@@ -1,6 +1,6 @@
 // NOSTR protocol integration: event handling, relay connections, NIP-46 signer support.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
@@ -28,6 +28,51 @@ pub const KIND_RELAY_LIST: u16 = 10002;
 
 /// Kind 3: Follow List (NIP-02)
 pub const KIND_FOLLOW_LIST: u16 = 3;
+
+// ============================================
+// Event De-duplication (Task 1)
+// ============================================
+
+/// Event deduplicator to prevent processing duplicate events from multiple relays
+pub struct EventDeduplicator {
+    seen_ids: HashSet<String>,
+    max_size: usize,
+}
+
+impl EventDeduplicator {
+    /// Create a new deduplicator with specified max size
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            seen_ids: HashSet::new(),
+            max_size,
+        }
+    }
+
+    /// Check if event was already seen, insert if not
+    /// Returns true if this is a duplicate (already seen)
+    pub fn check_and_insert(&mut self, event_id: &str) -> bool {
+        // If we're at capacity, clear half the entries (simple eviction)
+        if self.seen_ids.len() >= self.max_size {
+            let half = self.max_size / 2;
+            let ids: Vec<String> = self.seen_ids.iter().take(half).cloned().collect();
+            self.seen_ids.clear();
+            self.seen_ids.extend(ids);
+        }
+
+        // Check and insert
+        !self.seen_ids.insert(event_id.to_string())
+    }
+
+    /// Clear all seen events
+    pub fn clear(&mut self) {
+        self.seen_ids.clear();
+    }
+
+    /// Get current count of seen events
+    pub fn len(&self) -> usize {
+        self.seen_ids.len()
+    }
+}
 
 /// Parse relay list content from Kind 10002 event
 pub fn parse_relay_list_content(content: &str) -> Result<CachedRelayList, NostrError> {
@@ -756,5 +801,34 @@ mod nip65_tests {
                 // npub may be invalid, which is fine for this test
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    #[test]
+    fn test_deduplicator_new_event() {
+        let mut dedup = EventDeduplicator::new(100);
+        let is_dup = dedup.check_and_insert("event123");
+        assert!(!is_dup); // First time, not a duplicate
+    }
+
+    #[test]
+    fn test_deduplicator_duplicate_event() {
+        let mut dedup = EventDeduplicator::new(100);
+        let _ = dedup.check_and_insert("event123");
+        let is_dup = dedup.check_and_insert("event123");
+        assert!(is_dup); // Second time, is a duplicate
+    }
+
+    #[test]
+    fn test_deduplicator_clear() {
+        let mut dedup = EventDeduplicator::new(100);
+        let _ = dedup.check_and_insert("event123");
+        dedup.clear();
+        let is_dup = dedup.check_and_insert("event123");
+        assert!(!is_dup); // After clear, not a duplicate
     }
 }
