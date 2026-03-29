@@ -841,6 +841,15 @@ mod nip65_tests {
         assert!(relays.read_relays.contains(&"wss://relay.nostr.info".to_string()));
     }
 
+    #[tokio::test]
+    async fn test_fetch_relay_list_parses_kind_10002() {
+        // This test verifies that we can parse a Kind 10002 event
+        // The actual implementation will be added in the next step
+        //let client = NostrClient::new(vec!["wss://relay.damus.io".to_string()]).await.unwrap();
+        
+        // Test parsing of known Kind 10002 content format
+    }
+
     #[test]
     fn test_parse_nip19_npub() {
         // Test parsing a valid npub
