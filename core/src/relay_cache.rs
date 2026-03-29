@@ -49,6 +49,17 @@ pub struct CachedRelayList {
     pub updated_at: u64,
 }
 
+/// Relay health metrics
+#[derive(Debug, Clone)]
+pub struct RelayHealth {
+    pub relay_url: String,
+    pub latency_ms: u32,
+    pub error_rate: f32,
+    pub last_checked: u64,
+    pub total_requests: u32,
+    pub failed_requests: u32,
+}
+
 /// Relay cache storage
 pub struct RelayCache {
     conn: Mutex<Connection>,
@@ -85,7 +96,9 @@ impl RelayCache {
                 relay_url TEXT PRIMARY KEY,
                 latency_ms INTEGER NOT NULL,
                 error_rate REAL NOT NULL,
-                last_checked INTEGER NOT NULL
+                last_checked INTEGER NOT NULL,
+                total_requests INTEGER NOT NULL DEFAULT 0,
+                failed_requests INTEGER NOT NULL DEFAULT 0
             )",
             [],
         )?;
@@ -190,6 +203,105 @@ impl RelayCache {
             .unwrap_or_default();
 
         relays
+    }
+
+    /// Update relay health after a request
+    pub fn update_relay_health(
+        &self,
+        relay_url: &str,
+        latency_ms: u32,
+        success: bool,
+    ) -> Result<(), RelayCacheError> {
+        let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Get existing stats or use defaults
+        let (total, failed) = conn
+            .query_row(
+                "SELECT total_requests, failed_requests FROM relay_health WHERE relay_url = ?",
+                [relay_url],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+            )
+            .unwrap_or((0, 0));
+
+        let new_total = total.saturating_add(1);
+        let new_failed = if success {
+            failed
+        } else {
+            failed.saturating_add(1)
+        };
+        let new_error_rate = if new_total > 0 {
+            new_failed as f32 / new_total as f32
+        } else {
+            0.0
+        };
+
+        conn.execute(
+            "INSERT OR REPLACE INTO relay_health 
+             (relay_url, latency_ms, error_rate, last_checked, total_requests, failed_requests) 
+             VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                relay_url,
+                latency_ms,
+                new_error_rate,
+                now,
+                new_total,
+                new_failed
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Get health for a specific relay
+    pub fn get_relay_health(&self, relay_url: &str) -> Option<RelayHealth> {
+        let conn = self.conn.lock().ok()?;
+
+        conn.query_row(
+            "SELECT relay_url, latency_ms, error_rate, last_checked, total_requests, failed_requests 
+             FROM relay_health WHERE relay_url = ?",
+            [relay_url],
+            |row| {
+                Ok(RelayHealth {
+                    relay_url: row.get(0)?,
+                    latency_ms: row.get(1)?,
+                    error_rate: row.get(2)?,
+                    last_checked: row.get(3)?,
+                    total_requests: row.get(4)?,
+                    failed_requests: row.get(5)?,
+                })
+            },
+        )
+        .ok()
+    }
+
+    /// Calculate health score (0.0 - 1.0, higher is better)
+    pub fn get_health_score(&self, relay_url: &str) -> f32 {
+        let Some(health) = self.get_relay_health(relay_url) else {
+            return 1.0; // Unknown relays get neutral score
+        };
+
+        // Error penalty
+        let error_penalty = if health.error_rate > 0.2 { 0.7 } else { 1.0 };
+
+        // Staleness penalty
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let seven_days: u64 = 7 * 24 * 60 * 60;
+        let staleness_penalty = if now.saturating_sub(health.last_checked) > seven_days {
+            0.5
+        } else {
+            1.0
+        };
+
+        error_penalty * staleness_penalty
     }
 }
 

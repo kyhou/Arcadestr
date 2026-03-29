@@ -5,7 +5,7 @@ pub mod signer;
 pub mod auth;
 pub mod saved_users;
 pub mod relay_cache;
-pub use relay_cache::{RelayCache, CachedRelayList, RelayCacheError, RelayType};
+pub use relay_cache::{RelayCache, CachedRelayList, RelayCacheError, RelayType, RelayHealth};
 
 #[cfg(feature = "native")]
 pub mod nostr;
