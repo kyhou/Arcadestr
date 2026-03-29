@@ -1,7 +1,7 @@
 // NOSTR protocol integration: event handling, relay connections, NIP-46 signer support.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,61 @@ impl EventDeduplicator {
     /// Get current count of seen events
     pub fn len(&self) -> usize {
         self.seen_ids.len()
+    }
+}
+
+// ============================================
+// Idle Timeout Management (Task 3)
+// ============================================
+
+/// Manages relay connection idle timeouts
+pub struct RelayConnectionManager {
+    last_activity: HashMap<String, Instant>,
+    idle_timeout: Duration,
+}
+
+impl RelayConnectionManager {
+    /// Create a new manager with specified idle timeout
+    /// Default: 5 minutes
+    pub fn new(idle_timeout: Duration) -> Self {
+        Self {
+            last_activity: HashMap::new(),
+            idle_timeout,
+        }
+    }
+
+    /// Create with default 5-minute timeout
+    pub fn with_default_timeout() -> Self {
+        Self::new(Duration::from_secs(300))
+    }
+
+    /// Update last activity time for a relay
+    pub fn touch(&mut self, relay_url: &str) {
+        self.last_activity.insert(relay_url.to_string(), Instant::now());
+    }
+
+    /// Get relays that have been idle too long
+    pub fn get_idle_relays(&self) -> Vec<String> {
+        let now = Instant::now();
+        self.last_activity
+            .iter()
+            .filter(|(_, last_seen)| now.duration_since(**last_seen) > self.idle_timeout)
+            .map(|(url, _)| url.clone())
+            .collect()
+    }
+
+    /// Clean up idle relays and return them
+    pub fn cleanup(&mut self) -> Vec<String> {
+        let idle = self.get_idle_relays();
+        for url in &idle {
+            self.last_activity.remove(url);
+        }
+        idle
+    }
+
+    /// Remove a specific relay
+    pub fn remove(&mut self, relay_url: &str) {
+        self.last_activity.remove(relay_url);
     }
 }
 
@@ -830,5 +885,37 @@ mod dedup_tests {
         dedup.clear();
         let is_dup = dedup.check_and_insert("event123");
         assert!(!is_dup); // After clear, not a duplicate
+    }
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn test_touch_updates_last_activity() {
+        let mut manager = RelayConnectionManager::with_default_timeout();
+        manager.touch("wss://relay.example.com");
+        
+        let idle = manager.get_idle_relays();
+        assert!(idle.is_empty()); // Just touched, not idle
+    }
+
+    #[test]
+    fn test_cleanup_removes_idle_relays() {
+        let mut manager = RelayConnectionManager::new(Duration::from_millis(1));
+        manager.touch("wss://relay.example.com");
+        
+        // Wait a bit
+        thread::sleep(Duration::from_millis(10));
+        
+        let idle = manager.cleanup();
+        assert!(idle.contains(&"wss://relay.example.com".to_string()));
+        
+        // Should be removed now
+        let idle = manager.get_idle_relays();
+        assert!(idle.is_empty());
     }
 }
