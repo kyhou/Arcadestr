@@ -11,7 +11,7 @@ use arcadestr_core::signer::NostrSigner;
 
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
-use arcadestr_core::nostr::{GameListing, NostrClient, DEFAULT_RELAYS};
+use arcadestr_core::nostr::{GameListing, NostrClient, UserProfile, DEFAULT_RELAYS};
 use nostr::nips::nip46::NostrConnectURI;
 use nostr::prelude::ToBech32;
 
@@ -341,6 +341,26 @@ async fn fetch_listing_by_id(
         .map_err(|e| e.to_string())
 }
 
+/// Fetches user profile metadata (NIP-01 kind-0) with NIP-05 verification.
+///
+/// # Arguments
+/// * `npub` - The bech32 npub of the user
+///
+/// # Returns
+/// The user profile on success.
+#[tauri::command]
+async fn fetch_profile(
+    npub: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<UserProfile, String> {
+    let nostr = state.nostr.lock().await;
+
+    nostr
+        .fetch_profile_verified(&npub)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Requests a Lightning invoice for a zap payment.
 ///
 /// # Arguments
@@ -548,6 +568,7 @@ fn main() {
             publish_listing,
             fetch_listings,
             fetch_listing_by_id,
+            fetch_profile,
             request_invoice,
             // Saved users management
             get_saved_users,
