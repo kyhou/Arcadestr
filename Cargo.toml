@@ -1,0 +1,28 @@
+[workspace]
+members = ["app", "desktop", "web", "core"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Arcadestr Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/arcadestr/arcadestr"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Core dependencies
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["full"] }
+tracing = "0.1"
+thiserror = "1.0"
+
+# NOSTR
+nostr-sdk = { version = "0.44", features = ["all-nips"] }
+
+# Leptos
+leptos = { version = "0.8", features = ["csr"] }
+
+# Tauri
+tauri = "2"
