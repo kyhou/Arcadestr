@@ -507,6 +507,45 @@ impl NostrClient {
             }
         }
     }
+
+    /// Publish event to outbox relays
+    /// Rule A: Always include user's own write relays
+    /// Rule B: If replying, include the replied-to author's READ relays
+    pub async fn publish_to_outbox(
+        &self,
+        event: Event,
+        reply_target: Option<&Nip19Identifier>,
+        user_write_relays: &[String],
+    ) -> Result<(), NostrError> {
+        let mut target_relays: Vec<String> = user_write_relays.to_vec();
+
+        // Rule B: If replying, add target's read relays
+        if let Some(target) = reply_target {
+            if !target.relays.is_empty() {
+                target_relays.extend(target.relays.clone());
+            }
+        }
+
+        // Deduplicate relays
+        target_relays.sort();
+        target_relays.dedup();
+
+        // Publish to each relay
+        for relay_url in target_relays {
+            match self.inner.add_relay(&relay_url).await {
+                Ok(_) => {
+                    if let Err(e) = self.inner.send_event(&event).await {
+                        tracing::warn!("Failed to send event to {}: {}", relay_url, e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to add relay {}: {}", relay_url, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Converts a GameListing to an EventBuilder for signing.
