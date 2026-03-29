@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::models::{GameListing, ZapInvoice, ZapRequest};
-use crate::{invoke_request_invoice, AuthContext};
+use crate::models::{GameListing, UserProfile, ZapInvoice, ZapRequest};
+use crate::{invoke_fetch_profile, invoke_request_invoice, AuthContext};
 
 /// Detail view component - displays full listing information with Buy flow.
 #[component]
@@ -36,6 +36,50 @@ pub fn DetailView(
     let buy_loading: RwSignal<bool> = RwSignal::new(false);
     let buy_error: RwSignal<Option<String>> = RwSignal::new(None);
     let show_invoice: RwSignal<bool> = RwSignal::new(false);
+
+    // Seller profile state
+    let seller_profile: RwSignal<Option<UserProfile>> = RwSignal::new(None);
+    let profile_loading: RwSignal<bool> = RwSignal::new(true);
+    
+    // Clone listing's publisher_npub early to avoid move conflicts
+    let publisher_npub_for_fetch = listing.publisher_npub.clone();
+    let publisher_npub_for_fallback = publisher_npub_for_fetch.clone();
+
+    // Fetch seller profile on mount
+    Effect::new(move |_| {
+        let npub = publisher_npub_for_fetch.clone();
+        spawn_local(async move {
+            profile_loading.set(true);
+            match invoke_fetch_profile(npub).await {
+                Ok(p) => seller_profile.set(Some(p)),
+                Err(_) => seller_profile.set(None),
+            }
+            profile_loading.set(false);
+        });
+    });
+
+    // Helper to check if profile has actual data
+    let has_profile = move || {
+        seller_profile.get().map(|p| {
+            p.name.is_some() || p.display_name.is_some() || p.about.is_some() || p.picture.is_some()
+        }).unwrap_or(false)
+    };
+
+    // Get profile for display
+    let get_profile = move || seller_profile.get();
+
+    // Get first letter for avatar placeholder
+    let avatar_letter = move || {
+        get_profile()
+            .map(|p| {
+                let name = p.display();
+                name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".to_string())
+            })
+            .unwrap_or_else(|| "?".to_string())
+    };
+    
+    // Get seller profile for rendering
+    let seller_profile_for_render = seller_profile.clone();
 
     // Buy button handler - wrapped in Arc<Mutex> for thread-safe cloning
     let on_buy = {
@@ -157,14 +201,93 @@ pub fn DetailView(
                 "← Back"
             </button>
 
+            // Seller profile card
+            {move || {
+                if profile_loading.get() {
+                    Some(view! {
+                        <div class="seller-card-loading">
+                            "Loading seller info..."
+                        </div>
+                    }.into_any())
+                } else if has_profile() {
+                    let p = seller_profile_for_render.get().unwrap();
+                    let display_name = p.display();
+                    Some(view! {
+                        <div class="seller-card">
+                            {if let Some(url) = p.picture.clone() {
+                                Some(view! {
+                                    <img src={url} class="seller-avatar" alt="avatar" />
+                                }.into_any())
+                            } else {
+                                Some(view! {
+                                    <div class="seller-avatar-placeholder">{avatar_letter()}</div>
+                                }.into_any())
+                            }}
+                            <div class="seller-info">
+                                <div class="seller-name">
+                                    {display_name}
+                                    {if p.nip05_verified {
+                                        let nip05 = p.nip05.clone().unwrap_or_default();
+                                        Some(view! {
+                                            <span class="seller-verified" title={format!("NIP-05 verified: {}", nip05)}>{" ✓"}</span>
+                                        }.into_any())
+                                    } else {
+                                        None
+                                    }}
+                                </div>
+                                {if let Some(nip05) = p.nip05.clone() {
+                                    Some(view! {
+                                        <div class="seller-nip05">{nip05}</div>
+                                    }.into_any())
+                                } else {
+                                    None
+                                }}
+                                {if let Some(about) = p.about.clone() {
+                                    let truncated = if about.len() > 120 {
+                                        format!("{}...", &about[..120])
+                                    } else {
+                                        about
+                                    };
+                                    Some(view! {
+                                        <div class="seller-about">{truncated}</div>
+                                    }.into_any())
+                                } else {
+                                    None
+                                }}
+                                {if let Some(website) = p.website.clone() {
+                                    let website_url = website.clone();
+                                    Some(view! {
+                                        <a href={website_url} class="seller-website" target="_blank" rel="noopener">
+                                            {"🌐 "}{website}
+                                        </a>
+                                    }.into_any())
+                                } else {
+                                    None
+                                }}
+                            </div>
+                        </div>
+                    }.into_any())
+                } else {
+                    // No profile found - show fallback with truncated npub
+                    // listing.publisher_npub is already cloned at the top as publisher_npub_for_fetch
+                    let truncated_npub = if publisher_npub_for_fallback.len() > 20 {
+                        format!("{}...", &publisher_npub_for_fallback[..20])
+                    } else {
+                        publisher_npub_for_fallback.clone()
+                    };
+                    Some(view! {
+                        <div class="seller-card-fallback">
+                            <span class="meta-label">"Publisher: "</span>
+                            {truncated_npub}
+                        </div>
+                    }.into_any())
+                }
+            }}
+
             <div class="detail-content">
                 <h2 class="detail-title">{listing.title.clone()}</h2>
 
                 <div class="detail-meta">
-                    <p class="detail-publisher">
-                        <span class="meta-label">"Publisher: "</span>
-                        {listing.publisher_npub.clone()}
-                    </p>
                     <p class="detail-price">
                         <span class="meta-label">"Price: "</span>
                         <span class={if price_sats == 0 { "price-free" } else { "price-paid" }}>
