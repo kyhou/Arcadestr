@@ -9,6 +9,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::AuthState;
+use crate::relay_cache::{CachedRelayList, RelayCache, RelayDiscoverySource};
 use crate::signer::{ActiveSigner, NostrSigner as ArcadestrNostrSigner, SignerError};
 
 /// Arcadestr game listing event kind.
@@ -21,6 +22,43 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.nostr.band",
     "wss://nos.lol",
 ];
+
+/// Kind 10002: Relay List Metadata (NIP-65)
+pub const KIND_RELAY_LIST: u16 = 10002;
+
+/// Kind 3: Follow List (NIP-02)
+pub const KIND_FOLLOW_LIST: u16 = 3;
+
+/// Parse relay list content from Kind 10002 event
+pub fn parse_relay_list_content(content: &str) -> Result<CachedRelayList, NostrError> {
+    #[derive(Deserialize)]
+    struct RelayListContent {
+        read: Option<Vec<String>>,
+        write: Option<Vec<String>>,
+    }
+    
+    let parsed: RelayListContent = serde_json::from_str(content)
+        .map_err(|e| NostrError::MalformedEvent(format!("Invalid relay list content: {}", e)))?;
+    
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    
+    Ok(CachedRelayList {
+        pubkey: String::new(),
+        write_relays: parsed.write.unwrap_or_default(),
+        read_relays: parsed.read.unwrap_or_default(),
+        updated_at: now,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayDiscoveryResult {
+    pub write_relays: Vec<String>,
+    pub read_relays: Vec<String>,
+    pub source: RelayDiscoverySource,
+}
 
 /// Errors that can occur when interacting with NOSTR.
 #[derive(Debug, Error)]
@@ -401,6 +439,74 @@ impl NostrClient {
     pub async fn connect(&self) {
         self.inner.connect().await;
     }
+
+    /// Fetch Kind 10002 (relay list metadata) for a pubkey
+    pub async fn fetch_relay_list(&self, npub: &str) -> Result<CachedRelayList, NostrError> {
+        let pubkey = PublicKey::parse(npub)
+            .map_err(|e| NostrError::MalformedEvent(format!("Invalid npub: {}", e)))?;
+        
+        let filter = Filter::new()
+            .kind(Kind::from_u16(KIND_RELAY_LIST))
+            .author(pubkey)
+            .limit(1);
+        
+        let events = self.inner
+            .fetch_events(filter, Duration::from_secs(10))
+            .await
+            .map_err(|e| NostrError::RelayError(format!("Failed to fetch relay list: {}", e)))?;
+        
+        let event = events.first()
+            .ok_or_else(|| NostrError::MalformedEvent("No relay list found".into()))?;
+        
+        let mut relay_list = parse_relay_list_content(&event.content)?;
+        relay_list.pubkey = pubkey.to_hex();
+        relay_list.updated_at = event.created_at.as_secs();
+        
+        Ok(relay_list)
+    }
+
+    /// Get relays for a pubkey with fallback discovery
+    pub async fn get_relays_for_pubkey(
+        &self,
+        npub: &str,
+        cache: &RelayCache,
+    ) -> Result<RelayDiscoveryResult, NostrError> {
+        if let Some(cached) = cache.get_relay_list(npub) {
+            if !cache.is_stale(npub) {
+                return Ok(RelayDiscoveryResult {
+                    write_relays: cached.write_relays,
+                    read_relays: cached.read_relays,
+                    source: RelayDiscoverySource::RelayList,
+                });
+            }
+        }
+        
+        match self.fetch_relay_list(npub).await {
+            Ok(relay_list) => {
+                let _ = cache.save_relay_list(&relay_list);
+                Ok(RelayDiscoveryResult {
+                    write_relays: relay_list.write_relays,
+                    read_relays: relay_list.read_relays,
+                    source: RelayDiscoverySource::RelayList,
+                })
+            }
+            Err(_) => {
+                let seen_on = cache.get_seen_on(npub);
+                if !seen_on.is_empty() {
+                    return Ok(RelayDiscoveryResult {
+                        write_relays: seen_on.clone(),
+                        read_relays: seen_on,
+                        source: RelayDiscoverySource::SeenOn,
+                    });
+                }
+                Ok(RelayDiscoveryResult {
+                    write_relays: DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
+                    read_relays: DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
+                    source: RelayDiscoverySource::GlobalFallback,
+                })
+            }
+        }
+    }
 }
 
 /// Converts a GameListing to an EventBuilder for signing.
@@ -524,4 +630,20 @@ async fn sign_event_with_arcadestr_signer(
     _signer: &ActiveSigner,
 ) -> Result<Event, NostrError> {
     Err(NostrError::SigningError("Signing not supported in WASM target".into()))
+}
+
+#[cfg(test)]
+mod nip65_tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_relay_list_content() {
+        let content = r#"{"read":["wss://relay.nostr.info"],"write":["wss://relay.damus.io"]}"#;
+        let result = parse_relay_list_content(content);
+        assert!(result.is_ok());
+        
+        let relays = result.unwrap();
+        assert!(relays.write_relays.contains(&"wss://relay.damus.io".to_string()));
+        assert!(relays.read_relays.contains(&"wss://relay.nostr.info".to_string()));
+    }
 }

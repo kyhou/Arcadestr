@@ -23,6 +23,14 @@ pub enum RelayType {
     Read,
 }
 
+/// Source of relay discovery
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayDiscoverySource {
+    RelayList,
+    SeenOn,
+    GlobalFallback,
+}
+
 impl std::fmt::Display for RelayType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
