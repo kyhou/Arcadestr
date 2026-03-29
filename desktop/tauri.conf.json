@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Arcadestr",
+  "version": "0.1.0",
+  "identifier": "com.arcadestr.app",
+  "build": {
+    "beforeDevCommand": "cd web && trunk build",
+    "beforeBuildCommand": "cd web && trunk build --release",
+    "frontendDist": "../web/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Arcadestr",
+        "width": 1280,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}

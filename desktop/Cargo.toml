@@ -1,0 +1,27 @@
+[package]
+name = "arcadestr-desktop"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arcadestr-app = { path = "../app" }
+arcadestr-core = { path = "../core" }
+tauri = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nostr = { version = "0.44" }
+serde_json = { workspace = true }
+rand = "0.10.0"
+urlencoding = "2.1"
+dirs = "5"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = []
