@@ -3,6 +3,37 @@
 
 use serde::{Deserialize, Serialize};
 
+/// User profile data structure (NIP-01 kind-0 metadata).
+/// Mirrors arcadestr_core::nostr::UserProfile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct UserProfile {
+    pub npub: String,
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub about: Option<String>,
+    pub picture: Option<String>,
+    pub website: Option<String>,
+    pub nip05: Option<String>,
+    pub lud16: Option<String>,
+    pub nip05_verified: bool,
+}
+
+impl UserProfile {
+    /// Returns the best available display name, falling back to truncated npub.
+    pub fn display(&self) -> String {
+        self.display_name
+            .clone()
+            .or_else(|| self.name.clone())
+            .unwrap_or_else(|| {
+                if self.npub.len() > 16 {
+                    format!("{}...", &self.npub[..16])
+                } else {
+                    self.npub.clone()
+                }
+            })
+    }
+}
+
 /// Game listing data structure.
 /// Mirrors arcadestr_core::nostr::GameListing exactly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -48,4 +79,5 @@ pub enum MarketplaceView {
     Browse,
     Publish,
     Detail(GameListing),
+    Profile,
 }
