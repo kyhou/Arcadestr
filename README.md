@@ -30,6 +30,8 @@ Arcadestr implements several NIPs to provide a complete decentralized marketplac
 
 - **NIP-57** — Zap payments for purchases. Generates Lightning invoices via LNURL-pay and publishes zap receipt events (kind 9735) to confirm payment.
 
+- **NIP-65** — Relay List Metadata (Outbox Model) for efficient relay discovery. Clients discover where followed users publish their notes and send replies to the correct relays.
+
 - **NIP-78** — Parameterized replaceable events for game listings. Uses kind 30078 with a `d` tag for the listing ID, enabling updates and preventing duplicates.
 
 ## Prerequisites
