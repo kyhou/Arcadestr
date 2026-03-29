@@ -1,0 +1,35 @@
+[package]
+name = "arcadestr-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arcadestr-core = { path = "../core", default-features = false }
+leptos = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Navigator", "Clipboard"] }
+
+# Nostr re-export for web target (needed for ToBech32 trait)
+# This is used by web_auth.rs when web feature is enabled
+nostr = { version = "0.44", default-features = false, optional = true }
+
+# Tauri integration - only for WASM target with Tauri
+[target.'cfg(all(target_arch = "wasm32", not(feature = "web")))'.dependencies]
+serde-wasm-bindgen = "0.6"
+
+[features]
+default = ["csr", "native"]
+csr = ["leptos/csr"]
+hydrate = ["leptos/hydrate"]
+native = ["arcadestr-core/native"]
+wasm = ["arcadestr-core/wasm"]
+web = ["nostr"]

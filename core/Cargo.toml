@@ -1,0 +1,42 @@
+[package]
+name = "arcadestr-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Shared dependencies for both targets
+nostr = { version = "0.44", features = ["nip46"] }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+chrono = "0.4"
+
+# Native-only dependencies
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+nostr-sdk = { version = "0.44", features = ["nip57"] }
+nostr-connect = { version = "0.44" }
+tokio = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+url = "2"
+urlencoding = "2"
+
+# WASM-only dependencies
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "console"] }
+
+[features]
+default = []
+native = []
+wasm = []
+
+[dev-dependencies]
+tokio-test = "0.4"
