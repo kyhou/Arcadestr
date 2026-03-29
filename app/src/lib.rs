@@ -14,8 +14,8 @@ pub mod web_auth;
 
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 mod tauri_invoke;
-pub use components::{BrowseView, DetailView, PublishView};
-pub use models::{GameListing, MarketplaceView, ZapInvoice, ZapRequest};
+pub use components::{BrowseView, DetailView, ProfileView, PublishView};
+pub use models::{GameListing, MarketplaceView, UserProfile, ZapInvoice, ZapRequest};
 
 // =============================================================================
 // Tauri Invoke Bridge
@@ -356,6 +356,30 @@ pub async fn invoke_fetch_listing_by_id(
     Err("Tauri not available in web mode".to_string())
 }
 
+/// Arguments for fetch_profile command
+#[derive(Serialize)]
+#[allow(dead_code)]
+struct FetchProfileArgs {
+    npub: String,
+}
+
+/// Invoke fetch_profile Tauri command
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+pub async fn invoke_fetch_profile(npub: String) -> Result<UserProfile, String> {
+    use crate::tauri_invoke::invoke;
+
+    let fetch_args = serde_json::json!({
+        "npub": npub
+    });
+
+    invoke("fetch_profile", fetch_args).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+pub async fn invoke_fetch_profile(_npub: String) -> Result<UserProfile, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
 /// Invoke request_invoice Tauri command
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 pub async fn invoke_request_invoice(zap_req: ZapRequest) -> Result<ZapInvoice, String> {
@@ -381,6 +405,7 @@ pub async fn invoke_request_invoice(_zap_req: ZapRequest) -> Result<ZapInvoice, 
 #[derive(Clone)]
 pub struct AuthContext {
     pub npub: RwSignal<Option<String>>,
+    pub profile: RwSignal<Option<UserProfile>>,
     pub is_loading: RwSignal<bool>,
     pub error: RwSignal<Option<String>>,
 }
@@ -389,6 +414,7 @@ impl AuthContext {
     pub fn new() -> Self {
         Self {
             npub: RwSignal::new(None),
+            profile: RwSignal::new(None),
             is_loading: RwSignal::new(false),
             error: RwSignal::new(None),
         }
@@ -787,6 +813,58 @@ body {
     font-family: monospace;
 }
 
+.avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 1px solid var(--accent);
+    vertical-align: middle;
+    margin-right: 6px;
+}
+
+.avatar-placeholder {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #000;
+    font-weight: bold;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    margin-right: 6px;
+}
+
+.verified-badge {
+    color: var(--accent);
+    font-size: 12px;
+    margin-left: 3px;
+}
+
+.user-display-name {
+    color: var(--text-primary);
+    font-size: 0.875rem;
+    font-weight: 500;
+}
+
+.user-profile-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 6px;
+    transition: background-color 0.2s;
+}
+
+.user-profile-btn:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
 .disconnect-button {
     padding: 0.5rem 1rem;
     background-color: transparent;
@@ -1037,6 +1115,98 @@ body {
 .no-tags {
     color: var(--text-muted);
     font-style: italic;
+}
+
+/* Seller profile card styles */
+.seller-card-loading {
+    padding: 1rem;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    margin-bottom: 20px;
+}
+
+.seller-card {
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+}
+
+.seller-card-fallback {
+    padding: 1rem;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    margin-bottom: 20px;
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+}
+
+.seller-avatar {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 1px solid var(--accent);
+    flex-shrink: 0;
+}
+
+.seller-avatar-placeholder {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #000;
+    font-weight: bold;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    flex-shrink: 0;
+}
+
+.seller-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.seller-name {
+    font-weight: bold;
+    color: #fff;
+    font-size: 15px;
+}
+
+.seller-verified {
+    color: var(--accent);
+    font-size: 12px;
+}
+
+.seller-nip05 {
+    color: #888;
+    font-size: 12px;
+    margin-top: 2px;
+}
+
+.seller-about {
+    color: #aaa;
+    font-size: 13px;
+    margin-top: 6px;
+    line-height: 1.4;
+}
+
+.seller-website {
+    color: var(--accent);
+    font-size: 12px;
+    margin-top: 4px;
+    text-decoration: none;
+}
+
+.seller-website:hover {
+    text-decoration: underline;
 }
 
 .detail-actions {
@@ -1344,6 +1514,125 @@ body {
     font-size: 0.8rem;
     color: var(--text-muted);
     text-align: center;
+}
+
+/* Profile page styles */
+.profile-page {
+    padding: 32px;
+    max-width: 700px;
+}
+.profile-header {
+    display: flex;
+    gap: 24px;
+    align-items: flex-start;
+    margin-bottom: 32px;
+}
+.profile-avatar-lg {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 2px solid var(--accent);
+    flex-shrink: 0;
+}
+.profile-avatar-placeholder-lg {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #000;
+    font-weight: bold;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 32px;
+    flex-shrink: 0;
+}
+.profile-display-name {
+    font-size: 22px;
+    font-weight: bold;
+    color: #fff;
+    margin: 0 0 4px 0;
+}
+.profile-username {
+    color: #888;
+    font-size: 14px;
+    margin: 0 0 8px 0;
+}
+.profile-nip05 {
+    font-size: 13px;
+    color: #888;
+    margin-bottom: 10px;
+}
+.profile-nip05 .verified { color: var(--accent); }
+.profile-about {
+    color: #aaa;
+    font-size: 14px;
+    line-height: 1.6;
+    margin-bottom: 12px;
+    white-space: pre-wrap;
+}
+.profile-link {
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 14px;
+    display: block;
+    margin-bottom: 6px;
+}
+.profile-npub-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 14px;
+}
+.profile-npub {
+    font-family: monospace;
+    font-size: 12px;
+    color: #666;
+    word-break: break-all;
+}
+.copy-btn {
+    background: #1e1e1e;
+    border: 1px solid #333;
+    color: #ccc;
+    padding: 3px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+}
+.copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+.profile-divider {
+    border: none;
+    border-top: 1px solid #1e1e1e;
+    margin: 28px 0;
+}
+.my-listings-header {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 20px;
+}
+.my-listings-title {
+    font-size: 18px;
+    font-weight: bold;
+    color: #fff;
+}
+.my-listings-count { color: #666; font-size: 14px; }
+.empty-listings {
+    color: #666;
+    text-align: center;
+    padding: 40px 0;
+}
+.empty-listings-btn {
+    margin-top: 14px;
+    background: transparent;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    padding: 8px 18px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: monospace;
 }
 "#;
 
@@ -1968,17 +2257,82 @@ fn MainView() -> impl IntoView {
         });
     };
 
-    // Format npub for display (first 20 chars + "...")
-    let npub_display = move || {
-        auth.npub
-            .get()
-            .map(|n| {
-                if n.len() > 20 {
-                    format!("{}...", &n[..20])
-                } else {
-                    n
-                }
-            })
+    // Get profile for display - returns a closure that will be called in reactive context
+    let get_profile = move || {
+        let p = auth.profile.get();
+        #[cfg(debug_assertions)]
+        {
+            web_sys::console::log_1(&format!("get_profile called, profile: {:?}", p.is_some()).into());
+        }
+        p
+    };
+    let get_npub = move || {
+        let n = auth.npub.get();
+        #[cfg(debug_assertions)]
+        {
+            web_sys::console::log_1(&format!("get_npub called, npub: {:?}", n.is_some()).into());
+        }
+        n
+    };
+
+    // Get display name from profile - returns a closure
+    let get_profile_display = move || {
+        if let Some(p) = get_profile() {
+            let name = p.display();
+            #[cfg(debug_assertions)]
+            {
+                web_sys::console::log_1(&format!("Display name from profile: {}", name).into());
+            }
+            name
+        } else if let Some(n) = get_npub() {
+            let name = if n.len() > 16 {
+                format!("{}...", &n[..16])
+            } else {
+                n
+            };
+            #[cfg(debug_assertions)]
+            {
+                web_sys::console::log_1(&format!("Display name from npub: {}", name).into());
+            }
+            name
+        } else {
+            "?".to_string()
+        }
+    };
+
+    // Check if NIP-05 is verified
+    let get_nip05_verified = move || {
+        get_profile()
+            .map(|p| p.nip05_verified)
+            .unwrap_or(false)
+    };
+
+    // Get picture URL
+    let get_picture_url = move || {
+        let url = get_profile()
+            .and_then(|p| p.picture.clone());
+        #[cfg(debug_assertions)]
+        {
+            web_sys::console::log_1(&format!("get_picture_url: {:?}", url.is_some()).into());
+        }
+        url
+    };
+
+    // Get first letter for avatar placeholder
+    let get_avatar_letter = move || {
+        let name = get_profile_display();
+        let letter = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".to_string());
+        #[cfg(debug_assertions)]
+        {
+            web_sys::console::log_1(&format!("avatar_letter: {}", letter).into());
+        }
+        letter
+    };
+
+    // Get NIP-05 identifier for tooltip
+    let get_nip05 = move || {
+        get_profile()
+            .and_then(|p| p.nip05.clone())
             .unwrap_or_default()
     };
 
@@ -1989,6 +2343,10 @@ fn MainView() -> impl IntoView {
 
     let on_publish = move |_| {
         current_view.set(MarketplaceView::Publish);
+    };
+
+    let on_profile = move |_| {
+        current_view.set(MarketplaceView::Profile);
     };
 
     let on_select_listing = Callback::new(move |listing: GameListing| {
@@ -2004,7 +2362,32 @@ fn MainView() -> impl IntoView {
             <header class="header">
                 <h2 class="header-title">"Arcadestr"</h2>
                 <div class="user-info">
-                    <span class="npub-display">{npub_display}</span>
+                    <button class="user-profile-btn" on:click={on_profile}>
+                        {move || {
+                            if let Some(url) = get_picture_url() {
+                                Some(view! {
+                                    <img src={url} class="avatar" alt="avatar" />
+                                }.into_any())
+                            } else {
+                                Some(view! {
+                                    <div class="avatar-placeholder">{get_avatar_letter()}</div>
+                                }.into_any())
+                            }
+                        }}
+                        <span class="user-display-name">
+                            {get_profile_display()}
+                            {move || {
+                                if get_nip05_verified() {
+                                    let nip05 = get_nip05();
+                                    Some(view! {
+                                        <span class="verified-badge" title={format!("NIP-05 verified: {}", nip05)}>{"✓"}</span>
+                                    }.into_any())
+                                } else {
+                                    None
+                                }
+                            }}
+                        </span>
+                    </button>
                     <button
                         class="disconnect-button"
                         on:click=on_disconnect
@@ -2061,6 +2444,12 @@ fn MainView() -> impl IntoView {
                                         listing={listing.clone()}
                                         on_back={on_back}
                                     />
+                                }.into_any()
+                            }
+                            MarketplaceView::Profile => {
+                                let set_view = current_view.write_only();
+                                view! {
+                                    <ProfileView set_view={set_view} />
                                 }.into_any()
                             }
                         }
@@ -2126,6 +2515,50 @@ pub fn App() -> impl IntoView {
                 }
             }
         });
+    });
+
+    // Auto-fetch profile when npub becomes Some
+    // Track npub signal and fetch profile when it changes
+    let auth_for_effect = auth.clone();
+    Effect::new(move |_| {
+        // This read makes the effect track auth.npub
+        let npub = auth_for_effect.npub.get();
+        
+        #[cfg(debug_assertions)]
+        {
+            web_sys::console::log_1(&format!("Profile effect triggered, npub: {:?}", npub).into());
+        }
+        
+        if let Some(npub) = npub {
+            let auth = auth_for_effect.clone();
+            spawn_local(async move {
+                #[cfg(debug_assertions)]
+                {
+                    web_sys::console::log_1(&format!("Fetching profile for: {}", npub).into());
+                }
+                match invoke_fetch_profile(npub).await {
+                    Ok(profile) => {
+                        #[cfg(debug_assertions)]
+                        {
+                            web_sys::console::log_1(&format!("Profile fetched: {:?}", profile.name).into());
+                        }
+                        auth.profile.set(Some(profile));
+                    }
+                    Err(e) => {
+                        #[cfg(debug_assertions)]
+                        {
+                            web_sys::console::log_1(&format!("Failed to fetch profile: {}", e).into());
+                        }
+                    }
+                }
+            });
+        } else {
+            #[cfg(debug_assertions)]
+            {
+                web_sys::console::log_1(&"No npub, clearing profile".into());
+            }
+            auth_for_effect.profile.set(None);
+        }
     });
 
     view! {

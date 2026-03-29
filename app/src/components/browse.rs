@@ -81,7 +81,7 @@ pub fn BrowseView(
 
 /// Individual listing card component.
 #[component]
-fn ListingCard(
+pub fn ListingCard(
     listing: GameListing,
     on_select: Callback<GameListing>,
 ) -> impl IntoView {
