@@ -154,6 +154,122 @@ pub fn parse_relay_list_content(content: &str) -> Result<CachedRelayList, NostrE
     })
 }
 
+// ============================================
+// Relay Selection (NIP-65 Relay Gossip)
+// ============================================
+
+/// Scored relay for selection
+#[derive(Debug, Clone)]
+pub struct ScoredRelay {
+    pub url: String,
+    pub score: f32,
+    pub pubkeys: HashSet<String>,
+}
+
+/// Result of relay selection
+#[derive(Debug, Clone)]
+pub struct RelaySelection {
+    pub permanent: Vec<String>,
+    pub uncovered_pubkeys: Vec<String>,
+}
+
+/// Build relay map from follow list
+/// Returns: relay_url -> Set<pubkey>
+pub fn build_relay_map(
+    followed_pubkeys: &[String],
+    cache: &RelayCache,
+) -> HashMap<String, HashSet<String>> {
+    let mut relay_map: HashMap<String, HashSet<String>> = HashMap::new();
+    
+    for pubkey in followed_pubkeys {
+        if let Some(cached) = cache.get_relay_list(pubkey) {
+            for relay in &cached.write_relays {
+                relay_map.entry(relay.clone()).or_default().insert(pubkey.clone());
+            }
+        }
+    }
+    
+    relay_map
+}
+
+/// Score relays based on coverage and health
+pub fn score_relays(
+    relay_map: &HashMap<String, HashSet<String>>,
+    cache: &RelayCache,
+    user_pubkey: Option<&str>,
+) -> Vec<ScoredRelay> {
+    let mut scored = Vec::new();
+    
+    for (relay_url, pubkeys) in relay_map {
+        let raw_score = pubkeys.len() as f32;
+        
+        // Apply health multiplier
+        let health_score = cache.get_health_score(relay_url);
+        
+        // Apply staleness multiplier (if stale, half the score)
+        let staleness_multiplier = if cache.is_stale(relay_url) { 0.5 } else { 1.0 };
+        
+        // Apply user's own relay bonus
+        let is_user_own = user_pubkey.map(|u| {
+            cache.get_relay_list(u)
+                .map(|l| l.write_relays.contains(relay_url))
+                .unwrap_or(false)
+        }).unwrap_or(false);
+        
+        let own_relay_multiplier = if is_user_own { 1.5 } else { 1.0 };
+        
+        let final_score = raw_score * health_score * staleness_multiplier * own_relay_multiplier;
+        
+        scored.push(ScoredRelay {
+            url: relay_url.clone(),
+            score: final_score,
+            pubkeys: pubkeys.clone(),
+        });
+    }
+    
+    // Sort by score descending
+    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    
+    scored
+}
+
+/// Greedy set cover selection
+pub fn select_relays(
+    scored: Vec<ScoredRelay>,
+    max_relays: usize,
+    all_pubkeys: &HashSet<String>,
+) -> RelaySelection {
+    let mut selected: Vec<String> = Vec::new();
+    let mut covered: HashSet<String> = HashSet::new();
+    let mut uncovered: HashSet<String> = all_pubkeys.clone();
+    
+    for relay in scored {
+        if selected.len() >= max_relays {
+            break;
+        }
+        
+        if uncovered.is_empty() {
+            break;
+        }
+        
+        // Calculate marginal gain
+        let marginal: HashSet<_> = relay.pubkeys.intersection(&uncovered).cloned().collect();
+        
+        if marginal.is_empty() {
+            continue; // No new coverage
+        }
+        
+        selected.push(relay.url);
+        covered.extend(marginal.clone());
+        uncovered.retain(|p| !marginal.contains(p));
+    }
+    
+    RelaySelection {
+        permanent: selected,
+        uncovered_pubkeys: uncovered.into_iter().collect(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RelayDiscoveryResult {
     pub write_relays: Vec<String>,
@@ -564,6 +680,43 @@ impl NostrClient {
         relay_list.updated_at = event.created_at.as_secs();
         
         Ok(relay_list)
+    }
+
+    /// Fetch Kind 3 (follow list) for a pubkey
+    pub async fn fetch_follow_list(&self, npub: &str) -> Result<Vec<String>, NostrError> {
+        let pubkey = PublicKey::parse(npub)
+            .map_err(|e| NostrError::MalformedEvent(format!("Invalid npub: {}", e)))?;
+        
+        let filter = Filter::new()
+            .kind(Kind::from_u16(KIND_FOLLOW_LIST))
+            .author(pubkey)
+            .limit(1);
+        
+        let events = self.inner
+            .fetch_events(filter, Duration::from_secs(10))
+            .await
+            .map_err(|e| NostrError::RelayError(format!("Failed to fetch follow list: {}", e)))?;
+        
+        let event = match events.first() {
+            Some(e) => e,
+            None => return Ok(vec![]), // No follow list
+        };
+        
+        // Parse content - Kind 3 content is a JSON array of pubkeys
+        let content_str = event.content.trim();
+        if content_str.is_empty() {
+            return Ok(vec![]);
+        }
+        
+        // Try to parse as array of pubkeys
+        let pubkeys: Vec<String> = serde_json::from_str(content_str)
+            .unwrap_or_else(|_| {
+                // Try parsing as array of ["pubkey", "relay"] pairs
+                let pairs: Vec<Vec<String>> = serde_json::from_str(content_str).unwrap_or_default();
+                pairs.into_iter().filter_map(|p| p.into_iter().next()).collect()
+            });
+        
+        Ok(pubkeys)
     }
 
     /// Get relays for a pubkey with fallback discovery
