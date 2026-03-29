@@ -11,7 +11,7 @@ use arcadestr_core::signer::NostrSigner;
 
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
-use arcadestr_core::nostr::{EventDeduplicator, GameListing, NostrClient, UserProfile, DEFAULT_RELAYS};
+use arcadestr_core::nostr::{EventDeduplicator, GameListing, NostrClient, UserProfile, DEFAULT_RELAYS, parse_nip19_identifier};
 use arcadestr_core::relay_cache::RelayCache;
 use nostr::nips::nip46::NostrConnectURI;
 use nostr::prelude::ToBech32;
@@ -581,6 +581,44 @@ fn main() {
         }
     }
 
+/// Fetches a user profile using NIP-19 hints (nprofile/nevent) for relay hints.
+///
+/// This command parses a NIP-19 identifier (nprofile or nevent), connects to the
+/// hint relays, fetches the user's relay list (NIP-65), caches it, and then
+/// fetches the profile data.
+///
+/// # Arguments
+/// * `identifier` - NIP-19 identifier (nprofile or nevent)
+///
+/// # Returns
+/// The user profile on success.
+#[tauri::command]
+async fn fetch_profile_with_hints(
+    identifier: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<UserProfile, String> {
+    // Parse NIP-19 identifier
+    let parsed = parse_nip19_identifier(&identifier)
+        .map_err(|e| e.to_string())?;
+
+    let mut nostr = state.nostr.lock().await;
+    let cache = state.relay_cache.clone();
+
+    // Connect to hint relays if present
+    for hint in &parsed.relays {
+        let _ = nostr.add_relay(hint).await;
+    }
+
+    // Fetch relay list and cache it
+    let npub = format!("npub1{}", &parsed.pubkey[4.min(parsed.pubkey.len())..]);
+    if let Ok(relays) = nostr.fetch_relay_list(&npub).await {
+        let _ = cache.save_relay_list(&relays);
+    }
+
+    // Fetch profile
+    nostr.fetch_profile(&npub).await.map_err(|e| e.to_string())
+}
+
     /// Perform post-authentication relay discovery
     async fn initialize_relay_gossip(
         nostr: Arc<Mutex<NostrClient>>,
@@ -665,6 +703,7 @@ fn main() {
             fetch_listings,
             fetch_listing_by_id,
             fetch_profile,
+            fetch_profile_with_hints,
             request_invoice,
             // Saved users management
             get_saved_users,
