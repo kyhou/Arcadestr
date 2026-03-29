@@ -37,10 +37,17 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
         .await
         .map_err(|e| format!("JS error: {:?}", e))?;
 
-    // Get the response as a string
-    let response_str = js_value
-        .as_string()
-        .ok_or_else(|| "Expected string response".to_string())?;
+    // Convert the response to a string - it could be a string or an object
+    let response_str = if let Some(s) = js_value.as_string() {
+        s
+    } else {
+        // It's an object, need to stringify it using JSON.stringify
+        let stringify_call = js_sys::JSON::stringify(&js_value);
+        match stringify_call {
+            Ok(s) => s.as_string().unwrap_or_else(|| "{}".to_string()),
+            Err(_) => "{}".to_string(),
+        }
+    };
 
     // Debug: print what we received
     web_sys::console::log_1(&format!("Tauri response for '{}': {}", command, response_str).into());
