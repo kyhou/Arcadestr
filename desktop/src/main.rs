@@ -724,6 +724,16 @@ async fn fetch_profile_with_hints(
         }
     }
 
+    /// Get the number of currently connected relays.
+    #[tauri::command]
+    async fn get_connected_relay_count(
+        state: tauri::State<'_, AppState>,
+    ) -> Result<usize, String> {
+        let nostr = state.nostr.lock().await;
+        let relays = nostr.inner.relays().await;
+        Ok(relays.len())
+    }
+
     tauri::Builder::default()
         .manage(AppState {
             auth: Arc::new(Mutex::new(AuthState::new())),
@@ -753,6 +763,7 @@ async fn fetch_profile_with_hints(
             get_saved_user,
             rename_saved_user,
             connect_saved_user,
+            get_connected_relay_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Arcadestr");

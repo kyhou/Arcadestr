@@ -2,7 +2,7 @@
 
 use leptos::prelude::*;
 use serde::{Serialize, Deserialize};
-// use tracing::{error, info};
+use tracing::{error, info};
 use wasm_bindgen_futures::spawn_local;
 
 // Module declarations
@@ -187,6 +187,19 @@ async fn invoke_disconnect() -> Result<(), String> {
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
 async fn invoke_disconnect() -> Result<(), String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Invoke get_connected_relay_count Tauri command
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_get_relay_count() -> Result<usize, String> {
+    use crate::tauri_invoke::invoke;
+    
+    invoke("get_connected_relay_count", serde_json::json!(null)).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_get_relay_count() -> Result<usize, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
@@ -2088,8 +2101,26 @@ fn LoginView() -> impl IntoView {
                                                             auth.error.set(Some(e));
                                                             auth.is_loading.set(false);
                                                         }
-                                                    }
-                                                });
+            }
+            
+            // Poll relay count every 5 seconds
+            if let Some(window) = web_sys::window() {
+                let relay_count_clone = relay_count.clone();
+                let _ = window.set_interval(move || {
+                    let relay_count_local = relay_count_clone.clone();
+                    spawn_local(async move {
+                        match invoke_get_relay_count().await {
+                            Ok(count) => {
+                                relay_count_local.set(count);
+                            }
+                            Err(e) => {
+                                web_sys::console::log_1(&format!("Failed to get relay count: {}", e).into());
+                            }
+                        }
+                    });
+                }, 5000);
+            }
+        });
                                             }}
                                         >
                                             "Connect (wait for signer)"
@@ -2236,7 +2267,7 @@ fn LoginView() -> impl IntoView {
 
 /// Main view component - displayed when authenticated
 #[component]
-fn MainView() -> impl IntoView {
+fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
 
     // Marketplace view state
@@ -2474,6 +2505,7 @@ pub fn App() -> impl IntoView {
     // Create and provide auth context
     let auth = AuthContext::new();
     provide_context(auth.clone());
+    let relay_count = RwSignal::new(0);
 
     // Check authentication status on mount (with small delay for Tauri to initialize)
     Effect::new(move |_| {
@@ -2575,7 +2607,7 @@ pub fn App() -> impl IntoView {
                 when={move || auth.npub.get().is_some()}
                 fallback={|| view! { <LoginView /> }}
             >
-                <MainView />
+                <MainView relay_count=relay_count.clone() />
             </Show>
         </div>
     }
