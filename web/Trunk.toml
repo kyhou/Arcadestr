@@ -1,0 +1,13 @@
+[serve]
+# The port to serve the application on
+port = 5173
+
+[build]
+# The index HTML file to use
+target = "index.html"
+
+# The output directory for the build
+dist = "dist"
+
+# The public URL of the application
+public_url = "/"
