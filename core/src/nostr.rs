@@ -1,5 +1,6 @@
 // NOSTR protocol integration: event handling, relay connections, NIP-46 signer support.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
@@ -75,6 +76,38 @@ struct GameListingContent {
     download_url: String,
 }
 
+/// User profile data structure (NIP-01 kind-0 metadata).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UserProfile {
+    pub npub: String,
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub about: Option<String>,
+    pub picture: Option<String>,
+    pub website: Option<String>,
+    pub nip05: Option<String>,
+    pub lud16: Option<String>,
+    pub nip05_verified: bool,
+}
+
+/// Internal deserialization struct for kind-0 metadata content.
+#[derive(Deserialize, Default)]
+struct UserProfileContent {
+    name: Option<String>,
+    display_name: Option<String>,
+    about: Option<String>,
+    picture: Option<String>,
+    website: Option<String>,
+    nip05: Option<String>,
+    lud16: Option<String>,
+}
+
+/// NIP-05 verification response structure.
+#[derive(Deserialize)]
+struct Nip05Response {
+    names: HashMap<String, String>,
+}
+
 /// NOSTR client for Arcadestr.
 pub struct NostrClient {
     inner: nostr_sdk::Client,
@@ -91,8 +124,8 @@ impl NostrClient {
         info!("Creating NostrClient with {} relays", relays.len());
         let client = nostr_sdk::Client::default();
         
-        for relay in relays {
-            match client.add_relay(&relay).await {
+        for relay in &relays {
+            match client.add_relay(relay).await {
                 Ok(_) => {
                     info!("Added relay: {}", relay);
                 }
@@ -112,6 +145,18 @@ impl NostrClient {
         
         // Try to connect, but don't fail if relays are temporarily down
         client.connect().await;
+        
+        // Give some time for connections to establish
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        
+        // Check relay status
+        let relay_list = client.relays().await;
+        info!("Connected relays: {:?}", relay_list.keys().collect::<Vec<_>>());
+        
+        if relay_list.is_empty() {
+            warn!("No relays connected - queries may fail");
+        }
+        
         info!("NostrClient initialized");
         
         Ok(Self { inner: client })
@@ -195,6 +240,155 @@ impl NostrClient {
 
         event_to_game_listing(event)
     }
+
+    /// Fetches user profile metadata (kind-0) from relays.
+    pub async fn fetch_profile(
+        &self,
+        npub: &str,
+    ) -> Result<UserProfile, NostrError> {
+        // Parse npub as PublicKey
+        let pubkey = PublicKey::parse(npub)
+            .map_err(|e| NostrError::MalformedEvent(format!("Invalid npub: {}", e)))?;
+
+        // Log for debugging
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::console::log_1(&format!("[Nostr] Fetching profile for pubkey: {}", pubkey.to_hex()).into());
+        }
+        tracing::info!("Fetching profile for pubkey: {}", pubkey.to_hex());
+
+        // Build filter for kind-0 (metadata) events
+        let filter = Filter::new()
+            .kind(Kind::Metadata)
+            .author(pubkey)
+            .limit(1);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::console::log_1(&"[Nostr] Querying relays for kind-0 metadata...".into());
+        }
+        tracing::info!("Querying relays for kind-0 metadata events...");
+
+        // Fetch with 10s timeout
+        let events = self.inner
+            .fetch_events(filter, Duration::from_secs(10))
+            .await
+            .map_err(|e| NostrError::RelayError(format!("Failed to fetch profile: {}", e)))?;
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::console::log_1(&format!("[Nostr] Got {} events from relays", events.len()).into());
+        }
+        tracing::info!("Got {} events from relays", events.len());
+
+        // If no events returned, return minimal profile with only npub
+        let event = match events.first() {
+            Some(e) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    web_sys::console::log_1(&format!("[Nostr] Event content: {}", e.content).into());
+                }
+                tracing::info!("Event content: {}", e.content);
+                e
+            }
+            None => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    web_sys::console::log_1(&"[Nostr] No kind-0 events found for this user!".into());
+                }
+                tracing::warn!("No kind-0 events found for this user");
+                return Ok(UserProfile {
+                    npub: npub.to_string(),
+                    ..Default::default()
+                });
+            }
+        };
+
+        // Parse the event content as UserProfileContent
+        let content: UserProfileContent = serde_json::from_str(&event.content)
+            .unwrap_or_default();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::console::log_1(&format!("[Nostr] Parsed profile: name={:?}, display_name={:?}", content.name, content.display_name).into());
+        }
+        tracing::info!("Parsed profile: name={:?}, display_name={:?}, picture={:?}", 
+            content.name, content.display_name, content.picture);
+
+        Ok(UserProfile {
+            npub: npub.to_string(),
+            name: content.name,
+            display_name: content.display_name,
+            about: content.about,
+            picture: content.picture,
+            website: content.website,
+            nip05: content.nip05,
+            lud16: content.lud16,
+            nip05_verified: false,
+        })
+    }
+
+    /// Verifies a NIP-05 identifier against the user's pubkey.
+    pub async fn verify_nip05(
+        &self,
+        npub: &str,
+        nip05_identifier: &str,
+    ) -> bool {
+        // Split nip05_identifier on '@' to get name and domain
+        let parts: Vec<&str> = nip05_identifier.split('@').collect();
+        if parts.len() != 2 {
+            return false;
+        }
+        let (name, domain) = (parts[0], parts[1]);
+
+        // Fetch the NIP-05 JSON from the domain
+        let url = format!("https://{}/.well-known/nostr.json?name={}", domain, name);
+        
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        let response = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+
+        let nip05_resp: Nip05Response = match response.json().await {
+            Ok(resp) => resp,
+            Err(_) => return false,
+        };
+
+        // Get the expected hex pubkey from npub
+        let pubkey = match PublicKey::parse(npub) {
+            Ok(pk) => pk,
+            Err(_) => return false,
+        };
+
+        let expected_hex = pubkey.to_hex();
+
+        // Check if the names map contains our pubkey
+        nip05_resp.names
+            .get(name)
+            .map(|stored_hex| stored_hex.to_lowercase() == expected_hex.to_lowercase())
+            .unwrap_or(false)
+    }
+
+    /// Convenience method that fetches profile and verifies NIP-05.
+    pub async fn fetch_profile_verified(
+        &self,
+        npub: &str,
+    ) -> Result<UserProfile, NostrError> {
+        let mut profile = self.fetch_profile(npub).await?;
+        if let Some(ref identifier) = profile.nip05 {
+            profile.nip05_verified = self.verify_nip05(npub, identifier).await;
+        }
+        Ok(profile)
+    }
+
     /// Adds a relay to the client.
     /// Returns true if the relay was newly added, false if it already existed.
     pub async fn add_relay(&self, relay: &str) -> Result<bool, NostrError> {
