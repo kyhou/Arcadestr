@@ -11,7 +11,8 @@ use arcadestr_core::signer::NostrSigner;
 
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
-use arcadestr_core::nostr::{GameListing, NostrClient, UserProfile, DEFAULT_RELAYS};
+use arcadestr_core::nostr::{EventDeduplicator, ScoredRelay, RelaySelection, GameListing, NostrClient, UserProfile, DEFAULT_RELAYS};
+use arcadestr_core::relay_cache::RelayCache;
 use nostr::nips::nip46::NostrConnectURI;
 use nostr::prelude::ToBech32;
 
@@ -21,6 +22,10 @@ pub struct AppState {
     pub auth: Arc<Mutex<AuthState>>,
     /// NOSTR client for relay communication.
     pub nostr: Arc<Mutex<NostrClient>>,
+    /// Relay cache for NIP-65 relay list management.
+    pub relay_cache: Arc<RelayCache>,
+    /// Event deduplicator to prevent duplicate event processing.
+    pub deduplicator: Arc<Mutex<EventDeduplicator>>,
 }
 
 /// Generates a nostrconnect:// URI for client-initiated NIP-46 connections.
@@ -422,6 +427,11 @@ fn main() {
         }
     });
 
+    // Initialize RelayCache for NIP-65 relay list management
+    let relay_cache = RelayCache::new(keys_dir.join("relay_cache.db"))
+        .expect("Failed to create relay cache");
+    let deduplicator = EventDeduplicator::new(10000);
+
     // ─────────────────────────────────────────────────────────────────────────────
     // Saved Users Management Commands
     // ─────────────────────────────────────────────────────────────────────────────
@@ -555,6 +565,8 @@ fn main() {
         .manage(AppState {
             auth: Arc::new(Mutex::new(AuthState::new())),
             nostr: Arc::new(Mutex::new(nostr_client)),
+            relay_cache: Arc::new(relay_cache),
+            deduplicator: Arc::new(Mutex::new(deduplicator)),
         })
         .invoke_handler(tauri::generate_handler![
             wait_for_nostrconnect_signer,
