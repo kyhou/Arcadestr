@@ -11,7 +11,7 @@ use arcadestr_core::signer::NostrSigner;
 
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
-use arcadestr_core::nostr::{EventDeduplicator, ScoredRelay, RelaySelection, GameListing, NostrClient, UserProfile, DEFAULT_RELAYS};
+use arcadestr_core::nostr::{EventDeduplicator, GameListing, NostrClient, UserProfile, DEFAULT_RELAYS};
 use arcadestr_core::relay_cache::RelayCache;
 use nostr::nips::nip46::NostrConnectURI;
 use nostr::prelude::ToBech32;
@@ -531,6 +531,16 @@ fn main() {
                     
                     let pubkey = auth.public_key()
                         .ok_or("Public key not available")?;
+                    
+                    // After successful connection, spawn relay discovery
+                    let user_npub = pubkey.to_bech32().unwrap_or_default();
+                    let state_nostr = state.nostr.clone();
+                    let state_cache = state.relay_cache.clone();
+
+                    tokio::spawn(async move {
+                        initialize_relay_gossip(state_nostr, state_cache, user_npub).await;
+                    });
+                    
                     return pubkey.to_bech32().map_err(|e| e.to_string());
                 } else {
                     return Err("No private key found for this user".to_string());
@@ -553,12 +563,86 @@ fn main() {
                         let _ = mark_user_as_used(&user_id);
                         let pubkey = auth.public_key()
                             .ok_or("Public key not available after connection")?;
+                        
+                        // After successful connection, spawn relay discovery
+                        let user_npub = pubkey.to_bech32().unwrap_or_default();
+                        let state_nostr = state.nostr.clone();
+                        let state_cache = state.relay_cache.clone();
+
+                        tokio::spawn(async move {
+                            initialize_relay_gossip(state_nostr, state_cache, user_npub).await;
+                        });
+                        
                         return pubkey.to_bech32().map_err(|e| e.to_string());
                     }
                     Err(e) => return Err(format!("Connection failed: {}", e)),
                 }
             }
         }
+    }
+
+    /// Perform post-authentication relay discovery
+    async fn initialize_relay_gossip(
+        nostr: Arc<Mutex<NostrClient>>,
+        relay_cache: Arc<RelayCache>,
+        user_npub: String,
+    ) {
+        use arcadestr_core::nostr::{build_relay_map, score_relays, select_relays};
+        use std::collections::HashSet;
+        use arcadestr_core::CachedRelayList;
+        
+        let nostr_client = nostr.lock().await;
+        
+        // Fetch user's follow list
+        tracing::info!("Fetching follow list for {}", user_npub);
+        let followed = match nostr_client.fetch_follow_list(&user_npub).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!("Failed to fetch follow list: {}", e);
+                return;
+            }
+        };
+        
+        tracing::info!("Found {} followed pubkeys", followed.len());
+        
+        // Fetch relay lists for followed pubkeys
+        for pubkey in &followed {
+            match nostr_client.fetch_relay_list(pubkey).await {
+                Ok(relays) => {
+                    let _ = relay_cache.save_relay_list(&relays);
+                }
+                Err(_) => {
+                    // Fallback to seen_on if no relay list
+                    let seen = relay_cache.get_seen_on(pubkey);
+                    if !seen.is_empty() {
+                        let fallback = CachedRelayList {
+                            pubkey: pubkey.clone(),
+                            write_relays: seen.clone(),
+                            read_relays: seen,
+                            updated_at: 0,
+                        };
+                        let _ = relay_cache.save_relay_list(&fallback);
+                    }
+                }
+            }
+        }
+        
+        // Build relay map and select
+        let all_pubkeys: HashSet<_> = followed.iter().cloned().collect();
+        let relay_map = build_relay_map(&followed, &relay_cache);
+        let scored = score_relays(&relay_map, &relay_cache, Some(&user_npub));
+        let selection = select_relays(scored, 10, &all_pubkeys);
+        
+        tracing::info!("Selected {} permanent relays", selection.permanent.len());
+        
+        // Add selected relays
+        for relay in &selection.permanent {
+            let _ = nostr_client.add_relay(relay).await;
+        }
+        
+        nostr_client.connect().await;
+        
+        tracing::info!("Relay gossip initialized");
     }
 
     tauri::Builder::default()
