@@ -681,6 +681,47 @@ async fn fetch_profile_with_hints(
         nostr_client.connect().await;
         
         tracing::info!("Relay gossip initialized");
+        
+        // Schedule background refresh
+        let cache_for_refresh = relay_cache.clone();
+        let nostr_for_refresh = nostr.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            refresh_stale_relays(nostr_for_refresh, cache_for_refresh).await;
+        });
+    }
+
+    /// Refreshes stale relay lists for followed users.
+    async fn refresh_stale_relays(
+        nostr: Arc<Mutex<NostrClient>>,
+        relay_cache: Arc<RelayCache>,
+    ) {
+        let stale_pubkeys = relay_cache.get_stale_pubkeys();
+        
+        if stale_pubkeys.is_empty() {
+            return;
+        }
+        
+        tracing::info!("Refreshing {} stale relay lists", stale_pubkeys.len());
+        
+        let mut nostr_client = nostr.lock().await;
+        
+        for pubkey in stale_pubkeys {
+            let npub = if pubkey.starts_with("npub1") {
+                pubkey.clone()
+            } else {
+                format!("npub1{}", &pubkey[4..])
+            };
+            
+            match nostr_client.fetch_relay_list(&npub).await {
+                Ok(relays) => {
+                    let _ = relay_cache.save_relay_list(&relays);
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to refresh {}: {}", pubkey, e);
+                }
+            }
+        }
     }
 
     tauri::Builder::default()
