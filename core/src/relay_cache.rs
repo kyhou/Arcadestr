@@ -167,6 +167,35 @@ impl RelayCache {
         now.saturating_sub(relay_list.updated_at) > seven_days
     }
 
+    /// Get all pubkeys with stale relay lists (>7 days old)
+    pub fn get_stale_pubkeys(&self) -> Vec<String> {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return vec![],
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let seven_days: u64 = 7 * 24 * 60 * 60;
+        let threshold = now.saturating_sub(seven_days);
+
+        let mut stmt = match conn.prepare("SELECT pubkey FROM relay_lists WHERE updated_at < ?") {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        let pubkeys = stmt
+            .query_map([threshold], |row| row.get(0))
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+
+        pubkeys
+    }
+
     /// Update seen_on tracker
     pub fn update_seen_on(&self, pubkey: &str, relay_url: &str) -> Result<(), RelayCacheError> {
         let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
