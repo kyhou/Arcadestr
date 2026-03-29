@@ -9,6 +9,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::AuthState;
+#[cfg(feature = "native")]
 use crate::relay_cache::{CachedRelayList, RelayCache, RelayDiscoverySource};
 use crate::signer::{ActiveSigner, NostrSigner as ArcadestrNostrSigner, SignerError};
 
