@@ -2,7 +2,8 @@
 
 use leptos::prelude::*;
 use serde::{Serialize, Deserialize};
-use tracing::{error, info};
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 // Module declarations
@@ -203,6 +204,19 @@ async fn invoke_get_relay_count() -> Result<usize, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
+/// Invoke get_connected_relays Tauri command to get list of relay URLs
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_get_connected_relays() -> Result<Vec<String>, String> {
+    use crate::tauri_invoke::invoke;
+    
+    invoke("get_connected_relays", serde_json::json!(null)).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_get_connected_relays() -> Result<Vec<String>, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Saved Users Functions
 // ─────────────────────────────────────────────────────────────────────────────
@@ -298,16 +312,23 @@ async fn invoke_rename_saved_user(_user_id: String, _new_name: String) -> Result
     Err("Tauri not available".to_string())
 }
 
+/// Response from connect_saved_user
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConnectResponse {
+    npub: String,
+    profile: UserProfile,
+}
+
 /// Invoke connect_saved_user Tauri command
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
-async fn invoke_connect_saved_user(user_id: String) -> Result<String, String> {
+async fn invoke_connect_saved_user(user_id: String) -> Result<ConnectResponse, String> {
     use crate::tauri_invoke::invoke;
     
     invoke("connect_saved_user", serde_json::json!({ "userId": user_id })).await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
-async fn invoke_connect_saved_user(_user_id: String) -> Result<String, String> {
+async fn invoke_connect_saved_user(_user_id: String) -> Result<ConnectResponse, String> {
     Err("Tauri not available".to_string())
 }
 
@@ -893,6 +914,172 @@ body {
 .disconnect-button:hover {
     border-color: var(--error);
     color: var(--error);
+}
+
+/* Relay count badge styles */
+.relay-count-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+    font-weight: 500;
+    transition: all 0.2s ease;
+}
+
+.relay-count-badge:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.relay-count-badge.connected {
+    border-color: var(--success);
+    color: var(--success);
+}
+
+.relay-count-badge.connecting {
+    border-color: var(--accent);
+    color: var(--accent);
+    animation: pulse 2s infinite;
+}
+
+.relay-count-badge.disconnected {
+    border-color: var(--error);
+    color: var(--error);
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+
+.relay-icon {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+}
+
+.relay-count-number {
+    font-weight: 600;
+    min-width: 20px;
+    text-align: center;
+}
+
+/* Relay dropdown styles */
+.relay-badge-container {
+    position: relative;
+    display: inline-block;
+}
+
+.relay-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 8px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    min-width: 280px;
+    max-width: 350px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+    z-index: 1000;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(-10px);
+    transition: all 0.2s ease;
+}
+
+.relay-dropdown.open {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+}
+
+.relay-dropdown-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+    border-radius: 8px 8px 0 0;
+}
+
+.relay-dropdown-title {
+    font-weight: 600;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+}
+
+.relay-dropdown-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 1rem;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.relay-dropdown-close:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+}
+
+.relay-dropdown-list {
+    max-height: 300px;
+    overflow-y: auto;
+    padding: 8px 0;
+}
+
+.relay-dropdown-list ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.relay-dropdown-item {
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    transition: background 0.2s;
+}
+
+.relay-dropdown-item:last-child {
+    border-bottom: none;
+}
+
+.relay-dropdown-item:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.relay-url {
+    font-family: 'SF Mono', 'Monaco', 'Inconsolata', monospace;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    word-break: break-all;
+}
+
+.relay-dropdown-empty {
+    padding: 20px 16px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+/* Make the badge button styled properly */
+button.relay-count-badge {
+    cursor: pointer;
+    background: var(--bg-card);
+    font-family: inherit;
+}
+
+button.relay-count-badge:hover {
+    background: rgba(255, 255, 255, 0.05);
 }
 
 /* Marketplace layout */
@@ -1845,8 +2032,9 @@ fn LoginView() -> impl IntoView {
         
         spawn_local(async move {
             match invoke_connect_saved_user(user_id).await {
-                Ok(npub) => {
-                    auth.npub.set(Some(npub));
+                Ok(response) => {
+                    auth.npub.set(Some(response.npub));
+                    auth.profile.set(Some(response.profile));
                     auth.is_loading.set(false);
                 }
                 Err(e) => {
@@ -2101,26 +2289,8 @@ fn LoginView() -> impl IntoView {
                                                             auth.error.set(Some(e));
                                                             auth.is_loading.set(false);
                                                         }
-            }
-            
-            // Poll relay count every 5 seconds
-            if let Some(window) = web_sys::window() {
-                let relay_count_clone = relay_count.clone();
-                let _ = window.set_interval(move || {
-                    let relay_count_local = relay_count_clone.clone();
-                    spawn_local(async move {
-                        match invoke_get_relay_count().await {
-                            Ok(count) => {
-                                relay_count_local.set(count);
-                            }
-                            Err(e) => {
-                                web_sys::console::log_1(&format!("Failed to get relay count: {}", e).into());
-                            }
-                        }
-                    });
-                }, 5000);
-            }
-        });
+                                                    }
+                                                });
                                             }}
                                         >
                                             "Connect (wait for signer)"
@@ -2288,6 +2458,50 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
         });
     };
 
+    // Poll relay count every 5 seconds
+    Effect::new(move |_| {
+        if let Some(window) = web_sys::window() {
+            let relay_count_clone = relay_count.clone();
+            let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
+                &Closure::wrap(Box::new(move || {
+                    let relay_count_local = relay_count_clone.clone();
+                    spawn_local(async move {
+                        match invoke_get_relay_count().await {
+                            Ok(count) => relay_count_local.set(count),
+                            Err(e) => web_sys::console::log_1(&format!("Failed to get relay count: {}", e).into()),
+                        }
+                    });
+                }) as Box<dyn FnMut()>).into_js_value().as_ref().unchecked_ref(),
+                5000
+            );
+        }
+    });
+
+    // Relay dropdown state
+    let show_relay_dropdown = RwSignal::new(false);
+    let relay_list = RwSignal::new(Vec::<String>::new());
+
+    // Toggle relay dropdown and fetch relay list
+    let on_relay_badge_click = move |_| {
+        let current = show_relay_dropdown.get();
+        show_relay_dropdown.set(!current);
+        
+        // Fetch relay list when opening
+        if !current {
+            spawn_local(async move {
+                match invoke_get_connected_relays().await {
+                    Ok(relays) => relay_list.set(relays),
+                    Err(e) => web_sys::console::log_1(&format!("Failed to get relay list: {}", e).into()),
+                }
+            });
+        }
+    };
+
+    // Close dropdown when clicking outside
+    let on_close_relay_dropdown = move |_| {
+        show_relay_dropdown.set(false);
+    };
+
     // Get profile for display - returns a closure that will be called in reactive context
     let get_profile = move || {
         let p = auth.profile.get();
@@ -2393,6 +2607,72 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
             <header class="header">
                 <h2 class="header-title">"Arcadestr"</h2>
                 <div class="user-info">
+                    // Relay count badge with mesh network icon - now clickable
+                    {move || {
+                        let count = relay_count.get();
+                        let badge_class = if count == 0 {
+                            "relay-count-badge disconnected"
+                        } else if count < 3 {
+                            "relay-count-badge connecting"
+                        } else {
+                            "relay-count-badge connected"
+                        };
+                        let is_open = show_relay_dropdown.get();
+                        let dropdown_class = if is_open { "relay-dropdown open" } else { "relay-dropdown" };
+                        let relays = relay_list.get();
+                        
+                        view! {
+                            <div class="relay-badge-container">
+                                <button 
+                                    class={badge_class}
+                                    on:click={on_relay_badge_click}
+                                    title={format!("{} relays connected - Click to view", count)}
+                                >
+                                    // Mesh network icon (SVG)
+                                    <svg class="relay-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <circle cx="12" cy="5" r="2"/>
+                                        <circle cx="5" cy="12" r="2"/>
+                                        <circle cx="19" cy="12" r="2"/>
+                                        <circle cx="8" cy="19" r="2"/>
+                                        <circle cx="16" cy="19" r="2"/>
+                                        <line x1="12" y1="7" x2="12" y2="11"/>
+                                        <line x1="6.5" y1="10.5" x2="10.5" y2="12.5"/>
+                                        <line x1="17.5" y1="10.5" x2="13.5" y2="12.5"/>
+                                        <line x1="9" y1="17" x2="11" y2="15"/>
+                                        <line x1="15" y1="17" x2="13" y2="15"/>
+                                    </svg>
+                                    <span class="relay-count-number">{count}</span>
+                                </button>
+                                
+                                // Dropdown menu
+                                <div class={dropdown_class}>
+                                    <div class="relay-dropdown-header">
+                                        <span class="relay-dropdown-title">"Connected Relays"</span>
+                                        <button class="relay-dropdown-close" on:click={on_close_relay_dropdown}>"✕"</button>
+                                    </div>
+                                    <div class="relay-dropdown-list">
+                                        {if relays.is_empty() {
+                                            view! {
+                                                <div class="relay-dropdown-empty">"No relays connected"</div>
+                                            }.into_any()
+                                        } else {
+                                            view! {
+                                                <ul>
+                                                    {relays.into_iter().map(|relay| {
+                                                        view! {
+                                                            <li class="relay-dropdown-item">
+                                                                <span class="relay-url">{relay}</span>
+                                                            </li>
+                                                        }
+                                                    }).collect::<Vec<_>>()}
+                                                </ul>
+                                            }.into_any()
+                                        }}
+                                    </div>
+                                </div>
+                            </div>
+                        }.into_any()
+                    }}
                     <button class="user-profile-btn" on:click={on_profile}>
                         {move || {
                             if let Some(url) = get_picture_url() {
@@ -2618,6 +2898,26 @@ pub fn App() -> impl IntoView {
 #[component]
 fn DebugOverlay() -> impl IntoView {
     let show_debug = RwSignal::new(false);
+    let version_info = RwSignal::new(None::<VersionInfo>);
+    let error_msg = RwSignal::new(None::<String>);
+
+    // Fetch version info on mount
+    spawn_local(async move {
+        use crate::tauri_invoke::invoke;
+        web_sys::console::log_1(&"DebugOverlay: Fetching version info...".into());
+        
+        match invoke::<VersionInfo>("get_version_info", serde_json::json!(null)).await {
+            Ok(info) => {
+                web_sys::console::log_1(&format!("DebugOverlay: Got version info: {:?}", info).into());
+                version_info.set(Some(info));
+            }
+            Err(e) => {
+                let msg = format!("Failed to get version: {:?}", e);
+                web_sys::console::error_1(&msg.clone().into());
+                error_msg.set(Some(msg));
+            }
+        }
+    });
 
     view! {
         <div class="debug-overlay" style="position: fixed; bottom: 10px; right: 10px; z-index: 99999;">
@@ -2633,8 +2933,24 @@ fn DebugOverlay() -> impl IntoView {
                     <div style="background: #1a1a1a; border: 1px solid #f5821f; padding: 10px; border-radius: 4px; margin-top: 5px; font-size: 12px; color: #fff; max-width: 300px;">
                         <h4 style="color: #f5821f; margin-bottom: 5px;">Debug Info</h4>
                         <p>Build: Debug</p>
-                        <p>Target: {std::env::consts::OS}</p>
-                        <p>Arch: {std::env::consts::ARCH}</p>
+                        {move || version_info.get().map(|info| {
+                            let rev_display = format!("(rev {})", info.revision);
+                            view! {
+                                <div>
+                                    <p>Target: {info.os.clone()}</p>
+                                    <p>Arch: {info.arch.clone()}</p>
+                                    <hr style="border-color: #333; margin: 5px 0;" />
+                                    <p style="color: #f5821f; font-weight: bold;">Version: {info.full.clone()}</p>
+                                    <p style="color: #888; font-size: 10px;">{rev_display}</p>
+                                </div>
+                            }
+                        })}
+                        {move || error_msg.get().map(|err| view! {
+                            <div>
+                                <hr style="border-color: #333; margin: 5px 0;" />
+                                <p style="color: #ff4444;">Error: {err}</p>
+                            </div>
+                        })}
                         <hr style="border-color: #333; margin: 5px 0;" />
                         <p style="color: #888;">Press Ctrl+Shift+I for DevTools</p>
                     </div>
@@ -2644,4 +2960,15 @@ fn DebugOverlay() -> impl IntoView {
             }}
         </div>
     }
+}
+
+/// Version info structure matching the backend
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VersionInfo {
+    version: String,
+    revision: u32,
+    full: String,
+    os: String,
+    arch: String,
 }
