@@ -4,6 +4,8 @@
 pub mod signer;
 pub mod auth;
 pub mod saved_users;
+pub mod version;
+
 #[cfg(feature = "native")]
 pub mod relay_cache;
 
@@ -12,6 +14,15 @@ pub use relay_cache::{RelayCache, CachedRelayList, RelayCacheError, RelayType, R
 
 #[cfg(feature = "native")]
 pub mod nostr;
+
+#[cfg(feature = "native")]
+pub mod subscriptions;
+
+#[cfg(feature = "native")]
+pub mod profile_fetcher;
+
+#[cfg(feature = "native")]
+pub use profile_fetcher::{ProfileFetcher, ProfileCache, LruProfileCache, BATCH_SIZE, MAX_PROFILE_ATTEMPTS};
 
 #[cfg(feature = "native")]
 pub mod lightning;

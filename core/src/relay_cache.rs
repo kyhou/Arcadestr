@@ -2,8 +2,10 @@
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -40,6 +42,21 @@ impl std::fmt::Display for RelayType {
     }
 }
 
+/// Entry for a relay in the pubkey_relays map
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayEntry {
+    pub url: String,
+    pub relay_type: String, // "read" or "write"
+    pub last_seen: u64,     // unix timestamp
+}
+
+/// Simplified RelayHealth for in-memory storage
+#[derive(Debug, Clone)]
+pub struct RelayHealthData {
+    pub latency_ms: u64,
+    pub error_rate: f64,
+}
+
 /// Cached relay list for a pubkey
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CachedRelayList {
@@ -63,6 +80,16 @@ pub struct RelayHealth {
 /// Relay cache storage
 pub struct RelayCache {
     conn: Mutex<Connection>,
+    /// In-memory cache: pubkey → list of relay entries
+    pub pubkey_relays: Arc<Mutex<HashMap<String, Vec<RelayEntry>>>>,
+    /// In-memory cache: relay_url → health data
+    pub relay_health: Arc<Mutex<HashMap<String, RelayHealthData>>>,
+    /// In-memory cache: pubkey → list of relay URLs where seen
+    pub seen_on: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Pubkeys that need immediate background refresh (accessed while stale)
+    pending_refresh: Arc<Mutex<Vec<String>>>,
+    /// Counter for permanent WebSocket connections (max 10)
+    pub permanent_connection_count: Arc<AtomicUsize>,
 }
 
 impl RelayCache {
@@ -103,9 +130,123 @@ impl RelayCache {
             [],
         )?;
 
-        Ok(Self {
+        let cache = Self {
             conn: Mutex::new(conn),
-        })
+            pubkey_relays: Arc::new(Mutex::new(HashMap::new())),
+            relay_health: Arc::new(Mutex::new(HashMap::new())),
+            seen_on: Arc::new(Mutex::new(HashMap::new())),
+            pending_refresh: Arc::new(Mutex::new(Vec::new())),
+            permanent_connection_count: Arc::new(AtomicUsize::new(0)),
+        };
+
+        // Load existing data from SQLite into in-memory maps
+        cache.load_from_db()?;
+
+        Ok(cache)
+    }
+
+    /// Load all existing data from SQLite into in-memory maps
+    fn load_from_db(&self) -> Result<(), RelayCacheError> {
+        // Load relay_lists into pubkey_relays
+        {
+            let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
+            let mut stmt = conn
+                .prepare("SELECT pubkey, write_relays, read_relays, updated_at FROM relay_lists")?;
+
+            let rows = stmt.query_map([], |row| {
+                let pubkey: String = row.get(0)?;
+                let write_relays_json: String = row.get(1)?;
+                let read_relays_json: String = row.get(2)?;
+                let updated_at: u64 = row.get(3)?;
+
+                let write_relays: Vec<String> =
+                    serde_json::from_str(&write_relays_json).unwrap_or_default();
+                let read_relays: Vec<String> =
+                    serde_json::from_str(&read_relays_json).unwrap_or_default();
+
+                Ok((pubkey, write_relays, read_relays, updated_at))
+            })?;
+
+            let mut pubkey_relays = self
+                .pubkey_relays
+                .lock()
+                .map_err(|_| RelayCacheError::Lock)?;
+            for row in rows {
+                if let Ok((pubkey, write_relays, read_relays, updated_at)) = row {
+                    let mut entries = Vec::new();
+                    for url in write_relays {
+                        entries.push(RelayEntry {
+                            url,
+                            relay_type: "write".to_string(),
+                            last_seen: updated_at,
+                        });
+                    }
+                    for url in read_relays {
+                        entries.push(RelayEntry {
+                            url,
+                            relay_type: "read".to_string(),
+                            last_seen: updated_at,
+                        });
+                    }
+                    pubkey_relays.insert(pubkey, entries);
+                }
+            }
+        }
+
+        // Load seen_on into memory
+        {
+            let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
+            let mut stmt =
+                conn.prepare("SELECT pubkey, relay_url FROM seen_on ORDER BY last_seen DESC")?;
+
+            let rows = stmt.query_map([], |row| {
+                let pubkey: String = row.get(0)?;
+                let relay_url: String = row.get(1)?;
+                Ok((pubkey, relay_url))
+            })?;
+
+            let mut seen_on = self.seen_on.lock().map_err(|_| RelayCacheError::Lock)?;
+            for row in rows {
+                if let Ok((pubkey, relay_url)) = row {
+                    seen_on
+                        .entry(pubkey)
+                        .or_insert_with(Vec::new)
+                        .push(relay_url);
+                }
+            }
+        }
+
+        // Load relay_health into memory
+        {
+            let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
+            let mut stmt =
+                conn.prepare("SELECT relay_url, latency_ms, error_rate FROM relay_health")?;
+
+            let rows = stmt.query_map([], |row| {
+                let relay_url: String = row.get(0)?;
+                let latency_ms: u32 = row.get(1)?;
+                let error_rate: f32 = row.get(2)?;
+                Ok((relay_url, latency_ms, error_rate))
+            })?;
+
+            let mut relay_health = self
+                .relay_health
+                .lock()
+                .map_err(|_| RelayCacheError::Lock)?;
+            for row in rows {
+                if let Ok((relay_url, latency_ms, error_rate)) = row {
+                    relay_health.insert(
+                        relay_url,
+                        RelayHealthData {
+                            latency_ms: latency_ms as u64,
+                            error_rate: error_rate as f64,
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Get cached relay list for a pubkey
@@ -187,28 +328,66 @@ impl RelayCache {
             Err(_) => return vec![],
         };
 
-        let pubkeys = stmt
+        let pubkeys: Vec<String> = stmt
             .query_map([threshold], |row| row.get(0))
             .ok()
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default();
 
-        pubkeys
+        // Also include pubkeys marked for immediate refresh
+        let pending = self.get_and_clear_pending_refresh();
+        let mut all_pubkeys = pubkeys;
+        all_pubkeys.extend(pending);
+        all_pubkeys.dedup();
+
+        all_pubkeys
+    }
+
+    /// Mark a pubkey as needing immediate background refresh
+    pub fn mark_for_refresh(&self, pubkey: &str) {
+        if let Ok(mut pending) = self.pending_refresh.lock() {
+            if !pending.contains(&pubkey.to_string()) {
+                pending.push(pubkey.to_string());
+            }
+        }
+    }
+
+    /// Get and clear the list of pubkeys pending immediate refresh
+    pub fn get_and_clear_pending_refresh(&self) -> Vec<String> {
+        if let Ok(mut pending) = self.pending_refresh.lock() {
+            let result = pending.clone();
+            pending.clear();
+            result
+        } else {
+            vec![]
+        }
     }
 
     /// Update seen_on tracker
+    /// Writes to both SQLite (persistence) and in-memory map (performance)
     pub fn update_seen_on(&self, pubkey: &str, relay_url: &str) -> Result<(), RelayCacheError> {
-        let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
-
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        conn.execute(
-            "INSERT OR REPLACE INTO seen_on (pubkey, relay_url, last_seen) VALUES (?, ?, ?)",
-            rusqlite::params![pubkey, relay_url, now],
-        )?;
+        // Write to SQLite first (source of truth)
+        {
+            let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO seen_on (pubkey, relay_url, last_seen) VALUES (?, ?, ?)",
+                rusqlite::params![pubkey, relay_url, now],
+            )?;
+        }
+
+        // Update in-memory map
+        if let Ok(mut seen_on) = self.seen_on.lock() {
+            let entries = seen_on.entry(pubkey.to_string()).or_insert_with(Vec::new);
+            // Add relay if not already present
+            if !entries.contains(&relay_url.to_string()) {
+                entries.push(relay_url.to_string());
+            }
+        }
 
         Ok(())
     }
@@ -331,6 +510,64 @@ impl RelayCache {
         };
 
         error_penalty * staleness_penalty
+    }
+
+    /// Check if we can open a new permanent connection (max 10)
+    pub fn can_open_permanent_connection(&self) -> bool {
+        let count = self.permanent_connection_count.load(Ordering::SeqCst);
+        count < 10
+    }
+
+    /// Increment permanent connection count, returns true if successful
+    pub fn increment_permanent_connection(&self) -> bool {
+        let current = self.permanent_connection_count.load(Ordering::SeqCst);
+        if current >= 10 {
+            return false;
+        }
+        self.permanent_connection_count
+            .fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// Decrement permanent connection count
+    pub fn decrement_permanent_connection(&self) {
+        let current = self.permanent_connection_count.load(Ordering::SeqCst);
+        if current > 0 {
+            self.permanent_connection_count
+                .fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Get current permanent connection count
+    pub fn get_permanent_connection_count(&self) -> usize {
+        self.permanent_connection_count.load(Ordering::SeqCst)
+    }
+
+    // ============================================
+    // Event De-duplication (for notification loop)
+    // ============================================
+
+    /// Check if an event has already been seen
+    pub fn is_seen_event(&self, event_id: &str) -> bool {
+        // Use the seen_on table as a simple dedup store
+        // In production, this should use a dedicated events table or in-memory LRU cache
+        if let Ok(conn) = self.conn.lock() {
+            let result: Result<i64, _> = conn.query_row(
+                "SELECT 1 FROM seen_on WHERE pubkey = ? LIMIT 1",
+                [event_id],
+                |row| row.get(0),
+            );
+            result.is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Mark an event as seen
+    pub fn mark_event_seen(&self, event_id: String) {
+        // Store in a simple table - for now use seen_on with event_id as pubkey
+        // This is a temporary solution; production should use a dedicated events table
+        let _ = self.update_seen_on(&event_id, "dedup");
     }
 }
 
