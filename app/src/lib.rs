@@ -217,6 +217,20 @@ async fn invoke_get_connected_relays() -> Result<Vec<String>, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
+/// Invoke fetch_and_save_user_profile Tauri command
+/// Fetches and saves profile for the current authenticated user
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_fetch_and_save_user_profile() -> Result<UserProfile, String> {
+    use crate::tauri_invoke::invoke;
+    
+    invoke("fetch_and_save_user_profile", serde_json::json!(null)).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_fetch_and_save_user_profile() -> Result<UserProfile, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Saved Users Functions
 // ─────────────────────────────────────────────────────────────────────────────
@@ -232,6 +246,12 @@ pub struct SavedUser {
     pub npub: String,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
+    pub display_name: Option<String>,
+    pub username: Option<String>,
+    pub picture: Option<String>,
+    pub nip05: Option<String>,
+    pub about: Option<String>,
+    pub profile_updated_at: Option<i64>,
 }
 
 /// Saved users container
@@ -678,17 +698,62 @@ body {
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
+    flex: 1;
+    min-width: 0;
+}
+
+.saved-user-avatar-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.saved-user-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 2px solid var(--accent);
+    flex-shrink: 0;
+}
+
+.saved-user-avatar-placeholder {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--bg-primary);
+    font-weight: bold;
+    font-size: 1.2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.saved-user-details {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    min-width: 0;
+    overflow: hidden;
 }
 
 .saved-user-name {
     font-weight: 600;
     color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .saved-user-npub {
     font-size: 0.8rem;
     color: var(--text-muted);
     font-family: monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .saved-user-method {
@@ -2009,19 +2074,35 @@ fn LoginView() -> impl IntoView {
     let saved_users = SavedUsers { users: Vec::new() };
     let saved_users_signal = RwSignal::new(saved_users);
     
-    // Load users on mount and initialize screen state
-    spawn_local(async move {
-        match invoke_get_saved_users().await {
-            Ok(users) => {
-                let has_users = !users.users.is_empty();
-                saved_users_signal.set(users);
-                // Start with add new screen if no saved users
-                show_add_new.set(!has_users);
-                initialized.set(true);
-            }
-            Err(e) => {
-                web_sys::console::log_1(&format!("Failed to load saved users: {}", e).into());
-            }
+    // Track visibility for reloading saved users
+    let is_visible = RwSignal::new(true);
+    
+    // Load users on mount and when becoming visible again (after disconnect)
+    Effect::new(move |_| {
+        // This effect runs when is_visible changes to true
+        if is_visible.get() {
+            spawn_local(async move {
+                #[cfg(debug_assertions)]
+                {
+                    web_sys::console::log_1(&"Reloading saved users...".into());
+                }
+                match invoke_get_saved_users().await {
+                    Ok(users) => {
+                        let has_users = !users.users.is_empty();
+                        saved_users_signal.set(users);
+                        // Start with add new screen if no saved users
+                        show_add_new.set(!has_users);
+                        initialized.set(true);
+                        #[cfg(debug_assertions)]
+                        {
+                            web_sys::console::log_1(&"Saved users reloaded successfully".into());
+                        }
+                    }
+                    Err(e) => {
+                        web_sys::console::log_1(&format!("Failed to load saved users: {}", e).into());
+                    }
+                }
+            });
         }
     });
     
@@ -2129,14 +2210,34 @@ fn LoginView() -> impl IntoView {
                                                     } else { 
                                                         user.npub.clone() 
                                                     };
-                                                    let user_name = user.name.clone();
+                                                    // Use display_name or username or fallback to generic name
+                                                    let display_name = user.display_name.clone()
+                                                        .or_else(|| user.username.clone())
+                                                        .unwrap_or_else(|| user.name.clone());
                                                     let user_method = user.method.clone();
+                                                    let has_picture = user.picture.is_some();
+                                                    let picture_url = user.picture.clone().unwrap_or_default();
+                                                    let avatar_letter = display_name.chars().next().unwrap_or('?').to_uppercase().to_string();
+                                                    
                                                     view! {
                                                         <div class="saved-user-card">
                                                             <div class="saved-user-info">
-                                                                <span class="saved-user-name">{user_name}</span>
-                                                                <span class="saved-user-npub">{npub_short}</span>
-                                                                <span class="saved-user-method">{"["}{user_method}{"]"}</span>
+                                                                <div class="saved-user-avatar-row">
+                                                                    {if has_picture {
+                                                                        view! {
+                                                                            <img src={picture_url} class="saved-user-avatar" alt="avatar" />
+                                                                        }.into_any()
+                                                                    } else {
+                                                                        view! {
+                                                                            <div class="saved-user-avatar-placeholder">{avatar_letter}</div>
+                                                                        }.into_any()
+                                                                    }}
+                                                                    <div class="saved-user-details">
+                                                                        <span class="saved-user-name">{display_name}</span>
+                                                                        <span class="saved-user-npub">{npub_short}</span>
+                                                                        <span class="saved-user-method">{"["}{user_method}{"]"}</span>
+                                                                    </div>
+                                                                </div>
                                                             </div>
                                                             <div class="saved-user-actions">
                                                                 <button 
@@ -2848,13 +2949,31 @@ pub fn App() -> impl IntoView {
                 {
                     web_sys::console::log_1(&format!("Fetching profile for: {}", npub).into());
                 }
-                match invoke_fetch_profile(npub).await {
+                match invoke_fetch_profile(npub.clone()).await {
                     Ok(profile) => {
                         #[cfg(debug_assertions)]
                         {
                             web_sys::console::log_1(&format!("Profile fetched: {:?}", profile.name).into());
                         }
-                        auth.profile.set(Some(profile));
+                        auth.profile.set(Some(profile.clone()));
+                        
+                        // Also save profile to saved users for display on login screen
+                        spawn_local(async move {
+                            match invoke_fetch_and_save_user_profile().await {
+                                Ok(_) => {
+                                    #[cfg(debug_assertions)]
+                                    {
+                                        web_sys::console::log_1(&"Profile saved to saved users".into());
+                                    }
+                                }
+                                Err(e) => {
+                                    #[cfg(debug_assertions)]
+                                    {
+                                        web_sys::console::log_1(&format!("Failed to save profile: {}", e).into());
+                                    }
+                                }
+                            }
+                        });
                     }
                     Err(e) => {
                         #[cfg(debug_assertions)]
