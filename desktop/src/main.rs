@@ -562,7 +562,8 @@ fn main() {
                         state_registry, 
                         state_profile_fetcher,
                         app_handle,
-                        user_npub.clone()
+                        user_npub.clone(),
+                        Some(user_id.clone())
                     ).await;
                     
                     Ok(serde_json::json!({
@@ -608,7 +609,8 @@ fn main() {
                             state_registry, 
                             state_profile_fetcher,
                             app_handle,
-                            user_npub.clone()
+                            user_npub.clone(),
+                            Some(user_id.clone())
                         ).await;
                         
                         // Return both npub and profile
@@ -671,6 +673,7 @@ async fn fetch_profile_with_hints(
         profile_fetcher: Arc<ProfileFetcher>,
         app_handle: tauri::AppHandle,
         user_npub: String,
+        user_id: Option<String>,
     ) -> UserProfile {
         use arcadestr_core::nostr::{build_relay_map, score_relays, select_relays};
         use arcadestr_core::subscriptions::dispatch_ephemeral_read;
@@ -687,10 +690,29 @@ async fn fetch_profile_with_hints(
         };
         
         if let Some(profile) = profile_fetcher.fetch_single(&nostr_client, &user_npub).await {
-            tracing::info!("User profile loaded: name={:?}", profile.name);
+            tracing::info!("User profile loaded: name={:?}, display_name={:?}, picture={:?}", 
+                profile.name, profile.display_name, profile.picture);
             user_profile = profile.clone();
             // Emit event to update UI immediately
-            let _ = app_handle.emit("user_profile_loaded", profile);
+            let _ = app_handle.emit("user_profile_loaded", profile.clone());
+            
+            // Save profile to saved user if we have a user_id
+            if let Some(ref uid) = user_id {
+                tracing::info!("Saving profile to saved user {}: display_name={:?}, name={:?}, picture={:?}",
+                    uid, profile.display_name, profile.name, profile.picture);
+                let result = arcadestr_core::saved_users::update_user_profile(
+                    uid,
+                    profile.display_name.clone(),
+                    profile.name.clone(),
+                    profile.picture.clone(),
+                    profile.nip05.clone(),
+                    profile.about.clone(),
+                );
+                match result {
+                    Ok(_) => tracing::info!("Profile saved successfully"),
+                    Err(e) => tracing::error!("Failed to save profile: {}", e),
+                }
+            }
         }
         
         // Step 1: Fetch user's metadata (profile + relay list) from indexers
@@ -705,6 +727,25 @@ async fn fetch_profile_with_hints(
                 }
                 // Update user_profile with the fetched profile
                 user_profile = profile.clone();
+                
+                // Save profile to saved user if we have a user_id
+                if let Some(ref uid) = user_id {
+                    tracing::info!("Saving metadata profile to saved user {}: display_name={:?}, name={:?}, picture={:?}",
+                        uid, profile.display_name, profile.name, profile.picture);
+                    let result = arcadestr_core::saved_users::update_user_profile(
+                        uid,
+                        profile.display_name.clone(),
+                        profile.name.clone(),
+                        profile.picture.clone(),
+                        profile.nip05.clone(),
+                        profile.about.clone(),
+                    );
+                    match result {
+                        Ok(_) => tracing::info!("Metadata profile saved successfully"),
+                        Err(e) => tracing::error!("Failed to save metadata profile: {}", e),
+                    }
+                }
+                
                 relays
             }
             Err(e) => {
@@ -935,6 +976,77 @@ async fn fetch_profile_with_hints(
         Ok(nostr.get_connected_relays().await)
     }
 
+    /// Fetch and save profile for the current authenticated user.
+    /// This is called when the app initializes to update saved user metadata.
+    #[tauri::command]
+    async fn fetch_and_save_user_profile(
+        state: tauri::State<'_, AppState>,
+    ) -> Result<UserProfile, String> {
+        use arcadestr_core::saved_users::{load_saved_users, update_user_profile};
+        
+        let auth = state.auth.lock().await;
+        let npub = auth.public_key()
+            .ok_or("Not authenticated")?
+            .to_bech32()
+            .map_err(|e| e.to_string())?;
+        drop(auth);
+        
+        tracing::info!("fetch_and_save_user_profile called for npub: {}", npub);
+        
+        // Find the saved user with this npub
+        let users = load_saved_users()?;
+        tracing::info!("Loaded {} saved users", users.users.len());
+        
+        let user = users.users.iter()
+            .find(|u| u.npub == npub)
+            .cloned()
+            .ok_or_else(|| {
+                tracing::error!("User with npub {} not found in saved users", npub);
+                "User not found in saved users".to_string()
+            })?;
+        
+        tracing::info!("Found saved user: id={}, name={}", user.id, user.name);
+        
+        // Fetch profile
+        let nostr = state.nostr.lock().await;
+        let profile = match nostr.fetch_profile(&npub).await {
+            Ok(p) => {
+                tracing::info!("Profile fetched: name={:?}, display_name={:?}, picture={:?}", 
+                    p.name, p.display_name, p.picture);
+                p
+            }
+            Err(e) => {
+                tracing::error!("Failed to fetch profile: {}", e);
+                return Err(e.to_string());
+            }
+        };
+        drop(nostr);
+        
+        // Save profile to saved user
+        tracing::info!("Saving profile to saved user {}: display_name={:?}, name={:?}, picture={:?}",
+            user.id, profile.display_name, profile.name, profile.picture);
+        
+        let result = update_user_profile(
+            &user.id,
+            profile.display_name.clone(),
+            profile.name.clone(),
+            profile.picture.clone(),
+            profile.nip05.clone(),
+            profile.about.clone(),
+        );
+        
+        match result {
+            Ok(_) => {
+                tracing::info!("Profile saved successfully for user {}", npub);
+                Ok(profile)
+            }
+            Err(e) => {
+                tracing::error!("Failed to save profile: {}", e);
+                Err(e)
+            }
+        }
+    }
+
     /// Get application version and revision info
     #[tauri::command]
     fn get_version_info() -> Result<VersionInfo, String> {
@@ -990,6 +1102,7 @@ async fn fetch_profile_with_hints(
             connect_saved_user,
             get_connected_relay_count,
             get_connected_relays,
+            fetch_and_save_user_profile,
             get_version_info,
         ])
         .run(tauri::generate_context!())
