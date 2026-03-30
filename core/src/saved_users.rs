@@ -49,6 +49,24 @@ pub struct SavedUser {
     pub created_at: i64,
     /// Last time this user was used to login
     pub last_used_at: Option<i64>,
+    /// Profile metadata - display name from Nostr profile
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Profile metadata - username/handle
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Profile metadata - profile picture URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    /// Profile metadata - NIP-05 identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nip05: Option<String>,
+    /// Profile metadata - bio/about
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    /// When the profile was last fetched/updated
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_updated_at: Option<i64>,
 }
 
 /// Saved users storage
@@ -192,7 +210,40 @@ pub fn mark_user_as_used(user_id: &str) -> Result<(), String> {
     }
 }
 
-/// Generates a unique ID for a new user.
+/// Updates a saved user's profile metadata.
+/// Call this after fetching the user's profile from relays.
+pub fn update_user_profile(
+    user_id: &str,
+    display_name: Option<String>,
+    username: Option<String>,
+    picture: Option<String>,
+    nip05: Option<String>,
+    about: Option<String>,
+) -> Result<SavedUsers, String> {
+    let mut users = load_saved_users()?;
+
+    // Find the user first to check if it exists
+    let user_exists = users.users.iter().any(|u| u.id == user_id);
+
+    if !user_exists {
+        return Err("User not found".to_string());
+    }
+
+    // Now update the user
+    if let Some(user) = users.users.iter_mut().find(|u| u.id == user_id) {
+        let user_npub = user.npub.clone();
+        user.display_name = display_name;
+        user.username = username;
+        user.picture = picture;
+        user.nip05 = nip05;
+        user.about = about;
+        user.profile_updated_at = Some(chrono::Utc::now().timestamp());
+        save_saved_users(&users)?;
+        info!("Updated profile for user: {}", user_npub);
+    }
+
+    Ok(users)
+}
 fn generate_user_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now()
@@ -226,5 +277,11 @@ pub fn create_saved_user(
         npub: npub.to_string(),
         created_at: chrono::Utc::now().timestamp(),
         last_used_at: None,
+        display_name: None,
+        username: None,
+        picture: None,
+        nip05: None,
+        about: None,
+        profile_updated_at: None,
     }
 }
