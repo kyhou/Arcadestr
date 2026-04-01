@@ -21,65 +21,78 @@ pub fn AccountSelector(
                     each=accounts
                     key=|account| account.id.clone()
                     children=move |account: StoredAccount| {
-                        // Store values that need to be accessed in closures
-                        let account_id = StoredValue::new(account.id);
-                        let account_name = StoredValue::new(account.name);
-                        let account_npub = StoredValue::new(account.npub);
-                        let account_mode = StoredValue::new(account.signing_mode);
-                        let is_current = StoredValue::new(account.is_current);
+                        // Clone values for use in closures
+                        let account_id = account.id.clone();
+                        let account_name = account.name.clone();
+                        let account_npub = account.npub.clone();
+                        let account_mode = account.signing_mode.clone();
+                        let is_current = account.is_current;
 
                         view! {
                             <div
-                                class={format!("account-card {}", if is_current.get_value() { "active" } else { "" })}
-                                on:click=move |_| {
-                                    // Only switch if not currently active
-                                    if !is_current.get_value() {
-                                        let id = account_id.get_value();
-                                        on_switch.run(id);
+                                class={format!("account-card {}", if is_current { "active" } else { "" })}
+                                on:click={
+                                    let account_id = account_id.clone();
+                                    move |_| {
+                                        // Only switch if not currently active
+                                        if !is_current {
+                                            on_switch.run(account_id.clone());
+                                        }
                                     }
                                 }
                             >
                                 <div class="account-avatar">
                                     <div class="avatar-placeholder">
-                                        {move || {
-                                            let name = account_name.get_value();
-                                            name.as_deref().unwrap_or("?").chars().next().unwrap_or('?')
-                                        }}
+                                        {
+                                            let account_name = account_name.clone();
+                                            move || {
+                                                account_name.as_deref().unwrap_or("?").chars().next().unwrap_or('?')
+                                            }
+                                        }
                                     </div>
                                 </div>
 
                                 <div class="account-info">
                                     <span class="account-name">
-                                        {move || {
-                                            let name = account_name.get_value();
-                                            name.as_deref().unwrap_or("Unnamed Account").to_string()
-                                        }}
+                                        {
+                                            let account_name = account_name.clone();
+                                            move || {
+                                                account_name.as_deref().unwrap_or("Unnamed Account").to_string()
+                                            }
+                                        }
                                     </span>
                                     <span class="account-npub">
-                                        {move || {
-                                            let npub = account_npub.get_value();
-                                            format!("{}...{}", &npub[..8], &npub[npub.len()-8..])
-                                        }}
+                                        {
+                                            let account_npub = account_npub.clone();
+                                            move || {
+                                                format!("{}...{}", &account_npub[..8], &account_npub[account_npub.len()-8..])
+                                            }
+                                        }
                                     </span>
                                     <span class="account-mode">
-                                        {move || account_mode.get_value()}
+                                        {account_mode.clone()}
                                     </span>
                                 </div>
 
                                 <div class="account-actions">
                                     <Show
-                                        when=move || is_current.get_value()
-                                        fallback=move || view! {
-                                            <button
-                                                class="switch-btn"
-                                                on:click=move |e| {
-                                                    e.stop_propagation(); // Prevent card click
-                                                    let id = account_id.get_value();
-                                                    on_switch.run(id);
-                                                }
-                                            >
-                                                "Connect"
-                                            </button>
+                                        when=move || is_current
+                                        fallback={
+                                            let account_id = account_id.clone();
+                                            move || view! {
+                                                <button
+                                                    class="switch-btn"
+                                                    on:click={
+                                                        let account_id = account_id.clone();
+                                                        move |e| {
+                                                            e.stop_propagation(); // Prevent card click
+                                                            on_switch.run(account_id.clone());
+                                                        }
+                                                    }
+                                                >
+                                                    "Connect"
+                                                </button>
+                                            }
                                         }
                                     >
                                         <span class="current-badge">"Current"</span>
@@ -87,10 +100,12 @@ pub fn AccountSelector(
 
                                     <button
                                         class="delete-btn"
-                                        on:click=move |e| {
-                                            e.stop_propagation(); // Prevent card click
-                                            let id = account_id.get_value();
-                                            on_delete.run(id);
+                                        on:click={
+                                            let account_id = account_id.clone();
+                                            move |e| {
+                                                e.stop_propagation(); // Prevent card click
+                                                on_delete.run(account_id.clone());
+                                            }
                                         }
                                         title="Delete account"
                                     >

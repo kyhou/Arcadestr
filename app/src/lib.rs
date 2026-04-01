@@ -3660,17 +3660,24 @@ fn LoginView() -> impl IntoView {
 #[component]
 fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
+    let auth_stored = StoredValue::new(auth.clone());
 
     // Marketplace view state
     let current_view = RwSignal::new(MarketplaceView::Browse);
 
     // Handle disconnect button click (updated for new NIP-46 API)
     let on_disconnect = move |_| {
+        let auth = auth_stored.get_value();
         spawn_local(async move {
             match invoke_logout_nip46().await {
                 Ok(_) => {
                     auth.npub.set(None);
                     auth.error.set(None);
+                    auth.active_account.set(None);
+                    auth.connection_status.set("disconnected".to_string());
+                    auth.connection_error.set(None);
+                    // Reload accounts list to refresh "Current" status
+                    let _ = auth.load_accounts_list().await;
                 }
                 Err(e) => {
                     auth.error.set(Some(e));
