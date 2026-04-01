@@ -6,9 +6,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, error};
 use serde::Serialize;
+use tauri::Manager;
 
 #[allow(unused_imports)]
-use arcadestr_core::signer::NostrSigner;
+use arcadestr_core::signers::NostrSigner;
 
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
@@ -16,9 +17,13 @@ use arcadestr_core::nostr::{EventDeduplicator, GameListing, NostrClient, UserPro
 use arcadestr_core::relay_cache::RelayCache;
 use arcadestr_core::profile_fetcher::ProfileFetcher;
 use arcadestr_core::subscriptions::{SubscriptionRegistry, run_notification_loop, dispatch_permanent_subscriptions, dispatch_ephemeral_read};
+use arcadestr_core::nip46::AppSignerState;
+use arcadestr_core::nip46::{restore_session_on_startup, SessionRestoreResult};
 use nostr::nips::nip46::NostrConnectURI;
 use nostr::prelude::ToBech32;
 use tauri::Emitter;
+
+mod nip46_commands;
 
 /// Application state shared across Tauri commands.
 pub struct AppState {
@@ -52,7 +57,7 @@ async fn generate_nostrconnect_uri(
     relay: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    use arcadestr_core::signer::Nip46Signer;
+    use arcadestr_core::signers::Nip46Signer;
     use nostr::nips::nip19::ToBech32;
     use tracing::info;
 
@@ -194,15 +199,18 @@ async fn wait_for_nostrconnect_signer(
     timeout_secs: u64,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    use arcadestr_core::signer::Nip46Signer;
+    use arcadestr_core::signers::Nip46Signer;
     use nostr::nips::nip19::ToBech32;
 
     let mut auth = state.auth.lock().await;
 
     // Check if we have pending nostrconnect credentials
-    let (client_keys, relay, _secret) = auth
+    let pending = auth
         .take_pending_nostrconnect()
         .ok_or("No pending nostrconnect connection. Generate a URI first.")?;
+    let client_keys = pending.client_keys;
+    let relay = pending.relay;
+    let _secret = pending.secret;
 
     // Build the URI from stored credentials (matching working implementation)
     let uri = NostrConnectURI::client(
@@ -413,7 +421,7 @@ fn main() {
     }
     
     // Set the keys directory for the signer module
-    arcadestr_core::signer::set_keys_dir(keys_dir.clone());
+    arcadestr_core::signers::set_keys_dir(keys_dir.clone());
     info!("NIP-46 keys directory: {}", keys_dir.display());
 
     // Set the users directory for saved users
@@ -529,7 +537,7 @@ fn main() {
         app_handle: tauri::AppHandle,
     ) -> Result<serde_json::Value, String> {
         use arcadestr_core::saved_users::{get_saved_user, mark_user_as_used, LoginMethod};
-        use arcadestr_core::signer::SignerError;
+        use arcadestr_core::signers::SignerError;
         
         let user = get_saved_user(&user_id)?;
         
@@ -1078,6 +1086,42 @@ async fn fetch_profile_with_hints(
             subscription_registry: Arc::new(subscription_registry),
             profile_fetcher: Arc::new(profile_fetcher),
         })
+        .manage(Arc::new(Mutex::new(AppSignerState::new())))
+        .setup(|app| {
+            // Attempt to restore session on startup
+            let app_handle = app.handle().clone();
+            let signer_state: Arc<Mutex<AppSignerState>> = (*app.state::<Arc<Mutex<AppSignerState>>>()).clone();
+            
+            // Use tauri's async runtime instead of tokio::spawn
+            tauri::async_runtime::spawn(async move {
+                info!("Attempting to restore session on startup...");
+                
+                // Emit restoring event
+                let _ = app_handle.emit("session_restoring", ());
+                
+                // Attempt restore
+                match restore_session_on_startup(&signer_state, None).await {
+                    SessionRestoreResult::Success => {
+                        info!("Session restored successfully on startup");
+                        let _ = app_handle.emit("session_restored", ());
+                    }
+                    SessionRestoreResult::OfflineMode => {
+                        info!("Session restored in offline mode (bunker unreachable)");
+                        let _ = app_handle.emit("session_offline_mode", ());
+                    }
+                    SessionRestoreResult::NoSession => {
+                        info!("No saved session to restore");
+                        let _ = app_handle.emit("show_login", ());
+                    }
+                    SessionRestoreResult::Failed(e) => {
+                        error!("Failed to restore session: {}", e);
+                        let _ = app_handle.emit("session_restore_failed", e);
+                    }
+                }
+            });
+            
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             wait_for_nostrconnect_signer,
             generate_nostrconnect_uri,
@@ -1104,6 +1148,20 @@ async fn fetch_profile_with_hints(
             get_connected_relays,
             fetch_and_save_user_profile,
             get_version_info,
+            // New NIP-46 commands from nip46_commands module
+            nip46_commands::connect_bunker,
+            nip46_commands::get_connection_status,
+            nip46_commands::start_qr_login,
+            nip46_commands::check_qr_connection,
+            nip46_commands::list_saved_profiles,
+            nip46_commands::switch_profile,
+            nip46_commands::delete_profile,
+            nip46_commands::publish_game_score,
+            nip46_commands::ping_bunker,
+            nip46_commands::logout_nip46,
+            nip46_commands::has_accounts,
+            nip46_commands::load_active_account,
+            nip46_commands::attempt_reconnect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Arcadestr");
