@@ -4,12 +4,28 @@
 //! It stores the connection parameters and establishes the connection lazily.
 
 use std::sync::Arc;
+use std::any::Any;
+use std::fmt;
 use tokio::sync::RwLock;
 use nostr::{PublicKey, Event, UnsignedEvent, Keys};
 use nostr::nips::nip46::NostrConnectURI;
+use nostr::signer::{NostrSigner, SignerError, SignerBackend};
+use nostr::util::BoxedFuture;
 use tracing::{info, error};
 
-use crate::signers::{Nip46Signer, SignerError, NostrSigner};
+/// Error type for LazyNip46Signer operations
+#[derive(Debug)]
+struct LazySignerError {
+    message: String,
+}
+
+impl fmt::Display for LazySignerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for LazySignerError {}
 
 /// Connection state for lazy signer
 #[derive(Debug, Clone, PartialEq)]
@@ -31,8 +47,8 @@ pub struct LazyNip46Signer {
     bunker_uri: NostrConnectURI,
     /// Ephemeral app keys for this session
     app_keys: Keys,
-    /// Inner signer (initialized lazily)
-    inner: Arc<RwLock<Option<Nip46Signer>>>,
+    /// Inner signer (initialized lazily) - stores the nostr_connect client directly
+    inner: Arc<RwLock<Option<Arc<nostr_connect::client::NostrConnect>>>>,
     /// Connection state
     state: Arc<RwLock<LazyConnectionState>>,
     /// User's public key (known from initial connection)
@@ -63,7 +79,7 @@ impl LazyNip46Signer {
     }
 
     /// Ensure connection is established (called before signing)
-    async fn ensure_connected(&self) -> Result<Nip46Signer, SignerError> {
+    async fn ensure_connected(&self) -> Result<Arc<nostr_connect::client::NostrConnect>, SignerError> {
         // Check if already connected
         {
             let inner = self.inner.read().await;
@@ -112,50 +128,83 @@ impl LazyNip46Signer {
     }
 
     /// Perform the actual connection and handshake
-    async fn connect_and_handshake(&self) -> Result<Nip46Signer, SignerError> {
+    async fn connect_and_handshake(&self) -> Result<Arc<nostr_connect::client::NostrConnect>, SignerError> {
         use std::time::Duration;
+        use nostr::signer::NostrSigner as _;
 
-        // Create the NostrConnect client using Nip46Signer's method
-        let signer = Nip46Signer::connect_with_keys(
+        // Create the NostrConnect client directly
+        let client = nostr_connect::client::NostrConnect::new(
             self.bunker_uri.clone(),
             self.app_keys.clone(),
             Duration::from_secs(30), // Shorter timeout for deferred connection
-        ).await?;
+            None, // Default options
+        ).map_err(|e| SignerError::backend(e))?;
 
         // Perform handshake by calling get_public_key
-        signer.get_public_key().await?;
+        client.get_public_key().await?;
 
-        Ok(signer)
+        Ok(Arc::new(client))
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[async_trait::async_trait]
 impl NostrSigner for LazyNip46Signer {
-    async fn get_public_key(&self) -> Result<PublicKey, SignerError> {
+    fn backend(&self) -> SignerBackend {
+        SignerBackend::Custom(std::borrow::Cow::Borrowed("lazy-nip46"))
+    }
+
+    fn get_public_key(&self) -> BoxedFuture<Result<PublicKey, SignerError>> {
         // Return the known public key immediately
-        Ok(self.user_pubkey)
+        let pubkey = self.user_pubkey;
+        Box::pin(async move { Ok(pubkey) })
     }
 
-    async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SignerError> {
-        // Ensure connection before signing
-        let signer = self.ensure_connected().await?;
-        signer.sign_event(unsigned).await
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-#[async_trait::async_trait(?Send)]
-impl NostrSigner for LazyNip46Signer {
-    async fn get_public_key(&self) -> Result<PublicKey, SignerError> {
-        // Return the known public key immediately
-        Ok(self.user_pubkey)
+    fn sign_event(&self, unsigned: UnsignedEvent) -> BoxedFuture<Result<Event, SignerError>> {
+        let this = self.clone();
+        Box::pin(async move {
+            // Ensure connection before signing
+            let signer = this.ensure_connected().await?;
+            signer.sign_event(unsigned).await
+        })
     }
 
-    async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SignerError> {
-        // Ensure connection before signing
-        let signer = self.ensure_connected().await?;
-        signer.sign_event(unsigned).await
+    fn nip04_encrypt<'a>(
+        &'a self,
+        _public_key: &'a PublicKey,
+        _content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        Box::pin(async move {
+            Err(SignerError::backend(LazySignerError { message: "NIP-04 not supported by LazyNip46Signer".to_string() }))
+        })
+    }
+
+    fn nip04_decrypt<'a>(
+        &'a self,
+        _public_key: &'a PublicKey,
+        _encrypted_content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        Box::pin(async move {
+            Err(SignerError::backend(LazySignerError { message: "NIP-04 not supported by LazyNip46Signer".to_string() }))
+        })
+    }
+
+    fn nip44_encrypt<'a>(
+        &'a self,
+        _public_key: &'a PublicKey,
+        _content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        Box::pin(async move {
+            Err(SignerError::backend(LazySignerError { message: "NIP-44 not supported by LazyNip46Signer".to_string() }))
+        })
+    }
+
+    fn nip44_decrypt<'a>(
+        &'a self,
+        _public_key: &'a PublicKey,
+        _payload: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        Box::pin(async move {
+            Err(SignerError::backend(LazySignerError { message: "NIP-44 not supported by LazyNip46Signer".to_string() }))
+        })
     }
 }
 
@@ -165,5 +214,11 @@ impl std::fmt::Debug for LazyNip46Signer {
             .field("user_pubkey", &self.user_pubkey)
             .field("state", &"<async>")
             .finish()
+    }
+}
+
+impl AsRef<dyn Any> for LazyNip46Signer {
+    fn as_ref(&self) -> &dyn Any {
+        self
     }
 }
