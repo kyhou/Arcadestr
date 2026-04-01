@@ -94,10 +94,37 @@ pub async fn connect_bunker(
     // Update state with the client (connection happens in background)
     {
         let mut state_guard = state.lock().await;
-        state_guard.active_client = Some(client);
+        state_guard.active_client = Some(client.clone());
         state_guard.active_profile_id = Some(bunker_pubkey.clone());
         state_guard.connection_state = ConnectionState::Connecting; // Will transition on first sign
     }
+
+    // Trigger connection in background
+    let state_clone = state.inner().clone();
+    tokio::spawn(async move {
+        info!("Triggering deferred NIP-46 connection in background for new session...");
+        match client.signer().await {
+            Ok(signer) => {
+                match signer.get_public_key().await {
+                    Ok(_) => {
+                        info!("NIP-46 connection established successfully for new session");
+                        let mut state_guard = state_clone.lock().await;
+                        state_guard.connection_state = ConnectionState::Connected;
+                    }
+                    Err(e) => {
+                        error!("Failed to establish NIP-46 connection for new session: {}", e);
+                        let mut state_guard = state_clone.lock().await;
+                        state_guard.connection_state = ConnectionState::Failed(e.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to get signer from client for new session: {}", e);
+                let mut state_guard = state_clone.lock().await;
+                state_guard.connection_state = ConnectionState::Failed(e.to_string());
+            }
+        }
+    });
 
     // Set as last active profile for auto-restore on next startup
     if let Err(e) = set_last_active_profile_id(&profile.id) {

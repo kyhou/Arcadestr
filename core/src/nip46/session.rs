@@ -65,10 +65,40 @@ pub async fn activate_profile(
     // STEP 5: Update AppSignerState immediately
     {
         let mut state_guard = state.lock().await;
-        state_guard.active_client = Some(client);
+        state_guard.active_client = Some(client.clone());
         state_guard.active_profile_id = Some(bunker_pubkey.to_string());
         state_guard.connection_state = ConnectionState::Connecting;
     }
+
+    // STEP 6: Trigger connection in background
+    // This ensures the NIP-46 handshake happens without blocking the UI
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        info!("Triggering deferred NIP-46 connection in background...");
+        // Get the signer from client and trigger connection by calling get_public_key
+        match client.signer().await {
+            Ok(signer) => {
+                match signer.get_public_key().await {
+                    Ok(_) => {
+                        info!("NIP-46 connection established successfully in background");
+                        // Update state to connected
+                        let mut state_guard = state_clone.lock().await;
+                        state_guard.connection_state = ConnectionState::Connected;
+                    }
+                    Err(e) => {
+                        error!("Failed to establish NIP-46 connection: {}", e);
+                        let mut state_guard = state_clone.lock().await;
+                        state_guard.connection_state = ConnectionState::Failed(e.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to get signer from client: {}", e);
+                let mut state_guard = state_clone.lock().await;
+                state_guard.connection_state = ConnectionState::Failed(e.to_string());
+            }
+        }
+    });
 
     info!("Profile {} activated successfully (fast mode): user_pubkey={}", 
         bunker_pubkey, profile.user_pubkey.to_hex());
@@ -161,11 +191,38 @@ pub async fn restore_session_on_startup(
     // Update state
     {
         let mut state_guard = state.lock().await;
-        state_guard.active_client = Some(client);
+        state_guard.active_client = Some(client.clone());
         state_guard.active_profile_id = Some(profile_id);
         state_guard.is_offline_mode = false;
         state_guard.connection_state = ConnectionState::Connecting;
     }
+    
+    // STEP 6: Trigger connection in background
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        info!("Triggering deferred NIP-46 connection in background for restored session...");
+        match client.signer().await {
+            Ok(signer) => {
+                match signer.get_public_key().await {
+                    Ok(_) => {
+                        info!("NIP-46 connection established successfully for restored session");
+                        let mut state_guard = state_clone.lock().await;
+                        state_guard.connection_state = ConnectionState::Connected;
+                    }
+                    Err(e) => {
+                        error!("Failed to establish NIP-46 connection for restored session: {}", e);
+                        let mut state_guard = state_clone.lock().await;
+                        state_guard.connection_state = ConnectionState::Failed(e.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to get signer from client for restored session: {}", e);
+                let mut state_guard = state_clone.lock().await;
+                state_guard.connection_state = ConnectionState::Failed(e.to_string());
+            }
+        }
+    });
     
     SessionRestoreResult::Success
 }
