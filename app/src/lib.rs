@@ -6,6 +6,10 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
+// web_sys for browser APIs (window.open, etc.)
+#[cfg(target_arch = "wasm32")]
+use web_sys;
+
 // Module declarations
 pub mod components;
 pub mod models;
@@ -15,19 +19,19 @@ pub mod web_auth;
 
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 mod tauri_invoke;
-pub use components::{BrowseView, DetailView, ProfileView, PublishView};
+pub use components::{BrowseView, DetailView, ProfileView, PublishView, AccountSelector, BackupManager};
 pub use models::{GameListing, MarketplaceView, UserProfile, ZapInvoice, ZapRequest};
 
 // =============================================================================
 // Tauri Invoke Bridge
 // =============================================================================
 
-/// Arguments for connect_nip46 command
+/// Arguments for connect_bunker command (new NIP-46 API)
 #[derive(Serialize)]
 #[allow(dead_code)]
-struct ConnectNip46Args {
-    uri: String,
-    relay: String,
+struct ConnectBunkerArgs {
+    identifier: String,
+    display_name: String,
 }
 
 /// Arguments for publish_listing command
@@ -59,29 +63,23 @@ struct RequestInvoiceArgs {
     zap_request: ZapRequest,
 }
 
-/// Invoke connect_nip46 Tauri command
+/// Invoke connect_bunker Tauri command (new NIP-46 API)
+/// Connects with a bunker URI or NIP-05 identifier
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
-async fn invoke_connect_nip46(uri: String, relay: String) -> Result<String, String> {
+async fn invoke_connect_bunker(identifier: String, display_name: String) -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
 
     let connect_args = serde_json::json!({
-        "uri": uri,
-        "relay": relay
+        "identifier": identifier,
+        "displayName": display_name
     });
 
-    invoke("connect_nip46", connect_args).await
+    invoke("connect_bunker", connect_args).await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
-async fn invoke_connect_nip46(_uri: String, _relay: String) -> Result<String, String> {
+async fn invoke_connect_bunker(_identifier: String, _display_name: String) -> Result<serde_json::Value, String> {
     Err("Tauri not available in web mode".to_string())
-}
-
-/// Arguments for generate_nostrconnect_uri command
-#[derive(Serialize)]
-#[allow(dead_code)]
-struct GenerateNostrconnectUriArgs {
-    relay: String,
 }
 
 /// Invoke generate_nostrconnect_uri Tauri command
@@ -178,12 +176,16 @@ async fn invoke_is_authenticated() -> Result<bool, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
-/// Invoke disconnect Tauri command
+/// Invoke disconnect Tauri command (legacy - use logout_nip46 for NIP-46)
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 async fn invoke_disconnect() -> Result<(), String> {
     use crate::tauri_invoke::invoke_void;
+    invoke_void("disconnect", serde_json::json!({})).await
+}
 
-    invoke_void("disconnect", serde_json::json!(null)).await
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_disconnect() -> Result<(), String> {
+    Err("Tauri not available in web mode".to_string())
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
@@ -352,6 +354,183 @@ async fn invoke_connect_saved_user(_user_id: String) -> Result<ConnectResponse, 
     Err("Tauri not available".to_string())
 }
 
+// =============================================================================
+// NEW SECURE STORAGE API WRAPPERS
+// =============================================================================
+
+/// Check if any accounts exist in encrypted storage
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_has_accounts() -> Result<bool, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("has_accounts", serde_json::json!({})).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_has_accounts() -> Result<bool, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Load active account for fast login (~4 seconds)
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_load_active_account() -> Result<serde_json::Value, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("load_active_account", serde_json::json!({})).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_load_active_account() -> Result<serde_json::Value, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// List all saved profiles (new NIP-46 API)
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_list_saved_profiles() -> Result<serde_json::Value, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("list_saved_profiles", serde_json::json!({})).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_list_saved_profiles() -> Result<serde_json::Value, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Switch to a different profile (new NIP-46 API)
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_switch_profile(profile_id: String) -> Result<serde_json::Value, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("switch_profile", serde_json::json!({ "profileId": profile_id })).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_switch_profile(_profile_id: String) -> Result<serde_json::Value, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Login with nsec - creates encrypted local account
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_login_with_nsec(nsec: String, name: Option<String>) -> Result<serde_json::Value, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("login_with_nsec", serde_json::json!({ "nsec": nsec, "name": name })).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_login_with_nsec(_nsec: String, _name: Option<String>) -> Result<serde_json::Value, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Save NIP-46 remote account after successful connection
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_save_nip46_account(uri: String, relay: String, name: Option<String>) -> Result<serde_json::Value, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("save_nip46_account", serde_json::json!({ 
+        "uri": uri, 
+        "relay": relay, 
+        "name": name 
+    })).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_save_nip46_account(_uri: String, _relay: String, _name: Option<String>) -> Result<serde_json::Value, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Delete a profile (new NIP-46 API)
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_delete_profile(profile_id: String) -> Result<(), String> {
+    use crate::tauri_invoke::invoke_void;
+    invoke_void("delete_profile", serde_json::json!({ "profileId": profile_id })).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_delete_profile(_profile_id: String) -> Result<(), String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Logout from NIP-46 session (new NIP-46 API)
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_logout_nip46() -> Result<(), String> {
+    use crate::tauri_invoke::invoke_void;
+    invoke_void("logout_nip46", serde_json::json!({})).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_logout_nip46() -> Result<(), String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Start QR login session (new NIP-46 Flow B API)
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_start_qr_login() -> Result<String, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("start_qr_login", serde_json::json!({})).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_start_qr_login() -> Result<String, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Check QR connection status (new NIP-46 Flow B API)
+/// Returns profile info if connected, None if still waiting
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_check_qr_connection() -> Result<Option<serde_json::Value>, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("check_qr_connection", serde_json::json!({})).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_check_qr_connection() -> Result<Option<serde_json::Value>, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Ping the bunker to check connection health (new NIP-46 API)
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_ping_bunker() -> Result<serde_json::Value, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("ping_bunker", serde_json::json!({})).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_ping_bunker() -> Result<serde_json::Value, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Get NIP-46 connection status (new async auth API)
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_get_connection_status() -> Result<serde_json::Value, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("get_connection_status", serde_json::json!({})).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_get_connection_status() -> Result<serde_json::Value, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Create encrypted backup of all accounts
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_create_backup() -> Result<serde_json::Value, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("create_backup", serde_json::json!({})).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_create_backup() -> Result<serde_json::Value, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Restore accounts from backup
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+async fn invoke_restore_backup(backup_data: String) -> Result<serde_json::Value, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("restore_backup", serde_json::json!({ "backup_data": backup_data })).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+async fn invoke_restore_backup(_backup_data: String) -> Result<serde_json::Value, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
 /// Invoke publish_listing Tauri command
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 pub async fn invoke_publish_listing(listing: GameListing) -> Result<String, String> {
@@ -455,13 +634,39 @@ pub async fn invoke_request_invoice(_zap_req: ZapRequest) -> Result<ZapInvoice, 
 // Reactive State
 // =============================================================================
 
+/// Account information from secure storage
+#[derive(Debug, Clone)]
+pub struct StoredAccount {
+    pub id: String,
+    pub npub: String,
+    pub name: Option<String>,
+    pub signing_mode: String,
+    pub last_used: i64,
+    pub is_current: bool,  // ← NEW: indicates if this is the currently active account
+}
+
 /// Authentication context shared across components
 #[derive(Clone)]
 pub struct AuthContext {
+    // Existing fields
     pub npub: RwSignal<Option<String>>,
     pub profile: RwSignal<Option<UserProfile>>,
     pub is_loading: RwSignal<bool>,
     pub error: RwSignal<Option<String>>,
+    
+    // NEW: Secure storage fields
+    /// All stored accounts (for account switching UI)
+    pub accounts: RwSignal<Vec<StoredAccount>>,
+    /// Currently active account
+    pub active_account: RwSignal<Option<StoredAccount>>,
+    /// Whether accounts exist in new storage
+    pub has_secure_accounts: RwSignal<bool>,
+    
+    // NEW: NIP-46 connection status
+    /// Current connection state: "disconnected", "connecting", "connected", "failed"
+    pub connection_status: RwSignal<String>,
+    /// Connection error message if status is "failed"
+    pub connection_error: RwSignal<Option<String>>,
 }
 
 impl AuthContext {
@@ -471,6 +676,11 @@ impl AuthContext {
             profile: RwSignal::new(None),
             is_loading: RwSignal::new(false),
             error: RwSignal::new(None),
+            accounts: RwSignal::new(Vec::new()),
+            active_account: RwSignal::new(None),
+            has_secure_accounts: RwSignal::new(false),
+            connection_status: RwSignal::new("disconnected".to_string()),
+            connection_error: RwSignal::new(None),
         }
     }
 }
@@ -478,6 +688,226 @@ impl AuthContext {
 impl Default for AuthContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Helper function to parse account from JSON result
+fn parse_account_from_result(result: &serde_json::Value) -> Result<StoredAccount, String> {
+    let account = result.get("account").ok_or("Missing account field")?;
+    
+    Ok(StoredAccount {
+        id: account.get("id").and_then(|v| v.as_str()).ok_or("Missing id")?.to_string(),
+        npub: account.get("npub").and_then(|v| v.as_str()).ok_or("Missing npub")?.to_string(),
+        name: account.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        signing_mode: account.get("signing_mode").and_then(|v| v.as_str()).unwrap_or("Local").to_string(),
+        last_used: account.get("last_used").and_then(|v| v.as_i64()).unwrap_or(0),
+        is_current: account.get("is_current").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
+/// Helper function to parse accounts list from JSON result
+fn parse_accounts_list(result: &serde_json::Value) -> Result<Vec<StoredAccount>, String> {
+    let accounts = result.get("accounts").and_then(|a| a.as_array())
+        .ok_or("Missing accounts field")?;
+    
+    let stored_accounts: Vec<StoredAccount> = accounts
+        .iter()
+        .filter_map(|acc| {
+            Some(StoredAccount {
+                id: acc.get("id")?.as_str()?.to_string(),
+                npub: acc.get("npub")?.as_str()?.to_string(),
+                name: acc.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
+                signing_mode: acc.get("signing_mode")?.as_str()?.to_string(),
+                last_used: acc.get("last_used")?.as_i64()?,
+                is_current: acc.get("is_current").and_then(|v| v.as_bool()).unwrap_or(false),
+            })
+        })
+        .collect();
+    
+    Ok(stored_accounts)
+}
+
+/// Generate a QR code SVG from a string
+fn generate_qr_svg(data: &str) -> String {
+    use qrcode::{QrCode, Version, EcLevel};
+    use qrcode::render::svg;
+    
+    // Create QR code with medium error correction
+    let code = QrCode::with_error_correction_level(data, EcLevel::M)
+        .unwrap_or_else(|_| {
+            // Fallback: create a minimal QR code
+            QrCode::new("ERROR").expect("Failed to create QR code")
+        });
+    
+    // Render as SVG with styling
+    let svg = code.render()
+        .min_dimensions(200, 200)
+        .max_dimensions(300, 300)
+        .quiet_zone(true)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+    
+    svg
+}
+
+/// AuthContext methods for secure storage operations
+impl AuthContext {
+    /// Load list of all profiles from secure storage (new NIP-46 API)
+    pub async fn load_profiles_list(&self) -> Result<(), String> {
+        match invoke_list_saved_profiles().await {
+            Ok(result) => {
+                if let Ok(accounts) = parse_accounts_list(&result) {
+                    self.accounts.set(accounts);
+                    Ok(())
+                } else {
+                    Err("Failed to parse profiles".to_string())
+                }
+            }
+            Err(e) => Err(e)
+        }
+    }
+    
+    /// Load list of all accounts (alias for load_profiles_list)
+    pub async fn load_accounts_list(&self) -> Result<(), String> {
+        self.load_profiles_list().await
+    }
+    
+    /// Switch to a different profile (new NIP-46 API)
+    pub async fn switch_profile(&self, profile_id: String) -> Result<(), String> {
+        self.is_loading.set(true);
+        
+        match invoke_switch_profile(profile_id).await {
+            Ok(result) => {
+                if let Ok(account) = parse_account_from_result(&result) {
+                    self.active_account.set(Some(account.clone()));
+                    self.npub.set(Some(account.npub.clone()));
+                    self.is_loading.set(false);
+                    
+                    // Start connection status polling for NIP-46 accounts
+                    if account.signing_mode == "nip46" {
+                        self.start_connection_status_polling().await;
+                    }
+                    
+                    Ok(())
+                } else {
+                    self.is_loading.set(false);
+                    Err("Failed to parse profile".to_string())
+                }
+            }
+            Err(e) => {
+                self.error.set(Some(e.clone()));
+                self.is_loading.set(false);
+                Err(e)
+            }
+        }
+    }
+    
+    /// Switch to a different account (alias for switch_profile)
+    pub async fn switch_account(&self, account_id: String) -> Result<(), String> {
+        self.switch_profile(account_id).await
+    }
+    
+    /// Login with nsec - creates encrypted local account
+    pub async fn login_with_nsec(&self, nsec: String, name: Option<String>) -> Result<(), String> {
+        self.is_loading.set(true);
+        
+        match invoke_login_with_nsec(nsec, name).await {
+            Ok(result) => {
+                if let Ok(account) = parse_account_from_result(&result) {
+                    self.active_account.set(Some(account.clone()));
+                    self.npub.set(Some(account.npub.clone()));
+                    self.has_secure_accounts.set(true);
+                    self.is_loading.set(false);
+                    Ok(())
+                } else {
+                    self.is_loading.set(false);
+                    Err("Failed to parse account".to_string())
+                }
+            }
+            Err(e) => {
+                self.error.set(Some(e.clone()));
+                self.is_loading.set(false);
+                Err(e)
+            }
+        }
+    }
+    
+    /// Delete a profile (new NIP-46 API)
+    pub async fn delete_profile(&self, profile_id: String) -> Result<(), String> {
+        match invoke_delete_profile(profile_id).await {
+            Ok(_) => {
+                // Refresh profiles list
+                self.load_profiles_list().await
+            }
+            Err(e) => Err(e)
+        }
+    }
+    
+    /// Delete an account (alias for delete_profile)
+    pub async fn delete_account(&self, account_id: String) -> Result<(), String> {
+        self.delete_profile(account_id).await
+    }
+    
+    /// Logout from NIP-46 session (new NIP-46 API)
+    pub async fn logout_nip46(&self) -> Result<(), String> {
+        match invoke_logout_nip46().await {
+            Ok(_) => {
+                self.active_account.set(None);
+                self.npub.set(None);
+                self.connection_status.set("disconnected".to_string());
+                self.connection_error.set(None);
+                Ok(())
+            }
+            Err(e) => Err(e)
+        }
+    }
+    
+    /// Start polling for NIP-46 connection status
+    /// This runs every 2 seconds until connection is established or fails
+    pub async fn start_connection_status_polling(&self) {
+        let auth = self.clone();
+        spawn_local(async move {
+            loop {
+                match invoke_get_connection_status().await {
+                    Ok(status) => {
+                        let status_str = status.get("status")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("unknown");
+                        
+                        let error = status.get("error")
+                            .and_then(|e| e.as_str())
+                            .map(|s| s.to_string());
+                        
+                        auth.connection_status.set(status_str.to_string());
+                        auth.connection_error.set(error);
+                        
+                        // Stop polling if we reach a final state
+                        if status_str == "connected" || status_str == "failed" {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        // Error getting status, stop polling
+                        break;
+                    }
+                }
+                
+                // Wait 2 seconds before next poll
+                #[cfg(target_arch = "wasm32")]
+                {
+                    use js_sys::Promise;
+                    use wasm_bindgen_futures::JsFuture;
+                    let _ = JsFuture::from(Promise::new(&mut |resolve, _| {
+                        web_sys::window()
+                            .unwrap()
+                            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 2000)
+                            .unwrap();
+                    }))
+                    .await;
+                }
+            }
+        });
     }
 }
 
@@ -521,14 +951,701 @@ body {
 }
 
 /* Login styles */
+.login-view {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background-color: var(--bg-primary);
+}
+
 .login-container {
     flex: 1;
     display: flex;
+    flex-direction: column;
     align-items: center;
-    justify-content: center;
+    justify-content: flex-start;
     padding: 2rem;
+    max-width: 600px;
+    margin: 0 auto;
+    width: 100%;
 }
 
+.login-header {
+    text-align: center;
+    margin-bottom: 2rem;
+    margin-top: 2rem;
+}
+
+.login-header h1 {
+    font-size: 2.5rem;
+    font-weight: 700;
+    color: var(--accent);
+    margin-bottom: 0.5rem;
+    letter-spacing: -0.02em;
+}
+
+.login-header .tagline {
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+}
+
+.login-content {
+    width: 100%;
+    background-color: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 2rem;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+}
+
+/* Account selector styles */
+.account-selector-view h2,
+.add-account-view h2,
+.nsec-login-view h2 {
+    font-size: 1.5rem;
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+}
+
+.account-selector-view .subtitle,
+.add-account-view .subtitle {
+    color: var(--text-secondary);
+    margin-bottom: 1.5rem;
+    font-size: 0.9rem;
+}
+
+.back-btn {
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 0.9rem;
+    margin-bottom: 1rem;
+    padding: 0;
+    font-family: inherit;
+}
+
+.back-btn:hover {
+    color: var(--accent-hover);
+}
+
+/* Login options grid */
+.login-options {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.login-option {
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+}
+
+.login-option.primary {
+    border-color: var(--accent);
+    border-width: 2px;
+}
+
+.login-option h3 {
+    font-size: 1.1rem;
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+}
+
+.login-option .description {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    margin-bottom: 1rem;
+}
+
+/* Input group styling for NIP-46 section */
+.login-option .input-group {
+    margin-bottom: 1rem;
+}
+
+.login-option .input-group label {
+    display: block;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    margin-bottom: 0.5rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.login-option .input-group input {
+    width: 100%;
+    padding: 0.75rem;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 0.9rem;
+    margin-bottom: 0.5rem;
+}
+
+.login-option .input-group input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.login-option button {
+    width: 100%;
+    padding: 0.75rem 1rem;
+    background-color: var(--accent);
+    border: none;
+    border-radius: 6px;
+    color: var(--bg-primary);
+    font-family: inherit;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 0.2s;
+    margin-bottom: 0.5rem;
+}
+
+.login-option button:hover:not(:disabled) {
+    background-color: var(--accent-hover);
+}
+
+.login-option button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* Nsec login form */
+.nsec-login-view .form-group {
+    margin-bottom: 1rem;
+}
+
+.nsec-login-view label {
+    display: block;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    margin-bottom: 0.25rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.nsec-login-view input {
+    width: 100%;
+    padding: 0.75rem;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 0.9rem;
+}
+
+.nsec-login-view input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.security-notice {
+    background-color: rgba(68, 255, 68, 0.1);
+    border: 1px solid rgba(68, 255, 68, 0.3);
+    border-radius: 8px;
+    padding: 1rem;
+    margin: 1rem 0;
+}
+
+.security-notice p {
+    color: var(--success);
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+}
+
+.security-notice ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.security-notice li {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    padding: 0.25rem 0;
+}
+
+/* Restore backup view */
+.restore-backup-view {
+    padding: 1rem 0;
+}
+
+.restore-backup-view h2 {
+    font-size: 1.5rem;
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+}
+
+.restore-backup-view .subtitle {
+    color: var(--text-secondary);
+    margin-bottom: 1.5rem;
+    font-size: 0.9rem;
+}
+
+/* Generated URI display */
+.generated-uri {
+    margin-top: 1rem;
+    padding: 1rem;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+
+.generated-uri textarea {
+    width: 100%;
+    min-height: 80px;
+    padding: 0.75rem;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-family: monospace;
+    font-size: 0.8rem;
+    resize: vertical;
+    margin-bottom: 0.75rem;
+}
+
+.generated-uri button {
+    width: 100%;
+    padding: 0.75rem;
+    background-color: var(--accent);
+    border: none;
+    border-radius: 6px;
+    color: var(--bg-primary);
+    font-family: inherit;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.generated-uri button:hover {
+    background-color: var(--accent-hover);
+}
+
+/* QR Login View Styles */
+.qr-login-view {
+    padding: 1rem 0;
+    max-width: 500px;
+    margin: 0 auto;
+}
+
+.qr-login-view h2 {
+    font-size: 1.5rem;
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+    text-align: center;
+}
+
+.qr-login-view .subtitle {
+    color: var(--text-secondary);
+    margin-bottom: 1.5rem;
+    font-size: 0.9rem;
+    text-align: center;
+}
+
+.qr-container {
+    background-color: var(--bg-secondary);
+    border: 2px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.qr-code-display {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+}
+
+.qr-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+    width: 100%;
+}
+
+.qr-visual {
+    font-size: 4rem;
+    margin-bottom: 0.5rem;
+}
+
+.qr-uri-text {
+    width: 100%;
+    min-height: 80px;
+    padding: 0.75rem;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-family: monospace;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    resize: none;
+    word-break: break-all;
+}
+
+.qr-image {
+    width: 100%;
+    max-width: 280px;
+    margin: 0 auto;
+    background-color: white;
+    padding: 1rem;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.qr-image svg {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+.qr-uri-details {
+    width: 100%;
+    margin-top: 1rem;
+}
+
+.qr-uri-details summary {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    cursor: pointer;
+    padding: 0.5rem;
+    text-align: center;
+}
+
+.qr-uri-details summary:hover {
+    color: var(--accent);
+}
+
+.qr-uri-details[open] summary {
+    margin-bottom: 0.5rem;
+}
+
+.copy-btn {
+    padding: 0.75rem 1.5rem;
+    background-color: var(--accent);
+    border: none;
+    border-radius: 8px;
+    color: var(--bg-primary);
+    font-family: inherit;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 0.2s;
+    margin-top: 0.5rem;
+}
+
+.copy-btn:hover {
+    background-color: var(--accent-hover);
+}
+
+.qr-status {
+    text-align: center;
+    padding: 1rem;
+    margin-top: 1rem;
+}
+
+.qr-status.polling {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.qr-status .spinner {
+    width: 40px;
+    height: 40px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.qr-status p {
+    color: var(--text-primary);
+    font-weight: 500;
+    margin: 0;
+}
+
+.qr-status .hint {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+}
+
+.qr-status.error {
+    background-color: rgba(255, 68, 68, 0.1);
+    border: 1px solid rgba(255, 68, 68, 0.3);
+    border-radius: 8px;
+}
+
+.qr-status .error-text {
+    color: var(--error);
+    font-size: 0.9rem;
+}
+
+.qr-instructions {
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem;
+}
+
+.qr-instructions h4 {
+    color: var(--text-primary);
+    margin-bottom: 0.75rem;
+    font-size: 1rem;
+}
+
+.qr-instructions ol {
+    margin: 0;
+    padding-left: 1.25rem;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    line-height: 1.6;
+}
+
+.qr-instructions li {
+    margin-bottom: 0.5rem;
+}
+
+/* QR option in login options */
+.login-option.qr-option {
+    border: 2px dashed var(--accent);
+    background-color: rgba(255, 136, 0, 0.05);
+}
+
+.login-option.qr-option:hover {
+    background-color: rgba(255, 136, 0, 0.1);
+}
+
+.login-btn.primary {
+    width: 100%;
+    padding: 1rem;
+    background-color: var(--accent);
+    border: none;
+    border-radius: 8px;
+    color: var(--bg-primary);
+    font-family: inherit;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    margin-top: 1rem;
+}
+
+/* Account selector component styles */
+.account-selector h2 {
+    font-size: 1.5rem;
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+}
+
+.account-selector .subtitle {
+    color: var(--text-secondary);
+    margin-bottom: 1.5rem;
+    font-size: 0.9rem;
+}
+
+.accounts-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-bottom: 1.5rem;
+}
+
+.account-card {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    transition: border-color 0.2s;
+}
+
+.account-card.active {
+    border-color: var(--accent);
+    border-width: 2px;
+}
+
+.account-avatar {
+    flex-shrink: 0;
+}
+
+.avatar-placeholder {
+    width: 40px;
+    height: 40px;
+    background-color: var(--accent);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 600;
+    color: var(--bg-primary);
+    font-size: 1.2rem;
+}
+
+.account-info {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.account-name {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.account-npub {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-family: monospace;
+}
+
+.account-mode {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+}
+
+.account-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.switch-btn {
+    padding: 0.5rem 1rem;
+    background-color: var(--accent);
+    border: none;
+    border-radius: 6px;
+    color: var(--bg-primary);
+    font-family: inherit;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.delete-btn {
+    padding: 0.5rem 0.75rem;
+    background-color: transparent;
+    border: 1px solid var(--error);
+    border-radius: 6px;
+    color: var(--error);
+    font-family: inherit;
+    font-size: 1rem;
+    cursor: pointer;
+}
+
+.current-badge {
+    font-size: 0.8rem;
+    color: var(--success);
+    font-weight: 600;
+}
+
+.add-account-btn {
+    width: 100%;
+    padding: 0.75rem;
+    background-color: transparent;
+    border: 2px dashed var(--border);
+    border-radius: 8px;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.add-account-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+/* Backup manager styles */
+.backup-manager {
+    margin-top: 1rem;
+}
+
+.backup-manager h3 {
+    font-size: 1.1rem;
+    color: var(--text-primary);
+    margin-bottom: 1rem;
+}
+
+.backup-section,
+.restore-section {
+    margin-bottom: 1.5rem;
+}
+
+.backup-section h4,
+.restore-section h4 {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.5rem;
+}
+
+.backup-section .info,
+.restore-section .info {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-bottom: 1rem;
+}
+
+.backup-output,
+.restore-input {
+    margin-top: 1rem;
+}
+
+.backup-output label {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.5rem;
+}
+
+.backup-string,
+.restore-input textarea {
+    width: 100%;
+    padding: 0.75rem;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-family: monospace;
+    font-size: 0.8rem;
+    resize: vertical;
+}
+
+.backup-output .warning {
+    font-size: 0.75rem;
+    color: var(--error);
+    margin-top: 0.5rem;
+}
+
+.status-message {
+    margin-top: 1rem;
+    padding: 0.75rem;
+    background-color: rgba(245, 130, 31, 0.1);
+    border: 1px solid rgba(245, 130, 31, 0.3);
+    border-radius: 6px;
+    color: var(--accent);
+    font-size: 0.85rem;
+}
+
+/* Legacy login styles (keep for compatibility) */
 .login-card {
     background-color: var(--bg-card);
     border: 1px solid var(--border);
@@ -1015,6 +2132,50 @@ body {
 .relay-count-badge.disconnected {
     border-color: var(--error);
     color: var(--error);
+}
+
+/* Connection status indicator styles */
+.connection-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    margin-right: 8px;
+    transition: all 0.2s ease;
+}
+
+.connection-status.connecting {
+    border-color: #f5a623;
+    color: #f5a623;
+    animation: pulse 2s infinite;
+}
+
+.connection-status.connected {
+    border-color: var(--success);
+    color: var(--success);
+}
+
+.connection-status.failed {
+    border-color: var(--error);
+    color: var(--error);
+}
+
+.connection-status.unknown {
+    border-color: var(--text-muted);
+    color: var(--text-muted);
+}
+
+.connection-icon {
+    font-size: 10px;
+}
+
+.connection-text {
+    white-space: nowrap;
 }
 
 @keyframes pulse {
@@ -1905,35 +3066,186 @@ button.relay-count-badge:hover {
 // Components
 // =============================================================================
 
-/// Login view component - displays NIP-46 connection options (both nostrconnect:// and bunker://)
+/// Login view modes
+#[derive(Debug, Clone, PartialEq)]
+enum LoginViewMode {
+    AccountSelector,    // Primary: List of stored accounts
+    AddAccount,         // Secondary: Login methods (nsec, NIP-46, QR, etc.)
+    NsecLogin,          // Tertiary: Direct nsec input
+    QrLogin,            // Tertiary: QR code for mobile signer
+    RestoreBackup,      // Tertiary: Restore from backup
+}
+
+/// Redesigned LoginView with secure storage as primary
 #[component]
 fn LoginView() -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
-
-    // Screen state: true = show add new user, false = show saved users
-    // Will be initialized after loading saved users
-    let show_add_new = RwSignal::new(false);
-    let initialized = RwSignal::new(false);
-
-    // Form input signals for bunker:// flow
+    let auth_stored = StoredValue::new(auth.clone());
+    
+    // View mode state
+    let view_mode = RwSignal::new(LoginViewMode::AccountSelector);
+    
+    // Check if we have accounts on mount
+    Effect::new(move |_| {
+        let auth = auth_stored.get_value();
+        spawn_local(async move {
+            let has_accounts = invoke_has_accounts().await.unwrap_or(false);
+            if !has_accounts {
+                // No accounts, go directly to add account view
+                view_mode.set(LoginViewMode::AddAccount);
+            } else {
+                // Load accounts list
+                let _ = auth.load_accounts_list().await;
+            }
+        });
+    });
+    
+    // Set up event listener for bunker-auth-challenge (opens browser for approval)
+    Effect::new(move |_| {
+        spawn_local(async move {
+            #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+            {
+                use crate::tauri_invoke::listen_bunker_auth_challenge;
+                let _ = listen_bunker_auth_challenge(|auth_url| {
+                    web_sys::console::log_1(&format!("Received bunker-auth-challenge: {}", auth_url).into());
+                    // Open the auth URL in a new browser tab
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.open_with_url_and_target(&auth_url, "_blank");
+                    }
+                }).await;
+            }
+        });
+    });
+    
+    // Input signals for nsec login
+    let nsec_input = RwSignal::new(String::new());
+    let name_input = RwSignal::new(String::new());
+    
+    // Form input signals for bunker:// flow (updated for new NIP-46 API)
     let bunker_uri = RwSignal::new(String::new());
+    let bunker_display_name = RwSignal::new(String::new()); // NEW: display name for the profile
     let relay = RwSignal::new("wss://relay.damus.io".to_string());
-
-    // Signals for nostrconnect:// flow
+    
+    // Signals for nostrconnect:// flow (keep existing)
     let generated_uri = RwSignal::new(None::<String>);
     let show_generated = RwSignal::new(false);
-
-    // Signal for direct key input (testing only)
-    let direct_key = RwSignal::new(String::new());
-
-    // Handle bunker:// connect button click
+    
+    // Signals for QR login (Flow B)
+    let qr_uri = RwSignal::new(None::<String>);
+    let qr_loading = RwSignal::new(false);
+    let qr_error = RwSignal::new(None::<String>);
+    let qr_polling = RwSignal::new(false);
+    
+    // Set up event listener for qr-login-complete (Flow B)
+    Effect::new(move |_| {
+        spawn_local(async move {
+            #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+            {
+                use crate::tauri_invoke::listen_qr_login_complete;
+                let auth = auth_stored.get_value();
+                let view_mode_event = view_mode.clone();
+                let _ = listen_qr_login_complete(move |npub| {
+                    web_sys::console::log_1(&format!("QR login complete: {}", npub).into());
+                    // Update auth state
+                    let auth = auth.clone();
+                    let view_mode_event = view_mode_event.clone();
+                    spawn_local(async move {
+                        let _ = auth.load_profiles_list().await;
+                        auth.npub.set(Some(npub));
+                        auth.has_secure_accounts.set(true);
+                        qr_polling.set(false);
+                        qr_loading.set(false);
+                        // Navigate back to account selector
+                        view_mode_event.set(LoginViewMode::AccountSelector);
+                    });
+                }).await;
+            }
+        });
+    });
+    
+    // Handle QR login button click
+    let on_start_qr_login = move |_| {
+        let auth = auth_stored.get_value();
+        qr_loading.set(true);
+        qr_error.set(None);
+        
+        spawn_local(async move {
+            match invoke_start_qr_login().await {
+                Ok(uri) => {
+                    qr_uri.set(Some(uri));
+                    qr_loading.set(false);
+                    view_mode.set(LoginViewMode::QrLogin);
+                    
+                    // Start polling for connection
+                    qr_polling.set(true);
+                    let view_mode_poll = view_mode.clone();
+                    let qr_polling_clone = qr_polling.clone();
+                    spawn_local(async move {
+                        let auth = auth.clone();
+                        while qr_polling_clone.get() {
+                            match invoke_check_qr_connection().await {
+                                Ok(Some(result)) => {
+                                    // Connection established
+                                    if let Some(npub) = result.get("pubkey").and_then(|v| v.as_str()) {
+                                        let _ = auth.load_profiles_list().await;
+                                        auth.npub.set(Some(npub.to_string()));
+                                        auth.has_secure_accounts.set(true);
+                                    }
+                                    qr_polling_clone.set(false);
+                                    // Navigate back to account selector (which will show logged-in state)
+                                    view_mode_poll.set(LoginViewMode::AccountSelector);
+                                    break;
+                                }
+                                Ok(None) => {
+                                    // Still waiting, continue polling
+                                    // Wait 5 seconds before next poll (backend has 30s timeout)
+                                }
+                                Err(e) => {
+                                    qr_error.set(Some(e));
+                                    qr_polling_clone.set(false);
+                                    break;
+                                }
+                            }
+                            // Poll every 5 seconds (backend has 30s timeout)
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                use js_sys::Promise;
+                                use wasm_bindgen_futures::JsFuture;
+                                let _ = JsFuture::from(Promise::new(&mut |resolve, _| {
+                                    web_sys::window()
+                                        .unwrap()
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 5000)
+                                        .unwrap();
+                                }))
+                                .await;
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    qr_error.set(Some(e));
+                    qr_loading.set(false);
+                }
+            }
+        });
+    };
+    
+    // Handle cancel QR login
+    let on_cancel_qr = move |_| {
+        qr_polling.set(false);
+        qr_uri.set(None);
+        view_mode.set(LoginViewMode::AddAccount);
+    };
+    
+    // Handle bunker:// connect button click (updated for new NIP-46 API)
+    // Now uses connect_bunker which handles both connection and saving
     let on_connect_bunker = move |_| {
+        let auth = auth_stored.get_value();
         let uri_val = bunker_uri.get();
-        let relay_val = relay.get();
+        let display_name_val = bunker_display_name.get();
 
         if uri_val.is_empty() {
-            auth.error
-                .set(Some("Please enter a bunker:// URI".to_string()));
+            auth.error.set(Some("Please enter a bunker:// URI or NIP-05 identifier".to_string()));
             return;
         }
 
@@ -1941,37 +3253,36 @@ fn LoginView() -> impl IntoView {
         auth.error.set(None);
 
         spawn_local(async move {
-            match invoke_connect_nip46(uri_val.clone(), relay_val.clone()).await {
-                Ok(npub) => {
-                    // Auto-save user after successful login
-                    web_sys::console::log_1(&"Auto-saving user after login...".into());
-                    let save_result = invoke_add_saved_user(
-                        "nip46".to_string(),
-                        Some(relay_val.clone()),
-                        Some(uri_val.clone()),
-                        None,
-                        npub.clone(),
-                    ).await;
-                    match save_result {
-                        Ok(_) => web_sys::console::log_1(&"User saved successfully!".into()),
-                        Err(e) => web_sys::console::log_1(&format!("Failed to save user: {}", e).into()),
+            // Use the new connect_bunker API which handles both connection and saving
+            match invoke_connect_bunker(uri_val, display_name_val).await {
+                Ok(result) => {
+                    // Extract npub from result
+                    if let Some(npub) = result.get("pubkey").and_then(|v| v.as_str()) {
+                        // Reload profiles list to show the new profile
+                        let _ = auth.load_profiles_list().await;
+                        auth.npub.set(Some(npub.to_string()));
+                        auth.has_secure_accounts.set(true);
+                        auth.is_loading.set(false);
+                        
+                        // Start connection status polling for NIP-46 accounts
+                        auth.start_connection_status_polling().await;
+                    } else {
+                        auth.error.set(Some("Connected but failed to get pubkey from response".to_string()));
+                        auth.is_loading.set(false);
                     }
-                    
-                    auth.npub.set(Some(npub));
-                    auth.is_loading.set(false);
                 }
                 Err(e) => {
-                    auth.error.set(Some(e));
+                    auth.error.set(Some(format!("Failed to connect: {}", e)));
                     auth.is_loading.set(false);
                 }
             }
         });
     };
 
-    // Handle generate nostrconnect:// URI button click
+    // Handle generate nostrconnect:// URI button click (keep existing)
     let on_generate_nostrconnect = move |_| {
+        let auth = auth_stored.get_value();
         let relay_val = relay.get();
-
         auth.is_loading.set(true);
         auth.error.set(None);
 
@@ -1985,556 +3296,365 @@ fn LoginView() -> impl IntoView {
                     auth.is_loading.set(false);
                 }
                 Err(e) => {
-                    auth.error
-                        .set(Some(format!("Failed to generate URI: {}", e)));
-                    auth.is_loading.set(false);
-                }
-            }
-        });
-    };
-
-    // Handle direct key connect button click (for testing)
-    let on_connect_direct_key = move |_| {
-        let key_val = direct_key.get();
-
-        if key_val.is_empty() {
-            auth.error.set(Some(
-                "Please enter your private key (nsec1... or hex)".to_string(),
-            ));
-            return;
-        }
-        auth.is_loading.set(true);
-        auth.error.set(None);
-
-        spawn_local(async move {
-            match invoke_connect_with_key(key_val.clone()).await {
-                Ok(npub) => {
-                    println!("Connected with direct key: {}", npub);
-                    
-                    // Auto-save user after successful login (without storing the private key)
-                    let save_result = invoke_add_saved_user(
-                        "private_key".to_string(),
-                        None,
-                        None,
-                        None,  // Don't store private key for security
-                        npub.clone(),
-                    ).await;
-                    if let Err(e) = save_result {
-                        web_sys::console::log_1(&format!("Failed to save user: {}", e).into());
-                    }
-                    
-                    auth.npub.set(Some(npub));
-                    auth.is_loading.set(false);
-                }
-                Err(e) => {
-                    println!("Failed to connect with direct key: {}", e);
-                    auth.error.set(Some(e));
-                    auth.is_loading.set(false);
-                }
-            }
-        });
-    };
-
-    // Handle NIP-07 connect button click (web only)
-    let _on_connect_nip07 = move |_ev: leptos::ev::MouseEvent| {
-        auth.is_loading.set(true);
-        auth.error.set(None);
-
-        spawn_local(async move {
-            match invoke_connect_nip07().await {
-                Ok(npub) => {
-                    // Auto-save user after successful login
-                    let save_result = invoke_add_saved_user(
-                        "nip07".to_string(),
-                        None,
-                        None,
-                        None,
-                        npub.clone(),
-                    ).await;
-                    if let Err(e) = save_result {
-                        web_sys::console::log_1(&format!("Failed to save user: {}", e).into());
-                    }
-                    
-                    auth.npub.set(Some(npub));
-                    auth.is_loading.set(false);
-                }
-                Err(e) => {
-                    auth.error.set(Some(e));
-                    auth.is_loading.set(false);
-                }
-            }
-        });
-    };
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Saved Users Section
-    // ─────────────────────────────────────────────────────────────────────────
-    
-    // Load saved users on component mount
-    let saved_users = SavedUsers { users: Vec::new() };
-    let saved_users_signal = RwSignal::new(saved_users);
-    
-    // Track visibility for reloading saved users
-    let is_visible = RwSignal::new(true);
-    
-    // Load users on mount and when becoming visible again (after disconnect)
-    Effect::new(move |_| {
-        // This effect runs when is_visible changes to true
-        if is_visible.get() {
-            spawn_local(async move {
-                #[cfg(debug_assertions)]
-                {
-                    web_sys::console::log_1(&"Reloading saved users...".into());
-                }
-                match invoke_get_saved_users().await {
-                    Ok(users) => {
-                        let has_users = !users.users.is_empty();
-                        saved_users_signal.set(users);
-                        // Start with add new screen if no saved users
-                        show_add_new.set(!has_users);
-                        initialized.set(true);
-                        #[cfg(debug_assertions)]
-                        {
-                            web_sys::console::log_1(&"Saved users reloaded successfully".into());
-                        }
-                    }
-                    Err(e) => {
-                        web_sys::console::log_1(&format!("Failed to load saved users: {}", e).into());
-                    }
-                }
-            });
-        }
-    });
-    
-    // Handle connect with saved user
-    let on_connect_saved_user = move |user_id: String| {
-        auth.is_loading.set(true);
-        auth.error.set(None);
-        
-        spawn_local(async move {
-            match invoke_connect_saved_user(user_id).await {
-                Ok(response) => {
-                    auth.npub.set(Some(response.npub));
-                    auth.profile.set(Some(response.profile));
-                    auth.is_loading.set(false);
-                }
-                Err(e) => {
-                    auth.error.set(Some(e));
+                    auth.error.set(Some(format!("Failed to generate URI: {}", e)));
                     auth.is_loading.set(false);
                 }
             }
         });
     };
     
-    // Handle delete saved user
-    let on_delete_saved_user = move |user_id: String| {
-        spawn_local(async move {
-            match invoke_remove_saved_user(user_id).await {
-                Ok(users) => {
-                    saved_users_signal.set(users);
-                }
-                Err(e) => {
-                    web_sys::console::log_1(&format!("Failed to delete user: {}", e).into());
-                }
-            }
-        });
-    };
-
-    // Convert saved users to a vec for rendering
-    let saved_users_vec = move || {
-        saved_users_signal.get().users
-    };
-
-    // Helper to check if we should show saved users
-    let _show_saved_users = move || !show_add_new.get();
-    
-    // Handle navigation to add new screen
-    let go_to_add_new = move |_| {
-        show_add_new.set(true);
-    };
-    
-    // Handle navigation back to saved users
-    let go_to_saved_users = move |_| {
-        show_add_new.set(false);
-    };
-
     view! {
-        <div class="login-container">
-            <div class="login-card">
-                <h1 class="login-title">"Arcadestr"</h1>
-                <p class="login-tagline">"The decentralized game marketplace on NOSTR"</p>
-
-                // ─────────────────────────────────────────────────────────────────
-                // Loading state while initializing
-                // ─────────────────────────────────────────────────────────────────
-                {move || {
-                    if !initialized.get() {
-                        Some(view! {
-                            <div class="loading-indicator">"Loading..."</div>
-                        })
-                    } else {
-                        None
-                    }
-                }}
-
-                // ─────────────────────────────────────────────────────────────────
-                // Screen 1: Saved Users (shown when show_add_new is false)
-                // ─────────────────────────────────────────────────────────────────
-                {move || {
-                    if initialized.get() && !show_add_new.get() {
-                        Some(view! {
-                            <div class="saved-users-screen">
-                                <h2 class="screen-title">"Welcome Back"</h2>
-                                
-                                {move || {
-                                    let users = saved_users_vec();
-                                    if users.is_empty() {
-                                        Some(view! {
-                                            <div class="saved-users-empty">
-                                                <p>"No saved users yet"</p>
-                                            </div>
-                                        })
-                                    } else {
-                                        None
-                                    }
-                                }}
-
-                                {move || {
-                                    let users = saved_users_vec();
-                                    if !users.is_empty() {
-                                        Some(view! {
-                                            <div class="saved-users-section">
-                                                {users.into_iter().enumerate().map(|(idx, user)| {
-                                                    let npub_short = if user.npub.len() > 20 { 
-                                                        format!("{}...", &user.npub[..20]) 
-                                                    } else { 
-                                                        user.npub.clone() 
-                                                    };
-                                                    // Use display_name or username or fallback to generic name
-                                                    let display_name = user.display_name.clone()
-                                                        .or_else(|| user.username.clone())
-                                                        .unwrap_or_else(|| user.name.clone());
-                                                    let user_method = user.method.clone();
-                                                    let has_picture = user.picture.is_some();
-                                                    let picture_url = user.picture.clone().unwrap_or_default();
-                                                    let avatar_letter = display_name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                                                    
-                                                    view! {
-                                                        <div class="saved-user-card">
-                                                            <div class="saved-user-info">
-                                                                <div class="saved-user-avatar-row">
-                                                                    {if has_picture {
-                                                                        view! {
-                                                                            <img src={picture_url} class="saved-user-avatar" alt="avatar" />
-                                                                        }.into_any()
-                                                                    } else {
-                                                                        view! {
-                                                                            <div class="saved-user-avatar-placeholder">{avatar_letter}</div>
-                                                                        }.into_any()
-                                                                    }}
-                                                                    <div class="saved-user-details">
-                                                                        <span class="saved-user-name">{display_name}</span>
-                                                                        <span class="saved-user-npub">{npub_short}</span>
-                                                                        <span class="saved-user-method">{"["}{user_method}{"]"}</span>
-                                                                    </div>
-                                                                </div>
-                                                            </div>
-                                                            <div class="saved-user-actions">
-                                                                <button 
-                                                                    class="saved-user-connect"
-                                                                    on:click={move |_| {
-                                                                        let users = saved_users_signal.get().users;
-                                                                        if let Some(u) = users.get(idx) {
-                                                                            on_connect_saved_user(u.id.clone());
-                                                                        }
-                                                                    }}
-                                                                    disabled={move || auth.is_loading.get()}
-                                                                >
-                                                                    "Connect"
-                                                                </button>
-                                                                <button 
-                                                                    class="saved-user-delete"
-                                                                    on:click={move |_| {
-                                                                        let users = saved_users_signal.get().users;
-                                                                        if let Some(u) = users.get(idx) {
-                                                                            on_delete_saved_user(u.id.clone());
-                                                                        }
-                                                                    }}
-                                                                >
-                                                                    "×"
-                                                                </button>
-                                                            </div>
-                                                        </div>
-                                                    }
-                                                }).collect::<Vec<_>>()}
-                                            </div>
-                                        })
-                                    } else {
-                                        None
-                                    }
-                                }}
-
-                                <button 
-                                    class="add-new-button"
-                                    on:click=go_to_add_new
-                                >
-                                    "Add New User"
-                                </button>
-                            </div>
-                        })
-                    } else {
-                        None
-                    }
-                }}
-
-                // ─────────────────────────────────────────────────────────────────
-                // Screen 2: Add New User (shown when show_add_new is true)
-                // ─────────────────────────────────────────────────────────────────
-                {move || {
-                    if initialized.get() && show_add_new.get() {
-                        Some(view! {
-                            <div class="add-new-screen">
-                                <button 
-                                    class="back-button"
-                                    on:click=go_to_saved_users
-                                >
-                                    "← Back to Saved Users"
-                                </button>
-
-                                <h2 class="screen-title">"Add New User"</h2>
-
-                                <div class="input-group">
-                                    <label class="input-label">"Relay URL"</label>
-                                    <input
-                                        class="input-field"
-                                        type="text"
-                                        placeholder="wss://relay.example.com"
-                                        prop:value={move || relay.get()}
-                                        on:input:target=move |ev| {
-                                            relay.set(ev.target().value());
-                                        }
-                                        disabled={move || auth.is_loading.get()}
-                                    />
-                                </div>
-
-                // Option 1: Generate nostrconnect:// URI
-                <div class="nostrconnect-section">
-                    <h3 class="section-title">"Option 1: Generate Connection URI"</h3>
-                    <p class="section-description">"Generate a nostrconnect:// URI and paste it into your signer app (Nsec.app, Amber, etc.)"</p>
-
-                    <button
-                        class="generate-button"
-                        on:click=on_generate_nostrconnect
-                        disabled={move || auth.is_loading.get()}
-                    >
+        <div class="login-view">
+            <div class="login-container">
+                // Header
+                <div class="login-header">
+                    <h1>"Arcadestr"</h1>
+                    <p class="tagline">"Nostr-powered indie game marketplace"</p>
+                </div>
+                
+                // Main content based on view mode
+                <div class="login-content">
+                    <Show when=move || view_mode.get() == LoginViewMode::AccountSelector>
                         {move || {
-                            if auth.is_loading.get() {
-                                "Generating...".to_string()
-                            } else {
-                                "Generate nostrconnect:// URI".to_string()
-                            }
-                        }}
-                    </button>
-
-                    {move || {
-                        if show_generated.get() {
-                            generated_uri.get().map(|uri| view! {
-                                    <div class="generated-uri-box">
-                                        <label class="input-label">"Copy this URI and paste into your signer app:"</label>
-                                        <textarea
-                                            class="uri-textarea"
-                                            readonly=true
-                                            prop:value={uri.clone()}
-                                        />
-                                        <button
-                                            class="copy-button"
-                                            on:click={move |_| {
-                                                #[cfg(target_arch = "wasm32")]
-                                                {
-                                                    if let Some(window) = leptos::web_sys::window() {
-                                                        let _ = window.navigator().clipboard().write_text(&uri);
+                            let auth = auth_stored.get_value();
+                            let auth_for_switch = auth.clone();
+                            let auth_for_delete = auth.clone();
+                            view! {
+                                <div class="account-selector-view">
+                                    <h2>"Welcome Back"</h2>
+                                    <p class="subtitle">"Select an account to continue"</p>
+                                    
+                                    <AccountSelector
+                                        auth=auth.clone()
+                                        on_switch=move |id: String| {
+                                            let auth = auth_for_switch.clone();
+                                            spawn_local(async move {
+                                                if let Err(e) = auth.switch_account(id).await {
+                                                    auth.error.set(Some(e));
+                                                }
+                                            });
+                                        }
+                                        on_delete=move |id: String| {
+                                            let auth = auth_for_delete.clone();
+                                            let view_mode = view_mode.clone();
+                                            spawn_local(async move {
+                                                if let Err(e) = auth.delete_account(id).await {
+                                                    auth.error.set(Some(e));
+                                                } else {
+                                                    // Check if we still have accounts
+                                                    let has_accounts = invoke_has_accounts().await.unwrap_or(false);
+                                                    if !has_accounts {
+                                                        view_mode.set(LoginViewMode::AddAccount);
                                                     }
                                                 }
-                                            }}
-                                        >
-                                            "Copy to Clipboard"
-                                        </button>
-                                        <button
-                                            class="connect-button"
-                                            on:click={move |_| {
-                                                let relay_val = relay.get();
-                                                let uri_val = generated_uri.get();
-                                                
-                                                spawn_local(async move {
-                                                    // Wait for signer to connect (60 second timeout)
-                                                    match invoke_wait_for_nostrconnect_signer(60).await {
-                                                        Ok(npub) => {
-                                                            // Auto-save user after successful login
-                                                            if let Some(uri_str) = uri_val {
-                                                                let save_result = invoke_add_saved_user(
-                                                                    "nostrconnect".to_string(),
-                                                                    Some(relay_val),
-                                                                    Some(uri_str),
-                                                                    None,
-                                                                    npub.clone(),
-                                                                ).await;
-                                                                if let Err(e) = save_result {
-                                                                    web_sys::console::log_1(&format!("Failed to save user: {}", e).into());
-                                                                }
+                                            });
+                                        }
+                                        on_add_account=move || view_mode.set(LoginViewMode::AddAccount)
+                                    />
+                                </div>
+                            }
+                        }}
+                    </Show>
+                    
+                    <Show when=move || view_mode.get() == LoginViewMode::AddAccount>
+                        <div class="add-account-view">
+                            <button class="back-btn" on:click=move |_| {
+                                // Only go back if we have accounts
+                                spawn_local(async move {
+                                    if invoke_has_accounts().await.unwrap_or(false) {
+                                        view_mode.set(LoginViewMode::AccountSelector);
+                                    }
+                                });
+                            }>
+                                "← Back"
+                            </button>
+                            
+                            <h2>"Add Account"</h2>
+                            <p class="subtitle">"Choose how you want to connect"</p>
+                            
+                            <div class="login-options">
+                                // Option 1: Nsec with encryption (NEW PRIMARY)
+                                <div class="login-option primary">
+                                    <h3>"🔐 Login with Private Key"</h3>
+                                    <p class="description">
+                                        "Fast login (~4 seconds) with encrypted local storage"
+                                    </p>
+                                    <button on:click=move |_| view_mode.set(LoginViewMode::NsecLogin)>
+                                        "Enter Private Key"
+                                    </button>
+                                </div>
+                                
+                                // Option 2: NIP-46 (existing, keep but less prominent)
+                                <div class="login-option">
+                                    <h3>"📱 Remote Signer (NIP-46)"</h3>
+                                    <p class="description">
+                                        "Connect with Amber, Nsec.app, or other signer"
+                                    </p>
+                                    
+                                    <div class="input-group">
+                                        <label>"Relay URL"</label>
+                                        <input
+                                            type="text"
+                                            placeholder="wss://relay.example.com"
+                                            prop:value={move || relay.get()}
+                                            on:input:target=move |ev| relay.set(ev.target().value())
+                                        />
+                                    </div>
+                                    
+                                    <div class="input-group">
+                                        <label>"Bunker URI or NIP-05"</label>
+                                        <input
+                                            type="text"
+                                            placeholder="bunker://... or user@nsec.app"
+                                            prop:value={move || bunker_uri.get()}
+                                            on:input:target=move |ev| bunker_uri.set(ev.target().value())
+                                        />
+                                    </div>
+                                    
+                                    <div class="input-group">
+                                        <label>"Profile Name (optional)"</label>
+                                        <input
+                                            type="text"
+                                            placeholder="My Gaming Account"
+                                            prop:value={move || bunker_display_name.get()}
+                                            on:input:target=move |ev| bunker_display_name.set(ev.target().value())
+                                        />
+                                    </div>
+                                    
+                                    <button on:click=on_connect_bunker disabled=move || auth_stored.get_value().is_loading.get()>
+                                        {move || if auth_stored.get_value().is_loading.get() { "Connecting..." } else { "Connect with Bunker" }}
+                                    </button>
+                                    
+                                    <button on:click=on_generate_nostrconnect disabled=move || auth_stored.get_value().is_loading.get()>
+                                        "Generate nostrconnect:// URI"
+                                    </button>
+                                    
+                                    <Show when=move || show_generated.get()>
+                                        {move || generated_uri.get().map(|uri| {
+                                            let _uri_for_clipboard = uri.clone();
+                                            view! {
+                                                <div class="generated-uri">
+                                                    <textarea readonly prop:value=uri rows="3"/>
+                                                    <button on:click=move |_| {
+                                                        #[cfg(target_arch = "wasm32")]
+                                                        {
+                                                            if let Some(window) = web_sys::window() {
+                                                                let _ = window.navigator().clipboard().write_text(&_uri_for_clipboard);
                                                             }
-                                                            
-                                                            auth.npub.set(Some(npub));
-                                                            auth.is_loading.set(false);
                                                         }
-                                                        Err(e) => {
-                                                            auth.error.set(Some(e));
-                                                            auth.is_loading.set(false);
-                                                        }
+                                                    }>
+                                                        "Copy URI"
+                                                    </button>
+                                                </div>
+                                            }
+                                        })}
+                                    </Show>
+                                </div>
+                                
+                                // Option 3: QR Code Login (Flow B)
+                                <div class="login-option qr-option">
+                                    <h3>"📲 Scan QR Code"</h3>
+                                    <p class="description">
+                                        "Scan a QR code with your mobile signer (Amber, Amethyst)"
+                                    </p>
+                                    <button 
+                                        on:click=on_start_qr_login 
+                                        disabled=move || qr_loading.get()
+                                    >
+                                        {move || if qr_loading.get() { "Generating..." } else { "Show QR Code" }}
+                                    </button>
+                                    <Show when=move || qr_error.get().is_some()>
+                                        <div class="error-text">
+                                            {move || qr_error.get().unwrap_or_default()}
+                                        </div>
+                                    </Show>
+                                </div>
+                                
+                                // Option 4: Restore from backup
+                                <div class="login-option">
+                                    <h3>"☁️ Restore from Backup"</h3>
+                                    <p class="description">
+                                        "Restore your accounts from an encrypted backup string"
+                                    </p>
+                                    <button on:click=move |_| view_mode.set(LoginViewMode::RestoreBackup)>
+                                        "Restore from Backup"
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </Show>
+                    
+                    <Show when=move || view_mode.get() == LoginViewMode::NsecLogin>
+                        {move || {
+                            let auth = auth_stored.get_value();
+                            let auth_for_click = auth.clone();
+                            view! {
+                                <div class="nsec-login-view">
+                                    <button class="back-btn" on:click=move |_| view_mode.set(LoginViewMode::AddAccount)>
+                                        "← Back"
+                                    </button>
+                                    
+                                    <h2>"Login with Private Key"</h2>
+                                    <p class="info">
+                                        "Your key will be encrypted with AES-256-GCM and stored locally. "
+                                        "Master key never leaves your device."
+                                    </p>
+                                    
+                                    <div class="form-group">
+                                        <label>"Private Key (nsec1...)"</label>
+                                        <input 
+                                            type="password"
+                                            placeholder="nsec1..."
+                                            bind:value=nsec_input
+                                        />
+                                    </div>
+                                    
+                                    <div class="form-group">
+                                        <label>"Account Name (optional)"</label>
+                                        <input 
+                                            type="text"
+                                            placeholder="My Gaming Account"
+                                            bind:value=name_input
+                                        />
+                                    </div>
+                                    
+                                    <div class="security-notice">
+                                        <p>"🔒 Security Features:"</p>
+                                        <ul>
+                                            <li>"Encrypted with AES-256-GCM"</li>
+                                            <li>"Master key stored securely (0600 permissions)"</li>
+                                            <li>"~4 second login time"</li>
+                                            <li>"Automatic encrypted backups available"</li>
+                                        </ul>
+                                    </div>
+                                    
+                                    <button 
+                                        class="login-btn primary"
+                                        on:click=move |_| {
+                                            let nsec = nsec_input.get();
+                                            let name = name_input.get();
+                                            if !nsec.is_empty() {
+                                                let auth = auth_for_click.clone();
+                                                spawn_local(async move {
+                                                    let name_opt = if name.is_empty() { None } else { Some(name) };
+                                                    if let Err(e) = auth.login_with_nsec(nsec, name_opt).await {
+                                                        auth.error.set(Some(e));
                                                     }
                                                 });
-                                            }}
-                                        >
-                                            "Connect (wait for signer)"
-                                        </button>
-                                        <p class="instruction-text">"1. Copy the URI above and paste it into your signer app (Amber, Nsec.app, etc.)\n2. Click 'Connect' to wait for the signer to respond"</p>
+                                            }
+                                        }
+                                        disabled=move || nsec_input.get().is_empty() || auth.is_loading.get()
+                                    >
+                                        {move || if auth.is_loading.get() { "Logging in..." } else { "Login & Encrypt" }}
+                                    </button>
+                                </div>
+                            }
+                        }}
+                    </Show>
+                    
+                    <Show when=move || view_mode.get() == LoginViewMode::QrLogin>
+                        <div class="qr-login-view">
+                            <button class="back-btn" on:click=on_cancel_qr>
+                                "← Back"
+                            </button>
+                            
+                            <h2>"Scan with Mobile Signer"</h2>
+                            <p class="subtitle">"Scan this QR code with Amber, Amethyst, or another NIP-46 signer"</p>
+                            
+                            <div class="qr-container">
+                                <Show when=move || qr_uri.get().is_some()>
+                                    {move || qr_uri.get().map(|uri| {
+                                        let uri_for_button = uri.clone();
+                                        // Generate QR code SVG
+                                        let qr_svg = generate_qr_svg(&uri);
+                                        view! {
+                                            <div class="qr-code-display">
+                                                <div class="qr-placeholder">
+                                                    // Display actual QR code
+                                                    <div class="qr-image" inner_html=qr_svg></div>
+                                                    
+                                                    // Also show the URI for manual copy/paste
+                                                    <details class="qr-uri-details">
+                                                        <summary>"Show URI (for manual copy)"</summary>
+                                                        <textarea 
+                                                            readonly 
+                                                            prop:value=uri 
+                                                            rows="3"
+                                                            class="qr-uri-text"
+                                                        />
+                                                    </details>
+                                                    
+                                                    <button 
+                                                        class="copy-btn"
+                                                        on:click=move |_| {
+                                                            #[cfg(target_arch = "wasm32")]
+                                                            {
+                                                                if let Some(window) = web_sys::window() {
+                                                                    let _ = window.navigator().clipboard().write_text(&uri_for_button);
+                                                                }
+                                                            }
+                                                        }
+                                                    >
+                                                        "Copy URI"
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        }
+                                    })}
+                                </Show>
+                                
+                                <Show when=move || qr_polling.get()>
+                                    <div class="qr-status polling">
+                                        <div class="spinner"></div>
+                                        <p>"Waiting for mobile signer to connect..."</p>
+                                        <p class="hint">"Make sure your mobile wallet is online"</p>
                                     </div>
-                                })
-                        } else {
-                            None
-                        }
-                    }}
-                </div>
-
-                <div class="divider">"── or ──"</div>
-
-                // Option 2: Paste bunker:// URI
-                <div class="bunker-section">
-                    <h3 class="section-title">"Option 2: Paste Signer URI"</h3>
-                    <p class="section-description">"Paste a bunker:// URI from your signer app"</p>
-
-                    <div class="input-group">
-                        <label class="input-label">"bunker:// URI"</label>
-                        <input
-                            class="input-field"
-                            type="text"
-                            placeholder="bunker://..."
-                            prop:value={move || bunker_uri.get()}
-                            on:input:target=move |ev| {
-                                bunker_uri.set(ev.target().value());
-                            }
-                            disabled={move || auth.is_loading.get()}
-                        />
-                    </div>
-
-                    <button
-                        class="connect-button"
-                        on:click=on_connect_bunker
-                        disabled={move || auth.is_loading.get()}
-                    >
-                        {move || {
-                            if auth.is_loading.get() {
-                                "Connecting...".to_string()
-                            } else {
-                                "Connect with bunker://".to_string()
-                            }
-                        }}
-                    </button>
-                </div>
-
-                <div class="divider">"── or ──"</div>
-
-                // Option 3: Direct Key Input (for testing only)
-                <div class="direct-key-section">
-                    <h3 class="section-title">"Option 3: Test with Private Key ⚠️"</h3>
-                    <p class="section-description">"Enter your nsec or hex private key directly (TESTING ONLY - NOT SECURE)"</p>
-
-                    <div class="input-group">
-                        <label class="input-label">"Private Key (nsec1... or hex)"</label>
-                        <input
-                            class="input-field"
-                            type="password"
-                            placeholder="nsec1..."
-                            prop:value={move || direct_key.get()}
-                            on:input:target=move |ev| {
-                                direct_key.set(ev.target().value());
-                            }
-                            disabled={move || auth.is_loading.get()}
-                        />
-                    </div>
-
-                    <button
-                        class="connect-button"
-                        on:click=on_connect_direct_key
-                        disabled={move || auth.is_loading.get()}
-                    >
-                        {move || {
-                            if auth.is_loading.get() {
-                                "Connecting...".to_string()
-                            } else {
-                                "Connect with Private Key".to_string()
-                            }
-                        }}
-                    </button>
-
-                    <p class="warning-text">
-                        "⚠️ For testing only! Your key is exposed to the application. \
-                        Use NIP-46 or NIP-07 in production."
-                    </p>
-                </div>
-
-                // NIP-07 section (Web only, gated by feature)
-                {#[cfg(all(target_arch = "wasm32", feature = "web"))]
-                view! {
-                    <div class="nip07-section">
-                        <div class="divider">"── or ──"</div>
-                        <button
-                            class="nip07-button"
-                            on:click=_on_connect_nip07
-                            disabled={move || auth.is_loading.get()}
-                        >
-                            {move || {
-                                if auth.is_loading.get() {
-                                    "Connecting...".to_string()
-                                } else {
-                                    "Connect with Browser Extension".to_string()
-                                }
-                            }}
-                        </button>
-                        <p class="nip07-hint">"NIP-07 — Alby, nos2x"</p>
-                    </div>
-                }}
+                                </Show>
+                                
+                                <Show when=move || qr_error.get().is_some()>
+                                    <div class="qr-status error">
+                                        <p class="error-text">{move || qr_error.get().unwrap_or_default()}</p>
+                                    </div>
+                                </Show>
                             </div>
-                        })
-                    } else {
-                        None
-                    }
-                }}
-
-                {move || {
-                    if auth.is_loading.get() {
-                        Some(view! {
-                            <div class="loading-indicator">"Connecting to signer..."</div>
-                        })
-                    } else {
-                        None
-                    }
-                }}
-
-                {move || {
-                    auth.error.get().map(|err| {
-                        view! {
-                            <div class="error-message">{err}</div>
-                        }
-                    })
-                }}
-
-                <p class="login-footer">
-                    "Your private key never leaves your signer app."
-                </p>
+                            
+                            <div class="qr-instructions">
+                                <h4>"How to connect:"</h4>
+                                <ol>
+                                    <li>"Open your mobile Nostr wallet (Amber, Amethyst)"</li>
+                                    <li>"Go to Settings → Nostr Connect"</li>
+                                    <li>"Tap 'Scan QR' and point at this code"</li>
+                                    <li>"Approve the connection on your phone"</li>
+                                </ol>
+                            </div>
+                        </div>
+                    </Show>
+                    
+                    <Show when=move || view_mode.get() == LoginViewMode::RestoreBackup>
+                        <div class="restore-backup-view">
+                            <button class="back-btn" on:click=move |_| view_mode.set(LoginViewMode::AddAccount)>
+                                "← Back"
+                            </button>
+                            
+                            <h2>"Restore from Backup"</h2>
+                            <p class="subtitle">"Paste your encrypted backup string to restore accounts"</p>
+                            
+                            <BackupManager />
+                        </div>
+                    </Show>
+                </div>
+                
+                // Error display
+                <Show when=move || auth_stored.get_value().error.get().is_some()>
+                    <div class="error-message">
+                        {auth_stored.get_value().error.get().unwrap()}
+                    </div>
+                </Show>
             </div>
         </div>
     }
 }
+
 
 /// Main view component - displayed when authenticated
 #[component]
@@ -2544,10 +3664,10 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
     // Marketplace view state
     let current_view = RwSignal::new(MarketplaceView::Browse);
 
-    // Handle disconnect button click
+    // Handle disconnect button click (updated for new NIP-46 API)
     let on_disconnect = move |_| {
         spawn_local(async move {
-            match invoke_disconnect().await {
+            match invoke_logout_nip46().await {
                 Ok(_) => {
                     auth.npub.set(None);
                     auth.error.set(None);
@@ -2774,6 +3894,37 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                             </div>
                         }.into_any()
                     }}
+                    // Connection status indicator for NIP-46 accounts
+                    {move || {
+                        let status = auth.connection_status.get();
+                        let error = auth.connection_error.get();
+                        
+                        // Only show for NIP-46 accounts (when we have a connection status to show)
+                        if status != "disconnected" {
+                            let (icon, text, class) = match status.as_str() {
+                                "connecting" => ("🟡", "Connecting...", "connection-status connecting"),
+                                "connected" => ("🟢", "Connected", "connection-status connected"),
+                                "failed" => ("🔴", "Connection Failed", "connection-status failed"),
+                                _ => ("⚪", "Unknown", "connection-status unknown"),
+                            };
+                            
+                            let title = if let Some(err) = error {
+                                format!("{}: {}", text, err)
+                            } else {
+                                text.to_string()
+                            };
+                            
+                            Some(view! {
+                                <div class={class} title={title}>
+                                    <span class="connection-icon">{icon}</span>
+                                    <span class="connection-text">{text}</span>
+                                </div>
+                            }.into_any())
+                        } else {
+                            None
+                        }
+                    }}
+                    
                     <button class="user-profile-btn" on:click={on_profile}>
                         {move || {
                             if let Some(url) = get_picture_url() {
@@ -2887,9 +4038,13 @@ pub fn App() -> impl IntoView {
     let auth = AuthContext::new();
     provide_context(auth.clone());
     let relay_count = RwSignal::new(0);
+    
+    // Store auth for use in effects
+    let auth_stored = StoredValue::new(auth.clone());
 
     // Check authentication status on mount (with small delay for Tauri to initialize)
     Effect::new(move |_| {
+        let auth = auth_stored.get_value();
         spawn_local(async move {
             // Small delay to ensure Tauri API is ready
             #[cfg(target_arch = "wasm32")]
@@ -2905,26 +4060,52 @@ pub fn App() -> impl IntoView {
                 .await;
             }
 
-            match invoke_is_authenticated().await {
+            // Try new secure storage initialization first
+            match invoke_has_accounts().await {
                 Ok(true) => {
-                    // User is authenticated, fetch the public key
-                    match invoke_get_public_key().await {
-                        Ok(npub) => {
-                            auth.npub.set(Some(npub));
+                    // We have accounts in secure storage, try fast login
+                    match invoke_load_active_account().await {
+                        Ok(result) => {
+                            if let Ok(account) = parse_account_from_result(&result) {
+                                auth.active_account.set(Some(account.clone()));
+                                auth.npub.set(Some(account.npub.clone()));
+                                auth.has_secure_accounts.set(true);
+                                
+                                // Start connection status polling for NIP-46 accounts
+                                if account.signing_mode == "nip46" {
+                                    auth.start_connection_status_polling().await;
+                                }
+                            }
                         }
                         Err(_) => {
-                            // Failed to get public key, treat as not authenticated
-                            auth.npub.set(None);
+                            // No active account, but we have accounts
+                            // Load list for user to select
+                            auth.has_secure_accounts.set(true);
+                            if let Ok(result) = invoke_list_saved_profiles().await {
+                                if let Ok(accounts) = parse_accounts_list(&result) {
+                                    auth.accounts.set(accounts);
+                                }
+                            }
                         }
                     }
                 }
                 Ok(false) => {
-                    // Not authenticated
+                    // No accounts in new system, will show login screen
+                    auth.has_secure_accounts.set(false);
                     auth.npub.set(None);
                 }
                 Err(_) => {
-                    // Error checking auth status
-                    auth.npub.set(None);
+                    // Error checking secure storage, fallback to legacy check
+                    match invoke_is_authenticated().await {
+                        Ok(true) => {
+                            if let Ok(npub) = invoke_get_public_key().await {
+                                auth.npub.set(Some(npub));
+                            }
+                        }
+                        _ => {
+                            auth.npub.set(None);
+                        }
+                    }
                 }
             }
         });
