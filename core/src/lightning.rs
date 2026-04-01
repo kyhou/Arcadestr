@@ -9,7 +9,7 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::auth::AuthState;
-use crate::signer::{ActiveSigner, NostrSigner, SignerError};
+use crate::signers::{ActiveSigner, NostrSigner, SignerError};
 
 /// Errors that can occur during Lightning operations.
 #[derive(Debug, Error)]

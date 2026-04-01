@@ -69,7 +69,7 @@ pub async fn connect_bunker(
     // Initialize signer session with fast async flow (no blocking handshake)
     let (mut profile, client) = init_signer_session_fast(bunker_uri, user_pubkey)
         .await
-        .map_err(|e| {
+        .map_err(|e: anyhow::Error| {
             error!("init_signer_session_fast failed: {}", e);
             e.to_string()
         })?;
@@ -106,7 +106,7 @@ pub async fn connect_bunker(
 
     // Emit auth success event immediately (fast!)
     let user_npub = profile.user_pubkey.to_bech32()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e: nostr::prelude::Error| e.to_string())?;
     let _ = app_handle.emit("auth_success", user_npub.clone());
 
     info!("Fast authentication complete! user_npub={}", user_npub);
@@ -136,7 +136,7 @@ fn parse_bunker_uri(uri_str: &str) -> Result<(nostr::nips::nip46::NostrConnectUR
     
     // Note: The actual user pubkey will be obtained during the handshake
     // We use the remote signer pubkey as a placeholder for now
-    Ok((uri, remote_pubkey))
+    Ok((uri, *remote_pubkey))
 }
 
 /// Resolve NIP-05 identifier to NostrConnectURI and public key
@@ -201,6 +201,8 @@ async fn resolve_nip05_to_uri_and_pubkey(identifier: &str) -> Result<(nostr::nip
         return Err("No valid NIP-46 relays found".to_string());
     }
 
+    let relay_count = relays.len();
+
     // Create NostrConnectURI
     let uri = nostr::nips::nip46::NostrConnectURI::client(
         pubkey,
@@ -208,7 +210,7 @@ async fn resolve_nip05_to_uri_and_pubkey(identifier: &str) -> Result<(nostr::nip
         "Arcadestr",
     );
 
-    info!("Resolved NIP-05 {} to pubkey {} with {} relays", identifier, pubkey_hex, relays.len());
+    info!("Resolved NIP-05 {} to pubkey {} with {} relays", identifier, pubkey_hex, relay_count);
     
     Ok((uri, pubkey))
 }

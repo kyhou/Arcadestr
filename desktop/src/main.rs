@@ -1100,7 +1100,7 @@ async fn fetch_profile_with_hints(
                 let _ = app_handle.emit("session_restoring", ());
                 
                 // Attempt restore
-                match restore_session_on_startup(&signer_state, None).await {
+                match restore_session_on_startup(&signer_state).await {
                     SessionRestoreResult::Success => {
                         info!("Session restored successfully on startup");
                         let _ = app_handle.emit("session_restored", ());

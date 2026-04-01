@@ -17,6 +17,7 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Window", "Navigator", "Clipboard"] }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 # Nostr re-export for web target (needed for ToBech32 trait)
 # This is used by web_auth.rs when web feature is enabled
@@ -27,7 +28,7 @@ nostr = { version = "0.44", default-features = false, optional = true }
 serde-wasm-bindgen = "0.6"
 
 [features]
-default = ["csr", "native"]
+default = ["csr"]
 csr = ["leptos/csr"]
 hydrate = ["leptos/hydrate"]
 native = ["arcadestr-core/native"]

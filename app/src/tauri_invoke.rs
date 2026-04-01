@@ -1,8 +1,6 @@
 // Tauri v2 invoke bridge for WASM target
 // Uses direct JavaScript interop to call Tauri v2's window.__TAURI__.core
 
-use std::future::Future;
-use std::pin::Pin;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
@@ -13,6 +11,107 @@ fn is_tauri_available() -> bool {
     )
     .map(|v| v.as_bool().unwrap_or(false))
     .unwrap_or(false)
+}
+
+/// Check if Tauri event API is available
+fn is_tauri_event_available() -> bool {
+    js_sys::eval(
+        "typeof window.__TAURI__ !== 'undefined' && typeof window.__TAURI__.event !== 'undefined'",
+    )
+    .map(|v| v.as_bool().unwrap_or(false))
+    .unwrap_or(false)
+}
+
+/// Listen for a Tauri event
+/// Returns a callback handle that can be used to unlisten
+pub async fn listen<F>(event: &str, mut callback: F) -> Result<js_sys::Function, String>
+where
+    F: FnMut(serde_json::Value) + 'static,
+{
+    if !is_tauri_event_available() {
+        return Err("Tauri event API not available".to_string());
+    }
+
+    // Create a JavaScript callback wrapper
+    let closure = Closure::wrap(Box::new(move |event_data: JsValue| {
+        // Parse the event data
+        let data_str = if let Some(s) = event_data.as_string() {
+            s
+        } else {
+            match js_sys::JSON::stringify(&event_data) {
+                Ok(s) => s.as_string().unwrap_or_else(|| "{}".to_string()),
+                Err(_) => "{}".to_string(),
+            }
+        };
+        
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data_str) {
+            callback(json);
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+
+    let js_callback = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
+    closure.forget(); // Leak the closure to keep it alive
+
+    // Call Tauri's listen function
+    let js_code = format!(
+        "window.__TAURI__.event.listen('{}', {})",
+        event,
+        js_callback.as_string().unwrap_or_default()
+    );
+
+    js_sys::eval(&js_code)
+        .map(|v| v.unchecked_into::<js_sys::Function>())
+        .map_err(|e| format!("Failed to listen for event '{}': {:?}", event, e))
+}
+
+/// Listen for bunker-auth-challenge events (opens browser for approval)
+pub async fn listen_bunker_auth_challenge<F>(mut callback: F) -> Result<js_sys::Function, String>
+where
+    F: FnMut(String) + 'static,
+{
+    listen("bunker-auth-challenge", move |data| {
+        if let Some(url) = data.as_str() {
+            callback(url.to_string());
+        } else if let Some(url) = data.get("payload").and_then(|p| p.as_str()) {
+            callback(url.to_string());
+        }
+    }).await
+}
+
+/// Listen for auth_success events
+pub async fn listen_auth_success<F>(mut callback: F) -> Result<js_sys::Function, String>
+where
+    F: FnMut(String) + 'static,
+{
+    listen("auth_success", move |data| {
+        if let Some(npub) = data.as_str() {
+            callback(npub.to_string());
+        } else if let Some(npub) = data.get("payload").and_then(|p| p.as_str()) {
+            callback(npub.to_string());
+        }
+    }).await
+}
+
+/// Listen for bunker-heartbeat events
+pub async fn listen_bunker_heartbeat<F>(callback: F) -> Result<js_sys::Function, String>
+where
+    F: FnMut(serde_json::Value) + 'static,
+{
+    listen("bunker-heartbeat", callback).await
+}
+
+/// Listen for qr-login-complete events (Flow B successful connection)
+pub async fn listen_qr_login_complete<F>(mut callback: F) -> Result<js_sys::Function, String>
+where
+    F: FnMut(String) + 'static,
+{
+    listen("qr-login-complete", move |data| {
+        if let Some(npub) = data.as_str() {
+            callback(npub.to_string());
+        } else if let Some(npub) = data.get("payload").and_then(|p| p.as_str()) {
+            callback(npub.to_string());
+        }
+    }).await
 }
 
 /// Invoke a Tauri command via direct JavaScript interop
@@ -61,7 +160,10 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
         Err(_) => {
             // If JSON parsing fails, try to deserialize as a plain string
             // This handles commands that return plain strings like "npub1..."
-            serde_json::from_str(&format!("\"{}\"", response_str))
+            // We need to properly escape the string for JSON
+            let escaped = serde_json::to_string(&response_str)
+                .map_err(|e| format!("Failed to escape string: {}", e))?;
+            serde_json::from_str(&escaped)
                 .map_err(|e| format!("Failed to parse response from command '{}': {}. Response was: {}", command, e, &response_str[..response_str.len().min(200)]))
         }
     }

@@ -1,8 +1,19 @@
 // Core business logic: NOSTR events, Lightning payments, signer integration.
 
-// Signer and auth are needed for both native and WASM targets
-pub mod signer;
+// Signer is needed for both native and WASM targets
+pub mod signers;
+
+// Auth and storage are native-only (require sqlx, encryption, etc.)
+#[cfg(feature = "native")]
 pub mod auth;
+
+#[cfg(feature = "native")]
+pub mod storage;
+
+// NIP-46 remote signing module (native-only, uses OS keychain)
+#[cfg(feature = "native")]
+pub mod nip46;
+
 pub mod saved_users;
 pub mod version;
 

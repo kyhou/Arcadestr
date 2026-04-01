@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::auth::AuthState;
 #[cfg(feature = "native")]
 use crate::relay_cache::{CachedRelayList, RelayCache, RelayDiscoverySource};
-use crate::signer::{ActiveSigner, NostrSigner as ArcadestrNostrSigner, SignerError};
+use crate::signers::{ActiveSigner, NostrSigner as ArcadestrNostrSigner, SignerError};
 
 /// Arcadestr game listing event kind.
 /// Using kind 30078 (NIP-78 arbitrary app data, parameterized replaceable).
@@ -630,10 +630,12 @@ impl NostrClient {
             
             // Connect to newly added relays
             self.inner.connect().await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Quick 100ms yield for connections to start (was 500ms)
+            tokio::time::sleep(Duration::from_millis(100)).await;
             
-            tracing::info!("Querying {} discovery services for profile with 8s timeout...", discovery_urls.len());
-            match self.inner.fetch_events_from(discovery_urls.clone(), filter.clone(), Duration::from_secs(8)).await {
+            // Use 5s timeout for discovery (was 8s) - discovery should be fast
+            tracing::info!("Querying {} discovery services for profile with 5s timeout...", discovery_urls.len());
+            match self.inner.fetch_events_from(discovery_urls.clone(), filter.clone(), Duration::from_secs(5)).await {
                 Ok(events) => {
                     tracing::debug!("Discovery query returned {} events", events.len());
                     if let Some(event) = events.first() {
@@ -651,10 +653,10 @@ impl NostrClient {
             tracing::warn!("No valid discovery relay URLs found!");
         }
 
-        // Fetch with 10s timeout from all relays
-        tracing::info!("Querying all connected relays with 10s timeout...");
+        // Fetch with 8s timeout from all relays (was 10s)
+        tracing::info!("Querying all connected relays with 8s timeout...");
         let events = self.inner
-            .fetch_events(filter, Duration::from_secs(10))
+            .fetch_events(filter, Duration::from_secs(8))
             .await
             .map_err(|e| {
                 tracing::error!("Failed to fetch profile from all relays: {}", e);
