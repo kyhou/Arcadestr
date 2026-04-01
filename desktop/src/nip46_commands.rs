@@ -69,7 +69,7 @@ pub async fn connect_bunker(
     // Initialize signer session with fast async flow (no blocking handshake)
     let (mut profile, client) = init_signer_session_fast(bunker_uri, user_pubkey)
         .await
-        .map_err(|e: anyhow::Error| {
+        .map_err(|e| {
             error!("init_signer_session_fast failed: {}", e);
             e.to_string()
         })?;
@@ -106,7 +106,7 @@ pub async fn connect_bunker(
 
     // Emit auth success event immediately (fast!)
     let user_npub = profile.user_pubkey.to_bech32()
-        .map_err(|e: nostr::prelude::Error| e.to_string())?;
+        .map_err(|e| format!("Failed to encode pubkey: {}", e))?;
     let _ = app_handle.emit("auth_success", user_npub.clone());
 
     info!("Fast authentication complete! user_npub={}", user_npub);
@@ -132,11 +132,12 @@ fn parse_bunker_uri(uri_str: &str) -> Result<(nostr::nips::nip46::NostrConnectUR
     // The user_pubkey will be obtained during the actual handshake
     // For now, we use a placeholder that will be updated on first connection
     let remote_pubkey = uri.remote_signer_public_key()
-        .ok_or_else(|| "No remote signer public key in bunker URI".to_string())?;
+        .ok_or_else(|| "No remote signer public key in bunker URI".to_string())?
+        .clone();
     
     // Note: The actual user pubkey will be obtained during the handshake
     // We use the remote signer pubkey as a placeholder for now
-    Ok((uri, *remote_pubkey))
+    Ok((uri, remote_pubkey))
 }
 
 /// Resolve NIP-05 identifier to NostrConnectURI and public key
