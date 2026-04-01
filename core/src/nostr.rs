@@ -37,6 +37,7 @@ pub const DISCOVERY_RELAYS: &[&str] = &[
     "wss://purplepag.es",
     "wss://relay.nostr.info", 
     "wss://relay.nostr.band",
+    "wss://relay.nsec.app",        // NIP-46 service relay
 ];
 
 /// Indexer relays for profile/relay discovery (subset of DEFAULT_RELAYS)
@@ -589,10 +590,11 @@ impl NostrClient {
     }
 
     /// Fetches user profile metadata (kind-0) from relays.
-    /// First tries discovery services, then falls back to all connected relays.
+    /// First tries discovery services, then additional relays (if provided), then falls back to all connected relays.
     pub async fn fetch_profile(
         &self,
         npub: &str,
+        additional_relays: Option<Vec<String>>,
     ) -> Result<UserProfile, NostrError> {
         // Parse npub as PublicKey
         let pubkey = PublicKey::parse(npub)
@@ -648,9 +650,51 @@ impl NostrClient {
                     tracing::warn!("Discovery service query failed with error: {}", e);
                 }
             }
-            tracing::debug!("No profile found on discovery services, will try all relays");
+            tracing::debug!("No profile found on discovery services, will try additional relays if provided");
         } else {
             tracing::warn!("No valid discovery relay URLs found!");
+        }
+
+        // Second, try additional relays if provided (e.g., from NIP-46 bunker connection)
+        if let Some(additional) = additional_relays {
+            let additional_urls: Vec<Url> = additional
+                .iter()
+                .filter_map(|url| Url::parse(url).ok())
+                .collect();
+            
+            if !additional_urls.is_empty() {
+                tracing::info!("Adding {} additional relays from NIP-46 connection...", additional_urls.len());
+                
+                // Add additional relays
+                for url in &additional_urls {
+                    let url_str = url.to_string();
+                    match self.inner.add_relay(&url_str).await {
+                        Ok(_) => tracing::debug!("Added additional relay: {}", url_str),
+                        Err(e) => tracing::warn!("Failed to add additional relay {}: {}", url_str, e),
+                    }
+                }
+                
+                // Connect to newly added relays
+                self.inner.connect().await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                
+                // Query additional relays with 5s timeout
+                tracing::info!("Querying {} additional relays for profile with 5s timeout...", additional_urls.len());
+                match self.inner.fetch_events_from(additional_urls.clone(), filter.clone(), Duration::from_secs(5)).await {
+                    Ok(events) => {
+                        tracing::debug!("Additional relays query returned {} events", events.len());
+                        if let Some(event) = events.first() {
+                            tracing::info!("Found profile on additional relay! Event id: {}", event.id.to_hex());
+                            return self.parse_profile_event(event, npub);
+                        }
+                        tracing::debug!("Additional relays returned empty events list");
+                    }
+                    Err(e) => {
+                        tracing::warn!("Additional relays query failed with error: {}", e);
+                    }
+                }
+                tracing::debug!("No profile found on additional relays, will try all connected relays");
+            }
         }
 
         // Fetch with 8s timeout from all relays (was 10s)
@@ -758,8 +802,9 @@ impl NostrClient {
     pub async fn fetch_profile_verified(
         &self,
         npub: &str,
+        additional_relays: Option<Vec<String>>,
     ) -> Result<UserProfile, NostrError> {
-        let mut profile = self.fetch_profile(npub).await?;
+        let mut profile = self.fetch_profile(npub, additional_relays).await?;
         if let Some(ref identifier) = profile.nip05 {
             profile.nip05_verified = self.verify_nip05(npub, identifier).await;
         }

@@ -50,7 +50,7 @@ pub fn DetailView(
         let npub = publisher_npub_for_fetch.clone();
         spawn_local(async move {
             profile_loading.set(true);
-            match invoke_fetch_profile(npub).await {
+            match invoke_fetch_profile(npub, None).await {
                 Ok(p) => seller_profile.set(Some(p)),
                 Err(_) => seller_profile.set(None),
             }

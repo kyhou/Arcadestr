@@ -594,22 +594,24 @@ pub async fn invoke_fetch_listing_by_id(
 #[allow(dead_code)]
 struct FetchProfileArgs {
     npub: String,
+    additional_relays: Option<Vec<String>>,
 }
 
 /// Invoke fetch_profile Tauri command
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
-pub async fn invoke_fetch_profile(npub: String) -> Result<UserProfile, String> {
+pub async fn invoke_fetch_profile(npub: String, additional_relays: Option<Vec<String>>) -> Result<UserProfile, String> {
     use crate::tauri_invoke::invoke;
 
     let fetch_args = serde_json::json!({
-        "npub": npub
+        "npub": npub,
+        "additional_relays": additional_relays
     });
 
     invoke("fetch_profile", fetch_args).await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
-pub async fn invoke_fetch_profile(_npub: String) -> Result<UserProfile, String> {
+pub async fn invoke_fetch_profile(_npub: String, _additional_relays: Option<Vec<String>>) -> Result<UserProfile, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
@@ -4137,7 +4139,7 @@ pub fn App() -> impl IntoView {
                 {
                     web_sys::console::log_1(&format!("Fetching profile for: {}", npub).into());
                 }
-                match invoke_fetch_profile(npub.clone()).await {
+                match invoke_fetch_profile(npub.clone(), None).await {
                     Ok(profile) => {
                         #[cfg(debug_assertions)]
                         {
@@ -4167,6 +4169,43 @@ pub fn App() -> impl IntoView {
                         #[cfg(debug_assertions)]
                         {
                             web_sys::console::log_1(&format!("Failed to fetch profile: {}", e).into());
+                        }
+                    }
+                }
+                
+                // Retry logic: if profile is empty (no metadata), retry after 30 seconds
+                let auth = auth.clone();
+                if auth.profile.get().map(|p| p.name.is_none() && p.display_name.is_none()).unwrap_or(true) {
+                    #[cfg(debug_assertions)]
+                    {
+                        web_sys::console::log_1(&"Profile empty or not found, scheduling retry in 30s...".into());
+                    }
+                    
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        use js_sys::Promise;
+                        use wasm_bindgen_futures::JsFuture;
+                        let _ = JsFuture::from(Promise::new(&mut |resolve, _| {
+                            web_sys::window()
+                                .unwrap()
+                                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 30000)
+                                .unwrap();
+                        }))
+                        .await;
+                    }
+                    
+                    // Retry fetch
+                    #[cfg(debug_assertions)]
+                    {
+                        web_sys::console::log_1(&"Retrying profile fetch...".into());
+                    }
+                    if let Ok(profile) = invoke_fetch_profile(npub.clone(), None).await {
+                        if profile.name.is_some() || profile.display_name.is_some() {
+                            #[cfg(debug_assertions)]
+                            {
+                                web_sys::console::log_1(&format!("Profile fetched on retry: {:?}", profile.name).into());
+                            }
+                            auth.profile.set(Some(profile));
                         }
                     }
                 }

@@ -372,12 +372,13 @@ async fn fetch_listing_by_id(
 #[tauri::command]
 async fn fetch_profile(
     npub: String,
+    additional_relays: Option<Vec<String>>,
     state: tauri::State<'_, AppState>,
 ) -> Result<UserProfile, String> {
     let nostr = state.nostr.lock().await;
 
     nostr
-        .fetch_profile_verified(&npub)
+        .fetch_profile_verified(&npub, additional_relays)
         .await
         .map_err(|e| e.to_string())
 }
@@ -668,7 +669,7 @@ async fn fetch_profile_with_hints(
     }
 
     // Fetch profile
-    nostr.fetch_profile(&npub).await.map_err(|e| e.to_string())
+    nostr.fetch_profile(&npub, None).await.map_err(|e| e.to_string())
 }
 
     /// Perform post-authentication relay discovery and start subscriptions
@@ -1017,7 +1018,7 @@ async fn fetch_profile_with_hints(
         
         // Fetch profile
         let nostr = state.nostr.lock().await;
-        let profile = match nostr.fetch_profile(&npub).await {
+        let profile = match nostr.fetch_profile(&npub, None).await {
             Ok(p) => {
                 tracing::info!("Profile fetched: name={:?}, display_name={:?}, picture={:?}", 
                     p.name, p.display_name, p.picture);
