@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::components::ProfileRow;
 use crate::models::{GameListing, UserProfile, ZapInvoice, ZapRequest};
 use crate::{invoke_fetch_profile, invoke_request_invoice, AuthContext};
 
@@ -43,7 +44,6 @@ pub fn DetailView(
     
     // Clone listing's publisher_npub early to avoid move conflicts
     let publisher_npub_for_fetch = listing.publisher_npub.clone();
-    let publisher_npub_for_fallback = publisher_npub_for_fetch.clone();
 
     // Fetch seller profile on mount
     Effect::new(move |_| {
@@ -58,28 +58,26 @@ pub fn DetailView(
         });
     });
 
-    // Helper to check if profile has actual data
-    let has_profile = move || {
-        seller_profile.get().map(|p| {
-            p.name.is_some() || p.display_name.is_some() || p.about.is_some() || p.picture.is_some()
-        }).unwrap_or(false)
+    // Clone listing for closures
+    let listing_for_lud16 = listing.clone();
+
+    // Clone publisher_npub for the seller profile section
+    let publisher_npub_for_profile_row = listing.publisher_npub.clone();
+
+    let on_back_click = move |_| {
+        on_back.run(());
     };
 
-    // Get profile for display
-    let get_profile = move || seller_profile.get();
-
-    // Get first letter for avatar placeholder
-    let avatar_letter = move || {
-        get_profile()
-            .map(|p| {
-                let name = p.display();
-                name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".to_string())
-            })
-            .unwrap_or_else(|| "?".to_string())
+    // Truncate bolt11 for display
+    let invoice_display = move || {
+        invoice.get().map(|inv| {
+            if inv.bolt11.len() > 40 {
+                format!("{}...", &inv.bolt11[..40])
+            } else {
+                inv.bolt11.clone()
+            }
+        }).unwrap_or_default()
     };
-    
-    // Get seller profile for rendering
-    let seller_profile_for_render = seller_profile.clone();
 
     // Buy button handler - wrapped in Arc<Mutex> for thread-safe cloning
     let on_buy = {
@@ -174,24 +172,6 @@ pub fn DetailView(
         }))
     };
 
-    let on_back_click = move |_| {
-        on_back.run(());
-    };
-
-    // Truncate bolt11 for display
-    let invoice_display = move || {
-        invoice.get().map(|inv| {
-            if inv.bolt11.len() > 40 {
-                format!("{}...", &inv.bolt11[..40])
-            } else {
-                inv.bolt11.clone()
-            }
-        }).unwrap_or_default()
-    };
-
-    // Clone listing for closures
-    let listing_for_lud16 = listing.clone();
-
     view! {
         <div class="detail-container">
             <button
@@ -201,88 +181,100 @@ pub fn DetailView(
                 "← Back"
             </button>
 
-            // Seller profile card
-            {move || {
-                if profile_loading.get() {
-                    Some(view! {
-                        <div class="seller-card-loading">
-                            "Loading seller info..."
-                        </div>
-                    }.into_any())
-                } else if has_profile() {
-                    let p = seller_profile_for_render.get().unwrap();
-                    let display_name = p.display();
-                    Some(view! {
-                        <div class="seller-card">
-                            {if let Some(url) = p.picture.clone() {
-                                Some(view! {
-                                    <img src={url} class="seller-avatar" alt="avatar" />
-                                }.into_any())
-                            } else {
-                                Some(view! {
-                                    <div class="seller-avatar-placeholder">{avatar_letter()}</div>
-                                }.into_any())
-                            }}
-                            <div class="seller-info">
-                                <div class="seller-name">
-                                    {display_name}
-                                    {if p.nip05_verified {
-                                        let nip05 = p.nip05.clone().unwrap_or_default();
-                                        Some(view! {
-                                            <span class="seller-verified" title={format!("NIP-05 verified: {}", nip05)}>{" ✓"}</span>
-                                        }.into_any())
-                                    } else {
-                                        None
-                                    }}
-                                </div>
-                                {if let Some(nip05) = p.nip05.clone() {
-                                    Some(view! {
-                                        <div class="seller-nip05">{nip05}</div>
-                                    }.into_any())
-                                } else {
-                                    None
-                                }}
-                                {if let Some(about) = p.about.clone() {
-                                    let truncated = if about.len() > 120 {
-                                        format!("{}...", &about[..120])
-                                    } else {
-                                        about
-                                    };
-                                    Some(view! {
-                                        <div class="seller-about">{truncated}</div>
-                                    }.into_any())
-                                } else {
-                                    None
-                                }}
-                                {if let Some(website) = p.website.clone() {
-                                    let website_url = website.clone();
-                                    Some(view! {
-                                        <a href={website_url} class="seller-website" target="_blank" rel="noopener">
-                                            {"🌐 "}{website}
-                                        </a>
-                                    }.into_any())
-                                } else {
-                                    None
+            // Seller profile section using ProfileRow component
+            <div
+                class="seller-section"
+                style:margin-top="16px"
+                style:padding="16px"
+                style:background="#1a1a1a"
+                style:border-radius="8px"
+            >
+                <h3 style:margin-top="0" style:margin-bottom="12px" style:color="#f5821f">"Seller"</h3>
+                
+                {move || {
+                    if profile_loading.get() {
+                        Some(view! {
+                            <div style:color="#888">"Loading seller info..."</div>
+                        }.into_any())
+                    } else {
+                        Some(view! {
+                            <div class="seller-profile">
+                                <ProfileRow 
+                                    npub={publisher_npub_for_profile_row.clone()}
+                                    avatar_size="48px"
+                                    truncate_npub=20
+                                />
+                                
+                                // Show additional profile info if available
+                                {move || {
+                                    seller_profile.get().map(|p| {
+                                        view! {
+                                            <div class="seller-details" style:margin-top="12px" style:padding-top="12px" style:border-top="1px solid #333">
+                                                {if let Some(about) = p.about.clone() {
+                                                    if !about.is_empty() {
+                                                        let truncated = if about.len() > 120 {
+                                                            format!("{}...", &about[..120])
+                                                        } else {
+                                                            about
+                                                        };
+                                                        Some(view! {
+                                                            <p class="seller-about" style:margin="0 0 8px 0" style:color="#aaa" style:font-size="14px" style:line-height="1.4">
+                                                                {truncated}
+                                                            </p>
+                                                        }.into_any())
+                                                    } else { None }
+                                                } else { None }}
+                                                
+                                                {if let Some(nip05) = p.nip05.clone() {
+                                                    Some(view! {
+                                                        <p class="seller-nip05" style:margin="0 0 8px 0" style:color="#888" style:font-size="13px">
+                                                            {if p.nip05_verified {
+                                                                "✓ "
+                                                            } else {
+                                                                "? "
+                                                            }}
+                                                            {nip05}
+                                                        </p>
+                                                    }.into_any())
+                                                } else { None }}
+                                                
+                                                {if let Some(lud16) = p.lud16.clone() {
+                                                    if !lud16.is_empty() {
+                                                        Some(view! {
+                                                            <p class="seller-lud16" style:margin="0" style:color="#f5821f" style:font-size="13px">
+                                                                {"⚡ "}{lud16}
+                                                            </p>
+                                                        }.into_any())
+                                                    } else { None }
+                                                } else { None }}
+                                                
+                                                {if let Some(website) = p.website.clone() {
+                                                    let website_url = website.clone();
+                                                    Some(view! {
+                                                        <a 
+                                                            href={website_url.clone()} 
+                                                            class="seller-website" 
+                                                            target="_blank" 
+                                                            rel="noopener"
+                                                            style:display="inline-block"
+                                                            style:margin-top="8px"
+                                                            style:color="#4a9eff"
+                                                            style:font-size="13px"
+                                                            style:text-decoration="none"
+                                                        >
+                                                            {"🌐 "}{website}
+                                                        </a>
+                                                    }.into_any())
+                                                } else { None }}
+                                            </div>
+                                        }.into_any()
+                                    })
                                 }}
                             </div>
-                        </div>
-                    }.into_any())
-                } else {
-                    // No profile found - show fallback with truncated npub
-                    // listing.publisher_npub is already cloned at the top as publisher_npub_for_fetch
-                    let truncated_npub = if publisher_npub_for_fallback.len() > 20 {
-                        format!("{}...", &publisher_npub_for_fallback[..20])
-                    } else {
-                        publisher_npub_for_fallback.clone()
-                    };
-                    Some(view! {
-                        <div class="seller-card-fallback">
-                            <span class="meta-label">"Publisher: "</span>
-                            {truncated_npub}
-                        </div>
-                    }.into_any())
-                }
-            }}
+                        }.into_any())
+                    }
+                }}
+            </div>
 
             <div class="detail-content">
                 <h2 class="detail-title">{listing.title.clone()}</h2>

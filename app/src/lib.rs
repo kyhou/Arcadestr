@@ -13,6 +13,10 @@ use web_sys;
 // Module declarations
 pub mod components;
 pub mod models;
+pub mod store;
+
+// Import ProfileStore and related functions for store initialization and event handlers
+use crate::store::{ProfileStore, provide_profile_store, use_profile_store, try_use_profile_store};
 
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 pub mod web_auth;
@@ -21,6 +25,131 @@ pub mod web_auth;
 mod tauri_invoke;
 pub use components::{BrowseView, DetailView, ProfileView, PublishView, AccountSelector, BackupManager};
 pub use models::{GameListing, MarketplaceView, UserProfile, ZapInvoice, ZapRequest};
+
+// =============================================================================
+// Profile Event Types
+// =============================================================================
+
+/// Profile fetch progress event from desktop
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProfileFetchProgress {
+    pub completed: usize,
+    pub total: usize,
+}
+
+// =============================================================================
+// Profile Event Handlers
+// =============================================================================
+
+/// Setup Tauri event listeners for profile updates
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+pub fn setup_profile_event_handlers(profile_store: ProfileStore) {
+    use wasm_bindgen_futures::spawn_local;
+    
+    spawn_local(async move {
+        // Listen for individual profile fetched events
+        let listen_result = crate::tauri_invoke::listen("profile_fetched", move |data| {
+            // Parse the UserProfile from the event data
+            if let Ok(profile) = serde_json::from_value::<UserProfile>(data.clone()) {
+                profile_store.put(profile);
+            } else if let Some(payload) = data.get("payload") {
+                // Try parsing from payload field if wrapped
+                if let Ok(profile) = serde_json::from_value::<UserProfile>(payload.clone()) {
+                    profile_store.put(profile);
+                }
+            }
+        }).await;
+        
+        if let Err(e) = listen_result {
+            web_sys::console::error_1(&format!("Failed to listen for profile_fetched: {}", e).into());
+        }
+        
+        // Optionally listen for progress events (can be used for UI progress bars)
+        let _ = crate::tauri_invoke::listen("profile_fetch_progress", |_data| {
+            // Progress events can be handled here if needed
+            // For now, we just listen to prevent events from accumulating
+        }).await;
+    });
+}
+
+/// Fallback for non-Tauri targets
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+pub fn setup_profile_event_handlers(_profile_store: ProfileStore) {
+    // No-op on web target
+}
+
+// =============================================================================
+// Profile Fetch Helpers
+// =============================================================================
+
+/// Fetch a profile and store it in the global cache
+pub async fn fetch_and_store_profile(npub: String) -> Result<UserProfile, String> {
+    let profile = invoke_fetch_profile(npub.clone(), None).await?;
+    
+    // Store in global cache
+    if let Some(store) = use_context::<ProfileStore>() {
+        store.put(profile.clone());
+    }
+    
+    Ok(profile)
+}
+
+/// Batch fetch profiles that aren't in the cache
+pub async fn fetch_missing_profiles(npubs: Vec<String>) -> Result<Vec<UserProfile>, String> {
+    let store = use_context::<ProfileStore>();
+    
+    // Filter out already cached profiles
+    let missing: Vec<String> = npubs.into_iter()
+        .filter(|npub| {
+            if let Some(ref s) = store {
+                !s.has(npub)
+            } else {
+                true
+            }
+        })
+        .collect();
+    
+    if missing.is_empty() {
+        return Ok(vec![]);
+    }
+    
+    // Fetch missing profiles (we'll add the batch command later)
+    // For now, fetch individually
+    let mut profiles = Vec::new();
+    for npub in missing {
+        if let Ok(profile) = fetch_and_store_profile(npub).await {
+            profiles.push(profile);
+        }
+    }
+    
+    Ok(profiles)
+}
+
+/// Invoke get_cached_profiles Tauri command
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+pub async fn invoke_get_cached_profiles() -> Result<Vec<UserProfile>, String> {
+    use crate::tauri_invoke::invoke;
+    
+    invoke("get_cached_profiles", serde_json::json!({})).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+pub async fn invoke_get_cached_profiles() -> Result<Vec<UserProfile>, String> {
+    Err("Tauri not available".to_string())
+}
+
+/// Invoke get_cached_profile Tauri command (single profile)
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+pub async fn invoke_get_cached_profile(npub: String) -> Result<Option<UserProfile>, String> {
+    use crate::tauri_invoke::invoke;
+    
+    invoke("get_cached_profile", serde_json::json!({ "npub": npub })).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+pub async fn invoke_get_cached_profile(_npub: String) -> Result<Option<UserProfile>, String> {
+    Err("Tauri not available".to_string())
+}
 
 // =============================================================================
 // Tauri Invoke Bridge
@@ -645,6 +774,12 @@ pub struct StoredAccount {
     pub signing_mode: String,
     pub last_used: i64,
     pub is_current: bool,  // ← NEW: indicates if this is the currently active account
+    // Profile metadata fields
+    pub picture: Option<String>,
+    pub display_name: Option<String>,
+    pub username: Option<String>,
+    pub nip05: Option<String>,
+    pub about: Option<String>,
 }
 
 /// Authentication context shared across components
@@ -704,6 +839,12 @@ fn parse_account_from_result(result: &serde_json::Value) -> Result<StoredAccount
         signing_mode: account.get("signing_mode").and_then(|v| v.as_str()).unwrap_or("Local").to_string(),
         last_used: account.get("last_used").and_then(|v| v.as_i64()).unwrap_or(0),
         is_current: account.get("is_current").and_then(|v| v.as_bool()).unwrap_or(false),
+        // Profile metadata fields
+        picture: account.get("picture").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        display_name: account.get("display_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        username: account.get("username").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        nip05: account.get("nip05").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        about: account.get("about").and_then(|v| v.as_str()).map(|s| s.to_string()),
     })
 }
 
@@ -722,6 +863,12 @@ fn parse_accounts_list(result: &serde_json::Value) -> Result<Vec<StoredAccount>,
                 signing_mode: acc.get("signing_mode")?.as_str()?.to_string(),
                 last_used: acc.get("last_used")?.as_i64()?,
                 is_current: acc.get("is_current").and_then(|v| v.as_bool()).unwrap_or(false),
+                // Parse profile metadata fields
+                picture: acc.get("picture").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                display_name: acc.get("display_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                username: acc.get("username").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                nip05: acc.get("nip05").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                about: acc.get("about").and_then(|v| v.as_str()).map(|s| s.to_string()),
             })
         })
         .collect();
@@ -757,16 +904,60 @@ fn generate_qr_svg(data: &str) -> String {
 impl AuthContext {
     /// Load list of all profiles from secure storage (new NIP-46 API)
     pub async fn load_profiles_list(&self) -> Result<(), String> {
+        web_sys::console::log_1(&"[load_profiles_list] Starting...".into());
         match invoke_list_saved_profiles().await {
             Ok(result) => {
+                web_sys::console::log_1(&format!("[load_profiles_list] Got result: {:?}", result).into());
                 if let Ok(accounts) = parse_accounts_list(&result) {
-                    self.accounts.set(accounts);
+                    web_sys::console::log_1(&format!("[load_profiles_list] Parsed {} accounts", accounts.len()).into());
+                    self.accounts.set(accounts.clone());
+                    
+                    // Fetch profiles for all accounts to show pictures/names in the list
+                    let store = try_use_profile_store();
+                    web_sys::console::log_1(&format!("[load_profiles_list] ProfileStore available: {}", store.is_some()).into());
+                    for account in accounts {
+                        if let Some(store) = store.clone() {
+                            let npub = account.npub.clone();
+                            let name = account.name.clone();
+                            web_sys::console::log_1(&format!("[load_profiles_list] Processing account: {} (npub: {}, name: {:?})", account.id, npub, name).into());
+                            spawn_local(async move {
+                                // First try to get from backend cache
+                                match invoke_get_cached_profile(npub.clone()).await {
+                                    Ok(Some(profile)) => {
+                                        web_sys::console::log_1(&format!("[LOAD_PROFILES] Cached profile for {}: {:?}", npub, profile.name).into());
+                                        store.put(profile);
+                                    }
+                                    Ok(None) => {
+                                        web_sys::console::log_1(&format!("[LOAD_PROFILES] No cached profile for {}, fetching from relays", npub).into());
+                                        // Not in cache, fetch from relays
+                                        match invoke_fetch_profile(npub.clone(), None).await {
+                                            Ok(profile) => {
+                                                web_sys::console::log_1(&format!("[LOAD_PROFILES] Fetched profile for {}: {:?}", npub, profile.name).into());
+                                                store.put(profile);
+                                            }
+                                            Err(e) => {
+                                                web_sys::console::log_1(&format!("[LOAD_PROFILES] Failed to fetch profile for {}: {}", npub, e).into());
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        web_sys::console::log_1(&format!("[LOAD_PROFILES] Error getting cached profile for {}: {}", npub, e).into());
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    
                     Ok(())
                 } else {
+                    web_sys::console::log_1(&"[load_profiles_list] Failed to parse accounts".into());
                     Err("Failed to parse profiles".to_string())
                 }
             }
-            Err(e) => Err(e)
+            Err(e) => {
+                web_sys::console::log_1(&format!("[load_profiles_list] Error: {}", e).into());
+                Err(e)
+            }
         }
     }
     
@@ -790,6 +981,34 @@ impl AuthContext {
                     if account.signing_mode == "nip46" {
                         self.start_connection_status_polling().await;
                     }
+                    
+                    // Explicitly fetch profile immediately to avoid delay
+                    let npub_for_fetch = account.npub.clone();
+                    let auth_for_fetch = self.clone();
+                    spawn_local(async move {
+                        web_sys::console::log_1(&format!("[SWITCH] Immediate profile fetch for: {}", npub_for_fetch).into());
+                        
+                        // First try to get from backend cache
+                        match invoke_get_cached_profile(npub_for_fetch.clone()).await {
+                            Ok(Some(profile)) => {
+                                web_sys::console::log_1(&format!("[SWITCH] Got cached profile immediately: {:?}", profile.name).into());
+                                auth_for_fetch.profile.set(Some(profile));
+                            }
+                            _ => {
+                                web_sys::console::log_1(&"[SWITCH] No cached profile, fetching from relays...".into());
+                                // Fetch from relays
+                                match invoke_fetch_profile(npub_for_fetch.clone(), None).await {
+                                    Ok(profile) => {
+                                        web_sys::console::log_1(&format!("[SWITCH] Profile fetched from relays: {:?}", profile.name).into());
+                                        auth_for_fetch.profile.set(Some(profile));
+                                    }
+                                    Err(e) => {
+                                        web_sys::console::log_1(&format!("[SWITCH] Profile fetch failed: {}", e).into());
+                                    }
+                                }
+                            }
+                        }
+                    });
                     
                     Ok(())
                 } else {
@@ -1484,6 +1703,15 @@ body {
 
 .account-avatar {
     flex-shrink: 0;
+    width: 40px;
+    height: 40px;
+}
+
+.account-avatar-img {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    object-fit: cover;
 }
 
 .avatar-placeholder {
@@ -3091,13 +3319,17 @@ fn LoginView() -> impl IntoView {
     Effect::new(move |_| {
         let auth = auth_stored.get_value();
         spawn_local(async move {
+            web_sys::console::log_1(&"[LoginView] Checking for accounts...".into());
             let has_accounts = invoke_has_accounts().await.unwrap_or(false);
+            web_sys::console::log_1(&format!("[LoginView] has_accounts: {}", has_accounts).into());
             if !has_accounts {
                 // No accounts, go directly to add account view
                 view_mode.set(LoginViewMode::AddAccount);
             } else {
                 // Load accounts list
-                let _ = auth.load_accounts_list().await;
+                web_sys::console::log_1(&"[LoginView] Loading accounts list...".into());
+                let result = auth.load_accounts_list().await;
+                web_sys::console::log_1(&format!("[LoginView] load_accounts_list result: {:?}", result.is_ok()).into());
             }
         });
     });
@@ -3734,12 +3966,39 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
 
     // Get profile for display - returns a closure that will be called in reactive context
     let get_profile = move || {
-        let p = auth.profile.get();
+        // First check AuthContext profile
+        if let Some(p) = auth.profile.get() {
+            #[cfg(debug_assertions)]
+            {
+                web_sys::console::log_1(&format!("get_profile: Found in auth.profile").into());
+            }
+            return Some(p);
+        }
+        
+        // Then check ProfileStore (use_context returns Option<T>)
+        if let Some(store) = use_context::<ProfileStore>() {
+            if let Some(npub) = auth.npub.get() {
+                #[cfg(debug_assertions)]
+                {
+                    web_sys::console::log_1(&format!("get_profile: Checking ProfileStore for {}", npub).into());
+                    let count = store.signal().get_untracked().len();
+                    web_sys::console::log_1(&format!("get_profile: Store has {} profiles", count).into());
+                }
+                if let Some(p) = store.get(&npub) {
+                    #[cfg(debug_assertions)]
+                    {
+                        web_sys::console::log_1(&format!("get_profile: Found in ProfileStore!").into());
+                    }
+                    return Some(p);
+                }
+            }
+        }
+        
         #[cfg(debug_assertions)]
         {
-            web_sys::console::log_1(&format!("get_profile called, profile: {:?}", p.is_some()).into());
+            web_sys::console::log_1(&format!("get_profile: Not found anywhere").into());
         }
-        p
+        None
     };
     let get_npub = move || {
         let n = auth.npub.get();
@@ -3947,7 +4206,7 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                             }
                         }}
                         <span class="user-display-name">
-                            {get_profile_display()}
+                            {move || get_profile_display()}
                             {move || {
                                 if get_nip05_verified() {
                                     let nip05 = get_nip05();
@@ -4050,6 +4309,14 @@ pub fn App() -> impl IntoView {
     
     // Store auth for use in effects
     let auth_stored = StoredValue::new(auth.clone());
+    
+    // Initialize profile store
+    provide_profile_store();
+    let profile_store = use_profile_store();
+    
+    // Setup event listeners for profile updates
+    #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+    setup_profile_event_handlers(profile_store.clone());
 
     // Check authentication status on mount (with small delay for Tauri to initialize)
     Effect::new(move |_| {
@@ -4084,6 +4351,34 @@ pub fn App() -> impl IntoView {
                                 if account.signing_mode == "nip46" {
                                     auth.start_connection_status_polling().await;
                                 }
+                                
+                                // IMMEDIATE: Try to get profile from backend cache first
+                                let npub_for_fetch = account.npub.clone();
+                                let auth_for_fetch = auth.clone();
+                                spawn_local(async move {
+                                    web_sys::console::log_1(&format!("[INIT] Immediate profile fetch for: {}", npub_for_fetch).into());
+                                    
+                                    // First try to get from backend cache
+                                    match invoke_get_cached_profile(npub_for_fetch.clone()).await {
+                                        Ok(Some(profile)) => {
+                                            web_sys::console::log_1(&format!("[INIT] Got cached profile immediately: {:?}", profile.name).into());
+                                            auth_for_fetch.profile.set(Some(profile));
+                                        }
+                                        _ => {
+                                            web_sys::console::log_1(&"[INIT] No cached profile, fetching from relays...".into());
+                                            // Fetch from relays
+                                            match invoke_fetch_profile(npub_for_fetch.clone(), None).await {
+                                                Ok(profile) => {
+                                                    web_sys::console::log_1(&format!("[INIT] Profile fetched from relays: {:?}", profile.name).into());
+                                                    auth_for_fetch.profile.set(Some(profile));
+                                                }
+                                                Err(e) => {
+                                                    web_sys::console::log_1(&format!("[INIT] Profile fetch failed: {}", e).into());
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
                             }
                         }
                         Err(_) => {
@@ -4092,7 +4387,32 @@ pub fn App() -> impl IntoView {
                             auth.has_secure_accounts.set(true);
                             if let Ok(result) = invoke_list_saved_profiles().await {
                                 if let Ok(accounts) = parse_accounts_list(&result) {
-                                    auth.accounts.set(accounts);
+                                    auth.accounts.set(accounts.clone());
+                                    
+                                    // Fetch profiles for all saved accounts to show pictures/names
+                                    let store = try_use_profile_store();
+                                    for account in accounts {
+                                        if let Some(store) = store.clone() {
+                                            let npub = account.npub.clone();
+                                            spawn_local(async move {
+                                                // First try to get from backend cache
+                                                match invoke_get_cached_profile(npub.clone()).await {
+                                                    Ok(Some(profile)) => {
+                                                        web_sys::console::log_1(&format!("[ACCOUNTS] Cached profile for {}: {:?}", npub, profile.name).into());
+                                                        store.put(profile);
+                                                    }
+                                                    _ => {
+                                                        // Not in cache, fetch from relays
+                                                        web_sys::console::log_1(&format!("[ACCOUNTS] Fetching profile for {} from relays", npub).into());
+                                                        if let Ok(profile) = invoke_fetch_profile(npub.clone(), None).await {
+                                                            web_sys::console::log_1(&format!("[ACCOUNTS] Fetched profile for {}: {:?}", npub, profile.name).into());
+                                                            store.put(profile);
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4118,6 +4438,41 @@ pub fn App() -> impl IntoView {
                 }
             }
         });
+    });
+
+    // Load cached profiles from backend on startup
+    spawn_local(async move {
+        match invoke_get_cached_profiles().await {
+            Ok(profiles) => {
+                // Try to get the store - it might not be ready yet
+                let store: Option<ProfileStore> = try_use_profile_store();
+                if let Some(store) = store {
+                    #[cfg(debug_assertions)]
+                    {
+                        web_sys::console::log_1(&format!("Loaded {} profiles from backend cache", profiles.len()).into());
+                        for profile in &profiles {
+                            web_sys::console::log_1(&format!("  - {}: name={:?}, display_name={:?}", profile.npub, profile.name, profile.display_name).into());
+                        }
+                    }
+                    store.put_many(profiles);
+                    #[cfg(debug_assertions)]
+                    {
+                        web_sys::console::log_1(&format!("ProfileStore now has {} profiles", store.get_all().len()).into());
+                    }
+                } else {
+                    #[cfg(debug_assertions)]
+                    {
+                        web_sys::console::log_1(&"ProfileStore not ready yet, skipping cache load".into());
+                    }
+                }
+            }
+            Err(e) => {
+                #[cfg(debug_assertions)]
+                {
+                    web_sys::console::log_1(&format!("Failed to load cached profiles: {}", e).into());
+                }
+            }
+        }
     });
 
     // Auto-fetch profile when npub becomes Some

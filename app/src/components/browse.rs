@@ -3,6 +3,8 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::components::{ProfileAvatar, ProfileDisplayName};
+use crate::fetch_and_store_profile;
 use crate::models::GameListing;
 use crate::{invoke_fetch_listings, AuthContext};
 
@@ -86,21 +88,23 @@ pub fn ListingCard(
     on_select: Callback<GameListing>,
 ) -> impl IntoView {
     // Clone listing for use in closures
-    let listing_clone = listing.clone();
     let listing_for_click = listing.clone();
     
-    // Format publisher npub (first 16 chars + "...")
-    let publisher_display = move || {
-        let npub = &listing_clone.publisher_npub;
-        if npub.len() > 16 {
-            format!("{}...", &npub[..16])
-        } else {
-            npub.clone()
-        }
-    };
+    // Clone publisher_npub before moving into Effect
+    let publisher_npub = listing.publisher_npub.clone();
+    let publisher_npub_for_effect = publisher_npub.clone();
+    
+    // Fetch profile when component mounts
+    Effect::new(move |_| {
+        let npub = publisher_npub_for_effect.clone();
+        spawn_local(async move {
+            // This will use cached version if available
+            let _ = fetch_and_store_profile(npub).await;
+        });
+    });
     
     // Format price display
-    let price_sats = listing_clone.price_sats;
+    let price_sats = listing.price_sats;
     let price_display = move || -> String {
         if price_sats == 0 {
             "Free".to_string()
@@ -122,7 +126,22 @@ pub fn ListingCard(
         <div class="listing-card">
             <div class="listing-header">
                 <h3 class="listing-title">{title}</h3>
-                <p class="listing-publisher">{publisher_display}</p>
+                <div
+                    class="listing-publisher-row"
+                    style:display="flex"
+                    style:align-items="center"
+                    style:gap="8px"
+                    style:margin-top="4px"
+                >
+                    <ProfileAvatar 
+                        npub={publisher_npub.clone()} 
+                        size="24px"
+                    />
+                    <ProfileDisplayName 
+                        npub={publisher_npub.clone()}
+                        truncate_npub=16
+                    />
+                </div>
             </div>
             
             <div class="listing-price">
