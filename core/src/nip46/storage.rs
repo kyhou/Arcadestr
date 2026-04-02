@@ -2,10 +2,19 @@
 //
 // This module is the ONLY place in the codebase that reads/writes the OS keychain.
 // Uses tauri-plugin-keyring for cross-platform OS-native secure storage.
+//
+// ## Profile Metadata Cache
+//
+// Profile metadata (names, pubkeys, IDs) is cached locally in addition to the keyring.
+// This ensures profiles remain visible in the UI even when the OS keyring is temporarily
+// unavailable (locked, user canceled password prompt, DBus disconnected, etc.).
+// Secrets (nsec, bunker URIs) remain exclusively in the keyring for security.
 
 use keyring::Entry;
 use nostr::{nips::nip46::NostrConnectURI, Keys, ToBech32};
 use serde_json;
+use std::path::PathBuf;
+use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::nip46::types::{Nip46KeyringError, ProfileMetadata, SavedProfile};
@@ -18,6 +27,29 @@ const PROFILE_INDEX_KEY: &str = "profile_index";
 
 /// Key for storing the last active profile ID
 const LAST_ACTIVE_KEY: &str = "last_active_profile";
+
+/// Filename for local profile metadata cache (non-sensitive data only)
+const PROFILE_CACHE_FILENAME: &str = "profile_metadata_cache.json";
+
+/// Lazy-static storage for the cache directory path
+static CACHE_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Set the directory for local profile metadata cache.
+/// This should be called once during app initialization.
+pub fn set_profile_cache_dir(dir: PathBuf) {
+    let display_path = dir.display().to_string();
+    let mut cache_dir = CACHE_DIR.lock().unwrap();
+    *cache_dir = Some(dir);
+    info!("Profile metadata cache directory set to: {}", display_path);
+}
+
+/// Get the path to the local profile metadata cache file.
+fn get_profile_cache_path() -> Option<PathBuf> {
+    let cache_dir = CACHE_DIR.lock().unwrap();
+    cache_dir
+        .as_ref()
+        .map(|dir| dir.join(PROFILE_CACHE_FILENAME))
+}
 
 /// Persist a SavedProfile's secrets to the OS keychain.
 /// Call this immediately after a successful NIP-46 connection.
@@ -55,6 +87,13 @@ pub fn save_profile_to_keyring(profile: &SavedProfile) -> Result<(), Nip46Keyrin
 
     // Update profile index
     add_to_profile_index(profile)?;
+
+    // Also save to local cache as fallback (non-sensitive metadata only)
+    if let Err(e) = save_profile_metadata_to_local_cache(profile) {
+        warn!("Failed to save profile metadata to local cache: {}", e);
+        // Don't fail the whole operation if cache fails
+    }
+
     info!("Profile {} saved successfully to keyring", profile.id);
 
     Ok(())
@@ -128,6 +167,13 @@ pub fn delete_profile_from_keyring(key: &str) -> Result<(), Nip46KeyringError> {
     // Remove from index by profile ID
     // Try to find the profile by checking if this key matches any profile's ID
     remove_from_profile_index(key)?;
+
+    // Also remove from local cache
+    if let Err(e) = remove_profile_from_local_cache(key) {
+        warn!("Failed to remove profile from local cache: {}", e);
+        // Don't fail the whole operation if cache removal fails
+    }
+
     info!("Profile for key {} deleted from keyring", key);
 
     Ok(())
@@ -135,11 +181,37 @@ pub fn delete_profile_from_keyring(key: &str) -> Result<(), Nip46KeyringError> {
 
 /// Load all saved profile metadata (no secrets) for display in the UI.
 /// Returns a Vec of ProfileMetadata — NO secrets are included.
+///
+/// This function first tries to load from the OS keyring. If the keyring
+/// is unavailable (locked, user canceled password prompt, etc.), it falls
+/// back to the local file-based cache. This ensures profiles remain visible
+/// in the UI even when the keyring is temporarily inaccessible.
 pub fn list_profile_index() -> Vec<ProfileMetadata> {
+    // First, try to load from keyring (authoritative source)
     match load_profile_index() {
-        Ok(index) => index,
+        Ok(index) => {
+            // Sync to local cache for future fallback
+            if let Err(e) = save_profile_index_to_local_cache(&index) {
+                warn!("Failed to sync profile index to local cache: {}", e);
+            }
+            return index;
+        }
         Err(e) => {
-            warn!("Failed to load profile index: {}", e);
+            warn!(
+                "Failed to load profile index from keyring: {}. Falling back to local cache.",
+                e
+            );
+        }
+    }
+
+    // Fallback: try to load from local cache
+    match load_profile_index_from_local_cache() {
+        Ok(index) => {
+            info!("Loaded {} profiles from local cache fallback", index.len());
+            index
+        }
+        Err(e) => {
+            warn!("Failed to load profile index from local cache: {}", e);
             vec![]
         }
     }
@@ -173,6 +245,11 @@ fn add_to_profile_index(profile: &SavedProfile) -> Result<(), Nip46KeyringError>
         })?,
         pubkey_hex: profile.user_pubkey.to_hex(),
         bunker_pubkey_hex: bunker_pubkey.clone(),
+        picture: None,
+        display_name: None,
+        username: None,
+        nip05: None,
+        about: None,
     };
     index.push(metadata);
 
@@ -223,6 +300,114 @@ fn save_profile_index(index: &[ProfileMetadata]) -> Result<(), Nip46KeyringError
         Nip46KeyringError::Serialization(format!("Failed to serialize profile index: {}", e))
     })?;
     entry.set_password(&json_str)?;
+    Ok(())
+}
+
+// ============================================================================
+// Local File-Based Cache for Profile Metadata (Fallback)
+// ============================================================================
+// These functions provide a fallback cache for profile metadata when the OS
+// keyring is temporarily unavailable. Only non-sensitive metadata is cached
+// locally - secrets (nsec, bunker URIs) remain exclusively in the keyring.
+
+/// Save profile metadata to local file cache (non-sensitive data only).
+/// This is used as a fallback when the keyring is unavailable.
+fn save_profile_metadata_to_local_cache(profile: &SavedProfile) -> Result<(), String> {
+    let cache_path = get_profile_cache_path().ok_or("Cache directory not set")?;
+
+    // Load existing cache
+    let mut cache = load_profile_index_from_local_cache().unwrap_or_default();
+
+    // Get bunker pubkey
+    let bunker_pubkey = profile
+        .bunker_uri
+        .remote_signer_public_key()
+        .ok_or("No remote signer public key in URI")?
+        .to_hex();
+
+    // Remove existing entry if present
+    cache.retain(|p: &ProfileMetadata| p.pubkey_hex != profile.user_pubkey.to_hex());
+
+    // Add new entry
+    let metadata = ProfileMetadata {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        pubkey_bech32: profile
+            .user_pubkey
+            .to_bech32()
+            .map_err(|e| format!("Failed to encode pubkey: {}", e))?,
+        pubkey_hex: profile.user_pubkey.to_hex(),
+        bunker_pubkey_hex: bunker_pubkey,
+        picture: None,
+        display_name: None,
+        username: None,
+        nip05: None,
+        about: None,
+    };
+    cache.push(metadata);
+
+    // Save to file
+    save_profile_index_to_local_cache(&cache)
+}
+
+/// Save profile index to local file cache.
+fn save_profile_index_to_local_cache(index: &[ProfileMetadata]) -> Result<(), String> {
+    let cache_path = get_profile_cache_path().ok_or("Cache directory not set")?;
+
+    // Ensure parent directory exists
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+    }
+
+    let json_str = serde_json::to_string_pretty(index)
+        .map_err(|e| format!("Failed to serialize profile index: {}", e))?;
+
+    std::fs::write(&cache_path, json_str)
+        .map_err(|e| format!("Failed to write profile cache: {}", e))?;
+
+    debug!(
+        "Saved {} profiles to local cache at: {}",
+        index.len(),
+        cache_path.display()
+    );
+    Ok(())
+}
+
+/// Load profile index from local file cache.
+fn load_profile_index_from_local_cache() -> Result<Vec<ProfileMetadata>, String> {
+    let cache_path = get_profile_cache_path().ok_or("Cache directory not set")?;
+
+    match std::fs::read_to_string(&cache_path) {
+        Ok(json_str) => {
+            let index: Vec<ProfileMetadata> = serde_json::from_str(&json_str)
+                .map_err(|e| format!("Failed to parse profile cache: {}", e))?;
+            debug!("Loaded {} profiles from local cache", index.len());
+            Ok(index)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No cache file yet, return empty
+            Ok(vec![])
+        }
+        Err(e) => Err(format!("Failed to read profile cache: {}", e)),
+    }
+}
+
+/// Remove a profile from the local cache.
+fn remove_profile_from_local_cache(key: &str) -> Result<(), String> {
+    let cache_path = get_profile_cache_path().ok_or("Cache directory not set")?;
+
+    // Load existing cache
+    let mut cache = load_profile_index_from_local_cache().unwrap_or_default();
+
+    let original_len = cache.len();
+    cache.retain(|p: &ProfileMetadata| p.id != key && p.bunker_pubkey_hex != key);
+
+    if cache.len() < original_len {
+        save_profile_index_to_local_cache(&cache)?;
+        info!("Removed profile with key {} from local cache", key);
+    }
+
     Ok(())
 }
 
@@ -378,6 +563,11 @@ mod tests {
             pubkey_bech32: "npub1...".to_string(),
             pubkey_hex: "abcdef".to_string(),
             bunker_pubkey_hex: "123456".to_string(),
+            picture: None,
+            display_name: None,
+            username: None,
+            nip05: None,
+            about: None,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();

@@ -10,6 +10,7 @@ use lru::LruCache;
 use nostr_sdk::prelude::*;
 
 use crate::nostr::{NostrClient, NostrError, UserProfile, UserProfileContent};
+use crate::user_cache::UserCache;
 
 /// Configuration constants
 pub const BATCH_SIZE: usize = 200;
@@ -91,6 +92,8 @@ pub struct ProfileFetcher {
     failed_attempts: Arc<Mutex<HashMap<String, u32>>>,
     /// Cache backend (swappable)
     cache: Arc<dyn ProfileCache>,
+    /// Persistent SQLite cache for profile storage
+    persistent_cache: Option<Arc<UserCache>>,
     /// Maximum retry attempts
     max_attempts: u32,
     /// Batch size for fetching
@@ -113,9 +116,33 @@ impl ProfileFetcher {
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             failed_attempts: Arc::new(Mutex::new(HashMap::new())),
             cache,
+            persistent_cache: None, // Initialize as None
             max_attempts: MAX_PROFILE_ATTEMPTS,
             batch_size: BATCH_SIZE,
         }
+    }
+
+    /// Create with persistent SQLite cache
+    pub fn with_persistent_cache(user_cache: Arc<UserCache>) -> Self {
+        let mut fetcher = Self::new();
+        fetcher.persistent_cache = Some(user_cache);
+        fetcher
+    }
+
+    /// Load cached profiles from SQLite into memory
+    pub async fn load_cached_profiles(&self) -> Vec<UserProfile> {
+        if let Some(ref cache) = self.persistent_cache {
+            match cache.get_all().await {
+                Ok(profiles) => {
+                    for profile in &profiles {
+                        self.cache.put(profile.npub.clone(), profile.clone());
+                    }
+                    return profiles;
+                }
+                Err(e) => tracing::warn!("Failed to load cached profiles: {}", e),
+            }
+        }
+        vec![]
     }
 
     /// Queue a profile for fetching
@@ -172,9 +199,20 @@ impl ProfileFetcher {
         // Fetch from indexers first, then all relays
         match self.fetch_profiles_batch(client, &batch).await {
             Ok(profiles) => {
+                // Collect profiles for batch persistence
+                let mut profiles_to_persist: Vec<(String, UserProfile)> = Vec::new();
+                
                 for (npub, profile) in profiles {
                     results.push(profile.clone());
-                    self.cache.put(npub, profile);
+                    self.cache.put(npub.clone(), profile.clone());
+                    profiles_to_persist.push((npub, profile));
+                }
+                
+                // Persist to SQLite if persistent_cache is configured
+                if let Some(ref user_cache) = self.persistent_cache {
+                    if let Err(e) = user_cache.put_many(&profiles_to_persist).await {
+                        tracing::warn!("Failed to persist profiles to SQLite: {}", e);
+                    }
                 }
             }
             Err(e) => {
@@ -242,6 +280,14 @@ impl ProfileFetcher {
                         Ok(profile) => {
                             tracing::info!("Successfully parsed profile for {}: name={:?}", npub, profile.name);
                             self.cache.put(npub.to_string(), profile.clone());
+                            
+                            // Persist to SQLite if persistent_cache is configured
+                            if let Some(ref user_cache) = self.persistent_cache {
+                                if let Err(e) = user_cache.put(npub, &profile).await {
+                                    tracing::warn!("Failed to persist profile to SQLite: {}", e);
+                                }
+                            }
+                            
                             return Some(profile);
                         }
                         Err(e) => {

@@ -1,6 +1,7 @@
 // NOSTR protocol integration: event handling, relay connections, NIP-46 signer support.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::*;
@@ -12,6 +13,7 @@ use crate::auth::AuthState;
 #[cfg(feature = "native")]
 use crate::relay_cache::{CachedRelayList, RelayCache, RelayDiscoverySource};
 use crate::signers::{ActiveSigner, NostrSigner as ArcadestrNostrSigner, SignerError};
+use crate::user_cache::UserCache;
 
 /// Arcadestr game listing event kind.
 /// Using kind 30078 (NIP-78 arbitrary app data, parameterized replaceable).
@@ -459,6 +461,7 @@ struct Nip05Response {
 /// NOSTR client for Arcadestr.
 pub struct NostrClient {
     inner: nostr_sdk::Client,
+    user_cache: Option<Arc<UserCache>>,
 }
 
 impl NostrClient {
@@ -507,7 +510,55 @@ impl NostrClient {
         
         info!("NostrClient initialized");
         
-        Ok(Self { inner: client })
+        Ok(Self { inner: client, user_cache: None })
+    }
+
+    /// Creates a new NOSTR client with user cache support.
+    pub async fn new_with_cache(relays: Vec<String>, user_cache: Arc<UserCache>) -> Result<Self, NostrError> {
+        use tracing::{info, warn, error};
+        
+        info!("Creating NostrClient with {} relays and user cache", relays.len());
+        let client = nostr_sdk::Client::default();
+        
+        for relay in &relays {
+            match client.add_relay(relay).await {
+                Ok(_) => {
+                    info!("Added relay: {}", relay);
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    error!("Failed to add relay {}: {}", relay, err_str);
+                    if err_str.contains("parse") || err_str.contains("expected ident") {
+                        error!("  -> Relay returned HTML instead of WebSocket response");
+                        error!("  -> This usually means the relay is down or blocked");
+                    } else {
+                        warn!("  -> Will retry on first use");
+                    }
+                    // Don't fail - continue with other relays
+                }
+            }
+        }
+        
+        // Try to connect, but don't fail if relays are temporarily down
+        client.connect().await;
+        
+        // Give some time for connections to establish
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        
+        // Check relay status
+        let relay_list = client.relays().await;
+        info!("Connected relays: {:?}", relay_list.keys().collect::<Vec<_>>());
+        
+        if relay_list.is_empty() {
+            warn!("No relays connected - queries may fail");
+        }
+        
+        info!("NostrClient initialized with cache");
+        
+        Ok(Self { 
+            inner: client,
+            user_cache: Some(user_cache),
+        })
     }
 
     /// Publishes a game listing as a signed NOSTR event.
@@ -590,12 +641,20 @@ impl NostrClient {
     }
 
     /// Fetches user profile metadata (kind-0) from relays.
-    /// First tries discovery services, then additional relays (if provided), then falls back to all connected relays.
+    /// First checks cache, then tries discovery services, then additional relays (if provided), then falls back to all connected relays.
     pub async fn fetch_profile(
         &self,
         npub: &str,
         additional_relays: Option<Vec<String>>,
     ) -> Result<UserProfile, NostrError> {
+        // Check cache first
+        if let Some(ref cache) = self.user_cache {
+            if let Some(cached_profile) = cache.get(npub).await {
+                tracing::info!("Found profile in cache for {}", npub);
+                return Ok(cached_profile);
+            }
+        }
+
         // Parse npub as PublicKey
         let pubkey = PublicKey::parse(npub)
             .map_err(|e| NostrError::MalformedEvent(format!("Invalid npub: {}", e)))?;
@@ -610,49 +669,56 @@ impl NostrClient {
         
         tracing::debug!("Profile filter: kind=0, author={}, limit=1", pubkey.to_hex());
 
-        // First, try discovery services
-        let discovery_urls: Vec<Url> = DISCOVERY_RELAYS
+        // First, try indexer relays (more efficient for profile lookups)
+        let indexer_urls: Vec<Url> = INDEXER_RELAYS
             .iter()
             .filter_map(|url| Url::parse(url).ok())
             .collect();
         
-        tracing::debug!("Discovery relays: {:?}", discovery_urls);
+        tracing::debug!("Indexer relays: {:?}", indexer_urls);
         
-        if !discovery_urls.is_empty() {
-            tracing::info!("Adding {} discovery relays to client...", discovery_urls.len());
+        if !indexer_urls.is_empty() {
+            tracing::info!("Adding {} indexer relays to client...", indexer_urls.len());
             
-            // Add discovery relays to client first
-            for url in &discovery_urls {
+            // Add indexer relays to client first
+            for url in &indexer_urls {
                 let url_str = url.to_string();
                 match self.inner.add_relay(&url_str).await {
-                    Ok(_) => tracing::debug!("Added discovery relay: {}", url_str),
-                    Err(e) => tracing::warn!("Failed to add discovery relay {}: {}", url_str, e),
+                    Ok(_) => tracing::debug!("Added indexer relay: {}", url_str),
+                    Err(e) => tracing::warn!("Failed to add indexer relay {}: {}", url_str, e),
                 }
             }
             
             // Connect to newly added relays
             self.inner.connect().await;
-            // Quick 100ms yield for connections to start (was 500ms)
+            // Quick 100ms yield for connections to start
             tokio::time::sleep(Duration::from_millis(100)).await;
             
-            // Use 5s timeout for discovery (was 8s) - discovery should be fast
-            tracing::info!("Querying {} discovery services for profile with 5s timeout...", discovery_urls.len());
-            match self.inner.fetch_events_from(discovery_urls.clone(), filter.clone(), Duration::from_secs(5)).await {
+            // Use 5s timeout for indexer query
+            tracing::info!("Querying {} indexer relays for profile with 5s timeout...", indexer_urls.len());
+            match self.inner.fetch_events_from(indexer_urls.clone(), filter.clone(), Duration::from_secs(5)).await {
                 Ok(events) => {
-                    tracing::debug!("Discovery query returned {} events", events.len());
+                    tracing::debug!("Indexer query returned {} events", events.len());
                     if let Some(event) = events.first() {
-                        tracing::info!("Found profile on discovery service! Event id: {}", event.id.to_hex());
-                        return self.parse_profile_event(event, npub);
+                        tracing::info!("Found profile on indexer relay! Event id: {}", event.id.to_hex());
+                        let profile = self.parse_profile_event(event, npub)?;
+                        // Save to cache
+                        if let Some(ref cache) = self.user_cache {
+                            if let Err(e) = cache.put(npub, &profile).await {
+                                tracing::warn!("Failed to save profile to cache: {}", e);
+                            }
+                        }
+                        return Ok(profile);
                     }
-                    tracing::debug!("Discovery returned empty events list");
+                    tracing::debug!("Indexer returned empty events list");
                 }
                 Err(e) => {
-                    tracing::warn!("Discovery service query failed with error: {}", e);
+                    tracing::warn!("Indexer relay query failed with error: {}", e);
                 }
             }
-            tracing::debug!("No profile found on discovery services, will try additional relays if provided");
+            tracing::debug!("No profile found on indexer relays, will try additional relays if provided");
         } else {
-            tracing::warn!("No valid discovery relay URLs found!");
+            tracing::warn!("No valid indexer relay URLs found!");
         }
 
         // Second, try additional relays if provided (e.g., from NIP-46 bunker connection)
@@ -683,10 +749,17 @@ impl NostrClient {
                 match self.inner.fetch_events_from(additional_urls.clone(), filter.clone(), Duration::from_secs(5)).await {
                     Ok(events) => {
                         tracing::debug!("Additional relays query returned {} events", events.len());
-                        if let Some(event) = events.first() {
-                            tracing::info!("Found profile on additional relay! Event id: {}", event.id.to_hex());
-                            return self.parse_profile_event(event, npub);
+                    if let Some(event) = events.first() {
+                        tracing::info!("Found profile on additional relay! Event id: {}", event.id.to_hex());
+                        let profile = self.parse_profile_event(event, npub)?;
+                        // Save to cache
+                        if let Some(ref cache) = self.user_cache {
+                            if let Err(e) = cache.put(npub, &profile).await {
+                                tracing::warn!("Failed to save profile to cache: {}", e);
+                            }
                         }
+                        return Ok(profile);
+                    }
                         tracing::debug!("Additional relays returned empty events list");
                     }
                     Err(e) => {
@@ -694,6 +767,69 @@ impl NostrClient {
                     }
                 }
                 tracing::debug!("No profile found on additional relays, will try all connected relays");
+            }
+        }
+
+        // Third, try to fetch user's NIP-65 relay list and query those relays
+        // This is crucial for users whose profiles are only on their personal relays
+        tracing::info!("Fetching user's NIP-65 relay list to find profile...");
+        match self.fetch_relay_list(npub).await {
+            Ok(relay_list) => {
+                let user_relays: Vec<String> = relay_list
+                    .write_relays
+                    .into_iter()
+                    .chain(relay_list.read_relays.into_iter())
+                    .collect::<std::collections::HashSet<_>>() // deduplicate
+                    .into_iter()
+                    .collect();
+                
+                if !user_relays.is_empty() {
+                    tracing::info!("Found {} unique relays from NIP-65, adding...", user_relays.len());
+                    
+                    // Add user's relays
+                    for relay in &user_relays {
+                        match self.add_relay(relay).await {
+                            Ok(_) => tracing::debug!("Added user relay: {}", relay),
+                            Err(e) => tracing::warn!("Failed to add user relay {}: {}", relay, e),
+                        }
+                    }
+                    
+                    // Connect to user's relays
+                    self.connect().await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    
+                    // Query user's relays
+                    let user_relay_urls: Vec<Url> = user_relays
+                        .iter()
+                        .filter_map(|url| Url::parse(url).ok())
+                        .collect();
+                    
+                    if !user_relay_urls.is_empty() {
+                        tracing::info!("Querying {} user relays from NIP-65...", user_relay_urls.len());
+                        match self.inner.fetch_events_from(user_relay_urls, filter.clone(), Duration::from_secs(8)).await {
+                            Ok(events) => {
+                                tracing::debug!("User relays query returned {} events", events.len());
+                                if let Some(event) = events.first() {
+                                    tracing::info!("Found profile on user's NIP-65 relay!");
+                                    let profile = self.parse_profile_event(event, npub)?;
+                                    // Save to cache
+                                    if let Some(ref cache) = self.user_cache {
+                                        if let Err(e) = cache.put(npub, &profile).await {
+                                            tracing::warn!("Failed to save profile to cache: {}", e);
+                                        }
+                                    }
+                                    return Ok(profile);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("User relays query failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Could not fetch NIP-65 relay list: {}", e);
             }
         }
 
@@ -709,7 +845,7 @@ impl NostrClient {
 
         tracing::debug!("All relays query returned {} events", events.len());
 
-        // If no events returned, return minimal profile with only npub
+        // If no events returned, return minimal profile with only npub (don't cache empty profiles)
         let event = match events.first() {
             Some(e) => {
                 tracing::info!("Found profile event! Content preview: {}", &e.content[..e.content.len().min(100)]);
@@ -724,7 +860,14 @@ impl NostrClient {
             }
         };
 
-        self.parse_profile_event(event, npub)
+        let profile = self.parse_profile_event(event, npub)?;
+        // Save to cache
+        if let Some(ref cache) = self.user_cache {
+            if let Err(e) = cache.put(npub, &profile).await {
+                tracing::warn!("Failed to save profile to cache: {}", e);
+            }
+        }
+        Ok(profile)
     }
 
     /// Parse a profile event into UserProfile
@@ -950,28 +1093,28 @@ impl NostrClient {
             .author(pubkey)
             .limit(1);
         
-        // First, try to query discovery services specifically
-        let discovery_urls: Vec<Url> = DISCOVERY_RELAYS
+        // First, try to query indexer relays specifically (more efficient)
+        let indexer_urls: Vec<Url> = INDEXER_RELAYS
             .iter()
             .filter_map(|url| Url::parse(url).ok())
             .collect();
         
-        if !discovery_urls.is_empty() {
-            tracing::info!("Querying discovery services for {}'s relay list", npub);
-            match self.inner.fetch_events_from(discovery_urls, filter.clone(), Duration::from_secs(8)).await {
+        if !indexer_urls.is_empty() {
+            tracing::info!("Querying indexer relays for {}'s relay list", npub);
+            match self.inner.fetch_events_from(indexer_urls, filter.clone(), Duration::from_secs(8)).await {
                 Ok(events) => {
                     if let Some(event) = events.first() {
                         let relay_list = parse_relay_list_from_event(event)?;
-                        tracing::info!("Found relay list from discovery service for {} with {} read and {} write relays", 
+                        tracing::info!("Found relay list from indexer relay for {} with {} read and {} write relays", 
                             npub, relay_list.read_relays.len(), relay_list.write_relays.len());
                         return Ok(relay_list);
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("Discovery service query failed for {}: {}", npub, e);
+                    tracing::debug!("Indexer relay query failed for {}: {}", npub, e);
                 }
             }
-            tracing::debug!("No relay list found on discovery services for {}, trying all relays", npub);
+            tracing::debug!("No relay list found on indexer relays for {}, trying all relays", npub);
         }
         
         // Fall back to querying all connected relays
@@ -1001,21 +1144,21 @@ impl NostrClient {
             .author(pubkey)
             .limit(1);
         
-        // First, try discovery services
-        let discovery_urls: Vec<Url> = DISCOVERY_RELAYS
+        // First, try indexer relays (more efficient)
+        let indexer_urls: Vec<Url> = INDEXER_RELAYS
             .iter()
             .filter_map(|url| Url::parse(url).ok())
             .collect();
         
-        if !discovery_urls.is_empty() {
-            tracing::info!("Adding {} discovery relays to client for follow list fetch...", discovery_urls.len());
+        if !indexer_urls.is_empty() {
+            tracing::info!("Adding {} indexer relays to client for follow list fetch...", indexer_urls.len());
             
-            // Add discovery relays to client first
-            for url in &discovery_urls {
+            // Add indexer relays to client first
+            for url in &indexer_urls {
                 let url_str = url.to_string();
                 match self.inner.add_relay(&url_str).await {
-                    Ok(_) => tracing::debug!("Added discovery relay: {}", url_str),
-                    Err(e) => tracing::warn!("Failed to add discovery relay {}: {}", url_str, e),
+                    Ok(_) => tracing::debug!("Added indexer relay: {}", url_str),
+                    Err(e) => tracing::warn!("Failed to add indexer relay {}: {}", url_str, e),
                 }
             }
             
@@ -1023,19 +1166,19 @@ impl NostrClient {
             self.inner.connect().await;
             tokio::time::sleep(Duration::from_millis(500)).await;
             
-            tracing::info!("Querying discovery services for follow list");
-            match self.inner.fetch_events_from(discovery_urls.clone(), filter.clone(), Duration::from_secs(8)).await {
+            tracing::info!("Querying indexer relays for follow list");
+            match self.inner.fetch_events_from(indexer_urls.clone(), filter.clone(), Duration::from_secs(8)).await {
                 Ok(events) => {
                     if let Some(event) = events.first() {
-                        tracing::info!("Found follow list on discovery service");
+                        tracing::info!("Found follow list on indexer relay");
                         return self.parse_follow_list_content(&event.content);
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("Discovery service query failed: {}", e);
+                    tracing::debug!("Indexer relay query failed: {}", e);
                 }
             }
-            tracing::debug!("No follow list found on discovery services, trying all relays");
+            tracing::debug!("No follow list found on indexer relays, trying all relays");
         }
         
         // Fall back to all connected relays

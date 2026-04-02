@@ -632,9 +632,22 @@ impl NostrSigner for ActiveSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+
+    fn setup_test_keys_dir() {
+        INIT.call_once(|| {
+            let temp_dir = std::env::temp_dir().join("arcadestr_test_keys");
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            let _ = std::fs::create_dir_all(&temp_dir);
+            set_keys_dir(temp_dir);
+        });
+    }
 
     #[test]
     fn test_generate_nostrconnect_uri_basic() {
+        setup_test_keys_dir();
         let relay = "wss://relay.damus.io";
         let secret = "test_secret_123";
         
@@ -664,6 +677,7 @@ mod tests {
 
     #[test]
     fn test_generate_nostrconnect_uri_returns_keys() {
+        setup_test_keys_dir();
         let relay = "wss://relay.nostr.band";
         
         let result = Nip46Signer::generate_nostrconnect_uri(
@@ -686,6 +700,7 @@ mod tests {
 
     #[test]
     fn test_generate_nostrconnect_uri_with_name() {
+        setup_test_keys_dir();
         let relay = "wss://relay.example.com";
         let secret = "secret789";
         let name = "TestApp";
@@ -709,6 +724,7 @@ mod tests {
 
     #[test]
     fn test_generate_nostrconnect_uri_url_encoding() {
+        setup_test_keys_dir();
         let relay = "wss://relay.test.com/path";
         let secret = "secret";
         
@@ -728,12 +744,18 @@ mod tests {
 
     #[test]
     fn test_generate_nostrconnect_uri_unique() {
+        setup_test_keys_dir();
         let relay = "wss://relay.damus.io";
         
         // Generate multiple URIs and ensure they're different
+        // Note: We reset keys between calls to get different keypairs
         let mut uris = Vec::new();
         for i in 0..5 {
             let secret = format!("secret_{}", i);
+            
+            // Reset keys to force generation of a new keypair
+            let _ = reset_client_keys();
+            
             let result = Nip46Signer::generate_nostrconnect_uri(
                 relay,
                 &secret,
@@ -743,7 +765,7 @@ mod tests {
             uris.push(result.0);
         }
         
-        // Check all URIs are unique
+        // Check all URIs are unique (different keypairs = different pubkeys in URI)
         let unique_uris: std::collections::HashSet<_> = uris.iter().collect();
         assert_eq!(uris.len(), unique_uris.len());
     }

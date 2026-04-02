@@ -30,7 +30,7 @@ pub use storage::{
     delete_profile_from_keyring, get_profile_metadata_by_id, get_profile_metadata_by_pubkey,
     list_profile_index, load_profile_from_keyring, migrate_profile_to_keyring, profile_exists,
     save_profile_to_keyring, set_last_active_profile_id, get_last_active_profile_id, 
-    clear_last_active_profile_id,
+    clear_last_active_profile_id, set_profile_cache_dir,
 };
 pub use types::{
     keyring_keys, Nip46KeyringError, AppSignerState, PendingQrState, ProfileMetadata,

@@ -6,7 +6,7 @@ pub const VERSION: &str = "0.1.0";
 
 /// Build revision - increment this every time you make changes
 /// This helps verify that the latest code is actually running
-pub const REVISION: u32 = 32;
+pub const REVISION: u32 = 34;
 
 /// Get full version string including revision
 pub fn full_version() -> String {

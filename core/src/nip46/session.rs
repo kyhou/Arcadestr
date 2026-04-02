@@ -404,11 +404,16 @@ pub async fn logout(state: &Arc<Mutex<AppSignerState>>) {
     
     let mut state_guard = state.lock().await;
     
+    // Always clear the active profile ID and related state
+    // This ensures the UI shows the profile as disconnected even if
+    // the client was already dropped or in an error state
+    state_guard.active_profile_id = None;
+    state_guard.is_offline_mode = false;
+    state_guard.connection_state = ConnectionState::Disconnected;
+    
     if state_guard.active_client.is_some() {
         info!("Dropping active client (WebSocket connections will close)");
         state_guard.active_client = None;
-        state_guard.active_profile_id = None;
-        state_guard.is_offline_mode = false;
     } else {
         info!("No active client to drop");
     }

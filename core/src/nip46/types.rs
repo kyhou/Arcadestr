@@ -116,6 +116,21 @@ pub struct ProfileMetadata {
     /// Bunker pubkey (remote signer pubkey) in hex format - used as keyring key
     #[serde(default)]
     pub bunker_pubkey_hex: String,
+    /// Profile picture URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    /// Display name from Nostr profile
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Username/handle from Nostr profile
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// NIP-05 identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nip05: Option<String>,
+    /// Bio/about text
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
 }
 
 /// Pending QR connection state (Flow B).

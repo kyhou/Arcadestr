@@ -33,7 +33,13 @@ pub mod subscriptions;
 pub mod profile_fetcher;
 
 #[cfg(feature = "native")]
+pub mod user_cache;
+
+#[cfg(feature = "native")]
 pub use profile_fetcher::{ProfileFetcher, ProfileCache, LruProfileCache, BATCH_SIZE, MAX_PROFILE_ATTEMPTS};
+
+#[cfg(feature = "native")]
+pub use user_cache::UserCache;
 
 #[cfg(feature = "native")]
 pub mod lightning;
