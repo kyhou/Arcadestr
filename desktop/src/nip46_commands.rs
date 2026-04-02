@@ -406,17 +406,18 @@ pub async fn check_qr_connection(
 }
 
 /// Called by Leptos to list all saved profiles for the profile switcher UI.
-/// Returns an array of { id, name, npub, is_current } — NO secrets.
+/// Returns an array of { id, name, npub, is_current, picture, display_name, etc. } — NO secrets.
 /// Deduplicates by npub (only shows first profile for each npub).
 #[tauri::command]
 pub async fn list_saved_profiles(
-    state: State<'_, Arc<Mutex<AppSignerState>>>,
+    signer_state: State<'_, Arc<Mutex<AppSignerState>>>,
+    app_state: State<'_, crate::AppState>,
 ) -> Result<serde_json::Value, String> {
     info!("list_saved_profiles called");
 
     // Get the currently active profile ID from state
     let active_profile_id = {
-        let state_guard = state.lock().await;
+        let state_guard = signer_state.lock().await;
         state_guard.active_profile_id.clone()
     };
 
@@ -434,25 +435,46 @@ pub async fn list_saved_profiles(
     // Convert back to vec
     let unique_profiles: Vec<ProfileMetadata> = seen_npubs.into_values().collect();
     
+    // When there's only one profile, always show Connect button (never mark as current)
+    // This ensures the user can always reconnect after logout
+    let single_profile_mode = unique_profiles.len() == 1;
+    
     // Return in the format the frontend expects (matching old API)
-    let accounts_list: Vec<serde_json::Value> = unique_profiles
-        .into_iter()
-        .map(|p| {
-            // Check if this profile is currently active
-            let is_current = active_profile_id.as_ref() == Some(&p.id);
-            serde_json::json!({
-                "id": p.id,
-                "name": p.name,
-                "npub": p.pubkey_bech32,
-                "pubkey_hex": p.pubkey_hex,
-                "signing_mode": "nip46", // Default to nip46 for NIP-46 profiles
-                "last_used": 0, // We don't track this currently
-                "is_current": is_current,
-            })
-        })
-        .collect();
+    // Include profile metadata from UserCache
+    let mut accounts_list: Vec<serde_json::Value> = Vec::new();
+    
+    for p in unique_profiles {
+        // Check if this profile is currently active
+        // But don't mark as current if there's only one profile (always show Connect)
+        let is_current = if single_profile_mode {
+            false // Always show Connect button for single profile
+        } else {
+            active_profile_id.as_ref() == Some(&p.id)
+        };
+        
+        // Fetch profile metadata from UserCache
+        let cached_profile = app_state.user_cache.get(&p.pubkey_bech32).await;
+        
+        let account_json = serde_json::json!({
+            "id": p.id,
+            "name": p.name,
+            "npub": p.pubkey_bech32,
+            "pubkey_hex": p.pubkey_hex,
+            "signing_mode": "nip46", // Default to nip46 for NIP-46 profiles
+            "last_used": 0, // We don't track this currently
+            "is_current": is_current,
+            // Include profile metadata from cache if available
+            "picture": cached_profile.as_ref().and_then(|prof| prof.picture.clone()),
+            "display_name": cached_profile.as_ref().and_then(|prof| prof.display_name.clone()),
+            "username": cached_profile.as_ref().and_then(|prof| prof.name.clone()),
+            "nip05": cached_profile.as_ref().and_then(|prof| prof.nip05.clone()),
+            "about": cached_profile.as_ref().and_then(|prof| prof.about.clone()),
+        });
+        
+        accounts_list.push(account_json);
+    }
 
-    info!("Returning {} unique profiles", accounts_list.len());
+    info!("Returning {} unique profiles (single_profile_mode: {})", accounts_list.len(), single_profile_mode);
     Ok(serde_json::json!({
         "accounts": accounts_list,
     }))
@@ -489,10 +511,27 @@ pub async fn switch_profile(
     };
 
     // Load the full profile using the determined key
-    let profile = match load_profile_from_keyring(&key_to_use) {
+    // Retry up to 5 times with 200ms delay to handle temporary keyring unavailability
+    // The OS keyring can be locked for a short time after logout or during auth operations
+    let mut profile = None;
+    for attempt in 1..=5 {
+        profile = load_profile_from_keyring(&key_to_use);
+        if profile.is_some() {
+            if attempt > 1 {
+                info!("Profile {} loaded from keyring on attempt {}", profile_id, attempt);
+            }
+            break;
+        }
+        if attempt < 5 {
+            warn!("Profile {} not found in keyring on attempt {}, retrying in 200ms...", profile_id, attempt);
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+    }
+    
+    let profile = match profile {
         Some(p) => p,
         None => {
-            error!("Profile {} not found in keyring (key: {})", profile_id, key_to_use);
+            error!("Profile {} not found in keyring after 5 attempts (key: {})", profile_id, key_to_use);
             return Err(format!("Profile not found: {}", profile_id));
         }
     };
@@ -554,11 +593,12 @@ pub async fn switch_profile(
                         let user_npub = pubkey.to_bech32().unwrap_or_default();
                         let _ = app_handle.emit("auth_success", user_npub.clone());
                         // Return in format frontend expects (wrapped in "account" field)
+                        // Include the profile name from metadata for immediate UI display
                         Ok(serde_json::json!({
                             "account": {
                                 "id": profile_id,
                                 "npub": user_npub,
-                                "name": null,
+                                "name": metadata.name,
                                 "signing_mode": "nip46",
                                 "last_used": 0,
                             }
@@ -748,6 +788,11 @@ pub async fn load_active_account(
     
     // Check if we have an active profile
     if let Some(ref profile_id) = state_guard.active_profile_id {
+        // Get profile metadata for the name
+        let profile_name = get_profile_metadata_by_id(profile_id)
+            .map(|m| m.name)
+            .unwrap_or_default();
+        
         // Try to get the client and fetch pubkey
         if let Some(ref client) = state_guard.active_client {
             // Get signer from client, then get public key
@@ -761,7 +806,7 @@ pub async fn load_active_account(
                                 "account": {
                                     "id": profile_id,
                                     "npub": user_npub,
-                                    "name": null,
+                                    "name": profile_name,
                                     "signing_mode": "nip46",
                                     "last_used": 0,
                                 }
@@ -774,7 +819,7 @@ pub async fn load_active_account(
                                 "account": {
                                     "id": profile_id,
                                     "npub": null,
-                                    "name": null,
+                                    "name": profile_name,
                                     "signing_mode": "nip46",
                                     "last_used": 0,
                                 }
@@ -789,7 +834,7 @@ pub async fn load_active_account(
                         "account": {
                             "id": profile_id,
                             "npub": null,
-                            "name": null,
+                            "name": profile_name,
                             "signing_mode": "nip46",
                             "last_used": 0,
                         }

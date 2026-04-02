@@ -16,9 +16,10 @@ use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
 use arcadestr_core::nostr::{EventDeduplicator, GameListing, NostrClient, UserProfile, DEFAULT_RELAYS, parse_nip19_identifier};
 use arcadestr_core::relay_cache::RelayCache;
 use arcadestr_core::profile_fetcher::ProfileFetcher;
+use arcadestr_core::user_cache::UserCache;
 use arcadestr_core::subscriptions::{SubscriptionRegistry, run_notification_loop, dispatch_permanent_subscriptions, dispatch_ephemeral_read};
 use arcadestr_core::nip46::AppSignerState;
-use arcadestr_core::nip46::{restore_session_on_startup, SessionRestoreResult};
+use arcadestr_core::nip46::{restore_session_on_startup, SessionRestoreResult, storage::{get_profile_metadata_by_id, load_profile_from_keyring}};
 use nostr::nips::nip46::NostrConnectURI;
 use nostr::prelude::ToBech32;
 use tauri::Emitter;
@@ -39,6 +40,8 @@ pub struct AppState {
     pub subscription_registry: Arc<SubscriptionRegistry>,
     /// Profile fetcher for batched profile fetching.
     pub profile_fetcher: Arc<ProfileFetcher>,
+    /// User cache for persistent profile storage.
+    pub user_cache: Arc<UserCache>,
 }
 
 /// Generates a nostrconnect:// URI for client-initiated NIP-46 connections.
@@ -428,16 +431,36 @@ fn main() {
     // Set the users directory for saved users
     arcadestr_core::saved_users::set_users_dir(keys_dir.clone());
     info!("Saved users directory: {}", keys_dir.display());
+    
+    // Set the profile metadata cache directory for NIP-46
+    arcadestr_core::nip46::set_profile_cache_dir(keys_dir.clone());
+    info!("Profile metadata cache directory: {}", keys_dir.display());
 
-    // Initialize NostrClient in a temporary runtime BEFORE Tauri starts
+    // Initialize database pool for persistent storage FIRST
+    let db_path = keys_dir.join("arcadestr.db");
+    let database = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        arcadestr_core::storage::Database::new(&db_path)
+            .await
+            .expect("Failed to initialize database")
+    });
+    info!("Database initialized at: {}", db_path.display());
+    
+    // Initialize UserCache with database pool BEFORE NostrClient
+    let user_cache = Arc::new(UserCache::new(database.pool().clone()));
+    info!("UserCache initialized");
+
+    // Initialize NostrClient with UserCache
     let nostr_client = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        match NostrClient::new(DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()).await {
+        match NostrClient::new_with_cache(
+            DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
+            user_cache.clone()
+        ).await {
             Ok(client) => client,
             Err(e) => {
                 eprintln!("Warning: Failed to initialize NostrClient: {}", e);
                 eprintln!("The app will start but relay functionality may be limited.");
                 // Create a client with no relays - user can retry later
-                NostrClient::new(vec![])
+                NostrClient::new_with_cache(vec![], user_cache.clone())
                     .await
                     .expect("Failed to create empty client")
             }
@@ -449,7 +472,16 @@ fn main() {
         .expect("Failed to create relay cache");
     let deduplicator = EventDeduplicator::new(10000);
     let subscription_registry = SubscriptionRegistry::new();
-    let profile_fetcher = ProfileFetcher::new();
+    
+    // Initialize ProfileFetcher with persistent cache
+    let profile_fetcher = Arc::new(ProfileFetcher::with_persistent_cache(user_cache.clone()));
+    info!("ProfileFetcher initialized with persistent cache");
+    
+    // Load cached profiles on startup
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let cached = profile_fetcher.load_cached_profiles().await;
+        info!("Loaded {} cached profiles on startup", cached.len());
+    });
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Saved Users Management Commands
@@ -572,7 +604,8 @@ fn main() {
                         state_profile_fetcher,
                         app_handle,
                         user_npub.clone(),
-                        Some(user_id.clone())
+                        Some(user_id.clone()),
+                        user.relay.clone(), // Pass the relay from saved user
                     ).await;
                     
                     Ok(serde_json::json!({
@@ -619,7 +652,8 @@ fn main() {
                             state_profile_fetcher,
                             app_handle,
                             user_npub.clone(),
-                            Some(user_id.clone())
+                            Some(user_id.clone()),
+                            Some(relay), // Pass the relay from NIP-46 connection
                         ).await;
                         
                         // Return both npub and profile
@@ -683,6 +717,7 @@ async fn fetch_profile_with_hints(
         app_handle: tauri::AppHandle,
         user_npub: String,
         user_id: Option<String>,
+        bunker_relay: Option<String>, // NEW PARAMETER
     ) -> UserProfile {
         use arcadestr_core::nostr::{build_relay_map, score_relays, select_relays};
         use arcadestr_core::subscriptions::dispatch_ephemeral_read;
@@ -690,6 +725,22 @@ async fn fetch_profile_with_hints(
         use arcadestr_core::CachedRelayList;
         
         let nostr_client = nostr.lock().await;
+        
+        // Add bunker relay if provided (for NIP-46 connections)
+        if let Some(ref relay) = bunker_relay {
+            tracing::info!("Adding bunker relay from NIP-46: {}", relay);
+            match nostr_client.add_relay(relay).await {
+                Ok(_) => {
+                    tracing::info!("Successfully added bunker relay: {}", relay);
+                    // Connect to the relay immediately
+                    nostr_client.connect().await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to add bunker relay {}: {}", relay, e);
+                }
+            }
+        }
         
         // FAST PATH: Fetch logged-in user's profile immediately from indexers
         tracing::info!("Fast path: fetching user profile for {}", user_npub);
@@ -989,6 +1040,7 @@ async fn fetch_profile_with_hints(
     /// This is called when the app initializes to update saved user metadata.
     #[tauri::command]
     async fn fetch_and_save_user_profile(
+        app: tauri::AppHandle,
         state: tauri::State<'_, AppState>,
     ) -> Result<UserProfile, String> {
         use arcadestr_core::saved_users::{load_saved_users, update_user_profile};
@@ -1016,9 +1068,33 @@ async fn fetch_profile_with_hints(
         
         tracing::info!("Found saved user: id={}, name={}", user.id, user.name);
         
-        // Fetch profile
+        // Get the bunker relay from NIP-46 session
+        let signer_state = app.state::<Arc<Mutex<AppSignerState>>>();
+        let signer_state_guard = signer_state.lock().await;
+
+        let bunker_relays: Vec<String> = if let Some(ref profile_id) = signer_state_guard.active_profile_id {
+            // Get the bunker pubkey from metadata
+            if let Some(metadata) = get_profile_metadata_by_id(profile_id) {
+                if let Some(profile) = load_profile_from_keyring(&metadata.bunker_pubkey_hex) {
+                    // Extract relay URLs from bunker_uri
+                    profile.bunker_uri.relays().iter().map(|url| url.to_string()).collect()
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        drop(signer_state_guard);
+
+        tracing::info!("Using {} bunker relays from NIP-46: {:?}", bunker_relays.len(), bunker_relays);
+        
+        // Fetch profile with bunker relays
         let nostr = state.nostr.lock().await;
-        let profile = match nostr.fetch_profile(&npub, None).await {
+        let profile = match nostr.fetch_profile(&npub, Some(bunker_relays)).await {
             Ok(p) => {
                 tracing::info!("Profile fetched: name={:?}, display_name={:?}, picture={:?}", 
                     p.name, p.display_name, p.picture);
@@ -1056,6 +1132,29 @@ async fn fetch_profile_with_hints(
         }
     }
 
+    /// Get all cached profiles from SQLite
+    #[tauri::command]
+    async fn get_cached_profiles(
+        state: tauri::State<'_, AppState>,
+    ) -> Result<Vec<UserProfile>, String> {
+        let cache = state.user_cache.clone();
+        
+        cache.get_all()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Get a single cached profile by npub
+    #[tauri::command]
+    async fn get_cached_profile(
+        npub: String,
+        state: tauri::State<'_, AppState>,
+    ) -> Result<Option<UserProfile>, String> {
+        let cache = state.user_cache.clone();
+        
+        Ok(cache.get(&npub).await)
+    }
+
     /// Get application version and revision info
     #[tauri::command]
     fn get_version_info() -> Result<VersionInfo, String> {
@@ -1085,7 +1184,8 @@ async fn fetch_profile_with_hints(
             relay_cache: Arc::new(relay_cache),
             deduplicator: Arc::new(Mutex::new(deduplicator)),
             subscription_registry: Arc::new(subscription_registry),
-            profile_fetcher: Arc::new(profile_fetcher),
+            profile_fetcher,
+            user_cache,
         })
         .manage(Arc::new(Mutex::new(AppSignerState::new())))
         .setup(|app| {
@@ -1148,6 +1248,8 @@ async fn fetch_profile_with_hints(
             get_connected_relay_count,
             get_connected_relays,
             fetch_and_save_user_profile,
+            get_cached_profiles,
+            get_cached_profile,
             get_version_info,
             // New NIP-46 commands from nip46_commands module
             nip46_commands::connect_bunker,
