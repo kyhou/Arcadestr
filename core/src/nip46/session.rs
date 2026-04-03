@@ -184,6 +184,16 @@ pub async fn restore_session_on_startup(
         metadata.bunker_pubkey_hex.clone()
     };
 
+    // Validate: Check if profile actually exists in keyring before attempting restore
+    if load_profile_from_keyring(&key_to_use).is_none() {
+        warn!(
+            "Last active profile {} (key: {}) no longer exists in keyring, clearing last active",
+            profile_id, key_to_use
+        );
+        clear_last_active_profile_id();
+        return SessionRestoreResult::NoSession;
+    }
+
     // STEP 3: Load full profile from keyring
     let profile = match load_profile_from_keyring(&key_to_use) {
         Some(p) => p,
