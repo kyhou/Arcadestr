@@ -6,6 +6,7 @@
 use crate::nostr::{DEFAULT_RELAYS, DISCOVERY_RELAYS, INDEXER_RELAYS};
 use crate::relay_events::{RelayConnectionEvent, RelayStatus};
 use crate::relay_pool::{RelayPool, RelaySource};
+use futures::future;
 use nostr_sdk::{Client, Event, Filter, Url};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -302,6 +303,142 @@ impl RelayManager {
                 Err(RelayManagerError::QueryTimeout)
             }
         }
+    }
+
+    /// Fetch events from all connected relays with streaming results.
+    ///
+    /// Queries each relay individually and calls the callback as results arrive.
+    /// This allows faster relays to contribute results immediately without waiting
+    /// for slower ones. Continues until all relays respond or 5s of inactivity.
+    ///
+    /// # Arguments
+    /// * `filter` - The nostr filter to apply
+    /// * `timeout_secs` - Maximum timeout per relay in seconds
+    /// * `inactivity_timeout_secs` - Stop after this many seconds of no new results
+    /// * `on_events` - Callback invoked with (relay_url, events) as each relay responds
+    ///
+    /// # Returns
+    /// Returns total event count from all relays.
+    pub async fn fetch_events_streaming<F>(
+        &self,
+        filter: Filter,
+        timeout_secs: u64,
+        inactivity_timeout_secs: u64,
+        mut on_events: F,
+    ) -> Result<usize, RelayManagerError>
+    where
+        F: FnMut(String, Vec<Event>) + Send + 'static,
+    {
+        // Get connected relays
+        let relays = self.client.relays().await;
+        let connected_relays: Vec<(String, nostr_sdk::Relay)> = relays
+            .into_iter()
+            .filter(|(_, r)| r.is_connected())
+            .map(|(url, r)| (url.to_string(), r))
+            .collect();
+
+        if connected_relays.is_empty() {
+            return Err(RelayManagerError::Connection(
+                "No connected relays available".to_string(),
+            ));
+        }
+
+        let client = self.client.clone();
+        let filter = Arc::new(filter);
+        let timeout_duration = Duration::from_secs(timeout_secs);
+        let inactivity_duration = Duration::from_secs(inactivity_timeout_secs);
+
+        // Spawn tasks for each relay
+        let mut handles = Vec::new();
+        for (relay_url, _) in connected_relays {
+            let client = client.clone();
+            let filter = Arc::clone(&filter);
+            let url = relay_url.clone();
+
+            let handle = tokio::spawn(async move {
+                match Url::parse(&url) {
+                    Ok(url_parsed) => {
+                        let result = timeout(
+                            timeout_duration,
+                            client.fetch_events_from(vec![url_parsed], (*filter).clone(), timeout_duration)
+                        ).await;
+
+                        match result {
+                            Ok(Ok(events)) => {
+                                let events_vec: Vec<Event> = events.into_iter().collect();
+                                debug!("Relay {} returned {} events", url, events_vec.len());
+                                Some((url, events_vec))
+                            }
+                            Ok(Err(e)) => {
+                                debug!("Relay {} fetch failed: {}", url, e);
+                                None
+                            }
+                            Err(_) => {
+                                debug!("Relay {} timed out after {}s", url, timeout_secs);
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Failed to parse relay URL {}: {}", url, e);
+                        None
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Collect results with inactivity timeout
+        let total_relays = handles.len();
+        let mut completed = 0;
+        let mut total_events = 0;
+        let mut last_result_time = tokio::time::Instant::now();
+
+        loop {
+            let timeout_future = tokio::time::timeout(
+                inactivity_duration,
+                future::select_all(handles)
+            );
+
+            match timeout_future.await {
+                Ok((result, _index, remaining)) => {
+                    handles = remaining;
+                    completed += 1;
+
+                    if let Ok(Some((relay_url, events))) = result {
+                        let count = events.len();
+                        total_events += count;
+                        last_result_time = tokio::time::Instant::now();
+                        on_events(relay_url, events);
+                        debug!("Processed {}/{} relays, {} events so far", completed, total_relays, total_events);
+                    }
+
+                    if handles.is_empty() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // Inactivity timeout
+                    warn!(
+                        "Streaming fetch inactivity timeout after {}s ({} of {} relays completed, {} events)",
+                        inactivity_timeout_secs, completed, total_relays, total_events
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Cancel remaining tasks
+        for handle in handles {
+            handle.abort();
+        }
+
+        info!(
+            "Streaming fetch complete: {} of {} relays responded, {} total events",
+            completed, total_relays, total_events
+        );
+
+        Ok(total_events)
     }
 
     /// Fetch events from a specific subset of relays.
