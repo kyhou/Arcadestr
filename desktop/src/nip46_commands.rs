@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 
 use arcadestr_core::nip46::{
     activate_profile, attempt_manual_reconnect, cancel_bunker_retry, clear_last_active_profile_id,
-    delete_profile_from_keyring, generate_login_qr, get_profile_metadata_by_id, init_signer_session, init_signer_session_fast,
+    delete_profile_from_keyring, generate_login_qr, get_profile_metadata_by_id, init_signer_session,
     list_profile_index, load_profile_from_keyring, logout, ping_active_signer,
     save_profile_to_keyring, set_last_active_profile_id, wait_for_qr_connection, AppSignerState,
     ConnectionState, PendingQrState, ProfileMetadata,
@@ -60,10 +60,11 @@ pub async fn connect_bunker(
     };
 
     // STEP 2: Set up auth URL handler for bunkers that need browser approval (e.g., nsec.app)
-    let auth_url_handler = |auth_url: url::Url| {
+    let app_handle_clone = app_handle.clone();
+    let auth_url_handler = move |auth_url: url::Url| {
         info!("Auth URL received from bunker: {}", auth_url);
         // Emit event to frontend to open browser
-        let _ = app_handle.emit("bunker-auth-challenge", auth_url.to_string());
+        let _ = app_handle_clone.emit("bunker-auth-challenge", auth_url.to_string());
     };
 
     // STEP 3: Perform BLOCKING NIP-46 handshake
