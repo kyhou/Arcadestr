@@ -53,6 +53,20 @@ impl MarketplaceStore {
         });
     }
 
+    /// Add or update a single listing incrementally.
+    ///
+    /// Similar to `put()` but silently skips duplicates without logging.
+    /// Use this for streaming updates where the same product may arrive
+    /// from multiple relays.
+    pub fn put_streaming(&self, listing: GameListing) {
+        self.listings.update(|map| {
+            // Deduplicate: only insert if not already present
+            if !map.contains_key(&listing.id) {
+                map.insert(listing.id.clone(), listing);
+            }
+        });
+    }
+
     /// Check if a listing exists in the store
     pub fn has(&self, id: &str) -> bool {
         self.listings.get().contains_key(id)

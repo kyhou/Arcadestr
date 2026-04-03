@@ -93,13 +93,48 @@ where
     }
 }
 
+fn deserialize_optional_vec_shipping_zone<'de, D>(deserializer: D) -> Result<Vec<ShippingZone>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalVecShippingZoneVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptionalVecShippingZoneVisitor {
+        type Value = Vec<ShippingZone>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an array of shipping zones or null")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut vec = Vec::new();
+            while let Some(item) = seq.next_element()? {
+                vec.push(item);
+            }
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_option(OptionalVecShippingZoneVisitor)
+}
+
 #[derive(Debug, Deserialize)]
 struct StallContent {
     id: String,
     name: String,
     description: Option<String>,
     currency: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_vec_shipping_zone")]
     shipping: Vec<ShippingZone>,
 }
 
@@ -134,7 +169,9 @@ pub struct ShippingZone {
     pub id: String,
     pub name: Option<String>,
     /// Base shipping cost for orders to this zone (in the stall's currency).
+    #[serde(deserialize_with = "deserialize_f64_or_string")]
     pub cost: f64,
+    #[serde(default)]
     pub regions: Vec<String>,
 }
 
@@ -146,6 +183,7 @@ pub struct ShippingZone {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductShipping {
     pub id: String,
+    #[serde(deserialize_with = "deserialize_f64_or_string")]
     pub cost: f64,
 }
 

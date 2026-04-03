@@ -6,8 +6,10 @@ use wasm_bindgen_futures::spawn_local;
 use crate::components::{ProfileAvatar, ProfileDisplayName};
 use crate::fetch_and_store_profile;
 use crate::models::GameListing;
-use crate::store::{try_use_marketplace_store, MarketplaceStore, DEFAULT_LISTING_TTL_SECS};
-use crate::{invoke_fetch_marketplace, AuthContext};
+use crate::store::{try_use_marketplace_store, DEFAULT_LISTING_TTL_SECS};
+use crate::invoke_fetch_marketplace_stream;
+use crate::AuthContext;
+use gloo_timers::future::TimeoutFuture;
 
 /// Browse view component - displays a grid of game listings.
 /// Uses MarketplaceStore to persist listings across navigation.
@@ -20,13 +22,15 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
     let listings = RwSignal::new(Vec::<GameListing>::new());
     let is_loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
+    let received_count = RwSignal::new(0);
 
-    // Fetch listings on mount - use cache if available and fresh
+    // Fetch listings on mount using streaming
     Effect::new(move |_| {
         let store = marketplace_store.clone();
         spawn_local(async move {
             is_loading.set(true);
             error.set(None);
+            received_count.set(0);
 
             // Check if we have cached listings that are still fresh
             let should_fetch = match &store {
@@ -47,15 +51,46 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
             };
 
             if should_fetch {
-                match invoke_fetch_marketplace(50, Some(30), None).await {
-                    Ok(fetched) => {
-                        // Update cache if store is available
-                        if let Some(s) = &store {
-                            s.put_many(fetched.clone());
+                // Clear cache to prepare for streaming
+                if let Some(s) = &store {
+                    s.clear();
+                }
+                
+                // Start streaming fetch
+                let store_clone = store.clone();
+                let on_listing = move |listing: GameListing| {
+                    received_count.update(|c| *c += 1);
+                    if let Some(s) = &store_clone {
+                        s.put_streaming(listing.clone());
+                    }
+                    // Update listings signal to trigger re-render
+                    listings.update(|v| {
+                        // Check for duplicates in the vector too
+                        if !v.iter().any(|l| l.id == listing.id) {
+                            v.push(listing);
+                        }
+                    });
+                };
+                
+                let on_complete = Some({
+                    let store_clone = store.clone();
+                    move || {
+                        // Mark cache as fresh when complete
+                        if let Some(s) = &store_clone {
                             s.mark_fresh();
                         }
-                        listings.set(fetched);
                         is_loading.set(false);
+                    }
+                });
+                
+                match invoke_fetch_marketplace_stream(50, Some(30), on_listing, on_complete).await {
+                    Ok((product_cleanup, completion_cleanup)) => {
+                        // Clean up listeners after a delay
+                        spawn_local(async move {
+                            TimeoutFuture::new(5000).await;
+                            product_cleanup();
+                            completion_cleanup();
+                        });
                     }
                     Err(e) => {
                         // If fetch fails but we have cached data, use it as fallback
@@ -64,7 +99,6 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                             if !cached.is_empty() {
                                 listings.set(cached);
                                 is_loading.set(false);
-                                // Still log the error but don't show it to user
                                 #[cfg(target_arch = "wasm32")]
                                 web_sys::console::warn_1(
                                     &format!(
@@ -93,9 +127,16 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
 
             {move || {
                 if is_loading.get() {
+                    let count = received_count.get();
                     view! {
                         <div class="loading-state">
-                            <p>"Fetching listings from relays..."</p>
+                            <p>
+                                {if count > 0 {
+                                    format!("Loading... {} products found", count)
+                                } else {
+                                    "Fetching listings from relays...".to_string()
+                                }}
+                            </p>
                         </div>
                     }.into_any()
                 } else if let Some(err) = error.get() {
