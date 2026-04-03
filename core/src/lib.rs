@@ -48,6 +48,9 @@ pub mod subscriptions;
 pub mod profile_fetcher;
 
 #[cfg(feature = "native")]
+pub mod nip05_validator;
+
+#[cfg(feature = "native")]
 pub mod user_cache;
 
 #[cfg(feature = "native")]
@@ -63,6 +66,9 @@ pub use profile_fetcher::{
 
 #[cfg(feature = "native")]
 pub use user_cache::UserCache;
+
+#[cfg(feature = "native")]
+pub use nip05_validator::{Nip05Validator, ValidationCommand, ValidationResult};
 
 #[cfg(feature = "native")]
 pub mod lightning;
