@@ -5,6 +5,7 @@
 
 use nostr::prelude::ToBech32;
 use nostr::signer::NostrSigner;
+use nostr::nips::nip46::NostrConnectURI;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
@@ -19,9 +20,12 @@ use arcadestr_core::nip46::{
 };
 
 /// Called by Leptos when the user submits a bunker URI or NIP-05 address.
-/// Flow A entry point - FAST VERSION (async connection).
-/// On success: saves profile to keyring and activates it immediately.
-/// Returns the new profile's ID and display name to the frontend.
+/// Flow A entry point - BLOCKING VERSION (waits for handshake).
+/// On success: saves profile to keyring and returns the user npub.
+/// 
+/// IMPORTANT: This function BLOCKS until the user approves the connection
+/// in their signer app (Amber, nsec.app, etc.). The frontend will show
+/// "Connecting..." during this time.
 #[tauri::command]
 pub async fn connect_bunker(
     identifier: String,
@@ -30,15 +34,15 @@ pub async fn connect_bunker(
     app_handle: AppHandle,
 ) -> Result<serde_json::Value, String> {
     info!(
-        "connect_bunker called (fast mode): identifier={}, display_name={}",
+        "connect_bunker called (blocking handshake): identifier={}, display_name={}",
         identifier, display_name
     );
 
-    // Parse the bunker URI to extract user_pubkey and create NostrConnectURI
-    let (bunker_uri, user_pubkey) = if identifier.contains('@') {
-        // NIP-05 identifier - resolve to get pubkey and relays
+    // STEP 1: Parse the identifier to get bunker_uri and optional user_pubkey hint
+    let (bunker_uri, _user_pubkey_hint) = if identifier.contains('@') {
+        // NIP-05 identifier - resolve to get bunker URI
         match resolve_nip05_to_uri_and_pubkey(&identifier).await {
-            Ok((uri, pubkey)) => (uri, pubkey),
+            Ok((uri, pubkey)) => (uri, Some(pubkey)),
             Err(e) => {
                 error!("Failed to resolve NIP-05: {}", e);
                 return Err(format!("Failed to resolve NIP-05: {}", e));
@@ -47,7 +51,7 @@ pub async fn connect_bunker(
     } else {
         // Parse bunker URI directly
         match parse_bunker_uri(&identifier) {
-            Ok((uri, pubkey)) => (uri, pubkey),
+            Ok(uri) => (uri, None),
             Err(e) => {
                 error!("Failed to parse bunker URI: {}", e);
                 return Err(format!("Invalid bunker URI: {}", e));
@@ -55,18 +59,38 @@ pub async fn connect_bunker(
         }
     };
 
-    // Initialize signer session with fast async flow (no blocking handshake)
-    let (mut profile, client) = init_signer_session_fast(bunker_uri, user_pubkey)
-        .await
-        .map_err(|e| {
-            error!("init_signer_session_fast failed: {}", e);
-            e.to_string()
-        })?;
+    // STEP 2: Set up auth URL handler for bunkers that need browser approval (e.g., nsec.app)
+    let auth_url_handler = |auth_url: url::Url| {
+        info!("Auth URL received from bunker: {}", auth_url);
+        // Emit event to frontend to open browser
+        let _ = app_handle.emit("bunker-auth-challenge", auth_url.to_string());
+    };
 
-    // Allow the user to override the auto-generated name
-    profile.name = display_name.clone();
+    // STEP 3: Perform BLOCKING NIP-46 handshake
+    // This waits for the user to approve the connection in their signer app
+    info!("Starting blocking NIP-46 handshake...");
+    let bunker_uri_string: String = bunker_uri.to_string();
+    let (mut profile, client) = init_signer_session(
+        &bunker_uri_string,
+        Some(auth_url_handler),
+    )
+    .await
+    .map_err(|e| {
+        error!("NIP-46 handshake failed: {}", e);
+        format!("Failed to connect to bunker: {}", e)
+    })?;
 
-    // Save to keyring
+    info!(
+        "NIP-46 handshake successful! user_pubkey={}",
+        profile.user_pubkey.to_hex()
+    );
+
+    // STEP 4: Allow the user to override the auto-generated name
+    if !display_name.is_empty() {
+        profile.name = display_name.clone();
+    }
+
+    // STEP 5: Save to keyring
     save_profile_to_keyring(&profile).map_err(|e| {
         error!("save_profile_to_keyring failed: {}", e);
         e.to_string()
@@ -74,93 +98,58 @@ pub async fn connect_bunker(
 
     info!("Profile saved to keyring: id={}", profile.id);
 
-    // Get bunker pubkey for state management
+    // STEP 6: Get bunker pubkey for state management
     let bunker_pubkey = profile
         .bunker_uri
         .remote_signer_public_key()
         .ok_or("No remote signer public key in URI")?
         .to_hex();
 
-    // Update state with the client (connection happens in background)
+    // STEP 7: Update state with the client
     {
         let mut state_guard = state.lock().await;
         state_guard.active_client = Some(client.clone());
         state_guard.active_profile_id = Some(bunker_pubkey.clone());
-        state_guard.connection_state = ConnectionState::Connecting; // Will transition on first sign
+        state_guard.connection_state = ConnectionState::Connected; // Already connected!
     }
 
-    // Trigger connection in background
-    let state_clone = state.inner().clone();
-    tokio::spawn(async move {
-        info!("Triggering deferred NIP-46 connection in background for new session...");
-        match client.signer().await {
-            Ok(signer) => match signer.get_public_key().await {
-                Ok(_) => {
-                    info!("NIP-46 connection established successfully for new session");
-                    let mut state_guard = state_clone.lock().await;
-                    state_guard.connection_state = ConnectionState::Connected;
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to establish NIP-46 connection for new session: {}",
-                        e
-                    );
-                    let mut state_guard = state_clone.lock().await;
-                    state_guard.connection_state = ConnectionState::Failed(e.to_string());
-                }
-            },
-            Err(e) => {
-                error!("Failed to get signer from client for new session: {}", e);
-                let mut state_guard = state_clone.lock().await;
-                state_guard.connection_state = ConnectionState::Failed(e.to_string());
-            }
-        }
-    });
-
-    // Set as last active profile for auto-restore on next startup
+    // STEP 8: Set as last active profile for auto-restore on next startup
     if let Err(e) = set_last_active_profile_id(&profile.id) {
         warn!("Failed to set last active profile ID: {}", e);
     }
 
-    // Emit auth success event immediately (fast!)
+    // STEP 9: Return success with correct user npub
     let user_npub = profile
         .user_pubkey
         .to_bech32()
         .map_err(|e| format!("Failed to encode pubkey: {}", e))?;
-    let _ = app_handle.emit("auth_success", user_npub.clone());
 
-    info!("Fast authentication complete! user_npub={}", user_npub);
+    info!("Authentication complete! user_npub={}", user_npub);
 
-    // Return profile info immediately with connection state
+    // Return profile info with connected state
     Ok(serde_json::json!({
         "id": profile.id,
         "name": profile.name,
         "pubkey": user_npub,
         "pubkey_hex": profile.user_pubkey.to_hex(),
-        "connection_state": "connecting",
+        "connection_state": "connected",
     }))
 }
 
-/// Parse a bunker:// URI and extract the NostrConnectURI and user public key
+/// Parse a bunker:// URI and extract the NostrConnectURI
+/// Note: The user_pubkey is NOT available from the bunker URI itself - it must be
+/// obtained from the NIP-46 handshake via get_public_key().
 fn parse_bunker_uri(
     uri_str: &str,
-) -> Result<(nostr::nips::nip46::NostrConnectURI, nostr::PublicKey), String> {
+) -> Result<NostrConnectURI, String> {
     use nostr::nips::nip46::NostrConnectURI;
 
     let uri = NostrConnectURI::parse(uri_str)
         .map_err(|e| format!("Failed to parse bunker URI: {}", e))?;
 
-    // For bunker URIs, we need to get the remote signer pubkey
-    // The user_pubkey will be obtained during the actual handshake
-    // For now, we use a placeholder that will be updated on first connection
-    let remote_pubkey = uri
-        .remote_signer_public_key()
-        .ok_or_else(|| "No remote signer public key in bunker URI".to_string())?
-        .clone();
-
-    // Note: The actual user pubkey will be obtained during the handshake
-    // We use the remote signer pubkey as a placeholder for now
-    Ok((uri, remote_pubkey))
+    // For bunker URIs, we cannot determine the user pubkey from the URI alone.
+    // The user pubkey will be obtained during the NIP-46 handshake.
+    Ok(uri)
 }
 
 /// Resolve NIP-05 identifier to NostrConnectURI and public key

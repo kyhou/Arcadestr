@@ -3646,8 +3646,8 @@ fn LoginView() -> impl IntoView {
         view_mode.set(LoginViewMode::AddAccount);
     };
 
-    // Handle bunker:// connect button click (updated for new NIP-46 API)
-    // Now uses connect_bunker which handles both connection and saving
+    // Handle bunker:// connect button click (updated for blocking NIP-46 API)
+    // Now uses connect_bunker which waits for user approval in signer app
     let on_connect_bunker = move |_| {
         let auth = auth_stored.get_value();
         let uri_val = bunker_uri.get();
@@ -3660,11 +3660,17 @@ fn LoginView() -> impl IntoView {
             return;
         }
 
+        // Check if already connecting
+        if auth.is_loading.get() {
+            return; // Prevent multiple simultaneous attempts
+        }
+
         auth.is_loading.set(true);
         auth.error.set(None);
 
         spawn_local(async move {
-            // Use the new connect_bunker API which handles both connection and saving
+            // Use the connect_bunker API which performs blocking handshake
+            // This can take 30-60 seconds while waiting for user approval
             match invoke_connect_bunker(uri_val, display_name_val).await {
                 Ok(result) => {
                     // Extract npub from result
@@ -3677,6 +3683,10 @@ fn LoginView() -> impl IntoView {
 
                         // Start connection status polling for NIP-46 accounts
                         auth.start_connection_status_polling().await;
+                        
+                        // Clear the input field
+                        bunker_uri.set(String::new());
+                        bunker_display_name.set(String::new());
                     } else {
                         auth.error.set(Some(
                             "Connected but failed to get pubkey from response".to_string(),
@@ -3836,7 +3846,15 @@ fn LoginView() -> impl IntoView {
                                     </div>
 
                                     <button on:click=on_connect_bunker disabled=move || auth_stored.get_value().is_loading.get()>
-                                        {move || if auth_stored.get_value().is_loading.get() { "Connecting..." } else { "Connect with Bunker" }}
+                                        {move || if auth_stored.get_value().is_loading.get() { "Waiting for signer approval..." } else { "Connect with Bunker" }}
+                                    </button>
+
+                                    <p class="bunker-hint">
+                                        "After clicking connect, approve the connection in your signer app (Amber, nsec.app, etc.)"
+                                    </p>
+
+                                    <button on:click=on_generate_nostrconnect disabled=move || auth_stored.get_value().is_loading.get()>
+                                        "Generate nostrconnect:// URI"
                                     </button>
 
                                     <button on:click=on_generate_nostrconnect disabled=move || auth_stored.get_value().is_loading.get()>
