@@ -14,6 +14,7 @@
 //! | [`apply_filter`]        | Pure function: apply a filter to a product list         |
 //! | `fetch_nip15_stalls_impl`   | `pub(crate)` relay query for kind-30017            |
 //! | `fetch_nip15_products_impl` | `pub(crate)` relay query for kind-30018            |
+//! | `fetch_nip15_products_streaming` | `pub` streaming relay query for kind-30018      |
 //!
 //! Callers outside this crate should go through the `NostrClient` wrapper
 //! methods in `nostr.rs`, which keep the inner `nostr_sdk::Client` private.
@@ -437,6 +438,97 @@ pub(crate) async fn fetch_nip15_products_impl(
         products.len()
     );
     Ok(products)
+}
+
+/// Fetch NIP-15 products (kind 30018) with streaming results from each relay.
+///
+/// * `relay_manager` — the relay manager for relay communication.
+/// * `limit`      — maximum number of events to return.
+/// * `since_days` — if `Some(n)`, restrict to events published in the last
+///                  `n` days (open marketplace, no pubkey filter).
+/// * `on_product` — callback invoked for each unique product as it arrives.
+///
+/// Returns the total count of unique products found.
+/// 
+/// Products are deduplicated by ID (first occurrence wins).
+/// Events that fail to parse are silently skipped.
+pub async fn fetch_nip15_products_streaming<F>(
+    relay_manager: &Arc<tokio::sync::Mutex<RelayManager>>,
+    limit: usize,
+    since_days: Option<u64>,
+    mut on_product: F,
+) -> Result<u32, String>
+where
+    F: FnMut(Nip15Product) + Send + 'static,
+{
+    use std::collections::HashSet;
+    use tokio::sync::Mutex;
+    
+    let filter = build_filter(Kind::Custom(30018), limit, since_days);
+
+    tracing::info!(
+        "Streaming NIP-15 products: kind=30018, limit={}, since_days={:?}",
+        limit,
+        since_days
+    );
+
+    let manager = relay_manager.lock().await;
+    
+    // Track seen product IDs for deduplication
+    let seen_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let product_count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    
+    let seen_ids_clone = Arc::clone(&seen_ids);
+    let product_count_clone = Arc::clone(&product_count);
+    
+    // Stream events from relays
+    let result = manager.fetch_events_streaming(
+        filter,
+        5,  // 5s timeout per relay
+        5,  // 5s inactivity timeout
+        move |_relay_url, events| {
+            // Parse events and emit products
+            for event in events {
+                match parse_product(event) {
+                    Ok(product) => {
+                        // Deduplicate by ID
+                        let mut seen = seen_ids_clone.try_lock();
+                        if let Ok(ref mut guard) = seen {
+                            if !guard.contains(&product.id) {
+                                guard.insert(product.id.clone());
+                                drop(guard);
+                                
+                                // Update count
+                                if let Ok(mut count) = product_count_clone.try_lock() {
+                                    *count += 1;
+                                }
+                                
+                                // Emit product
+                                on_product(product);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Skipping malformed product event: {}", e);
+                    }
+                }
+            }
+        }
+    ).await;
+
+    let count = match result {
+        Ok(_) => {
+            let count = *product_count.lock().await;
+            tracing::info!("Streaming fetch complete: {} unique products", count);
+            count
+        }
+        Err(e) => {
+            tracing::warn!("Streaming fetch ended with error: {}", e);
+            *product_count.lock().await
+        }
+    };
+
+    Ok(count)
 }
 
 // ── Internal parsing helpers ──────────────────────────────────────────────────
