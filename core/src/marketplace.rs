@@ -529,19 +529,21 @@ where
             for event in events {
                 match parse_product(event) {
                     Ok(product) => {
-                        // Deduplicate by ID
-                        let mut seen = seen_ids_clone.blocking_lock();
-                        if !seen.contains(&product.id) {
-                            seen.insert(product.id.clone());
-                            drop(seen);  // Explicitly drop to release lock before callback
-                            
-                            // Update count
-                            let mut count = product_count_clone.blocking_lock();
-                            *count += 1;
-                            drop(count);  // Explicitly drop to release lock before callback
-                            
-                            // Emit product
-                            on_product(product);
+                        // Deduplicate by ID - use try_lock to avoid blocking in async context
+                        if let Ok(mut seen) = seen_ids_clone.try_lock() {
+                            if !seen.contains(&product.id) {
+                                seen.insert(product.id.clone());
+                                drop(seen);  // Explicitly drop to release lock
+                                
+                                // Update count
+                                if let Ok(mut count) = product_count_clone.try_lock() {
+                                    *count += 1;
+                                    drop(count);  // Explicitly drop to release lock
+                                }
+                                
+                                // Emit product
+                                on_product(product);
+                            }
                         }
                     }
                     Err(e) => {
