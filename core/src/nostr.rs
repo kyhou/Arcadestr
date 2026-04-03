@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::broadcast;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::auth::AuthState;
@@ -19,8 +21,6 @@ use crate::relay_hints::RelayHints;
 use crate::relay_manager::{RelayManager, RelayManagerConfig};
 use crate::signers::{ActiveSigner, NostrSigner as ArcadestrNostrSigner, SignerError};
 use crate::user_cache::UserCache;
-use tokio::sync::broadcast;
-use tokio::sync::Mutex;
 
 /// Arcadestr game listing event kind.
 /// Using kind 30078 (NIP-78 arbitrary app data, parameterized replaceable).
@@ -59,6 +59,12 @@ pub const KIND_RELAY_LIST: u16 = 10002;
 
 /// Kind 3: Follow List (NIP-02)
 pub const KIND_FOLLOW_LIST: u16 = 3;
+
+/// Capacity of the relay event broadcast channel.
+/// 
+/// This bounds memory usage while allowing for burst event handling.
+/// Events are dropped if the channel is full (acceptable for non-critical events).
+const RELAY_EVENT_CHANNEL_CAPACITY: usize = 100;
 
 // ============================================
 // Event De-duplication (Task 1)
@@ -530,6 +536,7 @@ pub struct NostrClient {
     relay_manager: Arc<Mutex<RelayManager>>,
     user_cache: Option<Arc<UserCache>>,
     profile_id: String,
+    /// Broadcast sender for relay connection events.
     relay_event_sender: broadcast::Sender<RelayConnectionEvent>,
 }
 
@@ -539,7 +546,21 @@ impl NostrClient {
         self.relay_manager.clone()
     }
 
-    /// Subscribe to relay connection events
+    /// Subscribe to relay connection events.
+    ///
+    /// Returns a broadcast receiver that receives `RelayConnectionEvent` values
+    /// whenever a relay connects or disconnects. Multiple subscribers can receive
+    /// events simultaneously.
+    ///
+    /// # Examples
+    /// ```
+    /// let client = NostrClient::new("profile".to_string(), vec![], None).await?;
+    /// let mut rx = client.subscribe_relay_events();
+    /// 
+    /// while let Ok(event) = rx.recv().await {
+    ///     println!("Relay event: {:?}", event);
+    /// }
+    /// ```
     pub fn subscribe_relay_events(&self) -> broadcast::Receiver<RelayConnectionEvent> {
         self.relay_event_sender.subscribe()
     }
@@ -577,7 +598,7 @@ impl NostrClient {
 
         info!("NostrClient initialized with relay manager");
 
-        let (relay_event_sender, _) = broadcast::channel(100);
+        let (relay_event_sender, _) = broadcast::channel(RELAY_EVENT_CHANNEL_CAPACITY);
 
         Ok(Self {
             relay_manager: Arc::new(Mutex::new(relay_manager)),
@@ -620,7 +641,7 @@ impl NostrClient {
 
         info!("NostrClient initialized with relay manager and cache");
 
-        let (relay_event_sender, _) = broadcast::channel(100);
+        let (relay_event_sender, _) = broadcast::channel(RELAY_EVENT_CHANNEL_CAPACITY);
 
         Ok(Self {
             relay_manager: Arc::new(Mutex::new(relay_manager)),
@@ -1925,4 +1946,16 @@ mod follow_list_tests {
         assert_eq!(pubkeys.len(), 1); // Only the p-tag pubkey
         assert!(pubkeys.contains(&pubkey));
     }
+}
+
+#[cfg(test)]
+mod assertions {
+    use super::NostrClient;
+    
+    const _: () = {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<NostrClient>();
+        assert_sync::<NostrClient>();
+    };
 }
