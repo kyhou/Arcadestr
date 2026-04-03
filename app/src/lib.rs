@@ -784,6 +784,68 @@ pub async fn invoke_fetch_marketplace(
     Err("Tauri not available in web mode".to_string())
 }
 
+/// Invoke streaming marketplace fetch command.
+/// 
+/// This starts a streaming fetch that emits products via Tauri events.
+/// The `on_listing` callback is called for each product as it arrives.
+/// 
+/// # Arguments
+/// * `limit` - Maximum products to fetch
+/// * `since_days` - Time window for events
+/// * `on_listing` - Callback invoked for each product
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+pub async fn invoke_fetch_marketplace_stream<F>(
+    limit: usize,
+    since_days: Option<u64>,
+    mut on_listing: F,
+) -> Result<(), String>
+where
+    F: FnMut(GameListing) + 'static,
+{
+    use crate::tauri_invoke::listen;
+    
+    // Set up listener for products before starting fetch
+    let product_listener = listen("marketplace-product", move |data| {
+        if let Ok(listing) = serde_json::from_value::<GameListing>(data) {
+            on_listing(listing);
+        }
+    }).await;
+    
+    if let Err(e) = product_listener {
+        return Err(format!("Failed to setup product listener: {}", e));
+    }
+    
+    // Also listen for completion
+    let _completion_listener = listen("marketplace-complete", |_data| {
+        // Completion signal - listener can be cleaned up
+    }).await;
+    
+    // Call the streaming command
+    let args = serde_json::json!({
+        "limit": limit,
+        "since_days": since_days,
+    });
+    
+    let result: Result<(), String> = crate::tauri_invoke::invoke("fetch_marketplace_stream", args).await;
+    
+    // Note: listeners continue to receive events after command returns
+    // They should be cleaned up by the caller when done
+    
+    result
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+pub async fn invoke_fetch_marketplace_stream<F>(
+    _limit: usize,
+    _since_days: Option<u64>,
+    _on_listing: F,
+) -> Result<(), String>
+where
+    F: FnMut(GameListing) + 'static,
+{
+    Err("Tauri not available in web mode".to_string())
+}
+
 /// Invoke fetch_listing_by_id Tauri command
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 pub async fn invoke_fetch_listing_by_id(
