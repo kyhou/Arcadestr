@@ -16,7 +16,10 @@ pub mod models;
 pub mod store;
 
 // Import ProfileStore and related functions for store initialization and event handlers
-use crate::store::{provide_profile_store, try_use_profile_store, use_profile_store, ProfileStore};
+use crate::store::{
+    provide_marketplace_store, provide_profile_store, try_use_marketplace_store,
+    try_use_profile_store, use_marketplace_store, use_profile_store, MarketplaceStore, ProfileStore,
+};
 
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 pub mod web_auth;
@@ -739,15 +742,44 @@ pub async fn invoke_publish_listing(_listing: GameListing) -> Result<String, Str
 pub async fn invoke_fetch_listings(limit: usize) -> Result<Vec<GameListing>, String> {
     use crate::tauri_invoke::invoke;
 
+    // Use the new fetch_marketplace command with default filter
     let fetch_args = serde_json::json!({
-        "limit": limit
+        "limit": limit,
+        "since_days": 30,
+        "filter": null
     });
 
-    invoke("fetch_listings", fetch_args).await
+    invoke("fetch_marketplace", fetch_args).await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
 pub async fn invoke_fetch_listings(_limit: usize) -> Result<Vec<GameListing>, String> {
+    Err("Tauri not available in web mode".to_string())
+}
+
+/// Invoke fetch_marketplace Tauri command (new NIP-15 API)
+#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+pub async fn invoke_fetch_marketplace(
+    limit: usize,
+    since_days: Option<u64>,
+    filter: Option<serde_json::Value>,
+) -> Result<Vec<GameListing>, String> {
+    use crate::tauri_invoke::invoke;
+
+    let args = serde_json::json!({
+        "limit": limit,
+        "since_days": since_days,
+        "filter": filter,
+    });
+    invoke("fetch_marketplace", args).await
+}
+
+#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+pub async fn invoke_fetch_marketplace(
+    _limit: usize,
+    _since_days: Option<u64>,
+    _filter: Option<serde_json::Value>,
+) -> Result<Vec<GameListing>, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
@@ -4117,49 +4149,83 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
         });
     };
 
-    // Poll relay count every 5 seconds
-    Effect::new(move |_| {
-        if let Some(window) = web_sys::window() {
-            let relay_count_clone = relay_count.clone();
-            let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
-                &Closure::wrap(Box::new(move || {
-                    let relay_count_local = relay_count_clone.clone();
-                    spawn_local(async move {
-                        match invoke_get_relay_count().await {
-                            Ok(count) => relay_count_local.set(count),
-                            Err(e) => web_sys::console::log_1(
-                                &format!("Failed to get relay count: {}", e).into(),
-                            ),
+    // Relay dropdown state - define signals before event listeners
+    let show_relay_dropdown = RwSignal::new(false);
+    let relay_list = RwSignal::new(Vec::<String>::new());
+    let connected_relays = RwSignal::new(Vec::<String>::new());
+
+    // Listen for relay connection events from backend (event-driven updates)
+    spawn_local(async move {
+        let window = web_sys::window().expect("no window");
+        let tauri = js_sys::Reflect::get(&window, &"__TAURI__".into()).unwrap();
+        let event_api = js_sys::Reflect::get(&tauri, &"event".into()).unwrap();
+        
+        // Create callback for relay events
+        let closure = Closure::wrap(Box::new(move |event: JsValue| {
+            let payload = js_sys::Reflect::get(&event, &"payload".into()).unwrap();
+            let event_type = js_sys::Reflect::get(&payload, &"type".into())
+                .unwrap()
+                .as_string()
+                .unwrap_or_default();
+            let url = js_sys::Reflect::get(&payload, &"url".into())
+                .unwrap()
+                .as_string()
+                .unwrap_or_default();
+            
+            match event_type.as_str() {
+                "connected" => {
+                    // Update connected relays list
+                    connected_relays.update(|relays| {
+                        if !relays.contains(&url) {
+                            relays.push(url);
                         }
                     });
-                }) as Box<dyn FnMut()>)
-                .into_js_value()
-                .as_ref()
-                .unchecked_ref(),
-                5000,
-            );
+                    relay_count.set(connected_relays.get().len());
+                }
+                "disconnected" => {
+                    // Remove from connected list
+                    connected_relays.update(|relays| {
+                        relays.retain(|r| r != &url);
+                    });
+                    relay_count.set(connected_relays.get().len());
+                }
+                _ => {}
+            }
+        }) as Box<dyn FnMut(JsValue)>);
+        
+        let listen_fn = js_sys::Reflect::get(&event_api, &"listen".into()).unwrap();
+        let listen_fn = listen_fn.dyn_ref::<js_sys::Function>().unwrap();
+        let _ = listen_fn.call2(
+            &event_api,
+            &"relay-connection".into(),
+            &closure.as_ref().into()
+        );
+        
+        closure.forget(); // Keep closure alive
+    });
+
+    // Also do initial fetch of connected relays
+    spawn_local(async move {
+        match invoke_get_connected_relays().await {
+            Ok(relays) => {
+                let count = relays.len();
+                connected_relays.set(relays);
+                relay_count.set(count);
+            }
+            Err(e) => {
+                web_sys::console::log_1(&format!("Failed to get initial relay list: {}", e).into());
+            }
         }
     });
 
-    // Relay dropdown state
-    let show_relay_dropdown = RwSignal::new(false);
-    let relay_list = RwSignal::new(Vec::<String>::new());
-
-    // Toggle relay dropdown and fetch relay list
+    // Toggle relay dropdown - uses tracked connected_relays (no API call needed)
     let on_relay_badge_click = move |_| {
         let current = show_relay_dropdown.get();
         show_relay_dropdown.set(!current);
 
-        // Fetch relay list when opening
+        // Update relay_list from tracked connected_relays when opening
         if !current {
-            spawn_local(async move {
-                match invoke_get_connected_relays().await {
-                    Ok(relays) => relay_list.set(relays),
-                    Err(e) => {
-                        web_sys::console::log_1(&format!("Failed to get relay list: {}", e).into())
-                    }
-                }
-            });
+            relay_list.set(connected_relays.get());
         }
     };
 
@@ -4522,6 +4588,10 @@ pub fn App() -> impl IntoView {
     // Initialize profile store
     provide_profile_store();
     let profile_store = use_profile_store();
+
+    // Initialize marketplace store for persistent listings
+    provide_marketplace_store();
+    let _marketplace_store = use_marketplace_store();
 
     // Setup event listeners for profile updates
     #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
