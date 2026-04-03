@@ -28,7 +28,7 @@ impl Default for RelayManagerConfig {
     fn default() -> Self {
         Self {
             max_relays: 100,
-            query_timeout_secs: 8,
+            query_timeout_secs: 15,
             connection_poll_timeout_ms: 5000, // 5s max wait
             connection_poll_interval_ms: 100, // Poll every 100ms
         }
@@ -517,7 +517,7 @@ mod tests {
     async fn test_relay_manager_config_default() {
         let config = RelayManagerConfig::default();
         assert_eq!(config.max_relays, 100);
-        assert_eq!(config.query_timeout_secs, 8);
+        assert_eq!(config.query_timeout_secs, 15);
         assert_eq!(config.connection_poll_timeout_ms, 5000);
         assert_eq!(config.connection_poll_interval_ms, 100);
     }
