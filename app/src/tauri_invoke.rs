@@ -23,8 +23,8 @@ fn is_tauri_event_available() -> bool {
 }
 
 /// Listen for a Tauri event
-/// Returns a callback handle that can be used to unlisten
-pub async fn listen<F>(event: &str, mut callback: F) -> Result<js_sys::Function, String>
+/// Returns a cleanup function that can be called to unlisten
+pub async fn listen<F>(event: &str, mut callback: F) -> Result<impl FnOnce(), String>
 where
     F: FnMut(serde_json::Value) + 'static,
 {
@@ -50,22 +50,33 @@ where
     }) as Box<dyn FnMut(JsValue)>);
 
     let js_callback = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
-    closure.forget(); // Leak the closure to keep it alive
-
-    // Call Tauri's listen function
+    
+    // Call Tauri's listen function and get the unlisten handle
     let js_code = format!(
         "window.__TAURI__.event.listen('{}', {})",
         event,
         js_callback.as_string().unwrap_or_default()
     );
 
-    js_sys::eval(&js_code)
-        .map(|v| v.unchecked_into::<js_sys::Function>())
-        .map_err(|e| format!("Failed to listen for event '{}': {:?}", event, e))
+    let unlisten_fn = js_sys::eval(&js_code)
+        .map_err(|e| format!("Failed to listen for event '{}': {:?}", event, e))?;
+    
+    // Create cleanup function
+    let cleanup = move || {
+        // Call unlisten if available
+        if let Ok(unlisten) = unlisten_fn.dyn_into::<js_sys::Function>() {
+            let _ = unlisten.call0(&JsValue::NULL);
+        }
+        // Note: closure is still leaked here, but at least we unlisten
+    };
+    
+    closure.forget(); // Still needed for now, but we have unlisten
+    
+    Ok(cleanup)
 }
 
 /// Listen for bunker-auth-challenge events (opens browser for approval)
-pub async fn listen_bunker_auth_challenge<F>(mut callback: F) -> Result<js_sys::Function, String>
+pub async fn listen_bunker_auth_challenge<F>(mut callback: F) -> Result<impl FnOnce(), String>
 where
     F: FnMut(String) + 'static,
 {
@@ -80,7 +91,7 @@ where
 }
 
 /// Listen for auth_success events
-pub async fn listen_auth_success<F>(mut callback: F) -> Result<js_sys::Function, String>
+pub async fn listen_auth_success<F>(mut callback: F) -> Result<impl FnOnce(), String>
 where
     F: FnMut(String) + 'static,
 {
@@ -95,7 +106,7 @@ where
 }
 
 /// Listen for bunker-heartbeat events
-pub async fn listen_bunker_heartbeat<F>(callback: F) -> Result<js_sys::Function, String>
+pub async fn listen_bunker_heartbeat<F>(callback: F) -> Result<impl FnOnce(), String>
 where
     F: FnMut(serde_json::Value) + 'static,
 {
@@ -103,7 +114,7 @@ where
 }
 
 /// Listen for qr-login-complete events (Flow B successful connection)
-pub async fn listen_qr_login_complete<F>(mut callback: F) -> Result<js_sys::Function, String>
+pub async fn listen_qr_login_complete<F>(mut callback: F) -> Result<impl FnOnce(), String>
 where
     F: FnMut(String) + 'static,
 {

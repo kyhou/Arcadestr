@@ -789,36 +789,58 @@ pub async fn invoke_fetch_marketplace(
 /// This starts a streaming fetch that emits products via Tauri events.
 /// The `on_listing` callback is called for each product as it arrives.
 /// 
+/// Returns cleanup functions that should be called when done to prevent memory leaks.
+/// 
 /// # Arguments
 /// * `limit` - Maximum products to fetch
 /// * `since_days` - Time window for events
 /// * `on_listing` - Callback invoked for each product
+/// * `on_complete` - Optional callback invoked when streaming completes
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
-pub async fn invoke_fetch_marketplace_stream<F>(
+pub async fn invoke_fetch_marketplace_stream<F, C>(
     limit: usize,
     since_days: Option<u64>,
     mut on_listing: F,
-) -> Result<(), String>
+    on_complete: Option<C>,
+) -> Result<(impl FnOnce(), impl FnOnce()), String>
 where
     F: FnMut(GameListing) + 'static,
+    C: FnOnce() + 'static,
 {
     use crate::tauri_invoke::listen;
     
     // Set up listener for products before starting fetch
     let product_listener = listen("marketplace-product", move |data| {
-        if let Ok(listing) = serde_json::from_value::<GameListing>(data) {
-            on_listing(listing);
+        match serde_json::from_value::<GameListing>(data) {
+            Ok(listing) => on_listing(listing),
+            Err(e) => {
+                #[cfg(target_arch = "wasm32")]
+                web_sys::console::warn_1(&format!("Failed to parse listing: {}", e).into());
+            }
         }
     }).await;
     
-    if let Err(e) = product_listener {
-        return Err(format!("Failed to setup product listener: {}", e));
-    }
+    let product_cleanup = match product_listener {
+        Ok(cleanup) => cleanup,
+        Err(e) => return Err(format!("Failed to setup product listener: {}", e)),
+    };
     
-    // Also listen for completion
-    let _completion_listener = listen("marketplace-complete", |_data| {
-        // Completion signal - listener can be cleaned up
+    // Set up completion listener
+    let completion_callback = std::cell::RefCell::new(on_complete);
+    let completion_listener = listen("marketplace-complete", move |_data| {
+        if let Some(callback) = completion_callback.borrow_mut().take() {
+            callback();
+        }
     }).await;
+    
+    let completion_cleanup = match completion_listener {
+        Ok(cleanup) => cleanup,
+        Err(e) => {
+            // Clean up product listener since we're failing
+            product_cleanup();
+            return Err(format!("Failed to setup completion listener: {}", e));
+        }
+    };
     
     // Call the streaming command
     let args = serde_json::json!({
@@ -828,20 +850,27 @@ where
     
     let result: Result<(), String> = crate::tauri_invoke::invoke("fetch_marketplace_stream", args).await;
     
-    // Note: listeners continue to receive events after command returns
-    // They should be cleaned up by the caller when done
+    if let Err(e) = result {
+        // Clean up listeners on error
+        product_cleanup();
+        completion_cleanup();
+        return Err(e);
+    }
     
-    result
+    // Return cleanup functions for caller to use when done
+    Ok((product_cleanup, completion_cleanup))
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
-pub async fn invoke_fetch_marketplace_stream<F>(
+pub async fn invoke_fetch_marketplace_stream<F, C>(
     _limit: usize,
     _since_days: Option<u64>,
     _on_listing: F,
-) -> Result<(), String>
+    _on_complete: Option<C>,
+) -> Result<(impl FnOnce(), impl FnOnce()), String>
 where
     F: FnMut(GameListing) + 'static,
+    C: FnOnce() + 'static,
 {
     Err("Tauri not available in web mode".to_string())
 }
