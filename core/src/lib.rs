@@ -39,7 +39,9 @@ pub use relay_cache::{CachedRelayList, RelayCache, RelayCacheError, RelayHealth,
 pub use relay_pool::{RelayPool, RelaySource};
 
 #[cfg(feature = "native")]
-pub use relay_manager::{RelayManager, RelayManagerConfig, RelayManagerError, SendEventResult, RelaySendResult};
+pub use relay_manager::{
+    RelayManager, RelayManagerConfig, RelayManagerError, RelaySendResult, SendEventResult,
+};
 
 #[cfg(feature = "native")]
 pub mod nostr;
@@ -49,15 +51,9 @@ pub mod subscriptions;
 
 #[cfg(feature = "native")]
 pub use subscriptions::{
-    close_subscriptions,
-    cleanup_view_subscriptions,
-    dispatch_ephemeral_read,
-    dispatch_ephemeral_reads_batch,
-    dispatch_permanent_subscriptions,
-    run_notification_loop,
-    ConnectionKind,
-    SerializableEvent,
-    SubscriptionRegistry,
+    cleanup_view_subscriptions, close_subscriptions, dispatch_ephemeral_read,
+    dispatch_ephemeral_reads_batch, dispatch_permanent_subscriptions, run_notification_loop,
+    ConnectionKind, SerializableEvent, SubscriptionRegistry,
 };
 
 #[cfg(feature = "native")]

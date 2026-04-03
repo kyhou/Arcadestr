@@ -6,32 +6,82 @@ use wasm_bindgen_futures::spawn_local;
 use crate::components::{ProfileAvatar, ProfileDisplayName};
 use crate::fetch_and_store_profile;
 use crate::models::GameListing;
-use crate::{invoke_fetch_listings, AuthContext};
+use crate::store::{try_use_marketplace_store, MarketplaceStore, DEFAULT_LISTING_TTL_SECS};
+use crate::{invoke_fetch_marketplace, AuthContext};
 
 /// Browse view component - displays a grid of game listings.
+/// Uses MarketplaceStore to persist listings across navigation.
 #[component]
 pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
     let _auth = use_context::<AuthContext>().expect("AuthContext not provided");
+    let marketplace_store = try_use_marketplace_store();
 
     // State signals
     let listings = RwSignal::new(Vec::<GameListing>::new());
     let is_loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
 
-    // Fetch listings on mount
+    // Fetch listings on mount - use cache if available and fresh
     Effect::new(move |_| {
+        let store = marketplace_store.clone();
         spawn_local(async move {
             is_loading.set(true);
             error.set(None);
 
-            match invoke_fetch_listings(20).await {
-                Ok(fetched) => {
-                    listings.set(fetched);
-                    is_loading.set(false);
+            // Check if we have cached listings that are still fresh
+            let should_fetch = match &store {
+                Some(s) => {
+                    let cached = s.get_all();
+                    let needs_refresh = s.needs_refresh(DEFAULT_LISTING_TTL_SECS);
+
+                    if !cached.is_empty() && !needs_refresh {
+                        // Use cached listings
+                        listings.set(cached);
+                        is_loading.set(false);
+                        false // Don't fetch from network
+                    } else {
+                        true // Need to fetch
+                    }
                 }
-                Err(e) => {
-                    error.set(Some(e));
-                    is_loading.set(false);
+                None => true, // No store available, fetch from network
+            };
+
+            if should_fetch {
+                match invoke_fetch_marketplace(50, Some(30), None).await {
+                    Ok(fetched) => {
+                        // Update cache if store is available
+                        if let Some(s) = &store {
+                            s.put_many(fetched.clone());
+                            s.mark_fresh();
+                        }
+                        listings.set(fetched);
+                        is_loading.set(false);
+                    }
+                    Err(e) => {
+                        // If fetch fails but we have cached data, use it as fallback
+                        if let Some(s) = &store {
+                            let cached = s.get_all();
+                            if !cached.is_empty() {
+                                listings.set(cached);
+                                is_loading.set(false);
+                                // Still log the error but don't show it to user
+                                #[cfg(target_arch = "wasm32")]
+                                web_sys::console::warn_1(
+                                    &format!(
+                                        "Failed to refresh listings, using cached data: {}",
+                                        e
+                                    )
+                                    .into(),
+                                );
+                            } else {
+                                error.set(Some(e));
+                                is_loading.set(false);
+                            }
+                        } else {
+                            error.set(Some(e));
+                            is_loading.set(false);
+                        }
+                    }
                 }
             }
         });

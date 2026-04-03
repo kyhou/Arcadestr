@@ -18,7 +18,8 @@ pub mod store;
 // Import ProfileStore and related functions for store initialization and event handlers
 use crate::store::{
     provide_marketplace_store, provide_profile_store, try_use_marketplace_store,
-    try_use_profile_store, use_marketplace_store, use_profile_store, MarketplaceStore, ProfileStore,
+    try_use_profile_store, use_marketplace_store, use_profile_store, MarketplaceStore,
+    ProfileStore,
 };
 
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
@@ -3715,7 +3716,7 @@ fn LoginView() -> impl IntoView {
 
                         // Start connection status polling for NIP-46 accounts
                         auth.start_connection_status_polling().await;
-                        
+
                         // Clear the input field
                         bunker_uri.set(String::new());
                         bunker_display_name.set(String::new());
@@ -4161,11 +4162,11 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
             .expect("TAURI API should be available in Tauri app");
         let event_api = js_sys::Reflect::get(&tauri, &"event".into())
             .expect("TAURI event API should be available");
-        
+
         // Create callback for relay events
         let closure = Closure::wrap(Box::new(move |event: JsValue| {
-            let payload = js_sys::Reflect::get(&event, &"payload".into())
-                .expect("event should have payload");
+            let payload =
+                js_sys::Reflect::get(&event, &"payload".into()).expect("event should have payload");
             let event_type = js_sys::Reflect::get(&payload, &"type".into())
                 .expect("payload should have type field")
                 .as_string()
@@ -4174,7 +4175,7 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                 .expect("payload should have url field")
                 .as_string()
                 .unwrap_or_default();
-            
+
             match event_type.as_str() {
                 "connected" => {
                     // Update connected relays list
@@ -4195,17 +4196,18 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                 _ => {}
             }
         }) as Box<dyn FnMut(JsValue)>);
-        
+
         let listen_fn = js_sys::Reflect::get(&event_api, &"listen".into())
             .expect("event API should have listen method");
-        let listen_fn = listen_fn.dyn_ref::<js_sys::Function>()
+        let listen_fn = listen_fn
+            .dyn_ref::<js_sys::Function>()
             .expect("listen should be a function");
         let _ = listen_fn.call2(
             &event_api,
             &"relay-connection".into(),
-            &closure.as_ref().into()
+            &closure.as_ref().into(),
         );
-        
+
         closure.forget(); // Keep closure alive
     });
 
@@ -4388,7 +4390,8 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                         };
                         let is_open = show_relay_dropdown.get();
                         let dropdown_class = if is_open { "relay-dropdown open" } else { "relay-dropdown" };
-                        let relays = relay_list.get();
+                        // Use connected_relays directly for real-time updates
+                        let relays = connected_relays.get();
 
                         view! {
                             <div class="relay-badge-container">
@@ -4430,6 +4433,7 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                                                     {relays.into_iter().map(|relay| {
                                                         view! {
                                                             <li class="relay-dropdown-item">
+                                                                <span class="relay-status-dot connected"></span>
                                                                 <span class="relay-url">{relay}</span>
                                                             </li>
                                                         }

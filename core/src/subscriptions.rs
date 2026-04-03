@@ -59,34 +59,42 @@ impl SubscriptionRegistry {
             }
         }
     }
-    
+
     /// Get all subscription IDs of a specific connection kind
     pub fn get_by_kind(&self, kind: ConnectionKind) -> Vec<String> {
-        self.entries.lock()
+        self.entries
+            .lock()
             .ok()
             .map(|entries| {
-                entries.iter()
+                entries
+                    .iter()
                     .filter(|(_, k)| **k == kind)
                     .map(|(id, _)| id.clone())
                     .collect()
             })
             .unwrap_or_default()
     }
-    
+
     /// Clear all ephemeral subscriptions (for view cleanup)
     pub fn clear_ephemeral(&self) -> Vec<String> {
-        let to_remove: Vec<String> = self.entries.lock()
+        let to_remove: Vec<String> = self
+            .entries
+            .lock()
             .ok()
             .map(|entries| {
-                entries.iter()
+                entries
+                    .iter()
                     .filter(|(_, kind)| {
-                        matches!(kind, ConnectionKind::EphemeralRead | ConnectionKind::EphemeralWrite)
+                        matches!(
+                            kind,
+                            ConnectionKind::EphemeralRead | ConnectionKind::EphemeralWrite
+                        )
                     })
                     .map(|(id, _)| id.clone())
                     .collect()
             })
             .unwrap_or_default();
-        
+
         self.remove_many(&to_remove);
         to_remove
     }
@@ -310,13 +318,15 @@ pub async fn dispatch_ephemeral_reads_batch(
     for pubkey in pubkeys {
         // Get best relay for this pubkey
         let relay_url = if let Some(cached) = relay_cache.get_relay_list(pubkey) {
-            cached.read_relays.first()
+            cached
+                .read_relays
+                .first()
                 .or(cached.write_relays.first())
                 .cloned()
         } else {
             None
         };
-        
+
         if let Some(url) = relay_url {
             dispatch_ephemeral_read(client, pubkey, &url, registry).await;
         } else {
@@ -335,7 +345,7 @@ pub async fn close_subscriptions(
         // Send UNREQ to all relays
         let sub_id = SubscriptionId::new(id);
         client.unsubscribe(&sub_id).await;
-        
+
         // Remove from registry
         registry.remove(id);
         tracing::debug!("Closed subscription: {}", id);
@@ -349,16 +359,19 @@ pub async fn cleanup_view_subscriptions(
     view_id: &str,
 ) {
     // Find subscriptions tagged with this view ID
-    let to_close: Vec<String> = registry.entries.lock()
+    let to_close: Vec<String> = registry
+        .entries
+        .lock()
         .ok()
         .map(|entries| {
-            entries.iter()
+            entries
+                .iter()
                 .filter(|(id, _)| id.starts_with(&format!("{}_", view_id)))
                 .map(|(id, _)| id.clone())
                 .collect()
         })
         .unwrap_or_default();
-    
+
     if !to_close.is_empty() {
         close_subscriptions(client, registry, to_close).await;
         tracing::info!("Cleaned up subscriptions for view: {}", view_id);

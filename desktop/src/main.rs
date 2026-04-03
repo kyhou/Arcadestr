@@ -15,6 +15,8 @@ use arcadestr_core::signers::NostrSigner;
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::extended_network::ExtendedNetworkRepository;
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
+use arcadestr_core::marketplace::{apply_filter, MarketplaceFilter};
+use arcadestr_core::nip05_validator::Nip05Validator;
 use arcadestr_core::nip46::AppSignerState;
 use arcadestr_core::nip46::{
     restore_session_on_startup,
@@ -25,8 +27,6 @@ use arcadestr_core::nostr::{
     parse_nip19_identifier, EventDeduplicator, GameListing, NostrClient, UserProfile,
     DEFAULT_RELAYS,
 };
-use arcadestr_core::marketplace::{apply_filter, MarketplaceFilter};
-use arcadestr_core::nip05_validator::Nip05Validator;
 use arcadestr_core::profile_fetcher::ProfileFetcher;
 use arcadestr_core::relay_cache::RelayCache;
 use arcadestr_core::relay_events::{RelayConnectionEvent, RelayStatus};
@@ -408,7 +408,11 @@ async fn fetch_marketplace(
 ) -> Result<Vec<GameListing>, String> {
     let filter = filter.unwrap_or_default();
 
-    tracing::info!("fetch_marketplace called: limit={}, since_days={:?}", limit, since_days);
+    tracing::info!(
+        "fetch_marketplace called: limit={}, since_days={:?}",
+        limit,
+        since_days
+    );
 
     // Acquire and release the lock for each operation to avoid holding a
     // MutexGuard across await points (see ARCHITECTURE.md §11.4).
@@ -430,7 +434,10 @@ async fn fetch_marketplace(
 
     // Apply the filter (no-op while filter == default).
     let filtered = apply_filter(products, &filter);
-    tracing::info!("fetch_marketplace: {} products after filtering", filtered.len());
+    tracing::info!(
+        "fetch_marketplace: {} products after filtering",
+        filtered.len()
+    );
 
     // Map Nip15Product → GameListing, enriching with stall name where available.
     let listings: Vec<GameListing> = filtered
@@ -519,22 +526,21 @@ fn main() {
 
     // Initialize database pool for persistent storage FIRST
     let db_path = keys_dir.join("arcadestr.db");
-    
+
     // Create subscription_registry BEFORE the async block (needed for validator spawn order)
     let subscription_registry = Arc::new(SubscriptionRegistry::new());
-    
+
     // Create a single runtime for all initialization
-    let runtime = tokio::runtime::Runtime::new()
-        .expect("Failed to create Tokio runtime");
+    let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
     let (database, nostr_client, user_cache, nip05_validator) = runtime.block_on(async {
         // Initialize database
         let db = arcadestr_core::storage::Database::new(&db_path)
             .await
             .expect("Failed to initialize database");
-        
+
         let cache = Arc::new(UserCache::new(db.pool().clone()));
-        
+
         // Initialize NostrClient with relay manager
         let relay_config = arcadestr_core::relay_manager::RelayManagerConfig {
             max_relays: 100,
@@ -542,69 +548,63 @@ fn main() {
             connection_poll_timeout_ms: 5000,
             connection_poll_interval_ms: 100,
         };
-        
+
         let client = match NostrClient::new_with_cache(
             "default".to_string(),
             DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
             cache.clone(),
             Some(relay_config),
         )
-        .await {
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Warning: Failed to initialize NostrClient: {}", e);
                 eprintln!("The app will start but relay functionality may be limited.");
                 // Create a client with no relays - user can retry later
-                NostrClient::new_with_cache(
-                    "default".to_string(),
-                    vec![],
-                    cache.clone(),
-                    None,
-                )
-                .await
-                .expect("Failed to create empty client")
+                NostrClient::new_with_cache("default".to_string(), vec![], cache.clone(), None)
+                    .await
+                    .expect("Failed to create empty client")
             }
         };
-        
+
         // Wrap client in Arc for sharing
         let client = Arc::new(client);
-        
+
         // Spawn NIP-05 background validator
-        let validator_client = match NostrClient::new_with_cache(
-            "default".to_string(),
-            vec![],
+        let validator_client =
+            match NostrClient::new_with_cache("default".to_string(), vec![], cache.clone(), None)
+                .await
+            {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    warn!("Failed to create validator client: {}", e);
+                    client.clone() // Fallback to shared client
+                }
+            };
+        let nip05_validator = Arc::new(std::sync::Mutex::new(Nip05Validator::spawn(
+            validator_client,
             cache.clone(),
-            None,
-        ).await {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                warn!("Failed to create validator client: {}", e);
-                client.clone() // Fallback to shared client
-            }
-        };
-        let nip05_validator = Arc::new(std::sync::Mutex::new(Nip05Validator::spawn(validator_client, cache.clone())));
+        )));
         info!("NIP-05 background validator spawned");
-        
+
         // Unwrap Arc to return the client directly (it will be re-wrapped later)
         let client = match Arc::try_unwrap(client) {
             Ok(c) => c,
             Err(_) => {
                 // If we can't unwrap (because validator is still using it), create a new empty client
                 warn!("Client is shared, creating new client for main use");
-                NostrClient::new_with_cache(
-                    "default".to_string(),
-                    vec![],
-                    cache.clone(),
-                    None,
-                ).await.expect("Failed to create fallback client")
+                NostrClient::new_with_cache("default".to_string(), vec![], cache.clone(), None)
+                    .await
+                    .expect("Failed to create fallback client")
             }
         };
-        
+
         // Connect to default relays immediately to reduce query latency
         info!("Connecting to default relays before starting Tauri...");
         client.connect().await;
         info!("Default relay connections initiated");
-        
+
         (db, client, cache, nip05_validator)
     });
     info!("Database initialized at: {}", db_path.display());
@@ -904,7 +904,11 @@ fn main() {
         if let Some(ref profile_id) = user_id {
             match relay_cache.load_relay_pool(profile_id) {
                 Ok(persisted_relays) if !persisted_relays.is_empty() => {
-                    tracing::info!("Loading {} persisted relays for profile {}", persisted_relays.len(), profile_id);
+                    tracing::info!(
+                        "Loading {} persisted relays for profile {}",
+                        persisted_relays.len(),
+                        profile_id
+                    );
                     for relay in &persisted_relays {
                         let _ = nostr_client.add_relay(relay).await;
                     }
@@ -913,7 +917,11 @@ fn main() {
                     tracing::info!("No persisted relays found for profile {}", profile_id);
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to load persisted relays for profile {}: {}", profile_id, e);
+                    tracing::warn!(
+                        "Failed to load persisted relays for profile {}: {}",
+                        profile_id,
+                        e
+                    );
                 }
             }
         }
@@ -1159,16 +1167,19 @@ fn main() {
             let manager = client.relay_manager();
             let manager_guard = manager.lock().await;
             let inner_client = manager_guard.get_client();
-            
+
             dispatch_ephemeral_reads_batch(
                 inner_client,
                 &selection.uncovered_pubkeys,
                 &relay_cache,
                 &subscription_registry,
-            ).await;
-            
-            info!("Activated ephemeral subscriptions for {} uncovered pubkeys", 
-                  selection.uncovered_pubkeys.len());
+            )
+            .await;
+
+            info!(
+                "Activated ephemeral subscriptions for {} uncovered pubkeys",
+                selection.uncovered_pubkeys.len()
+            );
         }
 
         // Schedule background refresh with recurring timer
@@ -1178,7 +1189,12 @@ fn main() {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await; // check every hour
-                refresh_stale_relays(nostr_for_refresh.clone(), cache_for_refresh.clone(), profile_id_for_refresh.clone()).await;
+                refresh_stale_relays(
+                    nostr_for_refresh.clone(),
+                    cache_for_refresh.clone(),
+                    profile_id_for_refresh.clone(),
+                )
+                .await;
             }
         });
 
@@ -1251,7 +1267,7 @@ fn main() {
             match nostr_client.fetch_relay_list(&npub).await {
                 Ok(relays) => {
                     let _ = relay_cache.save_relay_list(&relays);
-                    
+
                     // Add discovered relays to unified pool
                     let manager = nostr_client.relay_manager();
                     let manager_guard = manager.lock().await;
@@ -1261,7 +1277,7 @@ fn main() {
                     for relay in &relays.read_relays {
                         let _ = manager_guard.add_discovered_relay(relay.clone()).await;
                     }
-                    
+
                     // Persist the updated pool
                     let pool = manager_guard.get_relay_pool().await;
                     let all_relays: Vec<String> = pool.get_relays().await;
@@ -1488,10 +1504,10 @@ fn main() {
         let manager_arc = nostr.relay_manager();
         let manager = manager_arc.lock().await;
         let client = manager.get_client();
-        
+
         let mut statuses = Vec::new();
         let relays = client.relays().await;
-        
+
         for (url, relay) in relays {
             statuses.push(RelayStatus {
                 url: url.to_string(),
@@ -1499,7 +1515,7 @@ fn main() {
                 latency_ms: relay.stats().latency().map(|d| d.as_millis() as u64),
             });
         }
-        
+
         Ok(statuses)
     }
 

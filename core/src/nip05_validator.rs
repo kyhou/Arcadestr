@@ -1,5 +1,5 @@
 //! Background NIP-05 validation worker
-//! 
+//!
 //! Validates NIP-05 identifiers asynchronously without blocking the UI.
 //! Uses a queue-based system where profiles are queued for validation
 //! and processed in the background.
@@ -64,13 +64,13 @@ impl Nip05Validator {
                         // Process next item in queue
                         if let Some((npub, nip05)) = queue.pop_front() {
                             debug!("Validating NIP-05 for {}: {}", npub, nip05);
-                            
+
                             // Perform validation
                             let verified = client.verify_nip05(&npub, &nip05).await;
-                            
+
                             if verified {
                                 info!("NIP-05 verified for {}: {}", npub, nip05);
-                                
+
                                 // Update cache with verified status
                                 if let Some(mut profile) = user_cache.get(&npub).await {
                                     profile.nip05_verified = true;
@@ -81,7 +81,7 @@ impl Nip05Validator {
                             } else {
                                 warn!("NIP-05 verification failed for {}: {}", npub, nip05);
                             }
-                            
+
                             // Send result
                             let _ = result_tx.send(ValidationResult {
                                 npub: npub.clone(),
@@ -108,7 +108,9 @@ impl Nip05Validator {
 
     /// Queue a profile for NIP-05 validation
     pub fn queue_validation(&self, npub: String, nip05: String) {
-        let _ = self.command_tx.send(ValidationCommand::Validate { npub, nip05 });
+        let _ = self
+            .command_tx
+            .send(ValidationCommand::Validate { npub, nip05 });
     }
 
     /// Try to receive a validation result (non-blocking)
@@ -133,10 +135,18 @@ mod tests {
             nip05: "test@example.com".to_string(),
         };
         let cloned = cmd.clone();
-        
+
         match (cmd, cloned) {
-            (ValidationCommand::Validate { npub: n1, nip05: nip1 }, 
-             ValidationCommand::Validate { npub: n2, nip05: nip2 }) => {
+            (
+                ValidationCommand::Validate {
+                    npub: n1,
+                    nip05: nip1,
+                },
+                ValidationCommand::Validate {
+                    npub: n2,
+                    nip05: nip2,
+                },
+            ) => {
                 assert_eq!(n1, n2);
                 assert_eq!(nip1, nip2);
             }

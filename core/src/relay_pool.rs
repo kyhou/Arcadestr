@@ -1,8 +1,8 @@
 //! Relay Pool - Maintains unified set of relays for a profile
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 /// Information about a relay in the pool

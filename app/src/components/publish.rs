@@ -136,13 +136,21 @@ pub fn PublishView() -> impl IntoView {
 
         let listing = GameListing {
             id: id_val,
+            source: crate::models::ListingSource::Legacy,
             title: title_val,
             description: description_val,
-            price_sats: price_sats.get(),
+            images: vec![], // No images for legacy listings
             download_url: download_url_val,
-            publisher_npub: npub,
-            created_at,
+            price: price_sats.get() as f64,
+            currency: "SATS".to_string(),
+            price_sats: price_sats.get(),
+            quantity: None, // Unlimited for digital goods
             tags,
+            specs: vec![], // No specs for legacy listings
+            publisher_npub: npub,
+            stall_id: String::new(), // No stall for legacy listings
+            stall_name: None,
+            created_at,
             event_id: None, // Will be set by the backend after publishing
             lud16: lud16_val,
         };

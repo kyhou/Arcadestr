@@ -8,8 +8,8 @@ use crate::relay_events::{RelayConnectionEvent, RelayStatus};
 use crate::relay_pool::{RelayPool, RelaySource};
 use nostr_sdk::{Client, Event, Filter, Url};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -176,8 +176,8 @@ impl RelayManager {
                     warn!("Relay {} connection attempt: Err({})", relay, e);
                     if let Some(sender) = &self.event_sender {
                         let _ = sender.send(RelayConnectionEvent::disconnected(
-                            relay, 
-                            Some(e.to_string())
+                            relay,
+                            Some(e.to_string()),
                         ));
                     }
                 }
@@ -475,12 +475,12 @@ impl RelayManager {
                 Ok(_) => {
                     // Trigger connection
                     self.client.connect().await;
-                    
+
                     // Emit event immediately
                     if let Some(sender) = &self.event_sender {
                         let _ = sender.send(RelayConnectionEvent::connected(&url));
                     }
-                    
+
                     info!("Connected to discovered relay: {}", url);
                 }
                 Err(e) => {
@@ -488,7 +488,7 @@ impl RelayManager {
                     if let Some(sender) = &self.event_sender {
                         let _ = sender.send(RelayConnectionEvent::disconnected(
                             &url,
-                            Some(e.to_string())
+                            Some(e.to_string()),
                         ));
                     }
                 }
@@ -517,7 +517,7 @@ impl RelayManager {
     pub async fn get_connected_relays(&self) -> Vec<RelayStatus> {
         let mut statuses = Vec::new();
         let relays = self.client.relays().await;
-        
+
         for (url, relay) in relays {
             statuses.push(RelayStatus {
                 url: url.to_string(),
@@ -525,7 +525,7 @@ impl RelayManager {
                 latency_ms: relay.stats().latency().map(|d| d.as_millis() as u64),
             });
         }
-        
+
         statuses
     }
 
@@ -562,11 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_manager_initializes_with_defaults() {
-        let manager = RelayManager::new(
-            "test".to_string(),
-            RelayManagerConfig::default(),
-            None,
-        )
+        let manager = RelayManager::new("test".to_string(), RelayManagerConfig::default(), None)
             .await
             .unwrap();
 
@@ -576,11 +572,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_manager_adds_discovered_relays() {
-        let manager = RelayManager::new(
-            "test".to_string(),
-            RelayManagerConfig::default(),
-            None,
-        )
+        let manager = RelayManager::new("test".to_string(), RelayManagerConfig::default(), None)
             .await
             .unwrap();
 
@@ -602,7 +594,9 @@ mod tests {
             ..Default::default()
         };
 
-        let manager = RelayManager::new("test".to_string(), config, None).await.unwrap();
+        let manager = RelayManager::new("test".to_string(), config, None)
+            .await
+            .unwrap();
 
         // Should fail when at capacity
         let result = manager
@@ -623,11 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_manager_shutdown() {
-        let manager = RelayManager::new(
-            "test".to_string(),
-            RelayManagerConfig::default(),
-            None,
-        )
+        let manager = RelayManager::new("test".to_string(), RelayManagerConfig::default(), None)
             .await
             .unwrap();
 
@@ -638,13 +628,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_event_method_exists() {
-        let manager = RelayManager::new(
-            "test_send".to_string(),
-            RelayManagerConfig::default(),
-            None,
-        )
-            .await
-            .expect("Failed to create relay manager");
+        let manager =
+            RelayManager::new("test_send".to_string(), RelayManagerConfig::default(), None)
+                .await
+                .expect("Failed to create relay manager");
 
         // Verify the method exists and returns error when no relays connected
         // We can't test actual sending without a valid event, but we verify the API
@@ -663,8 +650,8 @@ mod tests {
             RelayManagerConfig::default(),
             None,
         )
-            .await
-            .expect("Failed to create relay manager");
+        .await
+        .expect("Failed to create relay manager");
 
         // The manager should have some relays from initialization
         let pool_size = manager.get_pool_size().await;
@@ -681,8 +668,8 @@ mod tests {
             RelayManagerConfig::default(),
             None,
         )
-            .await
-            .expect("Failed to create relay manager");
+        .await
+        .expect("Failed to create relay manager");
 
         // Verify we can call the method with indexer relays
         let indexer_relays: Vec<String> = vec![

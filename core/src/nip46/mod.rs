@@ -40,6 +40,6 @@ pub use storage::{
     set_last_active_profile_id, set_profile_cache_dir,
 };
 pub use types::{
-    keyring_keys, session_config, AppSignerState, ConnectionState, Nip46KeyringError,
-    Nip46UriType, PendingQrState, ProfileMetadata, SavedProfile,
+    keyring_keys, session_config, AppSignerState, ConnectionState, Nip46KeyringError, Nip46UriType,
+    PendingQrState, ProfileMetadata, SavedProfile,
 };

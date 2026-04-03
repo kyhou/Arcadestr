@@ -7,9 +7,11 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::components::ProfileRow;
 use crate::models::{GameListing, UserProfile, ZapInvoice, ZapRequest};
+use crate::store::try_use_profile_store;
 use crate::{invoke_fetch_profile, invoke_request_invoice, AuthContext};
 
 /// Detail view component - displays full listing information with Buy flow.
+/// Uses ProfileStore cache to avoid redundant network fetches for seller profiles.
 #[component]
 pub fn DetailView(
     listing: GameListing,
@@ -17,6 +19,7 @@ pub fn DetailView(
     #[prop(default = String::new())] listing_event_id: String,
 ) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
+    let profile_store = try_use_profile_store();
 
     // Format price display
     let price_sats = listing.price_sats;
@@ -44,16 +47,34 @@ pub fn DetailView(
     // Clone listing's publisher_npub early to avoid move conflicts
     let publisher_npub_for_fetch = listing.publisher_npub.clone();
 
-    // Fetch seller profile on mount
+    // Fetch seller profile on mount - check cache first
     Effect::new(move |_| {
         let npub = publisher_npub_for_fetch.clone();
+        let store = profile_store.clone();
         spawn_local(async move {
             profile_loading.set(true);
-            match invoke_fetch_profile(npub, None).await {
-                Ok(p) => seller_profile.set(Some(p)),
-                Err(_) => seller_profile.set(None),
+
+            // First check if profile is already in cache
+            let cached_profile = store.as_ref().and_then(|s| s.get(&npub));
+
+            if let Some(profile) = cached_profile {
+                // Use cached profile
+                seller_profile.set(Some(profile));
+                profile_loading.set(false);
+            } else {
+                // Fetch from network and cache the result
+                match invoke_fetch_profile(npub.clone(), None).await {
+                    Ok(profile) => {
+                        // Store in cache if available
+                        if let Some(s) = &store {
+                            s.put(profile.clone());
+                        }
+                        seller_profile.set(Some(profile));
+                    }
+                    Err(_) => seller_profile.set(None),
+                }
+                profile_loading.set(false);
             }
-            profile_loading.set(false);
         });
     });
 

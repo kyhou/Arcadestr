@@ -476,29 +476,34 @@ pub async fn wait_for_qr_connection(
                                 );
 
                                 // Send ack response with matching request id
-                                if let Err(e) =
-                                    send_connect_ack(&client, &app_keys, event.pubkey, &relays, &request_id)
-                                        .await
+                                if let Err(e) = send_connect_ack(
+                                    &client,
+                                    &app_keys,
+                                    event.pubkey,
+                                    &relays,
+                                    &request_id,
+                                )
+                                .await
                                 {
                                     warn!("Failed to send ack: {}", e);
                                 }
 
                                 // IMPORTANT: event.pubkey is the BUNKER's ephemeral key, NOT the user's identity key
                                 // We need to perform NIP-46 handshake to get the actual user's pubkey
-                                info!("Performing NIP-46 handshake to get user's identity pubkey...");
-                                
+                                info!(
+                                    "Performing NIP-46 handshake to get user's identity pubkey..."
+                                );
+
                                 // Create bunker URI with the bunker's pubkey
-                                let relay_params: Vec<String> = relays
-                                    .iter()
-                                    .map(|r| format!("relay={}", r))
-                                    .collect();
+                                let relay_params: Vec<String> =
+                                    relays.iter().map(|r| format!("relay={}", r)).collect();
                                 let bunker_uri_str = format!(
                                     "bunker://{}?{}",
                                     bunker_pubkey.to_hex(),
                                     relay_params.join("&")
                                 );
                                 let bunker_uri = NostrConnectURI::parse(&bunker_uri_str)?;
-                                
+
                                 // Create NostrConnect client to perform handshake
                                 let signer = NostrConnect::new(
                                     bunker_uri.clone(),
@@ -506,7 +511,7 @@ pub async fn wait_for_qr_connection(
                                     Duration::from_secs(30),
                                     None,
                                 )?;
-                                
+
                                 // Get the actual user's identity pubkey (not the bunker's key)
                                 let user_pubkey = signer.get_public_key().await?;
                                 info!(
@@ -637,7 +642,10 @@ async fn send_connect_ack(
     use nostr::nips::nip44;
     use nostr::{EventBuilder, Tag};
 
-    info!("Sending connect ack to {} with request id: {}", signer_pubkey, request_id);
+    info!(
+        "Sending connect ack to {} with request id: {}",
+        signer_pubkey, request_id
+    );
 
     // Build the JSON-RPC response using the SAME id as the request
     // This is required by JSON-RPC 2.0 spec for proper correlation

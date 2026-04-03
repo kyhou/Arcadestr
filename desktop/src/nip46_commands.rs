@@ -3,9 +3,9 @@
 // These are the functions the Leptos frontend calls via `invoke()`.
 // Each command is the single crossing point between the untrusted WebView and the trusted Rust backend.
 
+use nostr::nips::nip46::NostrConnectURI;
 use nostr::prelude::ToBech32;
 use nostr::signer::NostrSigner;
-use nostr::nips::nip46::NostrConnectURI;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
@@ -13,8 +13,8 @@ use tracing::{error, info, warn};
 
 use arcadestr_core::nip46::{
     activate_profile, attempt_manual_reconnect, cancel_bunker_retry, clear_last_active_profile_id,
-    delete_profile_from_keyring, generate_login_qr, get_profile_metadata_by_id, init_signer_session,
-    list_profile_index, load_profile_from_keyring, logout, ping_active_signer,
+    delete_profile_from_keyring, generate_login_qr, get_profile_metadata_by_id,
+    init_signer_session, list_profile_index, load_profile_from_keyring, logout, ping_active_signer,
     save_profile_to_keyring, set_last_active_profile_id, wait_for_qr_connection, AppSignerState,
     ConnectionState, PendingQrState, ProfileMetadata,
 };
@@ -22,7 +22,7 @@ use arcadestr_core::nip46::{
 /// Called by Leptos when the user submits a bunker URI or NIP-05 address.
 /// Flow A entry point - BLOCKING VERSION (waits for handshake).
 /// On success: saves profile to keyring and returns the user npub.
-/// 
+///
 /// IMPORTANT: This function BLOCKS until the user approves the connection
 /// in their signer app (Amber, nsec.app, etc.). The frontend will show
 /// "Connecting..." during this time.
@@ -71,15 +71,12 @@ pub async fn connect_bunker(
     // This waits for the user to approve the connection in their signer app
     info!("Starting blocking NIP-46 handshake...");
     let bunker_uri_string: String = bunker_uri.to_string();
-    let (mut profile, client) = init_signer_session(
-        &bunker_uri_string,
-        Some(auth_url_handler),
-    )
-    .await
-    .map_err(|e| {
-        error!("NIP-46 handshake failed: {}", e);
-        format!("Failed to connect to bunker: {}", e)
-    })?;
+    let (mut profile, client) = init_signer_session(&bunker_uri_string, Some(auth_url_handler))
+        .await
+        .map_err(|e| {
+            error!("NIP-46 handshake failed: {}", e);
+            format!("Failed to connect to bunker: {}", e)
+        })?;
 
     info!(
         "NIP-46 handshake successful! user_pubkey={}",
@@ -140,9 +137,7 @@ pub async fn connect_bunker(
 /// Parse a bunker:// URI and extract the NostrConnectURI
 /// Note: The user_pubkey is NOT available from the bunker URI itself - it must be
 /// obtained from the NIP-46 handshake via get_public_key().
-fn parse_bunker_uri(
-    uri_str: &str,
-) -> Result<NostrConnectURI, String> {
+fn parse_bunker_uri(uri_str: &str) -> Result<NostrConnectURI, String> {
     use nostr::nips::nip46::NostrConnectURI;
 
     let uri = NostrConnectURI::parse(uri_str)
@@ -719,15 +714,22 @@ pub async fn delete_profile(
     })?;
 
     // Always clear last active profile ID to prevent restore attempts of deleted profile
-    info!("Clearing last active profile ID after deleting profile {}", profile_id);
+    info!(
+        "Clearing last active profile ID after deleting profile {}",
+        profile_id
+    );
     clear_last_active_profile_id();
 
     // Also clear the active session state if this was the active profile
     {
         let mut state_guard = state.lock().await;
         if state_guard.active_profile_id.as_ref() == Some(&profile_id)
-            || state_guard.active_profile_id.as_ref() == Some(&key_to_delete) {
-            info!("Clearing active session state for deleted profile {}", profile_id);
+            || state_guard.active_profile_id.as_ref() == Some(&key_to_delete)
+        {
+            info!(
+                "Clearing active session state for deleted profile {}",
+                profile_id
+            );
             state_guard.active_profile_id = None;
             state_guard.active_client = None;
             state_guard.connection_state = ConnectionState::Disconnected;

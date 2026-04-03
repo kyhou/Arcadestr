@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lru::LruCache;
 use nostr_sdk::prelude::*;
 
-use crate::nostr::{NostrClient, NostrError, UserProfile, UserProfileContent};
 use crate::nip05_validator::Nip05Validator;
+use crate::nostr::{NostrClient, NostrError, UserProfile, UserProfileContent};
 use crate::user_cache::UserCache;
 
 /// Configuration constants
@@ -399,7 +399,7 @@ impl ProfileFetcher {
             lud16: content.lud16,
             nip05_verified: false,
         };
-        
+
         // Queue for NIP-05 validation if identifier present
         if let Some(ref nip05) = content.nip05 {
             if let Some(ref validator) = self.nip05_validator {

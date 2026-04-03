@@ -5,7 +5,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::components::ListingCard;
 use crate::models::{GameListing, MarketplaceView};
-use crate::{invoke_fetch_listings, AuthContext};
+use crate::{invoke_fetch_marketplace, AuthContext};
 
 /// Profile view component - displays the logged-in user's full profile and their listings.
 #[component]
@@ -35,7 +35,7 @@ pub fn ProfileView(set_view: WriteSignal<MarketplaceView>) -> impl IntoView {
             listings_loading.set(true);
             listings_error.set(None);
 
-            match invoke_fetch_listings(50).await {
+            match invoke_fetch_marketplace(50, Some(30), None).await {
                 Ok(all_listings) => {
                     // Filter to only this user's listings
                     let filtered: Vec<GameListing> = all_listings

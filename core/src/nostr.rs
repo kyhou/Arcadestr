@@ -12,9 +12,9 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::auth::AuthState;
-use crate::relay_events::{RelayConnectionEvent, RelayStatus};
 #[cfg(feature = "native")]
 use crate::relay_cache::{CachedRelayList, RelayCache, RelayDiscoverySource};
+use crate::relay_events::{RelayConnectionEvent, RelayStatus};
 #[cfg(feature = "native")]
 use crate::relay_hints::RelayHints;
 #[cfg(feature = "native")]
@@ -61,7 +61,7 @@ pub const KIND_RELAY_LIST: u16 = 10002;
 pub const KIND_FOLLOW_LIST: u16 = 3;
 
 /// Capacity of the relay event broadcast channel.
-/// 
+///
 /// This bounds memory usage while allowing for burst event handling.
 /// Events are dropped if the channel is full (acceptable for non-critical events).
 const RELAY_EVENT_CHANNEL_CAPACITY: usize = 100;
@@ -556,7 +556,7 @@ impl NostrClient {
     /// ```
     /// let client = NostrClient::new("profile".to_string(), vec![], None).await?;
     /// let mut rx = client.subscribe_relay_events();
-    /// 
+    ///
     /// while let Ok(event) = rx.recv().await {
     ///     println!("Relay event: {:?}", event);
     /// }
@@ -581,19 +581,16 @@ impl NostrClient {
         info!("Creating NostrClient for profile: {}", profile_id);
 
         let config = config.unwrap_or_default();
-        
+
         // Create the broadcast channel for relay events
         let (relay_event_sender, _) = broadcast::channel(RELAY_EVENT_CHANNEL_CAPACITY);
-        
-        let relay_manager = RelayManager::new(
-            profile_id.clone(),
-            config,
-            Some(relay_event_sender.clone()),
-        )
-            .await
-            .map_err(|e| {
-                NostrError::RelayError(format!("Failed to create relay manager: {}", e))
-            })?;
+
+        let relay_manager =
+            RelayManager::new(profile_id.clone(), config, Some(relay_event_sender.clone()))
+                .await
+                .map_err(|e| {
+                    NostrError::RelayError(format!("Failed to create relay manager: {}", e))
+                })?;
 
         // Add any additional relays from params
         for relay in &relays {
@@ -630,19 +627,16 @@ impl NostrClient {
         );
 
         let config = config.unwrap_or_default();
-        
+
         // Create the broadcast channel for relay events
         let (relay_event_sender, _) = broadcast::channel(RELAY_EVENT_CHANNEL_CAPACITY);
-        
-        let relay_manager = RelayManager::new(
-            profile_id.clone(),
-            config,
-            Some(relay_event_sender.clone()),
-        )
-            .await
-            .map_err(|e| {
-                NostrError::RelayError(format!("Failed to create relay manager: {}", e))
-            })?;
+
+        let relay_manager =
+            RelayManager::new(profile_id.clone(), config, Some(relay_event_sender.clone()))
+                .await
+                .map_err(|e| {
+                    NostrError::RelayError(format!("Failed to create relay manager: {}", e))
+                })?;
 
         // Add any additional relays from params
         for relay in &relays {
@@ -929,7 +923,7 @@ impl NostrClient {
     ) -> Result<UserProfile, NostrError> {
         // First, try to discover the user's relays via NIP-65
         tracing::info!("Discovering relays for {} via NIP-65...", npub);
-        
+
         match self.fetch_relay_list(npub).await {
             Ok(relay_list) => {
                 tracing::info!(
@@ -938,7 +932,7 @@ impl NostrClient {
                     relay_list.write_relays.len(),
                     npub
                 );
-                
+
                 // Connect to the user's read relays
                 let manager = self.relay_manager.lock().await;
                 for relay_url in &relay_list.read_relays {
@@ -952,7 +946,7 @@ impl NostrClient {
                 tracing::warn!("Could not discover relays for {}: {}", npub, e);
             }
         }
-        
+
         // Now fetch the profile (will use the newly connected relays)
         self.fetch_profile(npub, None).await
     }
@@ -1960,7 +1954,7 @@ mod follow_list_tests {
 #[cfg(test)]
 mod assertions {
     use super::NostrClient;
-    
+
     const _: () = {
         fn assert_send<T: Send>() {}
         fn assert_sync<T: Sync>() {}

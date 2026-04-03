@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-arcadestr-app = { path = "../app" }
+arcadestr-app = { path = "../app", features = ["native"] }
 arcadestr-core = { path = "../core", features = ["native"] }
 tauri = { workspace = true }
 tokio = { workspace = true }
