@@ -492,20 +492,18 @@ where
                 match parse_product(event) {
                     Ok(product) => {
                         // Deduplicate by ID
-                        let mut seen = seen_ids_clone.try_lock();
-                        if let Ok(ref mut guard) = seen {
-                            if !guard.contains(&product.id) {
-                                guard.insert(product.id.clone());
-                                drop(guard);
-                                
-                                // Update count
-                                if let Ok(mut count) = product_count_clone.try_lock() {
-                                    *count += 1;
-                                }
-                                
-                                // Emit product
-                                on_product(product);
-                            }
+                        let mut seen = seen_ids_clone.blocking_lock();
+                        if !seen.contains(&product.id) {
+                            seen.insert(product.id.clone());
+                            drop(seen);  // Explicitly drop to release lock before callback
+                            
+                            // Update count
+                            let mut count = product_count_clone.blocking_lock();
+                            *count += 1;
+                            drop(count);  // Explicitly drop to release lock before callback
+                            
+                            // Emit product
+                            on_product(product);
                         }
                     }
                     Err(e) => {
