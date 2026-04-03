@@ -802,6 +802,45 @@ impl NostrClient {
         Ok(profile)
     }
 
+    /// Fetch profile with NIP-65 relay discovery
+    /// First discovers the user's relays, connects to them, then fetches profile
+    pub async fn fetch_profile_with_relay_discovery(
+        &self,
+        npub: &str,
+    ) -> Result<UserProfile, NostrError> {
+        // First, try to discover the user's relays via NIP-65
+        tracing::info!("Discovering relays for {} via NIP-65...", npub);
+        
+        match self.fetch_relay_list(npub).await {
+            Ok(relay_list) => {
+                tracing::info!(
+                    "Found {} read relays and {} write relays for {}",
+                    relay_list.read_relays.len(),
+                    relay_list.write_relays.len(),
+                    npub
+                );
+                
+                // Connect to the user's read relays
+                let manager = self.relay_manager.lock().await;
+                for relay_url in &relay_list.read_relays {
+                    if let Err(e) = manager.add_relay(relay_url).await {
+                        tracing::warn!("Failed to add relay {}: {}", relay_url, e);
+                    }
+                }
+                drop(manager);
+                
+                // Give relays a moment to connect
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                tracing::warn!("Could not discover relays for {}: {}", npub, e);
+            }
+        }
+        
+        // Now fetch the profile (will use the newly connected relays)
+        self.fetch_profile(npub, None).await
+    }
+
     /// Parse a profile event into UserProfile
     pub fn parse_profile_event(
         &self,
