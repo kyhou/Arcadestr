@@ -25,6 +25,7 @@ use arcadestr_core::nostr::{
     parse_nip19_identifier, EventDeduplicator, GameListing, NostrClient, UserProfile,
     DEFAULT_RELAYS,
 };
+use arcadestr_core::nip05_validator::Nip05Validator;
 use arcadestr_core::profile_fetcher::ProfileFetcher;
 use arcadestr_core::relay_cache::RelayCache;
 use arcadestr_core::relay_hints::RelayHints;
@@ -62,6 +63,8 @@ pub struct AppState {
     pub extended_network_follows: Arc<RwLock<Vec<String>>>,
     /// Relay hints store for extracting relay URLs from p-tags.
     pub relay_hints: Option<Arc<RelayHints>>,
+    /// NIP-05 validator for background verification
+    pub nip05_validator: Arc<std::sync::Mutex<Nip05Validator>>,
 }
 
 /// Generates a nostrconnect:// URI for client-initiated NIP-46 connections.
@@ -466,7 +469,7 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new()
         .expect("Failed to create Tokio runtime");
 
-    let (database, nostr_client, user_cache) = runtime.block_on(async {
+    let (database, nostr_client, user_cache, nip05_validator) = runtime.block_on(async {
         // Initialize database
         let db = arcadestr_core::storage::Database::new(&db_path)
             .await
@@ -505,7 +508,41 @@ fn main() {
             }
         };
         
-        (db, client, cache)
+        // Wrap client in Arc for sharing
+        let client = Arc::new(client);
+        
+        // Spawn NIP-05 background validator
+        let validator_client = match NostrClient::new_with_cache(
+            "default".to_string(),
+            vec![],
+            cache.clone(),
+            None,
+        ).await {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                warn!("Failed to create validator client: {}", e);
+                client.clone() // Fallback to shared client
+            }
+        };
+        let nip05_validator = Arc::new(std::sync::Mutex::new(Nip05Validator::spawn(validator_client, cache.clone())));
+        info!("NIP-05 background validator spawned");
+        
+        // Unwrap Arc to return the client directly (it will be re-wrapped later)
+        let client = match Arc::try_unwrap(client) {
+            Ok(c) => c,
+            Err(arc) => {
+                // If we can't unwrap (because validator is still using it), create a new empty client
+                warn!("Client is shared, creating new client for main use");
+                NostrClient::new_with_cache(
+                    "default".to_string(),
+                    vec![],
+                    cache.clone(),
+                    None,
+                ).await.expect("Failed to create fallback client")
+            }
+        };
+        
+        (db, client, cache, nip05_validator)
     });
     info!("Database initialized at: {}", db_path.display());
     info!("UserCache initialized");
@@ -528,9 +565,13 @@ fn main() {
     let nostr_client = Arc::new(tokio::sync::Mutex::new(nostr_client));
     let relay_cache = Arc::new(relay_cache);
 
-    // Initialize ProfileFetcher with persistent cache
-    let profile_fetcher = Arc::new(ProfileFetcher::with_persistent_cache(user_cache.clone()));
-    info!("ProfileFetcher initialized with persistent cache");
+    // Initialize ProfileFetcher with persistent cache and NIP-05 validator
+    let profile_fetcher = Arc::new({
+        let mut fetcher = ProfileFetcher::with_persistent_cache(user_cache.clone());
+        fetcher.with_nip05_validator(nip05_validator.clone());
+        fetcher
+    });
+    info!("ProfileFetcher initialized with persistent cache and NIP-05 validator");
 
     // Load cached profiles on startup
     tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -1650,6 +1691,7 @@ fn main() {
             subscription_registry: subscription_registry.clone(),
             profile_fetcher,
             user_cache,
+            nip05_validator,  // ADD THIS LINE
             extended_network: Arc::new(RwLock::new(None)),
             extended_network_follows: Arc::new(RwLock::new(Vec::new())),
             relay_hints: Some(relay_hints.clone()),
