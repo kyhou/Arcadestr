@@ -465,6 +465,9 @@ fn main() {
     // Initialize database pool for persistent storage FIRST
     let db_path = keys_dir.join("arcadestr.db");
     
+    // Create subscription_registry BEFORE the async block (needed for validator spawn order)
+    let subscription_registry = Arc::new(SubscriptionRegistry::new());
+    
     // Create a single runtime for all initialization
     let runtime = tokio::runtime::Runtime::new()
         .expect("Failed to create Tokio runtime");
@@ -559,7 +562,6 @@ fn main() {
     info!("RelayHints initialized");
 
     let deduplicator = EventDeduplicator::new(10000);
-    let subscription_registry = Arc::new(SubscriptionRegistry::new());
 
     // Wrap in Arc for sharing across tasks
     let nostr_client = Arc::new(tokio::sync::Mutex::new(nostr_client));
