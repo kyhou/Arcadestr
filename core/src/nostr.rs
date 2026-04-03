@@ -581,7 +581,15 @@ impl NostrClient {
         info!("Creating NostrClient for profile: {}", profile_id);
 
         let config = config.unwrap_or_default();
-        let relay_manager = RelayManager::new(profile_id.clone(), config)
+        
+        // Create the broadcast channel for relay events
+        let (relay_event_sender, _) = broadcast::channel(RELAY_EVENT_CHANNEL_CAPACITY);
+        
+        let relay_manager = RelayManager::new(
+            profile_id.clone(),
+            config,
+            Some(relay_event_sender.clone()),
+        )
             .await
             .map_err(|e| {
                 NostrError::RelayError(format!("Failed to create relay manager: {}", e))
@@ -597,8 +605,6 @@ impl NostrClient {
         }
 
         info!("NostrClient initialized with relay manager");
-
-        let (relay_event_sender, _) = broadcast::channel(RELAY_EVENT_CHANNEL_CAPACITY);
 
         Ok(Self {
             relay_manager: Arc::new(Mutex::new(relay_manager)),
@@ -624,7 +630,15 @@ impl NostrClient {
         );
 
         let config = config.unwrap_or_default();
-        let relay_manager = RelayManager::new(profile_id.clone(), config)
+        
+        // Create the broadcast channel for relay events
+        let (relay_event_sender, _) = broadcast::channel(RELAY_EVENT_CHANNEL_CAPACITY);
+        
+        let relay_manager = RelayManager::new(
+            profile_id.clone(),
+            config,
+            Some(relay_event_sender.clone()),
+        )
             .await
             .map_err(|e| {
                 NostrError::RelayError(format!("Failed to create relay manager: {}", e))
@@ -640,8 +654,6 @@ impl NostrClient {
         }
 
         info!("NostrClient initialized with relay manager and cache");
-
-        let (relay_event_sender, _) = broadcast::channel(RELAY_EVENT_CHANNEL_CAPACITY);
 
         Ok(Self {
             relay_manager: Arc::new(Mutex::new(relay_manager)),

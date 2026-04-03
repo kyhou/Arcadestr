@@ -4,10 +4,12 @@
 //! and growing as new relays are discovered via NIP-65 and hints.
 
 use crate::nostr::{DEFAULT_RELAYS, DISCOVERY_RELAYS, INDEXER_RELAYS};
+use crate::relay_events::RelayConnectionEvent;
 use crate::relay_pool::{RelayPool, RelaySource};
 use nostr_sdk::{Client, Event, Filter, Url};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -73,6 +75,7 @@ pub struct RelayManager {
     pool: Arc<RelayPool>,
     config: RelayManagerConfig,
     shutdown: Arc<RwLock<bool>>,
+    event_sender: Option<broadcast::Sender<RelayConnectionEvent>>,
 }
 
 impl RelayManager {
@@ -91,6 +94,7 @@ impl RelayManager {
     pub async fn new(
         profile_id: String,
         config: RelayManagerConfig,
+        event_sender: Option<broadcast::Sender<RelayConnectionEvent>>,
     ) -> Result<Self, RelayManagerError> {
         let client = Client::default();
         let pool = Arc::new(RelayPool::new(profile_id));
@@ -100,6 +104,7 @@ impl RelayManager {
             pool,
             config,
             shutdown: Arc::new(RwLock::new(false)),
+            event_sender,
         };
 
         // Initialize with default relays
@@ -154,21 +159,31 @@ impl RelayManager {
     /// Connect to all relays in the pool
     async fn connect_all_relays(&self) -> Result<(), RelayManagerError> {
         let relays = self.pool.get_relays().await;
+        let total = relays.len();
 
         for relay in &relays {
             match self.client.add_relay(relay).await {
                 Ok(_) => {
-                    debug!("Added relay to client: {}", relay);
+                    // Emit event for each successfully added relay
+                    if let Some(sender) = &self.event_sender {
+                        let _ = sender.send(RelayConnectionEvent::connected(relay));
+                    }
+                    info!("Added relay: {}", relay);
                 }
                 Err(e) => {
                     warn!("Failed to add relay {}: {}", relay, e);
+                    if let Some(sender) = &self.event_sender {
+                        let _ = sender.send(RelayConnectionEvent::disconnected(
+                            relay, 
+                            Some(e.to_string())
+                        ));
+                    }
                 }
             }
         }
 
-        // Connect all
         self.client.connect().await;
-        info!("Connecting to {} relays", relays.len());
+        info!("Connecting to {} relays", total);
 
         Ok(())
     }
@@ -237,6 +252,51 @@ impl RelayManager {
             }
             Err(_) => {
                 warn!("Query timeout after {}s", self.config.query_timeout_secs);
+                Err(RelayManagerError::QueryTimeout)
+            }
+        }
+    }
+
+    /// Fetch events with a custom timeout.
+    ///
+    /// Similar to `fetch_events`, but allows specifying a custom timeout duration.
+    /// Useful for operations that may need more time, like marketplace queries.
+    ///
+    /// # Arguments
+    /// * `filter` - The nostr filter to apply
+    /// * `timeout_secs` - Custom timeout in seconds
+    ///
+    /// # Returns
+    /// Returns events from all connected relays.
+    pub async fn fetch_events_with_timeout(
+        &self,
+        filter: Filter,
+        timeout_secs: u64,
+    ) -> Result<Vec<Event>, RelayManagerError> {
+        // Ensure we have connections
+        self.wait_for_connections().await?;
+
+        let timeout_duration = Duration::from_secs(timeout_secs);
+
+        match timeout(
+            timeout_duration,
+            self.client.fetch_events(filter, timeout_duration),
+        )
+        .await
+        {
+            Ok(Ok(events)) => {
+                debug!("Fetched {} events with custom timeout", events.len());
+                Ok(events.into_iter().collect())
+            }
+            Ok(Err(e)) => {
+                error!("Failed to fetch events with custom timeout: {}", e);
+                Err(RelayManagerError::Connection(format!(
+                    "Fetch failed: {}",
+                    e
+                )))
+            }
+            Err(_) => {
+                warn!("Query timeout after {}s (custom timeout)", timeout_secs);
                 Err(RelayManagerError::QueryTimeout)
             }
         }
@@ -413,9 +473,22 @@ impl RelayManager {
                 Ok(_) => {
                     // Trigger connection
                     self.client.connect().await;
+                    
+                    // Emit event immediately
+                    if let Some(sender) = &self.event_sender {
+                        let _ = sender.send(RelayConnectionEvent::connected(&url));
+                    }
+                    
+                    info!("Connected to discovered relay: {}", url);
                 }
                 Err(e) => {
                     warn!("Failed to add discovered relay {}: {}", url, e);
+                    if let Some(sender) = &self.event_sender {
+                        let _ = sender.send(RelayConnectionEvent::disconnected(
+                            &url,
+                            Some(e.to_string())
+                        ));
+                    }
                 }
             }
         }
@@ -471,7 +544,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_manager_initializes_with_defaults() {
-        let manager = RelayManager::new("test".to_string(), RelayManagerConfig::default())
+        let manager = RelayManager::new(
+            "test".to_string(),
+            RelayManagerConfig::default(),
+            None,
+        )
             .await
             .unwrap();
 
@@ -481,7 +558,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_manager_adds_discovered_relays() {
-        let manager = RelayManager::new("test".to_string(), RelayManagerConfig::default())
+        let manager = RelayManager::new(
+            "test".to_string(),
+            RelayManagerConfig::default(),
+            None,
+        )
             .await
             .unwrap();
 
@@ -503,7 +584,7 @@ mod tests {
             ..Default::default()
         };
 
-        let manager = RelayManager::new("test".to_string(), config).await.unwrap();
+        let manager = RelayManager::new("test".to_string(), config, None).await.unwrap();
 
         // Should fail when at capacity
         let result = manager
@@ -524,7 +605,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_manager_shutdown() {
-        let manager = RelayManager::new("test".to_string(), RelayManagerConfig::default())
+        let manager = RelayManager::new(
+            "test".to_string(),
+            RelayManagerConfig::default(),
+            None,
+        )
             .await
             .unwrap();
 
@@ -535,7 +620,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_event_method_exists() {
-        let manager = RelayManager::new("test_send".to_string(), RelayManagerConfig::default())
+        let manager = RelayManager::new(
+            "test_send".to_string(),
+            RelayManagerConfig::default(),
+            None,
+        )
             .await
             .expect("Failed to create relay manager");
 
@@ -551,7 +640,11 @@ mod tests {
         // In a real test environment, we'd use a mock relay or test relay
         // For now, just verify the method signature and basic error handling
 
-        let manager = RelayManager::new("test_publish".to_string(), RelayManagerConfig::default())
+        let manager = RelayManager::new(
+            "test_publish".to_string(),
+            RelayManagerConfig::default(),
+            None,
+        )
             .await
             .expect("Failed to create relay manager");
 
@@ -565,7 +658,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_events_from_subset_queries_specific_relays() {
-        let manager = RelayManager::new("test_subset".to_string(), RelayManagerConfig::default())
+        let manager = RelayManager::new(
+            "test_subset".to_string(),
+            RelayManagerConfig::default(),
+            None,
+        )
             .await
             .expect("Failed to create relay manager");
 
