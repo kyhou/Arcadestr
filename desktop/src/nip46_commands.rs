@@ -3,33 +3,19 @@
 // These are the functions the Leptos frontend calls via `invoke()`.
 // Each command is the single crossing point between the untrusted WebView and the trusted Rust backend.
 
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tauri::{State, AppHandle, Emitter};
-use tracing::{error, info, warn};
-use nostr::signer::NostrSigner;
 use nostr::prelude::ToBech32;
+use nostr::signer::NostrSigner;
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 
 use arcadestr_core::nip46::{
-    AppSignerState,
-    init_signer_session, 
-    init_signer_session_fast,
-    generate_login_qr,
-    wait_for_qr_connection,
-    save_profile_to_keyring,
-    load_profile_from_keyring,
-    list_profile_index,
-    delete_profile_from_keyring,
-    activate_profile,
-    logout,
-    ping_active_signer,
-    get_profile_metadata_by_id,
-    set_last_active_profile_id,
-    cancel_bunker_retry,
-    attempt_manual_reconnect,
-    ProfileMetadata,
-    PendingQrState,
-    ConnectionState,
+    activate_profile, attempt_manual_reconnect, cancel_bunker_retry, delete_profile_from_keyring,
+    generate_login_qr, get_profile_metadata_by_id, init_signer_session, init_signer_session_fast,
+    list_profile_index, load_profile_from_keyring, logout, ping_active_signer,
+    save_profile_to_keyring, set_last_active_profile_id, wait_for_qr_connection, AppSignerState,
+    ConnectionState, PendingQrState, ProfileMetadata,
 };
 
 /// Called by Leptos when the user submits a bunker URI or NIP-05 address.
@@ -43,7 +29,10 @@ pub async fn connect_bunker(
     state: State<'_, Arc<Mutex<AppSignerState>>>,
     app_handle: AppHandle,
 ) -> Result<serde_json::Value, String> {
-    info!("connect_bunker called (fast mode): identifier={}, display_name={}", identifier, display_name);
+    info!(
+        "connect_bunker called (fast mode): identifier={}, display_name={}",
+        identifier, display_name
+    );
 
     // Parse the bunker URI to extract user_pubkey and create NostrConnectURI
     let (bunker_uri, user_pubkey) = if identifier.contains('@') {
@@ -78,16 +67,17 @@ pub async fn connect_bunker(
     profile.name = display_name.clone();
 
     // Save to keyring
-    save_profile_to_keyring(&profile)
-        .map_err(|e| {
-            error!("save_profile_to_keyring failed: {}", e);
-            e.to_string()
-        })?;
+    save_profile_to_keyring(&profile).map_err(|e| {
+        error!("save_profile_to_keyring failed: {}", e);
+        e.to_string()
+    })?;
 
     info!("Profile saved to keyring: id={}", profile.id);
 
     // Get bunker pubkey for state management
-    let bunker_pubkey = profile.bunker_uri.remote_signer_public_key()
+    let bunker_pubkey = profile
+        .bunker_uri
+        .remote_signer_public_key()
         .ok_or("No remote signer public key in URI")?
         .to_hex();
 
@@ -104,20 +94,21 @@ pub async fn connect_bunker(
     tokio::spawn(async move {
         info!("Triggering deferred NIP-46 connection in background for new session...");
         match client.signer().await {
-            Ok(signer) => {
-                match signer.get_public_key().await {
-                    Ok(_) => {
-                        info!("NIP-46 connection established successfully for new session");
-                        let mut state_guard = state_clone.lock().await;
-                        state_guard.connection_state = ConnectionState::Connected;
-                    }
-                    Err(e) => {
-                        error!("Failed to establish NIP-46 connection for new session: {}", e);
-                        let mut state_guard = state_clone.lock().await;
-                        state_guard.connection_state = ConnectionState::Failed(e.to_string());
-                    }
+            Ok(signer) => match signer.get_public_key().await {
+                Ok(_) => {
+                    info!("NIP-46 connection established successfully for new session");
+                    let mut state_guard = state_clone.lock().await;
+                    state_guard.connection_state = ConnectionState::Connected;
                 }
-            }
+                Err(e) => {
+                    error!(
+                        "Failed to establish NIP-46 connection for new session: {}",
+                        e
+                    );
+                    let mut state_guard = state_clone.lock().await;
+                    state_guard.connection_state = ConnectionState::Failed(e.to_string());
+                }
+            },
             Err(e) => {
                 error!("Failed to get signer from client for new session: {}", e);
                 let mut state_guard = state_clone.lock().await;
@@ -132,7 +123,9 @@ pub async fn connect_bunker(
     }
 
     // Emit auth success event immediately (fast!)
-    let user_npub = profile.user_pubkey.to_bech32()
+    let user_npub = profile
+        .user_pubkey
+        .to_bech32()
         .map_err(|e| format!("Failed to encode pubkey: {}", e))?;
     let _ = app_handle.emit("auth_success", user_npub.clone());
 
@@ -149,62 +142,78 @@ pub async fn connect_bunker(
 }
 
 /// Parse a bunker:// URI and extract the NostrConnectURI and user public key
-fn parse_bunker_uri(uri_str: &str) -> Result<(nostr::nips::nip46::NostrConnectURI, nostr::PublicKey), String> {
+fn parse_bunker_uri(
+    uri_str: &str,
+) -> Result<(nostr::nips::nip46::NostrConnectURI, nostr::PublicKey), String> {
     use nostr::nips::nip46::NostrConnectURI;
-    
+
     let uri = NostrConnectURI::parse(uri_str)
         .map_err(|e| format!("Failed to parse bunker URI: {}", e))?;
-    
+
     // For bunker URIs, we need to get the remote signer pubkey
     // The user_pubkey will be obtained during the actual handshake
     // For now, we use a placeholder that will be updated on first connection
-    let remote_pubkey = uri.remote_signer_public_key()
+    let remote_pubkey = uri
+        .remote_signer_public_key()
         .ok_or_else(|| "No remote signer public key in bunker URI".to_string())?
         .clone();
-    
+
     // Note: The actual user pubkey will be obtained during the handshake
     // We use the remote signer pubkey as a placeholder for now
     Ok((uri, remote_pubkey))
 }
 
 /// Resolve NIP-05 identifier to NostrConnectURI and public key
-async fn resolve_nip05_to_uri_and_pubkey(identifier: &str) -> Result<(nostr::nips::nip46::NostrConnectURI, nostr::PublicKey), String> {
+async fn resolve_nip05_to_uri_and_pubkey(
+    identifier: &str,
+) -> Result<(nostr::nips::nip46::NostrConnectURI, nostr::PublicKey), String> {
     use nostr::nips::nip05;
-    
+
     let address = nostr::nips::nip05::Nip05Address::parse(identifier)
         .map_err(|e| format!("Invalid NIP-05 format: {}", e))?;
 
     let client = reqwest::Client::new();
-    let url = format!("https://{}/.well-known/nostr.json?name={}", 
-        address.domain(), 
+    let url = format!(
+        "https://{}/.well-known/nostr.json?name={}",
+        address.domain(),
         address.name()
     );
-    
+
     info!("Fetching NIP-05 from: {}", url);
-    
-    let response = client.get(&url)
+
+    let response = client
+        .get(&url)
         .send()
         .await
         .map_err(|e| format!("Failed to fetch NIP-05: {}", e))?;
-    
-    let json: serde_json::Value = response.json()
+
+    let json: serde_json::Value = response
+        .json()
         .await
         .map_err(|e| format!("Failed to parse NIP-05 JSON: {}", e))?;
 
     // Extract the public key from the response
-    let names = json.get("names")
+    let names = json
+        .get("names")
         .and_then(|n| n.as_object())
         .ok_or_else(|| "No 'names' field in NIP-05 response".to_string())?;
-    
-    let pubkey_hex = names.get(address.name())
+
+    let pubkey_hex = names
+        .get(address.name())
         .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("No pubkey found for '{}' in NIP-05 response", address.name()))?;
-    
+        .ok_or_else(|| {
+            format!(
+                "No pubkey found for '{}' in NIP-05 response",
+                address.name()
+            )
+        })?;
+
     let pubkey = nostr::PublicKey::from_hex(pubkey_hex)
         .map_err(|e| format!("Invalid pubkey in NIP-05 response: {}", e))?;
 
     // Get NIP-46 relays from the response
-    let nip46_relays = json.get("nip46")
+    let nip46_relays = json
+        .get("nip46")
         .and_then(|n| n.as_object())
         .and_then(|n| n.get(address.name()))
         .and_then(|v| v.as_array())
@@ -232,14 +241,13 @@ async fn resolve_nip05_to_uri_and_pubkey(identifier: &str) -> Result<(nostr::nip
     let relay_count = relays.len();
 
     // Create NostrConnectURI
-    let uri = nostr::nips::nip46::NostrConnectURI::client(
-        pubkey,
-        relays,
-        "Arcadestr",
+    let uri = nostr::nips::nip46::NostrConnectURI::client(pubkey, relays, "Arcadestr");
+
+    info!(
+        "Resolved NIP-05 {} to pubkey {} with {} relays",
+        identifier, pubkey_hex, relay_count
     );
 
-    info!("Resolved NIP-05 {} to pubkey {} with {} relays", identifier, pubkey_hex, relay_count);
-    
     Ok((uri, pubkey))
 }
 
@@ -250,19 +258,19 @@ pub async fn get_connection_status(
     state: State<'_, Arc<Mutex<AppSignerState>>>,
 ) -> Result<serde_json::Value, String> {
     let state_guard = state.lock().await;
-    
+
     let status = match &state_guard.connection_state {
         ConnectionState::Disconnected => "disconnected",
         ConnectionState::Connecting => "connecting",
         ConnectionState::Connected => "connected",
         ConnectionState::Failed(_) => "failed",
     };
-    
+
     let error = match &state_guard.connection_state {
         ConnectionState::Failed(e) => Some(e.clone()),
         _ => None,
     };
-    
+
     Ok(serde_json::json!({
         "status": status,
         "error": error,
@@ -282,12 +290,10 @@ pub async fn start_qr_login(
     info!("start_qr_login called");
 
     // Generate QR with no specific permissions requested
-    let (uri_string, app_keys, secret) = generate_login_qr(None)
-        .await
-        .map_err(|e| {
-            error!("generate_login_qr failed: {}", e);
-            e.to_string()
-        })?;
+    let (uri_string, app_keys, secret) = generate_login_qr(None).await.map_err(|e| {
+        error!("generate_login_qr failed: {}", e);
+        e.to_string()
+    })?;
 
     // Store pending QR state in AppSignerState
     {
@@ -322,11 +328,10 @@ pub async fn check_qr_connection(
             // Check if we have an active profile (connection succeeded)
             if state_guard.active_profile_id.is_some() {
                 // Connection already established, return success
-            if let Some(ref client) = state_guard.active_client {
-                // Get signer from client, then get public key
-                match client.signer().await {
-                    Ok(signer) => {
-                        match signer.get_public_key().await {
+                if let Some(ref client) = state_guard.active_client {
+                    // Get signer from client, then get public key
+                    match client.signer().await {
+                        Ok(signer) => match signer.get_public_key().await {
                             Ok(pubkey) => {
                                 let user_npub = pubkey.to_bech32().unwrap_or_default();
                                 return Ok(Some(serde_json::json!({
@@ -337,11 +342,10 @@ pub async fn check_qr_connection(
                                 })));
                             }
                             Err(_) => {}
-                        }
+                        },
+                        Err(_) => {}
                     }
-                    Err(_) => {}
                 }
-            }
             }
             return Err("No QR login in progress. Call start_qr_login first.".to_string());
         }
@@ -363,10 +367,17 @@ pub async fn check_qr_connection(
 
     // Try to complete the connection with 30 second timeout per poll
     // The frontend polls every 3 seconds, so this gives plenty of time
-    match wait_for_qr_connection(&pending.uri, pending.app_keys.clone(), pending.secret.clone(), 30).await {
+    match wait_for_qr_connection(
+        &pending.uri,
+        pending.app_keys.clone(),
+        pending.secret.clone(),
+        30,
+    )
+    .await
+    {
         Ok(profile) => {
             info!("QR connection established for profile: {}", profile.id);
-            
+
             // Save profile to keyring
             if let Err(e) = save_profile_to_keyring(&profile) {
                 error!("Failed to save QR profile to keyring: {}", e);
@@ -382,11 +393,13 @@ pub async fn check_qr_connection(
             // The signer will send events directly to our relays
             drop(state_guard);
 
-            info!("QR profile {} activated (without bunker connection)", profile.id);
+            info!(
+                "QR profile {} activated (without bunker connection)",
+                profile.id
+            );
 
             // Emit success event
-            let user_npub = profile.user_pubkey.to_bech32()
-                .map_err(|e| e.to_string())?;
+            let user_npub = profile.user_pubkey.to_bech32().map_err(|e| e.to_string())?;
             let _ = app_handle.emit("qr-login-complete", user_npub.clone());
 
             // Return profile info
@@ -422,27 +435,29 @@ pub async fn list_saved_profiles(
     };
 
     let profiles = list_profile_index();
-    
+
     // Deduplicate by npub - use a HashMap to keep only first profile for each npub
     use std::collections::HashMap;
     let mut seen_npubs: HashMap<String, ProfileMetadata> = HashMap::new();
-    
+
     for profile in profiles {
         // Only keep the first profile for each npub
-        seen_npubs.entry(profile.pubkey_bech32.clone()).or_insert(profile);
+        seen_npubs
+            .entry(profile.pubkey_bech32.clone())
+            .or_insert(profile);
     }
-    
+
     // Convert back to vec
     let unique_profiles: Vec<ProfileMetadata> = seen_npubs.into_values().collect();
-    
+
     // When there's only one profile, always show Connect button (never mark as current)
     // This ensures the user can always reconnect after logout
     let single_profile_mode = unique_profiles.len() == 1;
-    
+
     // Return in the format the frontend expects (matching old API)
     // Include profile metadata from UserCache
     let mut accounts_list: Vec<serde_json::Value> = Vec::new();
-    
+
     for p in unique_profiles {
         // Check if this profile is currently active
         // But don't mark as current if there's only one profile (always show Connect)
@@ -451,10 +466,10 @@ pub async fn list_saved_profiles(
         } else {
             active_profile_id.as_ref() == Some(&p.id)
         };
-        
+
         // Fetch profile metadata from UserCache
         let cached_profile = app_state.user_cache.get(&p.pubkey_bech32).await;
-        
+
         let account_json = serde_json::json!({
             "id": p.id,
             "name": p.name,
@@ -470,11 +485,15 @@ pub async fn list_saved_profiles(
             "nip05": cached_profile.as_ref().and_then(|prof| prof.nip05.clone()),
             "about": cached_profile.as_ref().and_then(|prof| prof.about.clone()),
         });
-        
+
         accounts_list.push(account_json);
     }
 
-    info!("Returning {} unique profiles (single_profile_mode: {})", accounts_list.len(), single_profile_mode);
+    info!(
+        "Returning {} unique profiles (single_profile_mode: {})",
+        accounts_list.len(),
+        single_profile_mode
+    );
     Ok(serde_json::json!({
         "accounts": accounts_list,
     }))
@@ -518,27 +537,36 @@ pub async fn switch_profile(
         profile = load_profile_from_keyring(&key_to_use);
         if profile.is_some() {
             if attempt > 1 {
-                info!("Profile {} loaded from keyring on attempt {}", profile_id, attempt);
+                info!(
+                    "Profile {} loaded from keyring on attempt {}",
+                    profile_id, attempt
+                );
             }
             break;
         }
         if attempt < 5 {
-            warn!("Profile {} not found in keyring on attempt {}, retrying in 200ms...", profile_id, attempt);
+            warn!(
+                "Profile {} not found in keyring on attempt {}, retrying in 200ms...",
+                profile_id, attempt
+            );
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
     }
-    
+
     let profile = match profile {
         Some(p) => p,
         None => {
-            error!("Profile {} not found in keyring after 5 attempts (key: {})", profile_id, key_to_use);
+            error!(
+                "Profile {} not found in keyring after 5 attempts (key: {})",
+                profile_id, key_to_use
+            );
             return Err(format!("Profile not found: {}", profile_id));
         }
     };
 
     // Check if this is a QR profile (name contains "QR Connected")
     let is_qr_profile = profile.name.contains("QR Connected");
-    
+
     if is_qr_profile {
         // For QR profiles, just set as active without bunker connection
         info!("QR profile detected, activating without bunker connection");
@@ -547,16 +575,16 @@ pub async fn switch_profile(
         state_guard.is_offline_mode = false;
         // Note: active_client remains None for QR profiles
         drop(state_guard);
-        
+
         // Set as last active
         let _ = set_last_active_profile_id(&profile_id);
-        
+
         let user_npub = match profile.user_pubkey.to_bech32() {
             Ok(npub) => npub,
             Err(e) => return Err(format!("Failed to encode pubkey: {}", e)),
         };
         let _ = app_handle.emit("auth_success", user_npub.clone());
-        
+
         return Ok(serde_json::json!({
             "account": {
                 "id": profile_id,
@@ -626,24 +654,22 @@ pub async fn attempt_reconnect(
     match attempt_manual_reconnect(state.inner()).await {
         Ok(_) => {
             info!("Manual reconnect successful");
-            
+
             // Get the user pubkey
             let state_guard = state.lock().await;
             if let Some(ref client) = state_guard.active_client {
                 match client.signer().await {
-                    Ok(signer) => {
-                        match signer.get_public_key().await {
-                            Ok(pubkey) => {
-                                let user_npub = pubkey.to_bech32().unwrap_or_default();
-                                let _ = app_handle.emit("bunker_reconnected", user_npub.clone());
-                                Ok(serde_json::json!({
-                                    "success": true,
-                                    "npub": user_npub,
-                                }))
-                            }
-                            Err(e) => Err(format!("Connected but failed to get pubkey: {}", e)),
+                    Ok(signer) => match signer.get_public_key().await {
+                        Ok(pubkey) => {
+                            let user_npub = pubkey.to_bech32().unwrap_or_default();
+                            let _ = app_handle.emit("bunker_reconnected", user_npub.clone());
+                            Ok(serde_json::json!({
+                                "success": true,
+                                "npub": user_npub,
+                            }))
                         }
-                    }
+                        Err(e) => Err(format!("Connected but failed to get pubkey: {}", e)),
+                    },
                     Err(e) => Err(format!("Connected but failed to get signer: {}", e)),
                 }
             } else {
@@ -684,12 +710,12 @@ pub async fn delete_profile(
         // New profile - use bunker_pubkey_hex as the key
         metadata.bunker_pubkey_hex.clone()
     };
-    
+
     {
         let state_guard = state.lock().await;
         // Check if active_profile_id matches either the bunker pubkey or the profile id
-        let is_active = state_guard.active_profile_id.as_ref() == Some(&key_to_delete) ||
-                       state_guard.active_profile_id.as_ref() == Some(&profile_id);
+        let is_active = state_guard.active_profile_id.as_ref() == Some(&key_to_delete)
+            || state_guard.active_profile_id.as_ref() == Some(&profile_id);
         if is_active {
             info!("Profile {} is active, logging out first", profile_id);
             drop(state_guard);
@@ -697,11 +723,10 @@ pub async fn delete_profile(
         }
     }
 
-    delete_profile_from_keyring(&key_to_delete)
-        .map_err(|e| {
-            error!("delete_profile_from_keyring failed: {}", e);
-            e.to_string()
-        })
+    delete_profile_from_keyring(&key_to_delete).map_err(|e| {
+        error!("delete_profile_from_keyring failed: {}", e);
+        e.to_string()
+    })
 }
 
 /// Sign and publish a game event (example usage from game logic).
@@ -712,7 +737,7 @@ pub async fn publish_game_score(
     state: State<'_, Arc<Mutex<AppSignerState>>>,
 ) -> Result<String, String> {
     let state_guard = state.lock().await;
-    
+
     let _client = state_guard
         .active_client
         .as_ref()
@@ -723,14 +748,14 @@ pub async fn publish_game_score(
     //   1. Create an EventBuilder for the game score
     //   2. Use the client to sign it (which sends NIP-46 request to bunker)
     //   3. Return the event ID
-    
+
     // For now, return a placeholder since we need the full event builder integration
     info!("publish_game_score called with score: {}", score);
-    
+
     // TODO: Implement full event signing via NIP-46
     // let builder = nostr::EventBuilder::text_note(format!("I scored {} on Arcadestr!", score));
     // let event = client.sign_event_builder(builder).await?;
-    
+
     Ok(format!("score_{}_published", score))
 }
 
@@ -742,13 +767,13 @@ pub async fn ping_bunker(
     app_handle: AppHandle,
 ) -> Result<serde_json::Value, String> {
     let is_alive = ping_active_signer(state.inner()).await;
-    
+
     let payload = serde_json::json!({
         "alive": is_alive,
     });
-    
+
     let _ = app_handle.emit("bunker-heartbeat", payload.clone());
-    
+
     Ok(payload)
 }
 
@@ -760,11 +785,11 @@ pub async fn logout_nip46(
 ) -> Result<(), String> {
     info!("logout_nip46 called");
     logout(state.inner()).await;
-    
+
     // Emit logout event to notify frontend
     let _ = app_handle.emit("auth_logout", ());
     info!("Emitted auth_logout event");
-    
+
     Ok(())
 }
 
@@ -783,16 +808,16 @@ pub async fn load_active_account(
     state: State<'_, Arc<Mutex<AppSignerState>>>,
 ) -> Result<serde_json::Value, String> {
     info!("load_active_account called");
-    
+
     let state_guard = state.lock().await;
-    
+
     // Check if we have an active profile
     if let Some(ref profile_id) = state_guard.active_profile_id {
         // Get profile metadata for the name
         let profile_name = get_profile_metadata_by_id(profile_id)
             .map(|m| m.name)
             .unwrap_or_default();
-        
+
         // Try to get the client and fetch pubkey
         if let Some(ref client) = state_guard.active_client {
             // Get signer from client, then get public key
@@ -843,7 +868,7 @@ pub async fn load_active_account(
             }
         }
     }
-    
+
     // No active account
     Err("No active account".to_string())
 }
