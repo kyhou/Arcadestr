@@ -10,6 +10,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::auth::AuthState;
+use crate::relay_events::RelayConnectionEvent;
 #[cfg(feature = "native")]
 use crate::relay_cache::{CachedRelayList, RelayCache, RelayDiscoverySource};
 #[cfg(feature = "native")]
@@ -18,6 +19,7 @@ use crate::relay_hints::RelayHints;
 use crate::relay_manager::{RelayManager, RelayManagerConfig};
 use crate::signers::{ActiveSigner, NostrSigner as ArcadestrNostrSigner, SignerError};
 use crate::user_cache::UserCache;
+use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 
 /// Arcadestr game listing event kind.
@@ -441,6 +443,49 @@ pub struct GameListing {
     pub lud16: String, // Lightning address for payments (e.g., "seller@walletofsatoshi.com")
 }
 
+impl GameListing {
+    /// Construct a `GameListing` from a NIP-15 product, optionally enriched
+    /// with its parent stall.
+    ///
+    /// `lud16` is left empty here — callers should fill it once the
+    /// merchant's NIP-01 profile has been fetched.
+    pub fn from_nip15(
+        product: crate::marketplace::Nip15Product,
+        stall: Option<&crate::marketplace::Nip15Stall>,
+    ) -> Self {
+        // Prefer an explicit "download_url" spec entry, then fall back to
+        // the first image.
+        let download_url = product
+            .specs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("download_url"))
+            .map(|(_, v)| v.clone())
+            .or_else(|| product.images.first().cloned())
+            .unwrap_or_default();
+
+        // Best-effort sats conversion for the legacy buy/zap flow.
+        let price_sats = if product.currency.eq_ignore_ascii_case("SATS")
+            || product.currency.eq_ignore_ascii_case("SAT")
+        {
+            product.price as u64
+        } else {
+            0 // UI should use price + currency when price_sats == 0
+        };
+
+        GameListing {
+            id: product.id,
+            title: product.name,
+            description: product.description.unwrap_or_default(),
+            price_sats,
+            download_url,
+            publisher_npub: product.merchant_npub,
+            created_at: product.created_at,
+            tags: product.categories,
+            lud16: String::new(),
+        }
+    }
+}
+
 /// Content portion of a game listing event (stored in event.content).
 #[derive(Serialize, Deserialize)]
 struct GameListingContent {
@@ -485,12 +530,23 @@ pub struct NostrClient {
     relay_manager: Arc<Mutex<RelayManager>>,
     user_cache: Option<Arc<UserCache>>,
     profile_id: String,
+    relay_event_sender: broadcast::Sender<RelayConnectionEvent>,
 }
 
 impl NostrClient {
     /// Get access to the relay manager.
     pub fn relay_manager(&self) -> Arc<Mutex<RelayManager>> {
         self.relay_manager.clone()
+    }
+
+    /// Subscribe to relay connection events
+    pub fn subscribe_relay_events(&self) -> broadcast::Receiver<RelayConnectionEvent> {
+        self.relay_event_sender.subscribe()
+    }
+
+    /// Emit a relay connection event
+    fn emit_relay_event(&self, event: RelayConnectionEvent) {
+        let _ = self.relay_event_sender.send(event);
     }
 
     /// Creates a new NOSTR client with background relay manager.
@@ -521,10 +577,13 @@ impl NostrClient {
 
         info!("NostrClient initialized with relay manager");
 
+        let (relay_event_sender, _) = broadcast::channel(100);
+
         Ok(Self {
             relay_manager: Arc::new(Mutex::new(relay_manager)),
             user_cache: None,
             profile_id,
+            relay_event_sender,
         })
     }
 
@@ -561,10 +620,13 @@ impl NostrClient {
 
         info!("NostrClient initialized with relay manager and cache");
 
+        let (relay_event_sender, _) = broadcast::channel(100);
+
         Ok(Self {
             relay_manager: Arc::new(Mutex::new(relay_manager)),
             user_cache: Some(user_cache),
             profile_id,
+            relay_event_sender,
         })
     }
 
@@ -649,6 +711,30 @@ impl NostrClient {
         }
 
         Ok(listings)
+    }
+
+    /// Fetch NIP-15 stalls (kind 30017) from connected relays.
+    ///
+    /// * `limit`      — max events per relay.
+    /// * `since_days` — if `Some(n)`, restrict to the last `n` days.
+    pub async fn fetch_nip15_stalls(
+        &self,
+        limit: usize,
+        since_days: Option<u64>,
+    ) -> Result<Vec<crate::marketplace::Nip15Stall>, String> {
+        crate::marketplace::fetch_nip15_stalls_impl(&self.relay_manager, limit, since_days).await
+    }
+
+    /// Fetch NIP-15 products (kind 30018) from connected relays.
+    ///
+    /// * `limit`      — max events per relay.
+    /// * `since_days` — if `Some(n)`, restrict to the last `n` days.
+    pub async fn fetch_nip15_products(
+        &self,
+        limit: usize,
+        since_days: Option<u64>,
+    ) -> Result<Vec<crate::marketplace::Nip15Product>, String> {
+        crate::marketplace::fetch_nip15_products_impl(&self.relay_manager, limit, since_days).await
     }
 
     /// Fetches a specific game listing by its ID and publisher.
