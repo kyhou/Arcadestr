@@ -2066,6 +2066,8 @@ fn main() {
                 drop(nostr); // Release lock
 
                 while let Ok(event) = rx.recv().await {
+                    tracing::info!("Emitting relay event: {:?}", event);
+
                     let payload = match &event {
                         RelayConnectionEvent::Connected { url } => {
                             serde_json::json!({

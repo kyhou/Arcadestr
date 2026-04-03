@@ -161,6 +161,8 @@ impl RelayManager {
         let relays = self.pool.get_relays().await;
         let total = relays.len();
 
+        info!("Starting relay connections: {} relays to connect", total);
+
         for relay in &relays {
             match self.client.add_relay(relay).await {
                 Ok(_) => {
@@ -168,10 +170,10 @@ impl RelayManager {
                     if let Some(sender) = &self.event_sender {
                         let _ = sender.send(RelayConnectionEvent::connected(relay));
                     }
-                    info!("Added relay: {}", relay);
+                    info!("Relay {} connection attempt: Ok(())", relay);
                 }
                 Err(e) => {
-                    warn!("Failed to add relay {}: {}", relay, e);
+                    warn!("Relay {} connection attempt: Err({})", relay, e);
                     if let Some(sender) = &self.event_sender {
                         let _ = sender.send(RelayConnectionEvent::disconnected(
                             relay, 
