@@ -25,6 +25,73 @@ use serde::{Deserialize, Serialize};
 // These mirror the raw NIP-15 JSON structures and are private to this module.
 // Downstream code always works with the richer domain types below.
 
+/// Deserialize a field that may be either a float or a string representation of a float.
+fn deserialize_f64_or_string<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    use serde_json::Value;
+
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| D::Error::custom("invalid float number")),
+        Value::String(s) => s
+            .parse::<f64>()
+            .map_err(|e| D::Error::custom(format!("invalid float string: {}", e))),
+        _ => Err(D::Error::custom("expected float or string")),
+    }
+}
+
+/// Deserialize an optional u64 that may be an integer, string, or null.
+fn deserialize_optional_u64_or_string<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    use serde_json::Value;
+
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(n) => n
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| D::Error::custom("invalid unsigned integer")),
+        Value::String(s) => s
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|e| D::Error::custom(format!("invalid unsigned integer string: {}", e))),
+        _ => Err(D::Error::custom("expected integer, string, or null")),
+    }
+}
+
+/// Deserialize an optional vector that may be an array or null.
+fn deserialize_optional_vec_shipping<'de, D>(deserializer: D) -> Result<Vec<ProductShipping>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    use serde_json::Value;
+
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(arr) => {
+            let mut result = Vec::with_capacity(arr.len());
+            for item in arr {
+                let shipping: ProductShipping = serde_json::from_value(item)
+                    .map_err(|e| D::Error::custom(format!("invalid shipping entry: {}", e)))?;
+                result.push(shipping);
+            }
+            Ok(result)
+        }
+        _ => Err(D::Error::custom("expected array or null")),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct StallContent {
     id: String,
@@ -44,13 +111,15 @@ struct ProductContent {
     #[serde(default)]
     images: Vec<String>,
     currency: String,
+    #[serde(deserialize_with = "deserialize_f64_or_string")]
     price: f64,
     /// `null` in JSON becomes `None` here (unlimited / digital goods).
+    #[serde(default, deserialize_with = "deserialize_optional_u64_or_string")]
     quantity: Option<u64>,
     /// NIP-15 encodes specs as `[[key, value], ...]` arrays.
     #[serde(default)]
     specs: Vec<[String; 2]>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_vec_shipping")]
     shipping: Vec<ProductShipping>,
 }
 
