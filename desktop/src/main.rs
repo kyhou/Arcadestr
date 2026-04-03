@@ -452,6 +452,78 @@ async fn fetch_marketplace(
     Ok(listings)
 }
 
+/// Streams NIP-15 products from relays with real-time updates via Tauri events.
+///
+/// Products are emitted as they arrive from each relay via the `marketplace-product` event.
+/// When all relays finish or inactivity timeout is reached, `marketplace-complete` is emitted.
+/// This command returns immediately after starting the fetch; results come via events.
+///
+/// * `limit`      — max events to retrieve per relay.
+/// * `since_days` — time window; `None` means no time restriction.
+#[tauri::command]
+async fn fetch_marketplace_stream(
+    window: tauri::Window,
+    state: tauri::State<'_, AppState>,
+    limit: usize,
+    since_days: Option<u64>,
+) -> Result<(), String> {
+    tracing::info!(
+        "fetch_marketplace_stream called: limit={}, since_days={:?}",
+        limit,
+        since_days
+    );
+
+    // Fetch stalls first (needed for product enrichment)
+    let stalls = {
+        let nostr = state.nostr.lock().await;
+        nostr.fetch_nip15_stalls(limit, since_days).await?
+    };
+    tracing::info!("fetch_marketplace_stream: got {} stalls", stalls.len());
+
+    // Build stall lookup map for enriching products
+    let stall_map: std::collections::HashMap<String, arcadestr_core::marketplace::Nip15Stall> =
+        stalls.iter().map(|s| (s.id.clone(), s.clone())).collect();
+
+    // Clone window for use in the closure
+    let window_for_closure = window.clone();
+
+    // Start streaming product fetch
+    let products = {
+        let nostr = state.nostr.lock().await;
+        let relay_manager = nostr.get_relay_manager();
+        
+        arcadestr_core::marketplace::fetch_nip15_products_streaming(
+            relay_manager,
+            limit,
+            since_days,
+            move |product| {
+                // Enrich with stall data if available
+                let stall = stall_map.get(&product.stall_id);
+                let listing = GameListing::from_nip15(product, stall);
+                
+                // Emit product to frontend
+                if let Err(e) = window_for_closure.emit("marketplace-product", &listing) {
+                    tracing::debug!("Failed to emit marketplace-product: {}", e);
+                }
+            }
+        ).await
+    };
+
+    match products {
+        Ok(count) => {
+            tracing::info!("fetch_marketplace_stream: emitted {} products", count);
+        }
+        Err(e) => {
+            tracing::warn!("fetch_marketplace_stream: fetch error: {}", e);
+        }
+    }
+
+    // Signal completion
+    let _ = window.emit("marketplace-complete", ());
+    
+    Ok(())
+}
+
 /// Fetches user profile metadata (NIP-01 kind-0) with NIP-65 relay discovery.
 ///
 /// # Arguments
@@ -2119,6 +2191,7 @@ fn main() {
             fetch_listings,
             fetch_listing_by_id,
             fetch_marketplace,
+            fetch_marketplace_stream,
             fetch_profile,
             fetch_profile_with_hints,
             request_invoice,

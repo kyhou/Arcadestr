@@ -546,6 +546,11 @@ impl NostrClient {
         self.relay_manager.clone()
     }
 
+    /// Get access to the relay manager for streaming queries.
+    pub fn get_relay_manager(&self) -> &Arc<tokio::sync::Mutex<RelayManager>> {
+        &self.relay_manager
+    }
+
     /// Subscribe to relay connection events.
     ///
     /// Returns a broadcast receiver that receives `RelayConnectionEvent` values

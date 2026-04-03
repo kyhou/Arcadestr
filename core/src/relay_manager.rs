@@ -392,12 +392,19 @@ impl RelayManager {
         let total_relays = handles.len();
         let mut completed = 0;
         let mut total_events = 0;
-        let mut last_result_time = tokio::time::Instant::now();
+        let mut _last_result_time = tokio::time::Instant::now();
 
         loop {
+            // Take ownership of handles for this iteration
+            let current_handles = std::mem::take(&mut handles);
+            
+            if current_handles.is_empty() {
+                break;
+            }
+            
             let timeout_future = tokio::time::timeout(
                 inactivity_duration,
-                future::select_all(handles)
+                future::select_all(current_handles)
             );
 
             match timeout_future.await {
@@ -408,7 +415,7 @@ impl RelayManager {
                     if let Ok(Some((relay_url, events))) = result {
                         let count = events.len();
                         total_events += count;
-                        last_result_time = tokio::time::Instant::now();
+                        _last_result_time = tokio::time::Instant::now();
                         on_events(relay_url, events);
                         debug!("Processed {}/{} relays, {} events so far", completed, total_relays, total_events);
                     }
