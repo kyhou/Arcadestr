@@ -42,8 +42,8 @@ const DISCOVERY_TIMEOUT_SECS: u64 = 30;
 /// Follow list fetch timeout: 15 seconds (increased for better coverage)
 const FOLLOW_LIST_TIMEOUT_SECS: u64 = 15;
 
-/// Relay list fetch timeout: 8 seconds
-const RELAY_LIST_TIMEOUT_SECS: u64 = 8;
+/// Relay list fetch timeout: 15 seconds
+const RELAY_LIST_TIMEOUT_SECS: u64 = 15;
 
 /// Extended network discovery state
 #[derive(Debug, Clone, PartialEq)]
