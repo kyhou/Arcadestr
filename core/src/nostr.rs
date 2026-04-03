@@ -28,7 +28,6 @@ pub const KIND_GAME_LISTING: u16 = 30078;
 /// Includes popular relay discovery services that aggregate user metadata.
 pub const DEFAULT_RELAYS: &[&str] = &[
     // Relay discovery services (query these first for user lookups)
-    "wss://purplepag.es",     // Aggregates user metadata and relay lists
     "wss://relay.nostr.info", // Relay discovery service
     "wss://relay.nostr.band", // Relay aggregator with good coverage
     // General relays
@@ -41,7 +40,6 @@ pub const DEFAULT_RELAYS: &[&str] = &[
 
 /// Relay discovery services - prioritized for user lookups
 pub const DISCOVERY_RELAYS: &[&str] = &[
-    "wss://purplepag.es",
     "wss://relay.nostr.info",
     "wss://relay.nostr.band",
     "wss://relay.nsec.app", // NIP-46 service relay
@@ -51,7 +49,6 @@ pub const DISCOVERY_RELAYS: &[&str] = &[
 pub const INDEXER_RELAYS: &[&str] = &[
     "wss://relay.primal.net",
     "wss://relay.nostr.band",
-    "wss://purplepag.es",
     "wss://indexer.coracle.social",
 ];
 
