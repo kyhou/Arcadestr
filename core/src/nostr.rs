@@ -947,9 +947,6 @@ impl NostrClient {
                     }
                 }
                 drop(manager);
-                
-                // Give relays a moment to connect
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
             Err(e) => {
                 tracing::warn!("Could not discover relays for {}: {}", npub, e);
