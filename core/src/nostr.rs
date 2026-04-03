@@ -1096,8 +1096,8 @@ impl NostrClient {
 
     /// Get the list of connected relay URLs.
     pub async fn get_connected_relays(&self) -> Vec<String> {
-        // TODO: Implement through RelayManager
-        vec![]
+        let manager = self.relay_manager.lock().await;
+        manager.get_connected_relays().await
     }
 
     /// Fetch from unified relay pool

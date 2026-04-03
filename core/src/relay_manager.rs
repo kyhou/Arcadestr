@@ -511,6 +511,17 @@ impl RelayManager {
             .count()
     }
 
+    /// Get the list of connected relay URLs
+    pub async fn get_connected_relays(&self) -> Vec<String> {
+        self.client
+            .relays()
+            .await
+            .values()
+            .filter(|r| r.is_connected())
+            .map(|r| r.url().to_string())
+            .collect()
+    }
+
     /// Get the total number of relays in the pool
     pub async fn get_pool_size(&self) -> usize {
         self.pool.get_relays().await.len()
