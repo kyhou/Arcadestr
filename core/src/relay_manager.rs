@@ -76,6 +76,17 @@ pub struct RelayManager {
 }
 
 impl RelayManager {
+    /// Get a reference to the internal nostr_sdk Client.
+    /// Used for subscription management and notification loops.
+    pub fn get_client(&self) -> &Client {
+        &self.client
+    }
+
+    /// Get an owned Arc<Client> for spawning notification loops.
+    pub fn get_client_arc(&self) -> Arc<Client> {
+        Arc::new(self.client.clone())
+    }
+
     /// Create new relay manager for a profile
     pub async fn new(
         profile_id: String,
