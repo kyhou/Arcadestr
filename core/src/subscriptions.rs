@@ -260,6 +260,31 @@ pub async fn dispatch_ephemeral_read(
     }
 }
 
+/// Dispatch ephemeral read connections for multiple uncovered pubkeys (batch)
+pub async fn dispatch_ephemeral_reads_batch(
+    client: &Client,
+    pubkeys: &[String],
+    relay_cache: &Arc<RelayCache>,
+    registry: &Arc<SubscriptionRegistry>,
+) {
+    for pubkey in pubkeys {
+        // Get best relay for this pubkey
+        let relay_url = if let Some(cached) = relay_cache.get_relay_list(pubkey) {
+            cached.read_relays.first()
+                .or(cached.write_relays.first())
+                .cloned()
+        } else {
+            None
+        };
+        
+        if let Some(url) = relay_url {
+            dispatch_ephemeral_read(client, pubkey, &url, registry).await;
+        } else {
+            tracing::warn!("No relay found for ephemeral read: {}", pubkey);
+        }
+    }
+}
+
 /// Publish a note with ephemeral write connection tagging (Fix 10)
 pub async fn publish_note(
     client: &Client,

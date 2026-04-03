@@ -45,6 +45,17 @@ pub mod nostr;
 pub mod subscriptions;
 
 #[cfg(feature = "native")]
+pub use subscriptions::{
+    dispatch_ephemeral_read,
+    dispatch_ephemeral_reads_batch,
+    dispatch_permanent_subscriptions,
+    run_notification_loop,
+    ConnectionKind,
+    SerializableEvent,
+    SubscriptionRegistry,
+};
+
+#[cfg(feature = "native")]
 pub mod profile_fetcher;
 
 #[cfg(feature = "native")]

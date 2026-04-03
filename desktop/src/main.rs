@@ -31,8 +31,8 @@ use arcadestr_core::relay_cache::RelayCache;
 use arcadestr_core::relay_hints::RelayHints;
 use arcadestr_core::social_graph::SocialGraphDb;
 use arcadestr_core::subscriptions::{
-    dispatch_ephemeral_read, dispatch_permanent_subscriptions, run_notification_loop,
-    SubscriptionRegistry,
+    dispatch_ephemeral_read, dispatch_ephemeral_reads_batch, dispatch_permanent_subscriptions,
+    run_notification_loop, SubscriptionRegistry,
 };
 use arcadestr_core::user_cache::UserCache;
 use nostr::nips::nip46::NostrConnectURI;
@@ -1093,18 +1093,23 @@ fn main() {
         // Get the inner client for subscription dispatch
         drop(nostr_client);
 
-        // Step 6: Dispatch ephemeral connections for uncovered pubkeys
-        for pubkey in &selection.uncovered_pubkeys {
-            let relay_url =
-                get_fallback_relay(pubkey, &nostr, &relay_cache, &relay_hints, &user_npub).await;
-            tracing::info!("Would start ephemeral read for {} on {}", pubkey, relay_url);
+        // Activate ephemeral subscriptions for uncovered pubkeys
+        if !selection.uncovered_pubkeys.is_empty() {
+            let client = nostr.lock().await;
+            let manager = client.relay_manager();
+            let manager_guard = manager.lock().await;
+            let inner_client = manager_guard.get_client();
+            
+            dispatch_ephemeral_reads_batch(
+                inner_client,
+                &selection.uncovered_pubkeys,
+                &relay_cache,
+                &subscription_registry,
+            ).await;
+            
+            info!("Activated ephemeral subscriptions for {} uncovered pubkeys", 
+                  selection.uncovered_pubkeys.len());
         }
-
-        tracing::info!(
-            "Relay gossip initialized with {} permanent relays and {} uncovered pubkeys",
-            selection.permanent.len(),
-            selection.uncovered_pubkeys.len()
-        );
 
         // Schedule background refresh with recurring timer
         let cache_for_refresh = relay_cache.clone();
@@ -1956,26 +1961,24 @@ fn main() {
             let app_handle = app.handle().clone();
 
             tauri::async_runtime::spawn(async move {
+                // Get the client directly from RelayManager
                 let client = nostr_client_clone.lock().await;
-                let inner_client_opt = client.inner_clone();
-                drop(client); // Release the lock before moving to the loop
+                let relay_manager_arc = client.relay_manager();
+                let manager = relay_manager_arc.lock().await;
+                let inner_client = manager.get_client_arc();
+                drop(manager);
+                drop(client);
 
-                // Only run notification loop if inner client is available
-                if let Some(inner_client) = inner_client_opt {
-                    let inner_client = Arc::new(inner_client);
-                    run_notification_loop(
-                        inner_client,
-                        relay_cache_clone,
-                        registry_clone,
-                        Some(hints_for_loop),
-                        Box::new(move |event| {
-                            // Emit event to frontend
-                            let _ = app_handle.emit("nostr_event", event);
-                        }),
-                    ).await;
-                } else {
-                    tracing::warn!("Notification loop not started - inner client not available (RelayManager migration in progress)");
-                }
+                run_notification_loop(
+                    inner_client,
+                    relay_cache_clone,
+                    registry_clone,
+                    Some(hints_for_loop),
+                    Box::new(move |event| {
+                        // Emit event to frontend
+                        let _ = app_handle.emit("nostr_event", event);
+                    }),
+                ).await;
             });
 
             Ok(())
