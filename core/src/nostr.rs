@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::auth::AuthState;
-use crate::relay_events::RelayConnectionEvent;
+use crate::relay_events::{RelayConnectionEvent, RelayStatus};
 #[cfg(feature = "native")]
 use crate::relay_cache::{CachedRelayList, RelayCache, RelayDiscoverySource};
 #[cfg(feature = "native")]
@@ -1095,7 +1095,7 @@ impl NostrClient {
     }
 
     /// Get the list of connected relay URLs.
-    pub async fn get_connected_relays(&self) -> Vec<String> {
+    pub async fn get_connected_relays(&self) -> Vec<RelayStatus> {
         let manager = self.relay_manager.lock().await;
         manager.get_connected_relays().await
     }

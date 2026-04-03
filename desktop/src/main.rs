@@ -25,9 +25,11 @@ use arcadestr_core::nostr::{
     parse_nip19_identifier, EventDeduplicator, GameListing, NostrClient, UserProfile,
     DEFAULT_RELAYS,
 };
+use arcadestr_core::marketplace::{apply_filter, MarketplaceFilter};
 use arcadestr_core::nip05_validator::Nip05Validator;
 use arcadestr_core::profile_fetcher::ProfileFetcher;
 use arcadestr_core::relay_cache::RelayCache;
+use arcadestr_core::relay_events::RelayStatus;
 use arcadestr_core::relay_hints::RelayHints;
 use arcadestr_core::social_graph::SocialGraphDb;
 use arcadestr_core::subscriptions::{
@@ -391,6 +393,58 @@ async fn fetch_listing_by_id(
         .map_err(|e| e.to_string())
 }
 
+/// Fetches NIP-15 stalls and products, applies an optional filter, and
+/// returns the results as `GameListing` values ready for the browse view.
+///
+/// * `limit`      — max events to retrieve per kind (30017 and 30018 each).
+/// * `since_days` — time window; `None` means no time restriction.
+/// * `filter`     — pass `None` (or `{}` from JS) to skip all filtering.
+#[tauri::command]
+async fn fetch_marketplace(
+    state: tauri::State<'_, AppState>,
+    limit: usize,
+    since_days: Option<u64>,
+    filter: Option<MarketplaceFilter>,
+) -> Result<Vec<GameListing>, String> {
+    let filter = filter.unwrap_or_default();
+
+    tracing::info!("fetch_marketplace called: limit={}, since_days={:?}", limit, since_days);
+
+    // Acquire and release the lock for each operation to avoid holding a
+    // MutexGuard across await points (see ARCHITECTURE.md §11.4).
+    let stalls = {
+        let nostr = state.nostr.lock().await;
+        nostr.fetch_nip15_stalls(limit, since_days).await?
+    };
+    tracing::info!("fetch_marketplace: got {} stalls", stalls.len());
+
+    let products = {
+        let nostr = state.nostr.lock().await;
+        nostr.fetch_nip15_products(limit, since_days).await?
+    };
+    tracing::info!("fetch_marketplace: got {} products", products.len());
+
+    // Build a stall lookup map for O(1) enrichment during the product mapping.
+    let stall_map: std::collections::HashMap<String, &arcadestr_core::marketplace::Nip15Stall> =
+        stalls.iter().map(|s| (s.id.clone(), s)).collect();
+
+    // Apply the filter (no-op while filter == default).
+    let filtered = apply_filter(products, &filter);
+    tracing::info!("fetch_marketplace: {} products after filtering", filtered.len());
+
+    // Map Nip15Product → GameListing, enriching with stall name where available.
+    let listings: Vec<GameListing> = filtered
+        .into_iter()
+        .map(|p| {
+            let stall = stall_map.get(&p.stall_id).copied();
+            GameListing::from_nip15(p, stall)
+        })
+        .collect();
+
+    tracing::info!("fetch_marketplace: returning {} listings", listings.len());
+    Ok(listings)
+}
+
 /// Fetches user profile metadata (NIP-01 kind-0) with NIP-65 relay discovery.
 ///
 /// # Arguments
@@ -534,7 +588,7 @@ fn main() {
         // Unwrap Arc to return the client directly (it will be re-wrapped later)
         let client = match Arc::try_unwrap(client) {
             Ok(c) => c,
-            Err(arc) => {
+            Err(_) => {
                 // If we can't unwrap (because validator is still using it), create a new empty client
                 warn!("Client is shared, creating new client for main use");
                 NostrClient::new_with_cache(
@@ -545,6 +599,11 @@ fn main() {
                 ).await.expect("Failed to create fallback client")
             }
         };
+        
+        // Connect to default relays immediately to reduce query latency
+        info!("Connecting to default relays before starting Tauri...");
+        client.connect().await;
+        info!("Default relay connections initiated");
         
         (db, client, cache, nip05_validator)
     });
@@ -1424,9 +1483,24 @@ fn main() {
     #[tauri::command]
     async fn get_connected_relays(
         state: tauri::State<'_, AppState>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<RelayStatus>, String> {
         let nostr = state.nostr.lock().await;
-        Ok(nostr.get_connected_relays().await)
+        let manager_arc = nostr.relay_manager();
+        let manager = manager_arc.lock().await;
+        let client = manager.get_client();
+        
+        let mut statuses = Vec::new();
+        let relays = client.relays().await;
+        
+        for (url, relay) in relays {
+            statuses.push(RelayStatus {
+                url: url.to_string(),
+                connected: relay.is_connected(),
+                latency_ms: relay.stats().latency().map(|d| d.as_millis() as u64),
+            });
+        }
+        
+        Ok(statuses)
     }
 
     /// Get extended network discovery statistics.
@@ -1996,6 +2070,7 @@ fn main() {
             publish_listing,
             fetch_listings,
             fetch_listing_by_id,
+            fetch_marketplace,
             fetch_profile,
             fetch_profile_with_hints,
             request_invoice,

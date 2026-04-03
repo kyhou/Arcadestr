@@ -4,7 +4,7 @@
 //! and growing as new relays are discovered via NIP-65 and hints.
 
 use crate::nostr::{DEFAULT_RELAYS, DISCOVERY_RELAYS, INDEXER_RELAYS};
-use crate::relay_events::RelayConnectionEvent;
+use crate::relay_events::{RelayConnectionEvent, RelayStatus};
 use crate::relay_pool::{RelayPool, RelaySource};
 use nostr_sdk::{Client, Event, Filter, Url};
 use std::sync::Arc;
@@ -512,14 +512,19 @@ impl RelayManager {
     }
 
     /// Get the list of connected relay URLs
-    pub async fn get_connected_relays(&self) -> Vec<String> {
-        self.client
-            .relays()
-            .await
-            .values()
-            .filter(|r| r.is_connected())
-            .map(|r| r.url().to_string())
-            .collect()
+    pub async fn get_connected_relays(&self) -> Vec<RelayStatus> {
+        let mut statuses = Vec::new();
+        let relays = self.client.relays().await;
+        
+        for (url, relay) in relays {
+            statuses.push(RelayStatus {
+                url: url.to_string(),
+                connected: relay.is_connected(),
+                latency_ms: relay.stats().latency().map(|d| d.as_millis() as u64),
+            });
+        }
+        
+        statuses
     }
 
     /// Get the total number of relays in the pool
