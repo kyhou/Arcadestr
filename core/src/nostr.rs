@@ -823,7 +823,7 @@ impl NostrClient {
                 // Connect to the user's read relays
                 let manager = self.relay_manager.lock().await;
                 for relay_url in &relay_list.read_relays {
-                    if let Err(e) = manager.add_relay(relay_url).await {
+                    if let Err(e) = manager.add_discovered_relay(relay_url.clone()).await {
                         tracing::warn!("Failed to add relay {}: {}", relay_url, e);
                     }
                 }

@@ -391,7 +391,7 @@ async fn fetch_listing_by_id(
         .map_err(|e| e.to_string())
 }
 
-/// Fetches user profile metadata (NIP-01 kind-0) with NIP-05 verification.
+/// Fetches user profile metadata (NIP-01 kind-0) with NIP-65 relay discovery.
 ///
 /// # Arguments
 /// * `npub` - The bech32 npub of the user
@@ -401,13 +401,14 @@ async fn fetch_listing_by_id(
 #[tauri::command]
 async fn fetch_profile(
     npub: String,
-    additional_relays: Option<Vec<String>>,
+    _additional_relays: Option<Vec<String>>,
     state: tauri::State<'_, AppState>,
 ) -> Result<UserProfile, String> {
     let nostr = state.nostr.lock().await;
 
+    // Use NIP-65 relay discovery first, then fetch profile
     nostr
-        .fetch_profile_verified(&npub, additional_relays)
+        .fetch_profile_with_relay_discovery(&npub)
         .await
         .map_err(|e| e.to_string())
 }
