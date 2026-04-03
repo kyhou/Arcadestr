@@ -29,7 +29,7 @@ use arcadestr_core::marketplace::{apply_filter, MarketplaceFilter};
 use arcadestr_core::nip05_validator::Nip05Validator;
 use arcadestr_core::profile_fetcher::ProfileFetcher;
 use arcadestr_core::relay_cache::RelayCache;
-use arcadestr_core::relay_events::RelayStatus;
+use arcadestr_core::relay_events::{RelayConnectionEvent, RelayStatus};
 use arcadestr_core::relay_hints::RelayHints;
 use arcadestr_core::social_graph::SocialGraphDb;
 use arcadestr_core::subscriptions::{
@@ -2054,6 +2054,36 @@ fn main() {
                         let _ = app_handle.emit("nostr_event", event);
                     }),
                 ).await;
+            });
+
+            // Spawn relay event listener for connection status updates
+            let nostr_for_events = nostr_client.clone();
+            let app_handle_for_events = app.handle().clone();
+
+            tauri::async_runtime::spawn(async move {
+                let nostr = nostr_for_events.lock().await;
+                let mut rx = nostr.subscribe_relay_events();
+                drop(nostr); // Release lock
+
+                while let Ok(event) = rx.recv().await {
+                    let payload = match &event {
+                        RelayConnectionEvent::Connected { url } => {
+                            serde_json::json!({
+                                "type": "connected",
+                                "url": url
+                            })
+                        }
+                        RelayConnectionEvent::Disconnected { url, reason } => {
+                            serde_json::json!({
+                                "type": "disconnected",
+                                "url": url,
+                                "reason": reason
+                            })
+                        }
+                    };
+
+                    let _ = app_handle_for_events.emit("relay-connection", payload);
+                }
             });
 
             Ok(())
