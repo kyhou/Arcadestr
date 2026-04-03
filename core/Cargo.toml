@@ -33,7 +33,7 @@ uuid = { version = "1", features = ["v4"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
-rand = "0.8"
+rand = "0.10"
 zeroize = { version = "1.7", features = ["derive"] }
 # OS keychain storage via tauri-plugin-keyring (uses keyring crate internally)
 keyring = "3.6"
@@ -54,3 +54,4 @@ wasm = []
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3"
