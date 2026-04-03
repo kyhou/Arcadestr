@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use arcadestr_core::nip46::{
-    activate_profile, attempt_manual_reconnect, cancel_bunker_retry, delete_profile_from_keyring,
-    generate_login_qr, get_profile_metadata_by_id, init_signer_session, init_signer_session_fast,
+    activate_profile, attempt_manual_reconnect, cancel_bunker_retry, clear_last_active_profile_id,
+    delete_profile_from_keyring, generate_login_qr, get_profile_metadata_by_id, init_signer_session, init_signer_session_fast,
     list_profile_index, load_profile_from_keyring, logout, ping_active_signer,
     save_profile_to_keyring, set_last_active_profile_id, wait_for_qr_connection, AppSignerState,
     ConnectionState, PendingQrState, ProfileMetadata,
@@ -726,7 +726,25 @@ pub async fn delete_profile(
     delete_profile_from_keyring(&key_to_delete).map_err(|e| {
         error!("delete_profile_from_keyring failed: {}", e);
         e.to_string()
-    })
+    })?;
+
+    // Always clear last active profile ID to prevent restore attempts of deleted profile
+    info!("Clearing last active profile ID after deleting profile {}", profile_id);
+    clear_last_active_profile_id();
+
+    // Also clear the active session state if this was the active profile
+    {
+        let mut state_guard = state.lock().await;
+        if state_guard.active_profile_id.as_ref() == Some(&profile_id)
+            || state_guard.active_profile_id.as_ref() == Some(&key_to_delete) {
+            info!("Clearing active session state for deleted profile {}", profile_id);
+            state_guard.active_profile_id = None;
+            state_guard.active_client = None;
+            state_guard.connection_state = ConnectionState::Disconnected;
+        }
+    }
+
+    Ok(())
 }
 
 /// Sign and publish a game event (example usage from game logic).
