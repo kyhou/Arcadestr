@@ -334,9 +334,7 @@ pub async fn close_subscriptions(
     for id in &subscription_ids {
         // Send UNREQ to all relays
         let sub_id = SubscriptionId::new(id);
-        if let Err(e) = client.unsubscribe(&sub_id).await {
-            tracing::warn!("Failed to send UNREQ for {}: {}", id, e);
-        }
+        client.unsubscribe(&sub_id).await;
         
         // Remove from registry
         registry.remove(id);
