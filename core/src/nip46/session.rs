@@ -9,10 +9,15 @@ use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
+use crate::nip46::storage::{
+    clear_last_active_profile_id, get_last_active_profile_id, load_profile_from_keyring,
+    set_last_active_profile_id,
+};
+use crate::nip46::types::session_config::{
+    BUNKER_CONNECT_TIMEOUT_SECS, BUNKER_RETRY_INTERVAL_SECS,
+};
 use crate::nip46::types::AppSignerState;
-use crate::nip46::types::session_config::{BUNKER_RETRY_INTERVAL_SECS, BUNKER_CONNECT_TIMEOUT_SECS};
 use crate::nip46::types::ConnectionState;
-use crate::nip46::storage::{load_profile_from_keyring, set_last_active_profile_id, clear_last_active_profile_id, get_last_active_profile_id};
 use crate::signers::LazyNip46Signer;
 
 /// Activate a previously saved profile by bunker pubkey.
@@ -33,11 +38,18 @@ pub async fn activate_profile(
     state: &Arc<Mutex<AppSignerState>>,
     bunker_pubkey: &str,
 ) -> anyhow::Result<()> {
-    info!("Activating profile (fast mode) for bunker pubkey: {}", bunker_pubkey);
+    info!(
+        "Activating profile (fast mode) for bunker pubkey: {}",
+        bunker_pubkey
+    );
 
     // STEP 1: Load profile from keyring using bunker pubkey
-    let profile = load_profile_from_keyring(bunker_pubkey)
-        .ok_or_else(|| anyhow::anyhow!("Profile with bunker pubkey {} not found in keyring", bunker_pubkey))?;
+    let profile = load_profile_from_keyring(bunker_pubkey).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Profile with bunker pubkey {} not found in keyring",
+            bunker_pubkey
+        )
+    })?;
 
     // STEP 2: Drop old active_client by setting it to None
     {
@@ -50,7 +62,10 @@ pub async fn activate_profile(
     }
 
     // STEP 3: Create LazyNip46Signer (deferred connection - no blocking handshake)
-    info!("Creating LazyNip46Signer for bunker pubkey {}...", bunker_pubkey);
+    info!(
+        "Creating LazyNip46Signer for bunker pubkey {}...",
+        bunker_pubkey
+    );
     let lazy_signer = LazyNip46Signer::new(
         profile.bunker_uri.clone(),
         profile.app_keys.clone(),
@@ -100,8 +115,11 @@ pub async fn activate_profile(
         }
     });
 
-    info!("Profile {} activated successfully (fast mode): user_pubkey={}", 
-        bunker_pubkey, profile.user_pubkey.to_hex());
+    info!(
+        "Profile {} activated successfully (fast mode): user_pubkey={}",
+        bunker_pubkey,
+        profile.user_pubkey.to_hex()
+    );
 
     Ok(())
 }
@@ -120,7 +138,7 @@ pub enum SessionRestoreResult {
 }
 
 /// Restore the last active session on app startup.
-/// 
+///
 /// This function:
 /// 1. Checks for a last active profile ID in the keyring
 /// 2. Loads the profile from keyring
@@ -186,8 +204,11 @@ pub async fn restore_session_on_startup(
     // STEP 5: Build Client immediately without waiting for handshake
     info!("Building nostr-sdk Client with LazyNip46Signer...");
     let client = Client::new(Arc::new(lazy_signer) as Arc<dyn nostr::NostrSigner>);
-    info!("Client built successfully for bunker pubkey: {}", key_to_use);
-    
+    info!(
+        "Client built successfully for bunker pubkey: {}",
+        key_to_use
+    );
+
     // Update state
     {
         let mut state_guard = state.lock().await;
@@ -196,34 +217,38 @@ pub async fn restore_session_on_startup(
         state_guard.is_offline_mode = false;
         state_guard.connection_state = ConnectionState::Connecting;
     }
-    
+
     // STEP 6: Trigger connection in background
     let state_clone = state.clone();
     tokio::spawn(async move {
         info!("Triggering deferred NIP-46 connection in background for restored session...");
         match client.signer().await {
-            Ok(signer) => {
-                match signer.get_public_key().await {
-                    Ok(_) => {
-                        info!("NIP-46 connection established successfully for restored session");
-                        let mut state_guard = state_clone.lock().await;
-                        state_guard.connection_state = ConnectionState::Connected;
-                    }
-                    Err(e) => {
-                        error!("Failed to establish NIP-46 connection for restored session: {}", e);
-                        let mut state_guard = state_clone.lock().await;
-                        state_guard.connection_state = ConnectionState::Failed(e.to_string());
-                    }
+            Ok(signer) => match signer.get_public_key().await {
+                Ok(_) => {
+                    info!("NIP-46 connection established successfully for restored session");
+                    let mut state_guard = state_clone.lock().await;
+                    state_guard.connection_state = ConnectionState::Connected;
                 }
-            }
+                Err(e) => {
+                    error!(
+                        "Failed to establish NIP-46 connection for restored session: {}",
+                        e
+                    );
+                    let mut state_guard = state_clone.lock().await;
+                    state_guard.connection_state = ConnectionState::Failed(e.to_string());
+                }
+            },
             Err(e) => {
-                error!("Failed to get signer from client for restored session: {}", e);
+                error!(
+                    "Failed to get signer from client for restored session: {}",
+                    e
+                );
                 let mut state_guard = state_clone.lock().await;
                 state_guard.connection_state = ConnectionState::Failed(e.to_string());
             }
         }
     });
-    
+
     SessionRestoreResult::Success
 }
 
@@ -232,31 +257,33 @@ pub async fn restore_session_on_startup(
 fn start_bunker_retry_task(
     state: Arc<Mutex<AppSignerState>>,
     profile: crate::nip46::types::SavedProfile,
-) -> tokio::task::AbortHandle
-{
+) -> tokio::task::AbortHandle {
     let mut interval = interval(Duration::from_secs(BUNKER_RETRY_INTERVAL_SECS));
-    
+
     let task = tokio::spawn(async move {
         loop {
             interval.tick().await;
-            
+
             info!("Periodic retry: Testing bunker connection...");
-            
+
             // Create LazyNip46Signer and test connection immediately
             let lazy_signer = LazyNip46Signer::new(
                 profile.bunker_uri.clone(),
                 profile.app_keys.clone(),
                 profile.user_pubkey,
             );
-            
+
             // Test connection by calling get_public_key (this triggers handshake)
             match lazy_signer.get_public_key().await {
                 Ok(user_pubkey) => {
-                    info!("Retry successful! Reconnected to bunker: {}", user_pubkey.to_hex());
-                    
+                    info!(
+                        "Retry successful! Reconnected to bunker: {}",
+                        user_pubkey.to_hex()
+                    );
+
                     // Build Client with the now-connected signer
                     let client = Client::new(Arc::new(lazy_signer) as Arc<dyn nostr::NostrSigner>);
-                    
+
                     // Update state to online
                     {
                         let mut state_guard = state.lock().await;
@@ -265,7 +292,7 @@ fn start_bunker_retry_task(
                         state_guard.connection_state = ConnectionState::Connected;
                         state_guard.bunker_retry_handle = None; // Clear the handle
                     }
-                    
+
                     // Task completes successfully - stop retrying
                     break;
                 }
@@ -276,7 +303,7 @@ fn start_bunker_retry_task(
             }
         }
     });
-    
+
     task.abort_handle()
 }
 
@@ -292,12 +319,9 @@ pub async fn cancel_bunker_retry(state: &Arc<Mutex<AppSignerState>>) {
 
 /// Attempt to manually reconnect to the bunker.
 /// This is called when the user clicks the "reconnect" button in offline mode.
-pub async fn attempt_manual_reconnect(
-    state: &Arc<Mutex<AppSignerState>>,
-) -> Result<(), String>
-{
+pub async fn attempt_manual_reconnect(state: &Arc<Mutex<AppSignerState>>) -> Result<(), String> {
     info!("Manual reconnect attempt...");
-    
+
     // Get the current profile ID
     let profile_id = {
         let state_guard = state.lock().await;
@@ -306,46 +330,46 @@ pub async fn attempt_manual_reconnect(
             None => return Err("No active profile to reconnect".to_string()),
         }
     };
-    
+
     // Get metadata to find bunker pubkey
     let metadata = match crate::nip46::storage::get_profile_metadata_by_id(&profile_id) {
         Some(m) => m,
         None => return Err("Profile metadata not found".to_string()),
     };
-    
+
     let key_to_use = if metadata.bunker_pubkey_hex.is_empty() {
         profile_id.clone()
     } else {
         metadata.bunker_pubkey_hex.clone()
     };
-    
+
     // Load profile
     let profile = match load_profile_from_keyring(&key_to_use) {
         Some(p) => p,
         None => return Err("Profile not found in keyring".to_string()),
     };
-    
+
     // Create LazyNip46Signer and test connection immediately
     let lazy_signer = LazyNip46Signer::new(
         profile.bunker_uri.clone(),
         profile.app_keys.clone(),
         profile.user_pubkey,
     );
-    
+
     // Test connection by calling get_public_key (this triggers handshake)
     match lazy_signer.get_public_key().await {
         Ok(user_pubkey) => {
             info!("Manual reconnect successful: {}", user_pubkey.to_hex());
-            
+
             let client = Client::new(Arc::new(lazy_signer) as Arc<dyn nostr::NostrSigner>);
-            
+
             {
                 let mut state_guard = state.lock().await;
                 state_guard.active_client = Some(client);
                 state_guard.is_offline_mode = false;
                 state_guard.connection_state = ConnectionState::Connected;
             }
-            
+
             Ok(())
         }
         Err(e) => Err(format!("Failed to connect: {}", e)),
@@ -356,31 +380,27 @@ pub async fn attempt_manual_reconnect(
 /// Returns true if the bunker is alive, false otherwise.
 ///
 /// Reference: Amethyst implements this as a "bunker heartbeat indicator" in LoginViewModel.
-pub async fn ping_active_signer(
-    state: &Arc<Mutex<AppSignerState>>,
-) -> bool {
+pub async fn ping_active_signer(state: &Arc<Mutex<AppSignerState>>) -> bool {
     let state_guard = state.lock().await;
-    
+
     match &state_guard.active_client {
         Some(client) => {
             // Clone the client to avoid holding the lock across await
             let client_clone = client.clone();
             drop(state_guard);
-            
+
             // Try to get signer and call get_public_key as a ping test
             match client_clone.signer().await {
-                Ok(signer) => {
-                    match signer.get_public_key().await {
-                        Ok(pubkey) => {
-                            info!("Bunker ping successful: {}", pubkey.to_hex());
-                            true
-                        }
-                        Err(e) => {
-                            warn!("Bunker ping failed: {}", e);
-                            false
-                        }
+                Ok(signer) => match signer.get_public_key().await {
+                    Ok(pubkey) => {
+                        info!("Bunker ping successful: {}", pubkey.to_hex());
+                        true
                     }
-                }
+                    Err(e) => {
+                        warn!("Bunker ping failed: {}", e);
+                        false
+                    }
+                },
                 Err(e) => {
                     warn!("No signer available for ping: {}", e);
                     false
@@ -398,26 +418,26 @@ pub async fn ping_active_signer(
 /// Drops the WebSocket client but does NOT delete the saved profile from keyring.
 pub async fn logout(state: &Arc<Mutex<AppSignerState>>) {
     info!("Logging out of current session...");
-    
+
     // Cancel any ongoing retry task
     cancel_bunker_retry(state).await;
-    
+
     let mut state_guard = state.lock().await;
-    
+
     // Always clear the active profile ID and related state
     // This ensures the UI shows the profile as disconnected even if
     // the client was already dropped or in an error state
     state_guard.active_profile_id = None;
     state_guard.is_offline_mode = false;
     state_guard.connection_state = ConnectionState::Disconnected;
-    
+
     if state_guard.active_client.is_some() {
         info!("Dropping active client (WebSocket connections will close)");
         state_guard.active_client = None;
     } else {
         info!("No active client to drop");
     }
-    
+
     // Clear the last active profile ID
     clear_last_active_profile_id();
 }

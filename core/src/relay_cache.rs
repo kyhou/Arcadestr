@@ -1,12 +1,19 @@
 // RelayCache module - SQLite-based storage for NIP-65 relay lists
 
-use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
+// 1. Standard library
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+// 2. External crates
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::info;
+
+// 3. Internal crate imports
+use crate::relay_pool::RelayPool;
 
 #[derive(Debug, Error)]
 pub enum RelayCacheError {
@@ -28,9 +35,10 @@ pub enum RelayType {
 /// Source of relay discovery
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayDiscoverySource {
-    RelayList,
-    SeenOn,
-    GlobalFallback,
+    RelayList,      // NIP-65 Kind 10002
+    SeenOn,         // Events seen on this relay
+    RelayHints,     // From p-tag/e-tag relay hints
+    GlobalFallback, // Default hardcoded relays
 }
 
 impl std::fmt::Display for RelayType {
@@ -126,6 +134,14 @@ impl RelayCache {
                 last_checked INTEGER NOT NULL,
                 total_requests INTEGER NOT NULL DEFAULT 0,
                 failed_requests INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS seen_events (
+                event_id TEXT PRIMARY KEY,
+                seen_at INTEGER NOT NULL
             )",
             [],
         )?;
@@ -549,25 +565,113 @@ impl RelayCache {
 
     /// Check if an event has already been seen
     pub fn is_seen_event(&self, event_id: &str) -> bool {
-        // Use the seen_on table as a simple dedup store
-        // In production, this should use a dedicated events table or in-memory LRU cache
-        if let Ok(conn) = self.conn.lock() {
-            let result: Result<i64, _> = conn.query_row(
-                "SELECT 1 FROM seen_on WHERE pubkey = ? LIMIT 1",
-                [event_id],
-                |row| row.get(0),
-            );
-            result.is_ok()
-        } else {
-            false
-        }
+        let Ok(conn) = self.conn.lock() else {
+            return false;
+        };
+        conn.query_row(
+            "SELECT 1 FROM seen_events WHERE event_id = ?1",
+            [event_id],
+            |_| Ok(()),
+        )
+        .is_ok()
     }
 
     /// Mark an event as seen
-    pub fn mark_event_seen(&self, event_id: String) {
-        // Store in a simple table - for now use seen_on with event_id as pubkey
-        // This is a temporary solution; production should use a dedicated events table
-        let _ = self.update_seen_on(&event_id, "dedup");
+    pub fn mark_event_seen(&self, event_id: &str) -> Result<(), RelayCacheError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO seen_events (event_id, seen_at) VALUES (?1, ?2)",
+            rusqlite::params![event_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Save relay pool for a profile.
+    ///
+    /// Persists the list of relays to SQLite for the given profile.
+    /// Existing relays for this profile are replaced.
+    ///
+    /// # Arguments
+    /// * `profile_id` - The profile identifier
+    /// * `relays` - List of relay URLs to save
+    ///
+    /// # Errors
+    /// Returns `RelayCacheError` if database operations fail.
+    pub fn save_relay_pool(
+        &self,
+        profile_id: &str,
+        relays: &[String],
+    ) -> Result<(), RelayCacheError> {
+        let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
+
+        // Create table if not exists
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS profile_relay_pools (
+                profile_id TEXT NOT NULL,
+                relay_url TEXT NOT NULL,
+                source TEXT NOT NULL,
+                added_at INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, relay_url)
+            )",
+            [],
+        )?;
+
+        // Clear existing relays for this profile
+        conn.execute(
+            "DELETE FROM profile_relay_pools WHERE profile_id = ?1",
+            [profile_id],
+        )?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for url in relays {
+            conn.execute(
+                "INSERT INTO profile_relay_pools (profile_id, relay_url, source, added_at)
+                 VALUES (?1, ?2, 'discovered', ?3)",
+                [profile_id, url, &now.to_string()],
+            )?;
+        }
+
+        info!("Saved {} relays for profile {}", relays.len(), profile_id);
+        Ok(())
+    }
+
+    /// Load relay pool for a profile.
+    ///
+    /// Retrieves the list of persisted relays for the given profile.
+    ///
+    /// # Arguments
+    /// * `profile_id` - The profile identifier
+    ///
+    /// # Returns
+    /// Returns `Vec<String>` containing all relay URLs for the profile.
+    /// Returns empty vector if no relays are persisted.
+    ///
+    /// # Errors
+    /// Returns `RelayCacheError` if database query fails.
+    pub fn load_relay_pool(&self, profile_id: &str) -> Result<Vec<String>, RelayCacheError> {
+        let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
+
+        let mut stmt =
+            conn.prepare("SELECT relay_url FROM profile_relay_pools WHERE profile_id = ?1")?;
+
+        let relay_iter = stmt.query_map([profile_id], |row| row.get::<_, String>(0))?;
+
+        let mut relays = Vec::new();
+        for relay in relay_iter {
+            relays.push(relay?);
+        }
+
+        info!("Loaded {} relays for profile {}", relays.len(), profile_id);
+        Ok(relays)
     }
 }
 

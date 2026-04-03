@@ -127,10 +127,9 @@ impl Database {
     async fn run_migrations(pool: &SqlitePool) -> Result<(), DatabaseError> {
         for (idx, migration) in MIGRATIONS.iter().enumerate() {
             let migration_num = idx + 1;
-            sqlx::query(*migration)
-                .execute(pool)
-                .await
-                .map_err(|e| DatabaseError::Migration(format!("Migration {} failed: {}", migration_num, e)))?;
+            sqlx::query(*migration).execute(pool).await.map_err(|e| {
+                DatabaseError::Migration(format!("Migration {} failed: {}", migration_num, e))
+            })?;
         }
         Ok(())
     }
@@ -155,15 +154,15 @@ mod tests {
     async fn test_database_creation() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        
+
         let db = Database::new(&db_path).await.unwrap();
-        
+
         // Verify tables exist
         let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")
             .fetch_one(db.pool())
             .await
             .unwrap();
-        
+
         assert!(row.0 >= 4); // accounts, relay_backups, remote_uris, secure_storage
     }
 }

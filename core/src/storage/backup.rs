@@ -16,36 +16,36 @@
 use nostr::{Event, EventBuilder, Kind, PublicKey, Tag};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::auth::{Account, AccountManagerError};
-use crate::storage::{Encryption, EncryptedData, EncryptionError};
 use crate::signers::{NostrSigner, SignerError};
+use crate::storage::{EncryptedData, Encryption, EncryptionError};
 
 /// Errors that can occur during backup operations
 #[derive(Debug, Error)]
 pub enum BackupError {
     #[error("Encryption error: {0}")]
     Encryption(#[from] EncryptionError),
-    
+
     #[error("Account manager error: {0}")]
     AccountManager(#[from] AccountManagerError),
-    
+
     #[error("Signer error: {0}")]
     Signer(#[from] SignerError),
-    
+
     #[error("Serialization error: {0}")]
     Serialization(String),
-    
+
     #[error("Relay error: {0}")]
     Relay(String),
-    
+
     #[error("No relays available")]
     NoRelays,
-    
+
     #[error("Backup not found")]
     NotFound,
-    
+
     #[error("Invalid backup data")]
     InvalidData,
 }
@@ -115,24 +115,21 @@ pub struct RelayBackup<'a> {
 
 impl<'a> RelayBackup<'a> {
     /// Creates a new RelayBackup instance
-    /// 
+    ///
     /// # Arguments
     /// * `encryption` - The encryption instance to use for encrypting/decrypting backups
     pub fn new(encryption: &'a Encryption) -> Self {
         Self { encryption }
     }
-    
+
     /// Creates an encrypted backup of account data
-    /// 
+    ///
     /// # Arguments
     /// * `accounts` - List of accounts to backup
-    /// 
+    ///
     /// # Returns
     /// Encrypted backup data ready to be published
-    pub fn create_backup(
-        &self,
-        accounts: &[Account],
-    ) -> Result<String, BackupError> {
+    pub fn create_backup(&self, accounts: &[Account]) -> Result<String, BackupError> {
         // Convert accounts to backup format
         let backup_accounts: Vec<BackupAccountData> = accounts
             .iter()
@@ -148,40 +145,40 @@ impl<'a> RelayBackup<'a> {
                 last_used: acc.last_used,
             })
             .collect();
-        
+
         // Serialize accounts to JSON
         let accounts_json = serde_json::to_string(&backup_accounts)
             .map_err(|e| BackupError::Serialization(e.to_string()))?;
-        
+
         // Encrypt the accounts data
         let encrypted = self.encryption.encrypt(accounts_json.as_bytes());
-        
+
         // Serialize encrypted data to base64
         let encrypted_bytes = Encryption::serialize(&encrypted)
             .map_err(|e| BackupError::Serialization(e.to_string()))?;
         let encrypted_base64 = base64::encode(&encrypted_bytes);
-        
+
         // Create backup structure
         let backup = BackupData {
             version: BACKUP_VERSION,
             backup_timestamp: chrono::Utc::now().timestamp(),
             encrypted_accounts: encrypted_base64,
         };
-        
+
         // Serialize backup to JSON string
         let backup_json = serde_json::to_string(&backup)
             .map_err(|e| BackupError::Serialization(e.to_string()))?;
-        
+
         info!("Created encrypted backup for {} accounts", accounts.len());
-        
+
         Ok(backup_json)
     }
-    
+
     /// Decrypts backup data and returns accounts
-    /// 
+    ///
     /// # Arguments
     /// * `encrypted_backup` - The encrypted backup JSON string
-    /// 
+    ///
     /// # Returns
     /// List of accounts from the backup
     pub fn restore_backup(
@@ -191,39 +188,44 @@ impl<'a> RelayBackup<'a> {
         // Parse backup JSON
         let backup: BackupData = serde_json::from_str(encrypted_backup)
             .map_err(|e| BackupError::Serialization(e.to_string()))?;
-        
+
         // Check version
         if backup.version != BACKUP_VERSION {
-            warn!("Backup version mismatch: expected {}, got {}", BACKUP_VERSION, backup.version);
+            warn!(
+                "Backup version mismatch: expected {}, got {}",
+                BACKUP_VERSION, backup.version
+            );
         }
-        
+
         // Decode base64 encrypted data
         let encrypted_bytes = base64::decode(&backup.encrypted_accounts)
             .map_err(|e| BackupError::Serialization(format!("Base64 decode failed: {}", e)))?;
-        
+
         // Deserialize encrypted data
         let encrypted: EncryptedData = Encryption::deserialize(&encrypted_bytes)
             .map_err(|e| BackupError::Serialization(e.to_string()))?;
-        
+
         // Decrypt
-        let decrypted = self.encryption.decrypt(&encrypted)
+        let decrypted = self
+            .encryption
+            .decrypt(&encrypted)
             .map_err(BackupError::Encryption)?;
-        
+
         // Parse accounts JSON
         let accounts: Vec<BackupAccountData> = serde_json::from_slice(&decrypted)
             .map_err(|e| BackupError::Serialization(e.to_string()))?;
-        
+
         info!("Restored {} accounts from backup", accounts.len());
-        
+
         Ok(accounts)
     }
-    
+
     /// Builds a NIP-78 backup event
-    /// 
+    ///
     /// # Arguments
     /// * `backup_data` - The encrypted backup data
     /// * `signer` - The signer to use for signing the event
-    /// 
+    ///
     /// # Returns
     /// A signed Nostr event ready to be published
     pub async fn build_backup_event<S: NostrSigner>(
@@ -233,30 +235,27 @@ impl<'a> RelayBackup<'a> {
     ) -> Result<Event, BackupError> {
         // Get public key from signer
         let public_key = signer.get_public_key().await?;
-        
+
         // Build event with NIP-78 format
-        let builder = EventBuilder::new(
-            Kind::from(BACKUP_EVENT_KIND),
-            backup_data,
-        )
-        .tags(vec![Tag::identifier(BACKUP_D_TAG)]);
-        
+        let builder = EventBuilder::new(Kind::from(BACKUP_EVENT_KIND), backup_data)
+            .tags(vec![Tag::identifier(BACKUP_D_TAG)]);
+
         // Build unsigned event
         let unsigned = builder.build(public_key);
-        
+
         // Sign the event
         let signed = signer.sign_event(unsigned).await?;
-        
+
         info!("Built NIP-78 backup event: {}", signed.id);
-        
+
         Ok(signed)
     }
-    
+
     /// Parses a backup event and extracts the backup data
-    /// 
+    ///
     /// # Arguments
     /// * `event` - The Nostr event to parse
-    /// 
+    ///
     /// # Returns
     /// The backup data string if valid
     pub fn parse_backup_event(event: &Event) -> Result<String, BackupError> {
@@ -264,25 +263,24 @@ impl<'a> RelayBackup<'a> {
         if event.kind != Kind::from(BACKUP_EVENT_KIND) {
             return Err(BackupError::InvalidData);
         }
-        
+
         // Check d tag using the identifier method
-        let d_tag = event.tags.identifier()
-            .ok_or(BackupError::InvalidData)?;
-        
+        let d_tag = event.tags.identifier().ok_or(BackupError::InvalidData)?;
+
         if d_tag != BACKUP_D_TAG {
             return Err(BackupError::InvalidData);
         }
-        
+
         Ok(event.content.clone())
     }
 }
 
 /// Publishes a backup event to relays
-/// 
+///
 /// # Arguments
 /// * `client` - The Nostr client to use for publishing
 /// * `event` - The signed backup event
-/// 
+///
 /// # Returns
 /// Result indicating success or failure
 pub async fn publish_backup_to_relays(
@@ -302,12 +300,12 @@ pub async fn publish_backup_to_relays(
 }
 
 /// Fetches backup events from relays
-/// 
+///
 /// # Arguments
 /// * `client` - The Nostr client
 /// * `public_key` - The public key to fetch backups for
 /// * `relay_url` - Optional specific relay URL (uses client's relays if None)
-/// 
+///
 /// # Returns
 /// List of backup events
 pub async fn fetch_backup_events(
@@ -317,20 +315,20 @@ pub async fn fetch_backup_events(
 ) -> Result<Vec<Event>, BackupError> {
     use nostr_sdk::Filter;
     use std::time::Duration;
-    
+
     // Build filter for NIP-78 backup events
     let filter = Filter::new()
         .author(public_key)
         .kind(Kind::from(BACKUP_EVENT_KIND))
         .identifier(BACKUP_D_TAG);
-    
+
     // Fetch events
     let events = if let Some(url) = relay_url {
         // Add the specific relay temporarily if not already connected
         if let Err(e) = client.add_relay(url).await {
             warn!("Failed to add relay {}: {}", url, e);
         }
-        
+
         // Fetch from all connected relays (including the one we just added)
         match client.fetch_events(filter, Duration::from_secs(10)).await {
             Ok(events) => events.into_iter().collect(),
@@ -349,55 +347,53 @@ pub async fn fetch_backup_events(
             }
         }
     };
-    
+
     info!("Fetched {} backup events", events.len());
-    
+
     Ok(events)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MasterKeyManager, Database};
+    use crate::storage::{Database, MasterKeyManager};
     use std::path::PathBuf;
     use tempfile::TempDir;
-    
+
     #[tokio::test]
     async fn test_backup_roundtrip() {
         // Create temp directory
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path();
-        
+
         // Initialize master key and encryption
         let master_key_manager = MasterKeyManager::new(data_dir);
         let master_key = master_key_manager.initialize().await.unwrap();
         let encryption = Encryption::new(&master_key).unwrap();
-        
+
         // Create backup manager
-        let backup = RelayBackup::new(encryption.clone());
-        
+        let backup = RelayBackup::new(&encryption);
+
         // Create test accounts
-        let accounts = vec![
-            Account {
-                id: "test_1".to_string(),
-                pubkey: "abc123".to_string(),
-                npub: "npub1test".to_string(),
-                signing_mode: crate::auth::SigningMode::Local,
-                encrypted_nsec: Some("encrypted_data".to_string()),
-                display_name: Some("Test User".to_string()),
-                picture: None,
-                created_at: 1234567890,
-                last_used: 1234567890,
-                is_active: true,
-            }
-        ];
-        
+        let accounts = vec![Account {
+            id: "test_1".to_string(),
+            pubkey: "abc123".to_string(),
+            npub: "npub1test".to_string(),
+            signing_mode: crate::auth::SigningMode::Local,
+            encrypted_nsec: Some(b"encrypted_data".to_vec()),
+            display_name: Some("Test User".to_string()),
+            picture: None,
+            created_at: 1234567890,
+            last_used: 1234567890,
+            is_active: true,
+        }];
+
         // Create backup
         let backup_data = backup.create_backup(&accounts).unwrap();
-        
+
         // Restore backup
         let restored = backup.restore_backup(&backup_data).unwrap();
-        
+
         // Verify
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].id, "test_1");

@@ -19,6 +19,35 @@ pub enum ConnectionState {
     Failed(String),
 }
 
+/// Classification of NIP-46 URI formats.
+///
+/// NIP-46 has two connection flows with different URI structures:
+/// - `Bunker`: Signer-initiated (bunker://<signer_pubkey>?relay=...)
+/// - `NostrConnect`: Client-initiated (nostrconnect://<client_pubkey>?relay=...&secret=...)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nip46UriType {
+    /// Signer-initiated bunker:// URI containing remote signer pubkey.
+    Bunker,
+    /// Client-initiated nostrconnect:// URI where signer pubkey arrives later.
+    NostrConnect,
+}
+
+impl Nip46UriType {
+    /// Detects URI type from string prefix.
+    ///
+    /// # Panics
+    /// Panics if URI doesn't start with either `bunker://` or `nostrconnect://`.
+    pub fn from_uri(uri: &str) -> Self {
+        if uri.starts_with("bunker://") {
+            Self::Bunker
+        } else if uri.starts_with("nostrconnect://") {
+            Self::NostrConnect
+        } else {
+            panic!("Invalid NIP-46 URI: must be bunker:// or nostrconnect://")
+        }
+    }
+}
+
 /// A saved profile represents a previously authenticated bunker connection.
 /// It is safe to serialize and store the NON-SECRET fields to a config file.
 /// The SECRET fields (app_keys secret key, bunker URI secret param) MUST go

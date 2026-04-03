@@ -7,6 +7,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 /// AES-256-GCM encryption for nsec storage
+#[derive(Clone)]
 pub struct Encryption {
     cipher: Aes256Gcm,
 }

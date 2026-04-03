@@ -3,15 +3,15 @@
 //! This wrapper defers the NIP-46 handshake until the first signing request.
 //! It stores the connection parameters and establishes the connection lazily.
 
-use std::sync::Arc;
+use nostr::nips::nip46::NostrConnectURI;
+use nostr::signer::{NostrSigner, SignerBackend, SignerError};
+use nostr::util::BoxedFuture;
+use nostr::{Event, Keys, PublicKey, UnsignedEvent};
 use std::any::Any;
 use std::fmt;
+use std::sync::Arc;
 use tokio::sync::RwLock;
-use nostr::{PublicKey, Event, UnsignedEvent, Keys};
-use nostr::nips::nip46::NostrConnectURI;
-use nostr::signer::{NostrSigner, SignerError, SignerBackend};
-use nostr::util::BoxedFuture;
-use tracing::{info, error};
+use tracing::{error, info};
 
 /// Error type for LazyNip46Signer operations
 #[derive(Debug)]
@@ -57,11 +57,7 @@ pub struct LazyNip46Signer {
 
 impl LazyNip46Signer {
     /// Create a new lazy signer without establishing connection
-    pub fn new(
-        bunker_uri: NostrConnectURI,
-        app_keys: Keys,
-        user_pubkey: PublicKey,
-    ) -> Self {
+    pub fn new(bunker_uri: NostrConnectURI, app_keys: Keys, user_pubkey: PublicKey) -> Self {
         info!("Creating LazyNip46Signer (deferred connection)");
         Self {
             bunker_uri,
@@ -79,7 +75,9 @@ impl LazyNip46Signer {
     }
 
     /// Ensure connection is established (called before signing)
-    async fn ensure_connected(&self) -> Result<Arc<nostr_connect::client::NostrConnect>, SignerError> {
+    async fn ensure_connected(
+        &self,
+    ) -> Result<Arc<nostr_connect::client::NostrConnect>, SignerError> {
         // Check if already connected
         {
             let inner = self.inner.read().await;
@@ -90,7 +88,7 @@ impl LazyNip46Signer {
 
         // Need to connect
         let mut state = self.state.write().await;
-        
+
         // Double-check after acquiring write lock
         {
             let inner = self.inner.read().await;
@@ -110,17 +108,17 @@ impl LazyNip46Signer {
             Ok(signer) => {
                 let mut inner = self.inner.write().await;
                 *inner = Some(signer.clone());
-                
+
                 let mut state = self.state.write().await;
                 *state = LazyConnectionState::Connected;
-                
+
                 info!("NIP-46 connection established successfully");
                 Ok(signer)
             }
             Err(e) => {
                 let mut state = self.state.write().await;
                 *state = LazyConnectionState::Failed(e.to_string());
-                
+
                 error!("Failed to establish NIP-46 connection: {}", e);
                 Err(e)
             }
@@ -128,17 +126,20 @@ impl LazyNip46Signer {
     }
 
     /// Perform the actual connection and handshake
-    async fn connect_and_handshake(&self) -> Result<Arc<nostr_connect::client::NostrConnect>, SignerError> {
-        use std::time::Duration;
+    async fn connect_and_handshake(
+        &self,
+    ) -> Result<Arc<nostr_connect::client::NostrConnect>, SignerError> {
         use nostr::signer::NostrSigner as _;
+        use std::time::Duration;
 
         // Create the NostrConnect client directly
         let client = nostr_connect::client::NostrConnect::new(
             self.bunker_uri.clone(),
             self.app_keys.clone(),
             Duration::from_secs(30), // Shorter timeout for deferred connection
-            None, // Default options
-        ).map_err(|e| SignerError::backend(e))?;
+            None,                    // Default options
+        )
+        .map_err(|e| SignerError::backend(e))?;
 
         // Perform handshake by calling get_public_key
         client.get_public_key().await?;
@@ -173,7 +174,9 @@ impl NostrSigner for LazyNip46Signer {
         _content: &'a str,
     ) -> BoxedFuture<'a, Result<String, SignerError>> {
         Box::pin(async move {
-            Err(SignerError::backend(LazySignerError { message: "NIP-04 not supported by LazyNip46Signer".to_string() }))
+            Err(SignerError::backend(LazySignerError {
+                message: "NIP-04 not supported by LazyNip46Signer".to_string(),
+            }))
         })
     }
 
@@ -183,7 +186,9 @@ impl NostrSigner for LazyNip46Signer {
         _encrypted_content: &'a str,
     ) -> BoxedFuture<'a, Result<String, SignerError>> {
         Box::pin(async move {
-            Err(SignerError::backend(LazySignerError { message: "NIP-04 not supported by LazyNip46Signer".to_string() }))
+            Err(SignerError::backend(LazySignerError {
+                message: "NIP-04 not supported by LazyNip46Signer".to_string(),
+            }))
         })
     }
 
@@ -193,7 +198,9 @@ impl NostrSigner for LazyNip46Signer {
         _content: &'a str,
     ) -> BoxedFuture<'a, Result<String, SignerError>> {
         Box::pin(async move {
-            Err(SignerError::backend(LazySignerError { message: "NIP-44 not supported by LazyNip46Signer".to_string() }))
+            Err(SignerError::backend(LazySignerError {
+                message: "NIP-44 not supported by LazyNip46Signer".to_string(),
+            }))
         })
     }
 
@@ -203,7 +210,9 @@ impl NostrSigner for LazyNip46Signer {
         _payload: &'a str,
     ) -> BoxedFuture<'a, Result<String, SignerError>> {
         Box::pin(async move {
-            Err(SignerError::backend(LazySignerError { message: "NIP-44 not supported by LazyNip46Signer".to_string() }))
+            Err(SignerError::backend(LazySignerError {
+                message: "NIP-44 not supported by LazyNip46Signer".to_string(),
+            }))
         })
     }
 }

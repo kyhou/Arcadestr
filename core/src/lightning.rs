@@ -64,7 +64,7 @@ pub struct ZapRequest {
 /// Lightning invoice returned to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZapInvoice {
-    pub bolt11: String,           // the Lightning invoice string
+    pub bolt11: String, // the Lightning invoice string
     pub amount_sats: u64,
     pub seller_npub: String,
     pub listing_event_id: String,
@@ -105,10 +105,7 @@ fn lud16_to_lnurl_pay_url(lud16: &str) -> Result<String, LightningError> {
         ));
     }
 
-    Ok(format!(
-        "https://{}/.well-known/lnurlp/{}",
-        domain, user
-    ))
+    Ok(format!("https://{}/.well-known/lnurlp/{}", domain, user))
 }
 
 /// Signs an event using the Arcadestr ActiveSigner.
@@ -117,10 +114,9 @@ async fn sign_event_with_signer(
     signer: &ActiveSigner,
 ) -> Result<Event, LightningError> {
     // Get the public key from the signer
-    let pubkey = signer
-        .get_public_key()
-        .await
-        .map_err(|e| LightningError::ZapRequestSigning(format!("Failed to get public key: {}", e)))?;
+    let pubkey = signer.get_public_key().await.map_err(|e| {
+        LightningError::ZapRequestSigning(format!("Failed to get public key: {}", e))
+    })?;
 
     // Build the unsigned event
     let unsigned = builder.build(pubkey);
@@ -188,10 +184,7 @@ pub async fn request_zap_invoice(
     let mut tags: Vec<Tag> = vec![
         Tag::public_key(seller_pubkey),
         Tag::event(listing_event_id),
-        Tag::custom(
-            TagKind::Custom("amount".into()),
-            [amount_msats.to_string()],
-        ),
+        Tag::custom(TagKind::Custom("amount".into()), [amount_msats.to_string()]),
     ];
 
     // Add relays tag

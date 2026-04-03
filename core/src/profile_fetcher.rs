@@ -2,9 +2,9 @@
 // Based on Wisp's MetadataFetcher pattern
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::num::NonZeroUsize;
 
 use lru::LruCache;
 use nostr_sdk::prelude::*;
@@ -38,7 +38,8 @@ struct CachedProfile {
 
 impl LruProfileCache {
     pub fn new(capacity: usize, ttl_seconds: u64) -> Self {
-        let non_zero_capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(100).unwrap());
+        let non_zero_capacity =
+            NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(100).unwrap());
         Self {
             inner: Arc::new(Mutex::new(LruCache::new(non_zero_capacity))),
             ttl_seconds,
@@ -57,23 +58,26 @@ impl ProfileCache for LruProfileCache {
     fn get(&self, npub: &str) -> Option<UserProfile> {
         let mut cache = self.inner.lock().ok()?;
         let cached = cache.get(npub)?;
-        
+
         // Check if expired
         let now = Self::now();
         if now - cached.timestamp > self.ttl_seconds {
             cache.pop(npub);
             return None;
         }
-        
+
         Some(cached.profile.clone())
     }
 
     fn put(&self, npub: String, profile: UserProfile) {
         if let Ok(mut cache) = self.inner.lock() {
-            cache.put(npub, CachedProfile {
-                profile,
-                timestamp: Self::now(),
-            });
+            cache.put(
+                npub,
+                CachedProfile {
+                    profile,
+                    timestamp: Self::now(),
+                },
+            );
         }
     }
 
@@ -155,14 +159,18 @@ impl ProfileFetcher {
         let mut pending = self.pending.lock().unwrap();
         let in_flight = self.in_flight.lock().unwrap();
         let failed = self.failed_attempts.lock().unwrap();
-        
+
         // Skip if already queued, in flight, or exhausted
-        if pending.contains(&npub) 
+        if pending.contains(&npub)
             || in_flight.contains(&npub)
-            || failed.get(&npub).map(|&c| c >= self.max_attempts).unwrap_or(false) {
+            || failed
+                .get(&npub)
+                .map(|&c| c >= self.max_attempts)
+                .unwrap_or(false)
+        {
             return;
         }
-        
+
         pending.push_back(npub);
     }
 
@@ -177,7 +185,7 @@ impl ProfileFetcher {
     /// Returns (fetched_profiles, remaining_count)
     pub async fn fetch_batch(&self, client: &NostrClient) -> (Vec<UserProfile>, usize) {
         let mut results = Vec::new();
-        
+
         // Collect batch of pending pubkeys
         let batch: Vec<String> = {
             let mut pending = self.pending.lock().unwrap();
@@ -189,25 +197,25 @@ impl ProfileFetcher {
             }
             batch
         };
-        
+
         if batch.is_empty() {
             return (results, 0);
         }
-        
+
         tracing::info!("Fetching batch of {} profiles", batch.len());
-        
+
         // Fetch from indexers first, then all relays
         match self.fetch_profiles_batch(client, &batch).await {
             Ok(profiles) => {
                 // Collect profiles for batch persistence
                 let mut profiles_to_persist: Vec<(String, UserProfile)> = Vec::new();
-                
+
                 for (npub, profile) in profiles {
                     results.push(profile.clone());
                     self.cache.put(npub.clone(), profile.clone());
                     profiles_to_persist.push((npub, profile));
                 }
-                
+
                 // Persist to SQLite if persistent_cache is configured
                 if let Some(ref user_cache) = self.persistent_cache {
                     if let Err(e) = user_cache.put_many(&profiles_to_persist).await {
@@ -224,13 +232,13 @@ impl ProfileFetcher {
                 }
             }
         }
-        
+
         // Remove from in-flight
         let mut in_flight = self.in_flight.lock().unwrap();
         for npub in &batch {
             in_flight.remove(npub);
         }
-        
+
         let remaining = self.pending.lock().unwrap().len();
         (results, remaining)
     }
@@ -238,14 +246,14 @@ impl ProfileFetcher {
     /// Fast path: fetch single profile immediately (for logged-in user or feed users)
     pub async fn fetch_single(&self, client: &NostrClient, npub: &str) -> Option<UserProfile> {
         tracing::info!("ProfileFetcher::fetch_single called for {}", npub);
-        
+
         // Check cache first
         if let Some(cached) = self.cache.get(npub) {
             tracing::info!("Profile cache HIT for {}", npub);
             return Some(cached);
         }
         tracing::debug!("Profile cache MISS for {}", npub);
-        
+
         // Check if already being fetched
         {
             let in_flight = self.in_flight.lock().unwrap();
@@ -254,7 +262,7 @@ impl ProfileFetcher {
                 return None;
             }
         }
-        
+
         // Parse pubkey
         let pubkey = match PublicKey::parse(npub) {
             Ok(pk) => pk,
@@ -263,13 +271,10 @@ impl ProfileFetcher {
                 return None;
             }
         };
-        
+
         // Fetch immediately with priority
-        let filter = Filter::new()
-            .author(pubkey)
-            .kind(Kind::Metadata)
-            .limit(1);
-        
+        let filter = Filter::new().author(pubkey).kind(Kind::Metadata).limit(1);
+
         tracing::info!("Fetching profile from indexers for {}...", npub);
         match client.fetch_from_indexers_then_all(filter).await {
             Ok(events) => {
@@ -278,16 +283,20 @@ impl ProfileFetcher {
                     tracing::info!("Found profile event for {}, parsing...", npub);
                     match Self::parse_profile_event(event, npub) {
                         Ok(profile) => {
-                            tracing::info!("Successfully parsed profile for {}: name={:?}", npub, profile.name);
+                            tracing::info!(
+                                "Successfully parsed profile for {}: name={:?}",
+                                npub,
+                                profile.name
+                            );
                             self.cache.put(npub.to_string(), profile.clone());
-                            
+
                             // Persist to SQLite if persistent_cache is configured
                             if let Some(ref user_cache) = self.persistent_cache {
                                 if let Err(e) = user_cache.put(npub, &profile).await {
                                     tracing::warn!("Failed to persist profile to SQLite: {}", e);
                                 }
                             }
-                            
+
                             return Some(profile);
                         }
                         Err(e) => {
@@ -300,7 +309,7 @@ impl ProfileFetcher {
             }
             Err(e) => tracing::error!("Fast path fetch FAILED for {}: {}", npub, e),
         }
-        
+
         tracing::warn!("ProfileFetcher::fetch_single returning None for {}", npub);
         None
     }
@@ -339,23 +348,21 @@ impl ProfileFetcher {
         npubs: &[String],
     ) -> Result<Vec<(String, UserProfile)>, NostrError> {
         let mut results = Vec::new();
-        
+
         // Build filter for all pubkeys
         let authors: Vec<PublicKey> = npubs
             .iter()
             .filter_map(|npub| PublicKey::parse(npub).ok())
             .collect();
-        
+
         if authors.is_empty() {
             return Ok(results);
         }
-        
-        let filter = Filter::new()
-            .authors(authors)
-            .kind(Kind::Metadata);
-        
+
+        let filter = Filter::new().authors(authors).kind(Kind::Metadata);
+
         let events = client.fetch_from_indexers_then_all(filter).await?;
-        
+
         // Parse events and match to requested pubkeys
         for event in events {
             let npub = event.pubkey.to_hex();
@@ -363,15 +370,14 @@ impl ProfileFetcher {
                 results.push((npub, profile));
             }
         }
-        
+
         Ok(results)
     }
 
     /// Parse a profile event into UserProfile
     fn parse_profile_event(event: &Event, npub: &str) -> Result<UserProfile, NostrError> {
         // Parse the event content as UserProfileContent
-        let content: UserProfileContent = serde_json::from_str(&event.content)
-            .unwrap_or_default();
+        let content: UserProfileContent = serde_json::from_str(&event.content).unwrap_or_default();
 
         Ok(UserProfile {
             npub: npub.to_string(),
@@ -400,16 +406,16 @@ mod tests {
     #[test]
     fn test_lru_cache_basic() {
         let cache = LruProfileCache::new(100, 3600);
-        
+
         let profile = UserProfile {
             npub: "test".to_string(),
             name: Some("Test User".to_string()),
             ..Default::default()
         };
-        
+
         cache.put("test".to_string(), profile.clone());
         assert!(cache.contains("test"));
-        
+
         let retrieved = cache.get("test").unwrap();
         assert_eq!(retrieved.name, Some("Test User".to_string()));
     }
@@ -417,10 +423,10 @@ mod tests {
     #[test]
     fn test_profile_fetcher_enqueue() {
         let fetcher = ProfileFetcher::new();
-        
+
         fetcher.enqueue("npub1test".to_string());
         fetcher.enqueue("npub1test".to_string()); // Duplicate, should be ignored
-        
+
         assert_eq!(fetcher.pending_count(), 1);
     }
 }

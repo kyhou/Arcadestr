@@ -1,5 +1,5 @@
 //! Signers module for Nostr event signing
-//! 
+//!
 //! This module provides multiple signing backends:
 //! - LocalSigner: Fast local signing with encrypted nsec storage (native only)
 //! - Nip46Signer: NIP-46 remote signer (Amber, Nsec.app, etc.) (native only)
@@ -18,7 +18,10 @@ pub use local::LocalSigner;
 
 // These are native-only
 #[cfg(not(target_arch = "wasm32"))]
-pub use nip46::{ActiveSigner, DirectKeySigner, Nip46Signer, NostrSigner, SignerError, load_or_create_client_keys, reset_client_keys, set_keys_dir};
+pub use nip46::{
+    load_or_create_client_keys, reset_client_keys, set_keys_dir, ActiveSigner, DirectKeySigner,
+    Nip46Signer, NostrSigner, SignerError,
+};
 
 // LazyNip46Signer is native-only
 #[cfg(not(target_arch = "wasm32"))]
@@ -26,4 +29,4 @@ pub use lazy_nip46::LazyNip46Signer;
 
 // WASM-only exports
 #[cfg(target_arch = "wasm32")]
-pub use nip46::{NostrSigner, SignerError, Nip07Signer};
+pub use nip46::{Nip07Signer, NostrSigner, SignerError};

@@ -4,7 +4,7 @@ use nostr::{Event, Keys, PublicKey, SecretKey, UnsignedEvent};
 use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
-use tracing::{info, error, debug};
+use tracing::{debug, error, info};
 
 #[cfg(not(target_arch = "wasm32"))]
 use nostr::nips::nip46::NostrConnectURI;
@@ -21,9 +21,9 @@ pub fn set_keys_dir(path: PathBuf) {
 
 /// Gets the path to the client keys file.
 fn get_keys_path() -> Option<PathBuf> {
-    KEYS_DIR.get().and_then(|dir| {
-        dir.as_ref().map(|p| p.join(".nostr_client_key"))
-    })
+    KEYS_DIR
+        .get()
+        .and_then(|dir| dir.as_ref().map(|p| p.join(".nostr_client_key")))
 }
 
 /// Loads client keys from disk, or generates and saves a new keypair.
@@ -40,7 +40,9 @@ pub fn load_or_create_client_keys() -> Result<(Keys, bool), SignerError> {
         Some(p) => p,
         None => {
             error!("Keys directory not set! KEYS_DIR.get() returned None");
-            return Err(SignerError::Nip46Error("Keys directory not set. Call set_keys_dir() first.".to_string()));
+            return Err(SignerError::Nip46Error(
+                "Keys directory not set. Call set_keys_dir() first.".to_string(),
+            ));
         }
     };
 
@@ -48,10 +50,11 @@ pub fn load_or_create_client_keys() -> Result<(Keys, bool), SignerError> {
     if path.exists() {
         let hex = fs::read_to_string(&path)
             .map_err(|e| SignerError::Nip46Error(format!("Failed to read keys file: {}", e)))?;
-        
-        let secret = SecretKey::from_hex(hex.trim())
-            .map_err(|e| SignerError::Nip46Error(format!("Failed to parse saved secret key: {}", e)))?;
-        
+
+        let secret = SecretKey::from_hex(hex.trim()).map_err(|e| {
+            SignerError::Nip46Error(format!("Failed to parse saved secret key: {}", e))
+        })?;
+
         let keys = Keys::new(secret);
         debug!("Loaded existing client keys from {}", path.display());
         Ok((keys, false)) // false = not newly generated
@@ -61,14 +64,15 @@ pub fn load_or_create_client_keys() -> Result<(Keys, bool), SignerError> {
 
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| SignerError::Nip46Error(format!("Failed to create keys directory: {}", e)))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                SignerError::Nip46Error(format!("Failed to create keys directory: {}", e))
+            })?;
         }
-        
+
         // Save to file
         fs::write(&path, keys.secret_key().to_secret_hex())
             .map_err(|e| SignerError::Nip46Error(format!("Failed to save keys: {}", e)))?;
-        
+
         info!("Generated and saved new client keys to {}", path.display());
         Ok((keys, true)) // true = freshly generated
     }
@@ -196,25 +200,25 @@ impl Nip46Signer {
         // Load or create persistent client keys
         // IMPORTANT: This reuses existing keys if available!
         let (client_keys, is_new) = load_or_create_client_keys()?;
-        
+
         if is_new {
             info!("Generated new client keys for NIP-46 connection");
         } else {
-            info!("Reusing existing client keys (pubkey: {})", client_keys.public_key().to_hex());
+            info!(
+                "Reusing existing client keys (pubkey: {})",
+                client_keys.public_key().to_hex()
+            );
         }
 
         // Parse relay URL
-        let relay_url: RelayUrl = relay.parse()
+        let relay_url: RelayUrl = relay
+            .parse()
             .map_err(|e| SignerError::Nip46Error(format!("Invalid relay URL: {}", e)))?;
 
         // Generate URI using the library's built-in method (like the working implementation)
         // This creates a proper nostrconnect:// URI with automatic secret generation
         let app_name = name.unwrap_or("Arcadestr");
-        let uri = NostrConnectURI::client(
-            client_keys.public_key(),
-            vec![relay_url],
-            app_name,
-        );
+        let uri = NostrConnectURI::client(client_keys.public_key(), vec![relay_url], app_name);
 
         Ok((uri.to_string(), client_keys))
     }
@@ -237,8 +241,8 @@ impl Nip46Signer {
         client_keys: nostr::Keys,
         timeout_secs: u64,
     ) -> Result<(Self, PublicKey), SignerError> {
-        use std::time::Duration;
         use nostr::signer::NostrSigner as _;
+        use std::time::Duration;
 
         info!("Starting nostrconnect signer wait...");
         info!("Client pubkey: {}", client_keys.public_key().to_hex());
@@ -258,24 +262,27 @@ impl Nip46Signer {
             }
             Err(e) => {
                 error!("Failed to create NostrConnect client: {:?}", e);
-                return Err(SignerError::Nip46Error(format!("Failed to create NostrConnect: {}", e)));
+                return Err(SignerError::Nip46Error(format!(
+                    "Failed to create NostrConnect: {}",
+                    e
+                )));
             }
         };
 
         info!("Waiting for signer...");
-        
+
         // Fetch public key to verify connection (matching working implementation)
         // Call this BEFORE wrapping in our type, just like the MVP does
         info!("About to call get_public_key() on NostrConnect client...");
         match inner.get_public_key().await {
             Ok(pubkey) => {
                 info!("Signer connected! Public key: {}", pubkey.to_hex());
-                
+
                 // Create signer wrapper AFTER successful connection
-                let signer = Self { 
-                    inner: std::sync::Arc::new(inner) 
+                let signer = Self {
+                    inner: std::sync::Arc::new(inner),
                 };
-                
+
                 Ok((signer, pubkey))
             }
             Err(e) => {
@@ -303,26 +310,27 @@ impl Nip46Signer {
         use nostr::prelude::NostrConnectURI;
         use std::time::Duration;
 
-
         info!("Parsing NIP-46 URI: {}", uri);
 
         // Parse the NIP-46 URI
-        let uri = NostrConnectURI::parse(uri)
-            .map_err(|e| {
-                error!("Failed to parse NIP-46 URI: {}", e);
-                SignerError::Nip46Error(format!("Invalid NIP-46 URI: {}", e))
-            })?;
+        let uri = NostrConnectURI::parse(uri).map_err(|e| {
+            error!("Failed to parse NIP-46 URI: {}", e);
+            SignerError::Nip46Error(format!("Invalid NIP-46 URI: {}", e))
+        })?;
 
         info!("URI parsed successfully");
 
         // Load or create persistent client keys
         // IMPORTANT: This reuses existing keys if available!
         let (client_keys, is_new) = load_or_create_client_keys()?;
-        
+
         if is_new {
             info!("Generated new client keys for connection");
         } else {
-            info!("Reusing existing client keys (pubkey: {})", client_keys.public_key().to_hex());
+            info!(
+                "Reusing existing client keys (pubkey: {})",
+                client_keys.public_key().to_hex()
+            );
         }
 
         // Create the NostrConnect client
@@ -332,7 +340,7 @@ impl Nip46Signer {
             uri,
             client_keys,
             Duration::from_secs(60), // 60 second timeout
-            None, // Default options
+            None,                    // Default options
         ) {
             Ok(client) => {
                 info!("NostrConnect client created successfully");
@@ -342,9 +350,14 @@ impl Nip46Signer {
                 error!("Failed to create NostrConnect client: {:?}", e);
                 // Check if this is a JSON parse error
                 let err_str = format!("{:?}", e);
-                if err_str.contains("parse") || err_str.contains("json") || err_str.contains("expected ident") {
+                if err_str.contains("parse")
+                    || err_str.contains("json")
+                    || err_str.contains("expected ident")
+                {
                     error!("JSON parse error detected. This usually means:");
-                    error!("1. The relay returned an HTML error page instead of a WebSocket response");
+                    error!(
+                        "1. The relay returned an HTML error page instead of a WebSocket response"
+                    );
                     error!("2. The signer app returned an error in non-JSON format");
                     error!("3. There's a protocol version mismatch between nostr-connect and the signer");
                     return Err(SignerError::Nip46Error(
@@ -353,11 +366,16 @@ impl Nip46Signer {
                         Try: 1) Use a different relay 2) Use nostrconnect:// flow 3) Check Amber is updated".to_string()
                     ));
                 }
-                return Err(SignerError::Nip46Error(format!("Failed to create NostrConnect: {}", e)));
+                return Err(SignerError::Nip46Error(format!(
+                    "Failed to create NostrConnect: {}",
+                    e
+                )));
             }
         };
 
-        Ok(Self { inner: std::sync::Arc::new(inner) })
+        Ok(Self {
+            inner: std::sync::Arc::new(inner),
+        })
     }
 
     /// Connects to a NIP-46 signer using a pre-existing URI and client keys.
@@ -373,7 +391,7 @@ impl Nip46Signer {
         timeout: std::time::Duration,
     ) -> Result<Self, SignerError> {
         info!("Creating NostrConnect client with provided keys...");
-        
+
         let inner = match nostr_connect::client::NostrConnect::new(
             uri,
             client_keys,
@@ -386,11 +404,16 @@ impl Nip46Signer {
             }
             Err(e) => {
                 error!("Failed to create NostrConnect client: {:?}", e);
-                return Err(SignerError::Nip46Error(format!("Failed to create NostrConnect: {}", e)));
+                return Err(SignerError::Nip46Error(format!(
+                    "Failed to create NostrConnect: {}",
+                    e
+                )));
             }
         };
 
-        Ok(Self { inner: std::sync::Arc::new(inner) })
+        Ok(Self {
+            inner: std::sync::Arc::new(inner),
+        })
     }
 
     /// Returns the underlying NostrConnect client for advanced usage.
@@ -405,10 +428,7 @@ impl NostrSigner for Nip46Signer {
     async fn get_public_key(&self) -> Result<PublicKey, SignerError> {
         use nostr::signer::NostrSigner as _;
 
-        self.inner
-            .get_public_key()
-            .await
-            .map_err(SignerError::from)
+        self.inner.get_public_key().await.map_err(SignerError::from)
     }
 
     async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SignerError> {
@@ -467,8 +487,8 @@ impl NostrSigner for Nip07Signer {
         }
 
         let win = window().ok_or(SignerError::NotConnected)?;
-        let nostr = js_sys::Reflect::get(&win, &"nostr".into())
-            .map_err(|_| SignerError::NotConnected)?;
+        let nostr =
+            js_sys::Reflect::get(&win, &"nostr".into()).map_err(|_| SignerError::NotConnected)?;
 
         let get_public_key = js_sys::Reflect::get(&nostr, &"getPublicKey".into())
             .map_err(|_| SignerError::NotConnected)?;
@@ -485,8 +505,7 @@ impl NostrSigner for Nip07Signer {
             .as_string()
             .ok_or(SignerError::JsError("Expected string public key".into()))?;
 
-        PublicKey::from_hex(&hex_pubkey)
-            .map_err(|_| SignerError::PublicKeyUnavailable)
+        PublicKey::from_hex(&hex_pubkey).map_err(|_| SignerError::PublicKeyUnavailable)
     }
 
     async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SignerError> {
@@ -499,8 +518,8 @@ impl NostrSigner for Nip07Signer {
         }
 
         let win = window().ok_or(SignerError::NotConnected)?;
-        let nostr = js_sys::Reflect::get(&win, &"nostr".into())
-            .map_err(|_| SignerError::NotConnected)?;
+        let nostr =
+            js_sys::Reflect::get(&win, &"nostr".into()).map_err(|_| SignerError::NotConnected)?;
 
         let sign_event = js_sys::Reflect::get(&nostr, &"signEvent".into())
             .map_err(|_| SignerError::NotConnected)?;
@@ -525,13 +544,12 @@ impl NostrSigner for Nip07Signer {
             .as_string()
             .ok_or(SignerError::JsError("Expected string result".into()))?;
 
-        serde_json::from_str(&signed_json)
-            .map_err(|e| SignerError::Serialization(e.to_string()))
+        serde_json::from_str(&signed_json).map_err(|e| SignerError::Serialization(e.to_string()))
     }
 }
 
 /// Direct key signer for testing - uses a raw private key (nsec or hex).
-/// 
+///
 /// ⚠️ WARNING: This is for testing only! In production, use NIP-46 or NIP-07
 /// to avoid exposing private keys to the application.
 #[cfg(not(target_arch = "wasm32"))]
@@ -574,7 +592,8 @@ impl NostrSigner for DirectKeySigner {
     }
 
     async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SignerError> {
-        unsigned.sign(&self.keys)
+        unsigned
+            .sign(&self.keys)
             .await
             .map_err(|e| SignerError::SigningFailed(format!("Failed to sign event: {}", e)))
     }
@@ -650,26 +669,21 @@ mod tests {
         setup_test_keys_dir();
         let relay = "wss://relay.damus.io";
         let secret = "test_secret_123";
-        
-        let result = Nip46Signer::generate_nostrconnect_uri(
-            relay,
-            secret,
-            None,
-            None,
-        );
-        
+
+        let result = Nip46Signer::generate_nostrconnect_uri(relay, secret, None, None);
+
         assert!(result.is_ok());
         let (uri, _pubkey) = result.unwrap();
-        
+
         // Check URI starts with nostrconnect://
         assert!(uri.starts_with("nostrconnect://"));
-        
+
         // Check URI contains the relay
         assert!(uri.contains("relay="));
-        
+
         // Check URI contains metadata (generated by the library)
         assert!(uri.contains("metadata="));
-        
+
         // Verify the URI format matches what the library generates
         // Format: nostrconnect://<pubkey>?metadata={"name":"..."}&relay=wss://...
         assert!(uri.starts_with("nostrconnect://"));
@@ -679,20 +693,15 @@ mod tests {
     fn test_generate_nostrconnect_uri_returns_keys() {
         setup_test_keys_dir();
         let relay = "wss://relay.nostr.band";
-        
-        let result = Nip46Signer::generate_nostrconnect_uri(
-            relay,
-            "",
-            None,
-            None,
-        );
-        
+
+        let result = Nip46Signer::generate_nostrconnect_uri(relay, "", None, None);
+
         assert!(result.is_ok());
         let (uri, client_keys) = result.unwrap();
-        
+
         // Check we got valid keys back
         assert!(!client_keys.public_key().to_hex().is_empty());
-        
+
         // Check URI contains the pubkey
         let expected_prefix = format!("nostrconnect://{}", client_keys.public_key().to_hex());
         assert!(uri.starts_with(&expected_prefix));
@@ -704,17 +713,12 @@ mod tests {
         let relay = "wss://relay.example.com";
         let secret = "secret789";
         let name = "TestApp";
-        
-        let result = Nip46Signer::generate_nostrconnect_uri(
-            relay,
-            secret,
-            None,
-            Some(name),
-        );
-        
+
+        let result = Nip46Signer::generate_nostrconnect_uri(relay, secret, None, Some(name));
+
         assert!(result.is_ok());
         let (uri, _) = result.unwrap();
-        
+
         // Check URI contains metadata parameter (which includes the app name)
         assert!(uri.contains("metadata="));
         // The name is URL-encoded inside the metadata JSON
@@ -727,17 +731,12 @@ mod tests {
         setup_test_keys_dir();
         let relay = "wss://relay.test.com/path";
         let secret = "secret";
-        
-        let result = Nip46Signer::generate_nostrconnect_uri(
-            relay,
-            secret,
-            None,
-            None,
-        );
-        
+
+        let result = Nip46Signer::generate_nostrconnect_uri(relay, secret, None, None);
+
         assert!(result.is_ok());
         let (uri, _) = result.unwrap();
-        
+
         // Special characters should be encoded
         assert!(!uri.contains(" "));
     }
@@ -746,25 +745,21 @@ mod tests {
     fn test_generate_nostrconnect_uri_unique() {
         setup_test_keys_dir();
         let relay = "wss://relay.damus.io";
-        
+
         // Generate multiple URIs and ensure they're different
         // Note: We reset keys between calls to get different keypairs
         let mut uris = Vec::new();
         for i in 0..5 {
             let secret = format!("secret_{}", i);
-            
+
             // Reset keys to force generation of a new keypair
             let _ = reset_client_keys();
-            
-            let result = Nip46Signer::generate_nostrconnect_uri(
-                relay,
-                &secret,
-                None,
-                None,
-            ).unwrap();
+
+            let result =
+                Nip46Signer::generate_nostrconnect_uri(relay, &secret, None, None).unwrap();
             uris.push(result.0);
         }
-        
+
         // Check all URIs are unique (different keypairs = different pubkeys in URI)
         let unique_uris: std::collections::HashSet<_> = uris.iter().collect();
         assert_eq!(uris.len(), unique_uris.len());

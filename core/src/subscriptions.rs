@@ -8,6 +8,7 @@ use nostr_sdk::prelude::*;
 use serde::Serialize;
 
 use crate::relay_cache::RelayCache;
+use crate::relay_hints::RelayHints;
 
 /// Connection type for lifecycle management
 #[derive(Clone, PartialEq, Debug)]
@@ -94,28 +95,38 @@ pub async fn run_notification_loop(
     client: Arc<Client>,
     relay_cache: Arc<RelayCache>,
     registry: Arc<SubscriptionRegistry>,
+    relay_hints: Option<Arc<RelayHints>>,
     event_callback: EventCallback,
 ) {
     let mut notifications = client.notifications();
 
     loop {
         match notifications.recv().await {
-            Ok(RelayPoolNotification::Event { relay_url, subscription_id, event }) => {
+            Ok(RelayPoolNotification::Event {
+                relay_url,
+                subscription_id,
+                event,
+            }) => {
                 // Fix 3: update seen_on unconditionally
-                let _ = relay_cache.update_seen_on(
-                    &event.pubkey.to_hex(),
-                    &relay_url.to_string(),
-                );
+                let _ = relay_cache.update_seen_on(&event.pubkey.to_hex(), &relay_url.to_string());
+
+                // Extract relay hints from events
+                if let Some(ref hints) = relay_hints {
+                    if let Err(e) = hints.extract_hints_from_event(&event) {
+                        tracing::debug!("Failed to extract hints from event: {}", e);
+                    }
+                }
 
                 // De-duplication check
                 let event_id = event.id.to_hex();
                 if relay_cache.is_seen_event(&event_id) {
                     continue;
                 }
-                relay_cache.mark_event_seen(event_id);
-                
+                relay_cache.mark_event_seen(&event_id);
+
                 // Push to frontend via callback
-                let serializable = SerializableEvent::from(((*event).clone(), relay_url.to_string()));
+                let serializable =
+                    SerializableEvent::from(((*event).clone(), relay_url.to_string()));
                 event_callback(serializable);
             }
 
@@ -123,14 +134,18 @@ pub async fn run_notification_loop(
                 match message {
                     // Fix 9: close ephemeral read connections on EOSE
                     RelayMessage::EndOfStoredEvents(sub_id) => {
-                        if let Some(ConnectionKind::EphemeralRead) = registry.get_kind(&sub_id.to_string()) {
+                        if let Some(ConnectionKind::EphemeralRead) =
+                            registry.get_kind(&sub_id.to_string())
+                        {
                             let _ = client.unsubscribe(&sub_id).await;
                             registry.remove(&sub_id.to_string());
                         }
                     }
 
                     // Fix 10: close ephemeral write connections on OK
-                    RelayMessage::Ok { event_id, status, .. } => {
+                    RelayMessage::Ok {
+                        event_id, status, ..
+                    } => {
                         let id = event_id.to_hex();
                         if let Some(ConnectionKind::EphemeralWrite) = registry.get_kind(&id) {
                             // Disconnect the relay after receiving OK
@@ -148,7 +163,6 @@ pub async fn run_notification_loop(
                 // Channel closed or error, exit loop
                 break;
             }
-            _ => {} // Ignore other variants
         }
     }
 }
@@ -157,7 +171,7 @@ pub async fn run_notification_loop(
 /// Each relay gets a subscription with only its assigned pubkeys
 pub async fn dispatch_permanent_subscriptions(
     client: &Client,
-    relay_map: &HashMap<String, HashSet<String>>,  // relay_url → pubkeys
+    relay_map: &HashMap<String, HashSet<String>>, // relay_url → pubkeys
     registry: &Arc<SubscriptionRegistry>,
     relay_cache: &Arc<RelayCache>,
 ) {
@@ -194,10 +208,10 @@ pub async fn dispatch_permanent_subscriptions(
                 // nostr_sdk 0.44 subscribe_to takes: relays, filter, opts
                 let _ = client.subscribe_to(vec![url], filter, None).await;
                 registry.register(sub_id.to_string(), ConnectionKind::Permanent);
-                
+
                 // Increment permanent connection counter
                 relay_cache.increment_permanent_connection();
-                
+
                 tracing::info!("Subscribed to permanent relay: {}", relay_url);
             }
             Err(e) => {

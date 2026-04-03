@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::nip46::types::{Nip46KeyringError, ProfileMetadata, SavedProfile};
+use crate::nip46::types::{Nip46KeyringError, Nip46UriType, ProfileMetadata, SavedProfile};
 
 /// Service name for keyring entries - MUST be "arcadestr-auth"
 const SERVICE_NAME: &str = "arcadestr-auth";
@@ -51,6 +51,34 @@ fn get_profile_cache_path() -> Option<PathBuf> {
         .map(|dir| dir.join(PROFILE_CACHE_FILENAME))
 }
 
+/// Extracts the keyring storage key for a profile.
+///
+/// For bunker:// URIs, uses the remote signer public key from the URI.
+/// For nostrconnect:// URIs, uses the user's public key (obtained during handshake).
+///
+/// # Errors
+/// Returns `Nip46KeyringError::UriParse` if the bunker URI lacks a remote signer pubkey.
+fn extract_profile_key(profile: &SavedProfile) -> Result<String, Nip46KeyringError> {
+    let uri_type = Nip46UriType::from_uri(&profile.bunker_uri.to_string());
+
+    match uri_type {
+        Nip46UriType::Bunker => {
+            // For bunker://, extract remote signer pubkey from URI
+            profile
+                .bunker_uri
+                .remote_signer_public_key()
+                .ok_or_else(|| {
+                    Nip46KeyringError::UriParse("No remote signer public key in URI".to_string())
+                })
+                .map(|pk| pk.to_hex())
+        }
+        Nip46UriType::NostrConnect => {
+            // For nostrconnect://, use the user's pubkey (obtained during handshake)
+            Ok(profile.user_pubkey.to_hex())
+        }
+    }
+}
+
 /// Persist a SavedProfile's secrets to the OS keychain.
 /// Call this immediately after a successful NIP-46 connection.
 ///
@@ -59,31 +87,22 @@ fn get_profile_cache_path() -> Option<PathBuf> {
 pub fn save_profile_to_keyring(profile: &SavedProfile) -> Result<(), Nip46KeyringError> {
     info!("Saving profile {} to keyring", profile.id);
 
-    // Get bunker pubkey as account identifier
-    let bunker_pubkey = profile
-        .bunker_uri
-        .remote_signer_public_key()
-        .ok_or_else(|| {
-            Nip46KeyringError::UriParse("No remote signer public key in URI".to_string())
-        })?
-        .to_hex();
+    // Get the appropriate key based on URI type (bunker:// or nostrconnect://)
+    let profile_key = extract_profile_key(profile)?;
 
     // Store app_keys secret key as bech32 (nsec1...)
     let secret_bech32 =
         profile.app_keys.secret_key().to_bech32().map_err(|e| {
             Nip46KeyringError::Serialization(format!("Failed to encode secret: {}", e))
         })?;
-    let app_key_entry = Entry::new(SERVICE_NAME, &bunker_pubkey)?;
+    let app_key_entry = Entry::new(SERVICE_NAME, &profile_key)?;
     app_key_entry.set_password(&secret_bech32)?;
-    debug!(
-        "Stored app_key (bech32) for bunker pubkey {}",
-        bunker_pubkey
-    );
+    debug!("Stored app_key (bech32) for profile key {}", profile_key);
 
     // Store bunker URI (serialize to string)
-    let uri_entry = Entry::new(SERVICE_NAME, &format!("{}_uri", bunker_pubkey))?;
+    let uri_entry = Entry::new(SERVICE_NAME, &format!("{}_uri", profile_key))?;
     uri_entry.set_password(&profile.bunker_uri.to_string())?;
-    debug!("Stored bunker_uri for bunker pubkey {}", bunker_pubkey);
+    debug!("Stored bunker_uri for profile key {}", profile_key);
 
     // Update profile index
     add_to_profile_index(profile)?;
@@ -226,15 +245,9 @@ pub fn profile_exists(bunker_pubkey: &str) -> bool {
 fn add_to_profile_index(profile: &SavedProfile) -> Result<(), Nip46KeyringError> {
     let mut index = load_profile_index()?;
 
-    // Remove existing entry if present (by bunker pubkey)
-    let bunker_pubkey = profile
-        .bunker_uri
-        .remote_signer_public_key()
-        .ok_or_else(|| {
-            Nip46KeyringError::UriParse("No remote signer public key in URI".to_string())
-        })?
-        .to_hex();
-    index.retain(|p: &ProfileMetadata| p.pubkey_hex != bunker_pubkey);
+    // Remove existing entry if present (by profile key)
+    let profile_key = extract_profile_key(profile)?;
+    index.retain(|p: &ProfileMetadata| p.pubkey_hex != profile_key);
 
     // Add new entry
     let metadata = ProfileMetadata {
@@ -244,7 +257,7 @@ fn add_to_profile_index(profile: &SavedProfile) -> Result<(), Nip46KeyringError>
             Nip46KeyringError::Serialization(format!("Failed to encode pubkey: {}", e))
         })?,
         pubkey_hex: profile.user_pubkey.to_hex(),
-        bunker_pubkey_hex: bunker_pubkey.clone(),
+        bunker_pubkey_hex: profile_key,
         picture: None,
         display_name: None,
         username: None,
@@ -318,12 +331,9 @@ fn save_profile_metadata_to_local_cache(profile: &SavedProfile) -> Result<(), St
     // Load existing cache
     let mut cache = load_profile_index_from_local_cache().unwrap_or_default();
 
-    // Get bunker pubkey
-    let bunker_pubkey = profile
-        .bunker_uri
-        .remote_signer_public_key()
-        .ok_or("No remote signer public key in URI")?
-        .to_hex();
+    // Get the appropriate key based on URI type
+    let profile_key = extract_profile_key(profile)
+        .map_err(|e| format!("Failed to extract profile key: {}", e))?;
 
     // Remove existing entry if present
     cache.retain(|p: &ProfileMetadata| p.pubkey_hex != profile.user_pubkey.to_hex());
@@ -337,7 +347,7 @@ fn save_profile_metadata_to_local_cache(profile: &SavedProfile) -> Result<(), St
             .to_bech32()
             .map_err(|e| format!("Failed to encode pubkey: {}", e))?,
         pubkey_hex: profile.user_pubkey.to_hex(),
-        bunker_pubkey_hex: bunker_pubkey,
+        bunker_pubkey_hex: profile_key,
         picture: None,
         display_name: None,
         username: None,
@@ -547,7 +557,7 @@ pub fn clear_last_active_profile_id() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::Keys;
+    use nostr::{nips::nip46::NostrConnectURI, Keys};
 
     #[test]
     fn test_service_name() {
@@ -577,5 +587,49 @@ mod tests {
         assert_eq!(metadata.name, deserialized.name);
         assert_eq!(metadata.pubkey_bech32, deserialized.pubkey_bech32);
         assert_eq!(metadata.bunker_pubkey_hex, deserialized.bunker_pubkey_hex);
+    }
+
+    #[test]
+    fn test_nip46_uri_type_detection() {
+        assert_eq!(
+            Nip46UriType::from_uri("bunker://pubkey123"),
+            Nip46UriType::Bunker
+        );
+        assert_eq!(
+            Nip46UriType::from_uri("nostrconnect://pubkey456"),
+            Nip46UriType::NostrConnect
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid NIP-46 URI")]
+    fn test_nip46_uri_type_invalid() {
+        Nip46UriType::from_uri("https://example.com");
+    }
+
+    #[test]
+    fn test_extract_profile_key_nostrconnect() {
+        // Create a test profile with nostrconnect:// URI
+        let app_keys = Keys::generate();
+        let user_keys = Keys::generate();
+
+        // Create a nostrconnect:// URI
+        let uri = NostrConnectURI::client(
+            app_keys.public_key(),
+            vec!["wss://relay.example.com".parse().unwrap()],
+            "Test App",
+        );
+
+        let profile = SavedProfile {
+            id: "test-id".to_string(),
+            name: "Test Account".to_string(),
+            user_pubkey: user_keys.public_key(),
+            bunker_uri: uri,
+            app_keys,
+        };
+
+        // For nostrconnect://, should return user_pubkey
+        let key = extract_profile_key(&profile).unwrap();
+        assert_eq!(key, user_keys.public_key().to_hex());
     }
 }

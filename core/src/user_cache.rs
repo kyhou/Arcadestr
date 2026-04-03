@@ -1,9 +1,9 @@
 //! User profile cache for persistent storage of fetched profiles.
 //! Mirrors YakiHonne's Dexie users table functionality.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-use sqlx::{Pool, Sqlite, Row};
 use crate::nostr::UserProfile;
+use sqlx::{Pool, Row, Sqlite};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CACHE_TTL_SECONDS: i64 = 86400; // 24 hours, matching YakiHonne
 
@@ -23,21 +23,21 @@ impl UserCache {
     /// Get a user profile from cache
     pub async fn get(&self, npub: &str) -> Option<UserProfile> {
         let now = Self::now();
-        
+
         let row = sqlx::query(
             r#"
             SELECT npub, name, display_name, picture, about, 
                    nip05, lud16, website, created_at
             FROM users 
             WHERE npub = ? AND expires_at > ?
-            "#
+            "#,
         )
         .bind(npub)
         .bind(now)
         .fetch_optional(&self.db)
         .await
         .ok()?;
-        
+
         row.map(|r| UserProfile {
             npub: r.get("npub"),
             name: r.get("name"),
@@ -55,7 +55,7 @@ impl UserCache {
     pub async fn put(&self, npub: &str, profile: &UserProfile) -> Result<(), sqlx::Error> {
         let now = Self::now();
         let expires = now + self.ttl_seconds;
-        
+
         sqlx::query(
             r#"
             INSERT INTO users (npub, name, display_name, picture, about, 
@@ -71,7 +71,7 @@ impl UserCache {
                 website = excluded.website,
                 updated_at = excluded.updated_at,
                 expires_at = excluded.expires_at
-            "#
+            "#,
         )
         .bind(npub)
         .bind(&profile.name)
@@ -81,23 +81,23 @@ impl UserCache {
         .bind(&profile.nip05)
         .bind(&profile.lud16)
         .bind(&profile.website)
-        .bind(now)  // created_at - use current time since UserProfile doesn't have this field
-        .bind(now)  // updated_at
+        .bind(now) // created_at - use current time since UserProfile doesn't have this field
+        .bind(now) // updated_at
         .bind(expires)
         .execute(&self.db)
         .await?;
-        
+
         Ok(())
     }
 
     /// Save multiple profiles in a batch transaction
     pub async fn put_many(&self, profiles: &[(String, UserProfile)]) -> Result<(), sqlx::Error> {
         let mut tx = self.db.begin().await?;
-        
+
         for (npub, profile) in profiles {
             let now = Self::now();
             let expires = now + self.ttl_seconds;
-            
+
             sqlx::query(
                 r#"
                 INSERT INTO users (npub, name, display_name, picture, about, 
@@ -113,7 +113,7 @@ impl UserCache {
                     website = excluded.website,
                     updated_at = excluded.updated_at,
                     expires_at = excluded.expires_at
-                "#
+                "#,
             )
             .bind(npub)
             .bind(&profile.name)
@@ -123,13 +123,13 @@ impl UserCache {
             .bind(&profile.nip05)
             .bind(&profile.lud16)
             .bind(&profile.website)
-            .bind(now)  // created_at - use current time since UserProfile doesn't have this field
-            .bind(now)  // updated_at
+            .bind(now) // created_at - use current time since UserProfile doesn't have this field
+            .bind(now) // updated_at
             .bind(expires)
             .execute(&mut *tx)
             .await?;
         }
-        
+
         tx.commit().await?;
         Ok(())
     }
@@ -137,7 +137,7 @@ impl UserCache {
     /// Get all cached users
     pub async fn get_all(&self) -> Result<Vec<UserProfile>, sqlx::Error> {
         let now = Self::now();
-        
+
         let rows = sqlx::query(
             r#"
             SELECT npub, name, display_name, picture, about, 
@@ -145,23 +145,26 @@ impl UserCache {
             FROM users 
             WHERE expires_at > ?
             ORDER BY updated_at DESC
-            "#
+            "#,
         )
         .bind(now)
         .fetch_all(&self.db)
         .await?;
-        
-        Ok(rows.into_iter().map(|r| UserProfile {
-            npub: r.get("npub"),
-            name: r.get("name"),
-            display_name: r.get("display_name"),
-            picture: r.get("picture"),
-            about: r.get("about"),
-            nip05: r.get("nip05"),
-            lud16: r.get("lud16"),
-            website: r.get("website"),
-            nip05_verified: false,
-        }).collect())
+
+        Ok(rows
+            .into_iter()
+            .map(|r| UserProfile {
+                npub: r.get("npub"),
+                name: r.get("name"),
+                display_name: r.get("display_name"),
+                picture: r.get("picture"),
+                about: r.get("about"),
+                nip05: r.get("nip05"),
+                lud16: r.get("lud16"),
+                website: r.get("website"),
+                nip05_verified: false,
+            })
+            .collect())
     }
 
     /// Check if profile exists and is fresh
@@ -172,14 +175,12 @@ impl UserCache {
     /// Delete expired profiles
     pub async fn cleanup_expired(&self) -> Result<u64, sqlx::Error> {
         let now = Self::now();
-        
-        let result = sqlx::query(
-            "DELETE FROM users WHERE expires_at <= ?"
-        )
-        .bind(now)
-        .execute(&self.db)
-        .await?;
-        
+
+        let result = sqlx::query("DELETE FROM users WHERE expires_at <= ?")
+            .bind(now)
+            .execute(&self.db)
+            .await?;
+
         Ok(result.rows_affected())
     }
 
@@ -194,7 +195,7 @@ impl UserCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     fn create_test_profile() -> UserProfile {
         UserProfile {
             npub: "npub1test123".to_string(),
@@ -208,6 +209,6 @@ mod tests {
             nip05_verified: false,
         }
     }
-    
+
     // Tests would need actual DB - integration tests in tests/ dir
 }

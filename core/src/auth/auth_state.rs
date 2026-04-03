@@ -41,10 +41,10 @@ impl AuthState {
     }
 
     /// Connect with a direct private key (nsec or hex)
-    /// 
+    ///
     /// # Arguments
     /// * `key` - The private key as nsec1... string or hex string
-    /// 
+    ///
     /// # Returns
     /// * `Ok(())` - Connection successful
     /// * `Err(SignerError)` - Connection failed
@@ -53,19 +53,19 @@ impl AuthState {
         let signer = DirectKeySigner::from_key(key)?;
         // Access public key directly from the keys field
         let public_key = signer.keys().public_key();
-        
+
         self.signer = Some(ActiveSigner::DirectKey(signer));
         self.public_key = Some(public_key);
-        
+
         Ok(())
     }
 
     /// Connect with a NIP-46 signer using a URI
-    /// 
+    ///
     /// # Arguments
     /// * `uri` - The NIP-46 URI (nostrconnect:// or bunker://)
     /// * `relay` - The relay URL to use for the connection
-    /// 
+    ///
     /// # Returns
     /// * `Ok(())` - Connection successful
     /// * `Err(SignerError)` - Connection failed
@@ -73,10 +73,10 @@ impl AuthState {
     pub async fn connect_nip46(&mut self, uri: &str, relay: &str) -> Result<(), SignerError> {
         let signer = Nip46Signer::connect(uri, relay).await?;
         let public_key = signer.get_public_key().await?;
-        
+
         self.signer = Some(ActiveSigner::Nip46(signer));
         self.public_key = Some(public_key);
-        
+
         Ok(())
     }
 
@@ -164,15 +164,15 @@ mod tests {
     #[test]
     fn test_auth_state_disconnect() {
         let mut auth = AuthState::new();
-        
+
         // Create a test key and set it
         let keys = Keys::generate();
         auth.set_public_key(keys.public_key());
-        
+
         assert!(auth.is_authenticated());
-        
+
         auth.disconnect();
-        
+
         assert!(!auth.is_authenticated());
         assert!(auth.public_key().is_none());
     }

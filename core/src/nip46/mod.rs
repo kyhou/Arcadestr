@@ -22,17 +22,24 @@ pub mod session;
 pub mod storage;
 pub mod types;
 
-pub use auth::{init_signer_session, init_signer_session_fast, generate_login_qr, wait_for_qr_connection, TauriAuthUrlHandler};
-pub use methods::{get_public_key, sign_event, nip44_encrypt, nip44_decrypt, ping, get_relay_status};
-pub use session::{activate_profile, logout, ping_active_signer, restore_session_on_startup, 
-                 cancel_bunker_retry, attempt_manual_reconnect, SessionRestoreResult};
+pub use auth::{
+    generate_login_qr, init_signer_session, init_signer_session_fast, wait_for_qr_connection,
+    TauriAuthUrlHandler,
+};
+pub use methods::{
+    get_public_key, get_relay_status, nip44_decrypt, nip44_encrypt, ping, sign_event,
+};
+pub use session::{
+    activate_profile, attempt_manual_reconnect, cancel_bunker_retry, logout, ping_active_signer,
+    restore_session_on_startup, SessionRestoreResult,
+};
 pub use storage::{
-    delete_profile_from_keyring, get_profile_metadata_by_id, get_profile_metadata_by_pubkey,
-    list_profile_index, load_profile_from_keyring, migrate_profile_to_keyring, profile_exists,
-    save_profile_to_keyring, set_last_active_profile_id, get_last_active_profile_id, 
-    clear_last_active_profile_id, set_profile_cache_dir,
+    clear_last_active_profile_id, delete_profile_from_keyring, get_last_active_profile_id,
+    get_profile_metadata_by_id, get_profile_metadata_by_pubkey, list_profile_index,
+    load_profile_from_keyring, migrate_profile_to_keyring, profile_exists, save_profile_to_keyring,
+    set_last_active_profile_id, set_profile_cache_dir,
 };
 pub use types::{
-    keyring_keys, Nip46KeyringError, AppSignerState, PendingQrState, ProfileMetadata,
-    SavedProfile, session_config, ConnectionState,
+    keyring_keys, session_config, AppSignerState, ConnectionState, Nip46KeyringError,
+    Nip46UriType, PendingQrState, ProfileMetadata, SavedProfile,
 };

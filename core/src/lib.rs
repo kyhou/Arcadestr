@@ -21,7 +21,22 @@ pub mod version;
 pub mod relay_cache;
 
 #[cfg(feature = "native")]
-pub use relay_cache::{RelayCache, CachedRelayList, RelayCacheError, RelayType, RelayHealth};
+pub mod relay_hints;
+
+#[cfg(feature = "native")]
+pub mod relay_pool;
+
+#[cfg(feature = "native")]
+pub mod relay_manager;
+
+#[cfg(feature = "native")]
+pub use relay_cache::{CachedRelayList, RelayCache, RelayCacheError, RelayHealth, RelayType};
+
+#[cfg(feature = "native")]
+pub use relay_pool::{RelayPool, RelaySource};
+
+#[cfg(feature = "native")]
+pub use relay_manager::{RelayManager, RelayManagerConfig, RelayManagerError, SendEventResult, RelaySendResult};
 
 #[cfg(feature = "native")]
 pub mod nostr;
@@ -36,7 +51,15 @@ pub mod profile_fetcher;
 pub mod user_cache;
 
 #[cfg(feature = "native")]
-pub use profile_fetcher::{ProfileFetcher, ProfileCache, LruProfileCache, BATCH_SIZE, MAX_PROFILE_ATTEMPTS};
+pub mod social_graph;
+
+#[cfg(feature = "native")]
+pub mod extended_network;
+
+#[cfg(feature = "native")]
+pub use profile_fetcher::{
+    LruProfileCache, ProfileCache, ProfileFetcher, BATCH_SIZE, MAX_PROFILE_ATTEMPTS,
+};
 
 #[cfg(feature = "native")]
 pub use user_cache::UserCache;

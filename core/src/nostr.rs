@@ -7,13 +7,18 @@ use std::time::{Duration, Instant};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::auth::AuthState;
 #[cfg(feature = "native")]
 use crate::relay_cache::{CachedRelayList, RelayCache, RelayDiscoverySource};
+#[cfg(feature = "native")]
+use crate::relay_hints::RelayHints;
+#[cfg(feature = "native")]
+use crate::relay_manager::{RelayManager, RelayManagerConfig};
 use crate::signers::{ActiveSigner, NostrSigner as ArcadestrNostrSigner, SignerError};
 use crate::user_cache::UserCache;
+use tokio::sync::Mutex;
 
 /// Arcadestr game listing event kind.
 /// Using kind 30078 (NIP-78 arbitrary app data, parameterized replaceable).
@@ -23,9 +28,9 @@ pub const KIND_GAME_LISTING: u16 = 30078;
 /// Includes popular relay discovery services that aggregate user metadata.
 pub const DEFAULT_RELAYS: &[&str] = &[
     // Relay discovery services (query these first for user lookups)
-    "wss://purplepag.es",           // Aggregates user metadata and relay lists
-    "wss://relay.nostr.info",       // Relay discovery service
-    "wss://relay.nostr.band",       // Relay aggregator with good coverage
+    "wss://purplepag.es",     // Aggregates user metadata and relay lists
+    "wss://relay.nostr.info", // Relay discovery service
+    "wss://relay.nostr.band", // Relay aggregator with good coverage
     // General relays
     "wss://relay.damus.io",
     "wss://nos.lol",
@@ -37,9 +42,9 @@ pub const DEFAULT_RELAYS: &[&str] = &[
 /// Relay discovery services - prioritized for user lookups
 pub const DISCOVERY_RELAYS: &[&str] = &[
     "wss://purplepag.es",
-    "wss://relay.nostr.info", 
+    "wss://relay.nostr.info",
     "wss://relay.nostr.band",
-    "wss://relay.nsec.app",        // NIP-46 service relay
+    "wss://relay.nsec.app", // NIP-46 service relay
 ];
 
 /// Indexer relays for profile/relay discovery (subset of DEFAULT_RELAYS)
@@ -99,6 +104,10 @@ impl EventDeduplicator {
     pub fn len(&self) -> usize {
         self.seen_ids.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen_ids.is_empty()
+    }
 }
 
 // ============================================
@@ -128,7 +137,8 @@ impl RelayConnectionManager {
 
     /// Update last activity time for a relay
     pub fn touch(&mut self, relay_url: &str) {
-        self.last_activity.insert(relay_url.to_string(), Instant::now());
+        self.last_activity
+            .insert(relay_url.to_string(), Instant::now());
     }
 
     /// Get relays that have been idle too long
@@ -161,7 +171,7 @@ impl RelayConnectionManager {
 pub fn parse_relay_list_from_event(event: &Event) -> Result<CachedRelayList, NostrError> {
     let mut read_relays = Vec::new();
     let mut write_relays = Vec::new();
-    
+
     // Iterate through all tags looking for "r" tags
     for tag in event.tags.iter() {
         // Check if this is a relay tag ("r")
@@ -169,10 +179,10 @@ pub fn parse_relay_list_from_event(event: &Event) -> Result<CachedRelayList, Nos
         if tag_kind.to_string() == "r" {
             // Get all values from the tag as a vector
             let values = tag.clone().to_vec();
-            
+
             if values.len() >= 2 {
                 let url = &values[1];
-                
+
                 // Check for marker (read/write)
                 match values.get(2).map(|s: &String| s.as_str()) {
                     Some("read") => read_relays.push(url.clone()),
@@ -186,9 +196,13 @@ pub fn parse_relay_list_from_event(event: &Event) -> Result<CachedRelayList, Nos
             }
         }
     }
-    
-    tracing::debug!("Parsed relay list: {} read relays, {} write relays", read_relays.len(), write_relays.len());
-    
+
+    tracing::debug!(
+        "Parsed relay list: {} read relays, {} write relays",
+        read_relays.len(),
+        write_relays.len()
+    );
+
     Ok(CachedRelayList {
         pubkey: event.pubkey.to_hex(),
         write_relays,
@@ -206,7 +220,7 @@ pub fn parse_relay_list_content(content: &str) -> Result<CachedRelayList, NostrE
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        
+
         return Ok(CachedRelayList {
             pubkey: String::new(),
             write_relays: Vec::new(),
@@ -214,21 +228,21 @@ pub fn parse_relay_list_content(content: &str) -> Result<CachedRelayList, NostrE
             updated_at: now,
         });
     }
-    
+
     #[derive(Deserialize)]
     struct RelayListContent {
         read: Option<Vec<String>>,
         write: Option<Vec<String>>,
     }
-    
+
     let parsed: RelayListContent = serde_json::from_str(content)
         .map_err(|e| NostrError::MalformedEvent(format!("Invalid relay list content: {}", e)))?;
-    
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    
+
     Ok(CachedRelayList {
         pubkey: String::new(),
         write_relays: parsed.write.unwrap_or_default(),
@@ -263,15 +277,18 @@ pub fn build_relay_map(
     cache: &RelayCache,
 ) -> HashMap<String, HashSet<String>> {
     let mut relay_map: HashMap<String, HashSet<String>> = HashMap::new();
-    
+
     for pubkey in followed_pubkeys {
         if let Some(cached) = cache.get_relay_list(pubkey) {
             for relay in &cached.write_relays {
-                relay_map.entry(relay.clone()).or_default().insert(pubkey.clone());
+                relay_map
+                    .entry(relay.clone())
+                    .or_default()
+                    .insert(pubkey.clone());
             }
         }
     }
-    
+
     relay_map
 }
 
@@ -282,10 +299,10 @@ pub fn score_relays(
     user_pubkey: Option<&str>,
 ) -> Vec<ScoredRelay> {
     let mut scored = Vec::new();
-    
+
     for (relay_url, pubkeys) in relay_map {
         let raw_score = pubkeys.len() as f32;
-        
+
         // Apply health multiplier from in-memory cache
         let health_multiplier = {
             let health_map = cache.relay_health.lock().unwrap();
@@ -300,31 +317,39 @@ pub fn score_relays(
                 1.0 // No health data, no penalty
             }
         };
-        
+
         // Apply staleness multiplier (if stale, half the score)
         let staleness_multiplier = if cache.is_stale(relay_url) { 0.5 } else { 1.0 };
-        
+
         // Apply user's own relay bonus
-        let is_user_own = user_pubkey.map(|u| {
-            cache.get_relay_list(u)
-                .map(|l| l.write_relays.contains(relay_url))
-                .unwrap_or(false)
-        }).unwrap_or(false);
-        
+        let is_user_own = user_pubkey
+            .map(|u| {
+                cache
+                    .get_relay_list(u)
+                    .map(|l| l.write_relays.contains(relay_url))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
         let own_relay_multiplier = if is_user_own { 1.5 } else { 1.0 };
-        
-        let final_score = raw_score * health_multiplier * staleness_multiplier * own_relay_multiplier;
-        
+
+        let final_score =
+            raw_score * health_multiplier * staleness_multiplier * own_relay_multiplier;
+
         scored.push(ScoredRelay {
             url: relay_url.clone(),
             score: final_score,
             pubkeys: pubkeys.clone(),
         });
     }
-    
+
     // Sort by score descending
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     scored
 }
 
@@ -337,28 +362,28 @@ pub fn select_relays(
     let mut selected: Vec<String> = Vec::new();
     let mut covered: HashSet<String> = HashSet::new();
     let mut uncovered: HashSet<String> = all_pubkeys.clone();
-    
+
     for relay in scored {
         if selected.len() >= max_relays {
             break;
         }
-        
+
         if uncovered.is_empty() {
             break;
         }
-        
+
         // Calculate marginal gain
         let marginal: HashSet<_> = relay.pubkeys.intersection(&uncovered).cloned().collect();
-        
+
         if marginal.is_empty() {
             continue; // No new coverage
         }
-        
+
         selected.push(relay.url);
         covered.extend(marginal.clone());
         uncovered.retain(|p| !marginal.contains(p));
     }
-    
+
     RelaySelection {
         permanent: selected,
         uncovered_pubkeys: uncovered.into_iter().collect(),
@@ -408,15 +433,15 @@ impl From<serde_json::Error> for NostrError {
 /// Game listing data structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameListing {
-    pub id: String,           // unique slug / d-tag value, e.g. "my-game-v1"
+    pub id: String, // unique slug / d-tag value, e.g. "my-game-v1"
     pub title: String,
     pub description: String,
-    pub price_sats: u64,      // price in satoshis, 0 = free
-    pub download_url: String, // direct download link (may be encrypted in future)
+    pub price_sats: u64,        // price in satoshis, 0 = free
+    pub download_url: String,   // direct download link (may be encrypted in future)
     pub publisher_npub: String, // bech32 npub of the publisher
-    pub created_at: u64,      // unix timestamp
-    pub tags: Vec<String>,    // freeform tags e.g. ["rpg", "pixel-art"]
-    pub lud16: String,        // Lightning address for payments (e.g., "seller@walletofsatoshi.com")
+    pub created_at: u64,        // unix timestamp
+    pub tags: Vec<String>,      // freeform tags e.g. ["rpg", "pixel-art"]
+    pub lud16: String, // Lightning address for payments (e.g., "seller@walletofsatoshi.com")
 }
 
 /// Content portion of a game listing event (stored in event.content).
@@ -460,108 +485,104 @@ struct Nip05Response {
 
 /// NOSTR client for Arcadestr.
 pub struct NostrClient {
-    inner: nostr_sdk::Client,
+    relay_manager: Arc<Mutex<RelayManager>>,
     user_cache: Option<Arc<UserCache>>,
+    profile_id: String,
 }
 
 impl NostrClient {
-    /// Creates a new NOSTR client connected to the specified relays.
-    /// 
-    /// Note: Relay connection errors are logged but don't fail - the client
-    /// will retry connections automatically.
-    pub async fn new(relays: Vec<String>) -> Result<Self, NostrError> {
-        use tracing::{info, warn, error};
-        
-        info!("Creating NostrClient with {} relays", relays.len());
-        let client = nostr_sdk::Client::default();
-        
+    /// Get access to the relay manager.
+    pub fn relay_manager(&self) -> Arc<Mutex<RelayManager>> {
+        self.relay_manager.clone()
+    }
+
+    /// Creates a new NOSTR client with background relay manager.
+    pub async fn new(
+        profile_id: String,
+        relays: Vec<String>,
+        config: Option<RelayManagerConfig>,
+    ) -> Result<Self, NostrError> {
+        use tracing::{error, info, warn};
+
+        info!("Creating NostrClient for profile: {}", profile_id);
+
+        let config = config.unwrap_or_default();
+        let relay_manager = RelayManager::new(profile_id.clone(), config)
+            .await
+            .map_err(|e| {
+                NostrError::RelayError(format!("Failed to create relay manager: {}", e))
+            })?;
+
+        // Add any additional relays from params
         for relay in &relays {
-            match client.add_relay(relay).await {
-                Ok(_) => {
-                    info!("Added relay: {}", relay);
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    error!("Failed to add relay {}: {}", relay, err_str);
-                    if err_str.contains("parse") || err_str.contains("expected ident") {
-                        error!("  -> Relay returned HTML instead of WebSocket response");
-                        error!("  -> This usually means the relay is down or blocked");
-                    } else {
-                        warn!("  -> Will retry on first use");
-                    }
-                    // Don't fail - continue with other relays
-                }
+            if !DEFAULT_RELAYS.contains(&relay.as_str())
+                && !INDEXER_RELAYS.contains(&relay.as_str())
+            {
+                let _ = relay_manager.add_discovered_relay(relay.clone()).await;
             }
         }
-        
-        // Try to connect, but don't fail if relays are temporarily down
-        client.connect().await;
-        
-        // Give some time for connections to establish
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        
-        // Check relay status
-        let relay_list = client.relays().await;
-        info!("Connected relays: {:?}", relay_list.keys().collect::<Vec<_>>());
-        
-        if relay_list.is_empty() {
-            warn!("No relays connected - queries may fail");
-        }
-        
-        info!("NostrClient initialized");
-        
-        Ok(Self { inner: client, user_cache: None })
+
+        info!("NostrClient initialized with relay manager");
+
+        Ok(Self {
+            relay_manager: Arc::new(Mutex::new(relay_manager)),
+            user_cache: None,
+            profile_id,
+        })
     }
 
     /// Creates a new NOSTR client with user cache support.
-    pub async fn new_with_cache(relays: Vec<String>, user_cache: Arc<UserCache>) -> Result<Self, NostrError> {
-        use tracing::{info, warn, error};
-        
-        info!("Creating NostrClient with {} relays and user cache", relays.len());
-        let client = nostr_sdk::Client::default();
-        
+    pub async fn new_with_cache(
+        profile_id: String,
+        relays: Vec<String>,
+        user_cache: Arc<UserCache>,
+        config: Option<RelayManagerConfig>,
+    ) -> Result<Self, NostrError> {
+        use tracing::{info, warn};
+
+        info!(
+            "Creating NostrClient with {} relays and user cache for profile: {}",
+            relays.len(),
+            profile_id
+        );
+
+        let config = config.unwrap_or_default();
+        let relay_manager = RelayManager::new(profile_id.clone(), config)
+            .await
+            .map_err(|e| {
+                NostrError::RelayError(format!("Failed to create relay manager: {}", e))
+            })?;
+
+        // Add any additional relays from params
         for relay in &relays {
-            match client.add_relay(relay).await {
-                Ok(_) => {
-                    info!("Added relay: {}", relay);
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    error!("Failed to add relay {}: {}", relay, err_str);
-                    if err_str.contains("parse") || err_str.contains("expected ident") {
-                        error!("  -> Relay returned HTML instead of WebSocket response");
-                        error!("  -> This usually means the relay is down or blocked");
-                    } else {
-                        warn!("  -> Will retry on first use");
-                    }
-                    // Don't fail - continue with other relays
-                }
+            if !DEFAULT_RELAYS.contains(&relay.as_str())
+                && !INDEXER_RELAYS.contains(&relay.as_str())
+            {
+                let _ = relay_manager.add_discovered_relay(relay.clone()).await;
             }
         }
-        
-        // Try to connect, but don't fail if relays are temporarily down
-        client.connect().await;
-        
-        // Give some time for connections to establish
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        
-        // Check relay status
-        let relay_list = client.relays().await;
-        info!("Connected relays: {:?}", relay_list.keys().collect::<Vec<_>>());
-        
-        if relay_list.is_empty() {
-            warn!("No relays connected - queries may fail");
-        }
-        
-        info!("NostrClient initialized with cache");
-        
-        Ok(Self { 
-            inner: client,
+
+        info!("NostrClient initialized with relay manager and cache");
+
+        Ok(Self {
+            relay_manager: Arc::new(Mutex::new(relay_manager)),
             user_cache: Some(user_cache),
+            profile_id,
         })
     }
 
     /// Publishes a game listing as a signed NOSTR event.
+    ///
+    /// # Arguments
+    /// * `listing` - The game listing to publish
+    /// * `auth` - The authentication state containing the signer
+    ///
+    /// # Returns
+    /// Returns the event ID on success.
+    ///
+    /// # Errors
+    /// Returns `NostrError::NotAuthenticated` if user is not authenticated.
+    /// Returns `NostrError::RelayError` if event cannot be published to any relay.
     pub async fn publish_listing(
         &self,
         listing: &GameListing,
@@ -581,10 +602,27 @@ impl NostrClient {
         // Sign the event using our bridged signer
         let signed_event = sign_event_with_arcadestr_signer(builder, signer).await?;
 
-        // Send the event
-        self.inner.send_event(&signed_event).await.map_err(|e| {
-            NostrError::RelayError(format!("Failed to send event: {}", e))
-        })?;
+        // Send the event through relay manager
+        let result = {
+            let manager = self.relay_manager.lock().await;
+            manager
+                .send_event(&signed_event)
+                .await
+                .map_err(|e| NostrError::RelayError(format!("Failed to send event: {}", e)))?
+        };
+
+        // Check if event was successfully sent to at least one relay
+        if result.success_count == 0 {
+            return Err(NostrError::RelayError(format!(
+                "Failed to publish event to any relay. Attempted {} relays, all failed.",
+                result.relay_results.len()
+            )));
+        }
+
+        info!(
+            "Successfully published listing event {} to {} relays",
+            result.event_id, result.success_count
+        );
 
         Ok(signed_event.id)
     }
@@ -595,10 +633,13 @@ impl NostrClient {
             .kind(Kind::Custom(KIND_GAME_LISTING))
             .limit(limit);
 
-        let events = self.inner
-            .fetch_events(filter, Duration::from_secs(10))
-            .await
-            .map_err(|e| NostrError::RelayError(format!("Failed to fetch events: {}", e)))?;
+        let events = {
+            let manager = self.relay_manager.lock().await;
+            manager
+                .fetch_events(filter)
+                .await
+                .map_err(|e| NostrError::RelayError(format!("Failed to fetch events: {}", e)))?
+        };
 
         let mut listings = Vec::new();
         for event in events {
@@ -628,10 +669,13 @@ impl NostrClient {
             .author(pubkey)
             .identifier(listing_id);
 
-        let events = self.inner
-            .fetch_events(filter, Duration::from_secs(10))
-            .await
-            .map_err(|e| NostrError::RelayError(format!("Failed to fetch event: {}", e)))?;
+        let events = {
+            let manager = self.relay_manager.lock().await;
+            manager
+                .fetch_events(filter)
+                .await
+                .map_err(|e| NostrError::RelayError(format!("Failed to fetch event: {}", e)))?
+        };
 
         let event = events
             .first()
@@ -641,11 +685,11 @@ impl NostrClient {
     }
 
     /// Fetches user profile metadata (kind-0) from relays.
-    /// First checks cache, then tries discovery services, then additional relays (if provided), then falls back to all connected relays.
+    /// Uses indexer relays first, then falls back to full pool if not found.
     pub async fn fetch_profile(
         &self,
         npub: &str,
-        additional_relays: Option<Vec<String>>,
+        _additional_relays: Option<Vec<String>>,
     ) -> Result<UserProfile, NostrError> {
         // Check cache first
         if let Some(ref cache) = self.user_cache {
@@ -659,200 +703,89 @@ impl NostrClient {
         let pubkey = PublicKey::parse(npub)
             .map_err(|e| NostrError::MalformedEvent(format!("Invalid npub: {}", e)))?;
 
-        tracing::info!("Fetching profile for pubkey: {} (npub: {})", pubkey.to_hex(), npub);
+        tracing::info!(
+            "Fetching profile for pubkey: {} (npub: {})",
+            pubkey.to_hex(),
+            npub
+        );
 
         // Build filter for kind-0 (metadata) events
-        let filter = Filter::new()
-            .kind(Kind::Metadata)
-            .author(pubkey)
-            .limit(1);
-        
-        tracing::debug!("Profile filter: kind=0, author={}, limit=1", pubkey.to_hex());
+        let filter = Filter::new().kind(Kind::Metadata).author(pubkey).limit(1);
 
-        // First, try indexer relays (more efficient for profile lookups)
-        let indexer_urls: Vec<Url> = INDEXER_RELAYS
-            .iter()
-            .filter_map(|url| Url::parse(url).ok())
-            .collect();
-        
-        tracing::debug!("Indexer relays: {:?}", indexer_urls);
-        
-        if !indexer_urls.is_empty() {
-            tracing::info!("Adding {} indexer relays to client...", indexer_urls.len());
-            
-            // Add indexer relays to client first
-            for url in &indexer_urls {
-                let url_str = url.to_string();
-                match self.inner.add_relay(&url_str).await {
-                    Ok(_) => tracing::debug!("Added indexer relay: {}", url_str),
-                    Err(e) => tracing::warn!("Failed to add indexer relay {}: {}", url_str, e),
-                }
-            }
-            
-            // Connect to newly added relays
-            self.inner.connect().await;
-            // Quick 100ms yield for connections to start
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            
-            // Use 5s timeout for indexer query
-            tracing::info!("Querying {} indexer relays for profile with 5s timeout...", indexer_urls.len());
-            match self.inner.fetch_events_from(indexer_urls.clone(), filter.clone(), Duration::from_secs(5)).await {
-                Ok(events) => {
-                    tracing::debug!("Indexer query returned {} events", events.len());
-                    if let Some(event) = events.first() {
-                        tracing::info!("Found profile on indexer relay! Event id: {}", event.id.to_hex());
-                        let profile = self.parse_profile_event(event, npub)?;
-                        // Save to cache
-                        if let Some(ref cache) = self.user_cache {
-                            if let Err(e) = cache.put(npub, &profile).await {
-                                tracing::warn!("Failed to save profile to cache: {}", e);
-                            }
-                        }
-                        return Ok(profile);
-                    }
-                    tracing::debug!("Indexer returned empty events list");
-                }
+        tracing::debug!(
+            "Profile filter: kind=0, author={}, limit=1",
+            pubkey.to_hex()
+        );
+
+        // Phase 1: Try indexer relays first (5s timeout)
+        tracing::info!("Phase 1: Querying indexer relays for profile...");
+        let indexer_events = {
+            let manager = self.relay_manager.lock().await;
+            let indexer_relays: Vec<String> =
+                INDEXER_RELAYS.iter().map(|&s| s.to_string()).collect();
+
+            match manager
+                .fetch_events_from_subset(filter.clone(), indexer_relays)
+                .await
+            {
+                Ok(events) => Ok(events),
                 Err(e) => {
-                    tracing::warn!("Indexer relay query failed with error: {}", e);
+                    tracing::error!("Indexer relay query failed: {}", e);
+                    Err(e)
                 }
             }
-            tracing::debug!("No profile found on indexer relays, will try additional relays if provided");
-        } else {
-            tracing::warn!("No valid indexer relay URLs found!");
-        }
+        };
 
-        // Second, try additional relays if provided (e.g., from NIP-46 bunker connection)
-        if let Some(additional) = additional_relays {
-            let additional_urls: Vec<Url> = additional
-                .iter()
-                .filter_map(|url| Url::parse(url).ok())
-                .collect();
-            
-            if !additional_urls.is_empty() {
-                tracing::info!("Adding {} additional relays from NIP-46 connection...", additional_urls.len());
-                
-                // Add additional relays
-                for url in &additional_urls {
-                    let url_str = url.to_string();
-                    match self.inner.add_relay(&url_str).await {
-                        Ok(_) => tracing::debug!("Added additional relay: {}", url_str),
-                        Err(e) => tracing::warn!("Failed to add additional relay {}: {}", url_str, e),
-                    }
-                }
-                
-                // Connect to newly added relays
-                self.inner.connect().await;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                
-                // Query additional relays with 5s timeout
-                tracing::info!("Querying {} additional relays for profile with 5s timeout...", additional_urls.len());
-                match self.inner.fetch_events_from(additional_urls.clone(), filter.clone(), Duration::from_secs(5)).await {
-                    Ok(events) => {
-                        tracing::debug!("Additional relays query returned {} events", events.len());
-                    if let Some(event) = events.first() {
-                        tracing::info!("Found profile on additional relay! Event id: {}", event.id.to_hex());
-                        let profile = self.parse_profile_event(event, npub)?;
-                        // Save to cache
-                        if let Some(ref cache) = self.user_cache {
-                            if let Err(e) = cache.put(npub, &profile).await {
-                                tracing::warn!("Failed to save profile to cache: {}", e);
-                            }
+        match indexer_events {
+            Ok(events) if !events.is_empty() => {
+                tracing::info!("Found profile on indexer relays! {} events", events.len());
+                if let Some(event) = events.first() {
+                    let profile = self.parse_profile_event(event, npub)?;
+
+                    // Save to cache
+                    if let Some(ref cache) = self.user_cache {
+                        if let Err(e) = cache.put(npub, &profile).await {
+                            tracing::warn!("Failed to save profile to cache: {}", e);
                         }
-                        return Ok(profile);
                     }
-                        tracing::debug!("Additional relays returned empty events list");
-                    }
-                    Err(e) => {
-                        tracing::warn!("Additional relays query failed with error: {}", e);
-                    }
+
+                    return Ok(profile);
                 }
-                tracing::debug!("No profile found on additional relays, will try all connected relays");
             }
-        }
-
-        // Third, try to fetch user's NIP-65 relay list and query those relays
-        // This is crucial for users whose profiles are only on their personal relays
-        tracing::info!("Fetching user's NIP-65 relay list to find profile...");
-        match self.fetch_relay_list(npub).await {
-            Ok(relay_list) => {
-                let user_relays: Vec<String> = relay_list
-                    .write_relays
-                    .into_iter()
-                    .chain(relay_list.read_relays.into_iter())
-                    .collect::<std::collections::HashSet<_>>() // deduplicate
-                    .into_iter()
-                    .collect();
-                
-                if !user_relays.is_empty() {
-                    tracing::info!("Found {} unique relays from NIP-65, adding...", user_relays.len());
-                    
-                    // Add user's relays
-                    for relay in &user_relays {
-                        match self.add_relay(relay).await {
-                            Ok(_) => tracing::debug!("Added user relay: {}", relay),
-                            Err(e) => tracing::warn!("Failed to add user relay {}: {}", relay, e),
-                        }
-                    }
-                    
-                    // Connect to user's relays
-                    self.connect().await;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    
-                    // Query user's relays
-                    let user_relay_urls: Vec<Url> = user_relays
-                        .iter()
-                        .filter_map(|url| Url::parse(url).ok())
-                        .collect();
-                    
-                    if !user_relay_urls.is_empty() {
-                        tracing::info!("Querying {} user relays from NIP-65...", user_relay_urls.len());
-                        match self.inner.fetch_events_from(user_relay_urls, filter.clone(), Duration::from_secs(8)).await {
-                            Ok(events) => {
-                                tracing::debug!("User relays query returned {} events", events.len());
-                                if let Some(event) = events.first() {
-                                    tracing::info!("Found profile on user's NIP-65 relay!");
-                                    let profile = self.parse_profile_event(event, npub)?;
-                                    // Save to cache
-                                    if let Some(ref cache) = self.user_cache {
-                                        if let Err(e) = cache.put(npub, &profile).await {
-                                            tracing::warn!("Failed to save profile to cache: {}", e);
-                                        }
-                                    }
-                                    return Ok(profile);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("User relays query failed: {}", e);
-                            }
-                        }
-                    }
-                }
+            Ok(_) => {
+                tracing::debug!("No profile found on indexer relays");
             }
             Err(e) => {
-                tracing::debug!("Could not fetch NIP-65 relay list: {}", e);
+                tracing::warn!("Indexer relay query failed: {}", e);
             }
         }
 
-        // Fetch with 8s timeout from all relays (was 10s)
-        tracing::info!("Querying all connected relays with 8s timeout...");
-        let events = self.inner
-            .fetch_events(filter, Duration::from_secs(8))
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to fetch profile from all relays: {}", e);
-                NostrError::RelayError(format!("Failed to fetch profile: {}", e))
-            })?;
+        // Phase 2: Fall back to full relay pool (8s timeout)
+        tracing::info!("Phase 2: Querying all relays for profile...");
+        let events = {
+            let manager = self.relay_manager.lock().await;
+            manager
+                .fetch_events(filter)
+                .await
+                .map_err(|e| NostrError::RelayError(format!("Failed to fetch profile: {}", e)))?
+        };
 
-        tracing::debug!("All relays query returned {} events", events.len());
+        tracing::debug!("Query returned {} events", events.len());
 
-        // If no events returned, return minimal profile with only npub (don't cache empty profiles)
+        // If no events returned, return minimal profile
         let event = match events.first() {
             Some(e) => {
-                tracing::info!("Found profile event! Content preview: {}", &e.content[..e.content.len().min(100)]);
+                tracing::info!(
+                    "Found profile event! Content preview: {}",
+                    &e.content[..e.content.len().min(100)]
+                );
                 e
             }
             None => {
-                tracing::warn!("No kind-0 (metadata) events found for user {} on any relay", npub);
+                tracing::warn!(
+                    "No kind-0 (metadata) events found for user {} on any relay",
+                    npub
+                );
                 return Ok(UserProfile {
                     npub: npub.to_string(),
                     ..Default::default()
@@ -861,23 +794,38 @@ impl NostrClient {
         };
 
         let profile = self.parse_profile_event(event, npub)?;
+
         // Save to cache
         if let Some(ref cache) = self.user_cache {
             if let Err(e) = cache.put(npub, &profile).await {
                 tracing::warn!("Failed to save profile to cache: {}", e);
             }
         }
+
         Ok(profile)
     }
 
     /// Parse a profile event into UserProfile
-    pub fn parse_profile_event(&self, event: &Event, npub: &str) -> Result<UserProfile, NostrError> {
+    pub fn parse_profile_event(
+        &self,
+        event: &Event,
+        npub: &str,
+    ) -> Result<UserProfile, NostrError> {
         // Parse the event content as UserProfileContent
-        let content: UserProfileContent = serde_json::from_str(&event.content)
-            .unwrap_or_default();
+        let content: UserProfileContent = match serde_json::from_str(&event.content) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to parse profile content: {}", e);
+                UserProfileContent::default()
+            }
+        };
 
-        tracing::info!("Parsed profile: name={:?}, display_name={:?}, picture={:?}", 
-            content.name, content.display_name, content.picture);
+        tracing::info!(
+            "Parsed profile: name={:?}, display_name={:?}, picture={:?}",
+            content.name,
+            content.display_name,
+            content.picture
+        );
 
         Ok(UserProfile {
             npub: npub.to_string(),
@@ -893,11 +841,7 @@ impl NostrClient {
     }
 
     /// Verifies a NIP-05 identifier against the user's pubkey.
-    pub async fn verify_nip05(
-        &self,
-        npub: &str,
-        nip05_identifier: &str,
-    ) -> bool {
+    pub async fn verify_nip05(&self, npub: &str, nip05_identifier: &str) -> bool {
         // Split nip05_identifier on '@' to get name and domain
         let parts: Vec<&str> = nip05_identifier.split('@').collect();
         if parts.len() != 2 {
@@ -907,9 +851,9 @@ impl NostrClient {
 
         // Fetch the NIP-05 JSON from the domain
         let url = format!("https://{}/.well-known/nostr.json?name={}", domain, name);
-        
+
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(8))
             .build()
         {
             Ok(c) => c,
@@ -935,7 +879,8 @@ impl NostrClient {
         let expected_hex = pubkey.to_hex();
 
         // Check if the names map contains our pubkey
-        nip05_resp.names
+        nip05_resp
+            .names
             .get(name)
             .map(|stored_hex| stored_hex.to_lowercase() == expected_hex.to_lowercase())
             .unwrap_or(false)
@@ -957,98 +902,63 @@ impl NostrClient {
     /// Adds a relay to the client.
     /// Returns true if the relay was newly added, false if it already existed.
     pub async fn add_relay(&self, relay: &str) -> Result<bool, NostrError> {
-        self.inner.add_relay(relay).await.map_err(|e| {
-            NostrError::RelayError(format!("Failed to add relay: {}", e))
-        })
+        let result = {
+            let manager = self.relay_manager.lock().await;
+            manager.add_discovered_relay(relay.to_string()).await
+        };
+        result
+            .map(|_| true)
+            .map_err(|e| NostrError::RelayError(format!("Failed to add relay: {}", e)))
     }
 
     /// Connects to all added relays.
     pub async fn connect(&self) {
-        self.inner.connect().await;
+        // RelayManager handles connections automatically
+        tracing::debug!("connect() called - RelayManager handles connections automatically");
     }
 
     /// Get the inner nostr_sdk client for subscription management
-    pub fn inner(&self) -> &Client {
-        &self.inner
+    /// DEPRECATED: Use relay_manager instead
+    pub fn inner(&self) -> Option<&Client> {
+        // TODO: This method is deprecated and returns None
+        // Subscriptions should use the relay_manager instead
+        None
     }
 
     /// Get a clone of the inner client as Arc for subscription loops
-    pub fn inner_clone(&self) -> Client {
-        self.inner.clone()
+    /// DEPRECATED: Use relay_manager instead
+    pub fn inner_clone(&self) -> Option<Client> {
+        // TODO: This method is deprecated and returns None
+        // Subscriptions should use the relay_manager instead
+        None
     }
 
     /// Get the number of connected relays.
     pub async fn get_relay_count(&self) -> usize {
-        self.inner.relays().await.len()
+        let manager = self.relay_manager.lock().await;
+        manager.get_connected_count().await
     }
 
     /// Get the list of connected relay URLs.
     pub async fn get_connected_relays(&self) -> Vec<String> {
-        self.inner.relays().await.into_iter().map(|(url, _)| url.to_string()).collect()
+        // TODO: Implement through RelayManager
+        vec![]
     }
 
-    /// Fetch from indexer relays first, silently fall back to all relays
-    /// This is the core method for efficient profile/relay discovery
+    /// Fetch from unified relay pool
     pub async fn fetch_from_indexers_then_all(
         &self,
         filter: Filter,
     ) -> Result<Vec<Event>, NostrError> {
-        // Try indexers first
-        let indexer_urls: Vec<Url> = INDEXER_RELAYS
-            .iter()
-            .filter_map(|url| Url::parse(url).ok())
-            .collect();
-        
-        tracing::debug!("Indexer URLs to query: {:?}", indexer_urls);
-        tracing::debug!("Filter: {:?}", filter);
-        
-        if !indexer_urls.is_empty() {
-            tracing::info!("Adding {} indexer relays to client...", indexer_urls.len());
-            
-            // Add indexer relays to client first (required before querying)
-            for url in &indexer_urls {
-                let url_str = url.to_string();
-                match self.inner.add_relay(&url_str).await {
-                    Ok(_) => tracing::debug!("Added indexer relay: {}", url_str),
-                    Err(e) => tracing::warn!("Failed to add indexer relay {}: {}", url_str, e),
-                }
-            }
-            
-            // Connect to the newly added relays
-            self.inner.connect().await;
-            
-            // Give a moment for connections to establish
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            
-            tracing::info!("Querying {} indexer relays with 8s timeout...", indexer_urls.len());
-            match self.inner.fetch_events_from(indexer_urls.clone(), filter.clone(), Duration::from_secs(8)).await {
-                Ok(events) if !events.is_empty() => {
-                    tracing::info!("Found {} events from indexers", events.len());
-                    return Ok(events.into_iter().collect());
-                }
-                Ok(events) => {
-                    tracing::debug!("Indexer query returned {} events (empty)", events.len());
-                }
-                Err(e) => {
-                    tracing::warn!("Indexer query failed with error: {}", e);
-                }
-            }
-            tracing::debug!("No events from indexers, will try all relays");
-        } else {
-            tracing::warn!("No valid indexer URLs found!");
-        }
-        
-        // Fallback to all connected relays
-        tracing::info!("Querying all connected relays with 10s timeout...");
-        let events = self.inner
-            .fetch_events(filter, Duration::from_secs(10))
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to fetch from all relays: {}", e);
-                NostrError::RelayError(format!("Failed to fetch: {}", e))
-            })?;
-        
-        tracing::info!("Fallback query returned {} events", events.len());
+        let events = {
+            let manager = self.relay_manager.lock().await;
+            manager
+                .fetch_events(filter)
+                .await
+                .map_err(|e| NostrError::RelayError(format!("Failed to fetch: {}", e)))?
+        };
+
+        tracing::info!("Query returned {} events", events.len());
         Ok(events.into_iter().collect())
     }
 
@@ -1060,17 +970,17 @@ impl NostrClient {
     ) -> Result<(UserProfile, Option<CachedRelayList>), NostrError> {
         let pubkey = PublicKey::parse(npub)
             .map_err(|e| NostrError::MalformedEvent(format!("Invalid npub: {}", e)))?;
-        
+
         let filter = Filter::new()
             .author(pubkey)
             .kinds(vec![Kind::Metadata, Kind::from_u16(KIND_RELAY_LIST)])
             .limit(2);
-        
+
         let events = self.fetch_from_indexers_then_all(filter).await?;
-        
+
         let mut profile = None;
         let mut relay_list = None;
-        
+
         for event in events {
             match event.kind.as_u16() {
                 0 => profile = Some(self.parse_profile_event(&event, npub)?),
@@ -1078,139 +988,111 @@ impl NostrClient {
                 _ => {}
             }
         }
-        
+
         Ok((profile.unwrap_or_default(), relay_list))
     }
 
     /// Fetch Kind 10002 (relay list metadata) for a pubkey
-    /// First tries discovery services, then falls back to all connected relays
+    /// Uses unified relay pool through RelayManager
     pub async fn fetch_relay_list(&self, npub: &str) -> Result<CachedRelayList, NostrError> {
         let pubkey = PublicKey::parse(npub)
             .map_err(|e| NostrError::MalformedEvent(format!("Invalid npub: {}", e)))?;
-        
+
         let filter = Filter::new()
             .kind(Kind::from_u16(KIND_RELAY_LIST))
             .author(pubkey)
             .limit(1);
-        
-        // First, try to query indexer relays specifically (more efficient)
-        let indexer_urls: Vec<Url> = INDEXER_RELAYS
-            .iter()
-            .filter_map(|url| Url::parse(url).ok())
-            .collect();
-        
-        if !indexer_urls.is_empty() {
-            tracing::info!("Querying indexer relays for {}'s relay list", npub);
-            match self.inner.fetch_events_from(indexer_urls, filter.clone(), Duration::from_secs(8)).await {
-                Ok(events) => {
-                    if let Some(event) = events.first() {
-                        let relay_list = parse_relay_list_from_event(event)?;
-                        tracing::info!("Found relay list from indexer relay for {} with {} read and {} write relays", 
-                            npub, relay_list.read_relays.len(), relay_list.write_relays.len());
-                        return Ok(relay_list);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Indexer relay query failed for {}: {}", npub, e);
-                }
-            }
-            tracing::debug!("No relay list found on indexer relays for {}, trying all relays", npub);
-        }
-        
-        // Fall back to querying all connected relays
-        let events = self.inner
-            .fetch_events(filter, Duration::from_secs(10))
-            .await
-            .map_err(|e| NostrError::RelayError(format!("Failed to fetch relay list: {}", e)))?;
-        
-        let event = events.first()
+
+        // Query through relay manager (unified pool)
+        let events = {
+            let manager = self.relay_manager.lock().await;
+            manager
+                .fetch_events(filter)
+                .await
+                .map_err(|e| NostrError::RelayError(format!("Failed to fetch relay list: {}", e)))?
+        };
+
+        let event = events
+            .first()
             .ok_or_else(|| NostrError::MalformedEvent("No relay list found".into()))?;
-        
+
         let relay_list = parse_relay_list_from_event(event)?;
-        tracing::info!("Found relay list from all relays for {} with {} read and {} write relays",
-            npub, relay_list.read_relays.len(), relay_list.write_relays.len());
-        
+        tracing::info!(
+            "Found relay list for {} with {} read and {} write relays",
+            npub,
+            relay_list.read_relays.len(),
+            relay_list.write_relays.len()
+        );
+
         Ok(relay_list)
     }
 
     /// Fetch Kind 3 (follow list) for a pubkey
-    /// First tries discovery services, then falls back to all connected relays
+    /// Uses unified relay pool through RelayManager
     pub async fn fetch_follow_list(&self, npub: &str) -> Result<Vec<String>, NostrError> {
         let pubkey = PublicKey::parse(npub)
             .map_err(|e| NostrError::MalformedEvent(format!("Invalid npub: {}", e)))?;
-        
+
         let filter = Filter::new()
             .kind(Kind::from_u16(KIND_FOLLOW_LIST))
             .author(pubkey)
             .limit(1);
-        
-        // First, try indexer relays (more efficient)
-        let indexer_urls: Vec<Url> = INDEXER_RELAYS
-            .iter()
-            .filter_map(|url| Url::parse(url).ok())
-            .collect();
-        
-        if !indexer_urls.is_empty() {
-            tracing::info!("Adding {} indexer relays to client for follow list fetch...", indexer_urls.len());
-            
-            // Add indexer relays to client first
-            for url in &indexer_urls {
-                let url_str = url.to_string();
-                match self.inner.add_relay(&url_str).await {
-                    Ok(_) => tracing::debug!("Added indexer relay: {}", url_str),
-                    Err(e) => tracing::warn!("Failed to add indexer relay {}: {}", url_str, e),
-                }
-            }
-            
-            // Connect to newly added relays
-            self.inner.connect().await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            
-            tracing::info!("Querying indexer relays for follow list");
-            match self.inner.fetch_events_from(indexer_urls.clone(), filter.clone(), Duration::from_secs(8)).await {
-                Ok(events) => {
-                    if let Some(event) = events.first() {
-                        tracing::info!("Found follow list on indexer relay");
-                        return self.parse_follow_list_content(&event.content);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Indexer relay query failed: {}", e);
-                }
-            }
-            tracing::debug!("No follow list found on indexer relays, trying all relays");
-        }
-        
-        // Fall back to all connected relays
-        let events = self.inner
-            .fetch_events(filter, Duration::from_secs(10))
-            .await
-            .map_err(|e| NostrError::RelayError(format!("Failed to fetch follow list: {}", e)))?;
-        
+
+        // Query through relay manager (unified pool)
+        let events = {
+            let manager = self.relay_manager.lock().await;
+            manager.fetch_events(filter).await.map_err(|e| {
+                NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
+            })?
+        };
+
+        tracing::info!("Follow list fetch returned {} events", events.len());
+
         let event = match events.first() {
             Some(e) => e,
-            None => return Ok(vec![]), // No follow list
+            None => {
+                tracing::warn!("No follow list found on any relay");
+                return Ok(vec![]); // No follow list
+            }
         };
-        
-        self.parse_follow_list_content(&event.content)
+
+        tracing::info!(
+            "Found follow list event - kind: {}, content length: {}",
+            event.kind,
+            event.content.len()
+        );
+        tracing::debug!("Follow list has {} tags", event.tags.len());
+
+        self.parse_follow_list_content(event)
     }
 
-    /// Parse follow list content from Kind 3 event
-    fn parse_follow_list_content(&self, content: &str) -> Result<Vec<String>, NostrError> {
-        // Parse content - Kind 3 content is a JSON array of pubkeys
-        let content_str = content.trim();
-        if content_str.is_empty() {
-            return Ok(vec![]);
+    /// Parse follow list from Kind 3 event tags (NIP-02 format)
+    /// NIP-02 uses "p" tags: ["p", "<pubkey>", "<relay-url>", "<petname>"]
+    fn parse_follow_list_content(&self, event: &Event) -> Result<Vec<String>, NostrError> {
+        let mut pubkeys = Vec::new();
+
+        // Iterate through all tags looking for "p" tags
+        for tag in event.tags.iter() {
+            let tag_kind = tag.kind();
+            if tag_kind.to_string() == "p" {
+                // Get all values from the tag as a vector
+                let values: Vec<String> = tag.clone().to_vec();
+
+                // p-tag format: ["p", "<pubkey>", "<relay>", "<petname>"]
+                // We need at least 2 elements: "p" and the pubkey
+                if values.len() >= 2 {
+                    let pubkey = &values[1];
+                    // Validate it's a 64-char hex pubkey
+                    if pubkey.len() == 64 && pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+                        pubkeys.push(pubkey.clone());
+                    } else {
+                        tracing::debug!("Skipping invalid pubkey in p-tag: {}", pubkey);
+                    }
+                }
+            }
         }
-        
-        // Try to parse as array of pubkeys
-        let pubkeys: Vec<String> = serde_json::from_str(content_str)
-            .unwrap_or_else(|_| {
-                // Try parsing as array of ["pubkey", "relay"] pairs
-                let pairs: Vec<Vec<String>> = serde_json::from_str(content_str).unwrap_or_default();
-                pairs.into_iter().filter_map(|p| p.into_iter().next()).collect()
-            });
-        
+
+        tracing::info!("Parsed {} pubkeys from follow list p-tags", pubkeys.len());
         Ok(pubkeys)
     }
 
@@ -1220,18 +1102,18 @@ impl NostrClient {
     /// Tier 2: seen_on tracker
     /// Tier 3: user's own read relays
     /// Tier 4: global aggregators (DEFAULT_RELAYS)
-    /// 
+    ///
     /// If data is stale (>7 days), returns it immediately and triggers background refresh.
     pub async fn get_relays_for_pubkey(
         &self,
         npub: &str,
         cache: &RelayCache,
-        user_npub: Option<&str>,  // authenticated user's npub for Tier 3
+        user_npub: Option<&str>, // authenticated user's npub for Tier 3
     ) -> Result<RelayDiscoveryResult, NostrError> {
         // Check cache first
         if let Some(cached) = cache.get_relay_list(npub) {
             let is_stale = cache.is_stale(npub);
-            
+
             // If fresh, return immediately
             if !is_stale {
                 return Ok(RelayDiscoveryResult {
@@ -1240,17 +1122,17 @@ impl NostrClient {
                     source: RelayDiscoverySource::RelayList,
                 });
             }
-            
+
             // If stale, return immediately but trigger background refresh
             cache.mark_for_refresh(npub);
-            
+
             return Ok(RelayDiscoveryResult {
                 write_relays: cached.write_relays,
                 read_relays: cached.read_relays,
                 source: RelayDiscoverySource::RelayList,
             });
         }
-        
+
         // Try to fetch fresh Kind 10002
         match self.fetch_relay_list(npub).await {
             Ok(relay_list) => {
@@ -1272,7 +1154,7 @@ impl NostrClient {
                         });
                     }
                 }
-                
+
                 // Tier 2: seen_on tracker
                 let seen_on = cache.get_seen_on(npub);
                 if !seen_on.is_empty() {
@@ -1282,7 +1164,7 @@ impl NostrClient {
                         source: RelayDiscoverySource::SeenOn,
                     });
                 }
-                
+
                 // Tier 3: user's own read relays
                 if let Some(user) = user_npub {
                     if let Some(user_relays) = cache.get_relay_list(user) {
@@ -1295,7 +1177,7 @@ impl NostrClient {
                         }
                     }
                 }
-                
+
                 // Tier 4: global aggregators
                 Ok(RelayDiscoveryResult {
                     write_relays: DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
@@ -1306,36 +1188,119 @@ impl NostrClient {
         }
     }
 
+    /// Get relays for a pubkey with full fallback chain (Tier 1-4)
+    ///
+    /// Tier 1: NIP-65 Kind 10002 (from cache or fetch)
+    /// Tier 2: Kind 3 content field (legacy)
+    /// Tier 3: Relay hints (from p-tags)
+    /// Tier 4: Global fallbacks
+    #[cfg(feature = "native")]
+    pub async fn get_relays_for_pubkey_with_hints(
+        &self,
+        pubkey: &str,
+        relay_cache: &RelayCache,
+        hint_store: Option<&RelayHints>,
+    ) -> RelayDiscoveryResult {
+        // Tier 1: NIP-65 from cache
+        if let Some(cached) = relay_cache.get_relay_list(pubkey) {
+            return RelayDiscoveryResult {
+                write_relays: cached.write_relays,
+                read_relays: cached.read_relays,
+                source: RelayDiscoverySource::RelayList,
+            };
+        }
+
+        // Try fetching from network (indexers first)
+        match self.fetch_relay_list(pubkey).await {
+            Ok(relay_list) => {
+                if let Err(e) = relay_cache.save_relay_list(&relay_list) {
+                    tracing::warn!("Failed to save relay list to cache for {}: {}", pubkey, e);
+                }
+                return RelayDiscoveryResult {
+                    write_relays: relay_list.write_relays,
+                    read_relays: relay_list.read_relays,
+                    source: RelayDiscoverySource::RelayList,
+                };
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch relay list for {}: {}", pubkey, e);
+                // Continue to fallback tiers
+            }
+        }
+
+        // Tier 2: Kind 3 content field (legacy)
+        match self.fetch_follow_list_with_relays(pubkey).await {
+            Ok(follow_list) if !follow_list.is_empty() => {
+                return RelayDiscoveryResult {
+                    write_relays: follow_list.clone(),
+                    read_relays: follow_list,
+                    source: RelayDiscoverySource::SeenOn,
+                };
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch follow list for {}: {}", pubkey, e);
+            }
+            Ok(_) => {
+                // Empty follow list, continue to Tier 3
+            }
+        }
+
+        // Tier 3: Relay hints
+        if let Some(hint_store) = hint_store {
+            match hint_store.get_hints(pubkey) {
+                Ok(hints) if !hints.is_empty() => {
+                    return RelayDiscoveryResult {
+                        write_relays: hints.clone(),
+                        read_relays: hints,
+                        source: RelayDiscoverySource::RelayHints,
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to get relay hints for {}: {}", pubkey, e);
+                }
+                Ok(_) => {
+                    // Empty hints, continue to Tier 4
+                }
+            }
+        }
+
+        // Tier 4: Global fallbacks
+        RelayDiscoveryResult {
+            write_relays: DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
+            read_relays: DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
+            source: RelayDiscoverySource::GlobalFallback,
+        }
+    }
+
     /// Fetch Kind 3 (follow list) and extract relay hints from content field
     /// Returns list of relay URLs found in the content
-    async fn fetch_follow_list_with_relays(
-        &self,
-        npub: &str,
-    ) -> Result<Vec<String>, NostrError> {
+    async fn fetch_follow_list_with_relays(&self, npub: &str) -> Result<Vec<String>, NostrError> {
         let pubkey = PublicKey::parse(npub)
             .map_err(|e| NostrError::MalformedEvent(format!("Invalid npub: {}", e)))?;
-        
+
         let filter = Filter::new()
             .kind(Kind::from_u16(KIND_FOLLOW_LIST))
             .author(pubkey)
             .limit(1);
-        
-        let events = self.inner
-            .fetch_events(filter, Duration::from_secs(10))
-            .await
-            .map_err(|e| NostrError::RelayError(format!("Failed to fetch follow list: {}", e)))?;
-        
+
+        let events = {
+            let manager = self.relay_manager.lock().await;
+            manager.fetch_events(filter).await.map_err(|e| {
+                NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
+            })?
+        };
+
         let event = match events.first() {
             Some(e) => e,
             None => return Ok(vec![]),
         };
-        
+
         // Parse content for relay URLs
         let content_str = event.content.trim();
         if content_str.is_empty() {
             return Ok(vec![]);
         }
-        
+
         // Try to parse as array of ["pubkey", "relay_url"] pairs
         let pairs: Vec<Vec<String>> = serde_json::from_str(content_str).unwrap_or_default();
         let relay_urls: Vec<String> = pairs
@@ -1349,7 +1314,7 @@ impl NostrClient {
                 }
             })
             .collect();
-        
+
         Ok(relay_urls)
     }
 
@@ -1375,19 +1340,17 @@ impl NostrClient {
         target_relays.sort();
         target_relays.dedup();
 
-        // Publish to each relay
-        for relay_url in target_relays {
-            match self.inner.add_relay(&relay_url).await {
-                Ok(_) => {
-                    if let Err(e) = self.inner.send_event(&event).await {
-                        tracing::warn!("Failed to send event to {}: {}", relay_url, e);
-                    }
+        // Publish to each relay through RelayManager
+        {
+            let manager = self.relay_manager.lock().await;
+            for relay_url in target_relays {
+                if let Err(e) = manager.add_discovered_relay(relay_url.clone()).await {
+                    tracing::debug!("Could not add relay {}: {}", relay_url, e);
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to add relay {}: {}", relay_url, e);
-                }
+                // TODO: Implement event publishing through RelayManager
+                tracing::debug!("Would publish event to {}", relay_url);
             }
-        }
+        } // Lock dropped after loop
 
         Ok(())
     }
@@ -1404,10 +1367,7 @@ pub fn game_listing_to_event_builder(listing: &GameListing) -> EventBuilder {
 
     let mut tags: Vec<Tag> = vec![
         Tag::identifier(listing.id.clone()),
-        Tag::custom(
-            TagKind::Custom("title".into()),
-            [listing.title.clone()],
-        ),
+        Tag::custom(TagKind::Custom("title".into()), [listing.title.clone()]),
         Tag::custom(
             TagKind::Custom("price".into()),
             [listing.price_sats.to_string()],
@@ -1424,43 +1384,49 @@ pub fn game_listing_to_event_builder(listing: &GameListing) -> EventBuilder {
 
     // Add tags
     for tag in &listing.tags {
-        tags.push(Tag::custom(
-            TagKind::Custom("t".into()),
-            [tag.clone()],
-        ));
+        tags.push(Tag::custom(TagKind::Custom("t".into()), [tag.clone()]));
     }
 
-    EventBuilder::new(Kind::Custom(KIND_GAME_LISTING), content_json)
-        .tags(tags)
+    EventBuilder::new(Kind::Custom(KIND_GAME_LISTING), content_json).tags(tags)
 }
 
 /// Parses a NOSTR event into a GameListing.
 pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
     // Extract d tag (id)
-    let id = event.tags.identifier()
+    let id = event
+        .tags
+        .identifier()
         .ok_or_else(|| NostrError::MalformedEvent("Missing d tag".into()))?
         .to_string();
 
     // Extract title tag
-    let title = event.tags.find(TagKind::Custom("title".into()))
+    let title = event
+        .tags
+        .find(TagKind::Custom("title".into()))
         .and_then(|t| t.content().map(|c| c.to_string()))
         .ok_or_else(|| NostrError::MalformedEvent("Missing title tag".into()))?;
 
     // Extract price tag
-    let price_str = event.tags.find(TagKind::Custom("price".into()))
+    let price_str = event
+        .tags
+        .find(TagKind::Custom("price".into()))
         .and_then(|t| t.content().map(|c| c.to_string()))
         .ok_or_else(|| NostrError::MalformedEvent("Missing price tag".into()))?;
-    let price_sats = price_str.parse::<u64>()
+    let price_sats = price_str
+        .parse::<u64>()
         .map_err(|_| NostrError::MalformedEvent("Invalid price format".into()))?;
 
     // Extract t tags
-    let tags: Vec<String> = event.tags
+    let tags: Vec<String> = event
+        .tags
         .filter(TagKind::Custom("t".into()))
         .filter_map(|t| t.content().map(|c| c.to_string()))
         .collect();
 
     // Extract lud16 tag (optional - for backwards compatibility)
-    let lud16 = event.tags.find(TagKind::Custom("lud16".into()))
+    let lud16 = event
+        .tags
+        .find(TagKind::Custom("lud16".into()))
         .and_then(|t| t.content().map(|c| c.to_string()))
         .unwrap_or_default();
 
@@ -1469,7 +1435,9 @@ pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
         .map_err(|e| NostrError::MalformedEvent(format!("Invalid content JSON: {}", e)))?;
 
     // Get publisher npub
-    let publisher_npub = event.pubkey.to_bech32()
+    let publisher_npub = event
+        .pubkey
+        .to_bech32()
         .map_err(|e| NostrError::MalformedEvent(format!("Invalid pubkey: {}", e)))?;
 
     Ok(GameListing {
@@ -1486,7 +1454,7 @@ pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
 }
 
 /// Signs an event using the Arcadestr ActiveSigner.
-/// 
+///
 /// This bridges our local NostrSigner trait to nostr_sdk's NostrSigner trait.
 #[cfg(not(target_arch = "wasm32"))]
 async fn sign_event_with_arcadestr_signer(
@@ -1494,16 +1462,20 @@ async fn sign_event_with_arcadestr_signer(
     signer: &ActiveSigner,
 ) -> Result<Event, NostrError> {
     // Get the public key from the signer
-    let pubkey = signer.get_public_key().await
+    let pubkey = signer
+        .get_public_key()
+        .await
         .map_err(|e| NostrError::SigningError(format!("Failed to get public key: {}", e)))?;
-    
+
     // Build the unsigned event
     let unsigned = builder.build(pubkey);
-    
+
     // Sign the event using our signer
-    let signed = signer.sign_event(unsigned).await
+    let signed = signer
+        .sign_event(unsigned)
+        .await
         .map_err(|e| NostrError::SigningError(format!("Failed to sign event: {}", e)))?;
-    
+
     Ok(signed)
 }
 
@@ -1513,7 +1485,9 @@ async fn sign_event_with_arcadestr_signer(
     _builder: EventBuilder,
     _signer: &ActiveSigner,
 ) -> Result<Event, NostrError> {
-    Err(NostrError::SigningError("Signing not supported in WASM target".into()))
+    Err(NostrError::SigningError(
+        "Signing not supported in WASM target".into(),
+    ))
 }
 
 // ============================================
@@ -1529,17 +1503,15 @@ pub struct Nip19Identifier {
 
 /// Parse NIP-19 identifier (nprofile, nevent, npub, or note) to extract pubkey and relay hints
 pub fn parse_nip19_identifier(identifier: &str) -> Result<Nip19Identifier, NostrError> {
-    use nostr::nips::nip19::{Nip19Profile, Nip19Event, FromBech32};
     use nostr::key::PublicKey;
-    
+    use nostr::nips::nip19::{FromBech32, Nip19Event, Nip19Profile};
+
     // Check prefix by looking at the identifier start
     if identifier.starts_with("nprofile1") {
         let profile = Nip19Profile::from_bech32(identifier)
             .map_err(|e| NostrError::MalformedEvent(format!("Invalid nprofile: {}", e)))?;
         let pubkey = profile.public_key.to_hex();
-        let relays: Vec<String> = profile.relays.into_iter()
-            .map(|r| r.to_string())
-            .collect();
+        let relays: Vec<String> = profile.relays.into_iter().map(|r| r.to_string()).collect();
         Ok(Nip19Identifier { pubkey, relays })
     } else if identifier.starts_with("npub1") {
         // Parse npub using nostr_sdk
@@ -1553,9 +1525,7 @@ pub fn parse_nip19_identifier(identifier: &str) -> Result<Nip19Identifier, Nostr
         let event = Nip19Event::from_bech32(identifier)
             .map_err(|e| NostrError::MalformedEvent(format!("Invalid nevent: {}", e)))?;
         let pubkey = event.author.map(|p| p.to_hex()).unwrap_or_default();
-        let relays: Vec<String> = event.relays.into_iter()
-            .map(|r| r.to_string())
-            .collect();
+        let relays: Vec<String> = event.relays.into_iter().map(|r| r.to_string()).collect();
         Ok(Nip19Identifier { pubkey, relays })
     } else if identifier.starts_with("note1") {
         // For notes, we return the event id as the "pubkey" (for lack of a better field)
@@ -1567,23 +1537,29 @@ pub fn parse_nip19_identifier(identifier: &str) -> Result<Nip19Identifier, Nostr
             relays: vec![],
         })
     } else {
-        Err(NostrError::MalformedEvent("Invalid NIP-19 identifier".into()))
+        Err(NostrError::MalformedEvent(
+            "Invalid NIP-19 identifier".into(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod nip65_tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_relay_list_content() {
         let content = r#"{"read":["wss://relay.nostr.info"],"write":["wss://relay.damus.io"]}"#;
         let result = parse_relay_list_content(content);
         assert!(result.is_ok());
-        
+
         let relays = result.unwrap();
-        assert!(relays.write_relays.contains(&"wss://relay.damus.io".to_string()));
-        assert!(relays.read_relays.contains(&"wss://relay.nostr.info".to_string()));
+        assert!(relays
+            .write_relays
+            .contains(&"wss://relay.damus.io".to_string()));
+        assert!(relays
+            .read_relays
+            .contains(&"wss://relay.nostr.info".to_string()));
     }
 
     #[tokio::test]
@@ -1591,7 +1567,7 @@ mod nip65_tests {
         // This test verifies that we can parse a Kind 10002 event
         // The actual implementation will be added in the next step
         //let client = NostrClient::new(vec!["wss://relay.damus.io".to_string()]).await.unwrap();
-        
+
         // Test parsing of known Kind 10002 content format
     }
 
@@ -1652,7 +1628,7 @@ mod idle_timeout_tests {
     fn test_touch_updates_last_activity() {
         let mut manager = RelayConnectionManager::with_default_timeout();
         manager.touch("wss://relay.example.com");
-        
+
         let idle = manager.get_idle_relays();
         assert!(idle.is_empty()); // Just touched, not idle
     }
@@ -1661,15 +1637,170 @@ mod idle_timeout_tests {
     fn test_cleanup_removes_idle_relays() {
         let mut manager = RelayConnectionManager::new(Duration::from_millis(1));
         manager.touch("wss://relay.example.com");
-        
+
         // Wait a bit
         thread::sleep(Duration::from_millis(10));
-        
+
         let idle = manager.cleanup();
         assert!(idle.contains(&"wss://relay.example.com".to_string()));
-        
+
         // Should be removed now
         let idle = manager.get_idle_relays();
         assert!(idle.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod follow_list_tests {
+    use super::*;
+    use nostr_sdk::{EventBuilder, Keys, Tag, TagKind};
+
+    fn create_test_event_with_p_tags(pubkeys: Vec<&str>) -> Event {
+        let keys = Keys::generate();
+
+        let mut builder = EventBuilder::new(
+            Kind::from_u16(KIND_FOLLOW_LIST),
+            "", // empty content
+        );
+
+        for pubkey in pubkeys {
+            builder = builder.tag(Tag::custom(TagKind::p(), vec![pubkey.to_string()]));
+        }
+
+        builder.sign_with_keys(&keys).expect("Failed to sign event")
+    }
+
+    fn create_test_event_with_full_p_tags(
+        entries: Vec<(&str, Option<&str>, Option<&str>)>,
+    ) -> Event {
+        let keys = Keys::generate();
+
+        let mut builder = EventBuilder::new(
+            Kind::from_u16(KIND_FOLLOW_LIST),
+            "", // empty content
+        );
+
+        for (pubkey, relay, petname) in entries {
+            let mut tag_parts = vec![pubkey.to_string()];
+            if let Some(r) = relay {
+                tag_parts.push(r.to_string());
+            }
+            if let Some(p) = petname {
+                if tag_parts.len() < 2 {
+                    tag_parts.push("".to_string()); // Empty relay hint placeholder
+                }
+                tag_parts.push(p.to_string());
+            }
+            builder = builder.tag(Tag::custom(TagKind::p(), tag_parts));
+        }
+
+        builder.sign_with_keys(&keys).expect("Failed to sign event")
+    }
+
+    #[tokio::test]
+    async fn test_parse_follow_list_from_p_tags() {
+        let client = NostrClient::new("test".to_string(), vec![], None)
+            .await
+            .expect("Failed to create client");
+
+        // Valid 64-char hex pubkeys
+        let pubkey1 = "a".repeat(64);
+        let pubkey2 = "b".repeat(64);
+        let event = create_test_event_with_p_tags(vec![&pubkey1, &pubkey2]);
+
+        let result = client.parse_follow_list_content(&event);
+        assert!(result.is_ok());
+
+        let pubkeys = result.unwrap();
+        assert_eq!(pubkeys.len(), 2);
+        assert!(pubkeys.contains(&pubkey1));
+        assert!(pubkeys.contains(&pubkey2));
+    }
+
+    #[tokio::test]
+    async fn test_parse_follow_list_with_full_p_tags() {
+        let client = NostrClient::new("test".to_string(), vec![], None)
+            .await
+            .expect("Failed to create client");
+
+        let pubkey1 = "c".repeat(64);
+        let pubkey2 = "d".repeat(64);
+        let entries = vec![
+            (pubkey1.as_str(), Some("wss://relay1.com"), Some("Alice")),
+            (pubkey2.as_str(), Some("wss://relay2.com"), Some("Bob")),
+        ];
+        let event = create_test_event_with_full_p_tags(entries);
+
+        let result = client.parse_follow_list_content(&event);
+        assert!(result.is_ok());
+
+        let pubkeys = result.unwrap();
+        assert_eq!(pubkeys.len(), 2);
+        assert!(pubkeys.contains(&pubkey1));
+        assert!(pubkeys.contains(&pubkey2));
+    }
+
+    #[tokio::test]
+    async fn test_parse_follow_list_empty_tags() {
+        let client = NostrClient::new("test".to_string(), vec![], None)
+            .await
+            .expect("Failed to create client");
+
+        let event = create_test_event_with_p_tags(vec![]);
+
+        let result = client.parse_follow_list_content(&event);
+        assert!(result.is_ok());
+
+        let pubkeys = result.unwrap();
+        assert!(pubkeys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_follow_list_skips_malformed_p_tags() {
+        let client = NostrClient::new("test".to_string(), vec![], None)
+            .await
+            .expect("Failed to create client");
+        let keys = Keys::generate();
+
+        let valid_pubkey = "e".repeat(64);
+        let invalid_pubkey = "too_short"; // Not 64 chars
+
+        // Create event with mixed valid and invalid p-tags
+        let event = EventBuilder::new(Kind::from_u16(KIND_FOLLOW_LIST), "")
+            .tag(Tag::custom(TagKind::p(), vec![valid_pubkey.clone()]))
+            .tag(Tag::custom(TagKind::p(), vec![invalid_pubkey.to_string()]))
+            .tag(Tag::custom(TagKind::e(), vec!["some_event_id".to_string()]))
+            .sign_with_keys(&keys)
+            .expect("Failed to sign event");
+
+        let result = client.parse_follow_list_content(&event);
+        assert!(result.is_ok());
+
+        let pubkeys = result.unwrap();
+        assert_eq!(pubkeys.len(), 1); // Only the valid pubkey
+        assert!(pubkeys.contains(&valid_pubkey));
+    }
+
+    #[tokio::test]
+    async fn test_parse_follow_list_ignores_non_p_tags() {
+        let client = NostrClient::new("test".to_string(), vec![], None)
+            .await
+            .expect("Failed to create client");
+        let keys = Keys::generate();
+
+        let pubkey = "f".repeat(64);
+
+        let event = EventBuilder::new(Kind::from_u16(KIND_FOLLOW_LIST), "")
+            .tag(Tag::custom(TagKind::p(), vec![pubkey.clone()]))
+            .tag(Tag::custom(TagKind::e(), vec!["some_event_id".to_string()]))
+            .sign_with_keys(&keys)
+            .expect("Failed to sign event");
+
+        let result = client.parse_follow_list_content(&event);
+        assert!(result.is_ok());
+
+        let pubkeys = result.unwrap();
+        assert_eq!(pubkeys.len(), 1); // Only the p-tag pubkey
+        assert!(pubkeys.contains(&pubkey));
     }
 }

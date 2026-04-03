@@ -1,5 +1,5 @@
 //! Authentication and account management module
-//! 
+//!
 //! This module provides secure local storage of Nostr accounts with:
 //! - AES-256-GCM encryption for nsec
 //! - SQLite database for account metadata
