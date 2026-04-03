@@ -50,6 +50,46 @@ impl SubscriptionRegistry {
             entries.remove(id);
         }
     }
+
+    /// Remove multiple subscriptions at once (for bulk cleanup)
+    pub fn remove_many(&self, ids: &[String]) {
+        if let Ok(mut entries) = self.entries.lock() {
+            for id in ids {
+                entries.remove(id);
+            }
+        }
+    }
+    
+    /// Get all subscription IDs of a specific connection kind
+    pub fn get_by_kind(&self, kind: ConnectionKind) -> Vec<String> {
+        self.entries.lock()
+            .ok()
+            .map(|entries| {
+                entries.iter()
+                    .filter(|(_, k)| **k == kind)
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    
+    /// Clear all ephemeral subscriptions (for view cleanup)
+    pub fn clear_ephemeral(&self) -> Vec<String> {
+        let to_remove: Vec<String> = self.entries.lock()
+            .ok()
+            .map(|entries| {
+                entries.iter()
+                    .filter(|(_, kind)| {
+                        matches!(kind, ConnectionKind::EphemeralRead | ConnectionKind::EphemeralWrite)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        
+        self.remove_many(&to_remove);
+        to_remove
+    }
 }
 
 impl Default for SubscriptionRegistry {
@@ -282,6 +322,48 @@ pub async fn dispatch_ephemeral_reads_batch(
         } else {
             tracing::warn!("No relay found for ephemeral read: {}", pubkey);
         }
+    }
+}
+
+/// Close subscriptions by ID and send UNREQ to relays
+pub async fn close_subscriptions(
+    client: &Client,
+    registry: &Arc<SubscriptionRegistry>,
+    subscription_ids: Vec<String>,
+) {
+    for id in &subscription_ids {
+        // Send UNREQ to all relays
+        let sub_id = SubscriptionId::new(id);
+        if let Err(e) = client.unsubscribe(&sub_id).await {
+            tracing::warn!("Failed to send UNREQ for {}: {}", id, e);
+        }
+        
+        // Remove from registry
+        registry.remove(id);
+        tracing::debug!("Closed subscription: {}", id);
+    }
+}
+
+/// Cleanup all ephemeral subscriptions for a view/component
+pub async fn cleanup_view_subscriptions(
+    client: &Client,
+    registry: &Arc<SubscriptionRegistry>,
+    view_id: &str,
+) {
+    // Find subscriptions tagged with this view ID
+    let to_close: Vec<String> = registry.entries.lock()
+        .ok()
+        .map(|entries| {
+            entries.iter()
+                .filter(|(id, _)| id.starts_with(&format!("{}_", view_id)))
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    
+    if !to_close.is_empty() {
+        close_subscriptions(client, registry, to_close).await;
+        tracing::info!("Cleaned up subscriptions for view: {}", view_id);
     }
 }
 

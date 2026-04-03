@@ -46,6 +46,8 @@ pub mod subscriptions;
 
 #[cfg(feature = "native")]
 pub use subscriptions::{
+    close_subscriptions,
+    cleanup_view_subscriptions,
     dispatch_ephemeral_read,
     dispatch_ephemeral_reads_batch,
     dispatch_permanent_subscriptions,
