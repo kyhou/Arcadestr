@@ -4156,19 +4156,22 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
 
     // Listen for relay connection events from backend (event-driven updates)
     spawn_local(async move {
-        let window = web_sys::window().expect("no window");
-        let tauri = js_sys::Reflect::get(&window, &"__TAURI__".into()).unwrap();
-        let event_api = js_sys::Reflect::get(&tauri, &"event".into()).unwrap();
+        let window = web_sys::window().expect("window should be available");
+        let tauri = js_sys::Reflect::get(&window, &"__TAURI__".into())
+            .expect("TAURI API should be available in Tauri app");
+        let event_api = js_sys::Reflect::get(&tauri, &"event".into())
+            .expect("TAURI event API should be available");
         
         // Create callback for relay events
         let closure = Closure::wrap(Box::new(move |event: JsValue| {
-            let payload = js_sys::Reflect::get(&event, &"payload".into()).unwrap();
+            let payload = js_sys::Reflect::get(&event, &"payload".into())
+                .expect("event should have payload");
             let event_type = js_sys::Reflect::get(&payload, &"type".into())
-                .unwrap()
+                .expect("payload should have type field")
                 .as_string()
                 .unwrap_or_default();
             let url = js_sys::Reflect::get(&payload, &"url".into())
-                .unwrap()
+                .expect("payload should have url field")
                 .as_string()
                 .unwrap_or_default();
             
@@ -4193,8 +4196,10 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
             }
         }) as Box<dyn FnMut(JsValue)>);
         
-        let listen_fn = js_sys::Reflect::get(&event_api, &"listen".into()).unwrap();
-        let listen_fn = listen_fn.dyn_ref::<js_sys::Function>().unwrap();
+        let listen_fn = js_sys::Reflect::get(&event_api, &"listen".into())
+            .expect("event API should have listen method");
+        let listen_fn = listen_fn.dyn_ref::<js_sys::Function>()
+            .expect("listen should be a function");
         let _ = listen_fn.call2(
             &event_api,
             &"relay-connection".into(),
