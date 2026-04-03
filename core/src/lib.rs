@@ -30,6 +30,9 @@ pub mod relay_pool;
 pub mod relay_manager;
 
 #[cfg(feature = "native")]
+pub mod relay_events;
+
+#[cfg(feature = "native")]
 pub use relay_cache::{CachedRelayList, RelayCache, RelayCacheError, RelayHealth, RelayType};
 
 #[cfg(feature = "native")]
@@ -71,6 +74,9 @@ pub mod social_graph;
 
 #[cfg(feature = "native")]
 pub mod extended_network;
+
+#[cfg(feature = "native")]
+pub mod marketplace;
 
 #[cfg(feature = "native")]
 pub use profile_fetcher::{
