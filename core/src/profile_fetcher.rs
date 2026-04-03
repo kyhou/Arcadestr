@@ -10,6 +10,7 @@ use lru::LruCache;
 use nostr_sdk::prelude::*;
 
 use crate::nostr::{NostrClient, NostrError, UserProfile, UserProfileContent};
+use crate::nip05_validator::Nip05Validator;
 use crate::user_cache::UserCache;
 
 /// Configuration constants
@@ -102,6 +103,8 @@ pub struct ProfileFetcher {
     max_attempts: u32,
     /// Batch size for fetching
     batch_size: usize,
+    /// Optional NIP-05 validator for background verification
+    nip05_validator: Option<Arc<Mutex<Nip05Validator>>>,
 }
 
 impl ProfileFetcher {
@@ -123,6 +126,7 @@ impl ProfileFetcher {
             persistent_cache: None, // Initialize as None
             max_attempts: MAX_PROFILE_ATTEMPTS,
             batch_size: BATCH_SIZE,
+            nip05_validator: None,
         }
     }
 
@@ -131,6 +135,11 @@ impl ProfileFetcher {
         let mut fetcher = Self::new();
         fetcher.persistent_cache = Some(user_cache);
         fetcher
+    }
+
+    /// Attach a NIP-05 validator for background verification
+    pub fn with_nip05_validator(&mut self, validator: Arc<Mutex<Nip05Validator>>) {
+        self.nip05_validator = Some(validator);
     }
 
     /// Load cached profiles from SQLite into memory
@@ -281,7 +290,7 @@ impl ProfileFetcher {
                 tracing::debug!("fetch_single got {} events for {}", events.len(), npub);
                 if let Some(event) = events.first() {
                     tracing::info!("Found profile event for {}, parsing...", npub);
-                    match Self::parse_profile_event(event, npub) {
+                    match self.parse_profile_event(event, npub) {
                         Ok(profile) => {
                             tracing::info!(
                                 "Successfully parsed profile for {}: name={:?}",
@@ -366,7 +375,7 @@ impl ProfileFetcher {
         // Parse events and match to requested pubkeys
         for event in events {
             let npub = event.pubkey.to_hex();
-            if let Ok(profile) = Self::parse_profile_event(&event, &npub) {
+            if let Ok(profile) = self.parse_profile_event(&event, &npub) {
                 results.push((npub, profile));
             }
         }
@@ -375,21 +384,33 @@ impl ProfileFetcher {
     }
 
     /// Parse a profile event into UserProfile
-    fn parse_profile_event(event: &Event, npub: &str) -> Result<UserProfile, NostrError> {
+    fn parse_profile_event(&self, event: &Event, npub: &str) -> Result<UserProfile, NostrError> {
         // Parse the event content as UserProfileContent
         let content: UserProfileContent = serde_json::from_str(&event.content).unwrap_or_default();
 
-        Ok(UserProfile {
+        let profile = UserProfile {
             npub: npub.to_string(),
             name: content.name,
             display_name: content.display_name,
             about: content.about,
             picture: content.picture,
             website: content.website,
-            nip05: content.nip05,
+            nip05: content.nip05.clone(),
             lud16: content.lud16,
             nip05_verified: false,
-        })
+        };
+        
+        // Queue for NIP-05 validation if identifier present
+        if let Some(ref nip05) = content.nip05 {
+            if let Some(ref validator) = self.nip05_validator {
+                if let Ok(v) = validator.lock() {
+                    v.queue_validation(npub.to_string(), nip05.clone());
+                    tracing::debug!("Queued NIP-05 validation for {}: {}", npub, nip05);
+                }
+            }
+        }
+
+        Ok(profile)
     }
 }
 
