@@ -387,7 +387,7 @@ pub async fn wait_for_qr_connection(
     expected_secret: String,
     timeout_secs: u64,
 ) -> anyhow::Result<SavedProfile> {
-    use nostr::{Filter, Kind, PublicKey, Timestamp};
+    use nostr::{Filter, Kind, Timestamp};
     use nostr_sdk::Client;
     use std::time::Duration;
 
@@ -469,30 +469,50 @@ pub async fn wait_for_qr_connection(
                         // Try to decrypt and validate the connect request
                         match handle_nip46_connect_event(&event, &app_keys, &expected_secret).await
                         {
-                            Ok(user_pubkey) => {
+                            Ok((bunker_pubkey, request_id)) => {
                                 info!(
-                                    "Successfully validated connect request from {}",
-                                    user_pubkey
+                                    "Successfully validated connect request from bunker {} with id: {}",
+                                    bunker_pubkey, request_id
                                 );
 
-                                // Send ack response
+                                // Send ack response with matching request id
                                 if let Err(e) =
-                                    send_connect_ack(&client, &app_keys, event.pubkey, &relays)
+                                    send_connect_ack(&client, &app_keys, event.pubkey, &relays, &request_id)
                                         .await
                                 {
                                     warn!("Failed to send ack: {}", e);
                                 }
 
-                                // Create profile
-                                let bunker_uri = NostrConnectURI::parse(qr_uri_string)
-                                    .unwrap_or_else(|_| {
-                                        // Create a minimal URI if parsing fails
-                                        NostrConnectURI::client(
-                                            app_keys.public_key(),
-                                            relays.clone(),
-                                            "Arcadestr",
-                                        )
-                                    });
+                                // IMPORTANT: event.pubkey is the BUNKER's ephemeral key, NOT the user's identity key
+                                // We need to perform NIP-46 handshake to get the actual user's pubkey
+                                info!("Performing NIP-46 handshake to get user's identity pubkey...");
+                                
+                                // Create bunker URI with the bunker's pubkey
+                                let relay_params: Vec<String> = relays
+                                    .iter()
+                                    .map(|r| format!("relay={}", r))
+                                    .collect();
+                                let bunker_uri_str = format!(
+                                    "bunker://{}?{}",
+                                    bunker_pubkey.to_hex(),
+                                    relay_params.join("&")
+                                );
+                                let bunker_uri = NostrConnectURI::parse(&bunker_uri_str)?;
+                                
+                                // Create NostrConnect client to perform handshake
+                                let signer = NostrConnect::new(
+                                    bunker_uri.clone(),
+                                    app_keys.clone(),
+                                    Duration::from_secs(30),
+                                    None,
+                                )?;
+                                
+                                // Get the actual user's identity pubkey (not the bunker's key)
+                                let user_pubkey = signer.get_public_key().await?;
+                                info!(
+                                    "NIP-46 handshake complete! User identity pubkey: {}",
+                                    user_pubkey.to_hex()
+                                );
 
                                 let profile = SavedProfile {
                                     id: uuid::Uuid::new_v4().to_string(),
@@ -528,11 +548,12 @@ pub async fn wait_for_qr_connection(
 /// Handle a NIP-46 connect event
 /// Decrypts the event content and validates the secret
 /// Accepts both request format (method+params) and response format (id+result)
+/// Returns the signer's public key and the request id (for JSON-RPC response correlation)
 async fn handle_nip46_connect_event(
     event: &nostr::Event,
     app_keys: &Keys,
     expected_secret: &str,
-) -> anyhow::Result<PublicKey> {
+) -> anyhow::Result<(PublicKey, String)> {
     use nostr::nips::nip44;
 
     info!("Handling NIP-46 connect event from {}", event.pubkey);
@@ -552,9 +573,21 @@ async fn handle_nip46_connect_event(
     let message: serde_json::Value = serde_json::from_str(&decrypted)
         .map_err(|e| anyhow::anyhow!("Failed to parse JSON-RPC message: {}", e))?;
 
+    // Extract the request id for the response (JSON-RPC requires id matching)
+    let request_id = message
+        .get("id")
+        .and_then(|id| id.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            // If no id in request, generate one (shouldn't happen with compliant signers)
+            warn!("No id field in NIP-46 connect request, generating random id");
+            uuid::Uuid::new_v4().to_string()
+        });
+    info!("Extracted request id: {}", request_id);
+
     // Try to extract the secret from various formats
     let received_secret = if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
-        // Request format: {"method":"connect","params":[secret]}
+        // Request format: {"id":"...","method":"connect","params":[secret]}
         if method == "connect" {
             let params = message
                 .get("params")
@@ -588,25 +621,28 @@ async fn handle_nip46_connect_event(
 
     info!("Secret validated successfully");
 
-    // Return the signer's public key
-    Ok(event.pubkey)
+    // Return the signer's public key and the request id
+    Ok((event.pubkey, request_id))
 }
 
 /// Send a connect acknowledgment response
+/// Uses the same id as the request for JSON-RPC correlation
 async fn send_connect_ack(
     client: &nostr_sdk::Client,
     app_keys: &Keys,
     signer_pubkey: PublicKey,
     _relays: &[RelayUrl],
+    request_id: &str,
 ) -> anyhow::Result<()> {
     use nostr::nips::nip44;
     use nostr::{EventBuilder, Tag};
 
-    info!("Sending connect ack to {}", signer_pubkey);
+    info!("Sending connect ack to {} with request id: {}", signer_pubkey, request_id);
 
-    // Build the JSON-RPC response
+    // Build the JSON-RPC response using the SAME id as the request
+    // This is required by JSON-RPC 2.0 spec for proper correlation
     let response = serde_json::json!({
-        "id": uuid::Uuid::new_v4().to_string(),
+        "id": request_id,
         "result": "ack",
     });
 
@@ -631,6 +667,6 @@ async fn send_connect_ack(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to send ack: {}", e))?;
 
-    info!("Connect ack sent successfully");
+    info!("Connect ack sent successfully with id: {}", request_id);
     Ok(())
 }
