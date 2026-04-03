@@ -14,11 +14,10 @@ use crate::{invoke_fetch_profile, invoke_request_invoice, AuthContext};
 pub fn DetailView(
     listing: GameListing,
     on_back: Callback<()>,
-    #[prop(default = String::new())]
-    listing_event_id: String,
+    #[prop(default = String::new())] listing_event_id: String,
 ) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
-    
+
     // Format price display
     let price_sats = listing.price_sats;
     let price_display = move || -> String {
@@ -41,7 +40,7 @@ pub fn DetailView(
     // Seller profile state
     let seller_profile: RwSignal<Option<UserProfile>> = RwSignal::new(None);
     let profile_loading: RwSignal<bool> = RwSignal::new(true);
-    
+
     // Clone listing's publisher_npub early to avoid move conflicts
     let publisher_npub_for_fetch = listing.publisher_npub.clone();
 
@@ -70,20 +69,23 @@ pub fn DetailView(
 
     // Truncate bolt11 for display
     let invoice_display = move || {
-        invoice.get().map(|inv| {
-            if inv.bolt11.len() > 40 {
-                format!("{}...", &inv.bolt11[..40])
-            } else {
-                inv.bolt11.clone()
-            }
-        }).unwrap_or_default()
+        invoice
+            .get()
+            .map(|inv| {
+                if inv.bolt11.len() > 40 {
+                    format!("{}...", &inv.bolt11[..40])
+                } else {
+                    inv.bolt11.clone()
+                }
+            })
+            .unwrap_or_default()
     };
 
     // Buy button handler - wrapped in Arc<Mutex> for thread-safe cloning
     let on_buy = {
         let listing = listing.clone();
         let listing_event_id = listing_event_id.clone();
-        
+
         Arc::new(Mutex::new(move || {
             // Get buyer npub
             let buyer_npub = match auth.npub.get() {
@@ -93,14 +95,14 @@ pub fn DetailView(
                     return;
                 }
             };
-            
+
             // Use listing.id as fallback if listing_event_id is empty
             let event_id = if listing_event_id.is_empty() {
                 listing.id.clone()
             } else {
                 listing_event_id.clone()
             };
-            
+
             // Build zap request using listing.lud16
             let zap_req = ZapRequest {
                 seller_npub: listing.publisher_npub.clone(),
@@ -113,11 +115,11 @@ pub fn DetailView(
                     "wss://relay.nostr.band".to_string(),
                 ],
             };
-            
+
             buy_loading.set(true);
             buy_error.set(None);
             show_invoice.set(false);
-            
+
             spawn_local(async move {
                 match invoke_request_invoice(zap_req).await {
                     Ok(zap_invoice) => {
@@ -190,7 +192,7 @@ pub fn DetailView(
                 style:border-radius="8px"
             >
                 <h3 style:margin-top="0" style:margin-bottom="12px" style:color="#f5821f">"Seller"</h3>
-                
+
                 {move || {
                     if profile_loading.get() {
                         Some(view! {
@@ -199,12 +201,12 @@ pub fn DetailView(
                     } else {
                         Some(view! {
                             <div class="seller-profile">
-                                <ProfileRow 
+                                <ProfileRow
                                     npub={publisher_npub_for_profile_row.clone()}
                                     avatar_size="48px"
                                     truncate_npub=20
                                 />
-                                
+
                                 // Show additional profile info if available
                                 {move || {
                                     seller_profile.get().map(|p| {
@@ -224,7 +226,7 @@ pub fn DetailView(
                                                         }.into_any())
                                                     } else { None }
                                                 } else { None }}
-                                                
+
                                                 {if let Some(nip05) = p.nip05.clone() {
                                                     Some(view! {
                                                         <p class="seller-nip05" style:margin="0 0 8px 0" style:color="#888" style:font-size="13px">
@@ -237,7 +239,7 @@ pub fn DetailView(
                                                         </p>
                                                     }.into_any())
                                                 } else { None }}
-                                                
+
                                                 {if let Some(lud16) = p.lud16.clone() {
                                                     if !lud16.is_empty() {
                                                         Some(view! {
@@ -247,14 +249,14 @@ pub fn DetailView(
                                                         }.into_any())
                                                     } else { None }
                                                 } else { None }}
-                                                
+
                                                 {if let Some(website) = p.website.clone() {
                                                     let website_url = website.clone();
                                                     Some(view! {
-                                                        <a 
-                                                            href={website_url.clone()} 
-                                                            class="seller-website" 
-                                                            target="_blank" 
+                                                        <a
+                                                            href={website_url.clone()}
+                                                            class="seller-website"
+                                                            target="_blank"
                                                             rel="noopener"
                                                             style:display="inline-block"
                                                             style:margin-top="8px"
@@ -378,7 +380,7 @@ pub fn DetailView(
                             view! {
                                 <div class="buy-section">
                                     <h3>"Purchase"</h3>
-                                    
+
                                     {let on_buy = on_buy.clone(); let on_copy_invoice = on_copy_invoice.clone(); let on_open_wallet = on_open_wallet.clone(); move || {
                                         if buy_loading.get() {
                                             view! {
@@ -422,7 +424,7 @@ pub fn DetailView(
                                             }.into_any()
                                         }
                                     }}
-                                    
+
                                     {move || {
                                         buy_error.get().map(|err| {
                                             view! {

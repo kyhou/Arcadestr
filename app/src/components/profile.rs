@@ -9,9 +9,7 @@ use crate::{invoke_fetch_listings, AuthContext};
 
 /// Profile view component - displays the logged-in user's full profile and their listings.
 #[component]
-pub fn ProfileView(
-    set_view: WriteSignal<MarketplaceView>,
-) -> impl IntoView {
+pub fn ProfileView(set_view: WriteSignal<MarketplaceView>) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
 
     // Reactive state for listings
@@ -71,7 +69,10 @@ pub fn ProfileView(
                         let closure = Closure::wrap(Box::new(move || {
                             npub_copied2.set(false);
                         }) as Box<dyn FnMut()>);
-                        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(&closure.as_ref().unchecked_ref(), 2000);
+                        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                            &closure.as_ref().unchecked_ref(),
+                            2000,
+                        );
                         closure.forget();
                     }
                 }
@@ -116,7 +117,7 @@ pub fn ProfileView(
                     Some(p) => {
                         let display_name = p.display();
                         let avatar_letter = display_name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".to_string());
-                        
+
                         view! {
                             <div class="profile-header">
                                 {if let Some(url) = p.picture.clone() {
@@ -142,7 +143,7 @@ pub fn ProfileView(
                                     } else {
                                         None
                                     }}
-                                    
+
                                     // NIP-05 row
                                     {if let Some(nip05) = p.nip05.clone() {
                                         Some(view! {
@@ -162,7 +163,7 @@ pub fn ProfileView(
                                     } else {
                                         None
                                     }}
-                                    
+
                                     // About
                                     {if let Some(about) = p.about.clone() {
                                         if !about.is_empty() {
@@ -175,7 +176,7 @@ pub fn ProfileView(
                                     } else {
                                         None
                                     }}
-                                    
+
                                     // Website
                                     {if let Some(website) = p.website.clone() {
                                         if !website.is_empty() {
@@ -191,7 +192,7 @@ pub fn ProfileView(
                                     } else {
                                         None
                                     }}
-                                    
+
                                     // Lightning address
                                     {if let Some(lud16) = p.lud16.clone() {
                                         if !lud16.is_empty() {
@@ -204,7 +205,7 @@ pub fn ProfileView(
                                     } else {
                                         None
                                     }}
-                                    
+
                                     // npub row with copy button
                                     <div class="profile-npub-row">
                                         <code class="profile-npub">{p.npub.clone()}</code>

@@ -43,7 +43,7 @@ where
                 Err(_) => "{}".to_string(),
             }
         };
-        
+
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data_str) {
             callback(json);
         }
@@ -75,7 +75,8 @@ where
         } else if let Some(url) = data.get("payload").and_then(|p| p.as_str()) {
             callback(url.to_string());
         }
-    }).await
+    })
+    .await
 }
 
 /// Listen for auth_success events
@@ -89,7 +90,8 @@ where
         } else if let Some(npub) = data.get("payload").and_then(|p| p.as_str()) {
             callback(npub.to_string());
         }
-    }).await
+    })
+    .await
 }
 
 /// Listen for bunker-heartbeat events
@@ -111,7 +113,8 @@ where
         } else if let Some(npub) = data.get("payload").and_then(|p| p.as_str()) {
             callback(npub.to_string());
         }
-    }).await
+    })
+    .await
 }
 
 /// Invoke a Tauri command via direct JavaScript interop
@@ -154,7 +157,7 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
     // Try to parse as JSON first, then as plain string
     // Some commands return JSON, others return plain strings (like npub)
     let result: Result<T, _> = serde_json::from_str(&response_str);
-    
+
     match result {
         Ok(value) => Ok(value),
         Err(_) => {
@@ -163,8 +166,14 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
             // We need to properly escape the string for JSON
             let escaped = serde_json::to_string(&response_str)
                 .map_err(|e| format!("Failed to escape string: {}", e))?;
-            serde_json::from_str(&escaped)
-                .map_err(|e| format!("Failed to parse response from command '{}': {}. Response was: {}", command, e, &response_str[..response_str.len().min(200)]))
+            serde_json::from_str(&escaped).map_err(|e| {
+                format!(
+                    "Failed to parse response from command '{}': {}. Response was: {}",
+                    command,
+                    e,
+                    &response_str[..response_str.len().min(200)]
+                )
+            })
         }
     }
 }

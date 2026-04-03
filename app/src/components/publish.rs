@@ -22,8 +22,13 @@ fn validate_listing(
     if id.len() > 64 {
         return Err("Listing ID must be 64 characters or less".to_string());
     }
-    if !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
-        return Err("Listing ID can only contain lowercase letters, numbers, and hyphens".to_string());
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(
+            "Listing ID can only contain lowercase letters, numbers, and hyphens".to_string(),
+        );
     }
 
     // Validate title: non-empty, max 100 chars
@@ -104,7 +109,13 @@ pub fn PublishView() -> impl IntoView {
         let lud16_val = lud16.get();
 
         // Validate fields before proceeding
-        if let Err(msg) = validate_listing(&id_val, &title_val, &description_val, &download_url_val, &lud16_val) {
+        if let Err(msg) = validate_listing(
+            &id_val,
+            &title_val,
+            &description_val,
+            &download_url_val,
+            &lud16_val,
+        ) {
             error_message.set(Some(msg));
             return;
         }

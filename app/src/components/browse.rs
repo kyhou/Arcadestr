@@ -10,22 +10,20 @@ use crate::{invoke_fetch_listings, AuthContext};
 
 /// Browse view component - displays a grid of game listings.
 #[component]
-pub fn BrowseView(
-    on_select: Callback<GameListing>,
-) -> impl IntoView {
+pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
     let _auth = use_context::<AuthContext>().expect("AuthContext not provided");
-    
+
     // State signals
     let listings = RwSignal::new(Vec::<GameListing>::new());
     let is_loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
-    
+
     // Fetch listings on mount
     Effect::new(move |_| {
         spawn_local(async move {
             is_loading.set(true);
             error.set(None);
-            
+
             match invoke_fetch_listings(20).await {
                 Ok(fetched) => {
                     listings.set(fetched);
@@ -38,11 +36,11 @@ pub fn BrowseView(
             }
         });
     });
-    
+
     view! {
         <div class="browse-container">
             <h2 class="browse-title">"Browse Games"</h2>
-            
+
             {move || {
                 if is_loading.get() {
                     view! {
@@ -83,17 +81,14 @@ pub fn BrowseView(
 
 /// Individual listing card component.
 #[component]
-pub fn ListingCard(
-    listing: GameListing,
-    on_select: Callback<GameListing>,
-) -> impl IntoView {
+pub fn ListingCard(listing: GameListing, on_select: Callback<GameListing>) -> impl IntoView {
     // Clone listing for use in closures
     let listing_for_click = listing.clone();
-    
+
     // Clone publisher_npub before moving into Effect
     let publisher_npub = listing.publisher_npub.clone();
     let publisher_npub_for_effect = publisher_npub.clone();
-    
+
     // Fetch profile when component mounts
     Effect::new(move |_| {
         let npub = publisher_npub_for_effect.clone();
@@ -102,7 +97,7 @@ pub fn ListingCard(
             let _ = fetch_and_store_profile(npub).await;
         });
     });
-    
+
     // Format price display
     let price_sats = listing.price_sats;
     let price_display = move || -> String {
@@ -112,16 +107,16 @@ pub fn ListingCard(
             format!("⚡ {} sats", price_sats)
         }
     };
-    
+
     let on_click = {
         move |_| {
             on_select.run(listing_for_click.clone());
         }
     };
-    
+
     let tags = listing.tags.clone();
     let title = listing.title.clone();
-    
+
     view! {
         <div class="listing-card">
             <div class="listing-header">
@@ -133,29 +128,29 @@ pub fn ListingCard(
                     style:gap="8px"
                     style:margin-top="4px"
                 >
-                    <ProfileAvatar 
-                        npub={publisher_npub.clone()} 
+                    <ProfileAvatar
+                        npub={publisher_npub.clone()}
                         size="24px"
                     />
-                    <ProfileDisplayName 
+                    <ProfileDisplayName
                         npub={publisher_npub.clone()}
                         truncate_npub=16
                     />
                 </div>
             </div>
-            
+
             <div class="listing-price">
                 <span class={if price_sats == 0 { "price-free" } else { "price-paid" }}>
                     {price_display}
                 </span>
             </div>
-            
+
             <div class="listing-tags">
                 {tags.iter().map(|tag| {
                     view! { <span class="tag-badge">{tag.clone()}</span> }
                 }).collect::<Vec<_>>()}
             </div>
-            
+
             <button
                 class="view-button"
                 on:click={on_click}

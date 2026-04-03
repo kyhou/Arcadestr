@@ -3,9 +3,9 @@
 
 #![cfg(all(target_arch = "wasm32", feature = "web"))]
 
-use std::cell::RefCell;
 use arcadestr_core::auth::AuthState;
 use nostr::nips::nip19::ToBech32;
+use std::cell::RefCell;
 
 // Thread-local AuthState for web (no Tauri state management available)
 thread_local! {
@@ -17,10 +17,12 @@ thread_local! {
 pub async fn web_connect_nip07() -> Result<String, String> {
     // Create a temporary AuthState, connect, then store result
     let mut auth = AuthState::new();
-    auth.connect_nip07().await
+    auth.connect_nip07()
+        .await
         .map_err(|e: arcadestr_core::signer::SignerError| e.to_string())?;
 
-    let npub = auth.public_key()
+    let npub = auth
+        .public_key()
         .ok_or("No public key after connect".to_string())?
         .to_bech32()
         .map_err(|e| format!("Failed to encode npub: {}", e))?;

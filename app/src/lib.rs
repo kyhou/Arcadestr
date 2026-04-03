@@ -1,7 +1,7 @@
 // Leptos application: shared UI components and pages for both desktop and web targets.
 
 use leptos::prelude::*;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
@@ -16,14 +16,16 @@ pub mod models;
 pub mod store;
 
 // Import ProfileStore and related functions for store initialization and event handlers
-use crate::store::{ProfileStore, provide_profile_store, use_profile_store, try_use_profile_store};
+use crate::store::{provide_profile_store, try_use_profile_store, use_profile_store, ProfileStore};
 
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 pub mod web_auth;
 
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 mod tauri_invoke;
-pub use components::{BrowseView, DetailView, ProfileView, PublishView, AccountSelector, BackupManager};
+pub use components::{
+    AccountSelector, BackupManager, BrowseView, DetailView, ProfileView, PublishView,
+};
 pub use models::{GameListing, MarketplaceView, UserProfile, ZapInvoice, ZapRequest};
 
 // =============================================================================
@@ -45,7 +47,7 @@ pub struct ProfileFetchProgress {
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 pub fn setup_profile_event_handlers(profile_store: ProfileStore) {
     use wasm_bindgen_futures::spawn_local;
-    
+
     spawn_local(async move {
         // Listen for individual profile fetched events
         let listen_result = crate::tauri_invoke::listen("profile_fetched", move |data| {
@@ -58,17 +60,21 @@ pub fn setup_profile_event_handlers(profile_store: ProfileStore) {
                     profile_store.put(profile);
                 }
             }
-        }).await;
-        
+        })
+        .await;
+
         if let Err(e) = listen_result {
-            web_sys::console::error_1(&format!("Failed to listen for profile_fetched: {}", e).into());
+            web_sys::console::error_1(
+                &format!("Failed to listen for profile_fetched: {}", e).into(),
+            );
         }
-        
+
         // Optionally listen for progress events (can be used for UI progress bars)
         let _ = crate::tauri_invoke::listen("profile_fetch_progress", |_data| {
             // Progress events can be handled here if needed
             // For now, we just listen to prevent events from accumulating
-        }).await;
+        })
+        .await;
     });
 }
 
@@ -85,21 +91,22 @@ pub fn setup_profile_event_handlers(_profile_store: ProfileStore) {
 /// Fetch a profile and store it in the global cache
 pub async fn fetch_and_store_profile(npub: String) -> Result<UserProfile, String> {
     let profile = invoke_fetch_profile(npub.clone(), None).await?;
-    
+
     // Store in global cache
     if let Some(store) = use_context::<ProfileStore>() {
         store.put(profile.clone());
     }
-    
+
     Ok(profile)
 }
 
 /// Batch fetch profiles that aren't in the cache
 pub async fn fetch_missing_profiles(npubs: Vec<String>) -> Result<Vec<UserProfile>, String> {
     let store = use_context::<ProfileStore>();
-    
+
     // Filter out already cached profiles
-    let missing: Vec<String> = npubs.into_iter()
+    let missing: Vec<String> = npubs
+        .into_iter()
         .filter(|npub| {
             if let Some(ref s) = store {
                 !s.has(npub)
@@ -108,11 +115,11 @@ pub async fn fetch_missing_profiles(npubs: Vec<String>) -> Result<Vec<UserProfil
             }
         })
         .collect();
-    
+
     if missing.is_empty() {
         return Ok(vec![]);
     }
-    
+
     // Fetch missing profiles (we'll add the batch command later)
     // For now, fetch individually
     let mut profiles = Vec::new();
@@ -121,7 +128,7 @@ pub async fn fetch_missing_profiles(npubs: Vec<String>) -> Result<Vec<UserProfil
             profiles.push(profile);
         }
     }
-    
+
     Ok(profiles)
 }
 
@@ -129,7 +136,7 @@ pub async fn fetch_missing_profiles(npubs: Vec<String>) -> Result<Vec<UserProfil
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 pub async fn invoke_get_cached_profiles() -> Result<Vec<UserProfile>, String> {
     use crate::tauri_invoke::invoke;
-    
+
     invoke("get_cached_profiles", serde_json::json!({})).await
 }
 
@@ -142,7 +149,7 @@ pub async fn invoke_get_cached_profiles() -> Result<Vec<UserProfile>, String> {
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 pub async fn invoke_get_cached_profile(npub: String) -> Result<Option<UserProfile>, String> {
     use crate::tauri_invoke::invoke;
-    
+
     invoke("get_cached_profile", serde_json::json!({ "npub": npub })).await
 }
 
@@ -195,7 +202,10 @@ struct RequestInvoiceArgs {
 /// Invoke connect_bunker Tauri command (new NIP-46 API)
 /// Connects with a bunker URI or NIP-05 identifier
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
-async fn invoke_connect_bunker(identifier: String, display_name: String) -> Result<serde_json::Value, String> {
+async fn invoke_connect_bunker(
+    identifier: String,
+    display_name: String,
+) -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
 
     let connect_args = serde_json::json!({
@@ -207,7 +217,10 @@ async fn invoke_connect_bunker(identifier: String, display_name: String) -> Resu
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
-async fn invoke_connect_bunker(_identifier: String, _display_name: String) -> Result<serde_json::Value, String> {
+async fn invoke_connect_bunker(
+    _identifier: String,
+    _display_name: String,
+) -> Result<serde_json::Value, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
@@ -317,16 +330,11 @@ async fn invoke_disconnect() -> Result<(), String> {
     Err("Tauri not available in web mode".to_string())
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
-async fn invoke_disconnect() -> Result<(), String> {
-    Err("Tauri not available in web mode".to_string())
-}
-
 /// Invoke get_connected_relay_count Tauri command
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 async fn invoke_get_relay_count() -> Result<usize, String> {
     use crate::tauri_invoke::invoke;
-    
+
     invoke("get_connected_relay_count", serde_json::json!(null)).await
 }
 
@@ -339,7 +347,7 @@ async fn invoke_get_relay_count() -> Result<usize, String> {
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 async fn invoke_get_connected_relays() -> Result<Vec<String>, String> {
     use crate::tauri_invoke::invoke;
-    
+
     invoke("get_connected_relays", serde_json::json!(null)).await
 }
 
@@ -353,7 +361,7 @@ async fn invoke_get_connected_relays() -> Result<Vec<String>, String> {
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 async fn invoke_fetch_and_save_user_profile() -> Result<UserProfile, String> {
     use crate::tauri_invoke::invoke;
-    
+
     invoke("fetch_and_save_user_profile", serde_json::json!(null)).await
 }
 
@@ -395,7 +403,7 @@ pub struct SavedUsers {
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 async fn invoke_get_saved_users() -> Result<SavedUsers, String> {
     use crate::tauri_invoke::invoke;
-    
+
     invoke("get_saved_users", serde_json::json!(null)).await
 }
 
@@ -414,7 +422,7 @@ pub async fn invoke_add_saved_user(
     npub: String,
 ) -> Result<SavedUsers, String> {
     use crate::tauri_invoke::invoke;
-    
+
     let args = serde_json::json!({
         "method": method,
         "relay": relay,
@@ -422,7 +430,7 @@ pub async fn invoke_add_saved_user(
         "privateKey": private_key,
         "npub": npub,
     });
-    
+
     invoke("add_saved_user", args).await
 }
 
@@ -441,8 +449,12 @@ async fn invoke_add_saved_user(
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 async fn invoke_remove_saved_user(user_id: String) -> Result<SavedUsers, String> {
     use crate::tauri_invoke::invoke;
-    
-    invoke("remove_saved_user", serde_json::json!({ "userId": user_id })).await
+
+    invoke(
+        "remove_saved_user",
+        serde_json::json!({ "userId": user_id }),
+    )
+    .await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
@@ -454,12 +466,19 @@ async fn invoke_remove_saved_user(_user_id: String) -> Result<SavedUsers, String
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 async fn invoke_rename_saved_user(user_id: String, new_name: String) -> Result<SavedUsers, String> {
     use crate::tauri_invoke::invoke;
-    
-    invoke("rename_saved_user", serde_json::json!({ "userId": user_id, "newName": new_name })).await
+
+    invoke(
+        "rename_saved_user",
+        serde_json::json!({ "userId": user_id, "newName": new_name }),
+    )
+    .await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
-async fn invoke_rename_saved_user(_user_id: String, _new_name: String) -> Result<SavedUsers, String> {
+async fn invoke_rename_saved_user(
+    _user_id: String,
+    _new_name: String,
+) -> Result<SavedUsers, String> {
     Err("Tauri not available".to_string())
 }
 
@@ -474,8 +493,12 @@ struct ConnectResponse {
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 async fn invoke_connect_saved_user(user_id: String) -> Result<ConnectResponse, String> {
     use crate::tauri_invoke::invoke;
-    
-    invoke("connect_saved_user", serde_json::json!({ "userId": user_id })).await
+
+    invoke(
+        "connect_saved_user",
+        serde_json::json!({ "userId": user_id }),
+    )
+    .await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
@@ -527,7 +550,11 @@ async fn invoke_list_saved_profiles() -> Result<serde_json::Value, String> {
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 async fn invoke_switch_profile(profile_id: String) -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
-    invoke("switch_profile", serde_json::json!({ "profileId": profile_id })).await
+    invoke(
+        "switch_profile",
+        serde_json::json!({ "profileId": profile_id }),
+    )
+    .await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
@@ -537,29 +564,51 @@ async fn invoke_switch_profile(_profile_id: String) -> Result<serde_json::Value,
 
 /// Login with nsec - creates encrypted local account
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
-async fn invoke_login_with_nsec(nsec: String, name: Option<String>) -> Result<serde_json::Value, String> {
+async fn invoke_login_with_nsec(
+    nsec: String,
+    name: Option<String>,
+) -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
-    invoke("login_with_nsec", serde_json::json!({ "nsec": nsec, "name": name })).await
+    invoke(
+        "login_with_nsec",
+        serde_json::json!({ "nsec": nsec, "name": name }),
+    )
+    .await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
-async fn invoke_login_with_nsec(_nsec: String, _name: Option<String>) -> Result<serde_json::Value, String> {
+async fn invoke_login_with_nsec(
+    _nsec: String,
+    _name: Option<String>,
+) -> Result<serde_json::Value, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
 /// Save NIP-46 remote account after successful connection
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
-async fn invoke_save_nip46_account(uri: String, relay: String, name: Option<String>) -> Result<serde_json::Value, String> {
+async fn invoke_save_nip46_account(
+    uri: String,
+    relay: String,
+    name: Option<String>,
+) -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
-    invoke("save_nip46_account", serde_json::json!({ 
-        "uri": uri, 
-        "relay": relay, 
-        "name": name 
-    })).await
+    invoke(
+        "save_nip46_account",
+        serde_json::json!({
+            "uri": uri,
+            "relay": relay,
+            "name": name
+        }),
+    )
+    .await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
-async fn invoke_save_nip46_account(_uri: String, _relay: String, _name: Option<String>) -> Result<serde_json::Value, String> {
+async fn invoke_save_nip46_account(
+    _uri: String,
+    _relay: String,
+    _name: Option<String>,
+) -> Result<serde_json::Value, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
@@ -567,7 +616,11 @@ async fn invoke_save_nip46_account(_uri: String, _relay: String, _name: Option<S
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 async fn invoke_delete_profile(profile_id: String) -> Result<(), String> {
     use crate::tauri_invoke::invoke_void;
-    invoke_void("delete_profile", serde_json::json!({ "profileId": profile_id })).await
+    invoke_void(
+        "delete_profile",
+        serde_json::json!({ "profileId": profile_id }),
+    )
+    .await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
@@ -652,7 +705,11 @@ async fn invoke_create_backup() -> Result<serde_json::Value, String> {
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 async fn invoke_restore_backup(backup_data: String) -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
-    invoke("restore_backup", serde_json::json!({ "backup_data": backup_data })).await
+    invoke(
+        "restore_backup",
+        serde_json::json!({ "backup_data": backup_data }),
+    )
+    .await
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
@@ -728,7 +785,10 @@ struct FetchProfileArgs {
 
 /// Invoke fetch_profile Tauri command
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
-pub async fn invoke_fetch_profile(npub: String, additional_relays: Option<Vec<String>>) -> Result<UserProfile, String> {
+pub async fn invoke_fetch_profile(
+    npub: String,
+    additional_relays: Option<Vec<String>>,
+) -> Result<UserProfile, String> {
     use crate::tauri_invoke::invoke;
 
     let fetch_args = serde_json::json!({
@@ -740,7 +800,10 @@ pub async fn invoke_fetch_profile(npub: String, additional_relays: Option<Vec<St
 }
 
 #[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
-pub async fn invoke_fetch_profile(_npub: String, _additional_relays: Option<Vec<String>>) -> Result<UserProfile, String> {
+pub async fn invoke_fetch_profile(
+    _npub: String,
+    _additional_relays: Option<Vec<String>>,
+) -> Result<UserProfile, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
@@ -773,7 +836,7 @@ pub struct StoredAccount {
     pub name: Option<String>,
     pub signing_mode: String,
     pub last_used: i64,
-    pub is_current: bool,  // ← NEW: indicates if this is the currently active account
+    pub is_current: bool, // ← NEW: indicates if this is the currently active account
     // Profile metadata fields
     pub picture: Option<String>,
     pub display_name: Option<String>,
@@ -790,7 +853,7 @@ pub struct AuthContext {
     pub profile: RwSignal<Option<UserProfile>>,
     pub is_loading: RwSignal<bool>,
     pub error: RwSignal<Option<String>>,
-    
+
     // NEW: Secure storage fields
     /// All stored accounts (for account switching UI)
     pub accounts: RwSignal<Vec<StoredAccount>>,
@@ -798,7 +861,7 @@ pub struct AuthContext {
     pub active_account: RwSignal<Option<StoredAccount>>,
     /// Whether accounts exist in new storage
     pub has_secure_accounts: RwSignal<bool>,
-    
+
     // NEW: NIP-46 connection status
     /// Current connection state: "disconnected", "connecting", "connected", "failed"
     pub connection_status: RwSignal<String>,
@@ -831,72 +894,131 @@ impl Default for AuthContext {
 /// Helper function to parse account from JSON result
 fn parse_account_from_result(result: &serde_json::Value) -> Result<StoredAccount, String> {
     let account = result.get("account").ok_or("Missing account field")?;
-    
+
     Ok(StoredAccount {
-        id: account.get("id").and_then(|v| v.as_str()).ok_or("Missing id")?.to_string(),
-        npub: account.get("npub").and_then(|v| v.as_str()).ok_or("Missing npub")?.to_string(),
-        name: account.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        signing_mode: account.get("signing_mode").and_then(|v| v.as_str()).unwrap_or("Local").to_string(),
-        last_used: account.get("last_used").and_then(|v| v.as_i64()).unwrap_or(0),
-        is_current: account.get("is_current").and_then(|v| v.as_bool()).unwrap_or(false),
+        id: account
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing id")?
+            .to_string(),
+        npub: account
+            .get("npub")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing npub")?
+            .to_string(),
+        name: account
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        signing_mode: account
+            .get("signing_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Local")
+            .to_string(),
+        last_used: account
+            .get("last_used")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        is_current: account
+            .get("is_current")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         // Profile metadata fields
-        picture: account.get("picture").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        display_name: account.get("display_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        username: account.get("username").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        nip05: account.get("nip05").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        about: account.get("about").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        picture: account
+            .get("picture")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        display_name: account
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        username: account
+            .get("username")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        nip05: account
+            .get("nip05")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        about: account
+            .get("about")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     })
 }
 
 /// Helper function to parse accounts list from JSON result
 fn parse_accounts_list(result: &serde_json::Value) -> Result<Vec<StoredAccount>, String> {
-    let accounts = result.get("accounts").and_then(|a| a.as_array())
+    let accounts = result
+        .get("accounts")
+        .and_then(|a| a.as_array())
         .ok_or("Missing accounts field")?;
-    
+
     let stored_accounts: Vec<StoredAccount> = accounts
         .iter()
         .filter_map(|acc| {
             Some(StoredAccount {
                 id: acc.get("id")?.as_str()?.to_string(),
                 npub: acc.get("npub")?.as_str()?.to_string(),
-                name: acc.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
+                name: acc
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string()),
                 signing_mode: acc.get("signing_mode")?.as_str()?.to_string(),
                 last_used: acc.get("last_used")?.as_i64()?,
-                is_current: acc.get("is_current").and_then(|v| v.as_bool()).unwrap_or(false),
+                is_current: acc
+                    .get("is_current")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 // Parse profile metadata fields
-                picture: acc.get("picture").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                display_name: acc.get("display_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                username: acc.get("username").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                nip05: acc.get("nip05").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                about: acc.get("about").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                picture: acc
+                    .get("picture")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                display_name: acc
+                    .get("display_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                username: acc
+                    .get("username")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                nip05: acc
+                    .get("nip05")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                about: acc
+                    .get("about")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
             })
         })
         .collect();
-    
+
     Ok(stored_accounts)
 }
 
 /// Generate a QR code SVG from a string
 fn generate_qr_svg(data: &str) -> String {
-    use qrcode::{QrCode, Version, EcLevel};
     use qrcode::render::svg;
-    
+    use qrcode::{EcLevel, QrCode, Version};
+
     // Create QR code with medium error correction
-    let code = QrCode::with_error_correction_level(data, EcLevel::M)
-        .unwrap_or_else(|_| {
-            // Fallback: create a minimal QR code
-            QrCode::new("ERROR").expect("Failed to create QR code")
-        });
-    
+    let code = QrCode::with_error_correction_level(data, EcLevel::M).unwrap_or_else(|_| {
+        // Fallback: create a minimal QR code
+        QrCode::new("ERROR").expect("Failed to create QR code")
+    });
+
     // Render as SVG with styling
-    let svg = code.render()
+    let svg = code
+        .render()
         .min_dimensions(200, 200)
         .max_dimensions(300, 300)
         .quiet_zone(true)
         .dark_color(svg::Color("#000000"))
         .light_color(svg::Color("#ffffff"))
         .build();
-    
+
     svg
 }
 
@@ -907,14 +1029,24 @@ impl AuthContext {
         web_sys::console::log_1(&"[load_profiles_list] Starting...".into());
         match invoke_list_saved_profiles().await {
             Ok(result) => {
-                web_sys::console::log_1(&format!("[load_profiles_list] Got result: {:?}", result).into());
+                web_sys::console::log_1(
+                    &format!("[load_profiles_list] Got result: {:?}", result).into(),
+                );
                 if let Ok(accounts) = parse_accounts_list(&result) {
-                    web_sys::console::log_1(&format!("[load_profiles_list] Parsed {} accounts", accounts.len()).into());
+                    web_sys::console::log_1(
+                        &format!("[load_profiles_list] Parsed {} accounts", accounts.len()).into(),
+                    );
                     self.accounts.set(accounts.clone());
-                    
+
                     // Fetch profiles for all accounts to show pictures/names in the list
                     let store = try_use_profile_store();
-                    web_sys::console::log_1(&format!("[load_profiles_list] ProfileStore available: {}", store.is_some()).into());
+                    web_sys::console::log_1(
+                        &format!(
+                            "[load_profiles_list] ProfileStore available: {}",
+                            store.is_some()
+                        )
+                        .into(),
+                    );
                     for account in accounts {
                         if let Some(store) = store.clone() {
                             let npub = account.npub.clone();
@@ -924,7 +1056,13 @@ impl AuthContext {
                                 // First try to get from backend cache
                                 match invoke_get_cached_profile(npub.clone()).await {
                                     Ok(Some(profile)) => {
-                                        web_sys::console::log_1(&format!("[LOAD_PROFILES] Cached profile for {}: {:?}", npub, profile.name).into());
+                                        web_sys::console::log_1(
+                                            &format!(
+                                                "[LOAD_PROFILES] Cached profile for {}: {:?}",
+                                                npub, profile.name
+                                            )
+                                            .into(),
+                                        );
                                         store.put(profile);
                                     }
                                     Ok(None) => {
@@ -947,10 +1085,12 @@ impl AuthContext {
                             });
                         }
                     }
-                    
+
                     Ok(())
                 } else {
-                    web_sys::console::log_1(&"[load_profiles_list] Failed to parse accounts".into());
+                    web_sys::console::log_1(
+                        &"[load_profiles_list] Failed to parse accounts".into(),
+                    );
                     Err("Failed to parse profiles".to_string())
                 }
             }
@@ -960,56 +1100,75 @@ impl AuthContext {
             }
         }
     }
-    
+
     /// Load list of all accounts (alias for load_profiles_list)
     pub async fn load_accounts_list(&self) -> Result<(), String> {
         self.load_profiles_list().await
     }
-    
+
     /// Switch to a different profile (new NIP-46 API)
     pub async fn switch_profile(&self, profile_id: String) -> Result<(), String> {
         self.is_loading.set(true);
-        
+
         match invoke_switch_profile(profile_id).await {
             Ok(result) => {
                 if let Ok(account) = parse_account_from_result(&result) {
                     self.active_account.set(Some(account.clone()));
                     self.npub.set(Some(account.npub.clone()));
                     self.is_loading.set(false);
-                    
+
                     // Start connection status polling for NIP-46 accounts
                     if account.signing_mode == "nip46" {
                         self.start_connection_status_polling().await;
                     }
-                    
+
                     // Explicitly fetch profile immediately to avoid delay
                     let npub_for_fetch = account.npub.clone();
                     let auth_for_fetch = self.clone();
                     spawn_local(async move {
-                        web_sys::console::log_1(&format!("[SWITCH] Immediate profile fetch for: {}", npub_for_fetch).into());
-                        
+                        web_sys::console::log_1(
+                            &format!("[SWITCH] Immediate profile fetch for: {}", npub_for_fetch)
+                                .into(),
+                        );
+
                         // First try to get from backend cache
                         match invoke_get_cached_profile(npub_for_fetch.clone()).await {
                             Ok(Some(profile)) => {
-                                web_sys::console::log_1(&format!("[SWITCH] Got cached profile immediately: {:?}", profile.name).into());
+                                web_sys::console::log_1(
+                                    &format!(
+                                        "[SWITCH] Got cached profile immediately: {:?}",
+                                        profile.name
+                                    )
+                                    .into(),
+                                );
                                 auth_for_fetch.profile.set(Some(profile));
                             }
                             _ => {
-                                web_sys::console::log_1(&"[SWITCH] No cached profile, fetching from relays...".into());
+                                web_sys::console::log_1(
+                                    &"[SWITCH] No cached profile, fetching from relays...".into(),
+                                );
                                 // Fetch from relays
                                 match invoke_fetch_profile(npub_for_fetch.clone(), None).await {
                                     Ok(profile) => {
-                                        web_sys::console::log_1(&format!("[SWITCH] Profile fetched from relays: {:?}", profile.name).into());
+                                        web_sys::console::log_1(
+                                            &format!(
+                                                "[SWITCH] Profile fetched from relays: {:?}",
+                                                profile.name
+                                            )
+                                            .into(),
+                                        );
                                         auth_for_fetch.profile.set(Some(profile));
                                     }
                                     Err(e) => {
-                                        web_sys::console::log_1(&format!("[SWITCH] Profile fetch failed: {}", e).into());
+                                        web_sys::console::log_1(
+                                            &format!("[SWITCH] Profile fetch failed: {}", e).into(),
+                                        );
                                     }
                                 }
                             }
                         }
                     });
-                    
+
                     Ok(())
                 } else {
                     self.is_loading.set(false);
@@ -1023,16 +1182,16 @@ impl AuthContext {
             }
         }
     }
-    
+
     /// Switch to a different account (alias for switch_profile)
     pub async fn switch_account(&self, account_id: String) -> Result<(), String> {
         self.switch_profile(account_id).await
     }
-    
+
     /// Login with nsec - creates encrypted local account
     pub async fn login_with_nsec(&self, nsec: String, name: Option<String>) -> Result<(), String> {
         self.is_loading.set(true);
-        
+
         match invoke_login_with_nsec(nsec, name).await {
             Ok(result) => {
                 if let Ok(account) = parse_account_from_result(&result) {
@@ -1053,7 +1212,7 @@ impl AuthContext {
             }
         }
     }
-    
+
     /// Delete a profile (new NIP-46 API)
     pub async fn delete_profile(&self, profile_id: String) -> Result<(), String> {
         match invoke_delete_profile(profile_id).await {
@@ -1061,15 +1220,15 @@ impl AuthContext {
                 // Refresh profiles list
                 self.load_profiles_list().await
             }
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
-    
+
     /// Delete an account (alias for delete_profile)
     pub async fn delete_account(&self, account_id: String) -> Result<(), String> {
         self.delete_profile(account_id).await
     }
-    
+
     /// Logout from NIP-46 session (new NIP-46 API)
     pub async fn logout_nip46(&self) -> Result<(), String> {
         match invoke_logout_nip46().await {
@@ -1080,10 +1239,10 @@ impl AuthContext {
                 self.connection_error.set(None);
                 Ok(())
             }
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
-    
+
     /// Start polling for NIP-46 connection status
     /// This runs every 2 seconds until connection is established or fails
     pub async fn start_connection_status_polling(&self) {
@@ -1092,17 +1251,19 @@ impl AuthContext {
             loop {
                 match invoke_get_connection_status().await {
                     Ok(status) => {
-                        let status_str = status.get("status")
+                        let status_str = status
+                            .get("status")
                             .and_then(|s| s.as_str())
                             .unwrap_or("unknown");
-                        
-                        let error = status.get("error")
+
+                        let error = status
+                            .get("error")
                             .and_then(|e| e.as_str())
                             .map(|s| s.to_string());
-                        
+
                         auth.connection_status.set(status_str.to_string());
                         auth.connection_error.set(error);
-                        
+
                         // Stop polling if we reach a final state
                         if status_str == "connected" || status_str == "failed" {
                             break;
@@ -1113,7 +1274,7 @@ impl AuthContext {
                         break;
                     }
                 }
-                
+
                 // Wait 2 seconds before next poll
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -3299,11 +3460,11 @@ button.relay-count-badge:hover {
 /// Login view modes
 #[derive(Debug, Clone, PartialEq)]
 enum LoginViewMode {
-    AccountSelector,    // Primary: List of stored accounts
-    AddAccount,         // Secondary: Login methods (nsec, NIP-46, QR, etc.)
-    NsecLogin,          // Tertiary: Direct nsec input
-    QrLogin,            // Tertiary: QR code for mobile signer
-    RestoreBackup,      // Tertiary: Restore from backup
+    AccountSelector, // Primary: List of stored accounts
+    AddAccount,      // Secondary: Login methods (nsec, NIP-46, QR, etc.)
+    NsecLogin,       // Tertiary: Direct nsec input
+    QrLogin,         // Tertiary: QR code for mobile signer
+    RestoreBackup,   // Tertiary: Restore from backup
 }
 
 /// Redesigned LoginView with secure storage as primary
@@ -3311,10 +3472,10 @@ enum LoginViewMode {
 fn LoginView() -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let auth_stored = StoredValue::new(auth.clone());
-    
+
     // View mode state
     let view_mode = RwSignal::new(LoginViewMode::AccountSelector);
-    
+
     // Check if we have accounts on mount
     Effect::new(move |_| {
         let auth = auth_stored.get_value();
@@ -3329,11 +3490,17 @@ fn LoginView() -> impl IntoView {
                 // Load accounts list
                 web_sys::console::log_1(&"[LoginView] Loading accounts list...".into());
                 let result = auth.load_accounts_list().await;
-                web_sys::console::log_1(&format!("[LoginView] load_accounts_list result: {:?}", result.is_ok()).into());
+                web_sys::console::log_1(
+                    &format!(
+                        "[LoginView] load_accounts_list result: {:?}",
+                        result.is_ok()
+                    )
+                    .into(),
+                );
             }
         });
     });
-    
+
     // Set up event listener for bunker-auth-challenge (opens browser for approval)
     Effect::new(move |_| {
         spawn_local(async move {
@@ -3341,35 +3508,38 @@ fn LoginView() -> impl IntoView {
             {
                 use crate::tauri_invoke::listen_bunker_auth_challenge;
                 let _ = listen_bunker_auth_challenge(|auth_url| {
-                    web_sys::console::log_1(&format!("Received bunker-auth-challenge: {}", auth_url).into());
+                    web_sys::console::log_1(
+                        &format!("Received bunker-auth-challenge: {}", auth_url).into(),
+                    );
                     // Open the auth URL in a new browser tab
                     if let Some(window) = web_sys::window() {
                         let _ = window.open_with_url_and_target(&auth_url, "_blank");
                     }
-                }).await;
+                })
+                .await;
             }
         });
     });
-    
+
     // Input signals for nsec login
     let nsec_input = RwSignal::new(String::new());
     let name_input = RwSignal::new(String::new());
-    
+
     // Form input signals for bunker:// flow (updated for new NIP-46 API)
     let bunker_uri = RwSignal::new(String::new());
     let bunker_display_name = RwSignal::new(String::new()); // NEW: display name for the profile
     let relay = RwSignal::new("wss://relay.damus.io".to_string());
-    
+
     // Signals for nostrconnect:// flow (keep existing)
     let generated_uri = RwSignal::new(None::<String>);
     let show_generated = RwSignal::new(false);
-    
+
     // Signals for QR login (Flow B)
     let qr_uri = RwSignal::new(None::<String>);
     let qr_loading = RwSignal::new(false);
     let qr_error = RwSignal::new(None::<String>);
     let qr_polling = RwSignal::new(false);
-    
+
     // Set up event listener for qr-login-complete (Flow B)
     Effect::new(move |_| {
         spawn_local(async move {
@@ -3392,24 +3562,25 @@ fn LoginView() -> impl IntoView {
                         // Navigate back to account selector
                         view_mode_event.set(LoginViewMode::AccountSelector);
                     });
-                }).await;
+                })
+                .await;
             }
         });
     });
-    
+
     // Handle QR login button click
     let on_start_qr_login = move |_| {
         let auth = auth_stored.get_value();
         qr_loading.set(true);
         qr_error.set(None);
-        
+
         spawn_local(async move {
             match invoke_start_qr_login().await {
                 Ok(uri) => {
                     qr_uri.set(Some(uri));
                     qr_loading.set(false);
                     view_mode.set(LoginViewMode::QrLogin);
-                    
+
                     // Start polling for connection
                     qr_polling.set(true);
                     let view_mode_poll = view_mode.clone();
@@ -3420,7 +3591,9 @@ fn LoginView() -> impl IntoView {
                             match invoke_check_qr_connection().await {
                                 Ok(Some(result)) => {
                                     // Connection established
-                                    if let Some(npub) = result.get("pubkey").and_then(|v| v.as_str()) {
+                                    if let Some(npub) =
+                                        result.get("pubkey").and_then(|v| v.as_str())
+                                    {
                                         let _ = auth.load_profiles_list().await;
                                         auth.npub.set(Some(npub.to_string()));
                                         auth.has_secure_accounts.set(true);
@@ -3448,7 +3621,9 @@ fn LoginView() -> impl IntoView {
                                 let _ = JsFuture::from(Promise::new(&mut |resolve, _| {
                                     web_sys::window()
                                         .unwrap()
-                                        .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 5000)
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                            &resolve, 5000,
+                                        )
                                         .unwrap();
                                 }))
                                 .await;
@@ -3463,14 +3638,14 @@ fn LoginView() -> impl IntoView {
             }
         });
     };
-    
+
     // Handle cancel QR login
     let on_cancel_qr = move |_| {
         qr_polling.set(false);
         qr_uri.set(None);
         view_mode.set(LoginViewMode::AddAccount);
     };
-    
+
     // Handle bunker:// connect button click (updated for new NIP-46 API)
     // Now uses connect_bunker which handles both connection and saving
     let on_connect_bunker = move |_| {
@@ -3479,7 +3654,9 @@ fn LoginView() -> impl IntoView {
         let display_name_val = bunker_display_name.get();
 
         if uri_val.is_empty() {
-            auth.error.set(Some("Please enter a bunker:// URI or NIP-05 identifier".to_string()));
+            auth.error.set(Some(
+                "Please enter a bunker:// URI or NIP-05 identifier".to_string(),
+            ));
             return;
         }
 
@@ -3497,11 +3674,13 @@ fn LoginView() -> impl IntoView {
                         auth.npub.set(Some(npub.to_string()));
                         auth.has_secure_accounts.set(true);
                         auth.is_loading.set(false);
-                        
+
                         // Start connection status polling for NIP-46 accounts
                         auth.start_connection_status_polling().await;
                     } else {
-                        auth.error.set(Some("Connected but failed to get pubkey from response".to_string()));
+                        auth.error.set(Some(
+                            "Connected but failed to get pubkey from response".to_string(),
+                        ));
                         auth.is_loading.set(false);
                     }
                 }
@@ -3530,13 +3709,14 @@ fn LoginView() -> impl IntoView {
                     auth.is_loading.set(false);
                 }
                 Err(e) => {
-                    auth.error.set(Some(format!("Failed to generate URI: {}", e)));
+                    auth.error
+                        .set(Some(format!("Failed to generate URI: {}", e)));
                     auth.is_loading.set(false);
                 }
             }
         });
     };
-    
+
     view! {
         <div class="login-view">
             <div class="login-container">
@@ -3545,7 +3725,7 @@ fn LoginView() -> impl IntoView {
                     <h1>"Arcadestr"</h1>
                     <p class="tagline">"Nostr-powered indie game marketplace"</p>
                 </div>
-                
+
                 // Main content based on view mode
                 <div class="login-content">
                     <Show when=move || view_mode.get() == LoginViewMode::AccountSelector>
@@ -3557,7 +3737,7 @@ fn LoginView() -> impl IntoView {
                                 <div class="account-selector-view">
                                     <h2>"Welcome Back"</h2>
                                     <p class="subtitle">"Select an account to continue"</p>
-                                    
+
                                     <AccountSelector
                                         auth=auth.clone()
                                         on_switch=move |id: String| {
@@ -3589,7 +3769,7 @@ fn LoginView() -> impl IntoView {
                             }
                         }}
                     </Show>
-                    
+
                     <Show when=move || view_mode.get() == LoginViewMode::AddAccount>
                         <div class="add-account-view">
                             <button class="back-btn" on:click=move |_| {
@@ -3602,10 +3782,10 @@ fn LoginView() -> impl IntoView {
                             }>
                                 "← Back"
                             </button>
-                            
+
                             <h2>"Add Account"</h2>
                             <p class="subtitle">"Choose how you want to connect"</p>
-                            
+
                             <div class="login-options">
                                 // Option 1: Nsec with encryption (NEW PRIMARY)
                                 <div class="login-option primary">
@@ -3617,14 +3797,14 @@ fn LoginView() -> impl IntoView {
                                         "Enter Private Key"
                                     </button>
                                 </div>
-                                
+
                                 // Option 2: NIP-46 (existing, keep but less prominent)
                                 <div class="login-option">
                                     <h3>"📱 Remote Signer (NIP-46)"</h3>
                                     <p class="description">
                                         "Connect with Amber, Nsec.app, or other signer"
                                     </p>
-                                    
+
                                     <div class="input-group">
                                         <label>"Relay URL"</label>
                                         <input
@@ -3634,7 +3814,7 @@ fn LoginView() -> impl IntoView {
                                             on:input:target=move |ev| relay.set(ev.target().value())
                                         />
                                     </div>
-                                    
+
                                     <div class="input-group">
                                         <label>"Bunker URI or NIP-05"</label>
                                         <input
@@ -3644,7 +3824,7 @@ fn LoginView() -> impl IntoView {
                                             on:input:target=move |ev| bunker_uri.set(ev.target().value())
                                         />
                                     </div>
-                                    
+
                                     <div class="input-group">
                                         <label>"Profile Name (optional)"</label>
                                         <input
@@ -3654,15 +3834,15 @@ fn LoginView() -> impl IntoView {
                                             on:input:target=move |ev| bunker_display_name.set(ev.target().value())
                                         />
                                     </div>
-                                    
+
                                     <button on:click=on_connect_bunker disabled=move || auth_stored.get_value().is_loading.get()>
                                         {move || if auth_stored.get_value().is_loading.get() { "Connecting..." } else { "Connect with Bunker" }}
                                     </button>
-                                    
+
                                     <button on:click=on_generate_nostrconnect disabled=move || auth_stored.get_value().is_loading.get()>
                                         "Generate nostrconnect:// URI"
                                     </button>
-                                    
+
                                     <Show when=move || show_generated.get()>
                                         {move || generated_uri.get().map(|uri| {
                                             let _uri_for_clipboard = uri.clone();
@@ -3684,15 +3864,15 @@ fn LoginView() -> impl IntoView {
                                         })}
                                     </Show>
                                 </div>
-                                
+
                                 // Option 3: QR Code Login (Flow B)
                                 <div class="login-option qr-option">
                                     <h3>"📲 Scan QR Code"</h3>
                                     <p class="description">
                                         "Scan a QR code with your mobile signer (Amber, Amethyst)"
                                     </p>
-                                    <button 
-                                        on:click=on_start_qr_login 
+                                    <button
+                                        on:click=on_start_qr_login
                                         disabled=move || qr_loading.get()
                                     >
                                         {move || if qr_loading.get() { "Generating..." } else { "Show QR Code" }}
@@ -3703,7 +3883,7 @@ fn LoginView() -> impl IntoView {
                                         </div>
                                     </Show>
                                 </div>
-                                
+
                                 // Option 4: Restore from backup
                                 <div class="login-option">
                                     <h3>"☁️ Restore from Backup"</h3>
@@ -3717,7 +3897,7 @@ fn LoginView() -> impl IntoView {
                             </div>
                         </div>
                     </Show>
-                    
+
                     <Show when=move || view_mode.get() == LoginViewMode::NsecLogin>
                         {move || {
                             let auth = auth_stored.get_value();
@@ -3727,31 +3907,31 @@ fn LoginView() -> impl IntoView {
                                     <button class="back-btn" on:click=move |_| view_mode.set(LoginViewMode::AddAccount)>
                                         "← Back"
                                     </button>
-                                    
+
                                     <h2>"Login with Private Key"</h2>
                                     <p class="info">
                                         "Your key will be encrypted with AES-256-GCM and stored locally. "
                                         "Master key never leaves your device."
                                     </p>
-                                    
+
                                     <div class="form-group">
                                         <label>"Private Key (nsec1...)"</label>
-                                        <input 
+                                        <input
                                             type="password"
                                             placeholder="nsec1..."
                                             bind:value=nsec_input
                                         />
                                     </div>
-                                    
+
                                     <div class="form-group">
                                         <label>"Account Name (optional)"</label>
-                                        <input 
+                                        <input
                                             type="text"
                                             placeholder="My Gaming Account"
                                             bind:value=name_input
                                         />
                                     </div>
-                                    
+
                                     <div class="security-notice">
                                         <p>"🔒 Security Features:"</p>
                                         <ul>
@@ -3761,8 +3941,8 @@ fn LoginView() -> impl IntoView {
                                             <li>"Automatic encrypted backups available"</li>
                                         </ul>
                                     </div>
-                                    
-                                    <button 
+
+                                    <button
                                         class="login-btn primary"
                                         on:click=move |_| {
                                             let nsec = nsec_input.get();
@@ -3785,16 +3965,16 @@ fn LoginView() -> impl IntoView {
                             }
                         }}
                     </Show>
-                    
+
                     <Show when=move || view_mode.get() == LoginViewMode::QrLogin>
                         <div class="qr-login-view">
                             <button class="back-btn" on:click=on_cancel_qr>
                                 "← Back"
                             </button>
-                            
+
                             <h2>"Scan with Mobile Signer"</h2>
                             <p class="subtitle">"Scan this QR code with Amber, Amethyst, or another NIP-46 signer"</p>
-                            
+
                             <div class="qr-container">
                                 <Show when=move || qr_uri.get().is_some()>
                                     {move || qr_uri.get().map(|uri| {
@@ -3806,19 +3986,19 @@ fn LoginView() -> impl IntoView {
                                                 <div class="qr-placeholder">
                                                     // Display actual QR code
                                                     <div class="qr-image" inner_html=qr_svg></div>
-                                                    
+
                                                     // Also show the URI for manual copy/paste
                                                     <details class="qr-uri-details">
                                                         <summary>"Show URI (for manual copy)"</summary>
-                                                        <textarea 
-                                                            readonly 
-                                                            prop:value=uri 
+                                                        <textarea
+                                                            readonly
+                                                            prop:value=uri
                                                             rows="3"
                                                             class="qr-uri-text"
                                                         />
                                                     </details>
-                                                    
-                                                    <button 
+
+                                                    <button
                                                         class="copy-btn"
                                                         on:click=move |_| {
                                                             #[cfg(target_arch = "wasm32")]
@@ -3836,7 +4016,7 @@ fn LoginView() -> impl IntoView {
                                         }
                                     })}
                                 </Show>
-                                
+
                                 <Show when=move || qr_polling.get()>
                                     <div class="qr-status polling">
                                         <div class="spinner"></div>
@@ -3844,14 +4024,14 @@ fn LoginView() -> impl IntoView {
                                         <p class="hint">"Make sure your mobile wallet is online"</p>
                                     </div>
                                 </Show>
-                                
+
                                 <Show when=move || qr_error.get().is_some()>
                                     <div class="qr-status error">
                                         <p class="error-text">{move || qr_error.get().unwrap_or_default()}</p>
                                     </div>
                                 </Show>
                             </div>
-                            
+
                             <div class="qr-instructions">
                                 <h4>"How to connect:"</h4>
                                 <ol>
@@ -3863,21 +4043,21 @@ fn LoginView() -> impl IntoView {
                             </div>
                         </div>
                     </Show>
-                    
+
                     <Show when=move || view_mode.get() == LoginViewMode::RestoreBackup>
                         <div class="restore-backup-view">
                             <button class="back-btn" on:click=move |_| view_mode.set(LoginViewMode::AddAccount)>
                                 "← Back"
                             </button>
-                            
+
                             <h2>"Restore from Backup"</h2>
                             <p class="subtitle">"Paste your encrypted backup string to restore accounts"</p>
-                            
+
                             <BackupManager />
                         </div>
                     </Show>
                 </div>
-                
+
                 // Error display
                 <Show when=move || auth_stored.get_value().error.get().is_some()>
                     <div class="error-message">
@@ -3888,7 +4068,6 @@ fn LoginView() -> impl IntoView {
         </div>
     }
 }
-
 
 /// Main view component - displayed when authenticated
 #[component]
@@ -3930,11 +4109,16 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                     spawn_local(async move {
                         match invoke_get_relay_count().await {
                             Ok(count) => relay_count_local.set(count),
-                            Err(e) => web_sys::console::log_1(&format!("Failed to get relay count: {}", e).into()),
+                            Err(e) => web_sys::console::log_1(
+                                &format!("Failed to get relay count: {}", e).into(),
+                            ),
                         }
                     });
-                }) as Box<dyn FnMut()>).into_js_value().as_ref().unchecked_ref(),
-                5000
+                }) as Box<dyn FnMut()>)
+                .into_js_value()
+                .as_ref()
+                .unchecked_ref(),
+                5000,
             );
         }
     });
@@ -3947,13 +4131,15 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
     let on_relay_badge_click = move |_| {
         let current = show_relay_dropdown.get();
         show_relay_dropdown.set(!current);
-        
+
         // Fetch relay list when opening
         if !current {
             spawn_local(async move {
                 match invoke_get_connected_relays().await {
                     Ok(relays) => relay_list.set(relays),
-                    Err(e) => web_sys::console::log_1(&format!("Failed to get relay list: {}", e).into()),
+                    Err(e) => {
+                        web_sys::console::log_1(&format!("Failed to get relay list: {}", e).into())
+                    }
                 }
             });
         }
@@ -3974,26 +4160,32 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
             }
             return Some(p);
         }
-        
+
         // Then check ProfileStore (use_context returns Option<T>)
         if let Some(store) = use_context::<ProfileStore>() {
             if let Some(npub) = auth.npub.get() {
                 #[cfg(debug_assertions)]
                 {
-                    web_sys::console::log_1(&format!("get_profile: Checking ProfileStore for {}", npub).into());
+                    web_sys::console::log_1(
+                        &format!("get_profile: Checking ProfileStore for {}", npub).into(),
+                    );
                     let count = store.signal().get_untracked().len();
-                    web_sys::console::log_1(&format!("get_profile: Store has {} profiles", count).into());
+                    web_sys::console::log_1(
+                        &format!("get_profile: Store has {} profiles", count).into(),
+                    );
                 }
                 if let Some(p) = store.get(&npub) {
                     #[cfg(debug_assertions)]
                     {
-                        web_sys::console::log_1(&format!("get_profile: Found in ProfileStore!").into());
+                        web_sys::console::log_1(
+                            &format!("get_profile: Found in ProfileStore!").into(),
+                        );
                     }
                     return Some(p);
                 }
             }
         }
-        
+
         #[cfg(debug_assertions)]
         {
             web_sys::console::log_1(&format!("get_profile: Not found anywhere").into());
@@ -4035,16 +4227,11 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
     };
 
     // Check if NIP-05 is verified
-    let get_nip05_verified = move || {
-        get_profile()
-            .map(|p| p.nip05_verified)
-            .unwrap_or(false)
-    };
+    let get_nip05_verified = move || get_profile().map(|p| p.nip05_verified).unwrap_or(false);
 
     // Get picture URL
     let get_picture_url = move || {
-        let url = get_profile()
-            .and_then(|p| p.picture.clone());
+        let url = get_profile().and_then(|p| p.picture.clone());
         #[cfg(debug_assertions)]
         {
             web_sys::console::log_1(&format!("get_picture_url: {:?}", url.is_some()).into());
@@ -4055,7 +4242,11 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
     // Get first letter for avatar placeholder
     let get_avatar_letter = move || {
         let name = get_profile_display();
-        let letter = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".to_string());
+        let letter = name
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".to_string());
         #[cfg(debug_assertions)]
         {
             web_sys::console::log_1(&format!("avatar_letter: {}", letter).into());
@@ -4109,10 +4300,10 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                         let is_open = show_relay_dropdown.get();
                         let dropdown_class = if is_open { "relay-dropdown open" } else { "relay-dropdown" };
                         let relays = relay_list.get();
-                        
+
                         view! {
                             <div class="relay-badge-container">
-                                <button 
+                                <button
                                     class={badge_class}
                                     on:click={on_relay_badge_click}
                                     title={format!("{} relays connected - Click to view", count)}
@@ -4132,7 +4323,7 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                                     </svg>
                                     <span class="relay-count-number">{count}</span>
                                 </button>
-                                
+
                                 // Dropdown menu
                                 <div class={dropdown_class}>
                                     <div class="relay-dropdown-header">
@@ -4166,7 +4357,7 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                     {move || {
                         let status = auth.connection_status.get();
                         let error = auth.connection_error.get();
-                        
+
                         // Only show for NIP-46 accounts (when we have a connection status to show)
                         if status != "disconnected" {
                             let (icon, text, class) = match status.as_str() {
@@ -4175,13 +4366,13 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                                 "failed" => ("🔴", "Connection Failed", "connection-status failed"),
                                 _ => ("⚪", "Unknown", "connection-status unknown"),
                             };
-                            
+
                             let title = if let Some(err) = error {
                                 format!("{}: {}", text, err)
                             } else {
                                 text.to_string()
                             };
-                            
+
                             Some(view! {
                                 <div class={class} title={title}>
                                     <span class="connection-icon">{icon}</span>
@@ -4192,7 +4383,7 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                             None
                         }
                     }}
-                    
+
                     <button class="user-profile-btn" on:click={on_profile}>
                         {move || {
                             if let Some(url) = get_picture_url() {
@@ -4306,14 +4497,14 @@ pub fn App() -> impl IntoView {
     let auth = AuthContext::new();
     provide_context(auth.clone());
     let relay_count = RwSignal::new(0);
-    
+
     // Store auth for use in effects
     let auth_stored = StoredValue::new(auth.clone());
-    
+
     // Initialize profile store
     provide_profile_store();
     let profile_store = use_profile_store();
-    
+
     // Setup event listeners for profile updates
     #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
     setup_profile_event_handlers(profile_store.clone());
@@ -4346,34 +4537,54 @@ pub fn App() -> impl IntoView {
                                 auth.active_account.set(Some(account.clone()));
                                 auth.npub.set(Some(account.npub.clone()));
                                 auth.has_secure_accounts.set(true);
-                                
+
                                 // Start connection status polling for NIP-46 accounts
                                 if account.signing_mode == "nip46" {
                                     auth.start_connection_status_polling().await;
                                 }
-                                
+
                                 // IMMEDIATE: Try to get profile from backend cache first
                                 let npub_for_fetch = account.npub.clone();
                                 let auth_for_fetch = auth.clone();
                                 spawn_local(async move {
-                                    web_sys::console::log_1(&format!("[INIT] Immediate profile fetch for: {}", npub_for_fetch).into());
-                                    
+                                    web_sys::console::log_1(
+                                        &format!(
+                                            "[INIT] Immediate profile fetch for: {}",
+                                            npub_for_fetch
+                                        )
+                                        .into(),
+                                    );
+
                                     // First try to get from backend cache
                                     match invoke_get_cached_profile(npub_for_fetch.clone()).await {
                                         Ok(Some(profile)) => {
-                                            web_sys::console::log_1(&format!("[INIT] Got cached profile immediately: {:?}", profile.name).into());
+                                            web_sys::console::log_1(
+                                                &format!(
+                                                    "[INIT] Got cached profile immediately: {:?}",
+                                                    profile.name
+                                                )
+                                                .into(),
+                                            );
                                             auth_for_fetch.profile.set(Some(profile));
                                         }
                                         _ => {
                                             web_sys::console::log_1(&"[INIT] No cached profile, fetching from relays...".into());
                                             // Fetch from relays
-                                            match invoke_fetch_profile(npub_for_fetch.clone(), None).await {
+                                            match invoke_fetch_profile(npub_for_fetch.clone(), None)
+                                                .await
+                                            {
                                                 Ok(profile) => {
                                                     web_sys::console::log_1(&format!("[INIT] Profile fetched from relays: {:?}", profile.name).into());
                                                     auth_for_fetch.profile.set(Some(profile));
                                                 }
                                                 Err(e) => {
-                                                    web_sys::console::log_1(&format!("[INIT] Profile fetch failed: {}", e).into());
+                                                    web_sys::console::log_1(
+                                                        &format!(
+                                                            "[INIT] Profile fetch failed: {}",
+                                                            e
+                                                        )
+                                                        .into(),
+                                                    );
                                                 }
                                             }
                                         }
@@ -4388,7 +4599,7 @@ pub fn App() -> impl IntoView {
                             if let Ok(result) = invoke_list_saved_profiles().await {
                                 if let Ok(accounts) = parse_accounts_list(&result) {
                                     auth.accounts.set(accounts.clone());
-                                    
+
                                     // Fetch profiles for all saved accounts to show pictures/names
                                     let store = try_use_profile_store();
                                     for account in accounts {
@@ -4396,7 +4607,8 @@ pub fn App() -> impl IntoView {
                                             let npub = account.npub.clone();
                                             spawn_local(async move {
                                                 // First try to get from backend cache
-                                                match invoke_get_cached_profile(npub.clone()).await {
+                                                match invoke_get_cached_profile(npub.clone()).await
+                                                {
                                                     Ok(Some(profile)) => {
                                                         web_sys::console::log_1(&format!("[ACCOUNTS] Cached profile for {}: {:?}", npub, profile.name).into());
                                                         store.put(profile);
@@ -4404,7 +4616,10 @@ pub fn App() -> impl IntoView {
                                                     _ => {
                                                         // Not in cache, fetch from relays
                                                         web_sys::console::log_1(&format!("[ACCOUNTS] Fetching profile for {} from relays", npub).into());
-                                                        if let Ok(profile) = invoke_fetch_profile(npub.clone(), None).await {
+                                                        if let Ok(profile) =
+                                                            invoke_fetch_profile(npub.clone(), None)
+                                                                .await
+                                                        {
                                                             web_sys::console::log_1(&format!("[ACCOUNTS] Fetched profile for {}: {:?}", npub, profile.name).into());
                                                             store.put(profile);
                                                         }
@@ -4449,27 +4664,43 @@ pub fn App() -> impl IntoView {
                 if let Some(store) = store {
                     #[cfg(debug_assertions)]
                     {
-                        web_sys::console::log_1(&format!("Loaded {} profiles from backend cache", profiles.len()).into());
+                        web_sys::console::log_1(
+                            &format!("Loaded {} profiles from backend cache", profiles.len())
+                                .into(),
+                        );
                         for profile in &profiles {
-                            web_sys::console::log_1(&format!("  - {}: name={:?}, display_name={:?}", profile.npub, profile.name, profile.display_name).into());
+                            web_sys::console::log_1(
+                                &format!(
+                                    "  - {}: name={:?}, display_name={:?}",
+                                    profile.npub, profile.name, profile.display_name
+                                )
+                                .into(),
+                            );
                         }
                     }
                     store.put_many(profiles);
                     #[cfg(debug_assertions)]
                     {
-                        web_sys::console::log_1(&format!("ProfileStore now has {} profiles", store.get_all().len()).into());
+                        web_sys::console::log_1(
+                            &format!("ProfileStore now has {} profiles", store.get_all().len())
+                                .into(),
+                        );
                     }
                 } else {
                     #[cfg(debug_assertions)]
                     {
-                        web_sys::console::log_1(&"ProfileStore not ready yet, skipping cache load".into());
+                        web_sys::console::log_1(
+                            &"ProfileStore not ready yet, skipping cache load".into(),
+                        );
                     }
                 }
             }
             Err(e) => {
                 #[cfg(debug_assertions)]
                 {
-                    web_sys::console::log_1(&format!("Failed to load cached profiles: {}", e).into());
+                    web_sys::console::log_1(
+                        &format!("Failed to load cached profiles: {}", e).into(),
+                    );
                 }
             }
         }
@@ -4481,12 +4712,12 @@ pub fn App() -> impl IntoView {
     Effect::new(move |_| {
         // This read makes the effect track auth.npub
         let npub = auth_for_effect.npub.get();
-        
+
         #[cfg(debug_assertions)]
         {
             web_sys::console::log_1(&format!("Profile effect triggered, npub: {:?}", npub).into());
         }
-        
+
         if let Some(npub) = npub {
             let auth = auth_for_effect.clone();
             spawn_local(async move {
@@ -4498,23 +4729,29 @@ pub fn App() -> impl IntoView {
                     Ok(profile) => {
                         #[cfg(debug_assertions)]
                         {
-                            web_sys::console::log_1(&format!("Profile fetched: {:?}", profile.name).into());
+                            web_sys::console::log_1(
+                                &format!("Profile fetched: {:?}", profile.name).into(),
+                            );
                         }
                         auth.profile.set(Some(profile.clone()));
-                        
+
                         // Also save profile to saved users for display on login screen
                         spawn_local(async move {
                             match invoke_fetch_and_save_user_profile().await {
                                 Ok(_) => {
                                     #[cfg(debug_assertions)]
                                     {
-                                        web_sys::console::log_1(&"Profile saved to saved users".into());
+                                        web_sys::console::log_1(
+                                            &"Profile saved to saved users".into(),
+                                        );
                                     }
                                 }
                                 Err(e) => {
                                     #[cfg(debug_assertions)]
                                     {
-                                        web_sys::console::log_1(&format!("Failed to save profile: {}", e).into());
+                                        web_sys::console::log_1(
+                                            &format!("Failed to save profile: {}", e).into(),
+                                        );
                                     }
                                 }
                             }
@@ -4523,19 +4760,28 @@ pub fn App() -> impl IntoView {
                     Err(e) => {
                         #[cfg(debug_assertions)]
                         {
-                            web_sys::console::log_1(&format!("Failed to fetch profile: {}", e).into());
+                            web_sys::console::log_1(
+                                &format!("Failed to fetch profile: {}", e).into(),
+                            );
                         }
                     }
                 }
-                
+
                 // Retry logic: if profile is empty (no metadata), retry after 30 seconds
                 let auth = auth.clone();
-                if auth.profile.get().map(|p| p.name.is_none() && p.display_name.is_none()).unwrap_or(true) {
+                if auth
+                    .profile
+                    .get()
+                    .map(|p| p.name.is_none() && p.display_name.is_none())
+                    .unwrap_or(true)
+                {
                     #[cfg(debug_assertions)]
                     {
-                        web_sys::console::log_1(&"Profile empty or not found, scheduling retry in 30s...".into());
+                        web_sys::console::log_1(
+                            &"Profile empty or not found, scheduling retry in 30s...".into(),
+                        );
                     }
-                    
+
                     #[cfg(target_arch = "wasm32")]
                     {
                         use js_sys::Promise;
@@ -4543,12 +4789,14 @@ pub fn App() -> impl IntoView {
                         let _ = JsFuture::from(Promise::new(&mut |resolve, _| {
                             web_sys::window()
                                 .unwrap()
-                                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 30000)
+                                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                    &resolve, 30000,
+                                )
                                 .unwrap();
                         }))
                         .await;
                     }
-                    
+
                     // Retry fetch
                     #[cfg(debug_assertions)]
                     {
@@ -4558,7 +4806,9 @@ pub fn App() -> impl IntoView {
                         if profile.name.is_some() || profile.display_name.is_some() {
                             #[cfg(debug_assertions)]
                             {
-                                web_sys::console::log_1(&format!("Profile fetched on retry: {:?}", profile.name).into());
+                                web_sys::console::log_1(
+                                    &format!("Profile fetched on retry: {:?}", profile.name).into(),
+                                );
                             }
                             auth.profile.set(Some(profile));
                         }
@@ -4606,10 +4856,12 @@ fn DebugOverlay() -> impl IntoView {
     spawn_local(async move {
         use crate::tauri_invoke::invoke;
         web_sys::console::log_1(&"DebugOverlay: Fetching version info...".into());
-        
+
         match invoke::<VersionInfo>("get_version_info", serde_json::json!(null)).await {
             Ok(info) => {
-                web_sys::console::log_1(&format!("DebugOverlay: Got version info: {:?}", info).into());
+                web_sys::console::log_1(
+                    &format!("DebugOverlay: Got version info: {:?}", info).into(),
+                );
                 version_info.set(Some(info));
             }
             Err(e) => {
