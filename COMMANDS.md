@@ -334,6 +334,56 @@ cargo tauri dev
 
 ---
 
+## Code Analysis Commands
+
+### Analyze Patterns
+
+Search the codebase for recurring patterns, similar implementations, and refactoring opportunities.
+
+```bash
+# List all available patterns
+./scripts/analyze-patterns --list-patterns
+
+# Analyze error handling patterns
+./scripts/analyze-patterns --pattern=error-handling --language=rust
+
+# Analyze async patterns with JSON output
+./scripts/analyze-patterns --pattern=async-patterns --output=json
+
+# Analyze mutex usage with markdown output
+./scripts/analyze-patterns --pattern=mutex-patterns --output=markdown
+
+# Custom pattern search
+./scripts/analyze-patterns --pattern="Arc<" --depth=deep
+```
+
+**Available Patterns:**
+- `error-handling` - Result, Error types, thiserror, anyhow
+- `async-patterns` - async/await, tokio, futures
+- `singleton` - lazy_static, once_cell, Arc<Mutex>
+- `factory` - Factory pattern implementations
+- `builder` - Builder pattern implementations
+- `trait-patterns` - trait definitions and implementations
+- `mutex-patterns` - Mutex, RwLock usage patterns
+- `serialization` - serde, Serialize, Deserialize
+- `logging` - tracing, log macros
+- `testing` - Test modules and attributes
+- `unsafe` - unsafe code blocks
+- `todo` - TODO, FIXME, XXX comments
+- `documentation` - Documentation comments
+
+**Output Formats:**
+- `text` (default) - Human-readable report
+- `json` - Structured JSON data
+- `markdown` - Formatted markdown for documentation
+
+**Search Depth:**
+- `shallow` - Current directory only
+- `medium` - Source directories (core/src, desktop/src, app/src, web/src)
+- `deep` - Entire repository
+
+---
+
 ## ⚠️ IMPORTANT: Run from desktop/ directory!
 
 The `cargo tauri dev` command **MUST** be run from the `desktop/` directory:
