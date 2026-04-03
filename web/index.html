@@ -13,6 +13,31 @@
             color: #fff;
             min-height: 100vh;
         }
+        
+        /* Relay status dot styles */
+        .relay-status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+            flex-shrink: 0;
+        }
+        
+        .relay-status-dot.connected {
+            background: #22c55e;
+        }
+        
+        .relay-status-dot.disconnected {
+            background: #ef4444;
+        }
+        
+        /* Ensure relay dropdown items align properly */
+        .relay-dropdown-item {
+            display: flex;
+            align-items: center;
+            padding: 8px 12px;
+        }
     </style>
 </head>
 <body>
