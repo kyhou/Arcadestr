@@ -491,7 +491,7 @@ async fn fetch_marketplace_stream(
     let products = {
         let nostr = state.nostr.lock().await;
         let relay_manager = nostr.get_relay_manager();
-        
+
         arcadestr_core::marketplace::fetch_nip15_products_streaming(
             relay_manager,
             limit,
@@ -500,13 +500,14 @@ async fn fetch_marketplace_stream(
                 // Enrich with stall data if available
                 let stall = stall_map.get(&product.stall_id);
                 let listing = GameListing::from_nip15(product, stall);
-                
+
                 // Emit product to frontend
                 if let Err(e) = window_for_closure.emit("marketplace-product", &listing) {
                     tracing::debug!("Failed to emit marketplace-product: {}", e);
                 }
-            }
-        ).await
+            },
+        )
+        .await
     };
 
     match products {
@@ -520,7 +521,7 @@ async fn fetch_marketplace_stream(
 
     // Signal completion
     let _ = window.emit("marketplace-complete", ());
-    
+
     Ok(())
 }
 
@@ -676,6 +677,14 @@ fn main() {
         info!("Connecting to default relays before starting Tauri...");
         client.connect().await;
         info!("Default relay connections initiated");
+
+        // Start connection monitoring for real-time relay status updates
+        {
+            let relay_manager = client.relay_manager();
+            let manager = relay_manager.lock().await;
+            manager.start_connection_monitor().await;
+            info!("Relay connection monitoring started");
+        }
 
         (db, client, cache, nip05_validator)
     });
@@ -1571,24 +1580,22 @@ fn main() {
     #[tauri::command]
     async fn get_connected_relays(
         state: tauri::State<'_, AppState>,
-    ) -> Result<Vec<RelayStatus>, String> {
+    ) -> Result<Vec<String>, String> {
         let nostr = state.nostr.lock().await;
         let manager_arc = nostr.relay_manager();
         let manager = manager_arc.lock().await;
         let client = manager.get_client();
 
-        let mut statuses = Vec::new();
+        let mut connected_urls = Vec::new();
         let relays = client.relays().await;
 
         for (url, relay) in relays {
-            statuses.push(RelayStatus {
-                url: url.to_string(),
-                connected: relay.is_connected(),
-                latency_ms: relay.stats().latency().map(|d| d.as_millis() as u64),
-            });
+            if relay.is_connected() {
+                connected_urls.push(url.to_string());
+            }
         }
 
-        Ok(statuses)
+        Ok(connected_urls)
     }
 
     /// Get extended network discovery statistics.
@@ -1868,6 +1875,12 @@ fn main() {
         })
         .manage(Arc::new(Mutex::new(AppSignerState::new())))
         .setup(move |app| {
+            // Ensure window is visible and focused
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+
             // Attempt to restore session on startup
             let app_handle = app.handle().clone();
             let signer_state: Arc<Mutex<AppSignerState>> = (*app.state::<Arc<Mutex<AppSignerState>>>()).clone();

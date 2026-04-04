@@ -77,6 +77,8 @@ pub struct RelayManager {
     config: RelayManagerConfig,
     shutdown: Arc<RwLock<bool>>,
     event_sender: Option<broadcast::Sender<RelayConnectionEvent>>,
+    /// Track last known connection states for change detection
+    last_known_states: Arc<RwLock<std::collections::HashMap<String, bool>>>,
 }
 
 impl RelayManager {
@@ -106,6 +108,7 @@ impl RelayManager {
             config,
             shutdown: Arc::new(RwLock::new(false)),
             event_sender,
+            last_known_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
 
         // Initialize with default relays
@@ -360,8 +363,13 @@ impl RelayManager {
                     Ok(url_parsed) => {
                         let result = timeout(
                             timeout_duration,
-                            client.fetch_events_from(vec![url_parsed], (*filter).clone(), timeout_duration)
-                        ).await;
+                            client.fetch_events_from(
+                                vec![url_parsed],
+                                (*filter).clone(),
+                                timeout_duration,
+                            ),
+                        )
+                        .await;
 
                         match result {
                             Ok(Ok(events)) => {
@@ -397,15 +405,13 @@ impl RelayManager {
         loop {
             // Take ownership of handles for this iteration
             let current_handles = std::mem::take(&mut handles);
-            
+
             if current_handles.is_empty() {
                 break;
             }
-            
-            let timeout_future = tokio::time::timeout(
-                inactivity_duration,
-                future::select_all(current_handles)
-            );
+
+            let timeout_future =
+                tokio::time::timeout(inactivity_duration, future::select_all(current_handles));
 
             match timeout_future.await {
                 Ok((result, _index, remaining)) => {
@@ -417,7 +423,10 @@ impl RelayManager {
                         total_events += count;
                         _last_result_time = tokio::time::Instant::now();
                         on_events(relay_url, events);
-                        debug!("Processed {}/{} relays, {} events so far", completed, total_relays, total_events);
+                        debug!(
+                            "Processed {}/{} relays, {} events so far",
+                            completed, total_relays, total_events
+                        );
                     }
 
                     if handles.is_empty() {
@@ -688,6 +697,55 @@ impl RelayManager {
         let mut shutdown = self.shutdown.write().await;
         *shutdown = true;
         info!("Relay manager shutdown signal sent");
+    }
+
+    /// Start a background task that monitors relay connection states
+    /// and emits events when they change
+    pub async fn start_connection_monitor(&self) {
+        let client = self.client.clone();
+        let event_sender = self.event_sender.clone();
+        let shutdown = self.shutdown.clone();
+        let last_states = self.last_known_states.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+
+            loop {
+                interval.tick().await;
+
+                // Check shutdown signal
+                if *shutdown.read().await {
+                    break;
+                }
+
+                // Get current relay states
+                let relays = client.relays().await;
+                let mut states = last_states.write().await;
+
+                for (url, relay) in relays {
+                    let url_str = url.to_string();
+                    let is_connected = relay.is_connected();
+                    let was_connected = states.get(&url_str).copied().unwrap_or(false);
+
+                    // Only emit if state changed
+                    if is_connected != was_connected {
+                        if let Some(ref sender) = event_sender {
+                            if is_connected {
+                                let _ = sender.send(RelayConnectionEvent::connected(&url_str));
+                                tracing::info!("Connection monitor: {} connected", url_str);
+                            } else {
+                                let _ = sender.send(RelayConnectionEvent::disconnected(
+                                    &url_str,
+                                    Some("Connection lost".to_string()),
+                                ));
+                                tracing::info!("Connection monitor: {} disconnected", url_str);
+                            }
+                        }
+                        states.insert(url_str, is_connected);
+                    }
+                }
+            }
+        });
     }
 }
 
