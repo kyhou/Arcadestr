@@ -139,7 +139,7 @@ impl GameListing {
     /// perform the mapping without an extra IPC round-trip if needed.
     /// On the backend (`desktop/src/main.rs`) the Tauri command calls an
     /// equivalent mapping directly on the `core` types.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     pub fn from_nip15(
         product: arcadestr_core::marketplace::Nip15Product,
         stall: Option<&arcadestr_core::marketplace::Nip15Stall>,
@@ -150,7 +150,7 @@ impl GameListing {
             .specs
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("download_url"))
-            .map(|(_, v)| v.clone())
+            .map(|(_, v): &(String, String)| v.clone())
             .or_else(|| product.images.first().cloned())
             .unwrap_or_default();
 

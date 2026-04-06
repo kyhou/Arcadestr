@@ -1,12 +1,23 @@
-<!DOCTYPE html><html lang="en"><head>
+<!DOCTYPE html>
+<html lang="en">
+<head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Arcadestr</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/tailwind-ae33d2245c0e522c.css" integrity="sha384-sJ0BsADek0L3ou8R/KYrbEKJ+bmHCubXNrAbVQ6ozIuVGl2nJVXvfD+xi7AITBW/"/>
     
 <script type="module">
-import init, * as bindings from '/arcadestr-web-a9edf10431e2ca66.js';
-init('/arcadestr-web-a9edf10431e2ca66_bg.wasm');
+import init, * as bindings from '/arcadestr-web-5135a0552c2c1c00.js';
+const wasm = await init({ module_or_path: '/arcadestr-web-5135a0552c2c1c00_bg.wasm' });
+
+
 window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
     <style>
@@ -17,12 +28,34 @@ window.wasmBindings = bindings;
             color: #fff;
             min-height: 100vh;
         }
+        
+        /* Relay status dot styles */
+        .relay-status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+            flex-shrink: 0;
+        }
+        
+        .relay-status-dot.connected {
+            background: #22c55e;
+        }
+        
+        .relay-status-dot.disconnected {
+            background: #ef4444;
+        }
+        
+        /* Ensure relay dropdown items align properly */
+        .relay-dropdown-item {
+            display: flex;
+            align-items: center;
+            padding: 8px 12px;
+        }
     </style>
-
-<link rel="preload" href="/arcadestr-web-a9edf10431e2ca66_bg.wasm" as="fetch" type="application/wasm" crossorigin="anonymous" integrity="sha384-_ulBYxLwAM-k2FdpUhjm1l_uzk9_RbduAYI6Xx_i0QsM9xgPWlvHQwlqUW2AD0st">
-<link rel="modulepreload" href="/arcadestr-web-a9edf10431e2ca66.js" crossorigin="anonymous" integrity="sha384-wCyt1z7gI10OHBa8j_DoScE0g2VatrG3zUSeCzueQRPDAf030PeTI0xi5D3lQxCZ"></head>
+<link rel="modulepreload" href="/arcadestr-web-5135a0552c2c1c00.js" crossorigin="anonymous" integrity="sha384-24Rt2hbmv7+BhD5+KGY0ikbzvzR3YhZpayIPmYJKk+2Gzy86mdgnOrG0sLt9bTUZ"><link rel="preload" href="/arcadestr-web-5135a0552c2c1c00_bg.wasm" crossorigin="anonymous" integrity="sha384-lmljv44sv6dGNfRTqNpaYJqhaecGPTPgIJtEprFk7U+pOXxnFEKlRFqHjfttFZXb" as="fetch" type="application/wasm"></head>
 <body>
     <div id="app"></div>
-
-
-</body></html>
+</body>
+</html>
