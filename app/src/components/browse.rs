@@ -9,7 +9,6 @@ use crate::models::GameListing;
 use crate::store::{try_use_marketplace_store, DEFAULT_LISTING_TTL_SECS};
 use crate::invoke_fetch_marketplace_stream;
 use crate::AuthContext;
-use gloo_timers::future::TimeoutFuture;
 
 /// Browse view component - displays a grid of game listings.
 /// Uses MarketplaceStore to persist listings across navigation.
@@ -51,11 +50,6 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
             };
 
             if should_fetch {
-                // Clear cache to prepare for streaming
-                if let Some(s) = &store {
-                    s.clear();
-                }
-                
                 // Start streaming fetch
                 let store_clone = store.clone();
                 let on_listing = move |listing: GameListing| {
@@ -63,6 +57,8 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                     if let Some(s) = &store_clone {
                         s.put_streaming(listing.clone());
                     }
+                    // Unblock UI as soon as first listing arrives.
+                    is_loading.set(false);
                     // Update listings signal to trigger re-render
                     listings.update(|v| {
                         // Check for duplicates in the vector too
@@ -85,12 +81,11 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                 
                 match invoke_fetch_marketplace_stream(50, Some(30), on_listing, on_complete).await {
                     Ok((product_cleanup, completion_cleanup)) => {
-                        // Clean up listeners after a delay
-                        spawn_local(async move {
-                            TimeoutFuture::new(5000).await;
-                            product_cleanup();
-                            completion_cleanup();
-                        });
+                        // Backend command only returns when streaming finishes.
+                        // Ensure loading state clears even if completion event is missed.
+                        is_loading.set(false);
+                        product_cleanup();
+                        completion_cleanup();
                     }
                     Err(e) => {
                         // If fetch fails but we have cached data, use it as fallback
