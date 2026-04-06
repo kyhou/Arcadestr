@@ -14,10 +14,33 @@ use wasm_bindgen_futures::JsFuture;
 #[cfg(target_arch = "wasm32")]
 use web_sys;
 
+#[cfg(all(feature = "web", debug_assertions, target_arch = "wasm32"))]
+pub(crate) fn debug_storefront_bypass_enabled() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+
+    let Ok(Some(storage)) = window.local_storage() else {
+        return false;
+    };
+
+    matches!(
+        storage.get_item("arcadestr.debug.storefront").ok().flatten().as_deref(),
+        Some("1")
+    )
+}
+
+#[cfg(not(all(feature = "web", debug_assertions, target_arch = "wasm32")))]
+pub(crate) fn debug_storefront_bypass_enabled() -> bool {
+    false
+}
+
 // Module declarations
 pub mod components;
 pub mod models;
+pub mod qr;
 pub mod store;
+pub mod ui_v2;
 
 // Import ProfileStore and related functions for store initialization and event handlers
 use crate::store::{
@@ -25,11 +48,15 @@ use crate::store::{
     try_use_profile_store, use_marketplace_store, use_profile_store, MarketplaceStore,
     ProfileStore,
 };
+use crate::ui_v2::{views::LoginV2View, UiV2Root};
 
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 pub mod web_auth;
 
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+pub mod web_secure_store;
+
+#[cfg(not(feature = "web"))]
 mod tauri_invoke;
 pub use components::{
     AccountSelector, BackupManager, BrowseView, DetailView, ProfileView, PublishView,
@@ -55,7 +82,7 @@ pub struct ProfileFetchProgress {
 ///
 /// Waits 100ms for Tauri to initialize before setting up listeners to avoid
 /// race conditions during app startup.
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 pub fn setup_profile_event_handlers(profile_store: ProfileStore) {
     use wasm_bindgen_futures::{spawn_local, JsFuture};
 
@@ -105,7 +132,7 @@ pub fn setup_profile_event_handlers(profile_store: ProfileStore) {
 }
 
 /// Fallback for non-Tauri targets
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 pub fn setup_profile_event_handlers(_profile_store: ProfileStore) {
     // No-op on web target
 }
@@ -159,29 +186,29 @@ pub async fn fetch_missing_profiles(npubs: Vec<String>) -> Result<Vec<UserProfil
 }
 
 /// Invoke get_cached_profiles Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 pub async fn invoke_get_cached_profiles() -> Result<Vec<UserProfile>, String> {
     use crate::tauri_invoke::invoke;
 
     invoke("get_cached_profiles", serde_json::json!({})).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 pub async fn invoke_get_cached_profiles() -> Result<Vec<UserProfile>, String> {
-    Err("Tauri not available".to_string())
+    Ok(Vec::new())
 }
 
 /// Invoke get_cached_profile Tauri command (single profile)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 pub async fn invoke_get_cached_profile(npub: String) -> Result<Option<UserProfile>, String> {
     use crate::tauri_invoke::invoke;
 
     invoke("get_cached_profile", serde_json::json!({ "npub": npub })).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 pub async fn invoke_get_cached_profile(_npub: String) -> Result<Option<UserProfile>, String> {
-    Err("Tauri not available".to_string())
+    Ok(None)
 }
 
 // =============================================================================
@@ -227,7 +254,7 @@ struct RequestInvoiceArgs {
 
 /// Invoke connect_bunker Tauri command (new NIP-46 API)
 /// Connects with a bunker URI or NIP-05 identifier
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_connect_bunker(
     identifier: String,
     display_name: String,
@@ -242,7 +269,7 @@ async fn invoke_connect_bunker(
     invoke("connect_bunker", connect_args).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_connect_bunker(
     _identifier: String,
     _display_name: String,
@@ -252,7 +279,7 @@ async fn invoke_connect_bunker(
 
 /// Invoke generate_nostrconnect_uri Tauri command
 /// Available for both desktop (Tauri) and WASM builds
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_generate_nostrconnect_uri(relay: String) -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
 
@@ -264,13 +291,13 @@ async fn invoke_generate_nostrconnect_uri(relay: String) -> Result<serde_json::V
 }
 
 /// Fallback for environments where Tauri is not available
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_generate_nostrconnect_uri(_relay: String) -> Result<serde_json::Value, String> {
     Err("Tauri not available".to_string())
 }
 
 /// Invoke wait_for_nostrconnect_signer Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_wait_for_nostrconnect_signer(timeout_secs: u64) -> Result<String, String> {
     use crate::tauri_invoke::invoke;
 
@@ -281,13 +308,13 @@ async fn invoke_wait_for_nostrconnect_signer(timeout_secs: u64) -> Result<String
     invoke::<String>("wait_for_nostrconnect_signer", args).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_wait_for_nostrconnect_signer(_timeout_secs: u64) -> Result<String, String> {
     Err("Tauri not available".to_string())
 }
 
 /// Invoke connect_with_key Tauri command (for testing with raw private key)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_connect_with_key(key: String) -> Result<String, String> {
     use crate::tauri_invoke::invoke;
 
@@ -298,7 +325,7 @@ async fn invoke_connect_with_key(key: String) -> Result<String, String> {
     invoke::<String>("connect_with_key", args).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_connect_with_key(_key: String) -> Result<String, String> {
     Err("Tauri not available in web mode".to_string())
 }
@@ -319,81 +346,86 @@ pub async fn invoke_connect_nip07() -> Result<String, String> {
 }
 
 /// Invoke get_public_key Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_get_public_key() -> Result<String, String> {
     use crate::tauri_invoke::invoke;
 
     invoke("get_public_key", serde_json::json!(null)).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_get_public_key() -> Result<String, String> {
-    Err("Tauri not available in web mode".to_string())
+    crate::web_auth::web_get_public_key().ok_or("No public key available".to_string())
 }
 
 /// Invoke is_authenticated Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_is_authenticated() -> Result<bool, String> {
     use crate::tauri_invoke::invoke;
 
     invoke("is_authenticated", serde_json::json!(null)).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_is_authenticated() -> Result<bool, String> {
-    Err("Tauri not available in web mode".to_string())
+    Ok(crate::web_auth::web_is_authenticated())
 }
 
 /// Invoke disconnect Tauri command (legacy - use logout_nip46 for NIP-46)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_disconnect() -> Result<(), String> {
     use crate::tauri_invoke::invoke_void;
     invoke_void("disconnect", serde_json::json!({})).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_disconnect() -> Result<(), String> {
-    Err("Tauri not available in web mode".to_string())
+    crate::web_auth::web_disconnect();
+    Ok(())
 }
 
 /// Invoke get_connected_relay_count Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_get_relay_count() -> Result<usize, String> {
     use crate::tauri_invoke::invoke;
 
     invoke("get_connected_relay_count", serde_json::json!(null)).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_get_relay_count() -> Result<usize, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
 /// Invoke get_connected_relays Tauri command to get list of relay URLs
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_get_connected_relays() -> Result<Vec<String>, String> {
     use crate::tauri_invoke::invoke;
 
     invoke("get_connected_relays", serde_json::json!(null)).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_get_connected_relays() -> Result<Vec<String>, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
 /// Invoke fetch_and_save_user_profile Tauri command
 /// Fetches and saves profile for the current authenticated user
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_fetch_and_save_user_profile() -> Result<UserProfile, String> {
     use crate::tauri_invoke::invoke;
 
     invoke("fetch_and_save_user_profile", serde_json::json!(null)).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_fetch_and_save_user_profile() -> Result<UserProfile, String> {
-    Err("Tauri not available in web mode".to_string())
+    let npub = crate::web_auth::web_get_public_key().unwrap_or_default();
+    Ok(UserProfile {
+        npub,
+        ..UserProfile::default()
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -426,20 +458,20 @@ pub struct SavedUsers {
 }
 
 /// Invoke get_saved_users Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_get_saved_users() -> Result<SavedUsers, String> {
     use crate::tauri_invoke::invoke;
 
     invoke("get_saved_users", serde_json::json!(null)).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_get_saved_users() -> Result<SavedUsers, String> {
     Err("Tauri not available".to_string())
 }
 
 /// Invoke add_saved_user Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 pub async fn invoke_add_saved_user(
     method: String,
     relay: Option<String>,
@@ -460,7 +492,7 @@ pub async fn invoke_add_saved_user(
     invoke("add_saved_user", args).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_add_saved_user(
     _method: String,
     _relay: Option<String>,
@@ -472,7 +504,7 @@ async fn invoke_add_saved_user(
 }
 
 /// Invoke remove_saved_user Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_remove_saved_user(user_id: String) -> Result<SavedUsers, String> {
     use crate::tauri_invoke::invoke;
 
@@ -483,13 +515,13 @@ async fn invoke_remove_saved_user(user_id: String) -> Result<SavedUsers, String>
     .await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_remove_saved_user(_user_id: String) -> Result<SavedUsers, String> {
     Err("Tauri not available".to_string())
 }
 
 /// Invoke rename_saved_user Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_rename_saved_user(user_id: String, new_name: String) -> Result<SavedUsers, String> {
     use crate::tauri_invoke::invoke;
 
@@ -500,7 +532,7 @@ async fn invoke_rename_saved_user(user_id: String, new_name: String) -> Result<S
     .await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_rename_saved_user(
     _user_id: String,
     _new_name: String,
@@ -516,7 +548,7 @@ struct ConnectResponse {
 }
 
 /// Invoke connect_saved_user Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_connect_saved_user(user_id: String) -> Result<ConnectResponse, String> {
     use crate::tauri_invoke::invoke;
 
@@ -527,7 +559,7 @@ async fn invoke_connect_saved_user(user_id: String) -> Result<ConnectResponse, S
     .await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_connect_saved_user(_user_id: String) -> Result<ConnectResponse, String> {
     Err("Tauri not available".to_string())
 }
@@ -537,43 +569,43 @@ async fn invoke_connect_saved_user(_user_id: String) -> Result<ConnectResponse, 
 // =============================================================================
 
 /// Check if any accounts exist in encrypted storage
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_has_accounts() -> Result<bool, String> {
     use crate::tauri_invoke::invoke;
     invoke("has_accounts", serde_json::json!({})).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_has_accounts() -> Result<bool, String> {
-    Err("Tauri not available in web mode".to_string())
+    crate::web_auth::web_has_accounts()
 }
 
 /// Load active account for fast login (~4 seconds)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_load_active_account() -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
     invoke("load_active_account", serde_json::json!({})).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_load_active_account() -> Result<serde_json::Value, String> {
-    Err("Tauri not available in web mode".to_string())
+    crate::web_auth::web_load_active_account()
 }
 
 /// List all saved profiles (new NIP-46 API)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_list_saved_profiles() -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
     invoke("list_saved_profiles", serde_json::json!({})).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_list_saved_profiles() -> Result<serde_json::Value, String> {
-    Err("Tauri not available in web mode".to_string())
+    crate::web_auth::web_list_saved_profiles()
 }
 
 /// Switch to a different profile (new NIP-46 API)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_switch_profile(profile_id: String) -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
     invoke(
@@ -583,13 +615,13 @@ async fn invoke_switch_profile(profile_id: String) -> Result<serde_json::Value, 
     .await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_switch_profile(_profile_id: String) -> Result<serde_json::Value, String> {
-    Err("Tauri not available in web mode".to_string())
+    crate::web_auth::web_switch_profile(_profile_id)
 }
 
 /// Login with nsec - creates encrypted local account
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_login_with_nsec(
     nsec: String,
     name: Option<String>,
@@ -602,16 +634,27 @@ async fn invoke_login_with_nsec(
     .await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_login_with_nsec(
-    _nsec: String,
-    _name: Option<String>,
+    nsec: String,
+    name: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    Err("Tauri not available in web mode".to_string())
+    use nostr::nips::nip19::ToBech32;
+
+    let keys = nostr::Keys::parse(&nsec)
+        .map_err(|e| format!("Invalid private key format: {e}"))?;
+    let npub = keys
+        .public_key()
+        .to_bech32()
+        .map_err(|e| format!("Failed to derive npub: {e}"))?;
+
+    let account_id = format!("web_nsec_{npub}");
+    crate::web_secure_store::save_nsec(account_id.clone(), nsec)?;
+    crate::web_auth::web_upsert_account(account_id, npub, name, "local".to_string())
 }
 
 /// Save NIP-46 remote account after successful connection
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_save_nip46_account(
     uri: String,
     relay: String,
@@ -629,7 +672,7 @@ async fn invoke_save_nip46_account(
     .await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_save_nip46_account(
     _uri: String,
     _relay: String,
@@ -639,7 +682,7 @@ async fn invoke_save_nip46_account(
 }
 
 /// Delete a profile (new NIP-46 API)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_delete_profile(profile_id: String) -> Result<(), String> {
     use crate::tauri_invoke::invoke_void;
     invoke_void(
@@ -649,86 +692,86 @@ async fn invoke_delete_profile(profile_id: String) -> Result<(), String> {
     .await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_delete_profile(_profile_id: String) -> Result<(), String> {
-    Err("Tauri not available in web mode".to_string())
+    crate::web_auth::web_delete_profile(_profile_id)
 }
 
 /// Logout from NIP-46 session (new NIP-46 API)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_logout_nip46() -> Result<(), String> {
     use crate::tauri_invoke::invoke_void;
     invoke_void("logout_nip46", serde_json::json!({})).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_logout_nip46() -> Result<(), String> {
-    Err("Tauri not available in web mode".to_string())
+    crate::web_auth::web_logout_active_account()
 }
 
 /// Start QR login session (new NIP-46 Flow B API)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_start_qr_login() -> Result<String, String> {
     use crate::tauri_invoke::invoke;
     invoke("start_qr_login", serde_json::json!({})).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_start_qr_login() -> Result<String, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
 /// Check QR connection status (new NIP-46 Flow B API)
 /// Returns profile info if connected, None if still waiting
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_check_qr_connection() -> Result<Option<serde_json::Value>, String> {
     use crate::tauri_invoke::invoke;
     invoke("check_qr_connection", serde_json::json!({})).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_check_qr_connection() -> Result<Option<serde_json::Value>, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
 /// Ping the bunker to check connection health (new NIP-46 API)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_ping_bunker() -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
     invoke("ping_bunker", serde_json::json!({})).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_ping_bunker() -> Result<serde_json::Value, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
 /// Get NIP-46 connection status (new async auth API)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_get_connection_status() -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
     invoke("get_connection_status", serde_json::json!({})).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_get_connection_status() -> Result<serde_json::Value, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
 /// Create encrypted backup of all accounts
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_create_backup() -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
     invoke("create_backup", serde_json::json!({})).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_create_backup() -> Result<serde_json::Value, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
 /// Restore accounts from backup
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 async fn invoke_restore_backup(backup_data: String) -> Result<serde_json::Value, String> {
     use crate::tauri_invoke::invoke;
     invoke(
@@ -738,13 +781,13 @@ async fn invoke_restore_backup(backup_data: String) -> Result<serde_json::Value,
     .await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 async fn invoke_restore_backup(_backup_data: String) -> Result<serde_json::Value, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
 /// Invoke publish_listing Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 pub async fn invoke_publish_listing(listing: GameListing) -> Result<String, String> {
     use crate::tauri_invoke::invoke;
 
@@ -755,13 +798,13 @@ pub async fn invoke_publish_listing(listing: GameListing) -> Result<String, Stri
     invoke("publish_listing", publish_args).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 pub async fn invoke_publish_listing(_listing: GameListing) -> Result<String, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
 /// Invoke fetch_listings Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 pub async fn invoke_fetch_listings(limit: usize) -> Result<Vec<GameListing>, String> {
     use crate::tauri_invoke::invoke;
 
@@ -775,13 +818,13 @@ pub async fn invoke_fetch_listings(limit: usize) -> Result<Vec<GameListing>, Str
     invoke("fetch_marketplace", fetch_args).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 pub async fn invoke_fetch_listings(_limit: usize) -> Result<Vec<GameListing>, String> {
     Err("Tauri not available in web mode".to_string())
 }
 
 /// Invoke fetch_marketplace Tauri command (new NIP-15 API)
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 pub async fn invoke_fetch_marketplace(
     limit: usize,
     since_days: Option<u64>,
@@ -797,7 +840,7 @@ pub async fn invoke_fetch_marketplace(
     invoke("fetch_marketplace", args).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 pub async fn invoke_fetch_marketplace(
     _limit: usize,
     _since_days: Option<u64>,
@@ -818,7 +861,7 @@ pub async fn invoke_fetch_marketplace(
 /// * `since_days` - Time window for events
 /// * `on_listing` - Callback invoked for each product
 /// * `on_complete` - Optional callback invoked when streaming completes
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 pub async fn invoke_fetch_marketplace_stream<F, C>(
     limit: usize,
     since_days: Option<u64>,
@@ -887,7 +930,7 @@ where
     Ok((product_cleanup, completion_cleanup))
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 pub async fn invoke_fetch_marketplace_stream<F, C>(
     _limit: usize,
     _since_days: Option<u64>,
@@ -898,11 +941,11 @@ where
     F: FnMut(GameListing) + 'static,
     C: FnOnce() + 'static,
 {
-    Err("Tauri not available in web mode".to_string())
+    Err::<(fn(), fn()), String>("Tauri not available in web mode".to_string())
 }
 
 /// Invoke fetch_listing_by_id Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 pub async fn invoke_fetch_listing_by_id(
     publisher_npub: String,
     listing_id: String,
@@ -917,7 +960,7 @@ pub async fn invoke_fetch_listing_by_id(
     invoke("fetch_listing_by_id", fetch_args).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 pub async fn invoke_fetch_listing_by_id(
     _publisher_npub: String,
     _listing_id: String,
@@ -934,7 +977,7 @@ struct FetchProfileArgs {
 }
 
 /// Invoke fetch_profile Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 pub async fn invoke_fetch_profile(
     npub: String,
     additional_relays: Option<Vec<String>>,
@@ -949,16 +992,19 @@ pub async fn invoke_fetch_profile(
     invoke("fetch_profile", fetch_args).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 pub async fn invoke_fetch_profile(
-    _npub: String,
+    npub: String,
     _additional_relays: Option<Vec<String>>,
 ) -> Result<UserProfile, String> {
-    Err("Tauri not available in web mode".to_string())
+    Ok(UserProfile {
+        npub,
+        ..UserProfile::default()
+    })
 }
 
 /// Invoke request_invoice Tauri command
-#[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+#[cfg(not(feature = "web"))]
 pub async fn invoke_request_invoice(zap_req: ZapRequest) -> Result<ZapInvoice, String> {
     use crate::tauri_invoke::invoke;
 
@@ -969,7 +1015,7 @@ pub async fn invoke_request_invoice(zap_req: ZapRequest) -> Result<ZapInvoice, S
     invoke("request_invoice", request_args).await
 }
 
-#[cfg(not(any(target_arch = "wasm32", not(feature = "web"))))]
+#[cfg(feature = "web")]
 pub async fn invoke_request_invoice(_zap_req: ZapRequest) -> Result<ZapInvoice, String> {
     Err("Tauri not available in web mode".to_string())
 }
@@ -1146,30 +1192,6 @@ fn parse_accounts_list(result: &serde_json::Value) -> Result<Vec<StoredAccount>,
         .collect();
 
     Ok(stored_accounts)
-}
-
-/// Generate a QR code SVG from a string
-fn generate_qr_svg(data: &str) -> String {
-    use qrcode::render::svg;
-    use qrcode::{EcLevel, QrCode, Version};
-
-    // Create QR code with medium error correction
-    let code = QrCode::with_error_correction_level(data, EcLevel::M).unwrap_or_else(|_| {
-        // Fallback: create a minimal QR code
-        QrCode::new("ERROR").expect("Failed to create QR code")
-    });
-
-    // Render as SVG with styling
-    let svg = code
-        .render()
-        .min_dimensions(200, 200)
-        .max_dimensions(300, 300)
-        .quiet_zone(true)
-        .dark_color(svg::Color("#000000"))
-        .light_color(svg::Color("#ffffff"))
-        .build();
-
-    svg
 }
 
 /// AuthContext methods for secure storage operations
@@ -3654,7 +3676,7 @@ fn LoginView() -> impl IntoView {
     // Set up event listener for bunker-auth-challenge (opens browser for approval)
     Effect::new(move |_| {
         spawn_local(async move {
-            #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+            #[cfg(not(feature = "web"))]
             {
                 use crate::tauri_invoke::listen_bunker_auth_challenge;
                 let _ = listen_bunker_auth_challenge(|auth_url| {
@@ -3693,7 +3715,7 @@ fn LoginView() -> impl IntoView {
     // Set up event listener for qr-login-complete (Flow B)
     Effect::new(move |_| {
         spawn_local(async move {
-            #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+            #[cfg(not(feature = "web"))]
             {
                 use crate::tauri_invoke::listen_qr_login_complete;
                 let auth = auth_stored.get_value();
@@ -3852,6 +3874,29 @@ fn LoginView() -> impl IntoView {
         });
     };
 
+    // Handle NIP-07 browser extension connect button click
+    let on_connect_nip07 = move |_: leptos::ev::MouseEvent| {
+        let auth = auth_stored.get_value();
+        auth.is_loading.set(true);
+        auth.error.set(None);
+
+        spawn_local(async move {
+            match invoke_connect_nip07().await {
+                Ok(npub) => {
+                    let _ = auth.load_profiles_list().await;
+                    auth.npub.set(Some(npub));
+                    auth.has_secure_accounts.set(true);
+                    auth.is_loading.set(false);
+                }
+                Err(e) => {
+                    auth.error
+                        .set(Some(format!("Failed to connect NIP-07 signer: {e}")));
+                    auth.is_loading.set(false);
+                }
+            }
+        });
+    };
+
     // Handle generate nostrconnect:// URI button click (keep existing)
     let on_generate_nostrconnect = move |_| {
         let auth = auth_stored.get_value();
@@ -3947,6 +3992,22 @@ fn LoginView() -> impl IntoView {
                             <p class="subtitle">"Choose how you want to connect"</p>
 
                             <div class="login-options">
+                                {#[cfg(feature = "web")]
+                                view! {
+                                    <div class="login-option primary nip07-section">
+                                        <h3>"🌐 Browser Extension (NIP-07)"</h3>
+                                        <p class="description">
+                                            "Connect with Alby, nos2x, or another NIP-07 extension"
+                                        </p>
+                                        <button class="nip07-button" on:click=on_connect_nip07 disabled=move || auth_stored.get_value().is_loading.get()>
+                                            {move || if auth_stored.get_value().is_loading.get() { "Connecting..." } else { "Connect Extension" }}
+                                        </button>
+                                        <p class="nip07-hint">
+                                            "Make sure your signer extension is installed and unlocked"
+                                        </p>
+                                    </div>
+                                }}
+
                                 // Option 1: Nsec with encryption (NEW PRIMARY)
                                 <div class="login-option primary">
                                     <h3>"🔐 Login with Private Key"</h3>
@@ -3957,6 +4018,8 @@ fn LoginView() -> impl IntoView {
                                         "Enter Private Key"
                                     </button>
                                 </div>
+
+                                <Show when=move || !cfg!(feature = "web")>
 
                                 // Option 2: NIP-46 (existing, keep but less prominent)
                                 <div class="login-option">
@@ -4062,6 +4125,8 @@ fn LoginView() -> impl IntoView {
                                         "Restore from Backup"
                                     </button>
                                 </div>
+
+                                </Show>
                             </div>
                         </div>
                     </Show>
@@ -4148,7 +4213,7 @@ fn LoginView() -> impl IntoView {
                                     {move || qr_uri.get().map(|uri| {
                                         let uri_for_button = uri.clone();
                                         // Generate QR code SVG
-                                        let qr_svg = generate_qr_svg(&uri);
+                                        let qr_svg = crate::qr::generate_qr_svg(&uri);
                                         view! {
                                             <div class="qr-code-display">
                                                 <div class="qr-placeholder">
@@ -4822,13 +4887,36 @@ pub fn App() -> impl IntoView {
     let _marketplace_store = use_marketplace_store();
 
     // Setup event listeners for profile updates
-    #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
+    #[cfg(not(feature = "web"))]
     setup_profile_event_handlers(profile_store.clone());
 
     // Check authentication status on mount (with small delay for Tauri to initialize)
     Effect::new(move |_| {
         let auth = auth_stored.get_value();
         spawn_local(async move {
+            if debug_storefront_bypass_enabled() {
+                let debug_npub =
+                    "npub1debugstorefront000000000000000000000000000000000000000000".to_string();
+                auth.npub.set(Some(debug_npub.clone()));
+                auth.has_secure_accounts.set(true);
+                auth.connection_status.set("connected".to_string());
+                auth.connection_error.set(None);
+                auth.active_account.set(Some(StoredAccount {
+                    id: "debug-web-storefront".to_string(),
+                    npub: debug_npub,
+                    name: Some("Debug Curator".to_string()),
+                    signing_mode: "debug".to_string(),
+                    last_used: 0,
+                    is_current: true,
+                    picture: None,
+                    display_name: Some("Debug Curator".to_string()),
+                    username: Some("debug_curator".to_string()),
+                    nip05: None,
+                    about: Some("Debug storefront bypass account".to_string()),
+                }));
+                return;
+            }
+
             // Small delay to ensure Tauri API is ready
             #[cfg(target_arch = "wasm32")]
             {
@@ -5151,10 +5239,10 @@ pub fn App() -> impl IntoView {
             }}
 
             <Show
-                when={move || auth.npub.get().is_some()}
-                fallback={|| view! { <LoginView /> }}
+                when={move || auth.npub.get().is_some() || debug_storefront_bypass_enabled()}
+                fallback={|| view! { <LoginV2View /> }}
             >
-                <MainView relay_count=relay_count.clone() />
+                <UiV2Root relay_count=relay_count.clone() />
             </Show>
         </div>
     }
@@ -5169,6 +5257,7 @@ fn DebugOverlay() -> impl IntoView {
     let error_msg = RwSignal::new(None::<String>);
 
     // Fetch version info on mount
+    #[cfg(not(feature = "web"))]
     spawn_local(async move {
         use crate::tauri_invoke::invoke;
         web_sys::console::log_1(&"DebugOverlay: Fetching version info...".into());
@@ -5187,6 +5276,11 @@ fn DebugOverlay() -> impl IntoView {
             }
         }
     });
+
+    #[cfg(feature = "web")]
+    {
+        error_msg.set(Some("Version info unavailable in web mode".to_string()));
+    }
 
     view! {
         <div class="debug-overlay" style="position: fixed; bottom: 10px; right: 10px; z-index: 99999;">
