@@ -16,6 +16,7 @@ use arcadestr_core::auth::AuthState;
 use arcadestr_core::extended_network::ExtendedNetworkRepository;
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
 use arcadestr_core::marketplace::{apply_filter, MarketplaceFilter};
+use arcadestr_core::marketplace_cache::{MarketplaceCache, UpsertOutcome};
 use arcadestr_core::nip05_validator::Nip05Validator;
 use arcadestr_core::nip46::AppSignerState;
 use arcadestr_core::nip46::{
@@ -59,6 +60,8 @@ pub struct AppState {
     pub profile_fetcher: Arc<ProfileFetcher>,
     /// User cache for persistent profile storage.
     pub user_cache: Arc<UserCache>,
+    /// Marketplace cache for persistent listing storage.
+    pub marketplace_cache: Arc<MarketplaceCache>,
     /// Extended network repository for 2nd-degree follow discovery.
     pub extended_network: Arc<RwLock<Option<Arc<Mutex<ExtendedNetworkRepository>>>>>,
     /// Follows list for extended network refresh cycles.
@@ -67,6 +70,25 @@ pub struct AppState {
     pub relay_hints: Option<Arc<RelayHints>>,
     /// NIP-05 validator for background verification
     pub nip05_validator: Arc<std::sync::Mutex<Nip05Validator>>,
+}
+
+fn listing_cache_key(listing: &GameListing) -> (String, String) {
+    (listing.publisher_npub.clone(), listing.id.clone())
+}
+
+fn listing_signature(listing: &GameListing) -> String {
+    let tags_json = serde_json::to_string(&listing.tags).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        listing.publisher_npub,
+        listing.id,
+        listing.title,
+        listing.description,
+        listing.price_sats,
+        listing.download_url,
+        listing.created_at,
+        tags_json
+    )
 }
 
 /// Generates a nostrconnect:// URI for client-initiated NIP-46 connections.
@@ -467,10 +489,34 @@ async fn fetch_marketplace_stream(
     limit: usize,
     since_days: Option<u64>,
 ) -> Result<(), String> {
+    use std::collections::HashMap;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
     tracing::info!(
         "fetch_marketplace_stream called: limit={}, since_days={:?}",
         limit,
         since_days
+    );
+
+    let mut cached_emitted = 0usize;
+    let mut cached_signatures: HashMap<(String, String), String> = HashMap::new();
+
+    match state.marketplace_cache.load_listings(limit, since_days).await {
+        Ok(cached) => {
+            for listing in cached {
+                cached_signatures.insert(listing_cache_key(&listing), listing_signature(&listing));
+                if window.emit("marketplace-product", &listing).is_ok() {
+                    cached_emitted += 1;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("fetch_marketplace_stream: failed to load cache: {}", e);
+        }
+    }
+    tracing::info!(
+        "fetch_marketplace_stream: emitted {} cached products",
+        cached_emitted
     );
 
     // Fetch stalls first (needed for product enrichment)
@@ -480,12 +526,23 @@ async fn fetch_marketplace_stream(
     };
     tracing::info!("fetch_marketplace_stream: got {} stalls", stalls.len());
 
+    if let Err(e) = state.marketplace_cache.upsert_stalls(&stalls).await {
+        tracing::warn!("fetch_marketplace_stream: failed to upsert stalls: {}", e);
+    }
+
     // Build stall lookup map for enriching products
-    let stall_map: std::collections::HashMap<String, arcadestr_core::marketplace::Nip15Stall> =
-        stalls.iter().map(|s| (s.id.clone(), s.clone())).collect();
+    let stall_map: HashMap<(String, String), arcadestr_core::marketplace::Nip15Stall> = stalls
+        .iter()
+        .map(|s| ((s.merchant_npub.clone(), s.id.clone()), s.clone()))
+        .collect();
+
+    let seen_signatures = StdArc::new(StdMutex::new(cached_signatures));
+    let relay_updates: StdArc<StdMutex<Vec<GameListing>>> = StdArc::new(StdMutex::new(Vec::new()));
 
     // Clone window for use in the closure
     let window_for_closure = window.clone();
+    let seen_signatures_for_closure = StdArc::clone(&seen_signatures);
+    let relay_updates_for_closure = StdArc::clone(&relay_updates);
 
     // Start streaming product fetch
     let products = {
@@ -498,8 +555,34 @@ async fn fetch_marketplace_stream(
             since_days,
             move |product| {
                 // Enrich with stall data if available
-                let stall = stall_map.get(&product.stall_id);
+                let stall = stall_map.get(&(product.merchant_npub.clone(), product.stall_id.clone()));
                 let listing = GameListing::from_nip15(product, stall);
+                let key = listing_cache_key(&listing);
+                let signature = listing_signature(&listing);
+
+                let should_emit = {
+                    let mut known = seen_signatures_for_closure
+                        .lock()
+                        .expect("seen signatures mutex poisoned");
+                    match known.get(&key) {
+                        Some(existing) if existing == &signature => false,
+                        _ => {
+                            known.insert(key, signature);
+                            true
+                        }
+                    }
+                };
+
+                if !should_emit {
+                    return;
+                }
+
+                {
+                    let mut updates = relay_updates_for_closure
+                        .lock()
+                        .expect("relay updates mutex poisoned");
+                    updates.push(listing.clone());
+                }
 
                 // Emit product to frontend
                 if let Err(e) = window_for_closure.emit("marketplace-product", &listing) {
@@ -518,6 +601,31 @@ async fn fetch_marketplace_stream(
             tracing::warn!("fetch_marketplace_stream: fetch error: {}", e);
         }
     }
+
+    let updates = {
+        let updates_guard = relay_updates.lock().expect("relay updates mutex poisoned");
+        updates_guard.clone()
+    };
+
+    let mut upserted = 0usize;
+    let mut updated = 0usize;
+    let mut unchanged = 0usize;
+
+    for listing in updates {
+        match state.marketplace_cache.upsert_listing(&listing, None).await {
+            Ok(UpsertOutcome::Inserted) => upserted += 1,
+            Ok(UpsertOutcome::Updated) => updated += 1,
+            Ok(UpsertOutcome::Unchanged) => unchanged += 1,
+            Err(e) => tracing::warn!("fetch_marketplace_stream: upsert failed: {}", e),
+        }
+    }
+
+    tracing::info!(
+        "fetch_marketplace_stream: cache upserts inserted={}, updated={}, unchanged={}",
+        upserted,
+        updated,
+        unchanged
+    );
 
     // Signal completion
     let _ = window.emit("marketplace-complete", ());
@@ -606,7 +714,7 @@ fn main() {
     // Create a single runtime for all initialization
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
-    let (database, nostr_client, user_cache, nip05_validator) = runtime.block_on(async {
+    let (database, nostr_client, user_cache, marketplace_cache, nip05_validator) = runtime.block_on(async {
         // Initialize database
         let db = arcadestr_core::storage::Database::new(&db_path)
             .await
@@ -686,7 +794,9 @@ fn main() {
             info!("Relay connection monitoring started");
         }
 
-        (db, client, cache, nip05_validator)
+        let marketplace_cache = Arc::new(MarketplaceCache::new(db.pool().clone()));
+
+        (db, client, cache, marketplace_cache, nip05_validator)
     });
     info!("Database initialized at: {}", db_path.display());
     info!("UserCache initialized");
@@ -1868,7 +1978,8 @@ fn main() {
             subscription_registry: subscription_registry.clone(),
             profile_fetcher,
             user_cache,
-            nip05_validator,  // ADD THIS LINE
+            marketplace_cache,
+            nip05_validator,
             extended_network: Arc::new(RwLock::new(None)),
             extended_network_follows: Arc::new(RwLock::new(Vec::new())),
             relay_hints: Some(relay_hints.clone()),

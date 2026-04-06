@@ -1,4 +1,5 @@
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::Row;
 use std::path::Path;
 use thiserror::Error;
 
@@ -46,16 +47,49 @@ CREATE TABLE IF NOT EXISTS secure_storage (
 );
 "#;
 
-// Migration 2: Games table (placeholder - will be added when needed)
+// Migration 2: Marketplace cache tables (stalls + products)
 const MIGRATION_2_GAMES_TABLE: &str = r#"
--- Games table migration placeholder
--- This will be implemented when game storage is needed
+CREATE TABLE IF NOT EXISTS marketplace_stalls (
+    merchant_npub TEXT NOT NULL,
+    stall_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    currency TEXT NOT NULL,
+    shipping_json TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (merchant_npub, stall_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_marketplace_stalls_updated_at
+ON marketplace_stalls(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS marketplace_products (
+    publisher_npub TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    price_sats INTEGER NOT NULL,
+    download_url TEXT NOT NULL,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    lud16 TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    source_event_id TEXT,
+    PRIMARY KEY (publisher_npub, product_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_marketplace_products_updated_at
+ON marketplace_products(updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_marketplace_products_publisher
+ON marketplace_products(publisher_npub);
 "#;
 
-// Migration 3: Relays table (placeholder - will be added when needed)
+// Migration 3: Marketplace relational indexes
 const MIGRATION_3_RELAYS_TABLE: &str = r#"
--- Relays table migration placeholder
--- This will be implemented when relay management is needed
+CREATE INDEX IF NOT EXISTS idx_marketplace_products_created_at
+ON marketplace_products(created_at DESC);
 "#;
 
 // Migration 4: Add users table for profile caching
@@ -131,7 +165,106 @@ impl Database {
                 DatabaseError::Migration(format!("Migration {} failed: {}", migration_num, e))
             })?;
         }
+
+        Self::ensure_marketplace_cache_schema(pool).await?;
+
         Ok(())
+    }
+
+    async fn ensure_marketplace_cache_schema(pool: &SqlitePool) -> Result<(), DatabaseError> {
+        let products_needs_reset = Self::table_needs_reset(
+            pool,
+            "marketplace_products",
+            &["publisher_npub", "product_id", "title", "description"],
+        )
+        .await?;
+
+        let stalls_needs_reset = Self::table_needs_reset(
+            pool,
+            "marketplace_stalls",
+            &["merchant_npub", "stall_id", "name", "currency"],
+        )
+        .await?;
+
+        if products_needs_reset || stalls_needs_reset {
+            sqlx::query("DROP TABLE IF EXISTS marketplace_products")
+                .execute(pool)
+                .await
+                .map_err(|e| {
+                    DatabaseError::Migration(format!(
+                        "Failed to reset marketplace_products table: {}",
+                        e
+                    ))
+                })?;
+
+            sqlx::query("DROP TABLE IF EXISTS marketplace_stalls")
+                .execute(pool)
+                .await
+                .map_err(|e| {
+                    DatabaseError::Migration(format!(
+                        "Failed to reset marketplace_stalls table: {}",
+                        e
+                    ))
+                })?;
+
+            sqlx::query(MIGRATION_2_GAMES_TABLE)
+                .execute(pool)
+                .await
+                .map_err(|e| {
+                    DatabaseError::Migration(format!(
+                        "Failed to recreate marketplace cache tables: {}",
+                        e
+                    ))
+                })?;
+
+            sqlx::query(MIGRATION_3_RELAYS_TABLE)
+                .execute(pool)
+                .await
+                .map_err(|e| {
+                    DatabaseError::Migration(format!(
+                        "Failed to recreate marketplace cache indexes: {}",
+                        e
+                    ))
+                })?;
+        }
+
+        Ok(())
+    }
+
+    async fn table_needs_reset(
+        pool: &SqlitePool,
+        table_name: &str,
+        required_columns: &[&str],
+    ) -> Result<bool, DatabaseError> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1",
+        )
+        .bind(table_name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            DatabaseError::Migration(format!("Failed checking table {}: {}", table_name, e))
+        })?;
+
+        if exists.is_none() {
+            return Ok(false);
+        }
+
+        let pragma = format!("PRAGMA table_info({})", table_name);
+        let columns = sqlx::query(&pragma).fetch_all(pool).await.map_err(|e| {
+            DatabaseError::Migration(format!("Failed reading schema for {}: {}", table_name, e))
+        })?;
+
+        for required in required_columns {
+            let has_column = columns
+                .iter()
+                .any(|row| row.get::<String, _>("name") == *required);
+            if !has_column {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Get a reference to the connection pool

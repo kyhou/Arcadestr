@@ -75,6 +75,9 @@ pub mod extended_network;
 pub mod marketplace;
 
 #[cfg(feature = "native")]
+pub mod marketplace_cache;
+
+#[cfg(feature = "native")]
 pub use profile_fetcher::{
     LruProfileCache, ProfileCache, ProfileFetcher, BATCH_SIZE, MAX_PROFILE_ATTEMPTS,
 };
