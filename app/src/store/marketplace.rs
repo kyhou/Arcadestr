@@ -29,12 +29,12 @@ impl MarketplaceStore {
 
     /// Get a listing by ID
     pub fn get(&self, id: &str) -> Option<GameListing> {
-        self.listings.get().get(id).cloned()
+        self.listings.get_untracked().get(id).cloned()
     }
 
     /// Get all listings as a vector
     pub fn get_all(&self) -> Vec<GameListing> {
-        self.listings.get().values().cloned().collect()
+        self.listings.get_untracked().values().cloned().collect()
     }
 
     /// Add or update a single listing
@@ -69,23 +69,23 @@ impl MarketplaceStore {
 
     /// Check if a listing exists in the store
     pub fn has(&self, id: &str) -> bool {
-        self.listings.get().contains_key(id)
+        self.listings.get_untracked().contains_key(id)
     }
 
     /// Get the number of cached listings
     pub fn len(&self) -> usize {
-        self.listings.get().len()
+        self.listings.get_untracked().len()
     }
 
     /// Check if the store is empty
     pub fn is_empty(&self) -> bool {
-        self.listings.get().is_empty()
+        self.listings.get_untracked().is_empty()
     }
 
     /// Check if the cache needs refresh based on TTL
     /// Returns true if cache is empty or last fetch was longer than ttl_secs ago
     pub fn needs_refresh(&self, ttl_secs: u64) -> bool {
-        match self.last_fetch_time.get() {
+        match self.last_fetch_time.get_untracked() {
             None => true,
             Some(last_fetch) => {
                 let elapsed = last_fetch.elapsed();
@@ -113,7 +113,7 @@ impl MarketplaceStore {
     /// Get listings by publisher npub
     pub fn get_by_publisher(&self, publisher_npub: &str) -> Vec<GameListing> {
         self.listings
-            .get()
+            .get_untracked()
             .values()
             .filter(|l| l.publisher_npub == publisher_npub)
             .cloned()
