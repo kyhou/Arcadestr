@@ -3,6 +3,7 @@
 ## Build & Development Commands
 
 ### Running the Application
+
 ```bash
 # Development server (with 60s timeout to prevent hanging)
 cd /home/joel/Sync/Projetos/Arcadestr/desktop && timeout 60 cargo tauri dev 2>&1
@@ -17,6 +18,7 @@ cargo check -p arcadestr-app
 ```
 
 ### Testing
+
 ```bash
 # Run all tests for a crate
 cargo test -p arcadestr-core
@@ -30,6 +32,7 @@ cargo test -p arcadestr-core --lib -- --test-threads=1
 ```
 
 ### Linting & Formatting
+
 ```bash
 # Format code
 cargo fmt
@@ -44,12 +47,14 @@ cargo fix --lib -p arcadestr-core
 ## Code Style Guidelines
 
 ### Project Structure
+
 - `/core` - Core business logic (Nostr, NIP-46, storage) - **Library crate**
 - `/desktop` - Tauri desktop application - **Binary crate**
 - `/app` - Leptos web frontend - **WASM crate**
 - `/web` - Web-specific utilities
 
 ### Naming Conventions
+
 - **Files**: `snake_case.rs` (e.g., `social_graph.rs`)
 - **Structs/Enums**: `PascalCase` (e.g., `SocialGraphDb`, `RelayDiscoveryResult`)
 - **Functions/Variables**: `snake_case` (e.g., `insert_batch`, `relay_cache`)
@@ -58,6 +63,7 @@ cargo fix --lib -p arcadestr-core
 - **Avoid weasel words**: Use `RelayHints` not `RelayHintStore`
 
 ### Imports & Organization
+
 ```rust
 // 1. Standard library
 use std::collections::HashMap;
@@ -74,18 +80,21 @@ use crate::nostr::{NostrClient, KIND_RELAY_LIST};
 ```
 
 ### Error Handling
+
 - **Libraries (core crate)**: Use `thiserror` with canonical error structs
 - **Applications (desktop crate)**: May use `anyhow` for simplicity
 - **Never use `.unwrap()` in production code** - use `.expect()` with context or proper error propagation
 - **Mutex locks**: Use `.expect("mutex_name mutex poisoned")` instead of `.unwrap()`
 
 ### Type Safety
+
 - Use strong types over primitives (avoid primitive obsession)
 - Wrap shared state in `Arc<Mutex<T>>` or `Arc<RwLock<T>>`
 - Assert Send/Sync for public types: `const _: () = assert_send::<T>();`
 
 ### Documentation
-```rust
+
+````rust
 /// Summary sentence < 15 words.
 ///
 /// Extended documentation explaining purpose and behavior.
@@ -99,22 +108,23 @@ use crate::nostr::{NostrClient, KIND_RELAY_LIST};
 /// # Errors
 /// Returns `ErrorType` when condition occurs.
 pub fn function_name(arg: Type) -> Result<Type, ErrorType> {
-```
+````
 
 ### Testing Patterns
+
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_descriptive_name() {
         // Arrange
         let input = setup();
-        
+
         // Act
         let result = function_under_test(input);
-        
+
         // Assert
         assert_eq!(result, expected);
     }
@@ -122,16 +132,19 @@ mod tests {
 ```
 
 ### Database Testing
+
 - Use `std::env::temp_dir()` for test databases
 - Clean up database files in tests
 - Use unique paths per test to avoid conflicts
 
 ### Async Patterns
+
 - Use `tokio::time::timeout` for network operations
 - Spawn background tasks with `tauri::async_runtime::spawn` in Tauri apps
 - Don't hold mutex locks across await points
 
 ### Feature Gates
+
 - Use `#[cfg(feature = "native")]` for native-only code
 - Use `#[cfg(target_arch = "wasm32")]` for WASM-specific code
 
@@ -159,9 +172,11 @@ rtk git commit -m "type: description"
 ## Rust Guidelines Enforcement
 
 Follow the Microsoft Rust Guidelines:
+
 - https://microsoft.github.io/rust-guidelines/guidelines/index.html
 
 Core rules (must comply):
+
 - Naming conventions
 - Error handling patterns (Result, no unwrap in production)
 - Ownership and borrowing correctness
@@ -173,7 +188,8 @@ If a change violates these, reject or rewrite it.
 ### Protocol Layer ('nostr/')
 
 Each NIP is a standalone 'object':
-- Condensed NIP reference docs at '.claude/nips/*.md' with index at '.claude/nips/README.md'
+
+- Condensed NIP reference docs at '.claude/nips/\*.md' with index at '.claude/nips/README.md'
 
 ### Relay Layer ('relay/')
 
@@ -199,3 +215,117 @@ Each NIP is a standalone 'object':
 - **Signing**: secp256k1 (Schnorr) using native bindings (secp256k1 crate or libsecp256k1)
 - **NIP-44 encryption**: ECDH + HKDF + XChaCha20-Poly1305 (xchacha20poly1305, hkdf, hmac, sha2 or libsodium)
 - **Key storage**: libsecret (Secret Service API) or AES-256-GCM with Argon2-derived key
+
+# Tooling — Tauri + Leptos Dual Target
+
+## Scope
+
+Applies to all tasks involving:
+
+- Web frontend (Leptos)
+- Desktop runtime (Tauri)
+
+---
+
+## Tool Selection Rules
+
+### Web Target
+
+Use MCP browser tools.
+
+Primary:
+
+- Playwright MCP
+
+Secondary:
+
+- Chrome DevTools MCP
+- Firefox DevTools MCP
+
+Use for:
+
+- UI interaction
+- Navigation
+- Form input
+- Screenshot capture
+- DOM validation
+
+Debug with Chrome DevTools MCP when:
+
+- Console errors exist
+- Network requests fail
+- Rendering issues occur
+
+Target URL:
+http://localhost:<PORT>
+
+---
+
+### Desktop Target
+
+Do not use browser MCP tools.
+
+Execution:
+
+- cargo tauri dev
+
+Debugging:
+
+- Rust: LLDB
+- WebView: Tauri devtools (Ctrl+Shift+I or programmatic)
+
+Automation:
+
+- tauri-driver
+
+Use for:
+
+- Native window validation
+- OS integration
+- Rust backend debugging
+- WebView behavior
+
+---
+
+## Screenshot Rules
+
+Web:
+
+- Playwright MCP (preferred)
+- Chrome DevTools MCP (fallback)
+- Firefox DevTools MCP (fallback)
+
+Desktop:
+
+- Tauri window automation
+- System tools only if automation unavailable
+
+---
+
+## Execution Flow
+
+### Web
+
+1. Start dev server
+2. Open via Playwright MCP
+3. Execute interactions
+4. Capture screenshots
+5. Debug with Chrome DevTools MCP or Firefix DevTools if needed
+
+### Desktop
+
+1. Run cargo tauri dev
+2. Attach debuggers
+3. Execute interactions
+4. Capture screenshots
+5. Validate behavior
+
+---
+
+## Constraints
+
+- Never use browser MCP for desktop flows
+- Always validate web and desktop separately
+- Prefer Playwright MCP for interaction
+- Use Chrome DevTools MCP or Firefox DevTools only for inspection
+- Include both Rust and WebView debugging when needed
