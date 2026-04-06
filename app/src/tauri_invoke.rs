@@ -2,6 +2,7 @@
 // Uses direct JavaScript interop to call Tauri v2's window.__TAURI__.core
 
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
 /// Check if Tauri is available
@@ -45,33 +46,49 @@ where
         };
 
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data_str) {
-            callback(json);
+            if let Some(payload) = json.get("payload") {
+                callback(payload.clone());
+            } else {
+                callback(json);
+            }
         }
     }) as Box<dyn FnMut(JsValue)>);
 
-    let js_callback = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
-    
-    // Call Tauri's listen function and get the unlisten handle
-    let js_code = format!(
-        "window.__TAURI__.event.listen('{}', {})",
-        event,
-        js_callback.as_string().unwrap_or_default()
-    );
+    let window = web_sys::window().ok_or_else(|| "Window not available".to_string())?;
+    let tauri_obj = js_sys::Reflect::get(&window, &JsValue::from_str("__TAURI__"))
+        .map_err(|e| format!("Failed to access __TAURI__: {:?}", e))?;
+    let event_api = js_sys::Reflect::get(&tauri_obj, &JsValue::from_str("event"))
+        .map_err(|e| format!("Failed to access __TAURI__.event: {:?}", e))?;
+    let listen_fn = js_sys::Reflect::get(&event_api, &JsValue::from_str("listen"))
+        .map_err(|e| format!("Failed to access event.listen: {:?}", e))?
+        .dyn_into::<js_sys::Function>()
+        .map_err(|_| "event.listen is not a function".to_string())?;
 
-    let unlisten_fn = js_sys::eval(&js_code)
-        .map_err(|e| format!("Failed to listen for event '{}': {:?}", event, e))?;
-    
-    // Create cleanup function
+    let promise_val = listen_fn
+        .call2(
+            &event_api,
+            &JsValue::from_str(event),
+            closure.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to call listen for '{}': {:?}", event, e))?;
+
+    let promise = promise_val
+        .dyn_into::<js_sys::Promise>()
+        .map_err(|_| format!("listen('{}') did not return a Promise", event))?;
+
+    let unlisten_val = JsFuture::from(promise)
+        .await
+        .map_err(|e| format!("listen('{}') promise rejected: {:?}", event, e))?;
+
+    let unlisten_fn = unlisten_val
+        .dyn_into::<js_sys::Function>()
+        .map_err(|_| format!("listen('{}') resolved value is not a function", event))?;
+
     let cleanup = move || {
-        // Call unlisten if available
-        if let Ok(unlisten) = unlisten_fn.dyn_into::<js_sys::Function>() {
-            let _ = unlisten.call0(&JsValue::NULL);
-        }
-        // Note: closure is still leaked here, but at least we unlisten
+        let _ = unlisten_fn.call0(&JsValue::NULL);
+        drop(closure);
     };
-    
-    closure.forget(); // Still needed for now, but we have unlisten
-    
+
     Ok(cleanup)
 }
 
