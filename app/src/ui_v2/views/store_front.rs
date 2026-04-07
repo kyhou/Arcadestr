@@ -35,7 +35,7 @@ pub fn StoreFrontView(
 
     view! {
         <div class="max-w-[1600px] mx-auto p-8 space-y-12">
-            <section class="group relative h-[500px] rounded-xl transition-transform duration-700 hover:scale-[1.02] [clip-path:inset(0_round_0.75rem)]">
+            <section class="group relative h-[500px] rounded-xl overflow-hidden transition-transform duration-700 hover:scale-[1.02] [transform:translateZ(0)] [backface-visibility:hidden]">
                 <div class="absolute inset-0 bg-surface-high">
                     <img
                         class="w-full h-full object-cover"

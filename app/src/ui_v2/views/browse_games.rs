@@ -128,33 +128,37 @@ fn render_listing_card(listing: GameListing, on_select: Callback<GameListing>) -
         .unwrap_or_else(|| "OWNERSHIP Digital License".to_string());
 
     view! {
-        <article class="group relative aspect-[16/10] rounded-xl bg-surface-container-high transition-transform duration-300 hover:scale-[1.03] hover:z-10 [clip-path:inset(0_round_0.75rem)]">
-            <img alt={listing.title.clone()} class="w-full h-full object-cover" src={image_url} />
-            <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent"></div>
-            <div class="absolute bottom-4 left-4 flex items-center gap-2">
-                <span class="px-2 py-0.5 bg-tertiary-container/20 backdrop-blur-md border border-tertiary/30 rounded-sm text-[10px] font-bold text-tertiary uppercase tracking-wider">"⚡ LIVE"</span>
+        <article class="group relative flex flex-col bg-surface-container-high rounded-xl overflow-hidden transition-transform duration-300 hover:scale-[1.02] [transform:translateZ(0)] [backface-visibility:hidden]">
+            <div class="relative aspect-[16/10] w-full overflow-hidden">
+                <img alt={listing.title.clone()} class="w-full h-full object-cover" src={image_url} />
+                <div class="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent"></div>
+                <div class="absolute bottom-3 left-3 flex items-center gap-2">
+                    <span class="px-2 py-0.5 bg-tertiary-container/20 backdrop-blur-md border border-tertiary/30 rounded-sm text-[10px] font-bold text-tertiary uppercase tracking-wider">"⚡ LIVE"</span>
+                </div>
             </div>
-            <div class="absolute bottom-0 left-0 right-0 p-5 bg-gradient-to-t from-surface-container-high via-surface-container-high/95 to-transparent">
-                <div class="flex justify-between items-start mb-1 gap-3">
-                    <h3 class="font-headline text-xl font-bold text-on-surface leading-tight">{listing.title.clone()}</h3>
-                    <div class="flex flex-col items-end">
-                        <span class={if presentation.is_free { "text-secondary font-bold font-headline" } else { "text-primary font-bold font-headline" }}>{presentation.price_primary}</span>
+            <div class="p-5 flex flex-col gap-4">
+                <div class="flex justify-between items-start">
+                    <div class="flex flex-col">
+                        <h3 class="font-headline text-xl font-bold text-on-surface leading-tight">{listing.title.clone()}</h3>
+                        <p class="text-on-surface-variant text-sm">{listing_publisher(&listing)}</p>
+                    </div>
+                    <div class="text-right">
+                        <p class={if presentation.is_free { "text-secondary font-bold font-headline" } else { "text-primary font-bold font-headline" }}>{presentation.price_primary}</p>
                         {presentation.price_hint.clone().map(|hint| {
-                            view! { <span class="text-[10px] text-on-surface-variant font-medium">{hint}</span> }
+                            view! { <p class="text-on-surface-variant text-[10px]">{hint}</p> }
                         })}
                     </div>
                 </div>
-                <p class="text-on-surface-variant text-xs mb-4 font-medium">{listing_publisher(&listing)}</p>
-                <div class="flex items-center justify-between gap-3">
+                <div class="flex justify-between items-end">
                     <div class="flex flex-col">
                         <span class="text-[10px] text-on-surface-variant uppercase font-bold tracking-widest">{meta.split_whitespace().next().unwrap_or("TYPE").to_string()}</span>
                         <span class="text-xs text-on-surface">{meta.split_once(' ').map(|(_, v)| v.to_string()).unwrap_or_else(|| "Arcadestr".to_string())}</span>
                     </div>
                     <button
                         class={if presentation.is_free {
-                            "bg-secondary text-on-secondary font-bold px-6 py-2.5 rounded-md text-sm hover:brightness-110 transition-all active:scale-95 shadow-lg shadow-secondary/10"
+                            "bg-secondary text-on-secondary font-bold py-2 px-6 rounded-lg text-sm hover:brightness-110 transition-all active:scale-95 shadow-lg shadow-secondary/10"
                         } else {
-                            "bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold px-6 py-2.5 rounded-md text-sm hover:brightness-110 transition-all active:scale-95 shadow-lg shadow-primary/10"
+                            "bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold py-2 px-6 rounded-lg text-sm hover:brightness-110 transition-all active:scale-95 shadow-lg shadow-primary/10"
                         }}
                         on:click=move |_| on_select.run(selected.clone())
                     >
@@ -177,7 +181,7 @@ fn render_featured_card(listing: GameListing, on_select: Callback<GameListing>) 
     let presentation = listing_presentation(&listing);
 
     view! {
-        <article class="md:col-span-2 group relative rounded-xl bg-surface-container-high transition-transform duration-300 hover:scale-[1.02] hover:z-10 [clip-path:inset(0_round_0.75rem)]">
+        <article class="md:col-span-2 group relative rounded-xl bg-surface-container-high overflow-hidden transition-transform duration-300 hover:scale-[1.02] [transform:translateZ(0)] [backface-visibility:hidden]">
             <div class="flex flex-col lg:flex-row h-full">
                 <div class="lg:w-3/5 relative aspect-[16/9] lg:aspect-auto bg-surface-high">
                     <img alt={listing.title.clone()} class="w-full h-full object-cover" src={image_url} />
