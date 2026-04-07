@@ -62,7 +62,7 @@ pub fn StoreFrontView(
                                         <h1 class="text-6xl font-headline font-bold text-on-surface mb-4 leading-none tracking-tight -ml-1">{listing.title.clone()}</h1>
                                         <p class="text-on-surface-variant text-lg mb-8 line-clamp-2">{listing.description.clone()}</p>
                                         <div class="flex items-center gap-4">
-                                            <button class="px-8 py-4 bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold rounded-md active:scale-95 transition-all flex items-center gap-2" on:click=move |_| on_select.run(buy_listing.clone())>
+                                            <button class="px-8 py-4 bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold rounded-md active:scale-95 transition-transform duration-150 ease-out motion-safe:will-change-transform flex items-center gap-2" on:click=move |_| on_select.run(buy_listing.clone())>
                                                 <span class="material-symbols-outlined">"shopping_cart"</span>
                                                 {format!("Buy Now - {} {}", listing.price, listing.currency)}
                                             </button>
@@ -104,19 +104,19 @@ pub fn StoreFrontView(
 
             <section class="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div class="group relative h-24 rounded-lg overflow-hidden cursor-pointer">
-                    <div class="absolute inset-0 bg-[#b6a0ff]/20 group-hover:bg-[#b6a0ff]/30 transition-all"></div>
+                    <div class="absolute inset-0 bg-[#b6a0ff]/20 group-hover:bg-[#b6a0ff]/30 transition-[background-color,opacity] duration-300 ease-out motion-safe:will-change-transform"></div>
                     <div class="absolute inset-0 flex items-center justify-center"><span class="font-headline font-bold text-xl tracking-wide">"ACTION"</span></div>
                 </div>
                 <div class="group relative h-24 rounded-lg overflow-hidden cursor-pointer">
-                    <div class="absolute inset-0 bg-[#00d2fd]/20 group-hover:bg-[#00d2fd]/30 transition-all"></div>
+                    <div class="absolute inset-0 bg-[#00d2fd]/20 group-hover:bg-[#00d2fd]/30 transition-[background-color,opacity] duration-300 ease-out motion-safe:will-change-transform"></div>
                     <div class="absolute inset-0 flex items-center justify-center"><span class="font-headline font-bold text-xl tracking-wide">"RPG"</span></div>
                 </div>
                 <div class="group relative h-24 rounded-lg overflow-hidden cursor-pointer">
-                    <div class="absolute inset-0 bg-[#ff96bb]/20 group-hover:bg-[#ff96bb]/30 transition-all"></div>
+                    <div class="absolute inset-0 bg-[#ff96bb]/20 group-hover:bg-[#ff96bb]/30 transition-[background-color,opacity] duration-300 ease-out motion-safe:will-change-transform"></div>
                     <div class="absolute inset-0 flex items-center justify-center"><span class="font-headline font-bold text-xl tracking-wide">"STRATEGY"</span></div>
                 </div>
                 <div class="group relative h-24 rounded-lg overflow-hidden cursor-pointer">
-                    <div class="absolute inset-0 bg-surface-bright group-hover:bg-surface-container-highest transition-all"></div>
+                    <div class="absolute inset-0 bg-surface-bright group-hover:bg-surface-container-highest transition-[background-color] duration-300 ease-out motion-safe:will-change-transform"></div>
                     <div class="absolute inset-0 flex items-center justify-center"><span class="font-headline font-bold text-xl tracking-wide">"INDIE"</span></div>
                 </div>
             </section>
