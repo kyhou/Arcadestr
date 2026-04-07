@@ -47,29 +47,20 @@ CREATE TABLE IF NOT EXISTS secure_storage (
 );
 "#;
 
-// Migration 2: Marketplace cache tables (stalls + products)
+// Migration 2: Marketplace cache table (listings)
 const MIGRATION_2_GAMES_TABLE: &str = r#"
-CREATE TABLE IF NOT EXISTS marketplace_stalls (
-    merchant_npub TEXT NOT NULL,
-    stall_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    description TEXT,
-    currency TEXT NOT NULL,
-    shipping_json TEXT NOT NULL DEFAULT '[]',
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (merchant_npub, stall_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_marketplace_stalls_updated_at
-ON marketplace_stalls(updated_at DESC);
-
-CREATE TABLE IF NOT EXISTS marketplace_products (
+CREATE TABLE IF NOT EXISTS marketplace_listings (
     publisher_npub TEXT NOT NULL,
     product_id TEXT NOT NULL,
     title TEXT NOT NULL,
+    summary TEXT,
     description TEXT NOT NULL,
+    status TEXT,
+    published_at INTEGER,
     price_sats INTEGER NOT NULL,
+    price_amount TEXT,
+    price_currency TEXT,
+    price_frequency TEXT,
     download_url TEXT NOT NULL,
     tags_json TEXT NOT NULL DEFAULT '[]',
     lud16 TEXT NOT NULL DEFAULT '',
@@ -79,17 +70,17 @@ CREATE TABLE IF NOT EXISTS marketplace_products (
     PRIMARY KEY (publisher_npub, product_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_marketplace_products_updated_at
-ON marketplace_products(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_marketplace_listings_updated_at
+ON marketplace_listings(updated_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_marketplace_products_publisher
-ON marketplace_products(publisher_npub);
+CREATE INDEX IF NOT EXISTS idx_marketplace_listings_publisher
+ON marketplace_listings(publisher_npub);
 "#;
 
-// Migration 3: Marketplace relational indexes
+// Migration 3: Marketplace indexes
 const MIGRATION_3_RELAYS_TABLE: &str = r#"
-CREATE INDEX IF NOT EXISTS idx_marketplace_products_created_at
-ON marketplace_products(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_marketplace_listings_created_at
+ON marketplace_listings(created_at DESC);
 "#;
 
 // Migration 4: Add users table for profile caching
@@ -113,12 +104,20 @@ CREATE INDEX IF NOT EXISTS idx_users_npub ON users(npub);
 CREATE INDEX IF NOT EXISTS idx_users_expires ON users(expires_at);
 "#;
 
+// Migration 5: Add complete NIP-99 fields to marketplace listings
+const MIGRATION_5_NIP99_COMPLETE: &str = r#"
+ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS images_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS location TEXT;
+ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS geohash TEXT;
+"#;
+
 // List of all migrations in order
 const MIGRATIONS: &[&str] = &[
     MIGRATION_1_INITIAL,
     MIGRATION_2_GAMES_TABLE,
     MIGRATION_3_RELAYS_TABLE,
     MIGRATION_4_USERS_TABLE,
+    MIGRATION_5_NIP99_COMPLETE,
 ];
 
 /// Database connection pool for SQLite
@@ -172,37 +171,31 @@ impl Database {
     }
 
     async fn ensure_marketplace_cache_schema(pool: &SqlitePool) -> Result<(), DatabaseError> {
-        let products_needs_reset = Self::table_needs_reset(
+        let listings_needs_reset = Self::table_needs_reset(
             pool,
-            "marketplace_products",
-            &["publisher_npub", "product_id", "title", "description"],
+            "marketplace_listings",
+            &[
+                "publisher_npub",
+                "product_id",
+                "title",
+                "summary",
+                "description",
+                "status",
+                "published_at",
+                "price_amount",
+                "price_currency",
+                "price_frequency",
+            ],
         )
         .await?;
 
-        let stalls_needs_reset = Self::table_needs_reset(
-            pool,
-            "marketplace_stalls",
-            &["merchant_npub", "stall_id", "name", "currency"],
-        )
-        .await?;
-
-        if products_needs_reset || stalls_needs_reset {
-            sqlx::query("DROP TABLE IF EXISTS marketplace_products")
+        if listings_needs_reset {
+            sqlx::query("DROP TABLE IF EXISTS marketplace_listings")
                 .execute(pool)
                 .await
                 .map_err(|e| {
                     DatabaseError::Migration(format!(
-                        "Failed to reset marketplace_products table: {}",
-                        e
-                    ))
-                })?;
-
-            sqlx::query("DROP TABLE IF EXISTS marketplace_stalls")
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    DatabaseError::Migration(format!(
-                        "Failed to reset marketplace_stalls table: {}",
+                        "Failed to reset marketplace_listings table: {}",
                         e
                     ))
                 })?;
