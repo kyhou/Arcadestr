@@ -63,7 +63,10 @@ CREATE TABLE IF NOT EXISTS marketplace_listings (
     price_frequency TEXT,
     download_url TEXT NOT NULL,
     tags_json TEXT NOT NULL DEFAULT '[]',
+    images_json TEXT NOT NULL DEFAULT '[]',
     lud16 TEXT NOT NULL DEFAULT '',
+    location TEXT,
+    geohash TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     source_event_id TEXT,
@@ -105,11 +108,12 @@ CREATE INDEX IF NOT EXISTS idx_users_expires ON users(expires_at);
 "#;
 
 // Migration 5: Add complete NIP-99 fields to marketplace listings
-const MIGRATION_5_NIP99_COMPLETE: &str = r#"
-ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS images_json TEXT NOT NULL DEFAULT '[]';
-ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS location TEXT;
-ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS geohash TEXT;
-"#;
+// NOTE: This migration is disabled - columns were added directly to MIGRATION_2_GAMES_TABLE
+// const MIGRATION_5_NIP99_COMPLETE: &str = r#"
+// ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS images_json TEXT NOT NULL DEFAULT '[]';
+// ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS location TEXT;
+// ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS geohash TEXT;
+// "#;
 
 // List of all migrations in order
 const MIGRATIONS: &[&str] = &[
@@ -117,7 +121,6 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_2_GAMES_TABLE,
     MIGRATION_3_RELAYS_TABLE,
     MIGRATION_4_USERS_TABLE,
-    MIGRATION_5_NIP99_COMPLETE,
 ];
 
 /// Database connection pool for SQLite
