@@ -3,6 +3,23 @@ use leptos::prelude::*;
 use crate::models::GameListing;
 use crate::ui_v2::views::marketplace_loader::use_marketplace_listings;
 
+const FALLBACK_COVER: &str = "https://lh3.googleusercontent.com/aida-public/AB6AXuDcG9Zo3aR9Vrpk5pP2jenw1AoVFoOzbAQ-t57kQtlbwGQVsLLwmHyFuyzRVsOh71iN4mHyhfw0Sx4YgdJ9duL9ANv3Xa1W7jYKWeVgj5_rE7KzitErwV3dtgEFGsGCSXtFQxyw6tQoGmP3V-Ci9Vs9_ZQXh6WXrFi6eperEaPm3YutXUIImUuC5sKm2hgyVb6sMBnpn0Imy94ETrJ9WO2XeC6tTMddB6EA-x1LgnN3Ezj_dPitegkcYmXGBSWZyCTZgxINu01kmdM";
+
+fn first_valid_image(images: &[String]) -> String {
+    images
+        .iter()
+        .find(|url| {
+            let trimmed = url.trim();
+            !trimmed.is_empty()
+                && (trimmed.starts_with("https://") || trimmed.starts_with("http://"))
+                && !trimmed.contains('"')
+                && !trimmed.contains('\'')
+                && !trimmed.contains(')')
+        })
+        .cloned()
+        .unwrap_or_else(|| FALLBACK_COVER.to_string())
+}
+
 #[component]
 pub fn StoreFrontView(
     on_select: Callback<GameListing>,
@@ -19,7 +36,18 @@ pub fn StoreFrontView(
     view! {
         <div class="max-w-[1600px] mx-auto p-8 space-y-12">
             <section class="relative h-[500px] rounded-xl overflow-hidden group">
-                <div class="absolute inset-0 bg-cover bg-center transition-transform duration-700 group-hover:scale-105" style="background-image: url('https://lh3.googleusercontent.com/aida-public/AB6AXuDLZHKt11FGlVAe3iu4oH-Ztrgy-qXyUKQg5bT8GyKkAhkMPY2ZVFeieUrWpONKPc-qvXDt0Mbd8ywr530YAk_hYjJSBo46nTVtrwLINPALlirA8_uz9i_vkDRA5tFoLO9dOZfUfTxCuO_ioS3NiQXMu5jsSCBNK-qQe2JxpW1eHpEcH7pJt2gI-P8iZp75_MKWdbTQ3REexv9v1_2J27ojtqLvZnHxbZ2Vjns79XrylFHxppHMzyPpXcwLyumjr8GFBtWd_HFRwF4');"></div>
+                <div class="absolute inset-0 overflow-hidden">
+                    <img
+                        class="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
+                        src=move || {
+                            featured_listing
+                                .get()
+                                .map(|listing| first_valid_image(&listing.images))
+                                .unwrap_or_else(|| FALLBACK_COVER.to_string())
+                        }
+                        alt="featured game cover"
+                    />
+                </div>
                 <div class="absolute inset-0 bg-gradient-to-t from-background via-background/40 to-transparent"></div>
 
                 <div class="absolute bottom-0 left-0 p-12 w-full flex justify-between items-end">
@@ -38,7 +66,7 @@ pub fn StoreFrontView(
                                                 <span class="material-symbols-outlined">"shopping_cart"</span>
                                                 {format!("Buy Now - {} {}", listing.price, listing.currency)}
                                             </button>
-                                            <button class="px-8 py-4 bg-surface-bright/50 backdrop-blur-md text-on-surface font-bold rounded-md hover:bg-surface-bright transition-all active:scale-95" on:click=move |_| on_select.run(details_listing.clone())>
+                                            <button class="px-8 py-4 bg-surface-bright/50 backdrop-blur-md text-on-surface font-bold rounded-md hover:bg-surface-bright transition-[background-color,opacity] duration-300 ease-out active:scale-95 motion-safe:will-change-transform" on:click=move |_| on_select.run(details_listing.clone())>
                                                 "View Details"
                                             </button>
                                         </div>
@@ -156,14 +184,10 @@ pub fn StoreFrontView(
                                                 _ => "$5.80 USD".to_string(),
                                             };
                                             let cta_label = if index == 1 { "Play Now" } else { "Quick Buy" };
-                                            let image_url = match index % 3 {
-                                                0 => "https://lh3.googleusercontent.com/aida-public/AB6AXuAkSqV1ZOY7qDKBQQ-nU-WKmOwR16envOE_TMPHQep0afObsmDW51MoGnuCDehLWvRSiX2M-G1ipCeBVnLuSnk_GtSaKNiiKAL3NGBqfTVvkZErj92gogHgjo8Dm9s9qZAoKzMpmCEwTLAaasaklmpG0EvebxYhk_pgx9zFciCa6eEvQAequV2_VwSfxkp8qFHQKZDgSfcZX7ItUvMkkVo9gJMVU1kvmoEqtnEdxEgw_XCFEvda_kG_L7oqZh2ranJukSzpwKvU8ow",
-                                                1 => "https://lh3.googleusercontent.com/aida-public/AB6AXuBppEh6duJunDcRrAlDyCHwjcLgKSLNrLn7urlFTA1JDEkbmtnYBzd_8RTWxEH0yhfLUX6wQa3QLRpQt89K69EpDGFa4DG6BcbpzyvRD9MKUR4kFURF1OHnGUsMf8pBgOnoVi2rpRC8MhhdLRTwAZGOCXgv4HUTOLToqmpkDBz1btGwBcD05i3nH5GAd2JOlqCOUwMiPrEuVPBCjSKOLd6HZ8owiUNaSNfVauMEYH3RM5Gx5tWR72rlRSNaHzmv2votTLxYPeMXM5k",
-                                                _ => "https://lh3.googleusercontent.com/aida-public/AB6AXuBalkh2NCA6UZ04qa-pFXIL4N2iVby1eMnZRzDd9a2oAa9WYnFWl8OIykQNH3c4AcYN_aUwFcdGEXpllBbQf7Hz_j2HDQGKQaQXRZAmXB0nrdVNADrOeO4o5chwWjZYJKlC9Zp48Rwgt9m66yqG-k_rZ-Aot35r46iWmWCWdpye8690JqLNYoO0KmKmmTtAS2g8EsoY7eG58kSRXTaRsTqPVGPu7q43eYjpHizKEqucFvwzRT8C14m3Gji3_-ym2ZZqXrJI8pdohOA",
-                                            };
+                                            let image_url = first_valid_image(&listing.images);
 
                                             view! {
-                                                <button class="group bg-surface-container-high rounded-xl overflow-hidden hover:scale-[1.02] hover:bg-surface-bright transition-all duration-300 text-left h-full flex flex-col" on:click=move |_| on_select.run(selected.clone())>
+                                                <button class="group bg-surface-container-high rounded-xl overflow-hidden hover:scale-[1.02] hover:bg-surface-bright transition-[transform,background-color] duration-300 ease-out motion-safe:will-change-transform text-left h-full flex flex-col" on:click=move |_| on_select.run(selected.clone())>
                                                     <div class="aspect-video relative">
                                                         <img class="w-full h-full object-cover" src={image_url} alt="game cover" />
                                                         <div class="absolute top-3 right-3 bg-background/80 backdrop-blur-md px-2 py-1 rounded text-[10px] font-bold text-tertiary">{format!("⚡ {}", zaps)}</div>

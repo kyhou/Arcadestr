@@ -128,7 +128,7 @@ fn render_listing_card(listing: GameListing, on_select: Callback<GameListing>) -
         .unwrap_or_else(|| "OWNERSHIP Digital License".to_string());
 
     view! {
-        <article class="group bg-surface-container-high rounded-xl overflow-hidden hover:scale-[1.02] hover:bg-surface-bright transition-all duration-300">
+        <article class="group bg-surface-container-high rounded-xl overflow-hidden hover:scale-[1.02] hover:bg-surface-bright transition-[transform,background-color] duration-300 ease-out motion-safe:will-change-transform">
             <div class="relative aspect-[16/10] overflow-hidden">
                 <img alt={listing.title.clone()} class="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700" src={image_url} />
                 <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent"></div>
@@ -179,7 +179,7 @@ fn render_featured_card(listing: GameListing, on_select: Callback<GameListing>) 
     let presentation = listing_presentation(&listing);
 
     view! {
-        <article class="md:col-span-2 group bg-surface-container-high rounded-xl overflow-hidden hover:bg-surface-bright transition-all duration-300 relative">
+        <article class="md:col-span-2 group bg-surface-container-high rounded-xl overflow-hidden hover:bg-surface-bright transition-[background-color] duration-300 ease-out motion-safe:will-change-transform relative">
             <div class="flex flex-col lg:flex-row h-full">
                 <div class="lg:w-3/5 relative overflow-hidden aspect-[16/9] lg:aspect-auto">
                     <img alt={listing.title.clone()} class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-1000" src={image_url} />

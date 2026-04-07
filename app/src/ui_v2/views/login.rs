@@ -361,7 +361,7 @@ pub fn LoginV2View() -> impl IntoView {
                                                         type="password"
                                                     />
                                                     <button
-                                                        class="bg-surface-variant hover:bg-surface-bright text-on-surface px-6 py-3 rounded-md font-bold text-sm transition-colors"
+                                                        class="bg-surface-variant hover:bg-surface-bright text-on-surface px-6 py-3 rounded-md font-bold text-sm transition-[background-color] duration-300 ease-out motion-safe:will-change-transform"
                                                         on:click=on_nsec_login
                                                         disabled=move || nsec_input.get().is_empty() || auth_stored.get_value().is_loading.get()
                                                     >
@@ -414,7 +414,7 @@ pub fn LoginV2View() -> impl IntoView {
                                                     <div class="flex items-center bg-surface-container-lowest rounded-md border border-outline-variant/10 p-1">
                                                         <input class="bg-transparent border-none focus:ring-0 text-xs text-on-surface/60 flex-1 px-3 py-2 truncate" type="text" readonly=true prop:value=move || manual_connect_uri.get() />
                                                         <button
-                                                            class="bg-surface-container-high hover:bg-surface-bright text-primary p-2 rounded-md transition-colors"
+                                                            class="bg-surface-container-high hover:bg-surface-bright text-primary p-2 rounded-md transition-[background-color] duration-300 ease-out motion-safe:will-change-transform"
                                                             title="Copy to clipboard"
                                                             on:click=move |_| {
                                                                 #[cfg(target_arch = "wasm32")]
@@ -559,7 +559,7 @@ pub fn LoginV2View() -> impl IntoView {
                                                         _ => (acc.signing_mode.clone(), "text-tertiary"),
                                                     };
                                                 let card_class = format!(
-                                                    "group relative bg-surface-container-high hover:bg-surface-bright rounded-xl p-6 transition-all duration-300 border cursor-pointer {}",
+                                                    "group relative bg-surface-container-high hover:bg-surface-bright rounded-xl p-6 transition-[background-color,border-color] duration-300 ease-out border cursor-pointer motion-safe:will-change-transform {}",
                                                     if is_current {
                                                         "border-primary/40"
                                                     } else {
