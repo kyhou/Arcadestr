@@ -128,15 +128,13 @@ fn render_listing_card(listing: GameListing, on_select: Callback<GameListing>) -
         .unwrap_or_else(|| "OWNERSHIP Digital License".to_string());
 
     view! {
-        <article class="group bg-surface-container-high rounded-xl overflow-hidden hover:scale-[1.02] hover:bg-surface-bright transition-[transform,background-color] duration-300 ease-out motion-safe:will-change-transform">
-            <div class="relative aspect-[16/10] overflow-hidden bg-surface-high isolation-auto">
-                <img alt={listing.title.clone()} class="w-full h-full object-cover transition-transform duration-700 group-hover:scale-110 [transform:translateZ(0)] [backface-visibility:hidden] [outline:1px_solid_transparent] will-change-transform" src={image_url} />
-                <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent"></div>
-                <div class="absolute bottom-4 left-4 flex items-center gap-2">
-                    <span class="px-2 py-0.5 bg-tertiary-container/20 backdrop-blur-md border border-tertiary/30 rounded-sm text-[10px] font-bold text-tertiary uppercase tracking-wider">"⚡ LIVE"</span>
-                </div>
+        <article class="group relative aspect-[16/10] rounded-xl bg-surface-container-high transition-transform duration-300 hover:scale-[1.03] hover:z-10 [clip-path:inset(0_round_0.75rem)]">
+            <img alt={listing.title.clone()} class="w-full h-full object-cover" src={image_url} />
+            <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent"></div>
+            <div class="absolute bottom-4 left-4 flex items-center gap-2">
+                <span class="px-2 py-0.5 bg-tertiary-container/20 backdrop-blur-md border border-tertiary/30 rounded-sm text-[10px] font-bold text-tertiary uppercase tracking-wider">"⚡ LIVE"</span>
             </div>
-            <div class="p-5">
+            <div class="absolute bottom-0 left-0 right-0 p-5 bg-gradient-to-t from-surface-container-high via-surface-container-high/95 to-transparent">
                 <div class="flex justify-between items-start mb-1 gap-3">
                     <h3 class="font-headline text-xl font-bold text-on-surface leading-tight">{listing.title.clone()}</h3>
                     <div class="flex flex-col items-end">
@@ -146,7 +144,7 @@ fn render_listing_card(listing: GameListing, on_select: Callback<GameListing>) -
                         })}
                     </div>
                 </div>
-                <p class="text-on-surface-variant text-xs mb-6 font-medium">{listing_publisher(&listing)}</p>
+                <p class="text-on-surface-variant text-xs mb-4 font-medium">{listing_publisher(&listing)}</p>
                 <div class="flex items-center justify-between gap-3">
                     <div class="flex flex-col">
                         <span class="text-[10px] text-on-surface-variant uppercase font-bold tracking-widest">{meta.split_whitespace().next().unwrap_or("TYPE").to_string()}</span>
@@ -179,10 +177,10 @@ fn render_featured_card(listing: GameListing, on_select: Callback<GameListing>) 
     let presentation = listing_presentation(&listing);
 
     view! {
-        <article class="md:col-span-2 group bg-surface-container-high rounded-xl overflow-hidden hover:bg-surface-bright transition-[background-color] duration-300 ease-out motion-safe:will-change-transform relative">
+        <article class="md:col-span-2 group relative rounded-xl bg-surface-container-high transition-transform duration-300 hover:scale-[1.02] hover:z-10 [clip-path:inset(0_round_0.75rem)]">
             <div class="flex flex-col lg:flex-row h-full">
-                <div class="lg:w-3/5 relative overflow-hidden aspect-[16/9] lg:aspect-auto bg-surface-high isolation-auto">
-                    <img alt={listing.title.clone()} class="w-full h-full object-cover transition-transform duration-1000 group-hover:scale-105 [transform:translateZ(0)] [backface-visibility:hidden] [outline:1px_solid_transparent] will-change-transform" src={image_url} />
+                <div class="lg:w-3/5 relative aspect-[16/9] lg:aspect-auto bg-surface-high">
+                    <img alt={listing.title.clone()} class="w-full h-full object-cover" src={image_url} />
                     <div class="absolute inset-0 bg-gradient-to-r from-transparent via-black/20 to-surface-container-high hidden lg:block"></div>
                 </div>
                 <div class="lg:w-2/5 p-8 flex flex-col justify-center">

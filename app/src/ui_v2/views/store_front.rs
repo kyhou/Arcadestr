@@ -35,10 +35,10 @@ pub fn StoreFrontView(
 
     view! {
         <div class="max-w-[1600px] mx-auto p-8 space-y-12">
-            <section class="relative h-[500px] rounded-xl overflow-hidden group">
-                <div class="absolute inset-0 overflow-hidden bg-surface-high isolation-auto">
+            <section class="group relative h-[500px] rounded-xl transition-transform duration-700 hover:scale-[1.02] [clip-path:inset(0_round_0.75rem)]">
+                <div class="absolute inset-0 bg-surface-high">
                     <img
-                        class="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105 [transform:translateZ(0)] [backface-visibility:hidden] [outline:1px_solid_transparent] will-change-transform"
+                        class="w-full h-full object-cover"
                         src=move || {
                             featured_listing
                                 .get()
