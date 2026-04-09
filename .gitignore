@@ -1,7 +1,38 @@
-\target
+# Rust build artifacts
+/target
 
-\.opencode
-\.serena
-\.vscode
-\.worktrees
-\.tmp
+# IDE and editor files
+/.opencode
+/.serena
+/.vscode
+/.idea
+*.swp
+*.swo
+*~
+
+# Git worktrees and temp
+/.worktrees
+/.tmp
+
+# Tauri auto-generated files
+/desktop/gen/
+
+# Web build output (Trunk)
+/web/dist/
+
+# SQLite database files (test artifacts)
+*.db
+
+# Environment files
+.env
+.env.local
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# V8 compile cache
+v8-compile-cache-*/
