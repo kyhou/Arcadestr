@@ -15,7 +15,7 @@ use arcadestr_core::signers::NostrSigner;
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::extended_network::ExtendedNetworkRepository;
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
-use arcadestr_core::marketplace::{apply_filter, MarketplaceFilter};
+use arcadestr_core::marketplace::{apply_filter, apply_filter_nip99, MarketplaceFilter};
 use arcadestr_core::marketplace_cache::{MarketplaceCache, UpsertOutcome};
 use arcadestr_core::nip05_validator::Nip05Validator;
 use arcadestr_core::nip46::AppSignerState;
@@ -436,38 +436,26 @@ async fn fetch_marketplace(
         since_days
     );
 
-    // Acquire and release the lock for each operation to avoid holding a
-    // MutexGuard across await points (see ARCHITECTURE.md §11.4).
-    let stalls = {
-        let nostr = state.nostr.lock().await;
-        nostr.fetch_nip15_stalls(limit, since_days).await?
-    };
-    tracing::info!("fetch_marketplace: got {} stalls", stalls.len());
-
     let products = {
         let nostr = state.nostr.lock().await;
-        nostr.fetch_nip15_products(limit, since_days).await?
+        nostr.fetch_nip99_listings(limit, since_days).await?
     };
     tracing::info!("fetch_marketplace: got {} products", products.len());
 
-    // Build a stall lookup map for O(1) enrichment during the product mapping.
-    let stall_map: std::collections::HashMap<String, &arcadestr_core::marketplace::Nip15Stall> =
-        stalls.iter().map(|s| (s.id.clone(), s)).collect();
+    // TODO(nip99-migration): stall enrichment pipeline removed
+    // NIP-99 listings are self-contained — no stall join needed
 
     // Apply the filter (no-op while filter == default).
-    let filtered = apply_filter(products, &filter);
+    let filtered = apply_filter_nip99(products, &filter);
     tracing::info!(
         "fetch_marketplace: {} products after filtering",
         filtered.len()
     );
 
-    // Map Nip15Product → GameListing, enriching with stall name where available.
+    // Map listings directly to GameListing.
     let listings: Vec<GameListing> = filtered
         .into_iter()
-        .map(|p| {
-            let stall = stall_map.get(&p.stall_id).copied();
-            GameListing::from_nip15(p, stall)
-        })
+        .map(GameListing::from_listing)
         .collect();
 
     tracing::info!("fetch_marketplace: returning {} listings", listings.len());
@@ -519,23 +507,6 @@ async fn fetch_marketplace_stream(
         cached_emitted
     );
 
-    // Fetch stalls first (needed for product enrichment)
-    let stalls = {
-        let nostr = state.nostr.lock().await;
-        nostr.fetch_nip15_stalls(limit, since_days).await?
-    };
-    tracing::info!("fetch_marketplace_stream: got {} stalls", stalls.len());
-
-    if let Err(e) = state.marketplace_cache.upsert_stalls(&stalls).await {
-        tracing::warn!("fetch_marketplace_stream: failed to upsert stalls: {}", e);
-    }
-
-    // Build stall lookup map for enriching products
-    let stall_map: HashMap<(String, String), arcadestr_core::marketplace::Nip15Stall> = stalls
-        .iter()
-        .map(|s| ((s.merchant_npub.clone(), s.id.clone()), s.clone()))
-        .collect();
-
     let seen_signatures = StdArc::new(StdMutex::new(cached_signatures));
     let relay_updates: StdArc<StdMutex<Vec<GameListing>>> = StdArc::new(StdMutex::new(Vec::new()));
 
@@ -549,14 +520,14 @@ async fn fetch_marketplace_stream(
         let nostr = state.nostr.lock().await;
         let relay_manager = nostr.get_relay_manager();
 
-        arcadestr_core::marketplace::fetch_nip15_products_streaming(
+        // TODO(nip99-migration): stall enrichment pipeline removed
+        // NIP-99 listings are self-contained — no stall join needed
+        arcadestr_core::marketplace::fetch_nip99_listings_streaming(
             relay_manager,
             limit,
             since_days,
             move |product| {
-                // Enrich with stall data if available
-                let stall = stall_map.get(&(product.merchant_npub.clone(), product.stall_id.clone()));
-                let listing = GameListing::from_nip15(product, stall);
+                let listing = GameListing::from_listing(product);
                 let key = listing_cache_key(&listing);
                 let signature = listing_signature(&listing);
 

@@ -70,7 +70,9 @@ where
 }
 
 /// Deserialize an optional vector that may be an array or null.
-fn deserialize_optional_vec_shipping<'de, D>(deserializer: D) -> Result<Vec<ProductShipping>, D::Error>
+fn deserialize_optional_vec_shipping<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ProductShipping>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -93,7 +95,9 @@ where
     }
 }
 
-fn deserialize_optional_vec_shipping_zone<'de, D>(deserializer: D) -> Result<Vec<ShippingZone>, D::Error>
+fn deserialize_optional_vec_shipping_zone<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ShippingZone>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -225,6 +229,31 @@ pub struct Nip15Product {
     pub created_at: u64,
 }
 
+/// A NIP-99 listing (kind 30402/30403) enriched with event-level metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Nip99Listing {
+    /// Listing UUID from the `d` tag.
+    pub id: String,
+    pub title: String,
+    /// Markdown description from `event.content`.
+    pub content: String,
+    pub summary: Option<String>,
+    pub published_at: Option<i64>,
+    pub location: Option<String>,
+    pub price_amount: Option<String>,
+    pub price_currency: Option<String>,
+    pub price_frequency: Option<String>,
+    pub images: Vec<String>,
+    /// Geohash from the `g` tag.
+    pub geohash: Option<String>,
+    /// Categories/keywords derived from `t` tags.
+    pub tags: Vec<String>,
+    pub status: Option<String>,
+    /// Bech32-encoded `npub` of the merchant who published this event.
+    pub merchant_npub: String,
+    pub created_at: u64,
+}
+
 // ── MarketplaceFilter ─────────────────────────────────────────────────────────
 
 /// Describes every dimension along which the marketplace can be filtered.
@@ -266,9 +295,8 @@ pub struct MarketplaceFilter {
     /// is also set. Empty `Vec` = block nobody.
     pub merchant_blacklist: Option<Vec<String>>,
 
-    // ── Stall ─────────────────────────────────────────────────────────────────
-    /// Restrict results to products from these stall UUIDs.
-    /// Empty `Vec` = no restriction.
+    // ── Stall filtering ───────────────────────────────────────────────────────
+    /// Exclusive allowlist of stall IDs. Empty `Vec` = allow all.
     pub stall_ids: Option<Vec<String>>,
 }
 
@@ -284,6 +312,16 @@ pub fn apply_filter(products: Vec<Nip15Product>, filter: &MarketplaceFilter) -> 
     products
         .into_iter()
         .filter(|p| passes_filter(p, filter))
+        .collect()
+}
+
+pub fn apply_filter_nip99(
+    listings: Vec<Nip99Listing>,
+    filter: &MarketplaceFilter,
+) -> Vec<Nip99Listing> {
+    listings
+        .into_iter()
+        .filter(|p| passes_filter_nip99(p, filter))
         .collect()
 }
 
@@ -342,12 +380,73 @@ fn passes_filter(p: &Nip15Product, f: &MarketplaceFilter) -> bool {
         }
     }
 
-    // ── Stall filter ──────────────────────────────────────────────────────────
+    // ── Stall filter ───────────────────────────────────────────────────────────
     if let Some(ref stall_ids) = f.stall_ids {
         if !stall_ids.is_empty() && !stall_ids.contains(&p.stall_id) {
             return false;
         }
     }
+
+    true
+}
+
+fn passes_filter_nip99(p: &Nip99Listing, f: &MarketplaceFilter) -> bool {
+    let price = p
+        .price_amount
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<f64>()
+        .unwrap_or(0.0);
+
+    if f.free_only.unwrap_or(false) && price > 0.0 {
+        return false;
+    }
+
+    if let Some(min) = f.min_price {
+        if price < min {
+            return false;
+        }
+    }
+    if let Some(max) = f.max_price {
+        if price > max {
+            return false;
+        }
+    }
+
+    if let Some(ref currencies) = f.currencies {
+        if !currencies.is_empty()
+            && !currencies
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(p.price_currency.as_deref().unwrap_or("")))
+        {
+            return false;
+        }
+    }
+
+    if let Some(ref cats) = f.categories {
+        if !cats.is_empty() {
+            let hit = cats
+                .iter()
+                .any(|c| p.tags.iter().any(|pc| pc.eq_ignore_ascii_case(c)));
+            if !hit {
+                return false;
+            }
+        }
+    }
+
+    if let Some(ref wl) = f.merchant_whitelist {
+        if !wl.is_empty() && !wl.contains(&p.merchant_npub) {
+            return false;
+        }
+    }
+
+    if let Some(ref bl) = f.merchant_blacklist {
+        if bl.contains(&p.merchant_npub) {
+            return false;
+        }
+    }
+
+    // stall_ids filter not applicable in NIP-99
 
     true
 }
@@ -487,7 +586,7 @@ pub(crate) async fn fetch_nip15_products_impl(
 /// * `on_product` — callback invoked for each unique product as it arrives.
 ///
 /// Returns the total count of unique products found.
-/// 
+///
 /// Products are deduplicated by ID (first occurrence wins).
 /// Events that fail to parse are silently skipped.
 pub async fn fetch_nip15_products_streaming<F>(
@@ -501,7 +600,7 @@ where
 {
     use std::collections::HashSet;
     use tokio::sync::Mutex;
-    
+
     let filter = build_filter(Kind::Custom(30018), limit, since_days);
 
     tracing::info!(
@@ -511,48 +610,50 @@ where
     );
 
     let manager = relay_manager.lock().await;
-    
+
     // Track seen product IDs for deduplication
     let seen_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let product_count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    
+
     let seen_ids_clone = Arc::clone(&seen_ids);
     let product_count_clone = Arc::clone(&product_count);
-    
+
     // Stream events from relays
-    let result = manager.fetch_events_streaming(
-        filter,
-        5,  // 5s timeout per relay
-        5,  // 5s inactivity timeout
-        move |_relay_url, events| {
-            // Parse events and emit products
-            for event in events {
-                match parse_product(event) {
-                    Ok(product) => {
-                        // Deduplicate by ID - use try_lock to avoid blocking in async context
-                        if let Ok(mut seen) = seen_ids_clone.try_lock() {
-                            if !seen.contains(&product.id) {
-                                seen.insert(product.id.clone());
-                                drop(seen);  // Explicitly drop to release lock
-                                
-                                // Update count
-                                if let Ok(mut count) = product_count_clone.try_lock() {
-                                    *count += 1;
-                                    drop(count);  // Explicitly drop to release lock
+    let result = manager
+        .fetch_events_streaming(
+            filter,
+            5, // 5s timeout per relay
+            5, // 5s inactivity timeout
+            move |_relay_url, events| {
+                // Parse events and emit products
+                for event in events {
+                    match parse_product(event) {
+                        Ok(product) => {
+                            // Deduplicate by ID - use try_lock to avoid blocking in async context
+                            if let Ok(mut seen) = seen_ids_clone.try_lock() {
+                                if !seen.contains(&product.id) {
+                                    seen.insert(product.id.clone());
+                                    drop(seen); // Explicitly drop to release lock
+
+                                    // Update count
+                                    if let Ok(mut count) = product_count_clone.try_lock() {
+                                        *count += 1;
+                                        drop(count); // Explicitly drop to release lock
+                                    }
+
+                                    // Emit product
+                                    on_product(product);
                                 }
-                                
-                                // Emit product
-                                on_product(product);
                             }
                         }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Skipping malformed product event: {}", e);
+                        Err(e) => {
+                            tracing::debug!("Skipping malformed product event: {}", e);
+                        }
                     }
                 }
-            }
-        }
-    ).await;
+            },
+        )
+        .await;
 
     let count = match result {
         Ok(_) => {
@@ -628,6 +729,223 @@ fn parse_product(event: Event) -> Result<Nip15Product, serde_json::Error> {
         merchant_npub: npub_of(&event.pubkey),
         created_at: event.created_at.as_secs(),
     })
+}
+
+fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
+    let mut id: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut summary: Option<String> = None;
+    let mut published_at: Option<i64> = None;
+    let mut location: Option<String> = None;
+    let mut geohash: Option<String> = None;
+    let mut status: Option<String> = None;
+    let mut price_amount: Option<String> = None;
+    let mut price_currency: Option<String> = None;
+    let mut price_frequency: Option<String> = None;
+    let mut images: Vec<String> = Vec::new();
+    let mut tags: Vec<String> = Vec::new();
+
+    for tag in event.tags.iter() {
+        let v = tag.clone().to_vec();
+        match v.first().map(String::as_str) {
+            Some("d") => {
+                if id.is_none() {
+                    id = v.get(1).cloned();
+                }
+            }
+            Some("title") => {
+                if title.is_none() {
+                    title = v.get(1).cloned();
+                }
+            }
+            Some("summary") => {
+                if summary.is_none() {
+                    summary = v.get(1).cloned();
+                }
+            }
+            Some("published_at") => {
+                if published_at.is_none() {
+                    published_at = v.get(1).and_then(|s| s.parse::<i64>().ok());
+                }
+            }
+            Some("location") => {
+                if location.is_none() {
+                    location = v.get(1).cloned();
+                }
+            }
+            Some("g") => {
+                if geohash.is_none() {
+                    geohash = v.get(1).cloned();
+                }
+            }
+            Some("status") => {
+                if status.is_none() {
+                    status = v.get(1).cloned();
+                }
+            }
+            Some("price") => {
+                if price_amount.is_none() {
+                    price_amount = v.get(1).cloned();
+                }
+                if price_currency.is_none() {
+                    price_currency = v.get(2).cloned();
+                }
+                if price_frequency.is_none() {
+                    price_frequency = v.get(3).cloned();
+                }
+            }
+            Some("image") => {
+                if let Some(url) = v.get(1).cloned() {
+                    images.push(url);
+                }
+            }
+            Some("t") => {
+                if let Some(tag_value) = v.get(1).cloned() {
+                    tags.push(tag_value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let id = id.ok_or_else(|| "Missing required d tag".to_string())?;
+    let title = title.ok_or_else(|| "Missing required title tag".to_string())?;
+
+    Ok(Nip99Listing {
+        id,
+        title,
+        content: event.content,
+        summary,
+        published_at,
+        location,
+        price_amount,
+        price_currency,
+        price_frequency,
+        images,
+        geohash,
+        tags,
+        status,
+        merchant_npub: npub_of(&event.pubkey),
+        created_at: event.created_at.as_secs(),
+    })
+}
+
+pub(crate) async fn fetch_nip99_listings_impl(
+    relay_manager: &Arc<Mutex<RelayManager>>,
+    limit: usize,
+    since_days: Option<u64>,
+) -> Result<Vec<Nip99Listing>, String> {
+    let filter = build_filter(Kind::Custom(30402), limit, since_days);
+
+    let manager = relay_manager.lock().await;
+
+    tracing::info!(
+        "Fetching NIP-99 listings with filter: kind=30402, limit={}, since_days={:?}",
+        limit,
+        since_days
+    );
+
+    let events = match manager.fetch_events_with_timeout(filter, 30).await {
+        Ok(events) => {
+            tracing::info!(
+                "fetch_nip99_listings: successfully received {} events",
+                events.len()
+            );
+            events
+        }
+        Err(e) => {
+            tracing::warn!(
+                "fetch_nip99_listings relay error: {} - returning empty list",
+                e
+            );
+            return Ok(Vec::new());
+        }
+    };
+
+    let listings: Vec<Nip99Listing> = events
+        .into_iter()
+        .filter_map(|ev| {
+            parse_listing(ev)
+                .map_err(|e| tracing::warn!("Skipping malformed listing event: {e}"))
+                .ok()
+        })
+        .collect();
+
+    tracing::info!(
+        "fetch_nip99_listings: parsed {} valid listings",
+        listings.len()
+    );
+    Ok(listings)
+}
+
+pub async fn fetch_nip99_listings_streaming<F>(
+    relay_manager: &Arc<tokio::sync::Mutex<RelayManager>>,
+    limit: usize,
+    since_days: Option<u64>,
+    mut on_product: F,
+) -> Result<u32, String>
+where
+    F: FnMut(Nip99Listing) + Send + 'static,
+{
+    use std::collections::HashSet;
+    use tokio::sync::Mutex;
+
+    let filter = build_filter(Kind::Custom(30402), limit, since_days);
+
+    tracing::info!(
+        "Streaming NIP-99 listings: kind=30402, limit={}, since_days={:?}",
+        limit,
+        since_days
+    );
+
+    let manager = relay_manager.lock().await;
+
+    let seen_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let product_count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+
+    let seen_ids_clone = Arc::clone(&seen_ids);
+    let product_count_clone = Arc::clone(&product_count);
+
+    let result = manager
+        .fetch_events_streaming(filter, 5, 5, move |_relay_url, events| {
+            for event in events {
+                match parse_listing(event) {
+                    Ok(product) => {
+                        if let Ok(mut seen) = seen_ids_clone.try_lock() {
+                            if !seen.contains(&product.id) {
+                                seen.insert(product.id.clone());
+                                drop(seen);
+
+                                if let Ok(mut count) = product_count_clone.try_lock() {
+                                    *count += 1;
+                                    drop(count);
+                                }
+
+                                on_product(product);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Skipping malformed listing event: {}", e);
+                    }
+                }
+            }
+        })
+        .await;
+
+    let count = match result {
+        Ok(_) => {
+            let count = *product_count.lock().await;
+            tracing::info!("Streaming fetch complete: {} unique listings", count);
+            count
+        }
+        Err(e) => {
+            tracing::warn!("Streaming fetch ended with error: {}", e);
+            *product_count.lock().await
+        }
+    };
+
+    Ok(count)
 }
 
 /// Convert a `PublicKey` to bech32 `npub`, falling back to hex on error.

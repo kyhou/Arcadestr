@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 pub enum ListingSource {
     /// NIP-15 product event (kind 30018). Current standard.
     Nip15Product,
+    /// NIP-99 listing event (kind 30402/30403).
+    Nip99Listing,
     /// Legacy game listing (kind 30078). Deprecated — no longer published.
     Legacy,
 }
@@ -182,6 +184,46 @@ impl GameListing {
             lud16: String::new(),
             event_id: None,
             created_at: product.created_at,
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    pub fn from_listing(listing: arcadestr_core::marketplace::Nip99Listing) -> Self {
+        let download_url = listing.images.first().cloned().unwrap_or_default();
+
+        let parsed_amount = listing
+            .price_amount
+            .as_deref()
+            .and_then(|amount| amount.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        let currency = listing.price_currency.clone().unwrap_or_default();
+        let price_sats =
+            if currency.eq_ignore_ascii_case("SATS") || currency.eq_ignore_ascii_case("SAT") {
+                parsed_amount as u64
+            } else {
+                0
+            };
+
+        GameListing {
+            id: listing.id,
+            source: ListingSource::Nip99Listing,
+            title: listing.title,
+            description: listing.content,
+            images: listing.images,
+            download_url,
+            price: parsed_amount,
+            currency,
+            price_sats,
+            quantity: None,
+            tags: listing.tags,
+            specs: Vec::new(),
+            publisher_npub: listing.merchant_npub,
+            stall_id: String::new(),
+            stall_name: None,
+            lud16: String::new(),
+            event_id: None,
+            created_at: listing.created_at,
         }
     }
 }

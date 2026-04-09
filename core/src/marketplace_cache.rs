@@ -1,4 +1,3 @@
-use crate::marketplace::Nip15Stall;
 use crate::nostr::GameListing;
 use sqlx::{Pool, Row, Sqlite};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,8 +32,9 @@ impl MarketplaceCache {
             sqlx::query(
                 r#"
                 SELECT product_id, title, description, price_sats, download_url,
-                       publisher_npub, created_at, tags_json, lud16
-                FROM marketplace_products
+                       publisher_npub, created_at, tags_json, lud16,
+                       images_json, summary, published_at, location, geohash, status
+                FROM marketplace_listings
                 WHERE created_at >= ?
                 ORDER BY updated_at DESC
                 LIMIT ?
@@ -48,8 +48,9 @@ impl MarketplaceCache {
             sqlx::query(
                 r#"
                 SELECT product_id, title, description, price_sats, download_url,
-                       publisher_npub, created_at, tags_json, lud16
-                FROM marketplace_products
+                       publisher_npub, created_at, tags_json, lud16,
+                       images_json, summary, published_at, location, geohash, status
+                FROM marketplace_listings
                 ORDER BY updated_at DESC
                 LIMIT ?
                 "#,
@@ -64,6 +65,8 @@ impl MarketplaceCache {
             .map(|row| {
                 let tags_json: String = row.get("tags_json");
                 let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+                let images_json: String = row.get("images_json");
+                let images: Vec<String> = serde_json::from_str(&images_json).unwrap_or_default();
 
                 GameListing {
                     id: row.get("product_id"),
@@ -75,48 +78,17 @@ impl MarketplaceCache {
                     created_at: row.get::<i64, _>("created_at").max(0) as u64,
                     tags,
                     lud16: row.get("lud16"),
+                    images,
+                    summary: row.get("summary"),
+                    published_at: row
+                        .get::<Option<i64>, _>("published_at")
+                        .map(|v| v.max(0) as u64),
+                    location: row.get("location"),
+                    geohash: row.get("geohash"),
+                    status: row.get("status"),
                 }
             })
             .collect())
-    }
-
-    pub async fn upsert_stalls(&self, stalls: &[Nip15Stall]) -> Result<(), sqlx::Error> {
-        let now = now_secs();
-        let mut tx = self.db.begin().await?;
-
-        for stall in stalls {
-            let shipping_json = serde_json::to_string(&stall.shipping).unwrap_or_else(|_| "[]".to_string());
-
-            sqlx::query(
-                r#"
-                INSERT INTO marketplace_stalls (
-                    merchant_npub, stall_id, name, description, currency,
-                    shipping_json, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(merchant_npub, stall_id) DO UPDATE SET
-                    name = excluded.name,
-                    description = excluded.description,
-                    currency = excluded.currency,
-                    shipping_json = excluded.shipping_json,
-                    created_at = excluded.created_at,
-                    updated_at = excluded.updated_at
-                "#,
-            )
-            .bind(&stall.merchant_npub)
-            .bind(&stall.id)
-            .bind(&stall.name)
-            .bind(&stall.description)
-            .bind(&stall.currency)
-            .bind(shipping_json)
-            .bind(stall.created_at as i64)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-        Ok(())
     }
 
     pub async fn upsert_listing(
@@ -127,7 +99,7 @@ impl MarketplaceCache {
         let existed = sqlx::query(
             r#"
             SELECT 1
-            FROM marketplace_products
+            FROM marketplace_listings
             WHERE publisher_npub = ? AND product_id = ?
             "#,
         )
@@ -138,15 +110,18 @@ impl MarketplaceCache {
         .is_some();
 
         let tags_json = serde_json::to_string(&listing.tags).unwrap_or_else(|_| "[]".to_string());
+        let images_json =
+            serde_json::to_string(&listing.images).unwrap_or_else(|_| "[]".to_string());
         let now = now_secs();
 
         let result = sqlx::query(
             r#"
-            INSERT INTO marketplace_products (
+            INSERT INTO marketplace_listings (
                 publisher_npub, product_id, title, description, price_sats,
-                download_url, tags_json, lud16, created_at, updated_at, source_event_id
+                download_url, tags_json, lud16, created_at, updated_at, source_event_id,
+                images_json, summary, published_at, location, geohash, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(publisher_npub, product_id) DO UPDATE SET
                 title = excluded.title,
                 description = excluded.description,
@@ -156,16 +131,28 @@ impl MarketplaceCache {
                 lud16 = excluded.lud16,
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at,
-                source_event_id = excluded.source_event_id
+                source_event_id = excluded.source_event_id,
+                images_json = excluded.images_json,
+                summary = excluded.summary,
+                published_at = excluded.published_at,
+                location = excluded.location,
+                geohash = excluded.geohash,
+                status = excluded.status
             WHERE
-                marketplace_products.title <> excluded.title OR
-                marketplace_products.description <> excluded.description OR
-                marketplace_products.price_sats <> excluded.price_sats OR
-                marketplace_products.download_url <> excluded.download_url OR
-                marketplace_products.tags_json <> excluded.tags_json OR
-                marketplace_products.lud16 <> excluded.lud16 OR
-                marketplace_products.created_at <> excluded.created_at OR
-                IFNULL(marketplace_products.source_event_id, '') <> IFNULL(excluded.source_event_id, '')
+                marketplace_listings.title <> excluded.title OR
+                marketplace_listings.description <> excluded.description OR
+                marketplace_listings.price_sats <> excluded.price_sats OR
+                marketplace_listings.download_url <> excluded.download_url OR
+                marketplace_listings.tags_json <> excluded.tags_json OR
+                marketplace_listings.lud16 <> excluded.lud16 OR
+                marketplace_listings.created_at <> excluded.created_at OR
+                IFNULL(marketplace_listings.source_event_id, '') <> IFNULL(excluded.source_event_id, '') OR
+                marketplace_listings.images_json <> excluded.images_json OR
+                IFNULL(marketplace_listings.summary, '') <> IFNULL(excluded.summary, '') OR
+                IFNULL(marketplace_listings.published_at, 0) <> IFNULL(excluded.published_at, 0) OR
+                IFNULL(marketplace_listings.location, '') <> IFNULL(excluded.location, '') OR
+                IFNULL(marketplace_listings.geohash, '') <> IFNULL(excluded.geohash, '') OR
+                IFNULL(marketplace_listings.status, '') <> IFNULL(excluded.status, '')
             "#,
         )
         .bind(&listing.publisher_npub)
@@ -179,6 +166,12 @@ impl MarketplaceCache {
         .bind(listing.created_at as i64)
         .bind(now)
         .bind(source_event_id)
+        .bind(images_json)
+        .bind(&listing.summary)
+        .bind(listing.published_at.map(|v| v as i64))
+        .bind(&listing.location)
+        .bind(&listing.geohash)
+        .bind(&listing.status)
         .execute(&self.db)
         .await?;
 
@@ -219,6 +212,12 @@ mod tests {
             created_at,
             tags: vec!["rpg".to_string()],
             lud16: "merchant@example.com".to_string(),
+            images: vec!["https://example.com/image1.png".to_string()],
+            summary: Some("A test game".to_string()),
+            published_at: Some(created_at),
+            location: Some("Online".to_string()),
+            geohash: None,
+            status: Some("active".to_string()),
         }
     }
 
@@ -308,5 +307,141 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "recent");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_and_load_complete_nip99_listing() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+
+        let cache = MarketplaceCache::new(db.pool().clone());
+
+        // Create a GameListing with all NIP-99 fields populated
+        let listing = GameListing {
+            id: "complete-game-v1".to_string(),
+            title: "Complete NIP-99 Game".to_string(),
+            description: "A fully featured game with all NIP-99 fields".to_string(),
+            price_sats: 5000,
+            download_url: "https://example.com/download".to_string(),
+            publisher_npub: "npub1completepublisher".to_string(),
+            created_at: 1_710_000_000,
+            tags: vec![
+                "rpg".to_string(),
+                "action".to_string(),
+                "multiplayer".to_string(),
+            ],
+            lud16: "seller@walletofsatoshi.com".to_string(),
+            images: vec![
+                "https://example.com/image1.png".to_string(),
+                "https://example.com/image2.png".to_string(),
+                "https://example.com/image3.png".to_string(),
+            ],
+            summary: Some("Epic adventure awaits".to_string()),
+            published_at: Some(1_710_000_000),
+            location: Some("San Francisco, CA".to_string()),
+            geohash: Some("9q8yym".to_string()),
+            status: Some("active".to_string()),
+        };
+
+        // Upsert it to cache
+        let outcome = cache
+            .upsert_listing(&listing, Some("event-complete-1"))
+            .await
+            .expect("upsert should succeed");
+        assert_eq!(outcome, UpsertOutcome::Inserted);
+
+        // Load it back
+        let loaded = cache
+            .load_listings(10, None)
+            .await
+            .expect("load should succeed");
+
+        assert_eq!(loaded.len(), 1);
+        let loaded_listing = &loaded[0];
+
+        // Assert all fields match exactly
+        assert_eq!(loaded_listing.id, listing.id);
+        assert_eq!(loaded_listing.title, listing.title);
+        assert_eq!(loaded_listing.description, listing.description);
+        assert_eq!(loaded_listing.price_sats, listing.price_sats);
+        assert_eq!(loaded_listing.download_url, listing.download_url);
+        assert_eq!(loaded_listing.publisher_npub, listing.publisher_npub);
+        assert_eq!(loaded_listing.created_at, listing.created_at);
+        assert_eq!(loaded_listing.tags, listing.tags);
+        assert_eq!(loaded_listing.lud16, listing.lud16);
+        assert_eq!(loaded_listing.images, listing.images);
+        assert_eq!(loaded_listing.summary, listing.summary);
+        assert_eq!(loaded_listing.published_at, listing.published_at);
+        assert_eq!(loaded_listing.location, listing.location);
+        assert_eq!(loaded_listing.geohash, listing.geohash);
+        assert_eq!(loaded_listing.status, listing.status);
+    }
+
+    #[tokio::test]
+    async fn test_listing_with_empty_images() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+
+        let cache = MarketplaceCache::new(db.pool().clone());
+
+        // Create a GameListing with empty images and None for optional fields
+        let listing = GameListing {
+            id: "minimal-game-v1".to_string(),
+            title: "Minimal Game".to_string(),
+            description: "A game with minimal fields".to_string(),
+            price_sats: 1000,
+            download_url: "https://example.com/minimal".to_string(),
+            publisher_npub: "npub1minimalpublisher".to_string(),
+            created_at: 1_710_000_001,
+            tags: vec![],
+            lud16: "minimal@example.com".to_string(),
+            images: vec![], // Empty images
+            summary: None,
+            published_at: None,
+            location: None,
+            geohash: None,
+            status: None,
+        };
+
+        // Upsert and load
+        let outcome = cache
+            .upsert_listing(&listing, Some("event-minimal-1"))
+            .await
+            .expect("upsert should succeed");
+        assert_eq!(outcome, UpsertOutcome::Inserted);
+
+        let loaded = cache
+            .load_listings(10, None)
+            .await
+            .expect("load should succeed");
+
+        assert_eq!(loaded.len(), 1);
+        let loaded_listing = &loaded[0];
+
+        // Assert empty images and None fields are preserved
+        assert_eq!(loaded_listing.id, listing.id);
+        assert_eq!(loaded_listing.images, Vec::<String>::new());
+        assert!(loaded_listing.images.is_empty());
+        assert_eq!(loaded_listing.summary, None);
+        assert_eq!(loaded_listing.published_at, None);
+        assert_eq!(loaded_listing.location, None);
+        assert_eq!(loaded_listing.geohash, None);
+        assert_eq!(loaded_listing.status, None);
+
+        // Also verify required fields are correct
+        assert_eq!(loaded_listing.title, listing.title);
+        assert_eq!(loaded_listing.description, listing.description);
+        assert_eq!(loaded_listing.price_sats, listing.price_sats);
+        assert_eq!(loaded_listing.download_url, listing.download_url);
+        assert_eq!(loaded_listing.publisher_npub, listing.publisher_npub);
+        assert_eq!(loaded_listing.created_at, listing.created_at);
+        assert_eq!(loaded_listing.tags, Vec::<String>::new());
+        assert_eq!(loaded_listing.lud16, listing.lud16);
     }
 }

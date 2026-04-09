@@ -447,6 +447,17 @@ pub struct GameListing {
     pub created_at: u64,        // unix timestamp
     pub tags: Vec<String>,      // freeform tags e.g. ["rpg", "pixel-art"]
     pub lud16: String, // Lightning address for payments (e.g., "seller@walletofsatoshi.com")
+    pub images: Vec<String>, // product images from NIP-99/NIP-15 events
+    /// Short summary or tagline for the listing (NIP-99).
+    pub summary: Option<String>,
+    /// Original publication timestamp if different from created_at (NIP-99).
+    pub published_at: Option<u64>,
+    /// Physical or virtual location for the listing (NIP-99).
+    pub location: Option<String>,
+    /// Geohash for geographic filtering (NIP-99).
+    pub geohash: Option<String>,
+    /// Listing status: active, sold, archived, etc. (NIP-99).
+    pub status: Option<String>,
 }
 
 impl GameListing {
@@ -488,6 +499,48 @@ impl GameListing {
             created_at: product.created_at,
             tags: product.categories,
             lud16: String::new(),
+            images: product.images,
+            summary: None,
+            published_at: None,
+            location: None,
+            geohash: None,
+            status: None,
+        }
+    }
+
+    pub fn from_listing(listing: crate::marketplace::Nip99Listing) -> Self {
+        // price_sats: parse price_amount as f64, cast to u64 if currency is
+        // SATS/SAT, otherwise 0.
+        let price_sats = listing
+            .price_amount
+            .as_deref()
+            .and_then(|a| a.parse::<f64>().ok())
+            .map(|amount| {
+                let currency = listing.price_currency.as_deref().unwrap_or("");
+                if currency.eq_ignore_ascii_case("SATS") || currency.eq_ignore_ascii_case("SAT") {
+                    amount as u64
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+
+        GameListing {
+            id: listing.id,
+            title: listing.title,
+            description: listing.content,
+            price_sats,
+            download_url: listing.images.first().cloned().unwrap_or_default(),
+            publisher_npub: listing.merchant_npub,
+            created_at: listing.created_at,
+            tags: listing.tags,
+            lud16: String::new(),
+            images: listing.images,
+            summary: listing.summary,
+            published_at: listing.published_at.map(|v| v as u64),
+            location: listing.location,
+            geohash: listing.geohash,
+            status: listing.status,
         }
     }
 }
@@ -767,6 +820,14 @@ impl NostrClient {
         since_days: Option<u64>,
     ) -> Result<Vec<crate::marketplace::Nip15Product>, String> {
         crate::marketplace::fetch_nip15_products_impl(&self.relay_manager, limit, since_days).await
+    }
+
+    pub async fn fetch_nip99_listings(
+        &self,
+        limit: usize,
+        since_days: Option<u64>,
+    ) -> Result<Vec<crate::marketplace::Nip99Listing>, String> {
+        crate::marketplace::fetch_nip99_listings_impl(&self.relay_manager, limit, since_days).await
     }
 
     /// Fetches a specific game listing by its ID and publisher.
@@ -1601,6 +1662,12 @@ pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
         created_at: event.created_at.as_secs(),
         tags,
         lud16,
+        images: Vec::new(), // Legacy format doesn't include images
+        summary: None,
+        published_at: None,
+        location: None,
+        geohash: None,
+        status: None,
     })
 }
 
@@ -1961,8 +2028,8 @@ mod assertions {
     use super::NostrClient;
 
     const _: () = {
-        fn assert_send<T: Send>() {}
-        fn assert_sync<T: Sync>() {}
+        const fn assert_send<T: Send>() {}
+        const fn assert_sync<T: Sync>() {}
         assert_send::<NostrClient>();
         assert_sync::<NostrClient>();
     };
