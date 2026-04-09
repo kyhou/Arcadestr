@@ -55,7 +55,15 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
     let error = RwSignal::new(None::<String>);
     let received_count = RwSignal::new(0);
 
+    // Track if we've already fetched to prevent duplicate fetches
+    let has_fetched = RwSignal::new(false);
+
     Effect::new(move |_| {
+        // Prevent re-running if we've already fetched
+        if has_fetched.get() {
+            return;
+        }
+        
         let store = marketplace_store.clone();
         spawn_local(async move {
             loading.set(true);
@@ -71,6 +79,7 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
                 received_count.set(mocked.len());
                 listings.set(mocked);
                 loading.set(false);
+                has_fetched.set(true);
                 return;
             }
 
@@ -81,6 +90,7 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
                     if !cached.is_empty() && !needs_refresh {
                         listings.set(cached);
                         loading.set(false);
+                        has_fetched.set(true);
                         false
                     } else {
                         true
@@ -91,51 +101,69 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
 
             if should_fetch {
                 let store_for_listing = store.clone();
+                let store_for_listing_ref = std::cell::RefCell::new(store_for_listing);
+                
+                // Batch all updates for each listing to prevent cascading re-renders
                 let on_listing = move |listing: GameListing| {
-                    received_count.update(|count| *count += 1);
-                    if let Some(s) = &store_for_listing {
-                        s.put_streaming(listing.clone());
-                    }
-
-                    loading.set(false);
-
-                    listings.update(|items| {
-                        if !items.iter().any(|existing| existing.id == listing.id) {
-                            items.push(listing);
+                    let store_opt = store_for_listing_ref.borrow().clone();
+                    batch(move || {
+                        received_count.update(|count| *count += 1);
+                        if let Some(s) = &store_opt {
+                            s.put_streaming(listing.clone());
                         }
+
+                        listings.update(|items| {
+                            if !items.iter().any(|existing| existing.id == listing.id) {
+                                items.push(listing);
+                            }
+                        });
                     });
                 };
 
                 let on_complete = Some({
                     let store_for_complete = store.clone();
                     move || {
-                        if let Some(s) = &store_for_complete {
-                            s.mark_fresh();
-                        }
-                        loading.set(false);
+                        batch(move || {
+                            if let Some(s) = &store_for_complete {
+                                s.mark_fresh();
+                            }
+                            loading.set(false);
+                            has_fetched.set(true);
+                        });
                     }
                 });
 
                 match invoke_fetch_marketplace_stream(50, Some(30), on_listing, on_complete).await {
                     Ok((product_cleanup, completion_cleanup)) => {
-                        loading.set(false);
+                        // Stream command has returned; unregister listeners.
                         product_cleanup();
                         completion_cleanup();
+
+                        // Fallback in case completion event was missed.
+                        if loading.get_untracked() {
+                            loading.set(false);
+                            has_fetched.set(true);
+                        }
                     }
                     Err(e) => {
-                        if let Some(s) = &store {
-                            let cached = s.get_all();
-                            if !cached.is_empty() {
-                                listings.set(cached);
-                                loading.set(false);
+                        batch(move || {
+                            if let Some(s) = &store {
+                                let cached = s.get_all();
+                                if !cached.is_empty() {
+                                    listings.set(cached);
+                                    loading.set(false);
+                                    has_fetched.set(true);
+                                } else {
+                                    error.set(Some(e));
+                                    loading.set(false);
+                                    has_fetched.set(true);
+                                }
                             } else {
                                 error.set(Some(e));
                                 loading.set(false);
+                                has_fetched.set(true);
                             }
-                        } else {
-                            error.set(Some(e));
-                            loading.set(false);
-                        }
+                        });
                     }
                 }
             }

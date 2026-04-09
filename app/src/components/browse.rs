@@ -22,9 +22,17 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
     let is_loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
     let received_count = RwSignal::new(0);
+    
+    // Track if we've already fetched to prevent duplicate fetches
+    let has_fetched = RwSignal::new(false);
 
     // Fetch listings on mount using streaming
     Effect::new(move |_| {
+        // Prevent re-running if we've already fetched
+        if has_fetched.get() {
+            return;
+        }
+        
         let store = marketplace_store.clone();
         spawn_local(async move {
             is_loading.set(true);
@@ -41,6 +49,7 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                         // Use cached listings
                         listings.set(cached);
                         is_loading.set(false);
+                        has_fetched.set(true);
                         false // Don't fetch from network
                     } else {
                         true // Need to fetch
@@ -52,64 +61,80 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
             if should_fetch {
                 // Start streaming fetch
                 let store_clone = store.clone();
+                let store_clone_ref = std::cell::RefCell::new(store_clone);
+                
+                // Batch updates to prevent cascading re-renders
                 let on_listing = move |listing: GameListing| {
-                    received_count.update(|c| *c += 1);
-                    if let Some(s) = &store_clone {
-                        s.put_streaming(listing.clone());
-                    }
-                    // Unblock UI as soon as first listing arrives.
-                    is_loading.set(false);
-                    // Update listings signal to trigger re-render
-                    listings.update(|v| {
-                        // Check for duplicates in the vector too
-                        if !v.iter().any(|l| l.id == listing.id) {
-                            v.push(listing);
+                    let store_opt = store_clone_ref.borrow().clone();
+                    batch(move || {
+                        received_count.update(|c| *c += 1);
+                        if let Some(s) = &store_opt {
+                            s.put_streaming(listing.clone());
                         }
+                        // Update listings signal to trigger re-render
+                        listings.update(|v| {
+                            // Check for duplicates in the vector too
+                            if !v.iter().any(|l| l.id == listing.id) {
+                                v.push(listing);
+                            }
+                        });
                     });
                 };
                 
                 let on_complete = Some({
                     let store_clone = store.clone();
                     move || {
-                        // Mark cache as fresh when complete
-                        if let Some(s) = &store_clone {
-                            s.mark_fresh();
-                        }
-                        is_loading.set(false);
+                        batch(move || {
+                            // Mark cache as fresh when complete
+                            if let Some(s) = &store_clone {
+                                s.mark_fresh();
+                            }
+                            is_loading.set(false);
+                            has_fetched.set(true);
+                        });
                     }
                 });
                 
                 match invoke_fetch_marketplace_stream(50, Some(30), on_listing, on_complete).await {
                     Ok((product_cleanup, completion_cleanup)) => {
-                        // Backend command only returns when streaming finishes.
-                        // Ensure loading state clears even if completion event is missed.
-                        is_loading.set(false);
+                        // Stream command has returned; unregister listeners.
                         product_cleanup();
                         completion_cleanup();
+
+                        // Fallback in case completion event was missed.
+                        if is_loading.get_untracked() {
+                            is_loading.set(false);
+                            has_fetched.set(true);
+                        }
                     }
                     Err(e) => {
-                        // If fetch fails but we have cached data, use it as fallback
-                        if let Some(s) = &store {
-                            let cached = s.get_all();
-                            if !cached.is_empty() {
-                                listings.set(cached);
-                                is_loading.set(false);
-                                #[cfg(target_arch = "wasm32")]
-                                web_sys::console::warn_1(
-                                    &format!(
-                                        "Failed to refresh listings, using cached data: {}",
-                                        e
-                                    )
-                                    .into(),
-                                );
+                        batch(move || {
+                            // If fetch fails but we have cached data, use it as fallback
+                            if let Some(s) = &store {
+                                let cached = s.get_all();
+                                if !cached.is_empty() {
+                                    listings.set(cached);
+                                    is_loading.set(false);
+                                    has_fetched.set(true);
+                                    #[cfg(target_arch = "wasm32")]
+                                    web_sys::console::warn_1(
+                                        &format!(
+                                            "Failed to refresh listings, using cached data: {}",
+                                            e
+                                        )
+                                        .into(),
+                                    );
+                                } else {
+                                    error.set(Some(e));
+                                    is_loading.set(false);
+                                    has_fetched.set(true);
+                                }
                             } else {
                                 error.set(Some(e));
                                 is_loading.set(false);
+                                has_fetched.set(true);
                             }
-                        } else {
-                            error.set(Some(e));
-                            is_loading.set(false);
-                        }
+                        });
                     }
                 }
             }
