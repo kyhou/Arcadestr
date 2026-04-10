@@ -166,6 +166,16 @@ impl Database {
             sqlx::query(*migration).execute(pool).await.map_err(|e| {
                 DatabaseError::Migration(format!("Migration {} failed: {}", migration_num, e))
             })?;
+
+            sqlx::query(&format!("PRAGMA user_version = {}", migration_num))
+                .execute(pool)
+                .await
+                .map_err(|e| {
+                    DatabaseError::Migration(format!(
+                        "Setting schema version for migration {} failed: {}",
+                        migration_num, e
+                    ))
+                })?;
         }
 
         Self::ensure_marketplace_cache_schema(pool).await?;
@@ -280,7 +290,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_database_creation() {
+    async fn database_initializes_successfully() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
@@ -293,5 +303,53 @@ mod tests {
             .unwrap();
 
         assert!(row.0 >= 4); // accounts, relay_backups, remote_uris, secure_storage
+    }
+
+    #[tokio::test]
+    async fn migrations_run_idempotently() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("idempotent.db");
+
+        let first = Database::new(&db_path)
+            .await
+            .expect("first initialization should succeed");
+
+        let first_tables: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='marketplace_listings'",
+        )
+        .fetch_one(first.pool())
+        .await
+        .expect("table count query should succeed");
+        assert_eq!(first_tables.0, 1);
+        first.close().await;
+
+        let second = Database::new(&db_path)
+            .await
+            .expect("second initialization should also succeed");
+
+        let second_tables: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='marketplace_listings'",
+        )
+        .fetch_one(second.pool())
+        .await
+        .expect("table count query should succeed after re-init");
+
+        assert_eq!(second_tables.0, 1);
+    }
+
+    #[tokio::test]
+    async fn schema_version_increments() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("schema-version.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("database should initialize");
+
+        let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(db.pool())
+            .await
+            .expect("pragma user_version query should succeed");
+
+        assert_eq!(user_version as usize, MIGRATIONS.len());
     }
 }

@@ -1,3 +1,4 @@
+use argon2::Argon2;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rand::{prelude::*, TryRng};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ pub enum MasterKeyError {
     RandomGeneration,
     #[error("Base64 decode failed: {0}")]
     Base64(String),
+    #[error("Master key derivation failed")]
+    Derivation,
 }
 
 impl MasterKeyManager {
@@ -103,6 +106,18 @@ impl MasterKeyManager {
     pub fn key_file_path(&self) -> &Path {
         &self.key_file
     }
+
+    /// Derive a deterministic 256-bit master key from password and salt.
+    pub fn derive_master_key(
+        password: &str,
+        salt: &[u8],
+    ) -> Result<[u8; Self::KEY_LENGTH], MasterKeyError> {
+        let mut key = [0u8; Self::KEY_LENGTH];
+        Argon2::default()
+            .hash_password_into(password.as_bytes(), salt, &mut key)
+            .map_err(|_| MasterKeyError::Derivation)?;
+        Ok(key)
+    }
 }
 
 #[cfg(test)]
@@ -148,5 +163,27 @@ mod tests {
             let mode = metadata.permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "File should have 0600 permissions");
         }
+    }
+
+    #[test]
+    fn master_key_derivation_is_deterministic() {
+        let salt = b"0123456789abcdef";
+        let key1 = MasterKeyManager::derive_master_key("password-123", salt)
+            .expect("key derivation should succeed");
+        let key2 = MasterKeyManager::derive_master_key("password-123", salt)
+            .expect("key derivation should succeed");
+
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn master_key_derivation_different_passwords() {
+        let salt = b"0123456789abcdef";
+        let key1 = MasterKeyManager::derive_master_key("password-123", salt)
+            .expect("key derivation should succeed");
+        let key2 = MasterKeyManager::derive_master_key("password-456", salt)
+            .expect("key derivation should succeed");
+
+        assert_ne!(key1, key2);
     }
 }
