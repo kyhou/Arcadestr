@@ -436,48 +436,61 @@ impl RelayCache {
         latency_ms: u32,
         success: bool,
     ) -> Result<(), RelayCacheError> {
-        let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
-
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        // Get existing stats or use defaults
-        let (total, failed) = conn
-            .query_row(
-                "SELECT total_requests, failed_requests FROM relay_health WHERE relay_url = ?",
-                [relay_url],
-                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
-            )
-            .unwrap_or((0, 0));
+        let new_error_rate = {
+            let conn = self.conn.lock().map_err(|_| RelayCacheError::Lock)?;
 
-        let new_total = total.saturating_add(1);
-        let new_failed = if success {
-            failed
-        } else {
-            failed.saturating_add(1)
+            // Get existing stats or use defaults
+            let (total, failed) = conn
+                .query_row(
+                    "SELECT total_requests, failed_requests FROM relay_health WHERE relay_url = ?",
+                    [relay_url],
+                    |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+                )
+                .unwrap_or((0, 0));
+
+            let new_total = total.saturating_add(1);
+            let new_failed = if success {
+                failed
+            } else {
+                failed.saturating_add(1)
+            };
+            let new_error_rate = if new_total > 0 {
+                new_failed as f32 / new_total as f32
+            } else {
+                0.0
+            };
+
+            conn.execute(
+                "INSERT OR REPLACE INTO relay_health 
+                 (relay_url, latency_ms, error_rate, last_checked, total_requests, failed_requests) 
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    relay_url,
+                    latency_ms,
+                    new_error_rate,
+                    now,
+                    new_total,
+                    new_failed
+                ],
+            )?;
+
+            new_error_rate
         };
-        let new_error_rate = if new_total > 0 {
-            new_failed as f32 / new_total as f32
-        } else {
-            0.0
-        };
 
-        conn.execute(
-            "INSERT OR REPLACE INTO relay_health 
-             (relay_url, latency_ms, error_rate, last_checked, total_requests, failed_requests) 
-             VALUES (?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                relay_url,
-                latency_ms,
-                new_error_rate,
-                now,
-                new_total,
-                new_failed
-            ],
-        )?;
-
+        if let Ok(mut relay_health) = self.relay_health.lock() {
+            relay_health.insert(
+                relay_url.to_string(),
+                RelayHealthData {
+                    latency_ms: latency_ms as u64,
+                    error_rate: new_error_rate as f64,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -679,22 +692,114 @@ impl RelayCache {
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}_{}.db", name, nanos))
+    }
 
     #[test]
     fn test_relay_cache_initialization() {
-        let temp_dir = std::env::temp_dir();
-        let db_path = temp_dir.join("test_relay_cache.db");
+        let db_path = temp_db_path("test_relay_cache_init");
 
         // Clean up from previous runs
         let _ = fs::remove_file(&db_path);
 
-        let cache = RelayCache::new(db_path.to_str().unwrap()).unwrap();
+        let cache = RelayCache::new(db_path.to_str().expect("temp path should be valid utf-8"))
+            .expect("relay cache should initialize");
 
         // Verify tables exist by attempting a query
         let result = cache.get_relay_list("test_pubkey");
         assert!(result.is_none());
 
         // Clean up
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_update_relay_health_tracks_requests_and_errors() {
+        let db_path = temp_db_path("test_relay_health_counts");
+        let _ = fs::remove_file(&db_path);
+
+        let cache = RelayCache::new(db_path.to_str().expect("temp path should be valid utf-8"))
+            .expect("relay cache should initialize");
+
+        cache
+            .update_relay_health("wss://relay.example.com", 120, true)
+            .expect("first health update should succeed");
+        cache
+            .update_relay_health("wss://relay.example.com", 250, false)
+            .expect("second health update should succeed");
+
+        let health = cache
+            .get_relay_health("wss://relay.example.com")
+            .expect("health should be present after updates");
+
+        assert_eq!(health.total_requests, 2);
+        assert_eq!(health.failed_requests, 1);
+        assert_eq!(health.latency_ms, 250);
+        assert!((health.error_rate - 0.5).abs() < f32::EPSILON);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_update_relay_health_updates_in_memory_cache() {
+        let db_path = temp_db_path("test_relay_health_mem_cache");
+        let _ = fs::remove_file(&db_path);
+
+        let cache = RelayCache::new(db_path.to_str().expect("temp path should be valid utf-8"))
+            .expect("relay cache should initialize");
+
+        cache
+            .update_relay_health("wss://relay.mem.example", 321, false)
+            .expect("health update should succeed");
+
+        let map = cache
+            .relay_health
+            .lock()
+            .expect("relay_health mutex should not be poisoned");
+        let data = map
+            .get("wss://relay.mem.example")
+            .expect("in-memory relay health should be updated");
+
+        assert_eq!(data.latency_ms, 321);
+        assert!((data.error_rate - 1.0).abs() < f64::EPSILON);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_get_health_score_applies_error_and_staleness_penalties() {
+        let db_path = temp_db_path("test_relay_health_score");
+        let _ = fs::remove_file(&db_path);
+
+        let cache = RelayCache::new(db_path.to_str().expect("temp path should be valid utf-8"))
+            .expect("relay cache should initialize");
+
+        cache
+            .update_relay_health("wss://relay.stale.example", 150, false)
+            .expect("health update should succeed");
+
+        {
+            let conn = cache
+                .conn
+                .lock()
+                .expect("conn mutex should not be poisoned");
+            conn.execute(
+                "UPDATE relay_health SET last_checked = 0, error_rate = 0.5 WHERE relay_url = ?",
+                ["wss://relay.stale.example"],
+            )
+            .expect("test should update relay_health row");
+        }
+
+        let score = cache.get_health_score("wss://relay.stale.example");
+        assert!((score - 0.35).abs() < f32::EPSILON);
+
         let _ = fs::remove_file(&db_path);
     }
 }
