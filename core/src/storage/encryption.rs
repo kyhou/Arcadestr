@@ -162,7 +162,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_encryption_decryption() {
+    fn encrypt_decrypt_roundtrip() {
         let master_key = [0u8; 32]; // Test key (all zeros - don't use in production!)
         let encryption = Encryption::new(&master_key).unwrap();
 
@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_different_nonces() {
+    fn nonce_is_unique_per_encryption() {
         let master_key = [0u8; 32];
         let encryption = Encryption::new(&master_key).unwrap();
 
@@ -194,6 +194,30 @@ mod tests {
         // But both should decrypt to same value
         assert_eq!(*encryption.decrypt_nsec(&encrypted1).unwrap(), nsec);
         assert_eq!(*encryption.decrypt_nsec(&encrypted2).unwrap(), nsec);
+    }
+
+    #[test]
+    fn different_keys_cannot_decrypt() {
+        let key_a = [1u8; 32];
+        let key_b = [2u8; 32];
+        let encryption_a = Encryption::new(&key_a).expect("key A should be valid");
+        let encryption_b = Encryption::new(&key_b).expect("key B should be valid");
+
+        let encrypted = encryption_a.encrypt_nsec("nsec1test");
+        let result = encryption_b.decrypt_nsec(&encrypted);
+
+        assert!(matches!(result, Err(EncryptionError::DecryptionFailed)));
+    }
+
+    #[test]
+    fn ciphertext_differs_from_plaintext() {
+        let master_key = [3u8; 32];
+        let encryption = Encryption::new(&master_key).expect("key should be valid");
+        let plaintext = b"plain-text";
+
+        let encrypted = encryption.encrypt(plaintext);
+
+        assert_ne!(encrypted.ciphertext.as_slice(), plaintext);
     }
 
     #[test]
