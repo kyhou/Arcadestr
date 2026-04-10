@@ -25,7 +25,11 @@ pub(crate) fn debug_storefront_bypass_enabled() -> bool {
     };
 
     matches!(
-        storage.get_item("arcadestr.debug.storefront").ok().flatten().as_deref(),
+        storage
+            .get_item("arcadestr.debug.storefront")
+            .ok()
+            .flatten()
+            .as_deref(),
         Some("1")
     )
 }
@@ -641,8 +645,7 @@ async fn invoke_login_with_nsec(
 ) -> Result<serde_json::Value, String> {
     use nostr::nips::nip19::ToBech32;
 
-    let keys = nostr::Keys::parse(&nsec)
-        .map_err(|e| format!("Invalid private key format: {e}"))?;
+    let keys = nostr::Keys::parse(&nsec).map_err(|e| format!("Invalid private key format: {e}"))?;
     let npub = keys
         .public_key()
         .to_bech32()
