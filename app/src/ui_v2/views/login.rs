@@ -56,8 +56,9 @@ pub fn LoginV2View() -> impl IntoView {
         let display_name_val = bunker_display_name.get();
 
         if uri_val.is_empty() {
-            auth.error
-                .set(Some("Please enter a bunker URI or NIP-05 identifier".to_string()));
+            auth.error.set(Some(
+                "Please enter a bunker URI or NIP-05 identifier".to_string(),
+            ));
             return;
         }
 
@@ -186,7 +187,9 @@ pub fn LoginV2View() -> impl IntoView {
                         while qr_polling.get() {
                             match invoke_check_qr_connection().await {
                                 Ok(Some(result)) => {
-                                    if let Some(npub) = result.get("pubkey").and_then(|v| v.as_str()) {
+                                    if let Some(npub) =
+                                        result.get("pubkey").and_then(|v| v.as_str())
+                                    {
                                         let _ = auth_for_poll.load_profiles_list().await;
                                         let _ = auth_for_poll.load_accounts_list().await;
                                         auth_for_poll.npub.set(Some(npub.to_string()));

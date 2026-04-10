@@ -5,9 +5,9 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::components::{ProfileAvatar, ProfileDisplayName};
 use crate::fetch_and_store_profile;
+use crate::invoke_fetch_marketplace_stream;
 use crate::models::GameListing;
 use crate::store::{try_use_marketplace_store, DEFAULT_LISTING_TTL_SECS};
-use crate::invoke_fetch_marketplace_stream;
 use crate::AuthContext;
 
 /// Browse view component - displays a grid of game listings.
@@ -22,7 +22,7 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
     let is_loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
     let received_count = RwSignal::new(0);
-    
+
     // Track if we've already fetched to prevent duplicate fetches
     let has_fetched = RwSignal::new(false);
 
@@ -32,7 +32,7 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
         if has_fetched.get() {
             return;
         }
-        
+
         let store = marketplace_store.clone();
         spawn_local(async move {
             is_loading.set(true);
@@ -62,7 +62,7 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                 // Start streaming fetch
                 let store_clone = store.clone();
                 let store_clone_ref = std::cell::RefCell::new(store_clone);
-                
+
                 // Batch updates to prevent cascading re-renders
                 let on_listing = move |listing: GameListing| {
                     let store_opt = store_clone_ref.borrow().clone();
@@ -80,7 +80,7 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                         });
                     });
                 };
-                
+
                 let on_complete = Some({
                     let store_clone = store.clone();
                     move || {
@@ -94,7 +94,7 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                         });
                     }
                 });
-                
+
                 match invoke_fetch_marketplace_stream(50, Some(30), on_listing, on_complete).await {
                     Ok((product_cleanup, completion_cleanup)) => {
                         // Stream command has returned; unregister listeners.

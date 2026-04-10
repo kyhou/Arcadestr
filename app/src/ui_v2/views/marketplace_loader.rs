@@ -63,7 +63,7 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
         if has_fetched.get() {
             return;
         }
-        
+
         let store = marketplace_store.clone();
         spawn_local(async move {
             loading.set(true);
@@ -102,7 +102,7 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
             if should_fetch {
                 let store_for_listing = store.clone();
                 let store_for_listing_ref = std::cell::RefCell::new(store_for_listing);
-                
+
                 // Batch all updates for each listing to prevent cascading re-renders
                 let on_listing = move |listing: GameListing| {
                     let store_opt = store_for_listing_ref.borrow().clone();

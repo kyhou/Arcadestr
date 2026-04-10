@@ -1,7 +1,6 @@
 //! UI v2 view modules.
 
 pub mod browse_games;
-pub mod store_front;
 pub mod game_detail;
 pub mod library;
 pub mod login;
@@ -9,6 +8,7 @@ pub mod marketplace_loader;
 pub mod profile;
 pub mod publish;
 pub mod social;
+pub mod store_front;
 
 pub use browse_games::BrowseGamesView;
 pub use game_detail::GameDetailView;

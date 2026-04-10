@@ -80,7 +80,8 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                             }
 
                             relay_count_for_listener.set(relays_for_listener.get_untracked().len());
-                        }) as Box<dyn FnMut(JsValue)>);
+                        })
+                            as Box<dyn FnMut(JsValue)>);
 
                         if let Ok(listen) = js_sys::Reflect::get(&event_api, &"listen".into()) {
                             if let Some(listen_fn) = listen.dyn_ref::<js_sys::Function>() {
@@ -102,18 +103,19 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let connected_relays_signal = Signal::derive(move || connected_relays.get());
     let connection_status = Signal::derive(move || auth.connection_status.get());
     let connection_error = Signal::derive(move || auth.connection_error.get());
-    let search_placeholder = Signal::derive(move || {
-        match current_view.get() {
-            UiV2View::Store => "Search curated games...",
-            UiV2View::BrowseAll => "Search games, developers, notes...",
-            UiV2View::Detail(_) => "Search curated worlds...",
-            UiV2View::Library => "Search your library...",
-            UiV2View::Social => "Search the protocol...",
-            _ => "Search games...",
-        }
+    let search_placeholder = Signal::derive(move || match current_view.get() {
+        UiV2View::Store => "Search curated games...",
+        UiV2View::BrowseAll => "Search games, developers, notes...",
+        UiV2View::Detail(_) => "Search curated worlds...",
+        UiV2View::Library => "Search your library...",
+        UiV2View::Social => "Search the protocol...",
+        _ => "Search games...",
     });
     let browse_active = Signal::derive(move || {
-        matches!(current_view.get(), UiV2View::BrowseAll | UiV2View::Detail(_))
+        matches!(
+            current_view.get(),
+            UiV2View::BrowseAll | UiV2View::Detail(_)
+        )
     });
     let display_name = Signal::derive(move || {
         auth.profile
