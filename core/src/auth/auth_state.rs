@@ -161,13 +161,15 @@ mod tests {
         assert!(auth.signer().is_none());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn test_auth_state_disconnect() {
         let mut auth = AuthState::new();
 
-        // Create a test key and set it
+        // Create a test key and authenticate with both signer and public key
         let keys = Keys::generate();
-        auth.set_public_key(keys.public_key());
+        auth.connect_with_key(&keys.secret_key().to_secret_hex())
+            .expect("test key should authenticate auth state");
 
         assert!(auth.is_authenticated());
 

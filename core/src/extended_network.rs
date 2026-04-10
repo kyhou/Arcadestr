@@ -755,18 +755,21 @@ impl ExtendedNetworkRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn create_test_repo() -> (ExtendedNetworkRepository, Arc<SocialGraphDb>) {
+    fn create_test_repo() -> (ExtendedNetworkRepository, Arc<SocialGraphDb>, PathBuf) {
         let temp = TempDir::new().unwrap();
-        let social_graph = Arc::new(SocialGraphDb::new(temp.path().join("social.db")).unwrap());
+        let db_path = temp.path().join("social.db");
+        let social_graph = Arc::new(SocialGraphDb::new(&db_path).unwrap());
+        let temp_path = temp.keep();
         let repo = ExtendedNetworkRepository::new(social_graph.clone());
-        (repo, social_graph)
+        (repo, social_graph, temp_path)
     }
 
     #[test]
     fn test_compute_set_cover_basic() {
-        let (mut repo, _) = create_test_repo();
+        let (mut repo, _, _tmp_path) = create_test_repo();
         repo.set_pubkey("me".to_string());
 
         let mut qualified: HashSet<String> = HashSet::new();
@@ -801,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_qualifying_threshold() {
-        let (mut repo, social_graph) = create_test_repo();
+        let (mut repo, social_graph, _tmp_path) = create_test_repo();
         repo.set_pubkey("me".to_string());
 
         // Create follow relationships
