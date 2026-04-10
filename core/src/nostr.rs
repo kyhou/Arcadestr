@@ -1719,6 +1719,50 @@ pub struct Nip19Identifier {
     pub relays: Vec<String>,
 }
 
+fn is_lower_hex_with_len(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+}
+
+/// Validate NIP-01 JSON event field encodings before deserialization.
+///
+/// This rejects bech32 values (for example `npub1...`) in NIP-01 hex-only fields.
+pub fn validate_nip01_event_json_fields(event_json: &serde_json::Value) -> Result<(), NostrError> {
+    let pubkey = event_json
+        .get("pubkey")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| NostrError::MalformedEvent("Missing pubkey field".to_string()))?;
+    if !is_lower_hex_with_len(pubkey, 64) {
+        return Err(NostrError::MalformedEvent(
+            "Event pubkey must be 32-byte lowercase hex (NIP-01)".to_string(),
+        ));
+    }
+
+    let event_id = event_json
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| NostrError::MalformedEvent("Missing id field".to_string()))?;
+    if !is_lower_hex_with_len(event_id, 64) {
+        return Err(NostrError::MalformedEvent(
+            "Event id must be 32-byte lowercase hex (NIP-01)".to_string(),
+        ));
+    }
+
+    let sig = event_json
+        .get("sig")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| NostrError::MalformedEvent("Missing sig field".to_string()))?;
+    if !is_lower_hex_with_len(sig, 128) {
+        return Err(NostrError::MalformedEvent(
+            "Event sig must be 64-byte lowercase hex (NIP-01)".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Parse NIP-19 identifier (nprofile, nevent, npub, or note) to extract pubkey and relay hints
 pub fn parse_nip19_identifier(identifier: &str) -> Result<Nip19Identifier, NostrError> {
     use nostr::key::PublicKey;
