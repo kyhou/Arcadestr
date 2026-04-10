@@ -195,6 +195,8 @@ impl UserCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Database;
+    use tempfile::TempDir;
 
     fn create_test_profile() -> UserProfile {
         UserProfile {
@@ -210,5 +212,83 @@ mod tests {
         }
     }
 
-    // Tests would need actual DB - integration tests in tests/ dir
+    #[tokio::test]
+    async fn get_returns_none_for_unknown_npub() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("user_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("database should initialize");
+
+        let cache = UserCache::new(db.pool().clone());
+        let unknown = cache.get("npub1unknown").await;
+
+        assert!(unknown.is_none());
+    }
+
+    #[tokio::test]
+    async fn put_and_get_roundtrip() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("user_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("database should initialize");
+
+        let cache = UserCache::new(db.pool().clone());
+        let profile = create_test_profile();
+
+        cache
+            .put(&profile.npub, &profile)
+            .await
+            .expect("put should succeed");
+
+        let loaded = cache.get(&profile.npub).await;
+        assert!(loaded.is_some());
+        let loaded = loaded.expect("profile should be present");
+
+        assert_eq!(loaded.npub, profile.npub);
+        assert_eq!(loaded.name, profile.name);
+        assert_eq!(loaded.display_name, profile.display_name);
+        assert_eq!(loaded.picture, profile.picture);
+        assert_eq!(loaded.about, profile.about);
+        assert_eq!(loaded.nip05, profile.nip05);
+        assert_eq!(loaded.lud16, profile.lud16);
+        assert_eq!(loaded.website, profile.website);
+    }
+
+    #[tokio::test]
+    async fn put_overwrites_stale_profile() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("user_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("database should initialize");
+
+        let cache = UserCache::new(db.pool().clone());
+
+        let mut v1 = create_test_profile();
+        v1.name = Some("old-name".to_string());
+
+        cache
+            .put(&v1.npub, &v1)
+            .await
+            .expect("first put should succeed");
+
+        let mut v2 = v1.clone();
+        v2.name = Some("new-name".to_string());
+        v2.about = Some("new about".to_string());
+
+        cache
+            .put(&v2.npub, &v2)
+            .await
+            .expect("second put should succeed");
+
+        let loaded = cache
+            .get(&v2.npub)
+            .await
+            .expect("profile should still exist");
+
+        assert_eq!(loaded.name, v2.name);
+        assert_eq!(loaded.about, v2.about);
+    }
 }

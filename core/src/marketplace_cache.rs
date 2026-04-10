@@ -36,7 +36,7 @@ impl MarketplaceCache {
                        images_json, summary, published_at, location, geohash, status
                 FROM marketplace_listings
                 WHERE created_at >= ?
-                ORDER BY updated_at DESC
+                ORDER BY created_at DESC
                 LIMIT ?
                 "#,
             )
@@ -51,7 +51,7 @@ impl MarketplaceCache {
                        publisher_npub, created_at, tags_json, lud16,
                        images_json, summary, published_at, location, geohash, status
                 FROM marketplace_listings
-                ORDER BY updated_at DESC
+                ORDER BY created_at DESC
                 LIMIT ?
                 "#,
             )
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_and_load_roundtrip() {
+    async fn upsert_new_listing_returns_inserted() {
         let temp_dir = TempDir::new().expect("temp dir should be created");
         let db_path = temp_dir.path().join("marketplace_cache.db");
         let db = Database::new(&db_path)
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_detects_unchanged_and_updated() {
+    async fn upsert_unchanged_listing_returns_unchanged() {
         let temp_dir = TempDir::new().expect("temp dir should be created");
         let db_path = temp_dir.path().join("marketplace_cache.db");
         let db = Database::new(&db_path)
@@ -268,9 +268,27 @@ mod tests {
             .await
             .expect("second upsert should succeed");
         assert_eq!(unchanged, UpsertOutcome::Unchanged);
+    }
+
+    #[tokio::test]
+    async fn upsert_changed_listing_returns_updated() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+
+        let cache = MarketplaceCache::new(db.pool().clone());
+        let listing = make_listing("game-3", 1_710_000_002, "Game Three");
+
+        let first = cache
+            .upsert_listing(&listing, Some("event-1"))
+            .await
+            .expect("first upsert should succeed");
+        assert_eq!(first, UpsertOutcome::Inserted);
 
         let mut updated_listing = listing.clone();
-        updated_listing.title = "Game Two Updated".to_string();
+        updated_listing.title = "Game Three Updated".to_string();
         let updated = cache
             .upsert_listing(&updated_listing, Some("event-2"))
             .await
@@ -307,6 +325,90 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "recent");
+    }
+
+    #[tokio::test]
+    async fn load_listings_returns_all_upserted() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+
+        let cache = MarketplaceCache::new(db.pool().clone());
+
+        for i in 0..5 {
+            let listing = make_listing(&format!("game-{}", i), 1_710_000_100 + i, "Any");
+            cache
+                .upsert_listing(&listing, None)
+                .await
+                .expect("upsert should succeed");
+        }
+
+        let loaded = cache
+            .load_listings(10, None)
+            .await
+            .expect("load should succeed");
+
+        assert_eq!(loaded.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn listing_identity_is_publisher_plus_d_tag() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+
+        let cache = MarketplaceCache::new(db.pool().clone());
+
+        let first = make_listing("game-a", 1_710_001_000, "Game A");
+        let second = make_listing("game-b", 1_710_001_001, "Game B");
+
+        cache
+            .upsert_listing(&first, None)
+            .await
+            .expect("first upsert should succeed");
+        cache
+            .upsert_listing(&second, None)
+            .await
+            .expect("second upsert should succeed");
+
+        let loaded = cache
+            .load_listings(10, None)
+            .await
+            .expect("load should succeed");
+
+        assert_eq!(loaded.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn listing_ordering_by_created_at_desc() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+
+        let cache = MarketplaceCache::new(db.pool().clone());
+        cache
+            .upsert_listing(&make_listing("old", 1_710_010_000, "Old"), None)
+            .await
+            .expect("old upsert should succeed");
+        cache
+            .upsert_listing(&make_listing("new", 1_710_020_000, "New"), None)
+            .await
+            .expect("new upsert should succeed");
+
+        let loaded = cache
+            .load_listings(10, None)
+            .await
+            .expect("load should succeed");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, "new");
+        assert_eq!(loaded[1].id, "old");
     }
 
     #[tokio::test]
