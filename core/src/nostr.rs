@@ -1764,6 +1764,27 @@ pub fn parse_nip19_identifier(identifier: &str) -> Result<Nip19Identifier, Nostr
 #[cfg(test)]
 mod nip65_tests {
     use super::*;
+    use nostr_sdk::{Alphabet, EventBuilder, Keys, Kind, Tag, TagKind};
+
+    fn build_kind_10002_event(tags: Vec<Vec<&str>>) -> Event {
+        let keys = Keys::generate();
+        let mut builder = EventBuilder::new(Kind::from_u16(KIND_RELAY_LIST), "");
+
+        for tag_values in tags {
+            let values = tag_values
+                .into_iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<String>>();
+            builder = builder.tag(Tag::custom(
+                TagKind::single_letter(Alphabet::R, false),
+                values,
+            ));
+        }
+
+        builder
+            .sign_with_keys(&keys)
+            .expect("kind 10002 event should be signed")
+    }
 
     #[test]
     fn test_parse_relay_list_content() {
@@ -1782,11 +1803,41 @@ mod nip65_tests {
 
     #[tokio::test]
     async fn test_fetch_relay_list_parses_kind_10002() {
-        // This test verifies that we can parse a Kind 10002 event
-        // The actual implementation will be added in the next step
-        //let client = NostrClient::new(vec!["wss://relay.damus.io".to_string()]).await.unwrap();
+        // Mock relay response event (Kind 10002) with read/write/no-marker relay tags.
+        let event = build_kind_10002_event(vec![
+            vec!["wss://relay.read.example", "read"],
+            vec!["wss://relay.write.example", "write"],
+            vec!["wss://relay.both.example"],
+        ]);
 
-        // Test parsing of known Kind 10002 content format
+        let parsed = parse_relay_list_from_event(&event).expect("relay list should parse");
+
+        assert!(parsed
+            .read_relays
+            .contains(&"wss://relay.read.example".to_string()));
+        assert!(parsed
+            .write_relays
+            .contains(&"wss://relay.write.example".to_string()));
+        assert!(parsed
+            .read_relays
+            .contains(&"wss://relay.both.example".to_string()));
+        assert!(parsed
+            .write_relays
+            .contains(&"wss://relay.both.example".to_string()));
+    }
+
+    #[test]
+    fn test_parse_relay_list_from_event_unknown_marker_defaults_to_both() {
+        let event = build_kind_10002_event(vec![vec!["wss://relay.unknown.example", "custom"]]);
+
+        let parsed = parse_relay_list_from_event(&event).expect("relay list should parse");
+
+        assert!(parsed
+            .read_relays
+            .contains(&"wss://relay.unknown.example".to_string()));
+        assert!(parsed
+            .write_relays
+            .contains(&"wss://relay.unknown.example".to_string()));
     }
 
     #[test]
