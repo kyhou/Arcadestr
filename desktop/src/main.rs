@@ -489,7 +489,11 @@ async fn fetch_marketplace_stream(
     let mut cached_emitted = 0usize;
     let mut cached_signatures: HashMap<(String, String), String> = HashMap::new();
 
-    match state.marketplace_cache.load_listings(limit, since_days).await {
+    match state
+        .marketplace_cache
+        .load_listings(limit, since_days)
+        .await
+    {
         Ok(cached) => {
             for listing in cached {
                 cached_signatures.insert(listing_cache_key(&listing), listing_signature(&listing));
@@ -685,48 +689,53 @@ fn main() {
     // Create a single runtime for all initialization
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
-    let (database, nostr_client, user_cache, marketplace_cache, nip05_validator) = runtime.block_on(async {
-        // Initialize database
-        let db = arcadestr_core::storage::Database::new(&db_path)
-            .await
-            .expect("Failed to initialize database");
-
-        let cache = Arc::new(UserCache::new(db.pool().clone()));
-
-        // Initialize NostrClient with relay manager
-        let relay_config = arcadestr_core::relay_manager::RelayManagerConfig {
-            max_relays: 100,
-            query_timeout_secs: 8,
-            connection_poll_timeout_ms: 5000,
-            connection_poll_interval_ms: 100,
-        };
-
-        let client = match NostrClient::new_with_cache(
-            "default".to_string(),
-            DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
-            cache.clone(),
-            Some(relay_config),
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Warning: Failed to initialize NostrClient: {}", e);
-                eprintln!("The app will start but relay functionality may be limited.");
-                // Create a client with no relays - user can retry later
-                NostrClient::new_with_cache("default".to_string(), vec![], cache.clone(), None)
-                    .await
-                    .expect("Failed to create empty client")
-            }
-        };
-
-        // Wrap client in Arc for sharing
-        let client = Arc::new(client);
-
-        // Spawn NIP-05 background validator
-        let validator_client =
-            match NostrClient::new_with_cache("default".to_string(), vec![], cache.clone(), None)
+    let (database, nostr_client, user_cache, marketplace_cache, nip05_validator) = runtime
+        .block_on(async {
+            // Initialize database
+            let db = arcadestr_core::storage::Database::new(&db_path)
                 .await
+                .expect("Failed to initialize database");
+
+            let cache = Arc::new(UserCache::new(db.pool().clone()));
+
+            // Initialize NostrClient with relay manager
+            let relay_config = arcadestr_core::relay_manager::RelayManagerConfig {
+                max_relays: 100,
+                query_timeout_secs: 8,
+                connection_poll_timeout_ms: 5000,
+                connection_poll_interval_ms: 100,
+            };
+
+            let client = match NostrClient::new_with_cache(
+                "default".to_string(),
+                DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
+                cache.clone(),
+                Some(relay_config),
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Warning: Failed to initialize NostrClient: {}", e);
+                    eprintln!("The app will start but relay functionality may be limited.");
+                    // Create a client with no relays - user can retry later
+                    NostrClient::new_with_cache("default".to_string(), vec![], cache.clone(), None)
+                        .await
+                        .expect("Failed to create empty client")
+                }
+            };
+
+            // Wrap client in Arc for sharing
+            let client = Arc::new(client);
+
+            // Spawn NIP-05 background validator
+            let validator_client = match NostrClient::new_with_cache(
+                "default".to_string(),
+                vec![],
+                cache.clone(),
+                None,
+            )
+            .await
             {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
@@ -734,41 +743,41 @@ fn main() {
                     client.clone() // Fallback to shared client
                 }
             };
-        let nip05_validator = Arc::new(std::sync::Mutex::new(Nip05Validator::spawn(
-            validator_client,
-            cache.clone(),
-        )));
-        info!("NIP-05 background validator spawned");
+            let nip05_validator = Arc::new(std::sync::Mutex::new(Nip05Validator::spawn(
+                validator_client,
+                cache.clone(),
+            )));
+            info!("NIP-05 background validator spawned");
 
-        // Unwrap Arc to return the client directly (it will be re-wrapped later)
-        let client = match Arc::try_unwrap(client) {
-            Ok(c) => c,
-            Err(_) => {
-                // If we can't unwrap (because validator is still using it), create a new empty client
-                warn!("Client is shared, creating new client for main use");
-                NostrClient::new_with_cache("default".to_string(), vec![], cache.clone(), None)
-                    .await
-                    .expect("Failed to create fallback client")
+            // Unwrap Arc to return the client directly (it will be re-wrapped later)
+            let client = match Arc::try_unwrap(client) {
+                Ok(c) => c,
+                Err(_) => {
+                    // If we can't unwrap (because validator is still using it), create a new empty client
+                    warn!("Client is shared, creating new client for main use");
+                    NostrClient::new_with_cache("default".to_string(), vec![], cache.clone(), None)
+                        .await
+                        .expect("Failed to create fallback client")
+                }
+            };
+
+            // Connect to default relays immediately to reduce query latency
+            info!("Connecting to default relays before starting Tauri...");
+            client.connect().await;
+            info!("Default relay connections initiated");
+
+            // Start connection monitoring for real-time relay status updates
+            {
+                let relay_manager = client.relay_manager();
+                let manager = relay_manager.lock().await;
+                manager.start_connection_monitor().await;
+                info!("Relay connection monitoring started");
             }
-        };
 
-        // Connect to default relays immediately to reduce query latency
-        info!("Connecting to default relays before starting Tauri...");
-        client.connect().await;
-        info!("Default relay connections initiated");
+            let marketplace_cache = Arc::new(MarketplaceCache::new(db.pool().clone()));
 
-        // Start connection monitoring for real-time relay status updates
-        {
-            let relay_manager = client.relay_manager();
-            let manager = relay_manager.lock().await;
-            manager.start_connection_monitor().await;
-            info!("Relay connection monitoring started");
-        }
-
-        let marketplace_cache = Arc::new(MarketplaceCache::new(db.pool().clone()));
-
-        (db, client, cache, marketplace_cache, nip05_validator)
-    });
+            (db, client, cache, marketplace_cache, nip05_validator)
+        });
     info!("Database initialized at: {}", db_path.display());
     info!("UserCache initialized");
 
