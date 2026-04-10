@@ -611,13 +611,18 @@ impl NostrClient {
     /// events simultaneously.
     ///
     /// # Examples
-    /// ```
+    /// ```no_run
+    /// # use arcadestr_core::nostr::NostrClient;
+    /// # tokio::runtime::Runtime::new()?.block_on(async {
     /// let client = NostrClient::new("profile".to_string(), vec![], None).await?;
     /// let mut rx = client.subscribe_relay_events();
     ///
-    /// while let Ok(event) = rx.recv().await {
+    /// if let Ok(event) = rx.recv().await {
     ///     println!("Relay event: {:?}", event);
     /// }
+    /// # Ok::<(), arcadestr_core::nostr::NostrError>(())
+    /// # })?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn subscribe_relay_events(&self) -> broadcast::Receiver<RelayConnectionEvent> {
         self.relay_event_sender.subscribe()

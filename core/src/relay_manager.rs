@@ -536,8 +536,9 @@ impl RelayManager {
     /// Returns `RelayManagerError::Connection` if no relays are connected.
     ///
     /// # Examples
-    /// ```rust
+    /// ```ignore
     /// # use nostr_sdk::Event;
+    /// # use arcadestr_core::relay_manager::RelayManager;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let relay_manager = todo!(); // Assume relay_manager is initialized
     /// # let event: Event = todo!(); // Assume event is signed

@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Examples
 /// ```
+/// use arcadestr_core::relay_events::RelayConnectionEvent;
+///
 /// let event = RelayConnectionEvent::connected("wss://relay.damus.io");
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +31,8 @@ pub enum RelayConnectionEvent {
 ///
 /// # Examples
 /// ```
+/// use arcadestr_core::relay_events::RelayStatus;
+///
 /// let status = RelayStatus {
 ///     url: "wss://relay.damus.io".to_string(),
 ///     connected: true,
@@ -50,6 +54,8 @@ impl RelayConnectionEvent {
     ///
     /// # Examples
     /// ```
+    /// use arcadestr_core::relay_events::RelayConnectionEvent;
+    ///
     /// let event = RelayConnectionEvent::connected("wss://relay.damus.io");
     /// ```
     pub fn connected(url: impl Into<String>) -> Self {
@@ -60,6 +66,8 @@ impl RelayConnectionEvent {
     ///
     /// # Examples
     /// ```
+    /// use arcadestr_core::relay_events::RelayConnectionEvent;
+    ///
     /// let event = RelayConnectionEvent::disconnected(
     ///     "wss://relay.damus.io",
     ///     Some("Connection reset".to_string()),
