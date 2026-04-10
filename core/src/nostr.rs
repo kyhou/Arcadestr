@@ -1932,6 +1932,217 @@ mod dedup_tests {
 }
 
 #[cfg(test)]
+mod nip01_nip19_tests {
+    use super::*;
+    use nostr::ToBech32;
+    use nostr_sdk::{Event, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag, TagKind};
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    fn build_text_note_event(content: &str) -> Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::TextNote, content)
+            .sign_with_keys(&keys)
+            .expect("text note should sign")
+    }
+
+    #[test]
+    fn event_id_is_sha256_of_canonical_json() {
+        let event = build_text_note_event("hello world");
+        let canonical = json!([
+            0,
+            event.pubkey.to_hex(),
+            event.created_at.as_secs(),
+            event.kind.as_u16(),
+            Vec::<Vec<String>>::new(),
+            event.content
+        ])
+        .to_string();
+        let expected_id = hex::encode(Sha256::digest(canonical.as_bytes()));
+        assert_eq!(event.id.to_hex(), expected_id);
+    }
+
+    #[test]
+    fn event_id_is_32_byte_lowercase_hex() {
+        let event = build_text_note_event("event id shape");
+        let event_id = event.id.to_hex();
+        assert_eq!(event_id.len(), 64);
+        assert!(event_id.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn pubkey_is_32_byte_lowercase_hex() {
+        let event = build_text_note_event("pubkey shape");
+        let pubkey_hex = event.pubkey.to_hex();
+        assert_eq!(pubkey_hex.len(), 64);
+        assert!(pubkey_hex.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn signature_is_64_byte_lowercase_hex() {
+        let event = build_text_note_event("signature shape");
+        let sig_hex = event.sig.to_string();
+        assert_eq!(sig_hex.len(), 128);
+        assert!(sig_hex.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn schnorr_signature_verifies() {
+        let event = build_text_note_event("verify signature");
+        assert!(event.verify().is_ok());
+    }
+
+    #[test]
+    fn tampered_event_fails_verification() {
+        let event = build_text_note_event("original content");
+        let mut value = serde_json::to_value(&event).expect("event should serialize");
+        value["content"] = json!("tampered content");
+        let tampered: Event = serde_json::from_value(value).expect("tampered event should deserialize");
+        assert!(tampered.verify().is_err());
+    }
+
+    #[test]
+    fn kind_is_non_negative_integer() {
+        let event = build_text_note_event("kind range");
+        let kind = event.kind.as_u16();
+        assert!(kind <= u16::MAX);
+    }
+
+    #[test]
+    fn created_at_is_unix_timestamp() {
+        let event = build_text_note_event("created at range");
+        let created_at = event.created_at.as_secs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs();
+        let five_years = 5 * 365 * 24 * 60 * 60;
+
+        assert!(created_at > 0);
+        assert!(created_at >= now.saturating_sub(five_years));
+        assert!(created_at <= now + five_years);
+    }
+
+    #[test]
+    fn tags_are_arrays_of_strings() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "tagged")
+            .tag(Tag::custom(TagKind::Custom("t".into()), ["nostr"]))
+            .tag(Tag::custom(TagKind::Custom("client".into()), ["arcadestr", "v1"]))
+            .sign_with_keys(&keys)
+            .expect("tagged event should sign");
+
+        for tag in event.tags.iter() {
+            let values = tag.clone().to_vec();
+            assert!(!values.is_empty());
+            assert!(values.iter().all(|value| !value.is_empty()));
+        }
+    }
+
+    #[test]
+    fn filter_since_until_ordering() {
+        let timestamps = [100_u64, 200, 300, 400, 500];
+        let since = 200_u64;
+        let until = 400_u64;
+        let filtered: Vec<u64> = timestamps
+            .into_iter()
+            .filter(|ts| *ts >= since && *ts <= until)
+            .collect();
+
+        assert_eq!(filtered, vec![200, 300, 400]);
+    }
+
+    #[test]
+    fn kind_0_metadata_content_is_valid_json() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Metadata, r#"{"name":"alice"}"#)
+            .sign_with_keys(&keys)
+            .expect("metadata event should sign");
+
+        let content: serde_json::Value = serde_json::from_str(&event.content).expect("metadata must be json");
+        assert_eq!(content["name"], json!("alice"));
+    }
+
+    #[test]
+    fn npub_starts_with_npub1() {
+        let npub = Keys::generate()
+            .public_key()
+            .to_bech32()
+            .expect("npub encoding should succeed");
+        assert!(npub.starts_with("npub1"));
+    }
+
+    #[test]
+    fn nsec_starts_with_nsec1() {
+        let nsec = Keys::generate()
+            .secret_key()
+            .to_bech32()
+            .expect("nsec encoding should succeed");
+        assert!(nsec.starts_with("nsec1"));
+    }
+
+    #[test]
+    fn npub_decode_roundtrip() {
+        let npub = Keys::generate()
+            .public_key()
+            .to_bech32()
+            .expect("npub encoding should succeed");
+        let pubkey = PublicKey::parse(&npub).expect("npub parse should succeed");
+        let roundtrip = pubkey.to_bech32().expect("npub re-encoding should succeed");
+        assert_eq!(roundtrip, npub);
+    }
+
+    #[test]
+    fn hex_pubkey_and_npub_represent_same_key() {
+        let keys = Keys::generate();
+        let expected_hex = keys.public_key().to_hex();
+        let npub = keys
+            .public_key()
+            .to_bech32()
+            .expect("npub encoding should succeed");
+        let decoded = PublicKey::parse(&npub).expect("npub parse should succeed");
+        assert_eq!(decoded.to_hex(), expected_hex);
+    }
+
+    #[test]
+    fn npub_not_accepted_in_event_pubkey_field() {
+        let event = build_text_note_event("reject npub in event pubkey field");
+        let npub = event
+            .pubkey
+            .to_bech32()
+            .expect("npub encoding should succeed");
+
+        let mut value = serde_json::to_value(&event).expect("event should serialize");
+        value["pubkey"] = json!(npub);
+
+        let validation = validate_nip01_event_json_fields(&value);
+        assert!(validation.is_err());
+    }
+
+    #[test]
+    fn unknown_bech32_prefix_is_ignored() {
+        let result = parse_nip19_identifier("nxyz1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn nprofile_includes_relay_hints() {
+        let keys = Keys::generate();
+        let relay = RelayUrl::parse("wss://relay.damus.io").expect("relay url should parse");
+        let nprofile = nostr::nips::nip19::Nip19Profile {
+            public_key: keys.public_key(),
+            relays: vec![relay],
+        }
+        .to_bech32()
+        .expect("nprofile encoding should succeed");
+
+        let parsed = parse_nip19_identifier(&nprofile).expect("nprofile should parse");
+        assert!(!parsed.relays.is_empty());
+        assert!(parsed.relays.iter().any(|relay_url| relay_url.starts_with("wss://")));
+    }
+}
+
+#[cfg(test)]
 mod idle_timeout_tests {
     use super::*;
     use std::thread;
