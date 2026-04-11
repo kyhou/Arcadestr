@@ -958,6 +958,7 @@ fn npub_of(pubkey: &PublicKey) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr_sdk::{Event, EventBuilder, Keys, Kind, Tag, TagKind};
 
     fn make_product(price: f64, currency: &str, categories: &[&str], npub: &str) -> Nip15Product {
         Nip15Product {
@@ -975,6 +976,150 @@ mod tests {
             merchant_npub: npub.into(),
             created_at: 0,
         }
+    }
+
+    fn make_nip99_event(kind: u16, content: &str, tags: Vec<Vec<&str>>) -> Event {
+        let keys = Keys::generate();
+        let mut builder = EventBuilder::new(Kind::Custom(kind), content);
+
+        for tag in tags {
+            let tag_name = tag
+                .first()
+                .expect("tag must have a name")
+                .to_string();
+            let values = tag
+                .into_iter()
+                .skip(1)
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<String>>();
+            builder = builder.tag(Tag::custom(TagKind::Custom(tag_name.into()), values));
+        }
+
+        builder
+            .sign_with_keys(&keys)
+            .expect("NIP-99 event should sign")
+    }
+
+    #[test]
+    fn listing_event_uses_kind_30402() {
+        let event = make_nip99_event(
+            30402,
+            "# Listing\nActive listing in markdown",
+            vec![vec!["d", "listing-01"], vec!["title", "Test Listing"]],
+        );
+
+        let listing = parse_listing(event).expect("active listing should parse");
+        assert_eq!(listing.id, "listing-01");
+    }
+
+    #[test]
+    fn draft_listing_uses_kind_30403() {
+        let event = make_nip99_event(
+            30403,
+            "# Draft\nDraft listing in markdown",
+            vec![vec!["d", "listing-draft"], vec!["title", "Draft Listing"]],
+        );
+
+        let listing = parse_listing(event).expect("draft listing should parse");
+        assert_eq!(listing.id, "listing-draft");
+    }
+
+    #[test]
+    fn content_is_markdown_string() {
+        let markdown = "## Indie Adventure\nA cozy marketplace listing";
+        let event = make_nip99_event(
+            30402,
+            markdown,
+            vec![vec!["d", "listing-md"], vec!["title", "Markdown Listing"]],
+        );
+
+        let listing = parse_listing(event).expect("listing should parse");
+        assert!(!listing.content.trim().is_empty());
+        assert!(listing.content.contains("##"));
+    }
+
+    #[test]
+    fn title_tag_is_present() {
+        let event = make_nip99_event(
+            30402,
+            "content",
+            vec![vec!["d", "listing-title"], vec!["title", "The Game Title"]],
+        );
+
+        let listing = parse_listing(event).expect("listing should parse");
+        assert_eq!(listing.title, "The Game Title");
+    }
+
+    #[test]
+    fn published_at_tag_is_unix_timestamp() {
+        let timestamp = "1700000000";
+        let event = make_nip99_event(
+            30402,
+            "content",
+            vec![
+                vec!["d", "listing-published"],
+                vec!["title", "Published Listing"],
+                vec!["published_at", timestamp],
+            ],
+        );
+
+        let listing = parse_listing(event).expect("listing should parse");
+        let parsed_timestamp = listing.published_at.expect("published_at should be present");
+        assert_eq!(parsed_timestamp, 1_700_000_000_i64);
+    }
+
+    #[test]
+    fn price_tag_currency_codes() {
+        let event = make_nip99_event(
+            30402,
+            "content",
+            vec![
+                vec!["d", "listing-price"],
+                vec!["title", "Priced Listing"],
+                vec!["price", "100", "SATS"],
+            ],
+        );
+
+        let listing = parse_listing(event).expect("listing should parse");
+        assert_eq!(listing.price_amount.as_deref(), Some("100"));
+        let currency = listing
+            .price_currency
+            .as_deref()
+            .expect("price currency should be present");
+        assert_eq!(currency, "SATS");
+        assert!(currency.chars().all(|ch| !ch.is_ascii_alphabetic() || ch.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn summary_tag_when_summary_present() {
+        let event = make_nip99_event(
+            30402,
+            "content",
+            vec![
+                vec!["d", "listing-summary"],
+                vec!["title", "Summary Listing"],
+                vec!["summary", "Short summary text"],
+            ],
+        );
+
+        let listing = parse_listing(event).expect("listing should parse");
+        assert_eq!(listing.summary.as_deref(), Some("Short summary text"));
+    }
+
+    #[test]
+    fn location_tag_when_location_present() {
+        let event = make_nip99_event(
+            30402,
+            "content",
+            vec![
+                vec!["d", "listing-location"],
+                vec!["title", "Location Listing"],
+                vec!["location", "Remote"],
+            ],
+        );
+
+        let listing = parse_listing(event).expect("listing should parse");
+        assert_eq!(listing.location.as_deref(), Some("Remote"));
     }
 
     #[test]
