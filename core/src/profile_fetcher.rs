@@ -14,7 +14,7 @@ use crate::nostr::{NostrClient, NostrError, UserProfile, UserProfileContent};
 use crate::user_cache::UserCache;
 
 /// Configuration constants
-pub const BATCH_SIZE: usize = 200;
+pub const BATCH_SIZE: usize = 10;
 pub const MAX_PROFILE_ATTEMPTS: u32 = 2;
 pub const PROFILE_CACHE_SIZE: usize = 5000;
 pub const CACHE_TTL_SECONDS: u64 = 86400; // 24 hours
@@ -442,12 +442,64 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_fetcher_enqueue() {
+    fn enqueue_does_not_add_already_cached() {
+        let cache = Arc::new(LruProfileCache::new(100, 3600));
+        let fetcher = ProfileFetcher::with_cache(cache.clone());
+
+        let profile = UserProfile {
+            npub: "cached_npub".to_string(),
+            name: Some("Cached User".to_string()),
+            ..Default::default()
+        };
+        cache.put("cached_npub".to_string(), profile);
+
+        fetcher.enqueue_many(vec!["cached_npub".to_string()]);
+
+        assert_eq!(fetcher.pending_count(), 0);
+    }
+
+    #[test]
+    fn enqueue_does_not_add_duplicates() {
         let fetcher = ProfileFetcher::new();
 
-        fetcher.enqueue("npub1test".to_string());
-        fetcher.enqueue("npub1test".to_string()); // Duplicate, should be ignored
+        fetcher.enqueue_many(vec!["npub1test".to_string()]);
+        fetcher.enqueue_many(vec!["npub1test".to_string()]);
 
         assert_eq!(fetcher.pending_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_size_capped_at_10() {
+        let fetcher = ProfileFetcher::new();
+
+        let npubs: Vec<String> = (0..15).map(|i| format!("invalid-npub-{}", i)).collect();
+        fetcher.enqueue_many(npubs);
+
+        let client = NostrClient::new("test".to_string(), vec![], None)
+            .await
+            .expect("Failed to create test NostrClient");
+
+        let (_, remaining) = fetcher.fetch_batch(&client).await;
+
+        assert_eq!(remaining, 5);
+        assert_eq!(fetcher.pending_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn processed_items_removed_from_queue() {
+        let fetcher = ProfileFetcher::new();
+
+        let npubs: Vec<String> = (0..3).map(|i| format!("invalid-npub-{}", i)).collect();
+        fetcher.enqueue_many(npubs);
+
+        let client = NostrClient::new("test".to_string(), vec![], None)
+            .await
+            .expect("Failed to create test NostrClient");
+
+        let (_, remaining) = fetcher.fetch_batch(&client).await;
+
+        assert_eq!(remaining, 0);
+        assert_eq!(fetcher.pending_count(), 0);
+        assert_eq!(fetcher.in_flight_count(), 0);
     }
 }
