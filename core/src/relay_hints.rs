@@ -258,10 +258,19 @@ mod tests {
     use super::*;
     use nostr_sdk::{EventBuilder, Keys, Tag, TagKind};
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_db_path() -> std::path::PathBuf {
         let temp_dir = std::env::temp_dir();
-        let unique_name = format!("test_hints_{}.db", std::process::id());
+        let counter = TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let unique_name = format!(
+            "test_hints_{}_{}_{}.db",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed"),
+            counter
+        );
         temp_dir.join(unique_name)
     }
 
