@@ -651,9 +651,10 @@ impl NostrSigner for ActiveSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Once;
+    use std::sync::{Mutex, Once};
 
     static INIT: Once = Once::new();
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn setup_test_keys_dir() {
         INIT.call_once(|| {
@@ -664,8 +665,15 @@ mod tests {
         });
     }
 
+    fn lock_nip46_test_state() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .expect("nip46 test lock mutex poisoned")
+    }
+
     #[test]
     fn test_generate_nostrconnect_uri_basic() {
+        let _guard = lock_nip46_test_state();
         setup_test_keys_dir();
         let relay = "wss://relay.damus.io";
         let secret = "test_secret_123";
@@ -691,6 +699,7 @@ mod tests {
 
     #[test]
     fn test_generate_nostrconnect_uri_returns_keys() {
+        let _guard = lock_nip46_test_state();
         setup_test_keys_dir();
         let relay = "wss://relay.nostr.band";
 
@@ -709,6 +718,7 @@ mod tests {
 
     #[test]
     fn test_generate_nostrconnect_uri_with_name() {
+        let _guard = lock_nip46_test_state();
         setup_test_keys_dir();
         let relay = "wss://relay.example.com";
         let secret = "secret789";
@@ -728,6 +738,7 @@ mod tests {
 
     #[test]
     fn test_generate_nostrconnect_uri_url_encoding() {
+        let _guard = lock_nip46_test_state();
         setup_test_keys_dir();
         let relay = "wss://relay.test.com/path";
         let secret = "secret";
@@ -743,6 +754,7 @@ mod tests {
 
     #[test]
     fn test_generate_nostrconnect_uri_unique() {
+        let _guard = lock_nip46_test_state();
         setup_test_keys_dir();
         let relay = "wss://relay.damus.io";
 
