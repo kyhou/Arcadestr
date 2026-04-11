@@ -367,4 +367,89 @@ mod tests {
 
         cleanup(&path);
     }
+
+    #[test]
+    fn p_tag_with_relay_hint_is_stored() {
+        let path = temp_db_path();
+        cleanup(&path);
+
+        let store = RelayHints::new(&path).unwrap();
+
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note("test")
+            .tag(Tag::custom(
+                TagKind::p(),
+                vec!["pubkey_rh_01", "wss://relay-rh-01.example"],
+            ))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        store.extract_hints_from_event(&event).unwrap();
+
+        let hints = store.get_hints("pubkey_rh_01").unwrap();
+        assert_eq!(hints, vec!["wss://relay-rh-01.example".to_string()]);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn relay_hints_retrieved_by_pubkey() {
+        let path = temp_db_path();
+        cleanup(&path);
+
+        let store = RelayHints::new(&path).unwrap();
+
+        let keys = Keys::generate();
+        let event_one = EventBuilder::text_note("test")
+            .tag(Tag::custom(
+                TagKind::p(),
+                vec!["pubkey_rh_02", "wss://relay-rh-02-a.example"],
+            ))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let event_two = EventBuilder::text_note("test")
+            .tag(Tag::custom(
+                TagKind::p(),
+                vec!["pubkey_rh_02", "wss://relay-rh-02-b.example"],
+            ))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        store.extract_hints_from_event(&event_one).unwrap();
+        store.extract_hints_from_event(&event_two).unwrap();
+
+        let mut hints = store.get_hints("pubkey_rh_02").unwrap();
+        hints.sort();
+
+        assert_eq!(
+            hints,
+            vec![
+                "wss://relay-rh-02-a.example".to_string(),
+                "wss://relay-rh-02-b.example".to_string(),
+            ]
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn relay_hints_deduplicated() {
+        let path = temp_db_path();
+        cleanup(&path);
+
+        let store = RelayHints::new(&path).unwrap();
+
+        store
+            .add_hint("pubkey_rh_03", "wss://relay-rh-03.example")
+            .unwrap();
+        store
+            .add_hint("pubkey_rh_03", "wss://relay-rh-03.example")
+            .unwrap();
+
+        let hints = store.get_hints("pubkey_rh_03").unwrap();
+        assert_eq!(hints, vec!["wss://relay-rh-03.example".to_string()]);
+
+        cleanup(&path);
+    }
 }
