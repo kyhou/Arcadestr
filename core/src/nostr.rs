@@ -1907,6 +1907,302 @@ mod nip65_tests {
     }
 }
 
+#[cfg(all(test, feature = "native"))]
+mod relay_selection_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const FP_TOLERANCE: f32 = 0.001;
+
+    fn scored_relay(url: &str, score: f32, pubkeys: &[&str]) -> ScoredRelay {
+        ScoredRelay {
+            url: url.to_string(),
+            score,
+            pubkeys: pubkeys.iter().map(|p| (*p).to_string()).collect(),
+        }
+    }
+
+    fn all_pubkeys(pubkeys: &[&str]) -> HashSet<String> {
+        pubkeys.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("nostr_relay_selection_{}_{}.db", name, nanos))
+    }
+
+    fn unix_now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_secs()
+    }
+
+    fn apply_connection_event(status: &mut RelayStatus, event: RelayConnectionEvent) {
+        match event {
+            RelayConnectionEvent::Connected { url } => {
+                if status.url == url {
+                    status.connected = true;
+                }
+            }
+            RelayConnectionEvent::Disconnected { url, .. } => {
+                if status.url == url {
+                    status.connected = false;
+                    status.latency_ms = None;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn greedy_set_cover_selects_minimum_relays() {
+        let scored = vec![
+            scored_relay("wss://relay-a.example", 3.0, &["pk1", "pk2", "pk3"]),
+            scored_relay("wss://relay-b.example", 2.0, &["pk1", "pk2"]),
+            scored_relay("wss://relay-c.example", 1.0, &["pk3"]),
+        ];
+
+        let selection = select_relays(scored, 10, &all_pubkeys(&["pk1", "pk2", "pk3"]));
+
+        assert_eq!(selection.permanent, vec!["wss://relay-a.example".to_string()]);
+        assert!(selection.uncovered_pubkeys.is_empty());
+    }
+
+    #[test]
+    fn relay_selection_covers_all_pubkeys() {
+        let scored = vec![
+            scored_relay("wss://relay-a.example", 2.0, &["pk1", "pk2"]),
+            scored_relay("wss://relay-b.example", 2.0, &["pk2", "pk3"]),
+            scored_relay("wss://relay-c.example", 1.0, &["pk3"]),
+        ];
+
+        let selection = select_relays(scored, 10, &all_pubkeys(&["pk1", "pk2", "pk3"]));
+
+        assert!(selection.uncovered_pubkeys.is_empty());
+        assert_eq!(selection.permanent.len(), 2);
+    }
+
+    #[test]
+    fn relay_selection_respects_max_relays() {
+        let scored = vec![
+            scored_relay("wss://relay-a.example", 2.0, &["pk1", "pk2"]),
+            scored_relay("wss://relay-b.example", 1.0, &["pk3"]),
+            scored_relay("wss://relay-c.example", 1.0, &["pk4"]),
+        ];
+
+        let selection = select_relays(scored, 2, &all_pubkeys(&["pk1", "pk2", "pk3", "pk4"]));
+
+        assert_eq!(selection.permanent.len(), 2);
+        assert_eq!(selection.uncovered_pubkeys.len(), 1);
+    }
+
+    #[test]
+    fn greedy_skips_zero_marginal_gain_relays() {
+        let scored = vec![
+            scored_relay("wss://relay-a.example", 2.0, &["pk1", "pk2"]),
+            scored_relay("wss://relay-b.example", 1.0, &["pk1"]),
+        ];
+
+        let selection = select_relays(scored, 10, &all_pubkeys(&["pk1", "pk2"]));
+
+        assert_eq!(selection.permanent, vec!["wss://relay-a.example".to_string()]);
+        assert!(selection.uncovered_pubkeys.is_empty());
+    }
+
+    #[test]
+    fn greedy_handles_disjoint_sets() {
+        let scored = vec![
+            scored_relay("wss://relay-a.example", 1.0, &["pk1"]),
+            scored_relay("wss://relay-b.example", 1.0, &["pk2"]),
+            scored_relay("wss://relay-c.example", 1.0, &["pk3"]),
+        ];
+
+        let selection = select_relays(scored, 10, &all_pubkeys(&["pk1", "pk2", "pk3"]));
+
+        assert_eq!(selection.permanent.len(), 3);
+        assert!(selection.uncovered_pubkeys.is_empty());
+    }
+
+    #[test]
+    fn score_relays_applies_health_penalty_above_20pct() {
+        let path = temp_db_path("health_penalty");
+        let _ = fs::remove_file(&path);
+
+        let cache = RelayCache::new(path.to_str().expect("temp path should be valid utf-8"))
+            .expect("relay cache should initialize");
+        let relay_url = "wss://relay-health.example";
+
+        cache
+            .save_relay_list(&CachedRelayList {
+                pubkey: relay_url.to_string(),
+                write_relays: vec![relay_url.to_string()],
+                read_relays: vec![],
+                updated_at: unix_now_secs(),
+            })
+            .expect("relay list should be saved");
+
+        cache
+            .update_relay_health(relay_url, 120, false)
+            .expect("health update should succeed");
+
+        let relay_map = HashMap::from([(
+            relay_url.to_string(),
+            all_pubkeys(&["pk1", "pk2", "pk3"]),
+        )]);
+
+        let scored = score_relays(&relay_map, &cache, None);
+        assert_eq!(scored.len(), 1);
+        assert!((scored[0].score - 2.1).abs() < FP_TOLERANCE);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn score_relays_applies_staleness_penalty() {
+        let path = temp_db_path("staleness_penalty");
+        let _ = fs::remove_file(&path);
+
+        let cache = RelayCache::new(path.to_str().expect("temp path should be valid utf-8"))
+            .expect("relay cache should initialize");
+        let relay_url = "wss://relay-stale.example";
+
+        cache
+            .save_relay_list(&CachedRelayList {
+                pubkey: relay_url.to_string(),
+                write_relays: vec![relay_url.to_string()],
+                read_relays: vec![],
+                updated_at: 0,
+            })
+            .expect("relay list should be saved");
+
+        let relay_map = HashMap::from([(
+            relay_url.to_string(),
+            all_pubkeys(&["pk1", "pk2"]),
+        )]);
+
+        let scored = score_relays(&relay_map, &cache, None);
+        assert_eq!(scored.len(), 1);
+        assert!((scored[0].score - 1.0).abs() < FP_TOLERANCE);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn score_relays_applies_own_relay_bonus() {
+        let path = temp_db_path("own_bonus");
+        let _ = fs::remove_file(&path);
+
+        let cache = RelayCache::new(path.to_str().expect("temp path should be valid utf-8"))
+            .expect("relay cache should initialize");
+        let relay_url = "wss://relay-own.example";
+        let user_pubkey = "user-pubkey";
+
+        cache
+            .save_relay_list(&CachedRelayList {
+                pubkey: relay_url.to_string(),
+                write_relays: vec![relay_url.to_string()],
+                read_relays: vec![],
+                updated_at: unix_now_secs(),
+            })
+            .expect("relay list should be saved");
+
+        cache
+            .save_relay_list(&CachedRelayList {
+                pubkey: user_pubkey.to_string(),
+                write_relays: vec![relay_url.to_string()],
+                read_relays: vec![],
+                updated_at: unix_now_secs(),
+            })
+            .expect("user relay list should be saved");
+
+        let relay_map = HashMap::from([(relay_url.to_string(), all_pubkeys(&["pk1", "pk2"]))]);
+
+        let scored = score_relays(&relay_map, &cache, Some(user_pubkey));
+        assert_eq!(scored.len(), 1);
+        assert!((scored[0].score - 3.0).abs() < FP_TOLERANCE);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn score_relays_combines_multipliers() {
+        let path = temp_db_path("combined_multipliers");
+        let _ = fs::remove_file(&path);
+
+        let cache = RelayCache::new(path.to_str().expect("temp path should be valid utf-8"))
+            .expect("relay cache should initialize");
+        let relay_url = "wss://relay-combined.example";
+        let user_pubkey = "user-pubkey";
+
+        cache
+            .save_relay_list(&CachedRelayList {
+                pubkey: relay_url.to_string(),
+                write_relays: vec![relay_url.to_string()],
+                read_relays: vec![],
+                updated_at: 0,
+            })
+            .expect("relay list should be saved");
+
+        cache
+            .save_relay_list(&CachedRelayList {
+                pubkey: user_pubkey.to_string(),
+                write_relays: vec![relay_url.to_string()],
+                read_relays: vec![],
+                updated_at: unix_now_secs(),
+            })
+            .expect("user relay list should be saved");
+
+        cache
+            .update_relay_health(relay_url, 180, false)
+            .expect("health update should succeed");
+
+        let relay_map = HashMap::from([(relay_url.to_string(), all_pubkeys(&["pk1", "pk2"]))]);
+
+        let scored = score_relays(&relay_map, &cache, Some(user_pubkey));
+        assert_eq!(scored.len(), 1);
+        assert!((scored[0].score - 1.05).abs() < FP_TOLERANCE);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn relay_status_transitions_on_connect_disconnect() {
+        let mut status = RelayStatus {
+            url: "wss://relay-status.example".to_string(),
+            connected: false,
+            latency_ms: None,
+        };
+
+        apply_connection_event(
+            &mut status,
+            RelayConnectionEvent::connected("wss://relay-status.example"),
+        );
+        assert!(status.connected);
+
+        apply_connection_event(
+            &mut status,
+            RelayConnectionEvent::disconnected("wss://relay-status.example", Some("mock".to_string())),
+        );
+        assert!(!status.connected);
+        assert!(status.latency_ms.is_none());
+    }
+
+    #[test]
+    fn relay_status_latency_none_before_first_ping() {
+        let status = RelayStatus {
+            url: "wss://relay-latency.example".to_string(),
+            connected: false,
+            latency_ms: None,
+        };
+
+        assert!(status.latency_ms.is_none());
+    }
+}
+
 #[cfg(test)]
 mod dedup_tests {
     use super::*;
