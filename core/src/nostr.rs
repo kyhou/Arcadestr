@@ -19,6 +19,7 @@ use crate::relay_events::{RelayConnectionEvent, RelayStatus};
 use crate::relay_hints::RelayHints;
 #[cfg(feature = "native")]
 use crate::relay_manager::{RelayManager, RelayManagerConfig};
+use crate::nip05_validator::{IdentityValidationState, Nip05IdentityValidator};
 use crate::signers::{ActiveSigner, NostrSigner as ArcadestrNostrSigner, SignerError};
 use crate::user_cache::UserCache;
 
@@ -578,12 +579,6 @@ pub struct UserProfileContent {
     pub lud16: Option<String>,
 }
 
-/// NIP-05 verification response structure.
-#[derive(Deserialize)]
-struct Nip05Response {
-    names: HashMap<String, String>,
-}
-
 /// NOSTR client for Arcadestr.
 pub struct NostrClient {
     relay_manager: Arc<Mutex<RelayManager>>,
@@ -1059,48 +1054,9 @@ impl NostrClient {
 
     /// Verifies a NIP-05 identifier against the user's pubkey.
     pub async fn verify_nip05(&self, npub: &str, nip05_identifier: &str) -> bool {
-        // Split nip05_identifier on '@' to get name and domain
-        let parts: Vec<&str> = nip05_identifier.split('@').collect();
-        if parts.len() != 2 {
-            return false;
-        }
-        let (name, domain) = (parts[0], parts[1]);
-
-        // Fetch the NIP-05 JSON from the domain
-        let url = format!("https://{}/.well-known/nostr.json?name={}", domain, name);
-
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(8))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-
-        let response = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-
-        let nip05_resp: Nip05Response = match response.json().await {
-            Ok(resp) => resp,
-            Err(_) => return false,
-        };
-
-        // Get the expected hex pubkey from npub
-        let pubkey = match PublicKey::parse(npub) {
-            Ok(pk) => pk,
-            Err(_) => return false,
-        };
-
-        let expected_hex = pubkey.to_hex();
-
-        // Check if the names map contains our pubkey
-        nip05_resp
-            .names
-            .get(name)
-            .map(|stored_hex| stored_hex.to_lowercase() == expected_hex.to_lowercase())
-            .unwrap_or(false)
+        let validator = Nip05IdentityValidator::new();
+        let result = validator.validate(npub, nip05_identifier).await;
+        result.state == IdentityValidationState::Valid
     }
 
     /// Convenience method that fetches profile and verifies NIP-05.
