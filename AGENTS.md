@@ -329,3 +329,11 @@ Desktop:
 - Prefer Playwright MCP for interaction
 - Use Chrome DevTools MCP or Firefox DevTools only for inspection
 - Include both Rust and WebView debugging when needed
+
+## Test Infrastructure
+
+Reusable HTTP mocking: `core/src/http_client.rs` (HttpClient trait,
+ReqwestHttpClient) and `core/src/test_helpers/http_mocks.rs`
+(MockHttpClient with builders: with_nip05_response, with_lnurl_response,
+with_redirect_response, call_count). Always use this for HTTP-dependent
+tests — don't introduce new mocking approaches.
