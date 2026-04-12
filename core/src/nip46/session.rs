@@ -451,3 +451,75 @@ pub async fn logout(state: &Arc<Mutex<AppSignerState>>) {
     // Clear the last active profile ID
     clear_last_active_profile_id();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::{Notify, watch};
+
+    async fn wait_for_next_state(
+        rx: &mut watch::Receiver<ConnectionState>,
+    ) -> anyhow::Result<ConnectionState> {
+        tokio::time::timeout(Duration::from_secs(1), rx.changed())
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for connection state update"))?
+            .map_err(|e| anyhow::anyhow!("Connection state channel closed: {}", e))?;
+        Ok(rx.borrow().clone())
+    }
+
+    #[tokio::test]
+    async fn connection_state_transitions_are_signaled_in_order() {
+        let state = Arc::new(Mutex::new(AppSignerState::new()));
+        let stop = Arc::new(Notify::new());
+
+        let (tx, mut rx) = watch::channel(ConnectionState::Disconnected);
+
+        let state_for_watcher = state.clone();
+        let stop_for_watcher = stop.clone();
+        let watcher = tokio::spawn(async move {
+            let mut last = ConnectionState::Disconnected;
+            loop {
+                tokio::select! {
+                    _ = stop_for_watcher.notified() => break,
+                    _ = tokio::task::yield_now() => {
+                        let current = {
+                            let guard = state_for_watcher.lock().await;
+                            guard.connection_state.clone()
+                        };
+                        if current != last {
+                            last = current.clone();
+                            if tx.send(current).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        {
+            let mut guard = state.lock().await;
+            guard.connection_state = ConnectionState::Connecting;
+        }
+        assert_eq!(
+            wait_for_next_state(&mut rx)
+                .await
+                .expect("must receive Connecting state"),
+            ConnectionState::Connecting
+        );
+
+        {
+            let mut guard = state.lock().await;
+            guard.connection_state = ConnectionState::Connected;
+        }
+        assert_eq!(
+            wait_for_next_state(&mut rx)
+                .await
+                .expect("must receive Connected state"),
+            ConnectionState::Connected
+        );
+
+        stop.notify_one();
+        watcher.await.expect("watcher task must complete");
+    }
+}

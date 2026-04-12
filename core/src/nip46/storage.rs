@@ -632,4 +632,42 @@ mod tests {
         let key = extract_profile_key(&profile).unwrap();
         assert_eq!(key, user_keys.public_key().to_hex());
     }
+
+    #[test]
+    fn saved_profile_metadata_persists_across_restart_without_os_keyring() {
+        let temp_dir = tempfile::tempdir().expect("tempdir creation must succeed");
+        set_profile_cache_dir(temp_dir.path().to_path_buf());
+
+        let app_keys = Keys::generate();
+        let user_keys = Keys::generate();
+        let uri = NostrConnectURI::client(
+            app_keys.public_key(),
+            vec!["wss://relay.example.com".parse().expect("valid relay URL")],
+            "Arcadestr",
+        );
+
+        let profile = SavedProfile {
+            id: "restart-test-profile".to_string(),
+            name: "Restart Test".to_string(),
+            user_pubkey: user_keys.public_key(),
+            bunker_uri: uri,
+            app_keys,
+        };
+
+        save_profile_metadata_to_local_cache(&profile)
+            .expect("save_profile_metadata_to_local_cache must succeed");
+
+        // Simulate process restart by resetting configured cache dir and loading from disk.
+        set_profile_cache_dir(temp_dir.path().to_path_buf());
+        let reloaded = load_profile_index_from_local_cache()
+            .expect("load_profile_index_from_local_cache must succeed");
+
+        let saved = reloaded
+            .into_iter()
+            .find(|entry| entry.id == "restart-test-profile")
+            .expect("reloaded index must contain saved profile");
+
+        assert_eq!(saved.name, "Restart Test");
+        assert_eq!(saved.pubkey_hex, user_keys.public_key().to_hex());
+    }
 }
