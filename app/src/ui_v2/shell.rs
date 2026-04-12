@@ -169,7 +169,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
             <style>{UI_V2_STYLES}</style>
 
             <aside
-                class="fixed left-0 top-20 h-[calc(100vh-5rem)] w-64 z-40 bg-[#0f141a]/60 backdrop-blur-2xl border-r shadow-[20px_0px_40px_rgba(0,0,0,0.4)] flex flex-col py-6 gap-2 hidden md:flex"
+                class="fixed left-0 top-20 h-[calc(100vh-5rem)] w-64 z-40 bg-[#0f141a]/60 backdrop-blur-2xl border-r shadow-[20px_0px_40px_rgba(0,0,0,0.4)] will-change-transform [transform:translateZ(0)] flex flex-col py-6 gap-2 hidden md:flex"
                 style="border-right-color: rgba(68, 72, 79, 0.15);"
             >
                 <div class="px-6 mb-8">
