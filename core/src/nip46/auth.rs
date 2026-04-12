@@ -678,3 +678,287 @@ async fn send_connect_ack(
     info!("Connect ack sent successfully with id: {}", request_id);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::generate_login_qr;
+    use super::handle_nip46_connect_event;
+    use crate::test_helpers::nip46_mocks::MockNip46Relay;
+    use crate::signers::{load_or_create_client_keys, reset_client_keys, set_keys_dir};
+    use nostr::{Event, EventBuilder, Keys, Kind, SecretKey};
+
+    fn fixed_keys(hex_secret: &str) -> Keys {
+        let secret = SecretKey::from_hex(hex_secret).expect("test secret key hex must be valid");
+        Keys::new(secret)
+    }
+
+    fn app_keys() -> Keys {
+        fixed_keys("0000000000000000000000000000000000000000000000000000000000000001")
+    }
+
+    fn signer_keys() -> Keys {
+        fixed_keys("0000000000000000000000000000000000000000000000000000000000000002")
+    }
+
+    fn user_keys() -> Keys {
+        fixed_keys("0000000000000000000000000000000000000000000000000000000000000003")
+    }
+
+    fn extract_client_pubkey_hex(uri: &str) -> Option<&str> {
+        let rest = uri.strip_prefix("nostrconnect://")?;
+        let end = rest.find('?').unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+
+    #[tokio::test]
+    async fn nostrconnect_client_pubkey_not_derived_from_stored_key_material() {
+        let temp_dir = tempfile::tempdir().expect("tempdir creation must succeed");
+        set_keys_dir(temp_dir.path().to_path_buf());
+
+        reset_client_keys().expect("reset_client_keys must succeed");
+        let (stored_client_keys, _) =
+            load_or_create_client_keys().expect("load_or_create_client_keys must succeed");
+
+        let (uri, _app_keys, _secret) =
+            generate_login_qr(None).await.expect("generate_login_qr must succeed");
+
+        let uri_pubkey_hex =
+            extract_client_pubkey_hex(&uri).expect("nostrconnect URI must include client pubkey");
+
+        assert_ne!(
+            uri_pubkey_hex,
+            stored_client_keys.public_key().to_hex(),
+            "QR nostrconnect client pubkey must not be derived from persisted key material"
+        );
+    }
+
+    #[test]
+    fn request_event_uses_kind_24133() {
+        let app = app_keys();
+        let signer = signer_keys();
+
+        let request = MockNip46Relay::build_client_request_event(
+            &app,
+            signer.public_key(),
+            "connect",
+            json!(["secret-123"]),
+            "req-06",
+        );
+
+        assert_eq!(request.kind, Kind::NostrConnect);
+    }
+
+    #[test]
+    fn request_payload_is_nip44_encrypted() {
+        let app = app_keys();
+        let signer = signer_keys();
+
+        let request = MockNip46Relay::build_client_request_event(
+            &app,
+            signer.public_key(),
+            "connect",
+            json!(["secret-123"]),
+            "req-07",
+        );
+
+        assert!(!request.content.contains("\"method\""));
+        assert!(!request.content.contains("connect"));
+
+        let payload = MockNip46Relay::decrypt_client_request(&signer, &request)
+            .expect("mock relay must decrypt request payload");
+        assert_eq!(payload["method"], "connect");
+    }
+
+    #[test]
+    fn request_payload_json_rpc_structure() {
+        let app = app_keys();
+        let signer = signer_keys();
+
+        let request = MockNip46Relay::build_client_request_event(
+            &app,
+            signer.public_key(),
+            "connect",
+            json!(["secret-123"]),
+            "req-08",
+        );
+
+        let payload = MockNip46Relay::decrypt_client_request(&signer, &request)
+            .expect("mock relay must decrypt request payload");
+        assert!(payload.get("id").is_some());
+        assert!(payload.get("method").is_some());
+        assert!(payload.get("params").is_some());
+    }
+
+    #[test]
+    fn response_payload_json_rpc_structure() {
+        let app = app_keys();
+        let signer = signer_keys();
+        let user = user_keys();
+        let mut relay = MockNip46Relay::new(signer.clone(), user.clone());
+        relay.set_expected_secret("secret-123");
+
+        let request = MockNip46Relay::build_client_request_event(
+            &app,
+            signer.public_key(),
+            "connect",
+            json!(["secret-123"]),
+            "req-09",
+        );
+
+        let response = relay
+            .process_client_event(&request)
+            .expect("mock relay must process request");
+        let payload = MockNip46Relay::decrypt_relay_response(&app, &response)
+            .expect("app must decrypt relay response");
+
+        assert!(payload.get("id").is_some());
+        assert!(payload.get("result").is_some());
+        assert!(payload.get("error").is_some());
+    }
+
+    #[test]
+    fn connect_method_returns_ack() {
+        let app = app_keys();
+        let signer = signer_keys();
+        let user = user_keys();
+        let mut relay = MockNip46Relay::new(signer.clone(), user.clone());
+        relay.set_expected_secret("secret-123");
+
+        let request = MockNip46Relay::build_client_request_event(
+            &app,
+            signer.public_key(),
+            "connect",
+            json!(["secret-123"]),
+            "req-10",
+        );
+
+        let response = relay
+            .process_client_event(&request)
+            .expect("connect request must succeed");
+        let payload = MockNip46Relay::decrypt_relay_response(&app, &response)
+            .expect("app must decrypt connect response");
+        assert_eq!(payload["result"], "secret-123");
+    }
+
+    #[test]
+    fn get_public_key_after_connect() {
+        let app = app_keys();
+        let signer = signer_keys();
+        let user = user_keys();
+        let mut relay = MockNip46Relay::new(signer.clone(), user.clone());
+        relay.set_expected_secret("secret-123");
+
+        let connect = MockNip46Relay::build_client_request_event(
+            &app,
+            signer.public_key(),
+            "connect",
+            json!(["secret-123"]),
+            "req-11a",
+        );
+        relay
+            .process_client_event(&connect)
+            .expect("connect request must succeed");
+
+        let get_pubkey = MockNip46Relay::build_client_request_event(
+            &app,
+            signer.public_key(),
+            "get_public_key",
+            json!([]),
+            "req-11b",
+        );
+        let response = relay
+            .process_client_event(&get_pubkey)
+            .expect("get_public_key request must succeed");
+        let payload = MockNip46Relay::decrypt_relay_response(&app, &response)
+            .expect("app must decrypt get_public_key response");
+
+        let pubkey_hex = payload["result"]
+            .as_str()
+            .expect("result must be pubkey hex string");
+        assert_eq!(pubkey_hex, user.public_key().to_hex());
+        assert_eq!(pubkey_hex.len(), 64);
+    }
+
+    #[test]
+    fn sign_event_returns_valid_signature() {
+        let app = app_keys();
+        let signer = signer_keys();
+        let user = user_keys();
+        let mut relay = MockNip46Relay::new(signer.clone(), user.clone());
+        relay.set_expected_secret("secret-123");
+
+        let connect = MockNip46Relay::build_client_request_event(
+            &app,
+            signer.public_key(),
+            "connect",
+            json!(["secret-123"]),
+            "req-12a",
+        );
+        relay
+            .process_client_event(&connect)
+            .expect("connect request must succeed");
+
+        let unsigned = EventBuilder::new(Kind::TextNote, "hello-sign").build(user.public_key());
+        let sign_request = MockNip46Relay::build_client_request_event(
+            &app,
+            signer.public_key(),
+            "sign_event",
+            json!([unsigned]),
+            "req-12b",
+        );
+
+        let response = relay
+            .process_client_event(&sign_request)
+            .expect("sign_event request must succeed");
+        let payload = MockNip46Relay::decrypt_relay_response(&app, &response)
+            .expect("app must decrypt sign_event response");
+
+        let signed: Event = serde_json::from_value(payload["result"].clone())
+            .expect("result must be signed event JSON");
+        assert!(signed.verify().is_ok());
+    }
+
+    #[tokio::test]
+    async fn wrong_secret_rejected() {
+        let app = app_keys();
+        let signer = signer_keys();
+
+        let connect_event = MockNip46Relay::build_signer_connect_event(
+            &signer,
+            app.public_key(),
+            "wrong-secret",
+            "req-15",
+        );
+
+        let err = handle_nip46_connect_event(&connect_event, &app, "expected-secret")
+            .await
+            .expect_err("mismatched secret must be rejected");
+
+        assert!(err.to_string().contains("Secret mismatch"));
+    }
+
+    #[test]
+    fn ping_returns_pong() {
+        let app = app_keys();
+        let signer = signer_keys();
+        let user = user_keys();
+        let mut relay = MockNip46Relay::new(signer.clone(), user.clone());
+
+        let ping = MockNip46Relay::build_client_request_event(
+            &app,
+            signer.public_key(),
+            "ping",
+            json!([]),
+            "req-16",
+        );
+
+        let response = relay
+            .process_client_event(&ping)
+            .expect("ping request must succeed");
+        let payload = MockNip46Relay::decrypt_relay_response(&app, &response)
+            .expect("app must decrypt ping response");
+        assert_eq!(payload["result"], "pong");
+    }
+}
