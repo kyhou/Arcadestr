@@ -63,6 +63,9 @@ pub mod profile_fetcher;
 pub mod nip05_validator;
 
 #[cfg(feature = "native")]
+pub mod http_client;
+
+#[cfg(feature = "native")]
 pub mod user_cache;
 
 #[cfg(feature = "native")]
@@ -90,6 +93,9 @@ pub use nip05_validator::{Nip05Validator, ValidationCommand, ValidationResult};
 
 #[cfg(feature = "native")]
 pub mod lightning;
+
+#[cfg(all(test, feature = "native"))]
+pub mod test_helpers;
 
 // WASM-compatible stubs
 #[cfg(feature = "wasm")]
