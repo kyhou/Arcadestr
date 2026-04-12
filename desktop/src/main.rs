@@ -45,6 +45,8 @@ use tauri::Emitter;
 mod command_contracts;
 mod nip46_commands;
 
+use command_contracts::{Nip05Status, Nip49ExportResult, Nip49ImportRequest};
+
 /// Application state shared across Tauri commands.
 pub struct AppState {
     /// Authentication state wrapped in Arc<Mutex<>> for thread-safe access.
@@ -328,6 +330,32 @@ async fn get_public_key(state: tauri::State<'_, AppState>) -> Result<String, Str
 async fn is_authenticated(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     let auth = state.auth.lock().await;
     Ok(command_contracts::auth_is_authenticated(&auth))
+}
+
+#[tauri::command]
+async fn nip49_import(
+    request: Nip49ImportRequest,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    command_contracts::nip49_import(request, state.inner()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn nip49_export(
+    npub: String,
+    password: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Nip49ExportResult, String> {
+    command_contracts::nip49_export(npub, password, state.inner())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn verify_nip05(
+    identifier: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Nip05Status, String> {
+    command_contracts::verify_nip05(identifier, state.inner()).map_err(|error| error.to_string())
 }
 
 /// Disconnects the current signer and clears the authentication state.
@@ -2263,6 +2291,9 @@ fn main() {
             generate_nostrconnect_uri,
             connect_nip46,
             connect_with_key,
+            nip49_import,
+            nip49_export,
+            verify_nip05,
             reconnect_relays,
             get_public_key,
             is_authenticated,

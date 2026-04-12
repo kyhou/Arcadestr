@@ -290,6 +290,36 @@ pub struct ZapInvoice {
     pub zap_request_event_id: String,
 }
 
+// ── NIP-49 / NIP-05 IPC Models ───────────────────────────────────────────────
+
+/// Request payload for desktop `nip49_import` command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Nip49ImportRequest {
+    pub ncryptsec: String,
+    pub password: String,
+}
+
+/// Response payload for desktop `nip49_export` command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Nip49ExportResult {
+    pub npub: String,
+    pub ncryptsec: String,
+    pub deferred: bool,
+    pub message: String,
+}
+
+/// Response payload for desktop `verify_nip05` command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Nip05Status {
+    pub identifier: String,
+    pub normalized_identifier: String,
+    pub local_part: String,
+    pub domain: String,
+    pub verified: bool,
+    pub status: String,
+    pub message: String,
+}
+
 /// Marketplace view state for navigation.
 #[derive(Clone, PartialEq)]
 pub enum MarketplaceView {

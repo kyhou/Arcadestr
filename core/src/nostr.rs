@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::auth::AuthState;
+use crate::nip05_validator::{IdentityValidationState, Nip05IdentityValidator};
 #[cfg(feature = "native")]
 use crate::relay_cache::{CachedRelayList, RelayCache, RelayDiscoverySource};
 use crate::relay_events::{RelayConnectionEvent, RelayStatus};
@@ -19,7 +20,6 @@ use crate::relay_events::{RelayConnectionEvent, RelayStatus};
 use crate::relay_hints::RelayHints;
 #[cfg(feature = "native")]
 use crate::relay_manager::{RelayManager, RelayManagerConfig};
-use crate::nip05_validator::{IdentityValidationState, Nip05IdentityValidator};
 use crate::signers::{ActiveSigner, NostrSigner as ArcadestrNostrSigner, SignerError};
 use crate::user_cache::UserCache;
 
@@ -1680,6 +1680,97 @@ pub struct Nip19Identifier {
     pub relays: Vec<String>,
 }
 
+/// Parsed NIP-05 identifier (`name@domain`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nip05Identifier {
+    pub local_part: String,
+    pub domain: String,
+    pub full: String,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum Nip05ParseError {
+    #[error("NIP-05 identifier must contain '@'")]
+    MissingAtSymbol,
+    #[error("NIP-05 local part is empty")]
+    EmptyLocalPart,
+    #[error("NIP-05 domain is empty")]
+    EmptyDomain,
+    #[error("NIP-05 contains invalid character '{0}'")]
+    InvalidCharacters(String),
+}
+
+/// Parse and validate a NIP-05 identifier as `name@domain`.
+pub fn parse_nip05_identifier(identifier: &str) -> Result<Nip05Identifier, Nip05ParseError> {
+    let trimmed = identifier.trim();
+    let (raw_local_part, raw_domain) = trimmed
+        .split_once('@')
+        .ok_or(Nip05ParseError::MissingAtSymbol)?;
+
+    if raw_local_part.is_empty() {
+        return Err(Nip05ParseError::EmptyLocalPart);
+    }
+
+    if raw_domain.is_empty() {
+        return Err(Nip05ParseError::EmptyDomain);
+    }
+
+    let local_part = raw_local_part.trim().to_ascii_lowercase();
+    for ch in local_part.chars() {
+        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.')) {
+            return Err(Nip05ParseError::InvalidCharacters(ch.to_string()));
+        }
+    }
+
+    let domain = raw_domain.trim().to_ascii_lowercase();
+    if domain.is_empty() {
+        return Err(Nip05ParseError::EmptyDomain);
+    }
+
+    for ch in domain.chars() {
+        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '.')) {
+            return Err(Nip05ParseError::InvalidCharacters(ch.to_string()));
+        }
+    }
+
+    if !validate_nip05_domain(&domain) {
+        return Err(Nip05ParseError::InvalidCharacters(domain));
+    }
+
+    let full = format!("{local_part}@{domain}");
+    Ok(Nip05Identifier {
+        local_part,
+        domain,
+        full,
+    })
+}
+
+/// Normalize an arbitrary NIP-05 identifier into canonical lowercase form.
+pub fn normalize_nip05(identifier: &str) -> String {
+    match parse_nip05_identifier(identifier) {
+        Ok(parsed) => parsed.full,
+        Err(_) => identifier.trim().to_ascii_lowercase(),
+    }
+}
+
+/// Validate a NIP-05 domain in ASCII form.
+pub fn validate_nip05_domain(domain: &str) -> bool {
+    let normalized = domain.trim().to_ascii_lowercase();
+    if normalized.is_empty() || !normalized.contains('.') || normalized.len() > 253 {
+        return false;
+    }
+
+    normalized.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    })
+}
+
 fn is_lower_hex_with_len(value: &str, expected_len: usize) -> bool {
     value.len() == expected_len
         && value
@@ -1763,6 +1854,67 @@ pub fn parse_nip19_identifier(identifier: &str) -> Result<Nip19Identifier, Nostr
         Err(NostrError::MalformedEvent(
             "Invalid NIP-19 identifier".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod nip05_tests {
+    use super::*;
+
+    #[test]
+    fn nip05_parse_identifier_accepts_valid_input() {
+        let parsed = parse_nip05_identifier("Alice@example.com").expect("identifier should parse");
+        assert_eq!(parsed.local_part, "alice");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.full, "alice@example.com");
+    }
+
+    #[test]
+    fn nip05_parse_identifier_rejects_invalid_name() {
+        let result = parse_nip05_identifier("ali ce@example.com");
+        assert_eq!(result, Err(Nip05ParseError::InvalidCharacters(" ".into())));
+    }
+
+    #[test]
+    fn nip05_parse_identifier_rejects_invalid_domain() {
+        let result = parse_nip05_identifier("alice@example");
+        assert_eq!(result, Err(Nip05ParseError::InvalidCharacters("example".into())));
+    }
+
+    #[test]
+    fn nip05_parse_identifier_requires_separator() {
+        let result = parse_nip05_identifier("alice.example.com");
+        assert_eq!(result, Err(Nip05ParseError::MissingAtSymbol));
+    }
+
+    #[test]
+    fn nip05_parse_identifier_rejects_empty_local_part() {
+        let result = parse_nip05_identifier("@example.com");
+        assert_eq!(result, Err(Nip05ParseError::EmptyLocalPart));
+    }
+
+    #[test]
+    fn nip05_parse_identifier_rejects_empty_domain() {
+        let result = parse_nip05_identifier("alice@");
+        assert_eq!(result, Err(Nip05ParseError::EmptyDomain));
+    }
+
+    #[test]
+    fn nip05_normalize_returns_lowercase_canonical_form() {
+        assert_eq!(
+            normalize_nip05("  Bob.Smith@Sub.Example.COM  "),
+            "bob.smith@sub.example.com"
+        );
+    }
+
+    #[test]
+    fn nip05_validate_domain_accepts_and_rejects_expected_values() {
+        assert!(validate_nip05_domain("example.com"));
+        assert!(validate_nip05_domain("sub-domain.example.com"));
+        assert!(!validate_nip05_domain("example"));
+        assert!(!validate_nip05_domain("-example.com"));
+        assert!(!validate_nip05_domain("example..com"));
+        assert!(!validate_nip05_domain("exa mple.com"));
     }
 }
 
@@ -1924,7 +2076,10 @@ mod relay_selection_tests {
 
         let selection = select_relays(scored, 10, &all_pubkeys(&["pk1", "pk2", "pk3"]));
 
-        assert_eq!(selection.permanent, vec!["wss://relay-a.example".to_string()]);
+        assert_eq!(
+            selection.permanent,
+            vec!["wss://relay-a.example".to_string()]
+        );
         assert!(selection.uncovered_pubkeys.is_empty());
     }
 
@@ -1965,7 +2120,10 @@ mod relay_selection_tests {
 
         let selection = select_relays(scored, 10, &all_pubkeys(&["pk1", "pk2"]));
 
-        assert_eq!(selection.permanent, vec!["wss://relay-a.example".to_string()]);
+        assert_eq!(
+            selection.permanent,
+            vec!["wss://relay-a.example".to_string()]
+        );
         assert!(selection.uncovered_pubkeys.is_empty());
     }
 
@@ -2005,10 +2163,8 @@ mod relay_selection_tests {
             .update_relay_health(relay_url, 120, false)
             .expect("health update should succeed");
 
-        let relay_map = HashMap::from([(
-            relay_url.to_string(),
-            all_pubkeys(&["pk1", "pk2", "pk3"]),
-        )]);
+        let relay_map =
+            HashMap::from([(relay_url.to_string(), all_pubkeys(&["pk1", "pk2", "pk3"]))]);
 
         let scored = score_relays(&relay_map, &cache, None);
         assert_eq!(scored.len(), 1);
@@ -2035,10 +2191,7 @@ mod relay_selection_tests {
             })
             .expect("relay list should be saved");
 
-        let relay_map = HashMap::from([(
-            relay_url.to_string(),
-            all_pubkeys(&["pk1", "pk2"]),
-        )]);
+        let relay_map = HashMap::from([(relay_url.to_string(), all_pubkeys(&["pk1", "pk2"]))]);
 
         let scored = score_relays(&relay_map, &cache, None);
         assert_eq!(scored.len(), 1);
@@ -2141,7 +2294,10 @@ mod relay_selection_tests {
 
         apply_connection_event(
             &mut status,
-            RelayConnectionEvent::disconnected("wss://relay-status.example", Some("mock".to_string())),
+            RelayConnectionEvent::disconnected(
+                "wss://relay-status.example",
+                Some("mock".to_string()),
+            ),
         );
         assert!(!status.connected);
         assert!(status.latency_ms.is_none());
@@ -2224,7 +2380,9 @@ mod nip01_nip19_tests {
         let event = build_text_note_event("event id shape");
         let event_id = event.id.to_hex();
         assert_eq!(event_id.len(), 64);
-        assert!(event_id.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+        assert!(event_id
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
     }
 
     #[test]
@@ -2232,7 +2390,9 @@ mod nip01_nip19_tests {
         let event = build_text_note_event("pubkey shape");
         let pubkey_hex = event.pubkey.to_hex();
         assert_eq!(pubkey_hex.len(), 64);
-        assert!(pubkey_hex.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+        assert!(pubkey_hex
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
     }
 
     #[test]
@@ -2240,7 +2400,9 @@ mod nip01_nip19_tests {
         let event = build_text_note_event("signature shape");
         let sig_hex = event.sig.to_string();
         assert_eq!(sig_hex.len(), 128);
-        assert!(sig_hex.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+        assert!(sig_hex
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
     }
 
     #[test]
@@ -2254,7 +2416,8 @@ mod nip01_nip19_tests {
         let event = build_text_note_event("original content");
         let mut value = serde_json::to_value(&event).expect("event should serialize");
         value["content"] = json!("tampered content");
-        let tampered: Event = serde_json::from_value(value).expect("tampered event should deserialize");
+        let tampered: Event =
+            serde_json::from_value(value).expect("tampered event should deserialize");
         assert!(tampered.verify().is_err());
     }
 
@@ -2285,7 +2448,10 @@ mod nip01_nip19_tests {
         let keys = Keys::generate();
         let event = EventBuilder::new(Kind::TextNote, "tagged")
             .tag(Tag::custom(TagKind::Custom("t".into()), ["nostr"]))
-            .tag(Tag::custom(TagKind::Custom("client".into()), ["arcadestr", "v1"]))
+            .tag(Tag::custom(
+                TagKind::Custom("client".into()),
+                ["arcadestr", "v1"],
+            ))
             .sign_with_keys(&keys)
             .expect("tagged event should sign");
 
@@ -2316,7 +2482,8 @@ mod nip01_nip19_tests {
             .sign_with_keys(&keys)
             .expect("metadata event should sign");
 
-        let content: serde_json::Value = serde_json::from_str(&event.content).expect("metadata must be json");
+        let content: serde_json::Value =
+            serde_json::from_str(&event.content).expect("metadata must be json");
         assert_eq!(content["name"], json!("alice"));
     }
 
@@ -2378,7 +2545,9 @@ mod nip01_nip19_tests {
 
     #[test]
     fn unknown_bech32_prefix_is_ignored() {
-        let result = parse_nip19_identifier("nxyz1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq");
+        let result = parse_nip19_identifier(
+            "nxyz1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+        );
         assert!(result.is_err());
     }
 
@@ -2395,7 +2564,10 @@ mod nip01_nip19_tests {
 
         let parsed = parse_nip19_identifier(&nprofile).expect("nprofile should parse");
         assert!(!parsed.relays.is_empty());
-        assert!(parsed.relays.iter().any(|relay_url| relay_url.starts_with("wss://")));
+        assert!(parsed
+            .relays
+            .iter()
+            .any(|relay_url| relay_url.starts_with("wss://")));
     }
 }
 

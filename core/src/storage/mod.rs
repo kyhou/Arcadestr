@@ -17,5 +17,8 @@ pub use backup::{
     RelayBackup, BACKUP_D_TAG, BACKUP_EVENT_KIND,
 };
 pub use db::{Database, DatabaseError};
-pub use encryption::{EncryptedData, Encryption, EncryptionError};
+pub use encryption::{
+    extract_nip49_version, validate_nip49_format, validate_nip49_password, EncryptedData,
+    Encryption, EncryptionError, Nip49ValidationError,
+};
 pub use master_key::{MasterKeyError, MasterKeyManager};

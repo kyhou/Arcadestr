@@ -1,8 +1,13 @@
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::nip46::ProfileMetadata;
-use arcadestr_core::nostr::{GameListing, UserProfile};
+use arcadestr_core::nostr::{
+    normalize_nip05, parse_nip05_identifier, parse_nip19_identifier, GameListing, UserProfile,
+};
+use arcadestr_core::storage::{
+    extract_nip49_version, validate_nip49_format, validate_nip49_password,
+};
 use nostr::prelude::ToBech32;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize)]
@@ -18,6 +23,74 @@ pub struct VersionInfo {
 pub struct ConnectWithKeyResult {
     pub npub: String,
     pub event_name: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Nip49ImportRequest {
+    pub ncryptsec: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Nip49ExportResult {
+    pub npub: String,
+    pub ncryptsec: String,
+    pub deferred: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Nip05Status {
+    pub identifier: String,
+    pub normalized_identifier: String,
+    pub local_part: String,
+    pub domain: String,
+    pub verified: bool,
+    pub status: String,
+    pub message: String,
+}
+
+pub fn nip49_import(
+    request: Nip49ImportRequest,
+    _state: &crate::AppState,
+) -> Result<String, String> {
+    validate_nip49_format(&request.ncryptsec).map_err(|error| error.to_string())?;
+    validate_nip49_password(&request.password).map_err(|error| error.to_string())?;
+
+    let _version = extract_nip49_version(&request.ncryptsec).map_err(|error| error.to_string())?;
+
+    Ok("nip49-import-deferred-after-format-validation".to_string())
+}
+
+pub fn nip49_export(
+    npub: String,
+    password: String,
+    _state: &crate::AppState,
+) -> Result<Nip49ExportResult, String> {
+    parse_nip19_identifier(&npub).map_err(|error| error.to_string())?;
+    validate_nip49_password(&password).map_err(|error| error.to_string())?;
+
+    Ok(Nip49ExportResult {
+        npub,
+        ncryptsec: "ncryptsec1deferredmockpayload".to_string(),
+        deferred: true,
+        message: "NIP-49 export is deferred in this build (validation-only stub)".to_string(),
+    })
+}
+
+pub fn verify_nip05(identifier: String, _state: &crate::AppState) -> Result<Nip05Status, String> {
+    let parsed = parse_nip05_identifier(&identifier).map_err(|error| error.to_string())?;
+    let normalized_identifier = normalize_nip05(&identifier);
+
+    Ok(Nip05Status {
+        identifier,
+        normalized_identifier,
+        local_part: parsed.local_part,
+        domain: parsed.domain,
+        verified: false,
+        status: "deferred".to_string(),
+        message: "NIP-05 network verification is deferred in this build".to_string(),
+    })
 }
 
 pub fn auth_is_authenticated(auth: &AuthState) -> bool {

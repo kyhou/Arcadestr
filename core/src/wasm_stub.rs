@@ -64,3 +64,18 @@ impl Default for AuthManager {
         Self::new()
     }
 }
+
+/// WASM no-op stub for desktop NIP-49 import surface.
+pub fn nip49_import(_ncryptsec: &str, _password: &str) -> Result<String, String> {
+    Err("NIP-49 import unsupported on wasm target (deferred backend)".to_string())
+}
+
+/// WASM no-op stub for desktop NIP-49 export surface.
+pub fn nip49_export(_npub: &str, _password: &str) -> Result<String, String> {
+    Err("NIP-49 export unsupported on wasm target (deferred backend)".to_string())
+}
+
+/// WASM no-op stub for desktop NIP-05 verification surface.
+pub fn verify_nip05(_identifier: &str) -> Result<bool, String> {
+    Err("NIP-05 verification unsupported on wasm target (deferred backend)".to_string())
+}

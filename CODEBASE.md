@@ -177,7 +177,7 @@ arcadestr/
 │   ├── Cargo.toml          # Leptos, wasm-bindgen dependencies
 │   └── src/
 │       ├── lib.rs          # Main app component, auth context, styles
-│       ├── models.rs       # GameListing, UserProfile, ZapRequest types
+│       ├── models.rs       # GameListing, UserProfile, ZapRequest + NIP-49/NIP-05 IPC types
 │       ├── tauri_bridge.rs # Tauri command wrappers (invoke_*)
 │       ├── tauri_invoke.rs # Low-level Tauri IPC (wasm-bindgen)
 │       ├── web_auth.rs     # NIP-07 browser extension auth (web target)
@@ -208,6 +208,8 @@ arcadestr/
 │       │   ├── backup_manager.rs     # Backup/restore UI
 │       │   ├── browse.rs             # Game listing grid
 │       │   ├── detail.rs             # Game detail view with buy flow
+│       │   ├── nip49_modal.rs        # NIP-49 export modal (password confirm + copy)
+│       │   ├── nip05_badge.rs        # NIP-05 status badge (unverified/verifying/verified/failed)
 │       │   ├── profile.rs            # User profile view
 │       │   ├── profile_avatar.rs     # Avatar component with fallback
 │       │   ├── profile_display.rs    # Profile name/display components
@@ -220,9 +222,65 @@ arcadestr/
 │   ├── Cargo.toml          # Tauri v2, tauri-build dependencies
 │   ├── tauri.conf.json     # Tauri configuration (window, security, build)
 │   ├── build.rs            # Build script for Tauri
-│   └── src/
-│       ├── main.rs         # Entry point, Tauri setup, commands
-│       └── nip46_commands.rs # NIP-46 specific Tauri commands
+│   ├── src/
+│   │   ├── main.rs         # Entry point, Tauri setup, commands
+│   │   ├── nip46_commands.rs # NIP-46 specific Tauri commands
+│   │   └── command_contracts.rs # Pure command logic for testability
+│   └── tests/              # Desktop command layer tests
+│       └── section6_command_layer_tests.rs # Auth and command contract tests
+│
+├── core/                   # LIBRARY: Core business logic (NOSTR, storage, crypto)
+│   ├── Cargo.toml          # Native-only dependencies (tokio, sqlx, etc.)
+│   ├── src/
+│   │   ├── lib.rs          # Module exports, feature-gated (native vs wasm)
+│   │   ├── nostr.rs        # NOSTR client, event handling, relay management
+│   │   ├── auth/           # Authentication state and account management
+│   │   │   ├── mod.rs      # AuthState, signer switching
+│   │   │   ├── auth_state.rs  # Core authentication logic
+│   │   │   ├── account.rs      # Account data structures
+│   │   │   └── account_manager.rs  # Multi-account support
+│   │   ├── signers/        # Signer abstractions (local, NIP-46)
+│   │   │   ├── mod.rs      # Signer trait definitions
+│   │   │   ├── local.rs    # Local private key signer
+│   │   │   ├── nip46.rs    # NIP-46 remote signer
+│   │   │   └── lazy_nip46.rs   # Deferred connection NIP-46
+│   │   ├── nip46/          # NIP-46 implementation (native-only)
+│   │   │   ├── mod.rs      # Session management, QR flows
+│   │   │   ├── auth.rs     # Authentication flows
+│   │   │   ├── methods.rs  # NIP-46 method handlers
+│   │   │   ├── session.rs  # Session state
+│   │   │   ├── storage.rs  # Profile persistence (keyring)
+│   │   │   └── types.rs    # NIP-46 data structures
+│   │   ├── storage/        # Persistent storage layer
+│   │   │   ├── mod.rs      # Storage exports
+│   │   │   ├── db.rs       # SQLite database (sqlx)
+│   │   │   ├── encryption.rs   # AES-256-GCM encryption
+│   │   │   ├── master_key.rs   # Master key derivation
+│   │   │   ├── migration.rs    # Database migrations
+│   │   │   └── backup.rs       # Backup/restore functionality
+│   │   ├── relay_cache.rs    # NIP-65 relay list caching
+│   │   ├── relay_hints.rs    # Relay discovery from p-tags
+│   │   ├── relay_events.rs   # Real-time relay connection events
+│   │   ├── relay_manager.rs  # Background relay pool management
+│   │   ├── relay_pool.rs     # Relay connection pooling
+│   │   ├── profile_fetcher.rs # Batched profile fetching
+│   │   ├── marketplace_cache.rs # Persistent marketplace listing cache
+│   │   ├── nip05_validator.rs # NIP-05 validation service
+│   │   ├── user_cache.rs      # Persistent user profile cache
+│   │   ├── social_graph.rs   # Extended network discovery
+│   │   ├── extended_network.rs # 2nd-degree follow discovery
+│   │   ├── subscriptions.rs  # Relay subscription management
+│   │   ├── lightning.rs      # NIP-57 zap payments
+│   │   ├── saved_users.rs    # Legacy saved users (JSON file)
+│   │   ├── version.rs        # Version constants
+│   │   ├── test_helpers.rs   # HTTP mocking and test utilities
+│   │   ├── test_helpers/     # Test helper modules
+│   │   │   ├── http_mocks.rs # MockHttpClient for HTTP testing
+│   │   │   └── nip46_mocks.rs # NIP-46 mock signer implementations
+│   │   └── wasm_stub.rs      # WASM-compatible stubs
+│   ├── migrations/           # SQLx database migrations
+│   └── tests/                # Core integration tests
+│       └── integration.rs    # NIP-65, relay hints, NIP-46 integration tests
 │
 ├── web/                    # BINARY: WASM web target (Trunk)
 │   ├── Cargo.toml          # WASM-only dependencies
@@ -502,6 +560,8 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `delete_profile` | `nip46_commands.rs` | `profile_id: String` | `()` | Removes profile from keyring |
 | `logout_nip46` | `nip46_commands.rs` | None | `()` | Logs out current session |
 | `get_connection_status` | `nip46_commands.rs` | None | `serde_json::Value` | Returns connection state |
+| `has_accounts` | `nip46_commands.rs` | None | `bool` | Check if any saved profiles exist |
+| `load_active_account` | `nip46_commands.rs` | None | `serde_json::Value` | Load currently active account |
 | `generate_nostrconnect_uri` | `main.rs` | `relay: String` | `String` | Creates nostrconnect:// URI |
 | `connect_nip46` | `main.rs` | `uri: String`, `relay: String` | `String` | Connects via NIP-46 URI |
 | `connect_with_key` | `main.rs` | `key: String` | `String` | Direct key auth (testing only) |
@@ -512,14 +572,19 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `publish_listing` | `main.rs` | `listing: GameListing` | `String` | Publishes kind-30078 event |
 | `fetch_listings` | `main.rs` | `limit: usize` | `Vec<GameListing>` | Fetches recent listings |
 | `fetch_listing_by_id` | `main.rs` | `publisher_npub: String`, `listing_id: String` | `GameListing` | Fetches specific listing |
+| `fetch_marketplace` | `main.rs` | `limit: usize`, `since_days: Option<u64>`, `filter: Option<MarketplaceFilter>` | `Vec<GameListing>` | Fetches NIP-99 marketplace listings with optional filtering |
 | `fetch_profile` | `main.rs` | `npub: String`, `additional_relays: Option<Vec<String>>` | `UserProfile` | Fetches NIP-01 metadata |
 | `request_invoice` | `main.rs` | `zap_request: ZapRequest` | `ZapInvoice` | Generates Lightning invoice |
 | `get_saved_users` | `main.rs` | None | `String` | Returns saved users JSON |
+| `get_saved_user` | `main.rs` | `user_id: String` | `String` | Get specific saved user by ID |
 | `add_saved_user` | `main.rs` | `method: String`, `relay: Option<String>`, `uri: Option<String>`, `private_key: Option<String>`, `npub: String` | `String` | Adds saved user |
 | `remove_saved_user` | `main.rs` | `user_id: String` | `String` | Removes saved user |
+| `rename_saved_user` | `main.rs` | `user_id: String`, `new_name: String` | `String` | Update user alias/name |
 | `connect_saved_user` | `main.rs` | `user_id: String` | `serde_json::Value` | Reconnects saved user |
 | `get_connected_relay_count` | `main.rs` | None | `usize` | Returns relay count |
-| `get_connected_relays` | `main.rs` | None | `Vec<RelayStatus>` | Returns relay URLs with status |
+| `get_connected_relays` | `main.rs` | None | `Vec<String>` | Returns connected relay URLs |
+| `reconnect_relays` | `main.rs` | None | `String` | Reconnect to default relays |
+| `fetch_and_save_user_profile` | `main.rs` | None (uses app handle) | `UserProfile` | Fetch and save current user's profile |
 | `get_extended_network_stats` | `main.rs` | None | `Option<NetworkStats>` | Returns extended network info |
 | `get_relay_hints_for_pubkey` | `main.rs` | `pubkey: String` | `Vec<String>` | Returns relay hints for pubkey |
 | `fetch_profile_with_hints` | `main.rs` | `identifier: String` | `UserProfile` | Fetch profile using NIP-19 hints |
@@ -631,10 +696,10 @@ App (app/src/lib.rs)
 │   ├── Nsec Login View (direct key - testing only)
 │   └── Account List View (switch between saved accounts)
 │
+├── MainView (app/src/lib.rs) - Main application view after login
+│
 ├── BrowseView (app/src/components/browse.rs)
 │   ├── ListingCard (repeated for each game)
-│   │   ├── ProfileAvatar (publisher)
-│   │   └── Game metadata (title, price, tags)
 │   └── Loading states
 │
 ├── DetailView (app/src/components/detail.rs)
@@ -651,9 +716,19 @@ App (app/src/lib.rs)
 │   ├── Form fields (title, description, price, etc.)
 │   └── Publish button
 │
-└── BackupManager (app/src/components/backup_manager.rs)
-    ├── Create backup
-    └── Restore backup
+├── BackupManager (app/src/components/backup_manager.rs)
+│   └── Backup/restore UI with inline forms
+│
+├── ProfileAvatar (app/src/components/profile_avatar.rs)
+│   └── Avatar with fallback placeholder
+│
+├── ProfileDisplayName (app/src/components/profile_display.rs)
+│   └── Display name with fallback to npub
+│
+├── ProfileRow (app/src/components/profile_display.rs)
+│   └── Combined avatar + display name row
+│
+└── DebugOverlay (app/src/lib.rs) - Debug information overlay
 
 UiV2Root (app/src/ui_v2/shell.rs) - Stitch-based interface
 │
@@ -927,6 +1002,12 @@ fn main() {
 | `core::lightning` | Lightning payments | `ZapRequest`, `ZapInvoice` | `request_zap_invoice()` |
 | `core::social_graph` | Extended network | `SocialGraphDb` | `discover_network()` |
 
+**Recent `core::storage` public surface additions (for desktop NIP-49 UI stubs):**
+- `validate_nip49_format`
+- `extract_nip49_version`
+- `validate_nip49_password`
+- `Nip49ValidationError`
+
 ### 7.3 Key Data Structures
 
 #### GameListing
@@ -1000,6 +1081,35 @@ pub struct UserProfile {
     pub nip05: Option<String>,
     pub lud16: Option<String>,
     pub nip05_verified: bool,
+}
+```
+
+#### NIP-49 / NIP-05 IPC Models (UI-first desktop flow)
+```rust
+// app/src/models.rs
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Nip49ImportRequest {
+    pub ncryptsec: String,
+    pub password: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Nip49ExportResult {
+    pub ncryptsec: String,
+    pub npub: String,
+    pub deferred: bool,
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Nip05Status {
+    pub identifier: String,
+    pub normalized_identifier: String,
+    pub local_part: String,
+    pub domain: String,
+    pub verified: bool,
+    pub status: String,
+    pub message: String,
 }
 ```
 
@@ -1853,6 +1963,11 @@ console.log(window.__TAURI__.event);  // Should show listen/emit functions
 4. **NIP-46 connection timing**: The fast connection flow returns before handshake completes. Always check connection status before signing.
 
 5. **Relay connection failures**: Relays may return HTML instead of WebSocket responses if down. Check logs for "expected ident" errors.
+
+6. **Web feature check command**: `cargo check -p arcadestr-app --features web` without wasm target hits a pre-existing `web_auth` cfg mismatch in `app/src/lib.rs` and is not a valid standalone web validation. Use:
+   ```bash
+   cargo check -p arcadestr-app --target wasm32-unknown-unknown --features web
+   ```
 
 ---
 
