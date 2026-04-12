@@ -42,6 +42,7 @@ use nostr::nips::nip46::NostrConnectURI;
 use nostr::prelude::ToBech32;
 use tauri::Emitter;
 
+mod command_contracts;
 mod nip46_commands;
 
 /// Application state shared across Tauri commands.
@@ -205,6 +206,7 @@ async fn connect_nip46(
 async fn connect_with_key(
     key: String,
     state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
     use tracing::{error, info};
 
@@ -213,27 +215,19 @@ async fn connect_with_key(
 
     let mut auth = state.auth.lock().await;
 
-    match auth.connect_with_key(&key) {
-        Ok(_) => {
+    let result = match command_contracts::auth_connect_with_key(&mut auth, &key) {
+        Ok(ok) => {
             info!("Direct key authentication successful");
+            ok
         }
         Err(e) => {
             error!("Direct key authentication failed: {}", e);
-            return Err(format!(
-                "Failed to authenticate with provided key. \
-                Make sure you're entering a valid nsec1... key or hex private key. \
-                Error: {}",
-                e
-            ));
+            return Err(e);
         }
-    }
+    };
 
-    // Get the public key and convert to bech32 npub
-    let pubkey = auth
-        .public_key()
-        .ok_or_else(|| "Public key not available after authentication".to_string())?;
-
-    pubkey.to_bech32().map_err(|e| e.to_string())
+    let _ = app_handle.emit(result.event_name, result.npub.clone());
+    Ok(result.npub)
 }
 
 /// Waits for a nostrconnect:// signer to connect.
@@ -323,12 +317,7 @@ async fn reconnect_relays(state: tauri::State<'_, AppState>) -> Result<String, S
 #[tauri::command]
 async fn get_public_key(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let auth = state.auth.lock().await;
-
-    let pubkey = auth
-        .public_key()
-        .ok_or_else(|| "Not authenticated".to_string())?;
-
-    pubkey.to_bech32().map_err(|e| e.to_string())
+    command_contracts::auth_get_public_key(&auth)
 }
 
 /// Checks if the user is currently authenticated.
@@ -338,7 +327,7 @@ async fn get_public_key(state: tauri::State<'_, AppState>) -> Result<String, Str
 #[tauri::command]
 async fn is_authenticated(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     let auth = state.auth.lock().await;
-    Ok(auth.is_authenticated())
+    Ok(command_contracts::auth_is_authenticated(&auth))
 }
 
 /// Disconnects the current signer and clears the authentication state.
@@ -1930,24 +1919,11 @@ fn main() {
     /// Get application version and revision info
     #[tauri::command]
     fn get_version_info() -> Result<VersionInfo, String> {
-        Ok(VersionInfo {
-            version: arcadestr_core::version::VERSION.to_string(),
-            revision: arcadestr_core::version::REVISION,
-            full: arcadestr_core::version::full_version(),
-            os: std::env::consts::OS.to_string(),
-            arch: std::env::consts::ARCH.to_string(),
-        })
+        Ok(command_contracts::version_info())
     }
 
     /// Version info structure for frontend
-    #[derive(serde::Serialize)]
-    struct VersionInfo {
-        version: String,
-        revision: u32,
-        full: String,
-        os: String,
-        arch: String,
-    }
+    type VersionInfo = command_contracts::VersionInfo;
 
     tauri::Builder::default()
         .manage(AppState {
