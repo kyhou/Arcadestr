@@ -455,7 +455,7 @@ pub async fn logout(state: &Arc<Mutex<AppSignerState>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::{Notify, watch};
+    use tokio::sync::{watch, Notify};
 
     async fn wait_for_next_state(
         rx: &mut watch::Receiver<ConnectionState>,

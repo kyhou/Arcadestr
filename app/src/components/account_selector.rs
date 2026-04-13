@@ -63,7 +63,11 @@ fn bech32_char_value(ch: char) -> Result<u8, String> {
 }
 
 fn verify_bech32_checksum(hrp: &str, data: &[u8]) -> bool {
-    bech32_polymod(bech32_hrp_expand(hrp).into_iter().chain(data.iter().copied())) == 1
+    bech32_polymod(
+        bech32_hrp_expand(hrp)
+            .into_iter()
+            .chain(data.iter().copied()),
+    ) == 1
 }
 
 fn bech32_hrp_expand(hrp: &str) -> Vec<u8> {
@@ -216,7 +220,10 @@ pub fn AccountSelector(
         import_in_flight.set(true);
 
         spawn_local(async move {
-            let request = Nip49ImportRequest { ncryptsec, password };
+            let request = Nip49ImportRequest {
+                ncryptsec,
+                password,
+            };
 
             #[cfg(not(feature = "web"))]
             let import_result = crate::tauri_invoke::invoke::<String>(
@@ -226,9 +233,8 @@ pub fn AccountSelector(
             .await;
 
             #[cfg(feature = "web")]
-            let import_result: Result<String, String> = Err(
-                "NIP-49 import is desktop-only and unavailable on web target.".to_string(),
-            );
+            let import_result: Result<String, String> =
+                Err("NIP-49 import is desktop-only and unavailable on web target.".to_string());
 
             match import_result {
                 Ok(message) => {

@@ -2,13 +2,13 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use ::url::Url;
 use nostr::prelude::*;
 use nostr::RelayUrl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tracing::{debug, info};
-use ::url::Url;
 
 use crate::auth::AuthState;
 use crate::http_client::HttpClient;
@@ -171,9 +171,8 @@ pub(crate) async fn request_zap_invoice_with_http(
         .await
         .map_err(|e| LightningError::LnurlResolution(e.to_string()))?;
 
-    let metadata: LnurlPayMetadata = serde_json::from_value(metadata_value).map_err(|e| {
-        LightningError::LnurlResolution(format!("Failed to parse metadata: {}", e))
-    })?;
+    let metadata: LnurlPayMetadata = serde_json::from_value(metadata_value)
+        .map_err(|e| LightningError::LnurlResolution(format!("Failed to parse metadata: {}", e)))?;
 
     // Validate amount is within range
     let amount_msats = zap_req.amount_sats * 1000;
@@ -196,7 +195,8 @@ pub(crate) async fn request_zap_invoice_with_http(
         info!("Zap request event signed: {}", zap_event_id);
 
         let zap_event_json = serde_json::to_string(&zap_event)?;
-        let callback_url = build_callback_url(&metadata.callback, amount_msats, Some(&zap_event_json))?;
+        let callback_url =
+            build_callback_url(&metadata.callback, amount_msats, Some(&zap_event_json))?;
 
         (zap_event_id, callback_url)
     } else {
@@ -213,9 +213,8 @@ pub(crate) async fn request_zap_invoice_with_http(
         .await
         .map_err(|e| LightningError::InvoiceRequest(format!("HTTP request failed: {}", e)))?;
 
-    let callback_response: CallbackResponse = serde_json::from_value(callback_value).map_err(|e| {
-        LightningError::InvoiceRequest(format!("Failed to parse response: {}", e))
-    })?;
+    let callback_response: CallbackResponse = serde_json::from_value(callback_value)
+        .map_err(|e| LightningError::InvoiceRequest(format!("Failed to parse response: {}", e)))?;
 
     info!("Invoice received from LNURL callback");
 
@@ -334,8 +333,8 @@ mod tests {
 
     #[test]
     fn lud16_parsing() {
-        let parsed = lud16_to_lnurl_pay_url("seller@example.com")
-            .expect("lud16 parsing should succeed");
+        let parsed =
+            lud16_to_lnurl_pay_url("seller@example.com").expect("lud16 parsing should succeed");
         assert_eq!(parsed, lnurl_url());
 
         let invalid = lud16_to_lnurl_pay_url("seller-example.com");
@@ -372,7 +371,8 @@ mod tests {
             .last_requested_url()
             .expect("callback request URL should be captured");
         let parsed = Url::parse(&callback_url).expect("callback URL should parse");
-        let query: std::collections::HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+        let query: std::collections::HashMap<String, String> =
+            parsed.query_pairs().into_owned().collect();
 
         let amount_msats = request.amount_sats * 1000;
         assert_eq!(query.get("amount"), Some(&amount_msats.to_string()));
@@ -381,8 +381,8 @@ mod tests {
         let nostr_event_json = urlencoding::decode(nostr_encoded)
             .expect("nostr payload should decode")
             .into_owned();
-        let zap_event: Event =
-            serde_json::from_str(&nostr_event_json).expect("decoded nostr payload should parse as Event");
+        let zap_event: Event = serde_json::from_str(&nostr_event_json)
+            .expect("decoded nostr payload should parse as Event");
 
         assert_eq!(zap_event.kind, Kind::ZapRequest);
 
@@ -391,9 +391,7 @@ mod tests {
             .get("tags")
             .cloned()
             .expect("event should contain tags");
-        let tags = serialized_tags
-            .as_array()
-            .expect("tags should be array");
+        let tags = serialized_tags.as_array().expect("tags should be array");
 
         assert!(tags.iter().any(|tag| {
             tag.as_array()
@@ -454,7 +452,8 @@ mod tests {
             .last_requested_url()
             .expect("callback request URL should be captured");
         let parsed = Url::parse(&callback_url).expect("callback URL should parse");
-        let query: std::collections::HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+        let query: std::collections::HashMap<String, String> =
+            parsed.query_pairs().into_owned().collect();
 
         assert!(query.contains_key("amount"));
         assert!(!query.contains_key("nostr"));

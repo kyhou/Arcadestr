@@ -983,10 +983,7 @@ mod tests {
         let mut builder = EventBuilder::new(Kind::Custom(kind), content);
 
         for tag in tags {
-            let tag_name = tag
-                .first()
-                .expect("tag must have a name")
-                .to_string();
+            let tag_name = tag.first().expect("tag must have a name").to_string();
             let values = tag
                 .into_iter()
                 .skip(1)
@@ -1064,7 +1061,9 @@ mod tests {
         );
 
         let listing = parse_listing(event).expect("listing should parse");
-        let parsed_timestamp = listing.published_at.expect("published_at should be present");
+        let parsed_timestamp = listing
+            .published_at
+            .expect("published_at should be present");
         assert_eq!(parsed_timestamp, 1_700_000_000_i64);
     }
 
@@ -1087,7 +1086,9 @@ mod tests {
             .as_deref()
             .expect("price currency should be present");
         assert_eq!(currency, "SATS");
-        assert!(currency.chars().all(|ch| !ch.is_ascii_alphabetic() || ch.is_ascii_uppercase()));
+        assert!(currency
+            .chars()
+            .all(|ch| !ch.is_ascii_alphabetic() || ch.is_ascii_uppercase()));
     }
 
     #[test]

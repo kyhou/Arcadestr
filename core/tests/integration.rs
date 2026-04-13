@@ -8,7 +8,9 @@ use arcadestr_core::auth::AuthState;
 use arcadestr_core::marketplace::Nip99Listing;
 use arcadestr_core::marketplace_cache::MarketplaceCache;
 use arcadestr_core::nip05_validator::{IdentityValidationState, Nip05IdentityValidator};
-use arcadestr_core::nostr::{event_to_game_listing, game_listing_to_event_builder, GameListing, KIND_GAME_LISTING};
+use arcadestr_core::nostr::{
+    event_to_game_listing, game_listing_to_event_builder, GameListing, KIND_GAME_LISTING,
+};
 use arcadestr_core::signers::NostrSigner;
 use arcadestr_core::storage::Database;
 use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, ToBech32};
@@ -39,9 +41,9 @@ mod nip46_mocks;
 #[path = "../src/lightning.rs"]
 mod lightning_internal;
 
+use http_mocks::MockHttpClient;
 use lightning_internal::{request_zap_invoice_with_http, ZapRequest};
 use nip46_mocks::MockNip46Relay;
-use http_mocks::MockHttpClient;
 
 fn temp_db_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -325,7 +327,11 @@ async fn int_04_marketplace_cache_streaming_callback_collection() {
     };
 
     for idx in 0..20 {
-        let listing = test_nip99_listing(&format!("stream-{idx}"), "npub-stream-merchant", 1_710_000_100 + idx);
+        let listing = test_nip99_listing(
+            &format!("stream-{idx}"),
+            "npub-stream-merchant",
+            1_710_000_100 + idx,
+        );
         on_product(listing);
     }
 
@@ -351,13 +357,20 @@ async fn int_04_marketplace_cache_streaming_callback_collection() {
         .await
         .expect("final cache load should succeed");
 
-    assert!(loaded.len() >= 25, "cache should include cached + streamed listings");
+    assert!(
+        loaded.len() >= 25,
+        "cache should include cached + streamed listings"
+    );
 
     let keyset: HashSet<(String, String)> = loaded
         .iter()
         .map(|entry| (entry.publisher_npub.clone(), entry.id.clone()))
         .collect();
-    assert_eq!(keyset.len(), loaded.len(), "cache should not contain duplicates");
+    assert_eq!(
+        keyset.len(),
+        loaded.len(),
+        "cache should not contain duplicates"
+    );
 
     let _ = std::fs::remove_file(db_path);
 }
@@ -367,10 +380,10 @@ async fn int_05_nip57_zap_invoice_request_with_mock_http() {
     let auth = test_auth_state();
 
     let request = ZapRequest {
-        seller_npub:
-            "d94a3f0b5b907fda6c1d2716af34e4d533ddf8f6f6f0f8f1f4a3f605f6c9a3b4".to_string(),
+        seller_npub: "d94a3f0b5b907fda6c1d2716af34e4d533ddf8f6f6f0f8f1f4a3f605f6c9a3b4".to_string(),
         seller_lud16: "seller@example.com".to_string(),
-        listing_event_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        listing_event_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .to_string(),
         amount_sats: 21,
         buyer_npub: Keys::generate()
             .public_key()

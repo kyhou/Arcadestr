@@ -685,8 +685,8 @@ mod tests {
 
     use super::generate_login_qr;
     use super::handle_nip46_connect_event;
-    use crate::test_helpers::nip46_mocks::MockNip46Relay;
     use crate::signers::{load_or_create_client_keys, reset_client_keys, set_keys_dir};
+    use crate::test_helpers::nip46_mocks::MockNip46Relay;
     use nostr::{Event, EventBuilder, Keys, Kind, SecretKey};
 
     fn fixed_keys(hex_secret: &str) -> Keys {
@@ -721,8 +721,9 @@ mod tests {
         let (stored_client_keys, _) =
             load_or_create_client_keys().expect("load_or_create_client_keys must succeed");
 
-        let (uri, _app_keys, _secret) =
-            generate_login_qr(None).await.expect("generate_login_qr must succeed");
+        let (uri, _app_keys, _secret) = generate_login_qr(None)
+            .await
+            .expect("generate_login_qr must succeed");
 
         let uri_pubkey_hex =
             extract_client_pubkey_hex(&uri).expect("nostrconnect URI must include client pubkey");

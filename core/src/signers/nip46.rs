@@ -666,9 +666,7 @@ mod tests {
     }
 
     fn lock_nip46_test_state() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK
-            .lock()
-            .expect("nip46 test lock mutex poisoned")
+        TEST_LOCK.lock().expect("nip46 test lock mutex poisoned")
     }
 
     #[test]

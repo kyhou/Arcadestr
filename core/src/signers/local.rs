@@ -64,7 +64,7 @@ impl NostrSigner for LocalSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, Kind, Keys};
+    use nostr::{EventBuilder, Keys, Kind};
 
     fn build_unsigned_text_note(pubkey: nostr::PublicKey, content: &str) -> UnsignedEvent {
         EventBuilder::new(Kind::TextNote, content).build(pubkey)
