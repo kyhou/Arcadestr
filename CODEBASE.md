@@ -69,6 +69,9 @@ Both targets share the same UI components from the `app` crate, but the desktop 
 | **tauri-plugin-keyring** | 0.1 | OS keychain integration | `desktop/Cargo.toml` |
 | **argon2** | 0.5 | Password hashing for encryption | `core/src/storage/encryption.rs` |
 | **aes-gcm** | 0.10 | AES-256-GCM encryption | `core/src/storage/encryption.rs` |
+| **scrypt** | 0.11 | NIP-49 KDF for ncryptsec | `core/src/storage/encryption.rs` |
+| **chacha20poly1305** | 0.10 | XChaCha20-Poly1305 for NIP-49 | `core/src/storage/encryption.rs` |
+| **bech32** | 0.9 | NIP-49 `ncryptsec1...` encoding/decoding | `core/src/storage/encryption.rs` |
 | **reqwest** | 0.12 | HTTP client for NIP-05/NIP-57 | `core/src/nostr.rs`, `core/src/lightning.rs` |
 | **wasm-bindgen** | 0.2 | WASM/JavaScript interop | `app/`, `web/` crates |
 | **web-sys** | 0.3 | Browser API bindings | `app/src/web_auth.rs` |
@@ -227,7 +230,8 @@ arcadestr/
 │   │   ├── nip46_commands.rs # NIP-46 specific Tauri commands
 │   │   └── command_contracts.rs # Pure command logic for testability
 │   └── tests/              # Desktop command layer tests
-│       └── section6_command_layer_tests.rs # Auth and command contract tests
+│       ├── section6_command_layer_tests.rs # Auth and command contract tests
+│       └── section7_nip49_commands.rs      # NIP-49/NIP-05 command contract tests
 │
 ├── core/                   # LIBRARY: Core business logic (NOSTR, storage, crypto)
 │   ├── Cargo.toml          # Native-only dependencies (tokio, sqlx, etc.)
@@ -1002,11 +1006,29 @@ fn main() {
 | `core::lightning` | Lightning payments | `ZapRequest`, `ZapInvoice` | `request_zap_invoice()` |
 | `core::social_graph` | Extended network | `SocialGraphDb` | `discover_network()` |
 
-**Recent `core::storage` public surface additions (for desktop NIP-49 UI stubs):**
-- `validate_nip49_format`
-- `extract_nip49_version`
-- `validate_nip49_password`
-- `Nip49ValidationError`
+**Recent `core::storage::encryption` public surface additions (NIP-49 backend):**
+- `ScryptParams { n, r, p }`
+- `Ncryptsec { version, scrypt_n, scrypt_r, scrypt_p, salt, nonce, ciphertext }`
+- `derive_key_scrypt(password, salt, params) -> Result<[u8; 32], EncryptionError>`
+- `encrypt_private_key_nip49(private_key_hex, password, params) -> Result<Ncryptsec, EncryptionError>`
+- `decrypt_private_key_nip49(ncryptsec, password) -> Result<String, EncryptionError>`
+- `parse_ncryptsec(ncryptsec_str) -> Result<Ncryptsec, EncryptionError>`
+- `serialize_ncryptsec(ncryptsec) -> Result<String, EncryptionError>`
+- Existing validation helpers retained: `validate_nip49_format`, `extract_nip49_version`, `validate_nip49_password`
+
+**Recent `core::nip46::storage` additions (desktop keychain):**
+- `store_ncryptsec_in_keychain(entry_id, ncryptsec) -> Result<(), StorageError>`
+- `get_ncryptsec_from_keychain(entry_id) -> Result<String, StorageError>`
+- `delete_ncryptsec_from_keychain(entry_id) -> Result<(), StorageError>`
+- `ncryptsec_entry_exists(entry_id) -> bool`
+
+**Recent `core::nostr` additions (NIP-05):**
+- `build_nip05_url(domain, local_part) -> String`
+- `verify_nip05_identity(http_client, nip05, expected_pubkey) -> Result<Nip05Verification, NostrError>`
+
+**New test files:**
+- `core/tests/integration_nip05.rs` (NIP-05 lookup/verification with `MockHttpClient`)
+- `desktop/tests/section7_nip49_commands.rs` (desktop command-layer NIP-49/NIP-05 tests)
 
 ### 7.3 Key Data Structures
 

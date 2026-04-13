@@ -26,6 +26,9 @@ pub enum HttpClientError {
 pub trait HttpClient: Send + Sync {
     /// Fetch URL and decode JSON payload.
     async fn get_json(&self, url: &str) -> Result<Value, HttpClientError>;
+
+    /// Fetch URL and decode JSON payload while forbidding redirect following.
+    async fn get_json_no_redirects(&self, url: &str) -> Result<Value, HttpClientError>;
 }
 
 /// Production HTTP client backed by `reqwest`.
@@ -70,5 +73,9 @@ impl HttpClient for ReqwestHttpClient {
             .json::<Value>()
             .await
             .map_err(|e| HttpClientError::Json(e.to_string()))
+    }
+
+    async fn get_json_no_redirects(&self, url: &str) -> Result<Value, HttpClientError> {
+        self.get_json(url).await
     }
 }

@@ -14,6 +14,7 @@ use arcadestr_core::signers::NostrSigner;
 
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::extended_network::ExtendedNetworkRepository;
+use arcadestr_core::http_client::{HttpClient, ReqwestHttpClient};
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
 use arcadestr_core::marketplace::{apply_filter, apply_filter_nip99, MarketplaceFilter};
 use arcadestr_core::marketplace_cache::{MarketplaceCache, UpsertOutcome};
@@ -45,7 +46,10 @@ use tauri::Emitter;
 mod command_contracts;
 mod nip46_commands;
 
-use command_contracts::{Nip05Status, Nip49ExportResult, Nip49ImportRequest};
+use command_contracts::{
+    ExportKeyRequest, ExportKeyResult, ImportKeyRequest, ImportKeyResult, Nip05Status,
+    Nip49ExportResult, Nip49ImportRequest, VerifyNip05Request, VerifyNip05Result,
+};
 
 /// Application state shared across Tauri commands.
 pub struct AppState {
@@ -73,6 +77,8 @@ pub struct AppState {
     pub relay_hints: Option<Arc<RelayHints>>,
     /// NIP-05 validator for background verification
     pub nip05_validator: Arc<std::sync::Mutex<Nip05Validator>>,
+    /// Shared HTTP client used by command contracts.
+    pub http_client: Arc<dyn HttpClient>,
 }
 
 fn listing_cache_key(listing: &GameListing) -> (String, String) {
@@ -337,7 +343,39 @@ async fn nip49_import(
     request: Nip49ImportRequest,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    command_contracts::nip49_import(request, state.inner()).map_err(|error| error.to_string())
+    command_contracts::nip49_import(request, state.inner())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn export_encrypted_key(
+    request: ExportKeyRequest,
+    state: tauri::State<'_, AppState>,
+) -> Result<ExportKeyResult, String> {
+    command_contracts::export_encrypted_key(state.inner(), request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn import_encrypted_key(
+    request: ImportKeyRequest,
+    state: tauri::State<'_, AppState>,
+) -> Result<ImportKeyResult, String> {
+    command_contracts::import_encrypted_key(state.inner(), request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn verify_nip05_identity(
+    request: VerifyNip05Request,
+    state: tauri::State<'_, AppState>,
+) -> Result<VerifyNip05Result, String> {
+    command_contracts::verify_nip05_identity(state.inner(), request)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -347,6 +385,7 @@ async fn nip49_export(
     state: tauri::State<'_, AppState>,
 ) -> Result<Nip49ExportResult, String> {
     command_contracts::nip49_export(npub, password, state.inner())
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -355,7 +394,9 @@ async fn verify_nip05(
     identifier: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Nip05Status, String> {
-    command_contracts::verify_nip05(identifier, state.inner()).map_err(|error| error.to_string())
+    command_contracts::verify_nip05(identifier, state.inner())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Disconnects the current signer and clears the authentication state.
@@ -797,6 +838,14 @@ fn main() {
         });
     info!("Database initialized at: {}", db_path.display());
     info!("UserCache initialized");
+
+    let http_client: Arc<dyn HttpClient> = match ReqwestHttpClient::new(Duration::from_secs(10)) {
+        Ok(client) => Arc::new(client),
+        Err(error) => {
+            eprintln!("Failed to initialize HTTP client: {}", error);
+            return;
+        }
+    };
 
     // Initialize RelayCache for NIP-65 relay list management
     let relay_cache =
@@ -1964,6 +2013,7 @@ fn main() {
             user_cache,
             marketplace_cache,
             nip05_validator,
+            http_client,
             extended_network: Arc::new(RwLock::new(None)),
             extended_network_follows: Arc::new(RwLock::new(Vec::new())),
             relay_hints: Some(relay_hints.clone()),
@@ -2293,7 +2343,10 @@ fn main() {
             connect_with_key,
             nip49_import,
             nip49_export,
+            export_encrypted_key,
+            import_encrypted_key,
             verify_nip05,
+            verify_nip05_identity,
             reconnect_relays,
             get_public_key,
             is_authenticated,

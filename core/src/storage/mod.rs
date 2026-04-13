@@ -18,7 +18,8 @@ pub use backup::{
 };
 pub use db::{Database, DatabaseError};
 pub use encryption::{
-    extract_nip49_version, validate_nip49_format, validate_nip49_password, EncryptedData,
-    Encryption, EncryptionError, Nip49ValidationError,
+    decrypt_private_key_nip49, encrypt_private_key_nip49, extract_nip49_version, parse_ncryptsec,
+    serialize_ncryptsec, validate_nip49_format, validate_nip49_password, EncryptedData, Encryption,
+    EncryptionError, Ncryptsec, Nip49ValidationError, ScryptParams,
 };
 pub use master_key::{MasterKeyError, MasterKeyManager};

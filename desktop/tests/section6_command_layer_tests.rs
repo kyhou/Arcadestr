@@ -1,12 +1,65 @@
 use arcadestr_core::auth::AuthState;
+use arcadestr_core::http_client::{HttpClient, HttpClientError, ReqwestHttpClient};
 use arcadestr_core::nip46::ProfileMetadata;
 use arcadestr_core::nostr::{GameListing, UserProfile};
+use async_trait::async_trait;
 use nostr::Keys;
 use nostr::ToBech32;
+use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+
+pub struct AppState {
+    pub auth: Arc<Mutex<AuthState>>,
+    pub http_client: Arc<dyn HttpClient>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            auth: Arc::new(Mutex::new(AuthState::new())),
+            http_client: Arc::new(
+                ReqwestHttpClient::new(Duration::from_secs(1))
+                    .expect("test reqwest http client should build"),
+            ),
+        }
+    }
+}
 
 #[path = "../src/command_contracts.rs"]
 mod command_contracts;
+
+#[derive(Default)]
+struct MockNoRedirectHttpClient {
+    no_redirect_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl HttpClient for MockNoRedirectHttpClient {
+    async fn get_json(&self, _url: &str) -> Result<serde_json::Value, HttpClientError> {
+        Err(HttpClientError::Request(
+            "get_json path should not be used in NIP-05 verification".to_string(),
+        ))
+    }
+
+    async fn get_json_no_redirects(
+        &self,
+        _url: &str,
+    ) -> Result<serde_json::Value, HttpClientError> {
+        self.no_redirect_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({
+            "names": {
+                "alice": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "relays": {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": ["wss://relay.example.com"]
+            }
+        }))
+    }
+}
 
 #[test]
 fn is_authenticated_before_login_returns_false() {
@@ -190,4 +243,82 @@ fn delete_profile_contract_removes_profile_from_followup_list() {
         .expect("accounts should be array");
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0]["id"], serde_json::json!("profile-2"));
+}
+
+#[tokio::test]
+async fn verify_nip05_identity_uses_expected_pubkey_from_request() {
+    let http_client = Arc::new(MockNoRedirectHttpClient::default());
+    let state = AppState {
+        auth: Arc::new(Mutex::new(AuthState::new())),
+        http_client: http_client.clone(),
+    };
+
+    let result = command_contracts::verify_nip05_identity(
+        &state,
+        command_contracts::VerifyNip05Request {
+            nip05: "alice@example.com".to_string(),
+            expected_pubkey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+        },
+    )
+    .await
+    .expect("verification should use request.expected_pubkey");
+
+    assert!(result.verified);
+    assert_eq!(result.nip05, "alice@example.com");
+    assert_eq!(result.relays, vec!["wss://relay.example.com".to_string()]);
+    assert_eq!(result.error, None);
+    assert_eq!(http_client.no_redirect_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn export_import_verify_contract_structs_match_batch4_schema() {
+    let export_request = command_contracts::ExportKeyRequest {
+        password: "strong-password".to_string(),
+        scrypt_n: Some(131072),
+    };
+    let export_request_json = serde_json::to_value(export_request).expect("serialize request");
+    assert_eq!(export_request_json.get("entry_id"), None);
+    assert!(export_request_json.get("password").is_some());
+    assert!(export_request_json.get("scrypt_n").is_some());
+
+    let export_result = command_contracts::ExportKeyResult {
+        ncryptsec: "ncryptsec1xxx".to_string(),
+        keychain_entry: "arcadestr_nip49_deadbeef_123".to_string(),
+    };
+    let export_result_json = serde_json::to_value(export_result).expect("serialize result");
+    assert!(export_result_json.get("ncryptsec").is_some());
+    assert!(export_result_json.get("keychain_entry").is_some());
+    assert_eq!(export_result_json.get("entry_id"), None);
+    assert_eq!(export_result_json.get("npub"), None);
+
+    let import_result = command_contracts::ImportKeyResult {
+        pubkey: "abc".to_string(),
+        success: true,
+    };
+    let import_result_json = serde_json::to_value(import_result).expect("serialize import");
+    assert_eq!(import_result_json["pubkey"], json!("abc"));
+    assert_eq!(import_result_json["success"], json!(true));
+
+    let verify_request = command_contracts::VerifyNip05Request {
+        nip05: "alice@example.com".to_string(),
+        expected_pubkey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .to_string(),
+    };
+    let verify_request_json = serde_json::to_value(verify_request).expect("serialize verify req");
+    assert!(verify_request_json.get("nip05").is_some());
+    assert!(verify_request_json.get("expected_pubkey").is_some());
+    assert_eq!(verify_request_json.get("identifier"), None);
+
+    let verify_result = command_contracts::VerifyNip05Result {
+        nip05: "alice@example.com".to_string(),
+        verified: true,
+        relays: vec![],
+        error: None,
+    };
+    let verify_result_json = serde_json::to_value(verify_result).expect("serialize verify result");
+    assert!(verify_result_json.get("nip05").is_some());
+    assert!(verify_result_json.get("verified").is_some());
+    assert!(verify_result_json.get("relays").is_some());
+    assert!(verify_result_json.get("error").is_some());
 }

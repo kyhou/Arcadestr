@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::auth::AuthState;
+use crate::http_client::{HttpClient, HttpClientError};
 use crate::nip05_validator::{IdentityValidationState, Nip05IdentityValidator};
 #[cfg(feature = "native")]
 use crate::relay_cache::{CachedRelayList, RelayCache, RelayDiscoverySource};
@@ -1688,6 +1689,15 @@ pub struct Nip05Identifier {
     pub full: String,
 }
 
+/// Verified NIP-05 identity details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nip05Verification {
+    pub nip05: String,
+    pub pubkey: String,
+    pub verified: bool,
+    pub relays: Vec<String>,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum Nip05ParseError {
     #[error("NIP-05 identifier must contain '@'")]
@@ -1698,6 +1708,156 @@ pub enum Nip05ParseError {
     EmptyDomain,
     #[error("NIP-05 contains invalid character '{0}'")]
     InvalidCharacters(String),
+}
+
+/// Errors returned by NIP-05 network verification.
+#[derive(Debug, Error)]
+pub enum Nip05VerificationError {
+    #[error("Invalid NIP-05 identifier: {0}")]
+    Parse(#[from] Nip05ParseError),
+    #[error("Expected pubkey must be 32-byte hex")]
+    InvalidExpectedPubkey,
+    #[error("NIP-05 HTTP request failed: {0}")]
+    Http(#[from] HttpClientError),
+    #[error("NIP-05 response missing 'names' object")]
+    MissingNamesObject,
+    #[error("NIP-05 response missing name '{0}'")]
+    MissingName(String),
+    #[error("NIP-05 response contains invalid pubkey for '{0}'")]
+    InvalidResolvedPubkey(String),
+    #[error("NIP-05 pubkey mismatch (expected {expected}, got {found})")]
+    PubkeyMismatch { expected: String, found: String },
+    #[error("NIP-05 response has invalid JSON shape: {0}")]
+    InvalidJsonShape(String),
+}
+
+/// Build a canonical NIP-05 resolver URL.
+pub fn build_nip05_url(domain: &str, local_part: &str) -> String {
+    let domain = domain.trim().to_ascii_lowercase();
+    let local_part = if local_part.trim().is_empty() {
+        "_".to_string()
+    } else {
+        local_part.trim().to_ascii_lowercase()
+    };
+
+    format!("https://{domain}/.well-known/nostr.json?name={local_part}")
+}
+
+/// Verify a NIP-05 identifier against an expected pubkey.
+pub async fn verify_nip05_identity(
+    http_client: &dyn HttpClient,
+    nip05: &str,
+    expected_pubkey: &str,
+) -> Result<Nip05Verification, NostrError> {
+    let parsed = normalize_and_parse_nip05(nip05).map_err(|error| {
+        NostrError::MalformedEvent(format!("Invalid NIP-05 identifier: {error}"))
+    })?;
+    let expected = normalize_hex_pubkey(expected_pubkey)
+        .ok_or_else(|| NostrError::MalformedEvent("Expected pubkey must be 32-byte hex".into()))?;
+
+    let url = build_nip05_url(&parsed.domain, &parsed.local_part);
+    let body = http_client
+        .get_json_no_redirects(&url)
+        .await
+        .map_err(|error| NostrError::RelayError(format!("NIP-05 HTTP request failed: {error}")))?;
+
+    let names = body
+        .get("names")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            NostrError::MalformedEvent("NIP-05 response missing 'names' object".into())
+        })?;
+
+    let resolved = names
+        .get(&parsed.local_part)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            NostrError::MalformedEvent(format!(
+                "NIP-05 response missing name '{}'",
+                parsed.local_part
+            ))
+        })?;
+
+    if !is_lower_hex_with_len(resolved, 64) {
+        return Err(NostrError::MalformedEvent(format!(
+            "NIP-05 response contains invalid pubkey for '{}'",
+            parsed.local_part
+        )));
+    }
+
+    if resolved != expected {
+        return Err(NostrError::MalformedEvent(format!(
+            "NIP-05 pubkey mismatch (expected {expected}, got {resolved})"
+        )));
+    }
+
+    let relays = parse_relay_hints_from_nip05_document(&body, resolved)?;
+
+    Ok(Nip05Verification {
+        nip05: parsed.full,
+        pubkey: expected,
+        verified: true,
+        relays,
+    })
+}
+
+fn normalize_and_parse_nip05(identifier: &str) -> Result<Nip05Identifier, Nip05ParseError> {
+    let trimmed = identifier.trim();
+    if trimmed.contains('@') {
+        return parse_nip05_identifier(trimmed);
+    }
+
+    parse_nip05_identifier(&format!("_@{trimmed}"))
+}
+
+fn normalize_hex_pubkey(pubkey: &str) -> Option<String> {
+    let normalized = pubkey.trim().to_ascii_lowercase();
+    if normalized.len() == 64 && normalized.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Some(normalized);
+    }
+
+    None
+}
+
+fn parse_relay_hints_from_nip05_document(
+    body: &serde_json::Value,
+    resolved_pubkey: &str,
+) -> Result<Vec<String>, NostrError> {
+    let Some(relays_value) = body.get("relays") else {
+        return Ok(Vec::new());
+    };
+
+    let relays_map = relays_value.as_object().ok_or_else(|| {
+        NostrError::MalformedEvent("NIP-05 response 'relays' must be an object".into())
+    })?;
+
+    let Some(relays_for_pubkey) = relays_map.get(resolved_pubkey) else {
+        return Ok(Vec::new());
+    };
+
+    let relay_array = relays_for_pubkey.as_array().ok_or_else(|| {
+        NostrError::MalformedEvent(
+            "NIP-05 response 'relays[pubkey]' must be an array of relay URLs".into(),
+        )
+    })?;
+
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+
+    for relay in relay_array {
+        let relay = relay.as_str().ok_or_else(|| {
+            NostrError::MalformedEvent(
+                "NIP-05 response 'relays[pubkey]' entries must be strings".into(),
+            )
+        })?;
+
+        let relay = relay.to_string();
+        if seen.insert(relay.clone()) {
+            deduped.push(relay);
+        }
+    }
+
+    Ok(deduped)
 }
 
 /// Parse and validate a NIP-05 identifier as `name@domain`.
@@ -1878,7 +2038,10 @@ mod nip05_tests {
     #[test]
     fn nip05_parse_identifier_rejects_invalid_domain() {
         let result = parse_nip05_identifier("alice@example");
-        assert_eq!(result, Err(Nip05ParseError::InvalidCharacters("example".into())));
+        assert_eq!(
+            result,
+            Err(Nip05ParseError::InvalidCharacters("example".into()))
+        );
     }
 
     #[test]

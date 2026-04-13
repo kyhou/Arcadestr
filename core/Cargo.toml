@@ -33,8 +33,11 @@ futures = "0.3"
 # Secure storage dependencies
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }
 aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
 argon2 = "0.5"
+scrypt = "0.11"
 rand = "0.10"
+unicode-normalization = "0.1"
 zeroize = { version = "1.7", features = ["derive"] }
 # OS keychain storage via tauri-plugin-keyring (uses keyring crate internally)
 keyring = "3.6"

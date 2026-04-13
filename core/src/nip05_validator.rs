@@ -127,7 +127,7 @@ impl Nip05IdentityValidator {
 
         let url = format!("https://{}/.well-known/nostr.json?name={}", domain, name);
 
-        let result = match self.http_client.get_json(&url).await {
+        let result = match self.http_client.get_json_no_redirects(&url).await {
             Ok(body) => self.validate_json_response(&body, name, &expected_hex),
             Err(_) => IdentityValidationResult {
                 state: IdentityValidationState::Error,
@@ -362,7 +362,8 @@ mod tests {
 
     use crate::test_helpers::http_mocks::MockHttpClient;
 
-    const TEST_HEX_PUBKEY: &str = "d94a3f0b5b907fda6c1d2716af34e4d533ddf8f6f6f0f8f1f4a3f605f6c9a3b4";
+    const TEST_HEX_PUBKEY: &str =
+        "d94a3f0b5b907fda6c1d2716af34e4d533ddf8f6f6f0f8f1f4a3f605f6c9a3b4";
 
     fn test_npub() -> String {
         TEST_HEX_PUBKEY.to_string()
@@ -397,9 +398,7 @@ mod tests {
     #[tokio::test]
     async fn valid_identifier_format() {
         let npub = test_npub();
-        let expected_hex = PublicKey::parse(&npub)
-            .expect("invalid test npub")
-            .to_hex();
+        let expected_hex = PublicKey::parse(&npub).expect("invalid test npub").to_hex();
 
         let alice_url = "https://example.com/.well-known/nostr.json?name=alice";
         let root_url = "https://example.com/.well-known/nostr.json?name=_";
@@ -414,11 +413,11 @@ mod tests {
             )
             .with_json_response(
                 root_url,
-            json!({
-                "names": {
-                        "_": expected_hex,
-                }
-            }),
+                json!({
+                    "names": {
+                            "_": expected_hex,
+                    }
+                }),
             );
 
         let validator = Nip05IdentityValidator::with_http_client(Arc::new(mock.clone()));
@@ -438,9 +437,7 @@ mod tests {
         let npub = test_npub();
         let name = "alice";
         let domain = "example.com";
-        let expected_hex = PublicKey::parse(&npub)
-            .expect("invalid test npub")
-            .to_hex();
+        let expected_hex = PublicKey::parse(&npub).expect("invalid test npub").to_hex();
         let url = format!("https://{}/.well-known/nostr.json?name={}", domain, name);
 
         let mock = MockHttpClient::new().with_json_response(
@@ -533,9 +530,7 @@ mod tests {
     #[tokio::test]
     async fn cache_returns_cached_result() {
         let npub = test_npub();
-        let expected_hex = PublicKey::parse(&npub)
-            .expect("invalid test npub")
-            .to_hex();
+        let expected_hex = PublicKey::parse(&npub).expect("invalid test npub").to_hex();
         let url = "https://example.com/.well-known/nostr.json?name=alice";
 
         let mock = MockHttpClient::new().with_json_response(
@@ -561,9 +556,7 @@ mod tests {
     #[tokio::test]
     async fn cache_expiry_with_zero_ttl_calls_http_again() {
         let npub = test_npub();
-        let expected_hex = PublicKey::parse(&npub)
-            .expect("invalid test npub")
-            .to_hex();
+        let expected_hex = PublicKey::parse(&npub).expect("invalid test npub").to_hex();
         let url = "https://example.com/.well-known/nostr.json?name=alice";
 
         let mock = MockHttpClient::new().with_json_response(
@@ -575,8 +568,8 @@ mod tests {
             }),
         );
 
-        let validator =
-            Nip05IdentityValidator::with_http_client(Arc::new(mock.clone())).with_ttl(Duration::ZERO);
+        let validator = Nip05IdentityValidator::with_http_client(Arc::new(mock.clone()))
+            .with_ttl(Duration::ZERO);
 
         let _ = validator.validate(&npub, "alice@example.com").await;
         let _ = validator.validate(&npub, "alice@example.com").await;
@@ -587,9 +580,7 @@ mod tests {
     #[tokio::test]
     async fn relays_from_nostr_json_are_extracted() {
         let npub = test_npub();
-        let expected_hex = PublicKey::parse(&npub)
-            .expect("invalid test npub")
-            .to_hex();
+        let expected_hex = PublicKey::parse(&npub).expect("invalid test npub").to_hex();
         let url = "https://example.com/.well-known/nostr.json?name=alice";
 
         let mock = MockHttpClient::new().with_json_response(

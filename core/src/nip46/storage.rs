@@ -15,12 +15,20 @@ use nostr::{nips::nip46::NostrConnectURI, Keys, ToBech32};
 use serde_json;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::nip46::types::{Nip46KeyringError, Nip46UriType, ProfileMetadata, SavedProfile};
+use crate::storage::validate_nip49_format;
 
 /// Service name for keyring entries - MUST be "arcadestr-auth"
 const SERVICE_NAME: &str = "arcadestr-auth";
+
+/// Service name for NIP-49 ncryptsec blobs in OS keychain.
+const NIP49_SERVICE_NAME: &str = "arcadestr-nip49";
+
+/// Prefix for NIP-49 keyring entry keys.
+const NIP49_ENTRY_PREFIX: &str = "ncryptsec";
 
 /// Key for storing the profile index
 const PROFILE_INDEX_KEY: &str = "profile_index";
@@ -33,6 +41,163 @@ const PROFILE_CACHE_FILENAME: &str = "profile_metadata_cache.json";
 
 /// Lazy-static storage for the cache directory path
 static CACHE_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Errors for NIP-49 keychain blob persistence operations.
+#[derive(Debug, Error)]
+pub enum StorageError {
+    #[error("Unsupported platform for keychain persistence")]
+    UnsupportedPlatform,
+
+    #[error("Invalid entry id: entry_id cannot be empty")]
+    InvalidEntryId,
+
+    #[error("Invalid ncryptsec payload: {0}")]
+    InvalidNcryptsec(String),
+
+    #[error("Keychain entry not found: {0}")]
+    EntryNotFound(String),
+
+    #[error("Keyring error: {0}")]
+    Keyring(String),
+}
+
+fn validate_entry_id(entry_id: &str) -> Result<(), StorageError> {
+    if entry_id.trim().is_empty() {
+        return Err(StorageError::InvalidEntryId);
+    }
+
+    Ok(())
+}
+
+fn ncryptsec_keyring_key(entry_id: &str) -> String {
+    format!("{}_{}", NIP49_ENTRY_PREFIX, entry_id)
+}
+
+/// Store an encrypted NIP-49 `ncryptsec` blob in the OS keychain.
+pub async fn store_ncryptsec_in_keychain(
+    entry_id: &str,
+    ncryptsec: &str,
+) -> Result<(), StorageError> {
+    validate_entry_id(entry_id)?;
+    validate_nip49_format(ncryptsec)
+        .map_err(|error| StorageError::InvalidNcryptsec(error.to_string()))?;
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        let key = ncryptsec_keyring_key(entry_id);
+        let entry = Entry::new(NIP49_SERVICE_NAME, &key)
+            .map_err(|error| StorageError::Keyring(error.to_string()))?;
+        entry
+            .set_password(ncryptsec)
+            .map_err(|error| StorageError::Keyring(error.to_string()))?;
+        debug!(
+            "Stored ncryptsec blob in keychain for entry_id={}",
+            entry_id
+        );
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = ncryptsec;
+        warn!(
+            "store_ncryptsec_in_keychain unsupported on target for entry_id={}",
+            entry_id
+        );
+        Err(StorageError::UnsupportedPlatform)
+    }
+}
+
+/// Retrieve an encrypted NIP-49 `ncryptsec` blob from the OS keychain.
+pub async fn get_ncryptsec_from_keychain(entry_id: &str) -> Result<String, StorageError> {
+    validate_entry_id(entry_id)?;
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        let key = ncryptsec_keyring_key(entry_id);
+        let entry = Entry::new(NIP49_SERVICE_NAME, &key)
+            .map_err(|error| StorageError::Keyring(error.to_string()))?;
+
+        return entry.get_password().map_err(|error| match error {
+            keyring::Error::NoEntry => StorageError::EntryNotFound(entry_id.to_string()),
+            other => StorageError::Keyring(other.to_string()),
+        });
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        warn!(
+            "get_ncryptsec_from_keychain unsupported on target for entry_id={}",
+            entry_id
+        );
+        Err(StorageError::UnsupportedPlatform)
+    }
+}
+
+/// Delete an encrypted NIP-49 `ncryptsec` blob from the OS keychain.
+pub async fn delete_ncryptsec_from_keychain(entry_id: &str) -> Result<(), StorageError> {
+    validate_entry_id(entry_id)?;
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        let key = ncryptsec_keyring_key(entry_id);
+        let entry = Entry::new(NIP49_SERVICE_NAME, &key)
+            .map_err(|error| StorageError::Keyring(error.to_string()))?;
+
+        return match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(StorageError::Keyring(error.to_string())),
+        };
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        warn!(
+            "delete_ncryptsec_from_keychain unsupported on target for entry_id={}",
+            entry_id
+        );
+        Err(StorageError::UnsupportedPlatform)
+    }
+}
+
+/// Check whether a NIP-49 keychain entry exists.
+pub async fn ncryptsec_entry_exists(entry_id: &str) -> bool {
+    if validate_entry_id(entry_id).is_err() {
+        return false;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        let key = ncryptsec_keyring_key(entry_id);
+        let entry = match Entry::new(NIP49_SERVICE_NAME, &key) {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!(
+                    "Failed to access keychain entry for ncryptsec exists check {}: {}",
+                    entry_id, error
+                );
+                return false;
+            }
+        };
+
+        return match entry.get_password() {
+            Ok(_) => true,
+            Err(keyring::Error::NoEntry) => false,
+            Err(error) => {
+                warn!(
+                    "Failed to check ncryptsec keychain entry existence {}: {}",
+                    entry_id, error
+                );
+                false
+            }
+        };
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
 
 /// Set the directory for local profile metadata cache.
 /// This should be called once during app initialization.
@@ -562,7 +727,29 @@ mod tests {
     #[test]
     fn test_service_name() {
         assert_eq!(SERVICE_NAME, "arcadestr-auth");
+        assert_eq!(NIP49_SERVICE_NAME, "arcadestr-nip49");
         assert_eq!(PROFILE_INDEX_KEY, "profile_index");
+    }
+
+    #[test]
+    fn ncryptsec_keyring_rejects_empty_entry_id() {
+        let store_result = tokio_test::block_on(store_ncryptsec_in_keychain("", "ncryptsec1test"));
+        let get_result = tokio_test::block_on(get_ncryptsec_from_keychain(""));
+        let delete_result = tokio_test::block_on(delete_ncryptsec_from_keychain(""));
+        let exists = tokio_test::block_on(ncryptsec_entry_exists(""));
+
+        assert!(matches!(store_result, Err(StorageError::InvalidEntryId)));
+        assert!(matches!(get_result, Err(StorageError::InvalidEntryId)));
+        assert!(matches!(delete_result, Err(StorageError::InvalidEntryId)));
+        assert!(!exists);
+    }
+
+    #[test]
+    fn ncryptsec_keyring_key_uses_expected_prefix() {
+        assert_eq!(
+            ncryptsec_keyring_key("profile-123"),
+            "ncryptsec_profile-123"
+        );
     }
 
     #[test]

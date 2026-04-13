@@ -1,14 +1,78 @@
 use arcadestr_core::auth::AuthState;
+use arcadestr_core::nip46::store_ncryptsec_in_keychain;
 use arcadestr_core::nip46::ProfileMetadata;
 use arcadestr_core::nostr::{
-    normalize_nip05, parse_nip05_identifier, parse_nip19_identifier, GameListing, UserProfile,
+    parse_nip05_identifier, parse_nip19_identifier,
+    verify_nip05_identity as core_verify_nip05_identity, GameListing, UserProfile,
 };
+use arcadestr_core::signers::ActiveSigner;
 use arcadestr_core::storage::{
-    extract_nip49_version, validate_nip49_format, validate_nip49_password,
+    decrypt_private_key_nip49, encrypt_private_key_nip49, extract_nip49_version, parse_ncryptsec,
+    serialize_ncryptsec, validate_nip49_format, validate_nip49_password, ScryptParams,
 };
 use nostr::prelude::ToBech32;
+use nostr::Keys;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
+use tracing::error;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportKeyRequest {
+    pub password: String,
+    pub scrypt_n: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportKeyResult {
+    pub ncryptsec: String,
+    pub keychain_entry: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportKeyRequest {
+    pub ncryptsec: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportKeyResult {
+    pub success: bool,
+    pub pubkey: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifyNip05Request {
+    pub nip05: String,
+    pub expected_pubkey: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifyNip05Result {
+    pub nip05: String,
+    pub verified: bool,
+    pub relays: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CommandError {
+    #[error("Encryption failed")]
+    Encryption(String),
+    #[error("Wrong password or corrupted backup")]
+    Decryption(String),
+    #[error("Keychain operation failed")]
+    Keychain(String),
+    #[error("Network error during verification")]
+    Http(String),
+    #[error("Identity verification failed")]
+    Nip05(String),
+    #[error("No active local private key available for this operation")]
+    NoActiveKey,
+    #[error("{0}")]
+    InvalidInput(String),
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionInfo {
@@ -50,46 +114,225 @@ pub struct Nip05Status {
     pub message: String,
 }
 
-pub fn nip49_import(
-    request: Nip49ImportRequest,
-    _state: &crate::AppState,
-) -> Result<String, String> {
-    validate_nip49_format(&request.ncryptsec).map_err(|error| error.to_string())?;
-    validate_nip49_password(&request.password).map_err(|error| error.to_string())?;
+pub async fn export_encrypted_key(
+    state: &crate::AppState,
+    request: ExportKeyRequest,
+) -> Result<ExportKeyResult, CommandError> {
+    validate_nip49_password(&request.password)
+        .map_err(|error| CommandError::InvalidInput(error.to_string()))?;
 
-    let _version = extract_nip49_version(&request.ncryptsec).map_err(|error| error.to_string())?;
+    let default_params = ScryptParams::default_nip49();
+    let scrypt_n = request.scrypt_n.unwrap_or(default_params.n);
+    if !scrypt_n.is_power_of_two() {
+        return Err(CommandError::InvalidInput(
+            "scrypt_n must be a power-of-two value".to_string(),
+        ));
+    }
 
-    Ok("nip49-import-deferred-after-format-validation".to_string())
-}
+    let (private_key_hex, pubkey_hex) = {
+        let auth = state.auth.lock().await;
+        let signer = auth.signer().ok_or(CommandError::NoActiveKey)?;
+        let public_key = auth.public_key().ok_or(CommandError::NoActiveKey)?;
 
-pub fn nip49_export(
-    npub: String,
-    password: String,
-    _state: &crate::AppState,
-) -> Result<Nip49ExportResult, String> {
-    parse_nip19_identifier(&npub).map_err(|error| error.to_string())?;
-    validate_nip49_password(&password).map_err(|error| error.to_string())?;
+        let active_private_key = if let ActiveSigner::DirectKey(direct_key_signer) = signer {
+            direct_key_signer.keys().secret_key().to_secret_hex()
+        } else {
+            return Err(CommandError::NoActiveKey);
+        };
 
-    Ok(Nip49ExportResult {
-        npub,
-        ncryptsec: "ncryptsec1deferredmockpayload".to_string(),
-        deferred: true,
-        message: "NIP-49 export is deferred in this build (validation-only stub)".to_string(),
+        (active_private_key, public_key.to_hex())
+    };
+
+    let params = ScryptParams {
+        n: scrypt_n,
+        r: default_params.r,
+        p: default_params.p,
+    };
+    let typed_ncryptsec =
+        encrypt_private_key_nip49(&private_key_hex, &request.password, Some(params))
+            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let serialized_ncryptsec = serialize_ncryptsec(&typed_ncryptsec)
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+
+    let entry_prefix: String = pubkey_hex.chars().take(8).collect();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let keychain_entry = format!("arcadestr_nip49_{entry_prefix}_{timestamp}");
+
+    store_ncryptsec_in_keychain(&keychain_entry, &serialized_ncryptsec)
+        .await
+        .map_err(|error| {
+            error!("Failed to persist ncryptsec to keychain: {error}");
+            CommandError::Keychain(error.to_string())
+        })?;
+
+    Ok(ExportKeyResult {
+        ncryptsec: serialized_ncryptsec,
+        keychain_entry,
     })
 }
 
-pub fn verify_nip05(identifier: String, _state: &crate::AppState) -> Result<Nip05Status, String> {
-    let parsed = parse_nip05_identifier(&identifier).map_err(|error| error.to_string())?;
-    let normalized_identifier = normalize_nip05(&identifier);
+pub async fn import_encrypted_key(
+    _state: &crate::AppState,
+    request: ImportKeyRequest,
+) -> Result<ImportKeyResult, CommandError> {
+    validate_nip49_password(&request.password)
+        .map_err(|error| CommandError::InvalidInput(error.to_string()))?;
+
+    let typed_ncryptsec = parse_ncryptsec(&request.ncryptsec)
+        .map_err(|error| CommandError::InvalidInput(error.to_string()))?;
+    let private_key_hex =
+        decrypt_private_key_nip49(&typed_ncryptsec, &request.password).map_err(|error| {
+            error!("Failed to decrypt NIP-49 payload during import: {error}");
+            CommandError::Decryption(error.to_string())
+        })?;
+    let keys = Keys::parse(&private_key_hex)
+        .map_err(|error| CommandError::InvalidInput(format!("Invalid private key: {error}")))?;
+
+    Ok(ImportKeyResult {
+        success: true,
+        pubkey: keys.public_key().to_hex(),
+    })
+}
+
+pub async fn verify_nip05_identity(
+    _state: &crate::AppState,
+    request: VerifyNip05Request,
+) -> Result<VerifyNip05Result, CommandError> {
+    let parsed = parse_nip05_identifier(&request.nip05)
+        .map_err(|error| CommandError::InvalidInput(error.to_string()))?;
+
+    let normalized_identifier = format!("{}@{}", parsed.local_part, parsed.domain);
+
+    let verification = core_verify_nip05_identity(
+        _state.http_client.as_ref(),
+        &normalized_identifier,
+        &request.expected_pubkey,
+    )
+    .await
+    .map_err(|error| {
+        let details = error.to_string();
+        error!(
+            "NIP-05 verification failed for '{}': {details}",
+            request.nip05
+        );
+        match error {
+            arcadestr_core::nostr::NostrError::RelayError(_) => CommandError::Http(details),
+            _ => CommandError::Nip05(details),
+        }
+    })?;
+
+    Ok(VerifyNip05Result {
+        nip05: verification.nip05,
+        verified: verification.verified,
+        relays: verification.relays,
+        error: None,
+    })
+}
+
+pub async fn nip49_import(
+    request: Nip49ImportRequest,
+    state: &crate::AppState,
+) -> Result<String, CommandError> {
+    validate_nip49_format(&request.ncryptsec)
+        .map_err(|error| CommandError::InvalidInput(error.to_string()))?;
+    validate_nip49_password(&request.password)
+        .map_err(|error| CommandError::InvalidInput(error.to_string()))?;
+    let _version = extract_nip49_version(&request.ncryptsec)
+        .map_err(|error| CommandError::InvalidInput(error.to_string()))?;
+
+    let result = import_encrypted_key(
+        state,
+        ImportKeyRequest {
+            ncryptsec: request.ncryptsec,
+            password: request.password,
+        },
+    )
+    .await?;
+
+    Ok(format!("Import successful for pubkey {}", result.pubkey))
+}
+
+pub async fn nip49_export(
+    npub: String,
+    password: String,
+    state: &crate::AppState,
+) -> Result<Nip49ExportResult, CommandError> {
+    parse_nip19_identifier(&npub).map_err(|error| CommandError::InvalidInput(error.to_string()))?;
+    validate_nip49_password(&password)
+        .map_err(|error| CommandError::InvalidInput(error.to_string()))?;
+
+    let result = export_encrypted_key(
+        state,
+        ExportKeyRequest {
+            password,
+            scrypt_n: None,
+        },
+    )
+    .await?;
+
+    let active_npub = {
+        let auth = state.auth.lock().await;
+        let public_key = auth.public_key().ok_or(CommandError::NoActiveKey)?;
+        public_key
+            .to_bech32()
+            .map_err(|error| CommandError::InvalidInput(error.to_string()))?
+    };
+
+    if active_npub != npub {
+        return Err(CommandError::InvalidInput(
+            "Requested npub does not match active authenticated key".to_string(),
+        ));
+    }
+
+    Ok(Nip49ExportResult {
+        npub,
+        ncryptsec: result.ncryptsec,
+        deferred: false,
+        message: format!(
+            "NIP-49 encrypted backup exported and stored with entry id {}",
+            result.keychain_entry
+        ),
+    })
+}
+
+pub async fn verify_nip05(
+    identifier: String,
+    state: &crate::AppState,
+) -> Result<Nip05Status, CommandError> {
+    let result = verify_nip05_identity(
+        state,
+        VerifyNip05Request {
+            nip05: identifier.clone(),
+            expected_pubkey: {
+                let auth = state.auth.lock().await;
+                auth.public_key().ok_or(CommandError::NoActiveKey)?.to_hex()
+            },
+        },
+    )
+    .await?;
+
+    let parsed = parse_nip05_identifier(&result.nip05)
+        .map_err(|error| CommandError::InvalidInput(error.to_string()))?;
 
     Ok(Nip05Status {
-        identifier,
-        normalized_identifier,
+        identifier: result.nip05.clone(),
+        normalized_identifier: result.nip05,
         local_part: parsed.local_part,
         domain: parsed.domain,
-        verified: false,
-        status: "deferred".to_string(),
-        message: "NIP-05 network verification is deferred in this build".to_string(),
+        verified: result.verified,
+        status: if result.verified {
+            "verified".to_string()
+        } else {
+            "failed".to_string()
+        },
+        message: if result.verified {
+            "NIP-05 identity verified".to_string()
+        } else {
+            "NIP-05 identity verification failed".to_string()
+        },
     })
 }
 
