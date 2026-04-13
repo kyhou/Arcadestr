@@ -106,7 +106,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
             <div class="mt-16 flex justify-center">
                 <button class="px-10 py-4 bg-surface-container-low border border-outline-variant/15 text-on-surface-variant font-bold rounded-full hover:bg-surface-container-high hover:text-on-surface transition-all active:scale-95 flex items-center gap-3">
                     <span class="material-symbols-outlined">"expand_more"</span>
-                    "Load More Decentralized Experiences"
+                    "Load More..."
                 </button>
             </div>
         </section>

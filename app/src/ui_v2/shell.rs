@@ -187,9 +187,17 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         label="Store"
                         icon="grid_view"
                         active={Signal::derive(move || {
-                            matches!(current_view.get(), UiV2View::Store | UiV2View::BrowseAll)
+                            matches!(current_view.get(), UiV2View::Store)
                         })}
                         on_click={Callback::new(set_store)}
+                    />
+                    <NavItem
+                        label="Browse"
+                        icon="explore"
+                        active={Signal::derive(move || {
+                            matches!(current_view.get(), UiV2View::BrowseAll)
+                        })}
+                        on_click={Callback::new(set_browse_all)}
                     />
                     <NavItem
                         label="Library"
