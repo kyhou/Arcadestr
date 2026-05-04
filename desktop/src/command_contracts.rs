@@ -300,16 +300,24 @@ pub async fn nip49_export(
 
 pub async fn verify_nip05(
     identifier: String,
+    expected_npub: String,
     state: &crate::AppState,
 ) -> Result<Nip05Status, CommandError> {
+    let expected_pubkey = if expected_npub.starts_with("npub1")
+        || expected_npub.starts_with("nprofile1")
+    {
+        parse_nip19_identifier(&expected_npub)
+            .map_err(|error| CommandError::InvalidInput(error.to_string()))?
+            .pubkey
+    } else {
+        expected_npub
+    };
+
     let result = verify_nip05_identity(
         state,
         VerifyNip05Request {
             nip05: identifier.clone(),
-            expected_pubkey: {
-                let auth = state.auth.lock().await;
-                auth.public_key().ok_or(CommandError::NoActiveKey)?.to_hex()
-            },
+            expected_pubkey,
         },
     )
     .await?;

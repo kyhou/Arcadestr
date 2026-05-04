@@ -31,8 +31,8 @@ impl Default for RelayManagerConfig {
     fn default() -> Self {
         Self {
             max_relays: 100,
-            query_timeout_secs: 15,
-            connection_poll_timeout_ms: 2000, // 2s max wait (reduced from 5s)
+            query_timeout_secs: 10,
+            connection_poll_timeout_ms: 3000, // 3s max wait for initial relay readiness
             connection_poll_interval_ms: 50,  // Poll every 50ms (reduced from 100ms)
         }
     }
@@ -143,14 +143,14 @@ impl RelayManager {
 
         // Add DISCOVERY_RELAYS (excluding duplicates)
         for relay in DISCOVERY_RELAYS.iter() {
-            if !INDEXER_RELAYS.contains(relay) && !DEFAULT_RELAYS.contains(relay) {
-                if self
+            if !INDEXER_RELAYS.contains(relay)
+                && !DEFAULT_RELAYS.contains(relay)
+                && self
                     .pool
                     .add_relay(relay.to_string(), RelaySource::Discovered)
                     .await
-                {
-                    debug!("Added discovery relay: {}", relay);
-                }
+            {
+                debug!("Added discovery relay: {}", relay);
             }
         }
 
@@ -260,6 +260,59 @@ impl RelayManager {
                 warn!("Query timeout after {}s", self.config.query_timeout_secs);
                 Err(RelayManagerError::QueryTimeout)
             }
+        }
+    }
+
+    /// Fetch events using best-effort relay streaming.
+    ///
+    /// Unlike `fetch_events`, this method does not require all relays to
+    /// complete successfully. It returns any events received before inactivity
+    /// timeout, which is safer for sparse/slow relay topologies.
+    pub async fn fetch_events_best_effort(
+        &self,
+        filter: Filter,
+    ) -> Result<Vec<Event>, RelayManagerError> {
+        self.wait_for_connections().await?;
+
+        self.fetch_events_best_effort_no_wait(filter).await
+    }
+
+    /// Fetch events using best-effort relay streaming without blocking for
+    /// additional connection readiness.
+    ///
+    /// Queries currently connected relays and returns any events received before
+    /// inactivity timeout.
+    pub async fn fetch_events_best_effort_no_wait(
+        &self,
+        filter: Filter,
+    ) -> Result<Vec<Event>, RelayManagerError> {
+
+        let collected: Arc<std::sync::Mutex<Vec<Event>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&collected);
+
+        let _ = self
+            .fetch_events_streaming(
+                filter,
+                self.config.query_timeout_secs,
+                3,
+                move |_relay_url, events| {
+                    let mut guard = sink
+                        .lock()
+                        .expect("best_effort_events mutex poisoned");
+                    guard.extend(events);
+                },
+            )
+            .await;
+
+        let events = collected
+            .lock()
+            .expect("best_effort_events mutex poisoned")
+            .clone();
+
+        if events.is_empty() {
+            Err(RelayManagerError::QueryTimeout)
+        } else {
+            Ok(events)
         }
     }
 
@@ -813,8 +866,8 @@ mod tests {
     async fn test_relay_manager_config_default() {
         let config = RelayManagerConfig::default();
         assert_eq!(config.max_relays, 100);
-        assert_eq!(config.query_timeout_secs, 15);
-        assert_eq!(config.connection_poll_timeout_ms, 2000);
+        assert_eq!(config.query_timeout_secs, 10);
+        assert_eq!(config.connection_poll_timeout_ms, 3000);
         assert_eq!(config.connection_poll_interval_ms, 50);
     }
 

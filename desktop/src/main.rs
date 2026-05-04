@@ -2,7 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::Manager;
@@ -79,6 +79,71 @@ pub struct AppState {
     pub nip05_validator: Arc<std::sync::Mutex<Nip05Validator>>,
     /// Shared HTTP client used by command contracts.
     pub http_client: Arc<dyn HttpClient>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NetworkDiscoverySettings {
+    allow_insecure_public_ws: bool,
+}
+
+impl Default for NetworkDiscoverySettings {
+    fn default() -> Self {
+        Self {
+            allow_insecure_public_ws: false,
+        }
+    }
+}
+
+fn settings_file_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("arcadestr")
+        .join("settings.json")
+}
+
+fn load_network_discovery_settings() -> NetworkDiscoverySettings {
+    let path = settings_file_path();
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return NetworkDiscoverySettings::default(),
+    };
+
+    serde_json::from_str::<NetworkDiscoverySettings>(&content).unwrap_or_default()
+}
+
+fn save_network_discovery_settings(settings: &NetworkDiscoverySettings) -> Result<(), String> {
+    let path = settings_file_path();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Invalid settings file path".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create settings dir: {e}"))?;
+
+    let json = serde_json::to_string_pretty(settings)
+        .map_err(|e| format!("Failed to serialize settings: {e}"))?;
+    std::fs::write(path, json).map_err(|e| format!("Failed to write settings file: {e}"))
+}
+
+#[tauri::command]
+async fn get_network_discovery_settings() -> Result<NetworkDiscoverySettings, String> {
+    Ok(load_network_discovery_settings())
+}
+
+#[tauri::command]
+async fn set_allow_insecure_public_ws(
+    allow: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let mut settings = load_network_discovery_settings();
+    settings.allow_insecure_public_ws = allow;
+    save_network_discovery_settings(&settings)?;
+
+    let en_option = state.extended_network.read().await;
+    if let Some(ref repo) = *en_option {
+        let repo_guard = repo.lock().await;
+        repo_guard.set_allow_insecure_public_ws(allow);
+    }
+
+    Ok(())
 }
 
 fn listing_cache_key(listing: &GameListing) -> (String, String) {
@@ -392,9 +457,10 @@ async fn nip49_export(
 #[tauri::command]
 async fn verify_nip05(
     identifier: String,
+    expected_npub: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Nip05Status, String> {
-    command_contracts::verify_nip05(identifier, state.inner())
+    command_contracts::verify_nip05(identifier, expected_npub, state.inner())
         .await
         .map_err(|error| error.to_string())
 }
@@ -577,54 +643,55 @@ async fn fetch_marketplace_stream(
     let seen_signatures_for_closure = StdArc::clone(&seen_signatures);
     let relay_updates_for_closure = StdArc::clone(&relay_updates);
 
-    // Start streaming product fetch
-    let products = {
+    // Capture relay manager without holding the AppState nostr lock across awaits.
+    let relay_manager = {
         let nostr = state.nostr.lock().await;
-        let relay_manager = nostr.get_relay_manager();
-
-        // TODO(nip99-migration): stall enrichment pipeline removed
-        // NIP-99 listings are self-contained — no stall join needed
-        arcadestr_core::marketplace::fetch_nip99_listings_streaming(
-            relay_manager,
-            limit,
-            since_days,
-            move |product| {
-                let listing = GameListing::from_listing(product);
-                let key = listing_cache_key(&listing);
-                let signature = listing_signature(&listing);
-
-                let should_emit = {
-                    let mut known = seen_signatures_for_closure
-                        .lock()
-                        .expect("seen signatures mutex poisoned");
-                    match known.get(&key) {
-                        Some(existing) if existing == &signature => false,
-                        _ => {
-                            known.insert(key, signature);
-                            true
-                        }
-                    }
-                };
-
-                if !should_emit {
-                    return;
-                }
-
-                {
-                    let mut updates = relay_updates_for_closure
-                        .lock()
-                        .expect("relay updates mutex poisoned");
-                    updates.push(listing.clone());
-                }
-
-                // Emit product to frontend
-                if let Err(e) = window_for_closure.emit("marketplace-product", &listing) {
-                    tracing::debug!("Failed to emit marketplace-product: {}", e);
-                }
-            },
-        )
-        .await
+        nostr.relay_manager()
     };
+
+    // Start streaming product fetch.
+    // IMPORTANT: this await should not hold state.nostr lock, otherwise other commands
+    // (e.g. get_connected_relays for topbar relay badge) can be blocked behind marketplace fetch.
+    let products = arcadestr_core::marketplace::fetch_nip99_listings_streaming(
+        &relay_manager,
+        limit,
+        since_days,
+        move |product| {
+            let listing = GameListing::from_listing(product);
+            let key = listing_cache_key(&listing);
+            let signature = listing_signature(&listing);
+
+            let should_emit = {
+                let mut known = seen_signatures_for_closure
+                    .lock()
+                    .expect("seen signatures mutex poisoned");
+                match known.get(&key) {
+                    Some(existing) if existing == &signature => false,
+                    _ => {
+                        known.insert(key, signature);
+                        true
+                    }
+                }
+            };
+
+            if !should_emit {
+                return;
+            }
+
+            {
+                let mut updates = relay_updates_for_closure
+                    .lock()
+                    .expect("relay updates mutex poisoned");
+                updates.push(listing.clone());
+            }
+
+            // Emit product to frontend
+            if let Err(e) = window_for_closure.emit("marketplace-product", &listing) {
+                tracing::debug!("Failed to emit marketplace-product: {}", e);
+            }
+        },
+    )
+    .await;
 
     match products {
         Ok(count) => {
@@ -759,9 +826,9 @@ fn main() {
             // Initialize NostrClient with relay manager
             let relay_config = arcadestr_core::relay_manager::RelayManagerConfig {
                 max_relays: 100,
-                query_timeout_secs: 8,
-                connection_poll_timeout_ms: 5000,
-                connection_poll_interval_ms: 100,
+                query_timeout_secs: 10,
+                connection_poll_timeout_ms: 3000,
+                connection_poll_interval_ms: 50,
             };
 
             let client = match NostrClient::new_with_cache(
@@ -1288,8 +1355,9 @@ fn main() {
             // Connect to all added relays
             nostr_client.connect().await;
 
-            // Give time for connections to establish
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            tracing::info!(
+                "Skipping blocking relay readiness wait before follow list fetch (startup fast path)"
+            );
         }
 
         // Step 2: Now fetch the user's follow list (should be on their relays)
@@ -1558,6 +1626,8 @@ fn main() {
         {
             let mut repo = extended_network.lock().await;
             repo.set_pubkey(user_npub.to_string());
+            let settings = load_network_discovery_settings();
+            repo.set_allow_insecure_public_ws(settings.allow_insecure_public_ws);
         }
 
         // Store in app state using interior mutability
@@ -2119,9 +2189,9 @@ fn main() {
                                     }
                                 }
 
-                                // Wait a moment for relays to connect before fetching follows
-                                info!("Waiting for relays to connect before fetching follow list...");
-                                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                                info!(
+                                    "Skipping blocking relay readiness wait before follow list fetch (restore fast path)"
+                                );
 
                                 // Fetch follows list
                                 let nostr_client = nostr_for_restore.lock().await;
@@ -2173,6 +2243,10 @@ fn main() {
                                     {
                                         let mut repo = extended_network.lock().await;
                                         repo.set_pubkey(user_npub.to_string());
+                                        let settings = load_network_discovery_settings();
+                                        repo.set_allow_insecure_public_ws(
+                                            settings.allow_insecure_public_ws,
+                                        );
                                     }
 
                                     // Store in app state using interior mutability
@@ -2368,6 +2442,8 @@ fn main() {
             connect_saved_user,
             get_connected_relay_count,
             get_connected_relays,
+            get_network_discovery_settings,
+            set_allow_insecure_public_ws,
             get_extended_network_stats,
             get_relay_hints_for_pubkey,
             fetch_and_save_user_profile,

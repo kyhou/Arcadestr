@@ -3,8 +3,9 @@
 // Uses async streaming approach - relays are connected incrementally as they're discovered
 
 use crate::nostr::{parse_relay_list_from_event, NostrClient, KIND_FOLLOW_LIST, KIND_RELAY_LIST};
-use crate::relay_cache::{CachedRelayList, RelayCache};
+use crate::relay_cache::RelayCache;
 use crate::social_graph::SocialGraphDb;
+use futures::stream::{FuturesUnordered, StreamExt};
 use nostr_sdk::{Event, Filter, Kind};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -39,11 +40,17 @@ const CACHE_TTL_HOURS: u64 = 24;
 /// Discovery timeout: 30 seconds
 const DISCOVERY_TIMEOUT_SECS: u64 = 30;
 
-/// Follow list fetch timeout: 15 seconds (increased for better coverage)
-const FOLLOW_LIST_TIMEOUT_SECS: u64 = 15;
+/// Follow list fetch timeout: 10 seconds (conservative faster path)
+const FOLLOW_LIST_TIMEOUT_SECS: u64 = 10;
 
-/// Relay list fetch timeout: 15 seconds
-const RELAY_LIST_TIMEOUT_SECS: u64 = 15;
+/// Max first-degree authors queried per follow-list batch
+const FOLLOW_LIST_AUTHORS_PER_BATCH: usize = 20;
+
+/// Maximum concurrent follow-list batch requests.
+const MAX_CONCURRENT_FOLLOW_LIST_BATCHES: usize = 3;
+
+/// Relay list fetch timeout: 10 seconds (conservative faster path)
+const RELAY_LIST_TIMEOUT_SECS: u64 = 10;
 
 /// Extended network discovery state
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +110,7 @@ pub struct ExtendedNetworkRepository {
     discovery_state: Arc<Mutex<DiscoveryState>>,
     cached_network: Arc<Mutex<Option<ExtendedNetworkCache>>>,
     discovery_in_progress: Arc<Mutex<bool>>,
+    allow_insecure_public_ws: Arc<Mutex<bool>>,
 }
 
 impl ExtendedNetworkRepository {
@@ -113,6 +121,7 @@ impl ExtendedNetworkRepository {
             discovery_state: Arc::new(Mutex::new(DiscoveryState::Idle)),
             cached_network: Arc::new(Mutex::new(None)),
             discovery_in_progress: Arc::new(Mutex::new(false)),
+            allow_insecure_public_ws: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -137,6 +146,20 @@ impl ExtendedNetworkRepository {
             .lock()
             .expect("discovery_in_progress mutex poisoned") = false;
         Ok(())
+    }
+
+    pub fn set_allow_insecure_public_ws(&self, allow: bool) {
+        *self
+            .allow_insecure_public_ws
+            .lock()
+            .expect("allow_insecure_public_ws mutex poisoned") = allow;
+    }
+
+    pub fn get_allow_insecure_public_ws(&self) -> bool {
+        *self
+            .allow_insecure_public_ws
+            .lock()
+            .expect("allow_insecure_public_ws mutex poisoned")
     }
 
     pub fn get_state(&self) -> DiscoveryState {
@@ -228,6 +251,7 @@ impl ExtendedNetworkRepository {
 
         let first_degree_set: HashSet<String> = first_degree_follows.iter().cloned().collect();
         let total_first = first_degree_follows.len();
+        let allow_insecure_public_ws = self.get_allow_insecure_public_ws();
 
         info!(
             "Starting streaming extended network discovery with {} first-degree follows",
@@ -267,7 +291,7 @@ impl ExtendedNetworkRepository {
 
         match timeout(
             timeout_duration,
-            nostr_client.fetch_from_indexers_then_all(relay_list_filter),
+            nostr_client.fetch_from_connected_best_effort(relay_list_filter),
         )
         .await
         {
@@ -281,15 +305,26 @@ impl ExtendedNetworkRepository {
 
                         // Connect to this user's write relays (max 3 per user)
                         for relay_url in relay_list.write_relays.iter().take(3) {
-                            if unique_relays.insert(relay_url.clone()) {
-                                match nostr_client.add_relay(relay_url).await {
-                                    Ok(true) => {
-                                        debug!("Connected to user relay: {}", relay_url);
-                                        connected_relays += 1;
+                            if let Some(normalized_relay) = Self::normalize_and_admit_relay_url(
+                                relay_url,
+                                allow_insecure_public_ws,
+                            ) {
+                                if unique_relays.insert(normalized_relay.clone()) {
+                                    match nostr_client.add_relay(&normalized_relay).await {
+                                        Ok(true) => {
+                                            debug!("Connected to user relay: {}", normalized_relay);
+                                            connected_relays += 1;
+                                        }
+                                        Ok(false) => {
+                                            debug!("Relay already exists: {}", normalized_relay)
+                                        }
+                                        Err(e) => {
+                                            debug!("Failed to add relay {}: {}", normalized_relay, e)
+                                        }
                                     }
-                                    Ok(false) => debug!("Relay already exists: {}", relay_url),
-                                    Err(e) => debug!("Failed to add relay {}: {}", relay_url, e),
                                 }
+                            } else {
+                                debug!("Skipping relay not admitted by policy: {}", relay_url);
                             }
                         }
                     }
@@ -307,47 +342,109 @@ impl ExtendedNetworkRepository {
         // Step 2: Fetch follow lists from all connected relays
         info!("Step 2: Fetching follow lists from all connected relays...");
 
-        let follow_list_filter = Filter::new()
-            .kind(Kind::Custom(KIND_FOLLOW_LIST))
-            .authors(authors);
-
         let mut follow_lists: HashMap<String, Event> = HashMap::new();
         let timeout_duration = Duration::from_secs(FOLLOW_LIST_TIMEOUT_SECS);
 
-        match timeout(
-            timeout_duration,
-            nostr_client.fetch_from_indexers_then_all(follow_list_filter),
-        )
-        .await
-        {
-            Ok(Ok(events)) => {
-                for event in events {
-                    follow_lists.insert(event.pubkey.to_hex(), event);
+        let author_batches: Vec<Vec<nostr_sdk::PublicKey>> = authors
+            .chunks(FOLLOW_LIST_AUTHORS_PER_BATCH)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        let total_batches = author_batches.len();
 
-                    // Update progress
-                    let fetched = follow_lists.len();
-                    let coverage_percent = ((fetched * 100) / total_first) as u8;
+        info!(
+            "Fetching follow lists in {} batch(es) ({} authors per batch)",
+            total_batches,
+            FOLLOW_LIST_AUTHORS_PER_BATCH
+        );
 
-                    let mut state = self
-                        .discovery_state
-                        .lock()
-                        .expect("discovery_state mutex poisoned");
-                    *state = DiscoveryState::FetchingFollowLists {
-                        fetched,
-                        total: total_first,
-                        coverage_percent,
-                    };
+        let mut pending_batches = author_batches.into_iter().enumerate();
+        let mut in_flight = FuturesUnordered::new();
 
-                    if fetched % 10 == 0 || fetched == total_first {
-                        info!(
-                            "Follow list progress: {}/{} ({}%)",
-                            fetched, total_first, coverage_percent
-                        );
+        for _ in 0..MAX_CONCURRENT_FOLLOW_LIST_BATCHES {
+            if let Some((batch_idx, author_batch)) = pending_batches.next() {
+                let follow_list_filter = Filter::new()
+                    .kind(Kind::Custom(KIND_FOLLOW_LIST))
+                    .authors(author_batch);
+
+                in_flight.push(Self::fetch_follow_list_batch(
+                    nostr_client,
+                    timeout_duration,
+                    batch_idx,
+                    follow_list_filter,
+                ));
+            }
+        }
+
+        while let Some((batch_idx, fetch_result)) = in_flight.next().await {
+            match fetch_result {
+                Ok(Ok(events)) => {
+                    debug!(
+                        "Follow-list batch {}/{}: {} events",
+                        batch_idx + 1,
+                        total_batches,
+                        events.len()
+                    );
+
+                    for event in events {
+                        let author = event.pubkey.to_hex();
+                        match follow_lists.get(&author) {
+                            Some(existing) => {
+                                if Self::should_replace_follow_list(existing, &event) {
+                                    follow_lists.insert(author, event);
+                                }
+                            }
+                            None => {
+                                follow_lists.insert(author, event);
+                            }
+                        }
+
+                        // Update progress from unique authors fetched so far.
+                        let fetched = follow_lists.len();
+                        let coverage_percent = ((fetched * 100) / total_first) as u8;
+
+                        let mut state = self
+                            .discovery_state
+                            .lock()
+                            .expect("discovery_state mutex poisoned");
+                        *state = DiscoveryState::FetchingFollowLists {
+                            fetched,
+                            total: total_first,
+                            coverage_percent,
+                        };
+
+                        if fetched % 10 == 0 || fetched == total_first {
+                            info!(
+                                "Follow list progress: {}/{} ({}%)",
+                                fetched, total_first, coverage_percent
+                            );
+                        }
                     }
                 }
+                Ok(Err(e)) => warn!(
+                    "Error fetching follow lists in batch {}/{}: {}",
+                    batch_idx + 1,
+                    total_batches,
+                    e
+                ),
+                Err(_) => warn!(
+                    "Timeout fetching follow lists in batch {}/{}",
+                    batch_idx + 1,
+                    total_batches
+                ),
             }
-            Ok(Err(e)) => warn!("Error fetching follow lists: {}", e),
-            Err(_) => warn!("Timeout fetching follow lists"),
+
+            if let Some((next_batch_idx, next_author_batch)) = pending_batches.next() {
+                let follow_list_filter = Filter::new()
+                    .kind(Kind::Custom(KIND_FOLLOW_LIST))
+                    .authors(next_author_batch);
+
+                in_flight.push(Self::fetch_follow_list_batch(
+                    nostr_client,
+                    timeout_duration,
+                    next_batch_idx,
+                    follow_list_filter,
+                ));
+            }
         }
 
         info!(
@@ -359,7 +456,12 @@ impl ExtendedNetworkRepository {
 
         // Build social graph from fetched follow lists
         let (second_degree_counts, relay_hints) = self
-            .build_social_graph(&follow_lists, &my_pubkey, &first_degree_set)
+            .build_social_graph(
+                &follow_lists,
+                &my_pubkey,
+                &first_degree_set,
+                allow_insecure_public_ws,
+            )
             .await?;
 
         info!(
@@ -471,6 +573,7 @@ impl ExtendedNetworkRepository {
         follow_lists: &HashMap<String, Event>,
         my_pubkey: &str,
         first_degree_set: &HashSet<String>,
+        allow_insecure_public_ws: bool,
     ) -> Result<(HashMap<String, usize>, HashMap<String, Vec<String>>), ExtendedNetworkError> {
         let mut second_degree_counts: HashMap<String, usize> = HashMap::new();
         let mut relay_hints: HashMap<String, Vec<String>> = HashMap::new();
@@ -500,11 +603,13 @@ impl ExtendedNetworkRepository {
                         // Extract relay hint from p-tag if present
                         if tag_vec.len() >= 3 {
                             let hint = &tag_vec[2];
-                            if hint.starts_with("ws://") || hint.starts_with("wss://") {
+                            if let Some(normalized_hint) =
+                                Self::normalize_and_admit_relay_url(hint, allow_insecure_public_ws)
+                            {
                                 relay_hints
                                     .entry(target_pubkey.clone())
                                     .or_default()
-                                    .push(hint.clone());
+                                    .push(normalized_hint);
                             }
                         }
                     }
@@ -545,6 +650,37 @@ impl ExtendedNetworkRepository {
         };
 
         Ok((second_degree_counts, relay_hints))
+    }
+
+    async fn fetch_follow_list_batch(
+        nostr_client: &NostrClient,
+        timeout_duration: Duration,
+        batch_idx: usize,
+        follow_list_filter: Filter,
+    ) -> (
+        usize,
+        Result<Result<Vec<Event>, crate::nostr::NostrError>, tokio::time::error::Elapsed>,
+    ) {
+        (
+            batch_idx,
+            timeout(
+                timeout_duration,
+                nostr_client.fetch_from_connected_best_effort(follow_list_filter),
+            )
+            .await,
+        )
+    }
+
+    fn should_replace_follow_list(existing: &Event, candidate: &Event) -> bool {
+        let existing_ts = existing.created_at.as_secs();
+        let candidate_ts = candidate.created_at.as_secs();
+
+        if candidate_ts != existing_ts {
+            return candidate_ts > existing_ts;
+        }
+
+        // Deterministic tie-breaker for equal timestamps.
+        candidate.id.to_hex() > existing.id.to_hex()
     }
 
     async fn fetch_relay_lists_for_pubkeys(
@@ -589,7 +725,7 @@ impl ExtendedNetworkRepository {
 
             match timeout(
                 timeout_duration,
-                nostr_client.fetch_from_indexers_then_all(filter),
+                nostr_client.fetch_from_connected_best_effort(filter),
             )
             .await
             {
@@ -629,6 +765,7 @@ impl ExtendedNetworkRepository {
         relay_hints: &HashMap<String, Vec<String>>,
         relay_cache: &RelayCache,
     ) -> Vec<String> {
+        let allow_insecure_public_ws = self.get_allow_insecure_public_ws();
         let mut relay_to_authors: HashMap<String, HashSet<String>> = HashMap::new();
         let mut from_relay_lists = 0usize;
         let mut from_hints = 0usize;
@@ -639,19 +776,27 @@ impl ExtendedNetworkRepository {
                 // From NIP-65 relay list
                 from_relay_lists += 1;
                 for relay in &cached.write_relays {
-                    relay_to_authors
-                        .entry(relay.clone())
-                        .or_default()
-                        .insert(pubkey.clone());
+                    if let Some(normalized_relay) =
+                        Self::normalize_and_admit_relay_url(relay, allow_insecure_public_ws)
+                    {
+                        relay_to_authors
+                            .entry(normalized_relay)
+                            .or_default()
+                            .insert(pubkey.clone());
+                    }
                 }
             } else if let Some(hints) = relay_hints.get(pubkey) {
                 // From relay hints
                 from_hints += 1;
                 for hint in hints {
-                    relay_to_authors
-                        .entry(hint.clone())
-                        .or_default()
-                        .insert(pubkey.clone());
+                    if let Some(normalized_hint) =
+                        Self::normalize_and_admit_relay_url(hint, allow_insecure_public_ws)
+                    {
+                        relay_to_authors
+                            .entry(normalized_hint)
+                            .or_default()
+                            .insert(pubkey.clone());
+                    }
                 }
             }
         }
@@ -719,7 +864,7 @@ impl ExtendedNetworkRepository {
             selected.len(),
             covered_count,
             qualified.len(),
-            if qualified.len() > 0 {
+            if !qualified.is_empty() {
                 (covered_count * 100) / qualified.len()
             } else {
                 0
@@ -734,6 +879,92 @@ impl ExtendedNetworkRepository {
         );
 
         selected
+    }
+
+    fn normalize_and_admit_relay_url(url: &str, allow_insecure_public_ws: bool) -> Option<String> {
+        let normalized = Self::normalize_relay_url(url)?;
+        let is_ws = normalized.starts_with("ws://");
+        let host = Self::extract_relay_host(&normalized)?;
+
+        if !is_ws {
+            return Some(normalized);
+        }
+
+        if Self::is_local_or_private_host(&host) || allow_insecure_public_ws {
+            return Some(normalized);
+        }
+
+        None
+    }
+
+    fn normalize_relay_url(url: &str) -> Option<String> {
+        let trimmed = url.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let lowered = trimmed.to_ascii_lowercase();
+        if lowered.starts_with("ws://") || lowered.starts_with("wss://") {
+            return Some(lowered);
+        }
+
+        None
+    }
+
+    fn extract_relay_host(normalized_url: &str) -> Option<String> {
+        let rest = normalized_url
+            .strip_prefix("wss://")
+            .or_else(|| normalized_url.strip_prefix("ws://"))?;
+
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let authority = &rest[..authority_end];
+        if authority.is_empty() {
+            return None;
+        }
+
+        if let Some(stripped) = authority.strip_prefix('[') {
+            let end = stripped.find(']')?;
+            return Some(stripped[..end].to_string());
+        }
+
+        Some(authority.split(':').next().unwrap_or_default().to_string())
+    }
+
+    fn is_local_or_private_host(host: &str) -> bool {
+        if host == "localhost" || host == "::1" || host == "127.0.0.1" || host == "0.0.0.0" {
+            return true;
+        }
+
+        if host.ends_with(".local") {
+            return true;
+        }
+
+        Self::is_private_ipv4(host)
+    }
+
+    fn is_private_ipv4(host: &str) -> bool {
+        let parts: Vec<&str> = host.split('.').collect();
+        if parts.len() != 4 {
+            return false;
+        }
+
+        let octets: Vec<u8> = parts
+            .iter()
+            .filter_map(|part| part.parse::<u8>().ok())
+            .collect();
+
+        if octets.len() != 4 {
+            return false;
+        }
+
+        match octets.as_slice() {
+            [10, _, _, _] => true,
+            [127, _, _, _] => true,
+            [192, 168, _, _] => true,
+            [169, 254, _, _] => true,
+            [172, second, _, _] if (16..=31).contains(second) => true,
+            _ => false,
+        }
     }
 
     /// Get relay configurations for extended network (read-only)
@@ -836,5 +1067,43 @@ mod tests {
 
         assert_eq!(qualified.len(), 1);
         assert!(qualified.contains(&"pubkey_x".to_string()));
+    }
+
+    #[test]
+    fn test_relay_url_normalization_and_dedupe_shape() {
+        let a = ExtendedNetworkRepository::normalize_and_admit_relay_url(
+            "  WSS://Relay.Example.COM/  ",
+            false,
+        );
+        let b = ExtendedNetworkRepository::normalize_and_admit_relay_url(
+            "wss://relay.example.com",
+            false,
+        );
+
+        assert_eq!(a, Some("wss://relay.example.com".to_string()));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_public_ws_relay_policy_and_local_override() {
+        let public_ws = "ws://relay.example.com";
+        let local_ws = "ws://localhost:4848";
+
+        // Public insecure relay is blocked by default.
+        assert!(
+            ExtendedNetworkRepository::normalize_and_admit_relay_url(public_ws, false).is_none()
+        );
+
+        // Public insecure relay allowed when policy enabled.
+        assert_eq!(
+            ExtendedNetworkRepository::normalize_and_admit_relay_url(public_ws, true),
+            Some(public_ws.to_string())
+        );
+
+        // Local/dev insecure relay is always allowed.
+        assert_eq!(
+            ExtendedNetworkRepository::normalize_and_admit_relay_url(local_ws, false),
+            Some(local_ws.to_string())
+        );
     }
 }

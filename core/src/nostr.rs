@@ -1091,6 +1091,15 @@ impl NostrClient {
         tracing::debug!("connect() called - RelayManager handles connections automatically");
     }
 
+    /// Wait until relay pool has usable live connections.
+    pub async fn wait_for_connections(&self) -> Result<(), NostrError> {
+        let manager = self.relay_manager.lock().await;
+        manager
+            .wait_for_connections()
+            .await
+            .map_err(|e| NostrError::RelayError(format!("Failed waiting for connections: {}", e)))
+    }
+
     /// Get the inner nostr_sdk client for subscription management
     /// DEPRECATED: Use relay_manager instead
     pub fn inner(&self) -> Option<&Client> {
@@ -1136,6 +1145,24 @@ impl NostrClient {
         Ok(events.into_iter().collect())
     }
 
+    /// Fetch from currently connected relays without waiting for additional
+    /// connection readiness.
+    pub async fn fetch_from_connected_best_effort(
+        &self,
+        filter: Filter,
+    ) -> Result<Vec<Event>, NostrError> {
+        let events = {
+            let manager = self.relay_manager.lock().await;
+            manager
+                .fetch_events_best_effort_no_wait(filter)
+                .await
+                .map_err(|e| NostrError::RelayError(format!("Failed to fetch: {}", e)))?
+        };
+
+        tracing::info!("Best-effort query returned {} events", events.len());
+        Ok(events)
+    }
+
     /// Combined fetch for both profile metadata and relay list (kind 0 + 10002)
     /// Returns: (UserProfile, Option<CachedRelayList>)
     pub async fn fetch_user_metadata(
@@ -1177,11 +1204,11 @@ impl NostrClient {
             .author(pubkey)
             .limit(1);
 
-        // Query through relay manager (unified pool)
+        // Query through relay manager using best-effort streaming.
         let events = {
             let manager = self.relay_manager.lock().await;
             manager
-                .fetch_events(filter)
+                .fetch_events_best_effort(filter)
                 .await
                 .map_err(|e| NostrError::RelayError(format!("Failed to fetch relay list: {}", e)))?
         };
@@ -1212,12 +1239,31 @@ impl NostrClient {
             .author(pubkey)
             .limit(1);
 
-        // Query through relay manager (unified pool)
+        // Fast-path query: use currently connected relays first (non-blocking).
+        // If that yields nothing, fall back to readiness-waiting best-effort query.
         let events = {
             let manager = self.relay_manager.lock().await;
-            manager.fetch_events(filter).await.map_err(|e| {
-                NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
-            })?
+
+            match manager.fetch_events_best_effort_no_wait(filter.clone()).await {
+                Ok(events) if !events.is_empty() => events,
+                Ok(_) => {
+                    tracing::debug!(
+                        "Follow list fast-path returned no events; falling back to readiness-wait query"
+                    );
+                    manager.fetch_events_best_effort(filter).await.map_err(|e| {
+                        NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
+                    })?
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Follow list fast-path failed: {}. Falling back to readiness-wait query",
+                        e
+                    );
+                    manager.fetch_events_best_effort(filter).await.map_err(|e| {
+                        NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
+                    })?
+                }
+            }
         };
 
         tracing::info!("Follow list fetch returned {} events", events.len());
@@ -1459,7 +1505,7 @@ impl NostrClient {
 
         let events = {
             let manager = self.relay_manager.lock().await;
-            manager.fetch_events(filter).await.map_err(|e| {
+            manager.fetch_events_best_effort(filter).await.map_err(|e| {
                 NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
             })?
         };
