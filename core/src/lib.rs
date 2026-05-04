@@ -5,6 +5,9 @@ pub mod signers;
 
 // Auth and storage are native-only (require sqlx, encryption, etc.)
 #[cfg(feature = "native")]
+pub mod achievements;
+
+#[cfg(feature = "native")]
 pub mod auth;
 
 #[cfg(feature = "native")]

@@ -45,6 +45,91 @@ use http_mocks::MockHttpClient;
 use lightning_internal::{request_zap_invoice_with_http, ZapRequest};
 use nip46_mocks::MockNip46Relay;
 
+#[test]
+fn parse_valid_badge_definition_extracts_nip58_tags() {
+    let keys = Keys::generate();
+    let event = EventBuilder::new(Kind::Custom(30009), "")
+        .tags(vec![
+            nostr::Tag::custom(nostr::TagKind::d(), ["first_clear"]),
+            nostr::Tag::custom(nostr::TagKind::custom("name"), ["First Clear"]),
+            nostr::Tag::custom(
+                nostr::TagKind::custom("description"),
+                ["Finished a game once"],
+            ),
+            nostr::Tag::custom(
+                nostr::TagKind::custom("image"),
+                ["https://example.com/badge.png", "1024x1024"],
+            ),
+            nostr::Tag::custom(
+                nostr::TagKind::custom("thumb"),
+                ["https://example.com/badge-thumb.png", "256x256"],
+            ),
+        ])
+        .sign_with_keys(&keys)
+        .expect("test event signs");
+
+    let definition = arcadestr_core::achievements::parse_badge_definition(
+        &event,
+        Some("wss://relay.example.com".to_string()),
+    )
+    .expect("definition parses");
+
+    assert_eq!(definition.badge_id, "first_clear");
+    assert_eq!(definition.issuer_pubkey, keys.public_key().to_hex());
+    assert_eq!(
+        definition.coordinate,
+        format!("30009:{}:first_clear", keys.public_key().to_hex())
+    );
+    assert_eq!(definition.name.as_deref(), Some("First Clear"));
+    assert_eq!(definition.image_dimensions.as_deref(), Some("1024x1024"));
+}
+
+#[test]
+fn reject_badge_definition_without_non_empty_d_tag() {
+    let keys = Keys::generate();
+    let event = EventBuilder::new(Kind::Custom(30009), "")
+        .sign_with_keys(&keys)
+        .expect("test event signs");
+
+    let error = arcadestr_core::achievements::parse_badge_definition(&event, None)
+        .expect_err("missing d tag should fail");
+
+    assert!(error.to_string().contains("d tag"));
+}
+
+#[test]
+fn parse_profile_badges_requires_immediate_a_then_e_pairs() {
+    let owner = Keys::generate();
+    let event = EventBuilder::new(Kind::Custom(10008), "")
+        .tags(vec![
+            nostr::Tag::custom(nostr::TagKind::a(), ["30009:issuer:first"]),
+            nostr::Tag::custom(
+                nostr::TagKind::e(),
+                [
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "wss://relay.example.com",
+                ],
+            ),
+            nostr::Tag::custom(
+                nostr::TagKind::e(),
+                ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+            ),
+            nostr::Tag::custom(nostr::TagKind::a(), ["30009:issuer:orphan"]),
+        ])
+        .sign_with_keys(&owner)
+        .expect("test event signs");
+
+    let list = arcadestr_core::achievements::parse_profile_badge_list(
+        &event,
+        &owner.public_key().to_hex(),
+    )
+    .expect("profile list parses");
+
+    assert_eq!(list.entries.len(), 1);
+    assert_eq!(list.entries[0].badge_coordinate, "30009:issuer:first");
+    assert_eq!(list.entries[0].display_order, 0);
+}
+
 fn temp_db_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
