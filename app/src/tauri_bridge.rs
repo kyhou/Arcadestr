@@ -41,16 +41,22 @@ pub async fn invoke_nip49_export(
 
 /// Invoke desktop `verify_nip05` command.
 #[cfg(not(feature = "web"))]
-pub async fn invoke_verify_nip05(identifier: String) -> Result<Nip05Status, String> {
+pub async fn invoke_verify_nip05(
+    identifier: String,
+    expected_npub: String,
+) -> Result<Nip05Status, String> {
     crate::tauri_invoke::invoke(
         "verify_nip05",
-        serde_json::json!({ "identifier": identifier }),
+        serde_json::json!({ "identifier": identifier, "expectedNpub": expected_npub }),
     )
     .await
 }
 
 /// Web fallback for `verify_nip05`.
 #[cfg(feature = "web")]
-pub async fn invoke_verify_nip05(_identifier: String) -> Result<Nip05Status, String> {
+pub async fn invoke_verify_nip05(
+    _identifier: String,
+    _expected_npub: String,
+) -> Result<Nip05Status, String> {
     Err("verify_nip05 is only available in desktop builds".to_string())
 }
