@@ -43,6 +43,7 @@ pub(crate) fn debug_storefront_bypass_enabled() -> bool {
 pub mod components;
 pub mod models;
 pub mod qr;
+mod relay_state;
 pub mod store;
 pub mod ui_v2;
 
@@ -52,6 +53,7 @@ use crate::store::{
     try_use_profile_store, use_marketplace_store, use_profile_store, MarketplaceStore,
     ProfileStore,
 };
+use crate::relay_state::{apply_relay_event, merge_relay_snapshot};
 use crate::ui_v2::{views::LoginV2View, UiV2Root};
 
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
@@ -412,6 +414,44 @@ async fn invoke_get_connected_relays() -> Result<Vec<String>, String> {
 #[cfg(feature = "web")]
 async fn invoke_get_connected_relays() -> Result<Vec<String>, String> {
     Err("Tauri not available in web mode".to_string())
+}
+
+/// Invoke get_network_discovery_settings Tauri command and return
+/// allow_insecure_public_ws flag.
+#[cfg(not(feature = "web"))]
+async fn invoke_get_allow_insecure_public_ws() -> Result<bool, String> {
+    use crate::tauri_invoke::invoke;
+
+    #[derive(Deserialize)]
+    struct NetworkDiscoverySettingsResponse {
+        allow_insecure_public_ws: bool,
+    }
+
+    let settings: NetworkDiscoverySettingsResponse =
+        invoke("get_network_discovery_settings", serde_json::json!(null)).await?;
+    Ok(settings.allow_insecure_public_ws)
+}
+
+#[cfg(feature = "web")]
+async fn invoke_get_allow_insecure_public_ws() -> Result<bool, String> {
+    Ok(false)
+}
+
+/// Invoke set_allow_insecure_public_ws Tauri command.
+#[cfg(not(feature = "web"))]
+async fn invoke_set_allow_insecure_public_ws(allow: bool) -> Result<(), String> {
+    use crate::tauri_invoke::invoke_void;
+
+    invoke_void(
+        "set_allow_insecure_public_ws",
+        serde_json::json!({ "allow": allow }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+async fn invoke_set_allow_insecure_public_ws(_allow: bool) -> Result<(), String> {
+    Ok(())
 }
 
 /// Invoke fetch_and_save_user_profile Tauri command
@@ -4339,27 +4379,13 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
     let show_relay_dropdown = RwSignal::new(false);
     let connected_relays = RwSignal::new(Vec::<String>::new());
 
-    // Setup relay event listener and initial state (sequential: query first, then subscribe)
+    // Setup relay event listener and initial state.
+    // We subscribe first, then fetch a snapshot to recover any events emitted before UI listener setup.
     let connected_relays_for_spawn = connected_relays.clone();
     let relay_count_for_spawn = relay_count.clone();
 
     spawn_local(async move {
-        // FIRST: Query current relay state (blocks until complete)
-        match invoke_get_connected_relays().await {
-            Ok(initial_relays) => {
-                let count = initial_relays.len();
-                connected_relays_for_spawn.set(initial_relays);
-                relay_count_for_spawn.set(count);
-                web_sys::console::log_1(&format!("Loaded {} connected relays", count).into());
-            }
-            Err(e) => {
-                web_sys::console::error_1(
-                    &format!("Failed to get initial relay list: {}", e).into(),
-                );
-            }
-        }
-
-        // SECOND: Setup event listener for updates (Tauri v2 listen returns a Promise)
+        // Setup event listener for updates (Tauri v2 listen returns a Promise)
         let window = web_sys::window().expect("window should be available");
         let tauri = js_sys::Reflect::get(&window, &"__TAURI__".into())
             .expect("TAURI API should be available in Tauri app");
@@ -4408,61 +4434,29 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                 &format!("[RelayEvents] Processing {} event for {}", event_type, url).into(),
             );
 
-            match event_type.as_str() {
-                "connected" => {
-                    let url_clone = url.clone();
-                    connected_relays_for_closure.update(|relays| {
-                        if !relays.contains(&url_clone) {
-                            web_sys::console::log_1(
-                                &format!("[RelayEvents] Adding relay to list: {}", url_clone)
-                                    .into(),
-                            );
-                            relays.push(url_clone);
-                        } else {
-                            web_sys::console::log_1(
-                                &format!("[RelayEvents] Relay already in list: {}", url_clone)
-                                    .into(),
-                            );
-                        }
-                    });
-                    let new_count = connected_relays_for_closure.get_untracked().len();
-                    relay_count_for_closure.set(new_count);
-                    web_sys::console::log_1(
-                        &format!(
-                            "[RelayEvents] Relay connected: {} (total: {})",
-                            url, new_count
-                        )
-                        .into(),
-                    );
-                }
-                "disconnected" => {
-                    let url_clone = url.clone();
-                    connected_relays_for_closure.update(|relays| {
-                        let before_len = relays.len();
-                        relays.retain(|r| r != &url_clone);
-                        let after_len = relays.len();
-                        if before_len != after_len {
-                            web_sys::console::log_1(
-                                &format!("[RelayEvents] Removed relay from list: {}", url_clone)
-                                    .into(),
-                            );
-                        }
-                    });
-                    let new_count = connected_relays_for_closure.get_untracked().len();
-                    relay_count_for_closure.set(new_count);
-                    web_sys::console::log_1(
-                        &format!(
-                            "[RelayEvents] Relay disconnected: {} (total: {})",
-                            url, new_count
-                        )
-                        .into(),
-                    );
-                }
-                _ => {
-                    web_sys::console::log_1(
-                        &format!("[RelayEvents] Unknown event type: {}", event_type).into(),
-                    );
-                }
+            let mut changed = false;
+            connected_relays_for_closure.update(|relays| {
+                changed = apply_relay_event(relays, &event_type, &url);
+            });
+
+            if changed {
+                let new_count = connected_relays_for_closure.get_untracked().len();
+                relay_count_for_closure.set(new_count);
+                web_sys::console::log_1(
+                    &format!(
+                        "[RelayEvents] Relay {}: {} (total: {})",
+                        event_type, url, new_count
+                    )
+                    .into(),
+                );
+            } else {
+                web_sys::console::log_1(
+                    &format!(
+                        "[RelayEvents] Ignored duplicate/unknown event: {} {}",
+                        event_type, url
+                    )
+                    .into(),
+                );
             }
         }) as Box<dyn FnMut(JsValue)>);
 
@@ -4479,6 +4473,8 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
             &closure.as_ref().into(),
         );
 
+        let mut listener_registered = false;
+
         match listen_promise {
             Ok(promise) => {
                 web_sys::console::log_1(
@@ -4491,6 +4487,7 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                         web_sys::console::log_1(
                             &"[RelayEvents] Event listener registered successfully".into(),
                         );
+                        listener_registered = true;
                         // Store unlisten function if needed later
                         let _ = js_sys::Reflect::set(
                             &window,
@@ -4511,6 +4508,32 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
                     &format!("[RelayEvents] Failed to create listen promise: {:?}", e).into(),
                 );
             }
+        }
+
+        // Fetch snapshot after listener setup to recover any events emitted before subscribe.
+        // This keeps relay UI populated even when startup emits events early.
+        match invoke_get_connected_relays().await {
+            Ok(snapshot_relays) => {
+                connected_relays_for_spawn.update(|relays| {
+                    merge_relay_snapshot(relays, snapshot_relays);
+                });
+                let count = connected_relays_for_spawn.get_untracked().len();
+                relay_count_for_spawn.set(count);
+                web_sys::console::log_1(
+                    &format!("[RelayEvents] Loaded relay snapshot: {} relays", count).into(),
+                );
+            }
+            Err(e) => {
+                web_sys::console::error_1(
+                    &format!("[RelayEvents] Failed to load relay snapshot: {}", e).into(),
+                );
+            }
+        }
+
+        if !listener_registered {
+            web_sys::console::error_1(
+                &"[RelayEvents] Listener not registered; relying on snapshot only".into(),
+            );
         }
 
         closure.forget(); // Keep closure alive

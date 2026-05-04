@@ -1,17 +1,18 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::{closure::Closure, JsCast, JsValue};
-
 use crate::models::GameListing;
+use crate::relay_state::{apply_relay_event, merge_relay_snapshot};
 use crate::ui_v2::components::{NavItem, TopBar};
 use crate::ui_v2::theme::UI_V2_STYLES;
 use crate::ui_v2::views::{
     BrowseGamesView, GameDetailView, LibraryView, ProfileV2View, PublishV2View, SocialView,
     StoreFrontView,
 };
-use crate::{invoke_get_connected_relays, invoke_logout_nip46, AuthContext};
+use crate::{
+    invoke_get_allow_insecure_public_ws, invoke_get_connected_relays, invoke_logout_nip46,
+    invoke_set_allow_insecure_public_ws, AuthContext,
+};
 
 #[derive(Clone, PartialEq)]
 enum UiV2View {
@@ -30,71 +31,67 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let current_view = RwSignal::new(UiV2View::Store);
     let connected_relays = RwSignal::new(Vec::<String>::new());
+    let allow_insecure_public_ws = RwSignal::new(false);
+    let settings_error = RwSignal::new(None::<String>);
 
     Effect::new(move |_| {
         let connected_relays_for_effect = connected_relays.clone();
         let relay_count_for_effect = relay_count;
         spawn_local(async move {
-            if let Ok(relays) = invoke_get_connected_relays().await {
-                relay_count_for_effect.set(relays.len());
-                connected_relays_for_effect.set(relays);
+            // Subscribe first so early connection events are not missed.
+            #[cfg(not(feature = "web"))]
+            {
+                let relays_for_listener = connected_relays_for_effect.clone();
+                let relay_count_for_listener = relay_count_for_effect;
+
+                if let Err(err) = crate::tauri_invoke::listen("relay-connection", move |payload| {
+                    let event_type = payload
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    let url = payload
+                        .get("url")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+
+                    relays_for_listener.update(|relays| {
+                        let _ = apply_relay_event(relays, event_type, url);
+                    });
+                    relay_count_for_listener.set(relays_for_listener.get_untracked().len());
+                })
+                .await
+                {
+                    web_sys::console::error_1(
+                        &format!("[UiV2Root] Failed to subscribe relay listener: {}", err).into(),
+                    );
+                }
             }
 
-            #[cfg(target_arch = "wasm32")]
-            {
-                let window = web_sys::window().expect("window should be available");
-                if let Ok(tauri) = js_sys::Reflect::get(&window, &"__TAURI__".into()) {
-                    if let Ok(event_api) = js_sys::Reflect::get(&tauri, &"event".into()) {
-                        let relays_for_listener = connected_relays_for_effect.clone();
-                        let relay_count_for_listener = relay_count_for_effect;
-
-                        let closure = Closure::wrap(Box::new(move |event: JsValue| {
-                            let payload = match js_sys::Reflect::get(&event, &"payload".into()) {
-                                Ok(p) => p,
-                                Err(_) => return,
-                            };
-
-                            let event_type = js_sys::Reflect::get(&payload, &"type".into())
-                                .ok()
-                                .and_then(|v| v.as_string())
-                                .unwrap_or_default();
-                            let url = js_sys::Reflect::get(&payload, &"url".into())
-                                .ok()
-                                .and_then(|v| v.as_string())
-                                .unwrap_or_default();
-
-                            match event_type.as_str() {
-                                "connected" => {
-                                    relays_for_listener.update(|relays| {
-                                        if !relays.contains(&url) {
-                                            relays.push(url.clone());
-                                        }
-                                    });
-                                }
-                                "disconnected" => {
-                                    relays_for_listener.update(|relays| {
-                                        relays.retain(|relay| relay != &url);
-                                    });
-                                }
-                                _ => {}
-                            }
-
-                            relay_count_for_listener.set(relays_for_listener.get_untracked().len());
-                        })
-                            as Box<dyn FnMut(JsValue)>);
-
-                        if let Ok(listen) = js_sys::Reflect::get(&event_api, &"listen".into()) {
-                            if let Some(listen_fn) = listen.dyn_ref::<js_sys::Function>() {
-                                let _ = listen_fn.call2(
-                                    &event_api,
-                                    &"relay-connection".into(),
-                                    &closure.as_ref().into(),
-                                );
-                                closure.forget();
-                            }
-                        }
-                    }
+            // Snapshot after subscribe to recover early relays emitted before listener attach.
+            match invoke_get_connected_relays().await {
+                Ok(snapshot_relays) => {
+                    connected_relays_for_effect.update(|relays| {
+                        merge_relay_snapshot(relays, snapshot_relays);
+                    });
+                    relay_count_for_effect.set(connected_relays_for_effect.get_untracked().len());
                 }
+                Err(err) => {
+                    web_sys::console::error_1(
+                        &format!("[UiV2Root] Failed to load relay snapshot: {}", err).into(),
+                    );
+                }
+            }
+        });
+    });
+
+    Effect::new(move |_| {
+        let allow_flag = allow_insecure_public_ws;
+        let settings_error_signal = settings_error;
+
+        spawn_local(async move {
+            match invoke_get_allow_insecure_public_ws().await {
+                Ok(value) => allow_flag.set(value),
+                Err(err) => settings_error_signal.set(Some(err)),
             }
         });
     });
@@ -311,9 +308,52 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         UiV2View::Settings => {
                             view! {
                                 <section class="max-w-[1600px] mx-auto p-8">
-                                    <div class="bg-surface-container-high rounded-xl p-6">
-                                        <h2 class="font-headline text-3xl font-bold tracking-tight">"Settings"</h2>
-                                        <p class="text-on-surface-variant mt-2">"Account preferences and client options will land in the next parity pass."</p>
+                                    <div class="bg-surface-container-high rounded-xl p-6 space-y-6">
+                                        <div>
+                                            <h2 class="font-headline text-3xl font-bold tracking-tight">"Settings"</h2>
+                                            <p class="text-on-surface-variant mt-2">"Configure client behavior and relay discovery policies."</p>
+                                        </div>
+
+                                        <div class="border border-outline-variant/20 rounded-lg p-4 space-y-4">
+                                            <h3 class="font-semibold text-lg">"Advanced"</h3>
+
+                                            <label class="flex items-start justify-between gap-4 cursor-pointer">
+                                                <div>
+                                                    <p class="font-medium">"Allow insecure public ws:// relays"</p>
+                                                    <p class="text-sm text-on-surface-variant mt-1">
+                                                        "Keep OFF for safety. Local/dev ws:// relays are always allowed."
+                                                    </p>
+                                                </div>
+                                                <input
+                                                    type="checkbox"
+                                                    prop:checked=move || allow_insecure_public_ws.get()
+                                                    on:change=move |ev| {
+                                                        let next = event_target_checked(&ev);
+                                                        allow_insecure_public_ws.set(next);
+                                                        settings_error.set(None);
+
+                                                        spawn_local(async move {
+                                                            if let Err(err) = invoke_set_allow_insecure_public_ws(next).await {
+                                                                settings_error.set(Some(err));
+                                                                allow_insecure_public_ws.set(!next);
+                                                            }
+                                                        });
+                                                    }
+                                                />
+                                            </label>
+
+                                            {move || {
+                                                settings_error
+                                                    .get()
+                                                    .map(|err| {
+                                                        view! {
+                                                            <p class="text-sm text-red-400">{format!("Failed to save setting: {err}")}</p>
+                                                        }
+                                                            .into_any()
+                                                    })
+                                                    .unwrap_or_else(|| view! { <></> }.into_any())
+                                            }}
+                                        </div>
                                     </div>
                                 </section>
                             }
