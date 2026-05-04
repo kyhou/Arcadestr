@@ -81,6 +81,8 @@ pub enum AchievementError {
     MissingAwardRecipient,
     #[error("profile badge event pubkey does not match profile owner")]
     ProfileOwnerMismatch,
+    #[error("profile badge event must be kind 10008 or deprecated kind 30008")]
+    InvalidProfileBadgeKind,
     #[error("award issuer does not match definition issuer")]
     IssuerMismatch,
     #[error("relay error: {0}")]
@@ -139,9 +141,7 @@ pub fn parse_profile_badge_list(
             return Err(AchievementError::MissingDefinitionDTag);
         }
     } else if kind != KIND_PROFILE_BADGES_CURRENT {
-        return Err(AchievementError::Storage(
-            "profile badge event must be kind 10008 or deprecated kind 30008".to_string(),
-        ));
+        return Err(AchievementError::InvalidProfileBadgeKind);
     }
 
     Ok(ProfileBadgeList {
@@ -170,12 +170,15 @@ fn parse_profile_badge_entries(event: &nostr::Event) -> Vec<ProfileBadgeSelectio
             if let (Some(badge_coordinate), Some(award_event_id)) =
                 (tag_content(current), tag_content(next))
             {
-                entries.push(ProfileBadgeSelection {
-                    badge_coordinate: badge_coordinate.to_string(),
-                    award_event_id: award_event_id.to_string(),
-                    relay_url: next.get(2).filter(|value| !value.is_empty()).cloned(),
-                    display_order: entries.len(),
-                });
+                if is_valid_badge_coordinate(badge_coordinate) && is_valid_event_id(award_event_id)
+                {
+                    entries.push(ProfileBadgeSelection {
+                        badge_coordinate: badge_coordinate.to_string(),
+                        award_event_id: award_event_id.to_string(),
+                        relay_url: next.get(2).filter(|value| !value.is_empty()).cloned(),
+                        display_order: entries.len(),
+                    });
+                }
             }
             index += 2;
         } else {
@@ -184,6 +187,20 @@ fn parse_profile_badge_entries(event: &nostr::Event) -> Vec<ProfileBadgeSelectio
     }
 
     entries
+}
+
+fn is_valid_badge_coordinate(value: &str) -> bool {
+    let mut parts = value.splitn(3, ':');
+
+    matches!(parts.next(), Some("30009"))
+        && parts
+            .next()
+            .is_some_and(|pubkey| nostr::PublicKey::from_hex(pubkey).is_ok())
+        && parts.next().is_some_and(|badge_id| !badge_id.is_empty())
+}
+
+fn is_valid_event_id(value: &str) -> bool {
+    nostr::EventId::from_hex(value).is_ok()
 }
 
 fn first_tag_value(event: &nostr::Event, name: &str) -> Option<String> {

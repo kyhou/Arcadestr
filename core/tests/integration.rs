@@ -100,9 +100,11 @@ fn reject_badge_definition_without_non_empty_d_tag() {
 #[test]
 fn parse_profile_badges_requires_immediate_a_then_e_pairs() {
     let owner = Keys::generate();
+    let issuer = Keys::generate();
+    let badge_coordinate = format!("30009:{}:first", issuer.public_key().to_hex());
     let event = EventBuilder::new(Kind::Custom(10008), "")
         .tags(vec![
-            nostr::Tag::custom(nostr::TagKind::a(), ["30009:issuer:first"]),
+            nostr::Tag::custom(nostr::TagKind::a(), [badge_coordinate.as_str()]),
             nostr::Tag::custom(
                 nostr::TagKind::e(),
                 [
@@ -126,8 +128,68 @@ fn parse_profile_badges_requires_immediate_a_then_e_pairs() {
     .expect("profile list parses");
 
     assert_eq!(list.entries.len(), 1);
-    assert_eq!(list.entries[0].badge_coordinate, "30009:issuer:first");
+    assert_eq!(list.entries[0].badge_coordinate, badge_coordinate);
     assert_eq!(list.entries[0].display_order, 0);
+}
+
+#[test]
+fn malformed_profile_badge_pairs_are_skipped() {
+    let owner = Keys::generate();
+    let issuer = Keys::generate();
+    let valid_coordinate = format!("30009:{}:first", issuer.public_key().to_hex());
+    let valid_event_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let event = EventBuilder::new(Kind::Custom(10008), "")
+        .tags(vec![
+            nostr::Tag::custom(nostr::TagKind::a(), ["30009:not-a-pubkey:bad"]),
+            nostr::Tag::custom(nostr::TagKind::e(), [valid_event_id]),
+            nostr::Tag::custom(nostr::TagKind::a(), [valid_coordinate.as_str()]),
+            nostr::Tag::custom(nostr::TagKind::e(), ["not-an-event-id"]),
+            nostr::Tag::custom(nostr::TagKind::a(), ["30009::empty_issuer"]),
+            nostr::Tag::custom(nostr::TagKind::e(), [valid_event_id]),
+            nostr::Tag::custom(nostr::TagKind::a(), ["30009:too:few"]),
+            nostr::Tag::custom(nostr::TagKind::e(), [valid_event_id]),
+            nostr::Tag::custom(nostr::TagKind::a(), [valid_coordinate.as_str()]),
+            nostr::Tag::custom(
+                nostr::TagKind::e(),
+                [valid_event_id, "wss://relay.example.com"],
+            ),
+        ])
+        .sign_with_keys(&owner)
+        .expect("test event signs");
+
+    let list = arcadestr_core::achievements::parse_profile_badge_list(
+        &event,
+        &owner.public_key().to_hex(),
+    )
+    .expect("profile list parses with malformed pairs skipped");
+
+    assert_eq!(list.entries.len(), 1);
+    assert_eq!(list.entries[0].badge_coordinate, valid_coordinate);
+    assert_eq!(list.entries[0].award_event_id, valid_event_id);
+    assert_eq!(
+        list.entries[0].relay_url.as_deref(),
+        Some("wss://relay.example.com")
+    );
+    assert_eq!(list.entries[0].display_order, 0);
+}
+
+#[test]
+fn invalid_profile_badge_kind_returns_explicit_error() {
+    let owner = Keys::generate();
+    let event = EventBuilder::new(Kind::Custom(30009), "")
+        .sign_with_keys(&owner)
+        .expect("test event signs");
+
+    let error = arcadestr_core::achievements::parse_profile_badge_list(
+        &event,
+        &owner.public_key().to_hex(),
+    )
+    .expect_err("wrong profile badge kind should fail");
+
+    assert!(matches!(
+        error,
+        arcadestr_core::achievements::AchievementError::InvalidProfileBadgeKind
+    ));
 }
 
 fn temp_db_path(name: &str) -> PathBuf {
