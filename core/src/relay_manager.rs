@@ -286,8 +286,8 @@ impl RelayManager {
         &self,
         filter: Filter,
     ) -> Result<Vec<Event>, RelayManagerError> {
-
-        let collected: Arc<std::sync::Mutex<Vec<Event>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected: Arc<std::sync::Mutex<Vec<Event>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&collected);
 
         let _ = self
@@ -296,9 +296,7 @@ impl RelayManager {
                 self.config.query_timeout_secs,
                 3,
                 move |_relay_url, events| {
-                    let mut guard = sink
-                        .lock()
-                        .expect("best_effort_events mutex poisoned");
+                    let mut guard = sink.lock().expect("best_effort_events mutex poisoned");
                     guard.extend(events);
                 },
             )

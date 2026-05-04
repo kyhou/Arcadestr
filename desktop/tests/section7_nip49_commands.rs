@@ -1,8 +1,6 @@
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::http_client::{HttpClient, HttpClientError, ReqwestHttpClient};
-use arcadestr_core::storage::{
-    encrypt_private_key_nip49, serialize_ncryptsec, ScryptParams,
-};
+use arcadestr_core::storage::{encrypt_private_key_nip49, serialize_ncryptsec, ScryptParams};
 use async_trait::async_trait;
 use nostr::Keys;
 use serde_json::{json, Value};
@@ -138,7 +136,10 @@ async fn test_import_encrypted_key_wrong_password_returns_decryption_error() {
     .await
     .expect_err("import should fail with wrong password");
 
-    assert!(matches!(error, command_contracts::CommandError::Decryption(_)));
+    assert!(matches!(
+        error,
+        command_contracts::CommandError::Decryption(_)
+    ));
 }
 
 #[tokio::test]
@@ -161,7 +162,8 @@ async fn test_export_encrypted_key_without_authenticated_key_returns_no_active_k
 #[tokio::test]
 async fn test_verify_nip05_identity_success() {
     let expected_pubkey = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let mock_http = StaticNoRedirectHttpClient::success_nip05("example.com", "alice", expected_pubkey);
+    let mock_http =
+        StaticNoRedirectHttpClient::success_nip05("example.com", "alice", expected_pubkey);
     let state = create_test_state_with_http(None, Arc::new(mock_http));
 
     let result = command_contracts::verify_nip05_identity(

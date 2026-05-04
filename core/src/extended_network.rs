@@ -319,7 +319,10 @@ impl ExtendedNetworkRepository {
                                             debug!("Relay already exists: {}", normalized_relay)
                                         }
                                         Err(e) => {
-                                            debug!("Failed to add relay {}: {}", normalized_relay, e)
+                                            debug!(
+                                                "Failed to add relay {}: {}",
+                                                normalized_relay, e
+                                            )
                                         }
                                     }
                                 }
@@ -353,8 +356,7 @@ impl ExtendedNetworkRepository {
 
         info!(
             "Fetching follow lists in {} batch(es) ({} authors per batch)",
-            total_batches,
-            FOLLOW_LIST_AUTHORS_PER_BATCH
+            total_batches, FOLLOW_LIST_AUTHORS_PER_BATCH
         );
 
         let mut pending_batches = author_batches.into_iter().enumerate();

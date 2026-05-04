@@ -303,15 +303,14 @@ pub async fn verify_nip05(
     expected_npub: String,
     state: &crate::AppState,
 ) -> Result<Nip05Status, CommandError> {
-    let expected_pubkey = if expected_npub.starts_with("npub1")
-        || expected_npub.starts_with("nprofile1")
-    {
-        parse_nip19_identifier(&expected_npub)
-            .map_err(|error| CommandError::InvalidInput(error.to_string()))?
-            .pubkey
-    } else {
-        expected_npub
-    };
+    let expected_pubkey =
+        if expected_npub.starts_with("npub1") || expected_npub.starts_with("nprofile1") {
+            parse_nip19_identifier(&expected_npub)
+                .map_err(|error| CommandError::InvalidInput(error.to_string()))?
+                .pubkey
+        } else {
+            expected_npub
+        };
 
     let result = verify_nip05_identity(
         state,

@@ -153,7 +153,9 @@ pub fn ProfileV2View(
     let show_nip49_modal = RwSignal::new(false);
     let last_export_result = RwSignal::new(None::<Nip49ExportResult>);
     let nip05_status = RwSignal::new(default_nip05_status(
-        auth.profile.get_untracked().and_then(|profile| profile.nip05),
+        auth.profile
+            .get_untracked()
+            .and_then(|profile| profile.nip05),
     ));
     let last_auto_nip05_attempt = RwSignal::new(None::<String>);
 
