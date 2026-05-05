@@ -320,6 +320,51 @@ pub struct Nip05Status {
     pub message: String,
 }
 
+/// Badge definition metadata for NIP-58 display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BadgeDefinition {
+    pub coordinate: String,
+    pub issuer_pubkey: String,
+    pub badge_id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub image_url: Option<String>,
+    pub image_dimensions: Option<String>,
+    pub thumb_url: Option<String>,
+    pub thumb_dimensions: Option<String>,
+    pub relay_url: Option<String>,
+    pub event_id: String,
+    pub created_at: u64,
+}
+
+/// Award event metadata for a badge earned by a profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BadgeAward {
+    pub event_id: String,
+    pub issuer_pubkey: String,
+    pub recipient_pubkey: String,
+    pub badge_coordinate: String,
+    pub relay_url: Option<String>,
+    pub created_at: u64,
+}
+
+/// Profile showcase entry linking a badge definition and award.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileBadgeEntry {
+    pub definition: BadgeDefinition,
+    pub award: BadgeAward,
+    pub display_order: usize,
+    pub visible: bool,
+}
+
+/// Earned badge summary for achievements lists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EarnedBadgeSummary {
+    pub definition: BadgeDefinition,
+    pub award: BadgeAward,
+    pub visible_on_profile: bool,
+}
+
 /// Marketplace view state for navigation.
 #[derive(Clone, PartialEq)]
 pub enum MarketplaceView {
@@ -327,4 +372,43 @@ pub enum MarketplaceView {
     Publish,
     Detail(GameListing),
     Profile,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn earned_badge_summary_serializes_expected_field_names() {
+        let summary = EarnedBadgeSummary {
+            definition: BadgeDefinition {
+                coordinate: "30009:issuer:badge-id".to_string(),
+                issuer_pubkey: "issuer".to_string(),
+                badge_id: "badge-id".to_string(),
+                name: Some("Badge Name".to_string()),
+                description: Some("Badge Description".to_string()),
+                image_url: Some("https://example.com/image.png".to_string()),
+                image_dimensions: Some("1024x1024".to_string()),
+                thumb_url: Some("https://example.com/thumb.png".to_string()),
+                thumb_dimensions: Some("128x128".to_string()),
+                relay_url: Some("wss://relay.example.com".to_string()),
+                event_id: "event-id".to_string(),
+                created_at: 1,
+            },
+            award: BadgeAward {
+                event_id: "award-event-id".to_string(),
+                issuer_pubkey: "issuer".to_string(),
+                recipient_pubkey: "recipient".to_string(),
+                badge_coordinate: "30009:issuer:badge-id".to_string(),
+                relay_url: Some("wss://relay.example.com".to_string()),
+                created_at: 2,
+            },
+            visible_on_profile: true,
+        };
+
+        let value = serde_json::to_value(summary).expect("earned badge summary must serialize");
+        assert!(value.get("visible_on_profile").is_some());
+        assert!(value.get("definition").is_some());
+        assert!(value.get("award").is_some());
+    }
 }
