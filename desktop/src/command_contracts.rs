@@ -1,3 +1,4 @@
+use arcadestr_core::achievements::{EarnedBadgeSummary, ProfileBadgeEntry};
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::nip46::store_ncryptsec_in_keychain;
 use arcadestr_core::nip46::ProfileMetadata;
@@ -14,8 +15,10 @@ use nostr::prelude::ToBech32;
 use nostr::Keys;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tracing::error;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +75,17 @@ pub enum CommandError {
     NoActiveKey,
     #[error("{0}")]
     InvalidInput(String),
+    #[error("Achievement operation failed")]
+    Achievements(String),
+}
+
+pub trait BadgeCommandState {
+    fn badge_command_handles(
+        &self,
+    ) -> (
+        Arc<Mutex<arcadestr_core::nostr::NostrClient>>,
+        Arc<arcadestr_core::storage::Database>,
+    );
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -396,6 +410,64 @@ pub fn serialize_fetch_listings_result(
 
 pub fn serialize_fetch_profile_result(profile: &UserProfile) -> Result<serde_json::Value, String> {
     serde_json::to_value(profile).map_err(|e| e.to_string())
+}
+
+pub fn serialize_fetch_earned_badges_result(
+    badges: &[EarnedBadgeSummary],
+) -> Result<serde_json::Value, CommandError> {
+    serde_json::to_value(badges).map_err(|error| CommandError::InvalidInput(error.to_string()))
+}
+
+pub fn serialize_fetch_profile_badges_result(
+    badges: &[ProfileBadgeEntry],
+) -> Result<serde_json::Value, CommandError> {
+    serde_json::to_value(badges).map_err(|error| CommandError::InvalidInput(error.to_string()))
+}
+
+pub async fn fetch_earned_badges<S>(
+    state: &S,
+    profile_pubkey: String,
+) -> Result<Vec<EarnedBadgeSummary>, CommandError>
+where
+    S: BadgeCommandState + ?Sized,
+{
+    let (nostr, database) = state.badge_command_handles();
+    let (client, database) = {
+        let nostr = nostr.lock().await;
+        let relay_manager = nostr.relay_manager();
+        let client = {
+            let manager = relay_manager.lock().await;
+            manager.get_client_arc()
+        };
+        (client, database)
+    };
+
+    arcadestr_core::achievements::fetch_user_badges(client, database.as_ref(), &profile_pubkey)
+        .await
+        .map_err(|error| CommandError::Achievements(error.to_string()))
+}
+
+pub async fn fetch_profile_badges<S>(
+    state: &S,
+    profile_pubkey: String,
+) -> Result<Vec<ProfileBadgeEntry>, CommandError>
+where
+    S: BadgeCommandState + ?Sized,
+{
+    let (nostr, database) = state.badge_command_handles();
+    let (client, database) = {
+        let nostr = nostr.lock().await;
+        let relay_manager = nostr.relay_manager();
+        let client = {
+            let manager = relay_manager.lock().await;
+            manager.get_client_arc()
+        };
+        (client, database)
+    };
+
+    arcadestr_core::achievements::fetch_profile_badges(client, database.as_ref(), &profile_pubkey)
+        .await
+        .map_err(|error| CommandError::Achievements(error.to_string()))
 }
 
 pub fn build_list_saved_profiles_response(

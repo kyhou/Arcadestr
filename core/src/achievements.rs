@@ -3,6 +3,17 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(feature = "native")]
+use nostr::{Event, PublicKey};
+#[cfg(feature = "native")]
+use nostr_sdk::{Filter, Kind};
+#[cfg(feature = "native")]
+use std::sync::Arc;
+#[cfg(feature = "native")]
+use std::time::Duration;
+#[cfg(feature = "native")]
+use tracing::{info, warn};
+
 pub const KIND_BADGE_AWARD: u16 = 8;
 pub const KIND_PROFILE_BADGES_CURRENT: u16 = 10008;
 pub const KIND_PROFILE_BADGES_DEPRECATED: u16 = 30008;
@@ -166,6 +177,272 @@ pub fn validate_award_issuer(
     } else {
         Err(AchievementError::IssuerMismatch)
     }
+}
+
+/// Fetch earned badge awards and lazily cache referenced definitions.
+///
+/// # Errors
+/// Returns `AchievementError` when relay or storage access fails.
+#[cfg(feature = "native")]
+pub async fn fetch_user_badges(
+    client: Arc<nostr_sdk::Client>,
+    database: &crate::storage::Database,
+    profile_pubkey: &str,
+) -> Result<Vec<EarnedBadgeSummary>, AchievementError> {
+    let profile_public_key = PublicKey::from_hex(profile_pubkey)
+        .map_err(|error| AchievementError::Relay(error.to_string()))?;
+
+    cache_awards_for_profile(&client, database, profile_pubkey, profile_public_key).await?;
+
+    database
+        .earned_badges_for_profile(profile_pubkey)
+        .await
+        .map_err(|error| AchievementError::Storage(error.to_string()))
+}
+
+/// Fetch profile-selected badges, preferring kind 10008 over deprecated 30008.
+///
+/// # Errors
+/// Returns `AchievementError` when relay or storage access fails.
+#[cfg(feature = "native")]
+pub async fn fetch_profile_badges(
+    client: Arc<nostr_sdk::Client>,
+    database: &crate::storage::Database,
+    profile_pubkey: &str,
+) -> Result<Vec<ProfileBadgeEntry>, AchievementError> {
+    let profile_public_key = PublicKey::from_hex(profile_pubkey)
+        .map_err(|error| AchievementError::Relay(error.to_string()))?;
+
+    let current_filter = Filter::new()
+        .kind(Kind::Custom(KIND_PROFILE_BADGES_CURRENT))
+        .author(profile_public_key)
+        .limit(1);
+    let current_events = client
+        .fetch_events(current_filter, Duration::from_secs(10))
+        .await
+        .map_err(|error| AchievementError::Relay(error.to_string()))?
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let profile_event = if let Some(event) = latest_event(current_events) {
+        Some(event)
+    } else {
+        let deprecated_filter = Filter::new()
+            .kind(Kind::ProfileBadges)
+            .author(profile_public_key)
+            .identifier(PROFILE_BADGES_DEPRECATED_D)
+            .limit(1);
+        let deprecated_events = client
+            .fetch_events(deprecated_filter, Duration::from_secs(10))
+            .await
+            .map_err(|error| AchievementError::Relay(error.to_string()))?
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        let fallback = latest_event(deprecated_events);
+        if fallback.is_some() {
+            info!("Using deprecated NIP-58 kind-30008 profile_badges fallback");
+        }
+        fallback
+    };
+
+    if let Some(event) = profile_event {
+        let list = parse_profile_badge_list(&event, profile_pubkey)?;
+        let raw_event_json = serde_json::to_string(&event)
+            .map_err(|error| AchievementError::Storage(error.to_string()))?;
+        database
+            .cache_profile_badge_list(&list, &raw_event_json)
+            .await
+            .map_err(|error| AchievementError::Storage(error.to_string()))?;
+
+        let coordinates = list
+            .entries
+            .iter()
+            .map(|entry| entry.badge_coordinate.clone())
+            .collect::<Vec<_>>();
+        cache_missing_definitions(&client, database, &coordinates).await?;
+    }
+
+    cache_awards_for_profile(&client, database, profile_pubkey, profile_public_key).await?;
+
+    database
+        .profile_badges_for_profile(profile_pubkey)
+        .await
+        .map_err(|error| AchievementError::Storage(error.to_string()))
+}
+
+#[cfg(feature = "native")]
+async fn cache_awards_for_profile(
+    client: &Arc<nostr_sdk::Client>,
+    database: &crate::storage::Database,
+    profile_pubkey: &str,
+    profile_public_key: PublicKey,
+) -> Result<(), AchievementError> {
+    let awards_filter = Filter::new()
+        .kind(Kind::BadgeAward)
+        .pubkey(profile_public_key);
+    let award_events = client
+        .fetch_events(awards_filter, Duration::from_secs(10))
+        .await
+        .map_err(|error| AchievementError::Relay(error.to_string()))?
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let mut awards = Vec::new();
+    let mut coordinates = Vec::new();
+    for event in award_events {
+        match parse_badge_award_for_recipient(&event, profile_pubkey) {
+            Ok(award) => {
+                coordinates.push(award.badge_coordinate.clone());
+                awards.push((award, event));
+            }
+            Err(error) => warn!("Skipping malformed badge award: {error}"),
+        }
+    }
+
+    cache_missing_definitions(client, database, &coordinates).await?;
+
+    for (award, event) in awards {
+        let Some((_, definition_issuer, _)) = split_badge_coordinate(&award.badge_coordinate)
+        else {
+            warn!("Skipping badge award with invalid coordinate");
+            continue;
+        };
+        if award.issuer_pubkey != definition_issuer {
+            warn!(
+                award_event_id = %award.event_id,
+                award_issuer = %award.issuer_pubkey,
+                definition_issuer = %definition_issuer,
+                "Skipping badge award with issuer mismatch"
+            );
+            continue;
+        }
+
+        let raw_event_json = serde_json::to_string(&event)
+            .map_err(|error| AchievementError::Storage(error.to_string()))?;
+        database
+            .cache_badge_award(&award, &raw_event_json)
+            .await
+            .map_err(|error| AchievementError::Storage(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+async fn cache_missing_definitions(
+    client: &Arc<nostr_sdk::Client>,
+    database: &crate::storage::Database,
+    coordinates: &[String],
+) -> Result<(), AchievementError> {
+    for coordinate in coordinates {
+        if badge_definition_is_cached(database, coordinate).await? {
+            continue;
+        }
+
+        let Some((kind, issuer_pubkey, badge_id)) = split_badge_coordinate(coordinate) else {
+            warn!("Skipping invalid badge definition coordinate '{coordinate}'");
+            continue;
+        };
+        if kind != KIND_BADGE_DEFINITION {
+            warn!("Skipping unsupported badge definition coordinate kind {kind}");
+            continue;
+        }
+
+        let issuer_public_key = PublicKey::from_hex(&issuer_pubkey)
+            .map_err(|error| AchievementError::Relay(error.to_string()))?;
+        let definition_filter = Filter::new()
+            .kind(Kind::Custom(KIND_BADGE_DEFINITION))
+            .author(issuer_public_key)
+            .identifier(&badge_id)
+            .limit(1);
+        let definition_events = client
+            .fetch_events(definition_filter, Duration::from_secs(10))
+            .await
+            .map_err(|error| AchievementError::Relay(error.to_string()))?
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        for event in definition_events {
+            let definition = parse_badge_definition(&event, None)?;
+            let raw_event_json = serde_json::to_string(&event)
+                .map_err(|error| AchievementError::Storage(error.to_string()))?;
+            database
+                .cache_badge_definition(&definition, &raw_event_json)
+                .await
+                .map_err(|error| AchievementError::Storage(error.to_string()))?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+async fn badge_definition_is_cached(
+    database: &crate::storage::Database,
+    coordinate: &str,
+) -> Result<bool, AchievementError> {
+    let cached: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM badge_definitions WHERE coordinate = ? LIMIT 1")
+            .bind(coordinate)
+            .fetch_optional(database.pool())
+            .await
+            .map_err(|error| AchievementError::Storage(error.to_string()))?;
+
+    Ok(cached.is_some())
+}
+
+#[cfg(feature = "native")]
+fn parse_badge_award_for_recipient(
+    event: &Event,
+    profile_pubkey: &str,
+) -> Result<BadgeAward, AchievementError> {
+    if event.kind.as_u16() != KIND_BADGE_AWARD {
+        return Err(AchievementError::InvalidAwardKind);
+    }
+
+    let badge_coordinate = first_tag_value(event, "a")
+        .filter(|coordinate| is_valid_badge_coordinate(coordinate))
+        .ok_or(AchievementError::MissingAwardCoordinate)?;
+    let recipient_matches = event.tags.iter().any(|tag| {
+        let parts = tag.as_slice();
+        tag_name(parts) == Some("p") && tag_content(parts) == Some(profile_pubkey)
+    });
+    if !recipient_matches {
+        return Err(AchievementError::MissingAwardRecipient);
+    }
+
+    Ok(BadgeAward {
+        event_id: event.id.to_hex(),
+        issuer_pubkey: event.pubkey.to_hex(),
+        recipient_pubkey: profile_pubkey.to_string(),
+        badge_coordinate,
+        relay_url: None,
+        created_at: event.created_at.as_secs(),
+    })
+}
+
+#[cfg(feature = "native")]
+fn latest_event(events: Vec<Event>) -> Option<Event> {
+    events.into_iter().max_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| right.id.to_hex().cmp(&left.id.to_hex()))
+    })
+}
+
+#[cfg(feature = "native")]
+fn split_badge_coordinate(coordinate: &str) -> Option<(u16, String, String)> {
+    let mut parts = coordinate.splitn(3, ':');
+    let kind = parts.next()?.parse::<u16>().ok()?;
+    let issuer = parts.next()?.to_string();
+    let identifier = parts.next()?.to_string();
+
+    if issuer.is_empty() || identifier.is_empty() {
+        return None;
+    }
+
+    Some((kind, issuer, identifier))
 }
 
 fn parse_profile_badge_entries(event: &nostr::Event) -> Vec<ProfileBadgeSelection> {
