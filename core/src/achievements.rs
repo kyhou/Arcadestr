@@ -153,6 +153,21 @@ pub fn parse_profile_badge_list(
     })
 }
 
+/// Validate that an award was issued by the badge definition owner.
+///
+/// # Errors
+/// Returns `AchievementError::IssuerMismatch` when the issuer pubkeys differ.
+pub fn validate_award_issuer(
+    award: &BadgeAward,
+    definition: &BadgeDefinition,
+) -> Result<(), AchievementError> {
+    if award.issuer_pubkey == definition.issuer_pubkey {
+        Ok(())
+    } else {
+        Err(AchievementError::IssuerMismatch)
+    }
+}
+
 fn parse_profile_badge_entries(event: &nostr::Event) -> Vec<ProfileBadgeSelection> {
     let mut entries = Vec::new();
     let tags: Vec<Vec<String>> = event

@@ -203,6 +203,350 @@ fn temp_db_path(name: &str) -> PathBuf {
     path
 }
 
+fn badge_definition(
+    issuer_pubkey: &str,
+    badge_id: &str,
+    event_id: &str,
+    created_at: u64,
+) -> arcadestr_core::achievements::BadgeDefinition {
+    arcadestr_core::achievements::BadgeDefinition {
+        coordinate: format!("30009:{issuer_pubkey}:{badge_id}"),
+        issuer_pubkey: issuer_pubkey.to_string(),
+        badge_id: badge_id.to_string(),
+        name: Some(format!("Badge {badge_id}")),
+        description: Some("Achievement description".to_string()),
+        image_url: Some("https://example.com/badge.png".to_string()),
+        image_dimensions: Some("1024x1024".to_string()),
+        thumb_url: Some("https://example.com/thumb.png".to_string()),
+        thumb_dimensions: Some("256x256".to_string()),
+        relay_url: Some("wss://relay.example.com".to_string()),
+        event_id: event_id.to_string(),
+        created_at,
+    }
+}
+
+fn badge_award(
+    issuer_pubkey: &str,
+    recipient_pubkey: &str,
+    badge_coordinate: &str,
+    event_id: &str,
+    created_at: u64,
+) -> arcadestr_core::achievements::BadgeAward {
+    arcadestr_core::achievements::BadgeAward {
+        event_id: event_id.to_string(),
+        issuer_pubkey: issuer_pubkey.to_string(),
+        recipient_pubkey: recipient_pubkey.to_string(),
+        badge_coordinate: badge_coordinate.to_string(),
+        relay_url: Some("wss://relay.example.com".to_string()),
+        created_at,
+    }
+}
+
+#[test]
+fn issuer_mismatch_excludes_award_before_cache() {
+    let issuer = Keys::generate();
+    let attacker = Keys::generate();
+    let recipient = Keys::generate();
+    let definition = badge_definition(
+        &issuer.public_key().to_hex(),
+        "first_clear",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        1,
+    );
+    let award = badge_award(
+        &attacker.public_key().to_hex(),
+        &recipient.public_key().to_hex(),
+        &definition.coordinate,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        2,
+    );
+
+    let result = arcadestr_core::achievements::validate_award_issuer(&award, &definition);
+
+    assert!(matches!(
+        result,
+        Err(arcadestr_core::achievements::AchievementError::IssuerMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn cache_badge_definition_keeps_latest_by_coordinate() {
+    let db_path = temp_db_path("badge-definition-upsert");
+    let db = Database::new(&db_path)
+        .await
+        .expect("database should initialize");
+    let issuer = Keys::generate().public_key().to_hex();
+    let initial = badge_definition(
+        &issuer,
+        "first_clear",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        10,
+    );
+    let older = badge_definition(
+        &issuer,
+        "first_clear",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        9,
+    );
+    let tie_lower_event_id = badge_definition(
+        &issuer,
+        "first_clear",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        10,
+    );
+    let newer = badge_definition(
+        &issuer,
+        "first_clear",
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        11,
+    );
+
+    db.cache_badge_definition(&initial, r#"{"event":"initial"}"#)
+        .await
+        .expect("initial definition should cache");
+    db.cache_badge_definition(&older, r#"{"event":"older"}"#)
+        .await
+        .expect("older definition should be ignored");
+    db.cache_badge_definition(&tie_lower_event_id, r#"{"event":"tie"}"#)
+        .await
+        .expect("lower event id tie should replace");
+
+    let tied_event_id: String =
+        sqlx::query_scalar("SELECT event_id FROM badge_definitions WHERE coordinate = ?")
+            .bind(&initial.coordinate)
+            .fetch_one(db.pool())
+            .await
+            .expect("definition row should exist after tie replacement");
+
+    assert_eq!(tied_event_id, tie_lower_event_id.event_id);
+
+    db.cache_badge_definition(&newer, r#"{"event":"newer"}"#)
+        .await
+        .expect("newer definition should replace");
+
+    let cached_event_id: String =
+        sqlx::query_scalar("SELECT event_id FROM badge_definitions WHERE coordinate = ?")
+            .bind(&initial.coordinate)
+            .fetch_one(db.pool())
+            .await
+            .expect("definition row should exist");
+
+    assert_eq!(cached_event_id, newer.event_id);
+
+    db.close().await;
+    std::fs::remove_file(db_path).expect("test database should be removed");
+}
+
+#[tokio::test]
+async fn earned_badges_for_profile_joins_awards_to_definitions() {
+    let db_path = temp_db_path("earned-badges-join");
+    let db = Database::new(&db_path)
+        .await
+        .expect("database should initialize");
+    let issuer = Keys::generate().public_key().to_hex();
+    let recipient = Keys::generate().public_key().to_hex();
+    let definition = badge_definition(
+        &issuer,
+        "first_clear",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        1,
+    );
+    let award = badge_award(
+        &issuer,
+        &recipient,
+        &definition.coordinate,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        2,
+    );
+
+    db.cache_badge_definition(&definition, r#"{"kind":30009}"#)
+        .await
+        .expect("definition should cache");
+    db.cache_badge_award(&award, r#"{"kind":8}"#)
+        .await
+        .expect("award should cache");
+
+    let earned = db
+        .earned_badges_for_profile(&recipient)
+        .await
+        .expect("earned badges should query");
+
+    assert_eq!(earned.len(), 1);
+    assert_eq!(earned[0].definition.coordinate, definition.coordinate);
+    assert_eq!(earned[0].award.event_id, award.event_id);
+    assert!(!earned[0].visible_on_profile);
+
+    db.close().await;
+    std::fs::remove_file(db_path).expect("test database should be removed");
+}
+
+#[tokio::test]
+async fn cache_profile_badge_list_replaces_entries_in_transaction() {
+    let db_path = temp_db_path("profile-badge-replace");
+    let db = Database::new(&db_path)
+        .await
+        .expect("database should initialize");
+    let issuer = Keys::generate().public_key().to_hex();
+    let profile = Keys::generate().public_key().to_hex();
+    let first_definition = badge_definition(
+        &issuer,
+        "first_clear",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        1,
+    );
+    let second_definition = badge_definition(
+        &issuer,
+        "second_clear",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        2,
+    );
+    let first_award = badge_award(
+        &issuer,
+        &profile,
+        &first_definition.coordinate,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        3,
+    );
+    let second_award = badge_award(
+        &issuer,
+        &profile,
+        &second_definition.coordinate,
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        4,
+    );
+    db.cache_badge_definition(&first_definition, r#"{"badge":"first"}"#)
+        .await
+        .expect("first definition should cache");
+    db.cache_badge_definition(&second_definition, r#"{"badge":"second"}"#)
+        .await
+        .expect("second definition should cache");
+    db.cache_badge_award(&first_award, r#"{"award":"first"}"#)
+        .await
+        .expect("first award should cache");
+    db.cache_badge_award(&second_award, r#"{"award":"second"}"#)
+        .await
+        .expect("second award should cache");
+
+    let first_list = arcadestr_core::achievements::ProfileBadgeList {
+        profile_pubkey: profile.clone(),
+        event_id: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string(),
+        kind: arcadestr_core::achievements::KIND_PROFILE_BADGES_CURRENT,
+        created_at: 5,
+        entries: vec![arcadestr_core::achievements::ProfileBadgeSelection {
+            badge_coordinate: first_definition.coordinate.clone(),
+            award_event_id: first_award.event_id.clone(),
+            relay_url: Some("wss://relay.example.com".to_string()),
+            display_order: 0,
+        }],
+    };
+    let replacement_list = arcadestr_core::achievements::ProfileBadgeList {
+        profile_pubkey: profile.clone(),
+        event_id: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string(),
+        kind: arcadestr_core::achievements::KIND_PROFILE_BADGES_CURRENT,
+        created_at: 6,
+        entries: vec![arcadestr_core::achievements::ProfileBadgeSelection {
+            badge_coordinate: second_definition.coordinate.clone(),
+            award_event_id: second_award.event_id.clone(),
+            relay_url: Some("wss://relay.example.com".to_string()),
+            display_order: 0,
+        }],
+    };
+
+    db.cache_profile_badge_list(&first_list, r#"{"list":"first"}"#)
+        .await
+        .expect("first profile list should cache");
+    db.cache_profile_badge_list(&replacement_list, r#"{"list":"replacement"}"#)
+        .await
+        .expect("replacement profile list should cache");
+
+    let profile_badges = db
+        .profile_badges_for_profile(&profile)
+        .await
+        .expect("profile badges should query");
+
+    assert_eq!(profile_badges.len(), 1);
+    assert_eq!(
+        profile_badges[0].definition.coordinate,
+        second_definition.coordinate
+    );
+    assert_eq!(profile_badges[0].award.event_id, second_award.event_id);
+    assert_eq!(profile_badges[0].display_order, 0);
+    assert!(profile_badges[0].visible);
+
+    db.close().await;
+    std::fs::remove_file(db_path).expect("test database should be removed");
+}
+
+#[tokio::test]
+async fn profile_badge_queries_require_matching_award_recipient_and_coordinate() {
+    let db_path = temp_db_path("profile-badge-proof-match");
+    let db = Database::new(&db_path)
+        .await
+        .expect("database should initialize");
+    let issuer = Keys::generate().public_key().to_hex();
+    let profile = Keys::generate().public_key().to_hex();
+    let first_definition = badge_definition(
+        &issuer,
+        "first_clear",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        1,
+    );
+    let second_definition = badge_definition(
+        &issuer,
+        "second_clear",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        2,
+    );
+    let award = badge_award(
+        &issuer,
+        &profile,
+        &first_definition.coordinate,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        3,
+    );
+    let mismatched_list = arcadestr_core::achievements::ProfileBadgeList {
+        profile_pubkey: profile.clone(),
+        event_id: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+        kind: arcadestr_core::achievements::KIND_PROFILE_BADGES_CURRENT,
+        created_at: 4,
+        entries: vec![arcadestr_core::achievements::ProfileBadgeSelection {
+            badge_coordinate: second_definition.coordinate.clone(),
+            award_event_id: award.event_id.clone(),
+            relay_url: Some("wss://relay.example.com".to_string()),
+            display_order: 0,
+        }],
+    };
+
+    db.cache_badge_definition(&first_definition, r#"{"badge":"first"}"#)
+        .await
+        .expect("first definition should cache");
+    db.cache_badge_definition(&second_definition, r#"{"badge":"second"}"#)
+        .await
+        .expect("second definition should cache");
+    db.cache_badge_award(&award, r#"{"award":"first"}"#)
+        .await
+        .expect("award should cache");
+    db.cache_profile_badge_list(&mismatched_list, r#"{"list":"mismatch"}"#)
+        .await
+        .expect("mismatched profile list should cache as relay data");
+
+    let earned = db
+        .earned_badges_for_profile(&profile)
+        .await
+        .expect("earned badges should query");
+    let profile_badges = db
+        .profile_badges_for_profile(&profile)
+        .await
+        .expect("profile badges should query");
+
+    assert_eq!(earned.len(), 1);
+    assert!(!earned[0].visible_on_profile);
+    assert!(profile_badges.is_empty());
+
+    db.close().await;
+    std::fs::remove_file(db_path).expect("test database should be removed");
+}
+
 fn test_game_listing(publisher_npub: String, id: &str) -> GameListing {
     GameListing {
         id: id.to_string(),
