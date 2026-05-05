@@ -386,34 +386,8 @@ impl Database {
         raw_event_json: &str,
     ) -> Result<(), DatabaseError> {
         let mut tx = self.pool.begin().await?;
-        let current: Option<(i64, String, i64)> = sqlx::query_as(
-            "SELECT created_at, event_id, kind FROM profile_badge_lists WHERE profile_pubkey = ?",
-        )
-        .bind(&list.profile_pubkey)
-        .fetch_optional(&mut *tx)
-        .await?;
 
-        if let Some((created_at, event_id, kind)) = current {
-            let incoming_created_at = unix_to_i64(list.created_at)?;
-            if !should_replace_profile_list(
-                incoming_created_at,
-                &list.event_id,
-                list.kind,
-                created_at,
-                &event_id,
-                kind,
-            ) {
-                tx.commit().await?;
-                return Ok(());
-            }
-        }
-
-        sqlx::query("DELETE FROM profile_badge_entries WHERE profile_pubkey = ?")
-            .bind(&list.profile_pubkey)
-            .execute(&mut *tx)
-            .await?;
-
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             INSERT INTO profile_badge_lists (
                 profile_pubkey, event_id, kind, created_at, raw_event_json, updated_at
@@ -424,6 +398,12 @@ impl Database {
                 created_at = excluded.created_at,
                 raw_event_json = excluded.raw_event_json,
                 updated_at = excluded.updated_at
+            WHERE (excluded.kind = 10008 AND profile_badge_lists.kind = 30008)
+               OR (profile_badge_lists.kind = excluded.kind
+                   AND excluded.created_at > profile_badge_lists.created_at)
+               OR (profile_badge_lists.kind = excluded.kind
+                   AND excluded.created_at = profile_badge_lists.created_at
+                   AND excluded.event_id < profile_badge_lists.event_id)
             "#,
         )
         .bind(&list.profile_pubkey)
@@ -434,6 +414,16 @@ impl Database {
         .bind(now_unix_i64()?)
         .execute(&mut *tx)
         .await?;
+
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        sqlx::query("DELETE FROM profile_badge_entries WHERE profile_pubkey = ?")
+            .bind(&list.profile_pubkey)
+            .execute(&mut *tx)
+            .await?;
 
         for entry in &list.entries {
             sqlx::query(
@@ -469,15 +459,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
 
-        rows.iter()
-            .map(|row| {
-                Ok(crate::achievements::EarnedBadgeSummary {
-                    definition: definition_from_row(row),
-                    award: award_from_row(row),
-                    visible_on_profile: row.get::<i64, _>("visible_on_profile") != 0,
-                })
-            })
-            .collect()
+        rows.iter().map(earned_badge_summary_from_row).collect()
     }
 
     /// Return profile-selected badges in display order.
@@ -493,16 +475,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
 
-        rows.iter()
-            .map(|row| {
-                Ok(crate::achievements::ProfileBadgeEntry {
-                    definition: definition_from_row(row),
-                    award: award_from_row(row),
-                    display_order: i64_to_usize(row.get::<i64, _>("display_order"))?,
-                    visible: true,
-                })
-            })
-            .collect()
+        rows.iter().map(profile_badge_entry_from_row).collect()
     }
 }
 
@@ -568,55 +541,57 @@ const PROFILE_BADGES_QUERY: &str = r#"
     ORDER BY pbe.display_order ASC
 "#;
 
-fn definition_from_row(row: &sqlx::sqlite::SqliteRow) -> crate::achievements::BadgeDefinition {
-    crate::achievements::BadgeDefinition {
-        coordinate: row.get("definition_coordinate"),
-        issuer_pubkey: row.get("definition_issuer_pubkey"),
-        badge_id: row.get("definition_badge_id"),
-        name: row.get("definition_name"),
-        description: row.get("definition_description"),
-        image_url: row.get("definition_image_url"),
-        image_dimensions: row.get("definition_image_dimensions"),
-        thumb_url: row.get("definition_thumb_url"),
-        thumb_dimensions: row.get("definition_thumb_dimensions"),
-        relay_url: row.get("definition_relay_url"),
-        event_id: row.get("definition_event_id"),
-        created_at: row.get::<i64, _>("definition_created_at") as u64,
-    }
+fn earned_badge_summary_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<crate::achievements::EarnedBadgeSummary, DatabaseError> {
+    Ok(crate::achievements::EarnedBadgeSummary {
+        definition: definition_from_row(row)?,
+        award: award_from_row(row)?,
+        visible_on_profile: row.try_get::<i64, _>("visible_on_profile")? != 0,
+    })
 }
 
-fn award_from_row(row: &sqlx::sqlite::SqliteRow) -> crate::achievements::BadgeAward {
-    crate::achievements::BadgeAward {
-        event_id: row.get("award_event_id"),
-        issuer_pubkey: row.get("award_issuer_pubkey"),
-        recipient_pubkey: row.get("award_recipient_pubkey"),
-        badge_coordinate: row.get("award_badge_coordinate"),
-        relay_url: row.get("award_relay_url"),
-        created_at: row.get::<i64, _>("award_created_at") as u64,
-    }
+fn profile_badge_entry_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<crate::achievements::ProfileBadgeEntry, DatabaseError> {
+    Ok(crate::achievements::ProfileBadgeEntry {
+        definition: definition_from_row(row)?,
+        award: award_from_row(row)?,
+        display_order: i64_to_usize(row.try_get::<i64, _>("display_order")?)?,
+        visible: true,
+    })
 }
 
-fn should_replace_profile_list(
-    incoming_created_at: i64,
-    incoming_event_id: &str,
-    incoming_kind: u16,
-    current_created_at: i64,
-    current_event_id: &str,
-    current_kind: i64,
-) -> bool {
-    let current_is_deprecated =
-        current_kind == i64::from(crate::achievements::KIND_PROFILE_BADGES_DEPRECATED);
-    let incoming_is_current = incoming_kind == crate::achievements::KIND_PROFILE_BADGES_CURRENT;
+fn definition_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<crate::achievements::BadgeDefinition, DatabaseError> {
+    Ok(crate::achievements::BadgeDefinition {
+        coordinate: row.try_get("definition_coordinate")?,
+        issuer_pubkey: row.try_get("definition_issuer_pubkey")?,
+        badge_id: row.try_get("definition_badge_id")?,
+        name: row.try_get("definition_name")?,
+        description: row.try_get("definition_description")?,
+        image_url: row.try_get("definition_image_url")?,
+        image_dimensions: row.try_get("definition_image_dimensions")?,
+        thumb_url: row.try_get("definition_thumb_url")?,
+        thumb_dimensions: row.try_get("definition_thumb_dimensions")?,
+        relay_url: row.try_get("definition_relay_url")?,
+        event_id: row.try_get("definition_event_id")?,
+        created_at: i64_to_u64(row.try_get("definition_created_at")?)?,
+    })
+}
 
-    if incoming_is_current && current_is_deprecated {
-        return true;
-    }
-
-    if incoming_created_at != current_created_at {
-        return incoming_created_at > current_created_at;
-    }
-
-    i64::from(incoming_kind) == current_kind && incoming_event_id < current_event_id
+fn award_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<crate::achievements::BadgeAward, DatabaseError> {
+    Ok(crate::achievements::BadgeAward {
+        event_id: row.try_get("award_event_id")?,
+        issuer_pubkey: row.try_get("award_issuer_pubkey")?,
+        recipient_pubkey: row.try_get("award_recipient_pubkey")?,
+        badge_coordinate: row.try_get("award_badge_coordinate")?,
+        relay_url: row.try_get("award_relay_url")?,
+        created_at: i64_to_u64(row.try_get("award_created_at")?)?,
+    })
 }
 
 fn now_unix_i64() -> Result<i64, DatabaseError> {
@@ -639,6 +614,11 @@ fn usize_to_i64(value: usize) -> Result<i64, DatabaseError> {
 fn i64_to_usize(value: i64) -> Result<usize, DatabaseError> {
     usize::try_from(value)
         .map_err(|_| DatabaseError::Migration(format!("Display order out of range: {value}")))
+}
+
+fn i64_to_u64(value: i64) -> Result<u64, DatabaseError> {
+    u64::try_from(value)
+        .map_err(|_| DatabaseError::Migration(format!("Timestamp out of range: {value}")))
 }
 
 #[cfg(test)]

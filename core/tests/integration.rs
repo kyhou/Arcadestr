@@ -478,6 +478,424 @@ async fn cache_profile_badge_list_replaces_entries_in_transaction() {
 }
 
 #[tokio::test]
+async fn stale_profile_badge_list_does_not_replace_newer_entries() {
+    let db_path = temp_db_path("profile-badge-stale");
+    let db = Database::new(&db_path)
+        .await
+        .expect("database should initialize");
+    let issuer = Keys::generate().public_key().to_hex();
+    let profile = Keys::generate().public_key().to_hex();
+    let first_definition = badge_definition(
+        &issuer,
+        "first_clear",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        1,
+    );
+    let second_definition = badge_definition(
+        &issuer,
+        "second_clear",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        2,
+    );
+    let first_award = badge_award(
+        &issuer,
+        &profile,
+        &first_definition.coordinate,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        3,
+    );
+    let second_award = badge_award(
+        &issuer,
+        &profile,
+        &second_definition.coordinate,
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        4,
+    );
+    db.cache_badge_definition(&first_definition, r#"{"badge":"first"}"#)
+        .await
+        .expect("first definition should cache");
+    db.cache_badge_definition(&second_definition, r#"{"badge":"second"}"#)
+        .await
+        .expect("second definition should cache");
+    db.cache_badge_award(&first_award, r#"{"award":"first"}"#)
+        .await
+        .expect("first award should cache");
+    db.cache_badge_award(&second_award, r#"{"award":"second"}"#)
+        .await
+        .expect("second award should cache");
+
+    let newer_list = arcadestr_core::achievements::ProfileBadgeList {
+        profile_pubkey: profile.clone(),
+        event_id: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string(),
+        kind: arcadestr_core::achievements::KIND_PROFILE_BADGES_CURRENT,
+        created_at: 10,
+        entries: vec![arcadestr_core::achievements::ProfileBadgeSelection {
+            badge_coordinate: first_definition.coordinate.clone(),
+            award_event_id: first_award.event_id.clone(),
+            relay_url: Some("wss://relay.example.com".to_string()),
+            display_order: 0,
+        }],
+    };
+    let stale_list = arcadestr_core::achievements::ProfileBadgeList {
+        profile_pubkey: profile.clone(),
+        event_id: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string(),
+        kind: arcadestr_core::achievements::KIND_PROFILE_BADGES_CURRENT,
+        created_at: 9,
+        entries: vec![arcadestr_core::achievements::ProfileBadgeSelection {
+            badge_coordinate: second_definition.coordinate.clone(),
+            award_event_id: second_award.event_id.clone(),
+            relay_url: Some("wss://relay.example.com".to_string()),
+            display_order: 0,
+        }],
+    };
+
+    db.cache_profile_badge_list(&newer_list, r#"{"list":"newer"}"#)
+        .await
+        .expect("newer profile list should cache");
+    db.cache_profile_badge_list(&stale_list, r#"{"list":"stale"}"#)
+        .await
+        .expect("stale profile list should be ignored");
+
+    let profile_badges = db
+        .profile_badges_for_profile(&profile)
+        .await
+        .expect("profile badges should query");
+
+    assert_eq!(profile_badges.len(), 1);
+    assert_eq!(profile_badges[0].award.event_id, first_award.event_id);
+
+    db.close().await;
+    std::fs::remove_file(db_path).expect("test database should be removed");
+}
+
+#[tokio::test]
+async fn current_profile_badge_list_replaces_deprecated_list() {
+    let db_path = temp_db_path("profile-badge-current-over-deprecated");
+    let db = Database::new(&db_path)
+        .await
+        .expect("database should initialize");
+    let issuer = Keys::generate().public_key().to_hex();
+    let profile = Keys::generate().public_key().to_hex();
+    let deprecated_definition = badge_definition(
+        &issuer,
+        "deprecated_choice",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        1,
+    );
+    let current_definition = badge_definition(
+        &issuer,
+        "current_choice",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        2,
+    );
+    let deprecated_award = badge_award(
+        &issuer,
+        &profile,
+        &deprecated_definition.coordinate,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        3,
+    );
+    let current_award = badge_award(
+        &issuer,
+        &profile,
+        &current_definition.coordinate,
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        4,
+    );
+    db.cache_badge_definition(&deprecated_definition, r#"{"badge":"deprecated"}"#)
+        .await
+        .expect("deprecated definition should cache");
+    db.cache_badge_definition(&current_definition, r#"{"badge":"current"}"#)
+        .await
+        .expect("current definition should cache");
+    db.cache_badge_award(&deprecated_award, r#"{"award":"deprecated"}"#)
+        .await
+        .expect("deprecated award should cache");
+    db.cache_badge_award(&current_award, r#"{"award":"current"}"#)
+        .await
+        .expect("current award should cache");
+
+    let deprecated_list = arcadestr_core::achievements::ProfileBadgeList {
+        profile_pubkey: profile.clone(),
+        event_id: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string(),
+        kind: arcadestr_core::achievements::KIND_PROFILE_BADGES_DEPRECATED,
+        created_at: 10,
+        entries: vec![arcadestr_core::achievements::ProfileBadgeSelection {
+            badge_coordinate: deprecated_definition.coordinate.clone(),
+            award_event_id: deprecated_award.event_id.clone(),
+            relay_url: Some("wss://relay.example.com".to_string()),
+            display_order: 0,
+        }],
+    };
+    let current_list = arcadestr_core::achievements::ProfileBadgeList {
+        profile_pubkey: profile.clone(),
+        event_id: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string(),
+        kind: arcadestr_core::achievements::KIND_PROFILE_BADGES_CURRENT,
+        created_at: 9,
+        entries: vec![arcadestr_core::achievements::ProfileBadgeSelection {
+            badge_coordinate: current_definition.coordinate.clone(),
+            award_event_id: current_award.event_id.clone(),
+            relay_url: Some("wss://relay.example.com".to_string()),
+            display_order: 0,
+        }],
+    };
+
+    db.cache_profile_badge_list(&deprecated_list, r#"{"list":"deprecated"}"#)
+        .await
+        .expect("deprecated list should cache");
+    db.cache_profile_badge_list(&current_list, r#"{"list":"current"}"#)
+        .await
+        .expect("current list should replace deprecated list");
+
+    let profile_badges = db
+        .profile_badges_for_profile(&profile)
+        .await
+        .expect("profile badges should query");
+
+    assert_eq!(profile_badges.len(), 1);
+    assert_eq!(profile_badges[0].award.event_id, current_award.event_id);
+
+    db.close().await;
+    std::fs::remove_file(db_path).expect("test database should be removed");
+}
+
+#[tokio::test]
+async fn deprecated_profile_badge_list_does_not_replace_current_list() {
+    let db_path = temp_db_path("profile-badge-deprecated-after-current");
+    let db = Database::new(&db_path)
+        .await
+        .expect("database should initialize");
+    let issuer = Keys::generate().public_key().to_hex();
+    let profile = Keys::generate().public_key().to_hex();
+    let current_definition = badge_definition(
+        &issuer,
+        "current_choice",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        1,
+    );
+    let deprecated_definition = badge_definition(
+        &issuer,
+        "deprecated_choice",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        2,
+    );
+    let current_award = badge_award(
+        &issuer,
+        &profile,
+        &current_definition.coordinate,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        3,
+    );
+    let deprecated_award = badge_award(
+        &issuer,
+        &profile,
+        &deprecated_definition.coordinate,
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        4,
+    );
+    db.cache_badge_definition(&current_definition, r#"{"badge":"current"}"#)
+        .await
+        .expect("current definition should cache");
+    db.cache_badge_definition(&deprecated_definition, r#"{"badge":"deprecated"}"#)
+        .await
+        .expect("deprecated definition should cache");
+    db.cache_badge_award(&current_award, r#"{"award":"current"}"#)
+        .await
+        .expect("current award should cache");
+    db.cache_badge_award(&deprecated_award, r#"{"award":"deprecated"}"#)
+        .await
+        .expect("deprecated award should cache");
+
+    let current_list = arcadestr_core::achievements::ProfileBadgeList {
+        profile_pubkey: profile.clone(),
+        event_id: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string(),
+        kind: arcadestr_core::achievements::KIND_PROFILE_BADGES_CURRENT,
+        created_at: 10,
+        entries: vec![arcadestr_core::achievements::ProfileBadgeSelection {
+            badge_coordinate: current_definition.coordinate.clone(),
+            award_event_id: current_award.event_id.clone(),
+            relay_url: Some("wss://relay.example.com".to_string()),
+            display_order: 0,
+        }],
+    };
+    let deprecated_list = arcadestr_core::achievements::ProfileBadgeList {
+        profile_pubkey: profile.clone(),
+        event_id: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string(),
+        kind: arcadestr_core::achievements::KIND_PROFILE_BADGES_DEPRECATED,
+        created_at: 11,
+        entries: vec![arcadestr_core::achievements::ProfileBadgeSelection {
+            badge_coordinate: deprecated_definition.coordinate.clone(),
+            award_event_id: deprecated_award.event_id.clone(),
+            relay_url: Some("wss://relay.example.com".to_string()),
+            display_order: 0,
+        }],
+    };
+
+    db.cache_profile_badge_list(&current_list, r#"{"list":"current"}"#)
+        .await
+        .expect("current list should cache");
+    db.cache_profile_badge_list(&deprecated_list, r#"{"list":"deprecated"}"#)
+        .await
+        .expect("deprecated list should be ignored after current list");
+
+    let profile_badges = db
+        .profile_badges_for_profile(&profile)
+        .await
+        .expect("profile badges should query");
+
+    assert_eq!(profile_badges.len(), 1);
+    assert_eq!(profile_badges[0].award.event_id, current_award.event_id);
+
+    db.close().await;
+    std::fs::remove_file(db_path).expect("test database should be removed");
+}
+
+#[tokio::test]
+async fn earned_badges_query_rejects_negative_cached_timestamps() {
+    let db_path = temp_db_path("earned-badges-negative-ts");
+    let db = Database::new(&db_path)
+        .await
+        .expect("database should initialize");
+    let issuer = Keys::generate().public_key().to_hex();
+    let profile = Keys::generate().public_key().to_hex();
+    let coordinate = format!("30009:{issuer}:first_clear");
+
+    sqlx::query(
+        r#"
+        INSERT INTO badge_definitions (
+            coordinate, issuer_pubkey, badge_id, event_id, created_at, raw_event_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&coordinate)
+    .bind(&issuer)
+    .bind("first_clear")
+    .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    .bind(-1_i64)
+    .bind(r#"{"kind":30009}"#)
+    .execute(db.pool())
+    .await
+    .expect("corrupt definition fixture should insert");
+
+    sqlx::query(
+        r#"
+        INSERT INTO badge_awards (
+            event_id, issuer_pubkey, recipient_pubkey, badge_coordinate, created_at, raw_event_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    .bind(&issuer)
+    .bind(&profile)
+    .bind(&coordinate)
+    .bind(2_i64)
+    .bind(r#"{"kind":8}"#)
+    .execute(db.pool())
+    .await
+    .expect("award fixture should insert");
+
+    let error = db
+        .earned_badges_for_profile(&profile)
+        .await
+        .expect_err("negative timestamps should be rejected");
+
+    assert!(error.to_string().contains("Timestamp out of range"));
+
+    db.close().await;
+    std::fs::remove_file(db_path).expect("test database should be removed");
+}
+
+#[tokio::test]
+async fn profile_badges_query_rejects_negative_award_timestamps() {
+    let db_path = temp_db_path("profile-badges-negative-award-ts");
+    let db = Database::new(&db_path)
+        .await
+        .expect("database should initialize");
+    let issuer = Keys::generate().public_key().to_hex();
+    let profile = Keys::generate().public_key().to_hex();
+    let coordinate = format!("30009:{issuer}:first_clear");
+    let award_event_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    sqlx::query(
+        r#"
+        INSERT INTO badge_definitions (
+            coordinate, issuer_pubkey, badge_id, event_id, created_at, raw_event_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&coordinate)
+    .bind(&issuer)
+    .bind("first_clear")
+    .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    .bind(1_i64)
+    .bind(r#"{"kind":30009}"#)
+    .execute(db.pool())
+    .await
+    .expect("definition fixture should insert");
+
+    sqlx::query(
+        r#"
+        INSERT INTO badge_awards (
+            event_id, issuer_pubkey, recipient_pubkey, badge_coordinate, created_at, raw_event_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(award_event_id)
+    .bind(&issuer)
+    .bind(&profile)
+    .bind(&coordinate)
+    .bind(-1_i64)
+    .bind(r#"{"kind":8}"#)
+    .execute(db.pool())
+    .await
+    .expect("corrupt award fixture should insert");
+
+    sqlx::query(
+        r#"
+        INSERT INTO profile_badge_lists (
+            profile_pubkey, event_id, kind, created_at, raw_event_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&profile)
+    .bind("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+    .bind(i64::from(
+        arcadestr_core::achievements::KIND_PROFILE_BADGES_CURRENT,
+    ))
+    .bind(2_i64)
+    .bind(r#"{"kind":10008}"#)
+    .bind(3_i64)
+    .execute(db.pool())
+    .await
+    .expect("profile list fixture should insert");
+
+    sqlx::query(
+        r#"
+        INSERT INTO profile_badge_entries (
+            profile_pubkey, badge_coordinate, award_event_id, display_order
+        ) VALUES (?, ?, ?, ?)
+        "#,
+    )
+    .bind(&profile)
+    .bind(&coordinate)
+    .bind(award_event_id)
+    .bind(0_i64)
+    .execute(db.pool())
+    .await
+    .expect("profile entry fixture should insert");
+
+    let error = db
+        .profile_badges_for_profile(&profile)
+        .await
+        .expect_err("negative award timestamps should be rejected");
+
+    assert!(error.to_string().contains("Timestamp out of range"));
+
+    db.close().await;
+    std::fs::remove_file(db_path).expect("test database should be removed");
+}
+
+#[tokio::test]
 async fn profile_badge_queries_require_matching_award_recipient_and_coordinate() {
     let db_path = temp_db_path("profile-badge-proof-match");
     let db = Database::new(&db_path)
