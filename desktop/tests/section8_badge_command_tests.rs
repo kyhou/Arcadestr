@@ -33,3 +33,23 @@ fn fetch_profile_badges_command_name_serializes_empty_vec() {
 
     assert_eq!(value, json!([]));
 }
+
+#[test]
+fn achievements_error_to_string_includes_inner_message() {
+    let err = command_contracts::CommandError::Achievements("inner relay failure".to_string());
+
+    assert_eq!(
+        err.to_string(),
+        "Achievement operation failed: inner relay failure"
+    );
+}
+
+#[test]
+fn serializer_helper_still_serializes_empty_array_shape() {
+    let payload: Vec<arcadestr_core::achievements::EarnedBadgeSummary> = Vec::new();
+    let value = command_contracts::serialize_fetch_earned_badges_result(&payload)
+        .expect("earned badge payload serializes");
+
+    assert!(value.is_array());
+    assert_eq!(value, json!([]));
+}

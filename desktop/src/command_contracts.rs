@@ -75,7 +75,7 @@ pub enum CommandError {
     NoActiveKey,
     #[error("{0}")]
     InvalidInput(String),
-    #[error("Achievement operation failed")]
+    #[error("Achievement operation failed: {0}")]
     Achievements(String),
 }
 
@@ -432,14 +432,13 @@ where
     S: BadgeCommandState + ?Sized,
 {
     let (nostr, database) = state.badge_command_handles();
-    let (client, database) = {
+    let relay_manager = {
         let nostr = nostr.lock().await;
-        let relay_manager = nostr.relay_manager();
-        let client = {
-            let manager = relay_manager.lock().await;
-            manager.get_client_arc()
-        };
-        (client, database)
+        nostr.relay_manager()
+    };
+    let client = {
+        let manager = relay_manager.lock().await;
+        manager.get_client_arc()
     };
 
     arcadestr_core::achievements::fetch_user_badges(client, database.as_ref(), &profile_pubkey)
@@ -455,14 +454,13 @@ where
     S: BadgeCommandState + ?Sized,
 {
     let (nostr, database) = state.badge_command_handles();
-    let (client, database) = {
+    let relay_manager = {
         let nostr = nostr.lock().await;
-        let relay_manager = nostr.relay_manager();
-        let client = {
-            let manager = relay_manager.lock().await;
-            manager.get_client_arc()
-        };
-        (client, database)
+        nostr.relay_manager()
+    };
+    let client = {
+        let manager = relay_manager.lock().await;
+        manager.get_client_arc()
     };
 
     arcadestr_core::achievements::fetch_profile_badges(client, database.as_ref(), &profile_pubkey)

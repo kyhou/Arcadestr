@@ -364,7 +364,17 @@ async fn cache_missing_definitions(
             .collect::<Vec<_>>();
 
         for event in definition_events {
-            let definition = parse_badge_definition(&event, None)?;
+            let definition = match parse_badge_definition(&event, None) {
+                Ok(definition) => definition,
+                Err(error) => {
+                    warn!(
+                        coordinate = %coordinate,
+                        event_id = %event.id.to_hex(),
+                        "Skipping malformed badge definition event: {error}"
+                    );
+                    continue;
+                }
+            };
             let raw_event_json = serde_json::to_string(&event)
                 .map_err(|error| AchievementError::Storage(error.to_string()))?;
             database
