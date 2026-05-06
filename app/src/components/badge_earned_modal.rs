@@ -1,5 +1,7 @@
 use leptos::prelude::*;
 #[cfg(target_arch = "wasm32")]
+use wasm_bindgen::closure::Closure;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
 use crate::models::EarnedBadgeSummary;
@@ -22,11 +24,47 @@ pub fn BadgeEarnedModal(
     let on_keydown = {
         let on_close = on_close.clone();
         move |event: leptos::ev::KeyboardEvent| {
-            if event.key() == "Escape" && show.get() {
+            if should_close_on_key(&event.key()) && show.get() {
                 on_close.run(());
             }
         }
     };
+
+    Effect::new(move |_| {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if !show.get() {
+                return;
+            }
+
+            if let Some(window) = web_sys::window() {
+                if let Some(document) = window.document() {
+                    let on_close = on_close.clone();
+                    let callback = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
+                        if should_close_on_key(&event.key()) {
+                            on_close.run(());
+                        }
+                    }) as Box<dyn FnMut(_)>);
+
+                    let _ = document.add_event_listener_with_callback(
+                        "keydown",
+                        callback.as_ref().unchecked_ref(),
+                    );
+
+                    on_cleanup(move || {
+                        if let Some(window) = web_sys::window() {
+                            if let Some(document) = window.document() {
+                                let _ = document.remove_event_listener_with_callback(
+                                    "keydown",
+                                    callback.as_ref().unchecked_ref(),
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
 
     Effect::new(move |_| {
         #[cfg(target_arch = "wasm32")]
@@ -128,6 +166,10 @@ fn badge_modal_class_name(suffix: &str) -> String {
     format!("badge-earned-modal-{suffix}")
 }
 
+fn should_close_on_key(_key: &str) -> bool {
+    _key == "Escape"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +201,12 @@ mod tests {
             "badge-earned-modal-backdrop"
         );
         assert!(!badge_modal_class_name("panel").contains("nip49"));
+    }
+
+    #[test]
+    fn should_close_on_key_only_for_escape() {
+        assert!(should_close_on_key("Escape"));
+        assert!(!should_close_on_key("Enter"));
     }
 
     fn sample_badge(
