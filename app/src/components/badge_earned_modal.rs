@@ -47,7 +47,9 @@ pub fn BadgeEarnedModal(
                 let Ok(panel) = target.dyn_into::<web_sys::Element>() else {
                     return;
                 };
-                let Ok(focusables) = panel.query_selector_all(MODAL_FOCUSABLE_SELECTOR) else {
+                let Ok(focusables): Result<web_sys::NodeList, _> =
+                    panel.query_selector_all(MODAL_FOCUSABLE_SELECTOR)
+                else {
                     return;
                 };
 
@@ -56,10 +58,10 @@ pub fn BadgeEarnedModal(
                     return;
                 }
 
-                let first = focusables
+                let first: Option<web_sys::HtmlElement> = focusables
                     .item(0)
                     .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
-                let last = focusables
+                let last: Option<web_sys::HtmlElement> = focusables
                     .item(count - 1)
                     .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
 
@@ -69,15 +71,17 @@ pub fn BadgeEarnedModal(
                 let Some(document) = window.document() else {
                     return;
                 };
-                let active = document.active_element();
+                let active: Option<web_sys::Element> = document.active_element();
 
                 let active_is_first = active
                     .as_ref()
-                    .and_then(|a| first.as_ref().map(|f| a == f.as_ref()))
+                    .zip(first.as_ref())
+                    .map(|(active, first)| active.is_same_node(Some(first.as_ref())))
                     .unwrap_or(false);
                 let active_is_last = active
                     .as_ref()
-                    .and_then(|a| last.as_ref().map(|l| a == l.as_ref()))
+                    .zip(last.as_ref())
+                    .map(|(active, last)| active.is_same_node(Some(last.as_ref())))
                     .unwrap_or(false);
 
                 if !event.shift_key() && active_is_last {

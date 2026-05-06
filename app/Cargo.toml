@@ -16,7 +16,18 @@ tracing = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Navigator", "Clipboard", "Storage"] }
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Navigator",
+    "Clipboard",
+    "Storage",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "Node",
+    "NodeList",
+    "KeyboardEvent",
+] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 aes-gcm = "0.10"
