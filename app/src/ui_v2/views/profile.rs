@@ -288,7 +288,7 @@ pub fn ProfileV2View(
                 </Show>
             </header>
 
-            <BadgeShowcase profile_npub=current_npub />
+            <BadgeShowcase profile_identifier=current_npub />
 
             <Show when=move || is_own_profile.get()>
                 <div class="v2-panel v2-profile-listings">

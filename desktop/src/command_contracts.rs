@@ -21,6 +21,25 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::error;
 
+fn normalize_profile_pubkey_identifier(profile_pubkey: &str) -> Result<String, CommandError> {
+    let trimmed = profile_pubkey.trim();
+    if trimmed.is_empty() {
+        return Err(CommandError::InvalidInput(
+            "Profile pubkey cannot be empty".to_string(),
+        ));
+    }
+
+    if trimmed.starts_with("npub1") || trimmed.starts_with("nprofile1") {
+        return parse_nip19_identifier(trimmed)
+            .map(|parsed| parsed.pubkey)
+            .map_err(|error| CommandError::InvalidInput(error.to_string()));
+    }
+
+    nostr::key::PublicKey::parse(trimmed)
+        .map(|pubkey| pubkey.to_hex())
+        .map_err(|error| CommandError::InvalidInput(format!("Invalid profile pubkey: {error}")))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExportKeyRequest {
     pub password: String,
@@ -431,6 +450,8 @@ pub async fn fetch_earned_badges<S>(
 where
     S: BadgeCommandState + ?Sized,
 {
+    let normalized_pubkey = normalize_profile_pubkey_identifier(&profile_pubkey)?;
+
     let (nostr, database) = state.badge_command_handles();
     let relay_manager = {
         let nostr = nostr.lock().await;
@@ -441,7 +462,7 @@ where
         manager.get_client_arc()
     };
 
-    arcadestr_core::achievements::fetch_user_badges(client, database.as_ref(), &profile_pubkey)
+    arcadestr_core::achievements::fetch_user_badges(client, database.as_ref(), &normalized_pubkey)
         .await
         .map_err(|error| CommandError::Achievements(error.to_string()))
 }
@@ -453,6 +474,8 @@ pub async fn fetch_profile_badges<S>(
 where
     S: BadgeCommandState + ?Sized,
 {
+    let normalized_pubkey = normalize_profile_pubkey_identifier(&profile_pubkey)?;
+
     let (nostr, database) = state.badge_command_handles();
     let relay_manager = {
         let nostr = nostr.lock().await;
@@ -463,9 +486,38 @@ where
         manager.get_client_arc()
     };
 
-    arcadestr_core::achievements::fetch_profile_badges(client, database.as_ref(), &profile_pubkey)
-        .await
-        .map_err(|error| CommandError::Achievements(error.to_string()))
+    arcadestr_core::achievements::fetch_profile_badges(
+        client,
+        database.as_ref(),
+        &normalized_pubkey,
+    )
+    .await
+    .map_err(|error| CommandError::Achievements(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_profile_pubkey_identifier_accepts_hex_and_npub() {
+        let hex = "7c4cf6fb7248c4580e7215244f2f3f0ec3de6f7d9862092f155cb7dc39034f3c".to_string();
+        let npub = "npub1l36v00rjfrzy0rjx8f7w8hml4v5h76fht7dy9qn43jl6cwfex0hqvxx8la";
+
+        let normalized_hex =
+            normalize_profile_pubkey_identifier(&hex).expect("hex pubkey should normalize");
+        let normalized_npub =
+            normalize_profile_pubkey_identifier(npub).expect("npub identifier should normalize");
+
+        assert_eq!(normalized_hex, hex);
+        assert_eq!(normalized_npub, hex);
+    }
+
+    #[test]
+    fn normalize_profile_pubkey_identifier_rejects_invalid_identifier() {
+        let result = normalize_profile_pubkey_identifier("not-a-pubkey");
+        assert!(result.is_err());
+    }
 }
 
 pub fn build_list_saved_profiles_response(

@@ -17,8 +17,9 @@ enum BadgeShowcaseState {
 }
 
 #[component]
-pub fn BadgeShowcase(profile_npub: Signal<String>) -> impl IntoView {
+pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
     let state = RwSignal::new(BadgeShowcaseState::Loading);
+    let request_generation = RwSignal::new(0_u64);
 
     #[cfg(feature = "web")]
     {
@@ -27,35 +28,45 @@ pub fn BadgeShowcase(profile_npub: Signal<String>) -> impl IntoView {
 
     #[cfg(not(feature = "web"))]
     Effect::new(move |_| {
-        let npub = profile_npub.get();
-        if npub.is_empty() {
+        let requested_profile_identifier = profile_identifier.get();
+        if requested_profile_identifier.is_empty() {
             state.set(BadgeShowcaseState::Empty);
             return;
         }
 
+        let generation = request_generation.get_untracked().saturating_add(1);
+        request_generation.set(generation);
+
         state.set(BadgeShowcaseState::Loading);
         spawn_local(async move {
             let profile_result: Result<Vec<ProfileBadgeEntry>, String> =
-                fetch_profile_badges(npub.clone()).await;
+                fetch_profile_badges(requested_profile_identifier.clone()).await;
 
             match profile_result {
                 Ok(profile_entries) if !profile_entries.is_empty() => {
-                    state.set(BadgeShowcaseState::Ready(profile_entries_to_summaries(
-                        profile_entries,
-                    )));
+                    if generation == request_generation.get_untracked() {
+                        state.set(BadgeShowcaseState::Ready(profile_entries_to_summaries(
+                            profile_entries,
+                        )));
+                    }
                 }
-                Ok(_) => match fetch_earned_badges(npub).await {
+                Ok(_) | Err(_) => match fetch_earned_badges(requested_profile_identifier).await {
                     Ok(earned) => {
                         let capped = cap_fallback_badges(earned);
-                        if capped.is_empty() {
-                            state.set(BadgeShowcaseState::Empty);
-                        } else {
-                            state.set(BadgeShowcaseState::Ready(capped));
+                        if generation == request_generation.get_untracked() {
+                            if capped.is_empty() {
+                                state.set(BadgeShowcaseState::Empty);
+                            } else {
+                                state.set(BadgeShowcaseState::Ready(capped));
+                            }
                         }
                     }
-                    Err(error) => state.set(BadgeShowcaseState::Error(error)),
+                    Err(error) => {
+                        if generation == request_generation.get_untracked() {
+                            state.set(BadgeShowcaseState::Error(error));
+                        }
+                    }
                 },
-                Err(error) => state.set(BadgeShowcaseState::Error(error)),
             }
         });
     });
