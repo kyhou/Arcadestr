@@ -6,11 +6,14 @@ use crate::models::{Nip05Status, Nip49ExportResult};
 use crate::tauri_bridge::invoke_verify_nip05;
 use crate::{invoke_fetch_marketplace, AuthContext};
 
+#[path = "../../components/badge_showcase.rs"]
+mod badge_showcase;
 #[path = "../../components/nip05_badge.rs"]
 mod nip05_badge;
 #[path = "../../components/nip49_modal.rs"]
 mod nip49_modal;
 
+use badge_showcase::BadgeShowcase;
 use nip05_badge::Nip05Badge;
 use nip49_modal::Nip49Modal;
 
@@ -286,6 +289,8 @@ pub fn ProfileV2View(
                     <Nip05Badge status=nip05_status.into() on_verify=on_verify_nip05 />
                 </Show>
             </header>
+
+            <BadgeShowcase profile_npub=current_npub />
 
             <Show when=move || is_own_profile.get()>
                 <div class="v2-panel v2-profile-listings">
