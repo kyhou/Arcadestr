@@ -4,13 +4,14 @@ use crate::models::EarnedBadgeSummary;
 use crate::tauri_bridge::fetch_earned_badges;
 use crate::AuthContext;
 use leptos::prelude::*;
+use tracing::warn;
 use wasm_bindgen_futures::spawn_local;
 
 #[derive(Debug, Clone)]
 enum AchievementsState {
     Loading,
     Empty,
-    Error(String),
+    Error,
     Ready(Vec<EarnedBadgeSummary>),
     #[cfg(feature = "web")]
     WebUnavailable,
@@ -24,10 +25,36 @@ mod tests {
     fn format_award_date_returns_unix_prefix() {
         assert_eq!(format_award_date(1_714_633_600), "1714633600");
     }
+
+    #[test]
+    fn stale_generation_is_rejected() {
+        assert!(!should_apply_generation(2, 3));
+        assert!(should_apply_generation(3, 3));
+    }
+
+    #[test]
+    fn achievements_error_message_is_sanitized() {
+        assert_eq!(
+            achievements_error_message(),
+            "Could not load achievements. Please try again."
+        );
+    }
 }
 
-fn format_award_date(_created_at: u64) -> String {
-    _created_at.to_string()
+fn format_award_date(created_at: u64) -> String {
+    created_at.to_string()
+}
+
+fn next_generation(generation: u64) -> u64 {
+    generation.saturating_add(1)
+}
+
+fn should_apply_generation(request_generation: u64, current_generation: u64) -> bool {
+    request_generation == current_generation
+}
+
+fn achievements_error_message() -> &'static str {
+    "Could not load achievements. Please try again."
 }
 
 fn short_pubkey(pubkey: &str) -> String {
@@ -68,20 +95,21 @@ pub fn AchievementsView() -> impl IntoView {
 
     #[cfg(not(feature = "web"))]
     Effect::new(move |_| {
+        let generation = next_generation(request_generation.get_untracked());
+        request_generation.set(generation);
+
         let requested_profile_pubkey = profile_pubkey.get();
         if requested_profile_pubkey.is_empty() {
             state.set(AchievementsState::Empty);
             return;
         }
 
-        let generation = request_generation.get_untracked().saturating_add(1);
-        request_generation.set(generation);
         state.set(AchievementsState::Loading);
 
         spawn_local(async move {
             match fetch_earned_badges(requested_profile_pubkey).await {
                 Ok(badges) => {
-                    if generation == request_generation.get_untracked() {
+                    if should_apply_generation(generation, request_generation.get_untracked()) {
                         if badges.is_empty() {
                             state.set(AchievementsState::Empty);
                         } else {
@@ -90,8 +118,9 @@ pub fn AchievementsView() -> impl IntoView {
                     }
                 }
                 Err(error) => {
-                    if generation == request_generation.get_untracked() {
-                        state.set(AchievementsState::Error(error));
+                    warn!("failed to fetch achievements: {}", error);
+                    if should_apply_generation(generation, request_generation.get_untracked()) {
+                        state.set(AchievementsState::Error);
                     }
                 }
             }
@@ -114,10 +143,9 @@ pub fn AchievementsView() -> impl IntoView {
                     AchievementsState::Empty => {
                         view! { <p>"No verified badges yet."</p> }.into_any()
                     }
-                    AchievementsState::Error(error) => view! {
-                        <p>{format!("Failed to load achievements: {error}")}</p>
+                    AchievementsState::Error => {
+                        view! { <p>{achievements_error_message()}</p> }.into_any()
                     }
-                    .into_any(),
                     #[cfg(feature = "web")]
                     AchievementsState::WebUnavailable => view! {
                         <p class="badge-showcase-unavailable">

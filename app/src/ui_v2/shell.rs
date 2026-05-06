@@ -211,14 +211,6 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         on_click={Callback::new(set_social)}
                     />
                     <NavItem
-                        label="Achievements"
-                        icon="emoji_events"
-                        active={Signal::derive(move || {
-                            current_view.get() == UiV2View::Achievements
-                        })}
-                        on_click={Callback::new(set_achievements)}
-                    />
-                    <NavItem
                         label="Publish"
                         icon="upload"
                         active={Signal::derive(move || current_view.get() == UiV2View::Publish)}
@@ -229,6 +221,14 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         icon="person"
                         active={Signal::derive(move || current_view.get() == UiV2View::Profile)}
                         on_click={Callback::new(set_profile)}
+                    />
+                    <NavItem
+                        label="Achievements"
+                        icon="emoji_events"
+                        active={Signal::derive(move || {
+                            current_view.get() == UiV2View::Achievements
+                        })}
+                        on_click={Callback::new(set_achievements)}
                     />
                     <NavItem
                         label="Settings"
@@ -393,6 +393,10 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                 <button class="flex flex-col items-center text-on-surface-variant" on:click=move |_| current_view.set(UiV2View::Social)>
                     <span class="material-symbols-outlined">"forum"</span>
                     <span class="text-[10px] font-medium">"Social"</span>
+                </button>
+                <button class="flex flex-col items-center text-on-surface-variant" on:click=move |_| set_achievements(())>
+                    <span class="material-symbols-outlined">"emoji_events"</span>
+                    <span class="text-[10px] font-medium">"Achievements"</span>
                 </button>
                 <button class="flex flex-col items-center text-on-surface-variant" on:click=move |_| current_view.set(UiV2View::Settings)>
                     <span class="material-symbols-outlined">"settings"</span>
