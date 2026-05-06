@@ -509,8 +509,8 @@ mod tests {
 
         let normalized_hex =
             normalize_profile_pubkey_identifier(&hex).expect("hex pubkey should normalize");
-        let normalized_npub = normalize_profile_pubkey_identifier(&npub)
-            .expect("npub identifier should normalize");
+        let normalized_npub =
+            normalize_profile_pubkey_identifier(&npub).expect("npub identifier should normalize");
 
         assert_eq!(normalized_hex, hex);
         assert_eq!(normalized_npub, hex);
