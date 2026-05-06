@@ -30,38 +30,34 @@ pub fn BadgeEarnedModal(
         }
     };
 
+    #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
-        #[cfg(target_arch = "wasm32")]
-        {
-            if !show.get() {
-                return;
-            }
+        if !show.get() {
+            return;
+        }
 
-            if let Some(window) = web_sys::window() {
-                if let Some(document) = window.document() {
-                    let on_close = on_close.clone();
-                    let callback = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
-                        if should_close_on_key(&event.key()) {
-                            on_close.run(());
+        if let Some(window) = web_sys::window() {
+            if let Some(document) = window.document() {
+                let on_close = on_close.clone();
+                let callback = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
+                    if should_close_on_key(&event.key()) {
+                        on_close.run(());
+                    }
+                }) as Box<dyn FnMut(_)>);
+
+                let _ = document
+                    .add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
+
+                on_cleanup(move || {
+                    if let Some(window) = web_sys::window() {
+                        if let Some(document) = window.document() {
+                            let _ = document.remove_event_listener_with_callback(
+                                "keydown",
+                                callback.as_ref().unchecked_ref(),
+                            );
                         }
-                    }) as Box<dyn FnMut(_)>);
-
-                    let _ = document.add_event_listener_with_callback(
-                        "keydown",
-                        callback.as_ref().unchecked_ref(),
-                    );
-
-                    on_cleanup(move || {
-                        if let Some(window) = web_sys::window() {
-                            if let Some(document) = window.document() {
-                                let _ = document.remove_event_listener_with_callback(
-                                    "keydown",
-                                    callback.as_ref().unchecked_ref(),
-                                );
-                            }
-                        }
-                    });
-                }
+                    }
+                });
             }
         }
     });
