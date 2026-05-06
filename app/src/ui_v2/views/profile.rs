@@ -1,19 +1,17 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::components::BadgeShowcase;
 use crate::models::GameListing;
 use crate::models::{Nip05Status, Nip49ExportResult};
 use crate::tauri_bridge::invoke_verify_nip05;
 use crate::{invoke_fetch_marketplace, AuthContext};
 
-#[path = "../../components/badge_showcase.rs"]
-mod badge_showcase;
 #[path = "../../components/nip05_badge.rs"]
 mod nip05_badge;
 #[path = "../../components/nip49_modal.rs"]
 mod nip49_modal;
 
-use badge_showcase::BadgeShowcase;
 use nip05_badge::Nip05Badge;
 use nip49_modal::Nip49Modal;
 
