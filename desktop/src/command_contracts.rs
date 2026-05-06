@@ -1,3 +1,4 @@
+use arcadestr_core::achievements::{EarnedBadgeSummary, ProfileBadgeEntry};
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::nip46::store_ncryptsec_in_keychain;
 use arcadestr_core::nip46::ProfileMetadata;
@@ -14,9 +15,30 @@ use nostr::prelude::ToBech32;
 use nostr::Keys;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tracing::error;
+
+fn normalize_profile_pubkey_identifier(profile_pubkey: &str) -> Result<String, CommandError> {
+    let trimmed = profile_pubkey.trim();
+    if trimmed.is_empty() {
+        return Err(CommandError::InvalidInput(
+            "Profile pubkey cannot be empty".to_string(),
+        ));
+    }
+
+    if trimmed.starts_with("npub1") || trimmed.starts_with("nprofile1") {
+        return parse_nip19_identifier(trimmed)
+            .map(|parsed| parsed.pubkey)
+            .map_err(|error| CommandError::InvalidInput(error.to_string()));
+    }
+
+    nostr::key::PublicKey::parse(trimmed)
+        .map(|pubkey| pubkey.to_hex())
+        .map_err(|error| CommandError::InvalidInput(format!("Invalid profile pubkey: {error}")))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExportKeyRequest {
@@ -72,6 +94,17 @@ pub enum CommandError {
     NoActiveKey,
     #[error("{0}")]
     InvalidInput(String),
+    #[error("Achievement operation failed: {0}")]
+    Achievements(String),
+}
+
+pub trait BadgeCommandState {
+    fn badge_command_handles(
+        &self,
+    ) -> (
+        Arc<Mutex<arcadestr_core::nostr::NostrClient>>,
+        Arc<arcadestr_core::storage::Database>,
+    );
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -303,15 +336,14 @@ pub async fn verify_nip05(
     expected_npub: String,
     state: &crate::AppState,
 ) -> Result<Nip05Status, CommandError> {
-    let expected_pubkey = if expected_npub.starts_with("npub1")
-        || expected_npub.starts_with("nprofile1")
-    {
-        parse_nip19_identifier(&expected_npub)
-            .map_err(|error| CommandError::InvalidInput(error.to_string()))?
-            .pubkey
-    } else {
-        expected_npub
-    };
+    let expected_pubkey =
+        if expected_npub.starts_with("npub1") || expected_npub.starts_with("nprofile1") {
+            parse_nip19_identifier(&expected_npub)
+                .map_err(|error| CommandError::InvalidInput(error.to_string()))?
+                .pubkey
+        } else {
+            expected_npub
+        };
 
     let result = verify_nip05_identity(
         state,
@@ -397,6 +429,98 @@ pub fn serialize_fetch_listings_result(
 
 pub fn serialize_fetch_profile_result(profile: &UserProfile) -> Result<serde_json::Value, String> {
     serde_json::to_value(profile).map_err(|e| e.to_string())
+}
+
+pub fn serialize_fetch_earned_badges_result(
+    badges: &[EarnedBadgeSummary],
+) -> Result<serde_json::Value, CommandError> {
+    serde_json::to_value(badges).map_err(|error| CommandError::InvalidInput(error.to_string()))
+}
+
+pub fn serialize_fetch_profile_badges_result(
+    badges: &[ProfileBadgeEntry],
+) -> Result<serde_json::Value, CommandError> {
+    serde_json::to_value(badges).map_err(|error| CommandError::InvalidInput(error.to_string()))
+}
+
+pub async fn fetch_earned_badges<S>(
+    state: &S,
+    profile_pubkey: String,
+) -> Result<Vec<EarnedBadgeSummary>, CommandError>
+where
+    S: BadgeCommandState + ?Sized,
+{
+    let normalized_pubkey = normalize_profile_pubkey_identifier(&profile_pubkey)?;
+
+    let (nostr, database) = state.badge_command_handles();
+    let relay_manager = {
+        let nostr = nostr.lock().await;
+        nostr.relay_manager()
+    };
+    let client = {
+        let manager = relay_manager.lock().await;
+        manager.get_client_arc()
+    };
+
+    arcadestr_core::achievements::fetch_user_badges(client, database.as_ref(), &normalized_pubkey)
+        .await
+        .map_err(|error| CommandError::Achievements(error.to_string()))
+}
+
+pub async fn fetch_profile_badges<S>(
+    state: &S,
+    profile_pubkey: String,
+) -> Result<Vec<ProfileBadgeEntry>, CommandError>
+where
+    S: BadgeCommandState + ?Sized,
+{
+    let normalized_pubkey = normalize_profile_pubkey_identifier(&profile_pubkey)?;
+
+    let (nostr, database) = state.badge_command_handles();
+    let relay_manager = {
+        let nostr = nostr.lock().await;
+        nostr.relay_manager()
+    };
+    let client = {
+        let manager = relay_manager.lock().await;
+        manager.get_client_arc()
+    };
+
+    arcadestr_core::achievements::fetch_profile_badges(
+        client,
+        database.as_ref(),
+        &normalized_pubkey,
+    )
+    .await
+    .map_err(|error| CommandError::Achievements(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_profile_pubkey_identifier_accepts_hex_and_npub() {
+        let hex = "7c4cf6fb7248c4580e7215244f2f3f0ec3de6f7d9862092f155cb7dc39034f3c".to_string();
+        let npub = nostr::key::PublicKey::parse(&hex)
+            .expect("hex test vector should parse")
+            .to_bech32()
+            .expect("npub conversion should succeed");
+
+        let normalized_hex =
+            normalize_profile_pubkey_identifier(&hex).expect("hex pubkey should normalize");
+        let normalized_npub =
+            normalize_profile_pubkey_identifier(&npub).expect("npub identifier should normalize");
+
+        assert_eq!(normalized_hex, hex);
+        assert_eq!(normalized_npub, hex);
+    }
+
+    #[test]
+    fn normalize_profile_pubkey_identifier_rejects_invalid_identifier() {
+        let result = normalize_profile_pubkey_identifier("not-a-pubkey");
+        assert!(result.is_err());
+    }
 }
 
 pub fn build_list_saved_profiles_response(

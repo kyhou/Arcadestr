@@ -1,10 +1,35 @@
 use leptos::prelude::*;
 
-use crate::components::DetailView;
-use crate::models::GameListing;
+use crate::components::{BadgeEarnedModal, DetailView};
+use crate::models::{BadgeAward, BadgeDefinition, EarnedBadgeSummary, GameListing};
 
 #[component]
 pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoView {
+    let earned_badge_preview = RwSignal::new(None::<EarnedBadgeSummary>);
+
+    let close_badge_modal = {
+        let earned_badge_preview = earned_badge_preview;
+        Callback::new(move |_| {
+            earned_badge_preview.set(None);
+        })
+    };
+
+    // Follow-up: wire to kind-8 relay subscription when badge issuance lands.
+    let on_invoice_created = {
+        let earned_badge_preview = earned_badge_preview;
+        Callback::new(move |_| {
+            #[cfg(debug_assertions)]
+            {
+                earned_badge_preview.set(Some(debug_badge_preview()));
+            }
+
+            #[cfg(not(debug_assertions))]
+            {
+                let _ = earned_badge_preview;
+            }
+        })
+    };
+
     view! {
         <section class="v2-detail-wrap">
             <header class="v2-panel-glass v2-detail-hero" style="background-image: linear-gradient(to top, rgba(10,14,20,0.88), rgba(10,14,20,0.45)), url('https://lh3.googleusercontent.com/aida-public/AB6AXuD-Ozg13DMgznaYJPfnCPqP23kDPxch68yt6upMyXYigCQaIOMX4YdXUN3LwNGk3We8TUzv3wMIfTAquYKFk8OEvX76pBMOC_8XyhdgITa5_usQuj7BnBfaxinkhdbzYGWxwQPawXKz8ycGRM8BtW51t-mtyR--Sv20X81urEaqZQwVu17fQdfKkvNGN_bPW-Q3hwWWZ2kcScEa7h66NAkbLCmiiqwqF_qRaQ8Wsqt6sGYj3Sb2VRCzFmgOQEl-5n6kzZlQ3RfHpzU'); background-size: cover; background-position: center;">
@@ -115,8 +140,43 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             </div>
 
             <section class="v2-panel v2-detail-transaction-wrap">
-                <DetailView listing={listing} on_back={on_back} />
+                <DetailView
+                    listing={listing}
+                    on_back={on_back}
+                    on_invoice_created=on_invoice_created
+                />
             </section>
+
+            <BadgeEarnedModal badge=earned_badge_preview.into() on_close=close_badge_modal />
         </section>
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_badge_preview() -> EarnedBadgeSummary {
+    EarnedBadgeSummary {
+        definition: BadgeDefinition {
+            coordinate: "30009:debug:beta-tester".to_string(),
+            issuer_pubkey: "debug_issuer_pubkey".to_string(),
+            badge_id: "beta-tester".to_string(),
+            name: Some("Beta Tester".to_string()),
+            description: Some("Awarded for testing in debug mode.".to_string()),
+            image_url: Some("https://example.com/badge-beta.png".to_string()),
+            image_dimensions: None,
+            thumb_url: Some("https://example.com/badge-beta-thumb.png".to_string()),
+            thumb_dimensions: None,
+            relay_url: None,
+            event_id: "debug_definition_event".to_string(),
+            created_at: 0,
+        },
+        award: BadgeAward {
+            event_id: "debug_award_event".to_string(),
+            issuer_pubkey: "debug_issuer_pubkey".to_string(),
+            recipient_pubkey: "debug_recipient_pubkey".to_string(),
+            badge_coordinate: "30009:debug:beta-tester".to_string(),
+            relay_url: None,
+            created_at: 0,
+        },
+        visible_on_profile: true,
     }
 }

@@ -1,5 +1,6 @@
 //! UI v2 view modules.
 
+pub mod achievements;
 pub mod browse_games;
 pub mod game_detail;
 pub mod library;
@@ -10,6 +11,7 @@ pub mod publish;
 pub mod social;
 pub mod store_front;
 
+pub use achievements::AchievementsView;
 pub use browse_games::BrowseGamesView;
 pub use game_detail::GameDetailView;
 pub use library::LibraryView;

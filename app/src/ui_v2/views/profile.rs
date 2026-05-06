@@ -1,16 +1,16 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::components::BadgeShowcase;
 use crate::models::GameListing;
 use crate::models::{Nip05Status, Nip49ExportResult};
+use crate::tauri_bridge::invoke_verify_nip05;
 use crate::{invoke_fetch_marketplace, AuthContext};
 
 #[path = "../../components/nip05_badge.rs"]
 mod nip05_badge;
 #[path = "../../components/nip49_modal.rs"]
 mod nip49_modal;
-#[path = "../../tauri_bridge.rs"]
-mod tauri_bridge;
 
 use nip05_badge::Nip05Badge;
 use nip49_modal::Nip49Modal;
@@ -153,7 +153,9 @@ pub fn ProfileV2View(
     let show_nip49_modal = RwSignal::new(false);
     let last_export_result = RwSignal::new(None::<Nip49ExportResult>);
     let nip05_status = RwSignal::new(default_nip05_status(
-        auth.profile.get_untracked().and_then(|profile| profile.nip05),
+        auth.profile
+            .get_untracked()
+            .and_then(|profile| profile.nip05),
     ));
     let last_auto_nip05_attempt = RwSignal::new(None::<String>);
 
@@ -224,7 +226,7 @@ pub fn ProfileV2View(
         });
 
         spawn_local(async move {
-            match tauri_bridge::invoke_verify_nip05(identifier.clone(), expected_npub).await {
+            match invoke_verify_nip05(identifier.clone(), expected_npub).await {
                 Ok(status) => nip05_status.set(status),
                 Err(bridge_error) => {
                     let fallback = default_nip05_status(Some(identifier));
@@ -246,7 +248,7 @@ pub fn ProfileV2View(
         nip05_status.set(verifying);
 
         spawn_local(async move {
-            match tauri_bridge::invoke_verify_nip05(identifier.clone(), expected_npub).await {
+            match invoke_verify_nip05(identifier.clone(), expected_npub).await {
                 Ok(status) => nip05_status.set(status),
                 Err(bridge_error) => {
                     let fallback = default_nip05_status(Some(identifier));
@@ -285,6 +287,8 @@ pub fn ProfileV2View(
                     <Nip05Badge status=nip05_status.into() on_verify=on_verify_nip05 />
                 </Show>
             </header>
+
+            <BadgeShowcase profile_identifier=current_npub />
 
             <Show when=move || is_own_profile.get()>
                 <div class="v2-panel v2-profile-listings">

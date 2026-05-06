@@ -2,6 +2,8 @@
 
 pub mod account_selector;
 pub mod backup_manager;
+pub mod badge_earned_modal;
+pub mod badge_showcase;
 pub mod browse;
 pub mod detail;
 pub mod profile;
@@ -12,6 +14,8 @@ pub mod publish;
 // Re-export components
 pub use account_selector::AccountSelector;
 pub use backup_manager::BackupManager;
+pub use badge_earned_modal::BadgeEarnedModal;
+pub use badge_showcase::BadgeShowcase;
 pub use browse::{BrowseView, ListingCard};
 pub use detail::DetailView;
 pub use profile::ProfileView;

@@ -45,15 +45,16 @@ pub mod models;
 pub mod qr;
 mod relay_state;
 pub mod store;
+pub mod tauri_bridge;
 pub mod ui_v2;
 
 // Import ProfileStore and related functions for store initialization and event handlers
+use crate::relay_state::{apply_relay_event, merge_relay_snapshot};
 use crate::store::{
     provide_marketplace_store, provide_profile_store, try_use_marketplace_store,
     try_use_profile_store, use_marketplace_store, use_profile_store, MarketplaceStore,
     ProfileStore,
 };
-use crate::relay_state::{apply_relay_event, merge_relay_snapshot};
 use crate::ui_v2::{views::LoginV2View, UiV2Root};
 
 #[cfg(all(target_arch = "wasm32", feature = "web"))]

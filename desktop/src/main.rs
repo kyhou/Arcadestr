@@ -57,6 +57,8 @@ pub struct AppState {
     pub auth: Arc<Mutex<AuthState>>,
     /// NOSTR client for relay communication.
     pub nostr: Arc<Mutex<NostrClient>>,
+    /// Shared SQLite database for command contract cache coordination.
+    pub database: Arc<arcadestr_core::storage::Database>,
     /// Relay cache for NIP-65 relay list management.
     pub relay_cache: Arc<RelayCache>,
     /// Event deduplicator to prevent duplicate event processing.
@@ -79,6 +81,17 @@ pub struct AppState {
     pub nip05_validator: Arc<std::sync::Mutex<Nip05Validator>>,
     /// Shared HTTP client used by command contracts.
     pub http_client: Arc<dyn HttpClient>,
+}
+
+impl command_contracts::BadgeCommandState for AppState {
+    fn badge_command_handles(
+        &self,
+    ) -> (
+        Arc<Mutex<arcadestr_core::nostr::NostrClient>>,
+        Arc<arcadestr_core::storage::Database>,
+    ) {
+        (self.nostr.clone(), self.database.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2069,6 +2082,26 @@ fn main() {
         Ok(command_contracts::version_info())
     }
 
+    #[tauri::command]
+    async fn fetch_earned_badges(
+        state: tauri::State<'_, AppState>,
+        profile_pubkey: String,
+    ) -> Result<Vec<arcadestr_core::achievements::EarnedBadgeSummary>, String> {
+        command_contracts::fetch_earned_badges(state.inner(), profile_pubkey)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[tauri::command]
+    async fn fetch_profile_badges(
+        state: tauri::State<'_, AppState>,
+        profile_pubkey: String,
+    ) -> Result<Vec<arcadestr_core::achievements::ProfileBadgeEntry>, String> {
+        command_contracts::fetch_profile_badges(state.inner(), profile_pubkey)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     /// Version info structure for frontend
     type VersionInfo = command_contracts::VersionInfo;
 
@@ -2076,6 +2109,7 @@ fn main() {
         .manage(AppState {
             auth: Arc::new(Mutex::new(AuthState::new())),
             nostr: nostr_client.clone(),
+            database: Arc::new(database),
             relay_cache: relay_cache.clone(),
             deduplicator: Arc::new(Mutex::new(deduplicator)),
             subscription_registry: subscription_registry.clone(),
@@ -2431,6 +2465,8 @@ fn main() {
             fetch_marketplace,
             fetch_marketplace_stream,
             fetch_profile,
+            fetch_earned_badges,
+            fetch_profile_badges,
             fetch_profile_with_hints,
             request_invoice,
             // Saved users management

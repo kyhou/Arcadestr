@@ -1,6 +1,7 @@
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 // Migration 1: Initial schema (accounts, relay_backups, remote_uris, secure_storage)
@@ -115,12 +116,16 @@ CREATE INDEX IF NOT EXISTS idx_users_expires ON users(expires_at);
 // ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS geohash TEXT;
 // "#;
 
+// Migration 5: NIP-58 achievement badge cache
+const MIGRATION_5_ACHIEVEMENTS: &str = include_str!("../../migrations/002_achievements.sql");
+
 // List of all migrations in order
 const MIGRATIONS: &[&str] = &[
     MIGRATION_1_INITIAL,
     MIGRATION_2_GAMES_TABLE,
     MIGRATION_3_RELAYS_TABLE,
     MIGRATION_4_USERS_TABLE,
+    MIGRATION_5_ACHIEVEMENTS,
 ];
 
 /// Database connection pool for SQLite
@@ -146,11 +151,16 @@ impl Database {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        let connect_options = SqliteConnectOptions::new()
+            .filename(db_path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .min_connections(1)
             .acquire_timeout(std::time::Duration::from_secs(30))
-            .connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .connect_with(connect_options)
             .await?;
 
         // Run migrations
@@ -282,6 +292,333 @@ impl Database {
     pub async fn close(&self) {
         self.pool.close().await;
     }
+
+    /// Cache or update a badge definition by coordinate.
+    ///
+    /// # Errors
+    /// Returns `DatabaseError` when SQLite rejects the write.
+    pub async fn cache_badge_definition(
+        &self,
+        definition: &crate::achievements::BadgeDefinition,
+        raw_event_json: &str,
+    ) -> Result<(), DatabaseError> {
+        sqlx::query(
+            r#"
+            INSERT INTO badge_definitions (
+                coordinate, issuer_pubkey, badge_id, event_id, name, description,
+                image_url, image_dimensions, thumb_url, thumb_dimensions, relay_url,
+                created_at, raw_event_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(coordinate) DO UPDATE SET
+                issuer_pubkey = excluded.issuer_pubkey,
+                badge_id = excluded.badge_id,
+                event_id = excluded.event_id,
+                name = excluded.name,
+                description = excluded.description,
+                image_url = excluded.image_url,
+                image_dimensions = excluded.image_dimensions,
+                thumb_url = excluded.thumb_url,
+                thumb_dimensions = excluded.thumb_dimensions,
+                relay_url = excluded.relay_url,
+                created_at = excluded.created_at,
+                raw_event_json = excluded.raw_event_json
+            WHERE excluded.created_at > badge_definitions.created_at
+               OR (excluded.created_at = badge_definitions.created_at
+                   AND excluded.event_id < badge_definitions.event_id)
+            "#,
+        )
+        .bind(&definition.coordinate)
+        .bind(&definition.issuer_pubkey)
+        .bind(&definition.badge_id)
+        .bind(&definition.event_id)
+        .bind(&definition.name)
+        .bind(&definition.description)
+        .bind(&definition.image_url)
+        .bind(&definition.image_dimensions)
+        .bind(&definition.thumb_url)
+        .bind(&definition.thumb_dimensions)
+        .bind(&definition.relay_url)
+        .bind(unix_to_i64(definition.created_at)?)
+        .bind(raw_event_json)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Cache an immutable kind-8 badge award by event id.
+    ///
+    /// # Errors
+    /// Returns `DatabaseError` when SQLite rejects the write.
+    pub async fn cache_badge_award(
+        &self,
+        award: &crate::achievements::BadgeAward,
+        raw_event_json: &str,
+    ) -> Result<(), DatabaseError> {
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO badge_awards (
+                event_id, issuer_pubkey, recipient_pubkey, badge_coordinate,
+                relay_url, created_at, raw_event_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&award.event_id)
+        .bind(&award.issuer_pubkey)
+        .bind(&award.recipient_pubkey)
+        .bind(&award.badge_coordinate)
+        .bind(&award.relay_url)
+        .bind(unix_to_i64(award.created_at)?)
+        .bind(raw_event_json)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Replace cached profile badge entries in a single transaction.
+    ///
+    /// # Errors
+    /// Returns `DatabaseError` when SQLite rejects the transaction.
+    pub async fn cache_profile_badge_list(
+        &self,
+        list: &crate::achievements::ProfileBadgeList,
+        raw_event_json: &str,
+    ) -> Result<(), DatabaseError> {
+        let mut tx = self.pool.begin().await?;
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO profile_badge_lists (
+                profile_pubkey, event_id, kind, created_at, raw_event_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(profile_pubkey) DO UPDATE SET
+                event_id = excluded.event_id,
+                kind = excluded.kind,
+                created_at = excluded.created_at,
+                raw_event_json = excluded.raw_event_json,
+                updated_at = excluded.updated_at
+            WHERE (excluded.kind = 10008 AND profile_badge_lists.kind = 30008)
+               OR (profile_badge_lists.kind = excluded.kind
+                   AND excluded.created_at > profile_badge_lists.created_at)
+               OR (profile_badge_lists.kind = excluded.kind
+                   AND excluded.created_at = profile_badge_lists.created_at
+                   AND excluded.event_id < profile_badge_lists.event_id)
+            "#,
+        )
+        .bind(&list.profile_pubkey)
+        .bind(&list.event_id)
+        .bind(i64::from(list.kind))
+        .bind(unix_to_i64(list.created_at)?)
+        .bind(raw_event_json)
+        .bind(now_unix_i64()?)
+        .execute(&mut *tx)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        sqlx::query("DELETE FROM profile_badge_entries WHERE profile_pubkey = ?")
+            .bind(&list.profile_pubkey)
+            .execute(&mut *tx)
+            .await?;
+
+        for entry in &list.entries {
+            sqlx::query(
+                r#"
+                INSERT INTO profile_badge_entries (
+                    profile_pubkey, badge_coordinate, award_event_id, relay_url, display_order
+                ) VALUES (?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&list.profile_pubkey)
+            .bind(&entry.badge_coordinate)
+            .bind(&entry.award_event_id)
+            .bind(&entry.relay_url)
+            .bind(usize_to_i64(entry.display_order)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Return verified earned badges joined to cached definitions.
+    ///
+    /// # Errors
+    /// Returns `DatabaseError` when SQLite query execution fails.
+    pub async fn earned_badges_for_profile(
+        &self,
+        profile_pubkey: &str,
+    ) -> Result<Vec<crate::achievements::EarnedBadgeSummary>, DatabaseError> {
+        let rows = sqlx::query(EARNED_BADGES_QUERY)
+            .bind(profile_pubkey)
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.iter().map(earned_badge_summary_from_row).collect()
+    }
+
+    /// Return profile-selected badges in display order.
+    ///
+    /// # Errors
+    /// Returns `DatabaseError` when SQLite query execution fails.
+    pub async fn profile_badges_for_profile(
+        &self,
+        profile_pubkey: &str,
+    ) -> Result<Vec<crate::achievements::ProfileBadgeEntry>, DatabaseError> {
+        let rows = sqlx::query(PROFILE_BADGES_QUERY)
+            .bind(profile_pubkey)
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.iter().map(profile_badge_entry_from_row).collect()
+    }
+}
+
+const EARNED_BADGES_QUERY: &str = r#"
+    SELECT
+        d.coordinate AS definition_coordinate,
+        d.issuer_pubkey AS definition_issuer_pubkey,
+        d.badge_id AS definition_badge_id,
+        d.event_id AS definition_event_id,
+        d.name AS definition_name,
+        d.description AS definition_description,
+        d.image_url AS definition_image_url,
+        d.image_dimensions AS definition_image_dimensions,
+        d.thumb_url AS definition_thumb_url,
+        d.thumb_dimensions AS definition_thumb_dimensions,
+        d.relay_url AS definition_relay_url,
+        d.created_at AS definition_created_at,
+        a.event_id AS award_event_id,
+        a.issuer_pubkey AS award_issuer_pubkey,
+        a.recipient_pubkey AS award_recipient_pubkey,
+        a.badge_coordinate AS award_badge_coordinate,
+        a.relay_url AS award_relay_url,
+        a.created_at AS award_created_at,
+        CASE WHEN pbe.award_event_id IS NULL THEN 0 ELSE 1 END AS visible_on_profile
+    FROM badge_awards a
+    INNER JOIN badge_definitions d ON d.coordinate = a.badge_coordinate
+    LEFT JOIN profile_badge_entries pbe
+        ON pbe.profile_pubkey = a.recipient_pubkey
+       AND pbe.award_event_id = a.event_id
+       AND pbe.badge_coordinate = a.badge_coordinate
+    WHERE a.recipient_pubkey = ?
+    ORDER BY a.created_at DESC, a.event_id ASC
+"#;
+
+const PROFILE_BADGES_QUERY: &str = r#"
+    SELECT
+        d.coordinate AS definition_coordinate,
+        d.issuer_pubkey AS definition_issuer_pubkey,
+        d.badge_id AS definition_badge_id,
+        d.event_id AS definition_event_id,
+        d.name AS definition_name,
+        d.description AS definition_description,
+        d.image_url AS definition_image_url,
+        d.image_dimensions AS definition_image_dimensions,
+        d.thumb_url AS definition_thumb_url,
+        d.thumb_dimensions AS definition_thumb_dimensions,
+        d.relay_url AS definition_relay_url,
+        d.created_at AS definition_created_at,
+        a.event_id AS award_event_id,
+        a.issuer_pubkey AS award_issuer_pubkey,
+        a.recipient_pubkey AS award_recipient_pubkey,
+        a.badge_coordinate AS award_badge_coordinate,
+        a.relay_url AS award_relay_url,
+        a.created_at AS award_created_at,
+        pbe.display_order AS display_order
+    FROM profile_badge_entries pbe
+    INNER JOIN badge_definitions d ON d.coordinate = pbe.badge_coordinate
+    INNER JOIN badge_awards a
+        ON a.event_id = pbe.award_event_id
+       AND a.recipient_pubkey = pbe.profile_pubkey
+       AND a.badge_coordinate = pbe.badge_coordinate
+    WHERE pbe.profile_pubkey = ?
+    ORDER BY pbe.display_order ASC
+"#;
+
+fn earned_badge_summary_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<crate::achievements::EarnedBadgeSummary, DatabaseError> {
+    Ok(crate::achievements::EarnedBadgeSummary {
+        definition: definition_from_row(row)?,
+        award: award_from_row(row)?,
+        visible_on_profile: row.try_get::<i64, _>("visible_on_profile")? != 0,
+    })
+}
+
+fn profile_badge_entry_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<crate::achievements::ProfileBadgeEntry, DatabaseError> {
+    Ok(crate::achievements::ProfileBadgeEntry {
+        definition: definition_from_row(row)?,
+        award: award_from_row(row)?,
+        display_order: i64_to_usize(row.try_get::<i64, _>("display_order")?)?,
+        visible: true,
+    })
+}
+
+fn definition_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<crate::achievements::BadgeDefinition, DatabaseError> {
+    Ok(crate::achievements::BadgeDefinition {
+        coordinate: row.try_get("definition_coordinate")?,
+        issuer_pubkey: row.try_get("definition_issuer_pubkey")?,
+        badge_id: row.try_get("definition_badge_id")?,
+        name: row.try_get("definition_name")?,
+        description: row.try_get("definition_description")?,
+        image_url: row.try_get("definition_image_url")?,
+        image_dimensions: row.try_get("definition_image_dimensions")?,
+        thumb_url: row.try_get("definition_thumb_url")?,
+        thumb_dimensions: row.try_get("definition_thumb_dimensions")?,
+        relay_url: row.try_get("definition_relay_url")?,
+        event_id: row.try_get("definition_event_id")?,
+        created_at: i64_to_u64(row.try_get("definition_created_at")?)?,
+    })
+}
+
+fn award_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<crate::achievements::BadgeAward, DatabaseError> {
+    Ok(crate::achievements::BadgeAward {
+        event_id: row.try_get("award_event_id")?,
+        issuer_pubkey: row.try_get("award_issuer_pubkey")?,
+        recipient_pubkey: row.try_get("award_recipient_pubkey")?,
+        badge_coordinate: row.try_get("award_badge_coordinate")?,
+        relay_url: row.try_get("award_relay_url")?,
+        created_at: i64_to_u64(row.try_get("award_created_at")?)?,
+    })
+}
+
+fn now_unix_i64() -> Result<i64, DatabaseError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| DatabaseError::Migration(format!("System clock before Unix epoch: {e}")))?;
+    unix_to_i64(duration.as_secs())
+}
+
+fn unix_to_i64(value: u64) -> Result<i64, DatabaseError> {
+    i64::try_from(value)
+        .map_err(|_| DatabaseError::Migration(format!("Timestamp out of range: {value}")))
+}
+
+fn usize_to_i64(value: usize) -> Result<i64, DatabaseError> {
+    i64::try_from(value)
+        .map_err(|_| DatabaseError::Migration(format!("Display order out of range: {value}")))
+}
+
+fn i64_to_usize(value: i64) -> Result<usize, DatabaseError> {
+    usize::try_from(value)
+        .map_err(|_| DatabaseError::Migration(format!("Display order out of range: {value}")))
+}
+
+fn i64_to_u64(value: i64) -> Result<u64, DatabaseError> {
+    u64::try_from(value)
+        .map_err(|_| DatabaseError::Migration(format!("Timestamp out of range: {value}")))
 }
 
 #[cfg(test)]

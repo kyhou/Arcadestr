@@ -1244,24 +1244,33 @@ impl NostrClient {
         let events = {
             let manager = self.relay_manager.lock().await;
 
-            match manager.fetch_events_best_effort_no_wait(filter.clone()).await {
+            match manager
+                .fetch_events_best_effort_no_wait(filter.clone())
+                .await
+            {
                 Ok(events) if !events.is_empty() => events,
                 Ok(_) => {
                     tracing::debug!(
                         "Follow list fast-path returned no events; falling back to readiness-wait query"
                     );
-                    manager.fetch_events_best_effort(filter).await.map_err(|e| {
-                        NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
-                    })?
+                    manager
+                        .fetch_events_best_effort(filter)
+                        .await
+                        .map_err(|e| {
+                            NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
+                        })?
                 }
                 Err(e) => {
                     tracing::debug!(
                         "Follow list fast-path failed: {}. Falling back to readiness-wait query",
                         e
                     );
-                    manager.fetch_events_best_effort(filter).await.map_err(|e| {
-                        NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
-                    })?
+                    manager
+                        .fetch_events_best_effort(filter)
+                        .await
+                        .map_err(|e| {
+                            NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
+                        })?
                 }
             }
         };
@@ -1505,9 +1514,12 @@ impl NostrClient {
 
         let events = {
             let manager = self.relay_manager.lock().await;
-            manager.fetch_events_best_effort(filter).await.map_err(|e| {
-                NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
-            })?
+            manager
+                .fetch_events_best_effort(filter)
+                .await
+                .map_err(|e| {
+                    NostrError::RelayError(format!("Failed to fetch follow list: {}", e))
+                })?
         };
 
         let event = match events.first() {
