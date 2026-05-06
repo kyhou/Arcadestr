@@ -1,42 +1,12 @@
 use leptos::prelude::*;
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::closure::Closure;
-#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
 use crate::models::EarnedBadgeSummary;
 
 #[cfg(target_arch = "wasm32")]
-struct DocumentKeydownListenerHandle {
-    document: web_sys::Document,
-    callback: Closure<dyn FnMut(web_sys::KeyboardEvent)>,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl DocumentKeydownListenerHandle {
-    fn new(on_close: Callback<()>) -> Option<Self> {
-        let document = web_sys::window()?.document()?;
-        let callback = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
-            if should_close_on_key(&event.key()) {
-                on_close.run(());
-            }
-        }) as Box<dyn FnMut(_)>);
-
-        let _ =
-            document.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
-
-        Some(Self { document, callback })
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl Drop for DocumentKeydownListenerHandle {
-    fn drop(&mut self) {
-        let _ = self
-            .document
-            .remove_event_listener_with_callback("keydown", self.callback.as_ref().unchecked_ref());
-    }
-}
+const MODAL_FOCUSABLE_SELECTOR: &str =
+    "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])";
 
 #[component]
 pub fn BadgeEarnedModal(
@@ -47,8 +17,6 @@ pub fn BadgeEarnedModal(
 
     #[cfg(target_arch = "wasm32")]
     let last_focused_element = RwSignal::new(None::<web_sys::Element>);
-    #[cfg(target_arch = "wasm32")]
-    let document_keydown_listener = RwSignal::new(None::<DocumentKeydownListenerHandle>);
 
     let close = {
         let on_close = on_close.clone();
@@ -58,28 +26,74 @@ pub fn BadgeEarnedModal(
     let on_keydown = {
         let on_close = on_close.clone();
         move |event: leptos::ev::KeyboardEvent| {
-            if should_close_on_key(&event.key()) && show.get() {
+            if !show.get() {
+                return;
+            }
+
+            if should_close_on_key(&event.key()) {
                 on_close.run(());
+                return;
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                if !should_trap_tab(&event.key()) {
+                    return;
+                }
+
+                let Some(target) = event.target() else {
+                    return;
+                };
+                let Ok(panel) = target.dyn_into::<web_sys::Element>() else {
+                    return;
+                };
+                let Ok(focusables) = panel.query_selector_all(MODAL_FOCUSABLE_SELECTOR) else {
+                    return;
+                };
+
+                let count = focusables.length();
+                if count == 0 {
+                    return;
+                }
+
+                let first = focusables
+                    .item(0)
+                    .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
+                let last = focusables
+                    .item(count - 1)
+                    .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
+
+                let Some(window) = web_sys::window() else {
+                    return;
+                };
+                let Some(document) = window.document() else {
+                    return;
+                };
+                let active = document.active_element();
+
+                let active_is_first = active
+                    .as_ref()
+                    .and_then(|a| first.as_ref().map(|f| a == f.as_ref()))
+                    .unwrap_or(false);
+                let active_is_last = active
+                    .as_ref()
+                    .and_then(|a| last.as_ref().map(|l| a == l.as_ref()))
+                    .unwrap_or(false);
+
+                if !event.shift_key() && active_is_last {
+                    event.prevent_default();
+                    if let Some(first) = first {
+                        let _ = first.focus();
+                    }
+                } else if event.shift_key() && active_is_first {
+                    event.prevent_default();
+                    if let Some(last) = last {
+                        let _ = last.focus();
+                    }
+                }
             }
         }
     };
-
-    #[cfg(target_arch = "wasm32")]
-    Effect::new(move |_| {
-        if show.get() {
-            let has_listener =
-                document_keydown_listener.with_untracked(|listener| listener.is_some());
-            if !has_listener {
-                document_keydown_listener.set(DocumentKeydownListenerHandle::new(on_close.clone()));
-            }
-        } else {
-            let has_listener =
-                document_keydown_listener.with_untracked(|listener| listener.is_some());
-            if has_listener {
-                document_keydown_listener.set(None);
-            }
-        }
-    });
 
     Effect::new(move |_| {
         #[cfg(target_arch = "wasm32")]
@@ -185,6 +199,10 @@ fn should_close_on_key(_key: &str) -> bool {
     _key == "Escape"
 }
 
+fn should_trap_tab(_key: &str) -> bool {
+    _key == "Tab"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +240,12 @@ mod tests {
     fn should_close_on_key_only_for_escape() {
         assert!(should_close_on_key("Escape"));
         assert!(!should_close_on_key("Enter"));
+    }
+
+    #[test]
+    fn should_trap_only_tab_key() {
+        assert!(should_trap_tab("Tab"));
+        assert!(!should_trap_tab("Escape"));
     }
 
     fn sample_badge(
