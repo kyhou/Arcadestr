@@ -6,8 +6,8 @@ use crate::relay_state::{apply_relay_event, merge_relay_snapshot};
 use crate::ui_v2::components::{NavItem, TopBar};
 use crate::ui_v2::theme::UI_V2_STYLES;
 use crate::ui_v2::views::{
-    BrowseGamesView, GameDetailView, LibraryView, ProfileV2View, PublishV2View, SocialView,
-    StoreFrontView,
+    AchievementsView, BrowseGamesView, GameDetailView, LibraryView, ProfileV2View, PublishV2View,
+    SocialView, StoreFrontView,
 };
 use crate::{
     invoke_get_allow_insecure_public_ws, invoke_get_connected_relays, invoke_logout_nip46,
@@ -21,6 +21,7 @@ enum UiV2View {
     Detail(GameListing),
     Library,
     Social,
+    Achievements,
     Publish,
     Profile,
     Settings,
@@ -126,6 +127,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let set_browse_all = move |_| current_view.set(UiV2View::BrowseAll);
     let set_library = move |_| current_view.set(UiV2View::Library);
     let set_social = move |_| current_view.set(UiV2View::Social);
+    let set_achievements = move |_| current_view.set(UiV2View::Achievements);
     let set_publish = move |_| current_view.set(UiV2View::Publish);
     let set_profile = move |_| current_view.set(UiV2View::Profile);
     let set_settings = move |_| current_view.set(UiV2View::Settings);
@@ -209,6 +211,14 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         on_click={Callback::new(set_social)}
                     />
                     <NavItem
+                        label="Achievements"
+                        icon="emoji_events"
+                        active={Signal::derive(move || {
+                            current_view.get() == UiV2View::Achievements
+                        })}
+                        on_click={Callback::new(set_achievements)}
+                    />
+                    <NavItem
                         label="Publish"
                         icon="upload"
                         active={Signal::derive(move || current_view.get() == UiV2View::Publish)}
@@ -290,6 +300,10 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         }
                         UiV2View::Social => {
                             view! { <div class="max-w-[1600px] mx-auto p-8"><SocialView /></div> }
+                                .into_any()
+                        }
+                        UiV2View::Achievements => {
+                            view! { <div class="max-w-[1600px] mx-auto p-8"><AchievementsView /></div> }
                                 .into_any()
                         }
                         UiV2View::Publish => {
