@@ -502,12 +502,15 @@ mod tests {
     #[test]
     fn normalize_profile_pubkey_identifier_accepts_hex_and_npub() {
         let hex = "7c4cf6fb7248c4580e7215244f2f3f0ec3de6f7d9862092f155cb7dc39034f3c".to_string();
-        let npub = "npub1l36v00rjfrzy0rjx8f7w8hml4v5h76fht7dy9qn43jl6cwfex0hqvxx8la";
+        let npub = nostr::key::PublicKey::parse(&hex)
+            .expect("hex test vector should parse")
+            .to_bech32()
+            .expect("npub conversion should succeed");
 
         let normalized_hex =
             normalize_profile_pubkey_identifier(&hex).expect("hex pubkey should normalize");
-        let normalized_npub =
-            normalize_profile_pubkey_identifier(npub).expect("npub identifier should normalize");
+        let normalized_npub = normalize_profile_pubkey_identifier(&npub)
+            .expect("npub identifier should normalize");
 
         assert_eq!(normalized_hex, hex);
         assert_eq!(normalized_npub, hex);
