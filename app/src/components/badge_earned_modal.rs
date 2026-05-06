@@ -6,6 +6,38 @@ use wasm_bindgen::JsCast;
 
 use crate::models::EarnedBadgeSummary;
 
+#[cfg(target_arch = "wasm32")]
+struct DocumentKeydownListenerHandle {
+    document: web_sys::Document,
+    callback: Closure<dyn FnMut(web_sys::KeyboardEvent)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl DocumentKeydownListenerHandle {
+    fn new(on_close: Callback<()>) -> Option<Self> {
+        let document = web_sys::window()?.document()?;
+        let callback = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
+            if should_close_on_key(&event.key()) {
+                on_close.run(());
+            }
+        }) as Box<dyn FnMut(_)>);
+
+        let _ =
+            document.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
+
+        Some(Self { document, callback })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for DocumentKeydownListenerHandle {
+    fn drop(&mut self) {
+        let _ = self
+            .document
+            .remove_event_listener_with_callback("keydown", self.callback.as_ref().unchecked_ref());
+    }
+}
+
 #[component]
 pub fn BadgeEarnedModal(
     badge: Signal<Option<EarnedBadgeSummary>>,
@@ -15,6 +47,8 @@ pub fn BadgeEarnedModal(
 
     #[cfg(target_arch = "wasm32")]
     let last_focused_element = RwSignal::new(None::<web_sys::Element>);
+    #[cfg(target_arch = "wasm32")]
+    let document_keydown_listener = RwSignal::new(None::<DocumentKeydownListenerHandle>);
 
     let close = {
         let on_close = on_close.clone();
@@ -32,32 +66,17 @@ pub fn BadgeEarnedModal(
 
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
-        if !show.get() {
-            return;
-        }
-
-        if let Some(window) = web_sys::window() {
-            if let Some(document) = window.document() {
-                let on_close = on_close.clone();
-                let callback = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
-                    if should_close_on_key(&event.key()) {
-                        on_close.run(());
-                    }
-                }) as Box<dyn FnMut(_)>);
-
-                let _ = document
-                    .add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
-
-                on_cleanup(move || {
-                    if let Some(window) = web_sys::window() {
-                        if let Some(document) = window.document() {
-                            let _ = document.remove_event_listener_with_callback(
-                                "keydown",
-                                callback.as_ref().unchecked_ref(),
-                            );
-                        }
-                    }
-                });
+        if show.get() {
+            let has_listener =
+                document_keydown_listener.with_untracked(|listener| listener.is_some());
+            if !has_listener {
+                document_keydown_listener.set(DocumentKeydownListenerHandle::new(on_close.clone()));
+            }
+        } else {
+            let has_listener =
+                document_keydown_listener.with_untracked(|listener| listener.is_some());
+            if has_listener {
+                document_keydown_listener.set(None);
             }
         }
     });
