@@ -45,6 +45,7 @@ pub mod models;
 pub mod qr;
 mod relay_state;
 pub mod store;
+pub mod tauri_bridge;
 pub mod ui_v2;
 
 // Import ProfileStore and related functions for store initialization and event handlers

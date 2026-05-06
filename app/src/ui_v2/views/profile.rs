@@ -3,14 +3,13 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::models::GameListing;
 use crate::models::{Nip05Status, Nip49ExportResult};
+use crate::tauri_bridge::invoke_verify_nip05;
 use crate::{invoke_fetch_marketplace, AuthContext};
 
 #[path = "../../components/nip05_badge.rs"]
 mod nip05_badge;
 #[path = "../../components/nip49_modal.rs"]
 mod nip49_modal;
-#[path = "../../tauri_bridge.rs"]
-mod tauri_bridge;
 
 use nip05_badge::Nip05Badge;
 use nip49_modal::Nip49Modal;
@@ -226,7 +225,7 @@ pub fn ProfileV2View(
         });
 
         spawn_local(async move {
-            match tauri_bridge::invoke_verify_nip05(identifier.clone(), expected_npub).await {
+            match invoke_verify_nip05(identifier.clone(), expected_npub).await {
                 Ok(status) => nip05_status.set(status),
                 Err(bridge_error) => {
                     let fallback = default_nip05_status(Some(identifier));
@@ -248,7 +247,7 @@ pub fn ProfileV2View(
         nip05_status.set(verifying);
 
         spawn_local(async move {
-            match tauri_bridge::invoke_verify_nip05(identifier.clone(), expected_npub).await {
+            match invoke_verify_nip05(identifier.clone(), expected_npub).await {
                 Ok(status) => nip05_status.set(status),
                 Err(bridge_error) => {
                     let fallback = default_nip05_status(Some(identifier));
