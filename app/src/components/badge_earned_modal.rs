@@ -1,4 +1,6 @@
 use leptos::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
 
 use crate::models::EarnedBadgeSummary;
 
@@ -8,6 +10,9 @@ pub fn BadgeEarnedModal(
     on_close: Callback<()>,
 ) -> impl IntoView {
     let show = Signal::derive(move || badge.get().is_some());
+
+    #[cfg(target_arch = "wasm32")]
+    let last_focused_element = RwSignal::new(None::<web_sys::Element>);
 
     let close = {
         let on_close = on_close.clone();
@@ -23,12 +28,45 @@ pub fn BadgeEarnedModal(
         }
     };
 
+    Effect::new(move |_| {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if show.get() {
+                if let Some(window) = web_sys::window() {
+                    if let Some(document) = window.document() {
+                        last_focused_element.set(document.active_element());
+
+                        if let Some(close_button) = document
+                            .get_element_by_id("badge-earned-modal-close-button")
+                            .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+                        {
+                            let _ = close_button.focus();
+                        }
+                    }
+                }
+            } else if let Some(previous) = last_focused_element.get_untracked() {
+                if let Ok(previous_focusable) = previous.dyn_into::<web_sys::HtmlElement>() {
+                    let _ = previous_focusable.focus();
+                }
+            }
+        }
+    });
+
     view! {
         <Show when=move || show.get()>
-            <div class="nip49-modal-backdrop" tabindex="0" on:click=close on:keydown=on_keydown>
-                <div class="nip49-modal-panel" on:click=|ev| ev.stop_propagation()>
+            <div
+                class=badge_modal_class_name("backdrop")
+                tabindex="0"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby=badge_modal_title_id()
+                on:click=close
+                on:keydown=on_keydown
+            >
+                <div class=badge_modal_class_name("panel") on:click=|ev| ev.stop_propagation()>
                     <button
-                        class="nip49-modal-close"
+                        id="badge-earned-modal-close-button"
+                        class=badge_modal_class_name("close")
                         aria-label="Close badge earned modal"
                         on:click=close
                     >
@@ -52,9 +90,9 @@ fn render_badge_content(badge: EarnedBadgeSummary) -> impl IntoView {
         .unwrap_or_else(|| "No description provided.".to_string());
 
     view! {
-        <article class="nip49-modal-result">
-            <h3>"Achievement unlocked!"</h3>
-            {image.map(|src| view! { <img src=src alt=name.clone() class="nip49-modal-result-text" /> })}
+        <article class=badge_modal_class_name("content")>
+            <h3 id=badge_modal_title_id()>"Achievement unlocked!"</h3>
+            {image.map(|src| view! { <img src=src alt=name.clone() class=badge_modal_class_name("image") /> })}
             <h4>{name}</h4>
             <p>{description}</p>
             <p>
@@ -82,6 +120,14 @@ fn badge_display_name(_badge: &EarnedBadgeSummary) -> String {
         .unwrap_or_else(|| _badge.definition.badge_id.clone())
 }
 
+fn badge_modal_title_id() -> &'static str {
+    "badge-earned-modal-title"
+}
+
+fn badge_modal_class_name(suffix: &str) -> String {
+    format!("badge-earned-modal-{suffix}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +149,16 @@ mod tests {
         let name = badge_display_name(&badge);
 
         assert_eq!(name, "first-clear");
+    }
+
+    #[test]
+    fn badge_modal_uses_neutral_semantic_identifiers() {
+        assert_eq!(badge_modal_title_id(), "badge-earned-modal-title");
+        assert_eq!(
+            badge_modal_class_name("backdrop"),
+            "badge-earned-modal-backdrop"
+        );
+        assert!(!badge_modal_class_name("panel").contains("nip49"));
     }
 
     fn sample_badge(

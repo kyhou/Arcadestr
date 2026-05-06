@@ -15,7 +15,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     };
 
     // Follow-up: wire to kind-8 relay subscription when badge issuance lands.
-    let on_purchase_confirmed = {
+    let on_invoice_created = {
         let earned_badge_preview = earned_badge_preview;
         Callback::new(move |_| {
             #[cfg(debug_assertions)]
@@ -143,7 +143,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 <DetailView
                     listing={listing}
                     on_back={on_back}
-                    on_purchase_confirmed=on_purchase_confirmed
+                    on_invoice_created=on_invoice_created
                 />
             </section>
 

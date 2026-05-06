@@ -17,7 +17,7 @@ pub fn DetailView(
     listing: GameListing,
     on_back: Callback<()>,
     #[prop(default = String::new())] listing_event_id: String,
-    #[prop(optional)] on_purchase_confirmed: Option<Callback<()>>,
+    #[prop(optional)] on_invoice_created: Option<Callback<()>>,
 ) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let profile_store = try_use_profile_store();
@@ -148,7 +148,7 @@ pub fn DetailView(
                         invoice.set(Some(zap_invoice));
                         show_invoice.set(true);
                         buy_loading.set(false);
-                        if let Some(callback) = on_purchase_confirmed.clone() {
+                        if let Some(callback) = on_invoice_created.clone() {
                             callback.run(());
                         }
                     }
