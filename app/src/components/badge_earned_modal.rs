@@ -4,18 +4,31 @@ use crate::models::EarnedBadgeSummary;
 
 #[component]
 pub fn BadgeEarnedModal(
-    show: Signal<bool>,
     badge: Signal<Option<EarnedBadgeSummary>>,
     on_close: Callback<()>,
 ) -> impl IntoView {
-    let close = move |_| on_close.run(());
+    let show = Signal::derive(move || badge.get().is_some());
+
+    let close = {
+        let on_close = on_close.clone();
+        move |_| on_close.run(())
+    };
+
+    let on_keydown = {
+        let on_close = on_close.clone();
+        move |event: leptos::ev::KeyboardEvent| {
+            if event.key() == "Escape" && show.get() {
+                on_close.run(());
+            }
+        }
+    };
 
     view! {
         <Show when=move || show.get()>
-            <div class="badge-earned-modal-backdrop" on:click=close>
-                <div class="badge-earned-modal-panel" on:click=|ev| ev.stop_propagation()>
+            <div class="nip49-modal-backdrop" tabindex="0" on:click=close on:keydown=on_keydown>
+                <div class="nip49-modal-panel" on:click=|ev| ev.stop_propagation()>
                     <button
-                        class="badge-earned-modal-close"
+                        class="nip49-modal-close"
                         aria-label="Close badge earned modal"
                         on:click=close
                     >
@@ -39,9 +52,9 @@ fn render_badge_content(badge: EarnedBadgeSummary) -> impl IntoView {
         .unwrap_or_else(|| "No description provided.".to_string());
 
     view! {
-        <article class="badge-earned-modal-content">
+        <article class="nip49-modal-result">
             <h3>"Achievement unlocked!"</h3>
-            {image.map(|src| view! { <img src=src alt=name.clone() class="badge-earned-modal-image" /> })}
+            {image.map(|src| view! { <img src=src alt=name.clone() class="nip49-modal-result-text" /> })}
             <h4>{name}</h4>
             <p>{description}</p>
             <p>

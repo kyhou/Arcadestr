@@ -5,35 +5,29 @@ use crate::models::{BadgeAward, BadgeDefinition, EarnedBadgeSummary, GameListing
 
 #[component]
 pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoView {
-    let show_badge_earned_modal = RwSignal::new(false);
-    let earned_badge = RwSignal::new(None::<EarnedBadgeSummary>);
+    let earned_badge_preview = RwSignal::new(None::<EarnedBadgeSummary>);
 
     let close_badge_modal = {
-        let show_badge_earned_modal = show_badge_earned_modal;
-        let earned_badge = earned_badge;
+        let earned_badge_preview = earned_badge_preview;
         Callback::new(move |_| {
-            show_badge_earned_modal.set(false);
-            earned_badge.set(None);
+            earned_badge_preview.set(None);
         })
     };
 
     // Follow-up: wire to kind-8 relay subscription when badge issuance lands.
-    let buy_click_hook = {
-        let show_badge_earned_modal = show_badge_earned_modal;
-        let earned_badge = earned_badge;
-        move |_| {
+    let on_purchase_confirmed = {
+        let earned_badge_preview = earned_badge_preview;
+        Callback::new(move |_| {
             #[cfg(debug_assertions)]
             {
-                earned_badge.set(Some(debug_badge_preview()));
-                show_badge_earned_modal.set(true);
+                earned_badge_preview.set(Some(debug_badge_preview()));
             }
 
             #[cfg(not(debug_assertions))]
             {
-                let _ = show_badge_earned_modal;
-                let _ = earned_badge;
+                let _ = earned_badge_preview;
             }
-        }
+        })
     };
 
     view! {
@@ -64,7 +58,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     <button class="v2-btn-secondary" on:click=move |_| on_back.run(())>
                         "Back"
                     </button>
-                    <button class="v2-btn-primary" on:click=buy_click_hook>
+                    <button class="v2-btn-primary">
                         "Buy with Lightning"
                     </button>
                     <button class="v2-btn-ghost">"Add to Library"</button>
@@ -146,14 +140,14 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             </div>
 
             <section class="v2-panel v2-detail-transaction-wrap">
-                <DetailView listing={listing} on_back={on_back} />
+                <DetailView
+                    listing={listing}
+                    on_back={on_back}
+                    on_purchase_confirmed=on_purchase_confirmed
+                />
             </section>
 
-            <BadgeEarnedModal
-                show=show_badge_earned_modal.into()
-                badge=earned_badge.into()
-                on_close=close_badge_modal
-            />
+            <BadgeEarnedModal badge=earned_badge_preview.into() on_close=close_badge_modal />
         </section>
     }
 }
