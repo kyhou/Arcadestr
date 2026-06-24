@@ -2643,13 +2643,6 @@ mod nip01_nip19_tests {
     }
 
     #[test]
-    fn kind_is_non_negative_integer() {
-        let event = build_text_note_event("kind range");
-        let kind = event.kind.as_u16();
-        assert!(kind <= u16::MAX);
-    }
-
-    #[test]
     fn created_at_is_unix_timestamp() {
         let event = build_text_note_event("created at range");
         let created_at = event.created_at.as_secs();
