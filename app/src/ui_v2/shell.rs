@@ -27,6 +27,19 @@ enum UiV2View {
     Settings,
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shell_sidebar_avatar_does_not_use_generated_placeholder() {
+        let source = include_str!("shell.rs");
+
+        assert!(
+            !source.contains(concat!("aida", "-public")),
+            "shell sidebar avatar should come from user profile/account data, not a generated placeholder URL"
+        );
+    }
+}
+
 #[component]
 pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
@@ -122,6 +135,24 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
             .or_else(|| auth.npub.get())
             .unwrap_or_else(|| "Neon Curator".to_string())
     });
+    let avatar_url = Signal::derive(move || {
+        auth.profile
+            .get()
+            .and_then(|profile| profile.picture)
+            .or_else(|| {
+                auth.active_account
+                    .get()
+                    .and_then(|account| account.picture)
+            })
+    });
+    let avatar_fallback = Signal::derive(move || {
+        display_name
+            .get()
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_uppercase().to_string())
+            .unwrap_or_else(|| "?".to_string())
+    });
 
     let set_store = move |_| current_view.set(UiV2View::Store);
     let set_browse_all = move |_| current_view.set(UiV2View::BrowseAll);
@@ -173,7 +204,22 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
             >
                 <div class="px-6 mb-8">
                     <div class="flex items-center gap-3">
-                        <img alt="Nostr Avatar" class="w-10 h-10 rounded-full bg-surface-container-high" src="https://lh3.googleusercontent.com/aida-public/AB6AXuDonh-oj27BASn7hRbc5ABl3sahWXPvHlPRriWjdt6XOn9NTuz3Yhov4Y5n3D2N3gv5ZAYxmNJAhPcMkdwqI0RF7FPMPzC2XYgVPsbydtgmvV47MYyDu7gxbEhpZkg4FplYMwJL7fUsav2O363fF9z5kGa4GY4p53YZpIlVd1pGzL9qKI5cwYcWoamMHRzH5IlEg3Yaxa3bMR52OanALmy4DlzubsGLV022a7sIH-m6tG77PfALprgA-sNVjvbU9siIrnoYktG5qYI" />
+                        {move || match avatar_url.get() {
+                            Some(url) => view! {
+                                <img
+                                    alt="Nostr Avatar"
+                                    class="w-10 h-10 rounded-full bg-surface-container-high object-cover"
+                                    src={url}
+                                />
+                            }
+                                .into_any(),
+                            None => view! {
+                                <div class="w-10 h-10 rounded-full bg-surface-container-highest flex items-center justify-center text-sm font-headline font-bold text-on-surface">
+                                    {move || avatar_fallback.get()}
+                                </div>
+                            }
+                                .into_any(),
+                        }}
                         <div>
                             <h3 class="font-bold text-on-surface text-sm">{move || display_name.get()}</h3>
                             <p class="text-tertiary text-xs">"⚡ 4.2k Zaps"</p>
