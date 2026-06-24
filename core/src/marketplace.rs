@@ -248,6 +248,10 @@ pub struct Nip99Listing {
     pub geohash: Option<String>,
     /// Categories/keywords derived from `t` tags.
     pub tags: Vec<String>,
+    /// Supported delivery platforms from `platform` tags.
+    pub platforms: Vec<String>,
+    /// First NIP-94 metadata event id from `nip94` tags.
+    pub nip94_event_id: Option<String>,
     pub status: Option<String>,
     /// Bech32-encoded `npub` of the merchant who published this event.
     pub merchant_npub: String,
@@ -258,9 +262,10 @@ pub struct Nip99Listing {
 
 /// Describes every dimension along which the marketplace can be filtered.
 ///
-/// Every field is `Option<_>` — `None` means "no restriction on this
-/// dimension". `MarketplaceFilter::default()` therefore passes every product
-/// through unmodified, making it safe to wire up now and restrict later.
+/// Most fields are `Option<_>` — `None` means "no restriction on this
+/// dimension". Empty vectors also mean "no restriction".
+/// `MarketplaceFilter::default()` therefore passes every product through
+/// unmodified, making it safe to wire up now and restrict later.
 ///
 /// ### Adding a new filter type
 ///
@@ -298,6 +303,11 @@ pub struct MarketplaceFilter {
     // ── Stall filtering ───────────────────────────────────────────────────────
     /// Exclusive allowlist of stall IDs. Empty `Vec` = allow all.
     pub stall_ids: Option<Vec<String>>,
+
+    /// If non-empty, only return listings whose `platforms` field contains
+    /// at least one of these values. An empty vec disables platform filtering.
+    #[serde(default)]
+    pub platforms: Vec<String>,
 }
 
 // ── Filtering ─────────────────────────────────────────────────────────────────
@@ -447,6 +457,17 @@ fn passes_filter_nip99(p: &Nip99Listing, f: &MarketplaceFilter) -> bool {
     }
 
     // stall_ids filter not applicable in NIP-99
+
+    if !f.platforms.is_empty()
+        && !p.platforms.is_empty()
+        && !p.platforms.iter().any(|listing_platform| {
+            f.platforms
+                .iter()
+                .any(|requested| listing_platform == requested)
+        })
+    {
+        return false;
+    }
 
     true
 }
@@ -752,6 +773,8 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
     let mut price_frequency: Option<String> = None;
     let mut images: Vec<String> = Vec::new();
     let mut tags: Vec<String> = Vec::new();
+    let mut platforms: Vec<String> = Vec::new();
+    let mut nip94_event_id: Option<String> = None;
 
     for tag in event.tags.iter() {
         let v = tag.clone().to_vec();
@@ -812,6 +835,16 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
                     tags.push(tag_value);
                 }
             }
+            Some("platform") => {
+                if let Some(platform) = v.get(1).cloned() {
+                    platforms.push(platform);
+                }
+            }
+            Some("nip94") => {
+                if nip94_event_id.is_none() {
+                    nip94_event_id = v.get(1).cloned();
+                }
+            }
             _ => {}
         }
     }
@@ -832,6 +865,8 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
         images,
         geohash,
         tags,
+        platforms,
+        nip94_event_id,
         status,
         merchant_npub: npub_of(&event.pubkey),
         created_at: event.created_at.as_secs(),
@@ -988,6 +1023,31 @@ mod tests {
         }
     }
 
+    fn make_nip99_listing(id: &str, platforms: &[&str]) -> Nip99Listing {
+        Nip99Listing {
+            id: id.into(),
+            title: format!("Listing {id}"),
+            content: "Markdown body".into(),
+            summary: None,
+            published_at: None,
+            location: None,
+            price_amount: Some("1000".into()),
+            price_currency: Some("SATS".into()),
+            price_frequency: None,
+            images: vec![],
+            geohash: None,
+            tags: vec![],
+            status: Some("active".into()),
+            merchant_npub: "npub1merchant".into(),
+            created_at: 0,
+            platforms: platforms
+                .iter()
+                .map(|platform| (*platform).into())
+                .collect(),
+            nip94_event_id: None,
+        }
+    }
+
     fn make_nip99_event(kind: u16, content: &str, tags: Vec<Vec<&str>>) -> Event {
         let keys = Keys::generate();
         let mut builder = EventBuilder::new(Kind::Custom(kind), content);
@@ -1134,6 +1194,40 @@ mod tests {
     }
 
     #[test]
+    fn platform_tags_are_captured() {
+        let event = make_nip99_event(
+            30402,
+            "content",
+            vec![
+                vec!["d", "listing-platforms"],
+                vec!["title", "Platform Listing"],
+                vec!["platform", "linux-x86_64"],
+                vec!["platform", "windows-x86_64"],
+            ],
+        );
+
+        let listing = parse_listing(event).expect("listing should parse");
+        assert_eq!(listing.platforms, vec!["linux-x86_64", "windows-x86_64"]);
+    }
+
+    #[test]
+    fn nip94_tag_is_captured() {
+        let event = make_nip99_event(
+            30402,
+            "content",
+            vec![
+                vec!["d", "listing-nip94"],
+                vec!["title", "NIP-94 Listing"],
+                vec!["nip94", "event-id-01"],
+                vec!["nip94", "event-id-02"],
+            ],
+        );
+
+        let listing = parse_listing(event).expect("listing should parse");
+        assert_eq!(listing.nip94_event_id.as_deref(), Some("event-id-01"));
+    }
+
+    #[test]
     fn default_filter_passes_everything() {
         let products = vec![
             make_product(0.0, "SATS", &["game"], "npub1alice"),
@@ -1235,5 +1329,43 @@ mod tests {
         let result = apply_filter(products, &filter);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].stall_id, "stall-1");
+    }
+
+    #[test]
+    fn matching_platform_filter_passes_listing() {
+        let listings = vec![make_nip99_listing("linux-game", &["linux-x86_64"])];
+        let filter = MarketplaceFilter {
+            platforms: vec!["linux-x86_64".into()],
+            ..Default::default()
+        };
+
+        let result = apply_filter_nip99(listings, &filter);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "linux-game");
+    }
+
+    #[test]
+    fn nonmatching_platform_filter_removes_listing() {
+        let listings = vec![make_nip99_listing("windows-game", &["windows-x86_64"])];
+        let filter = MarketplaceFilter {
+            platforms: vec!["linux-x86_64".into()],
+            ..Default::default()
+        };
+
+        let result = apply_filter_nip99(listings, &filter);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn unrestricted_listing_passes_platform_filter() {
+        let listings = vec![make_nip99_listing("any-platform-game", &[])];
+        let filter = MarketplaceFilter {
+            platforms: vec!["linux-x86_64".into()],
+            ..Default::default()
+        };
+
+        let result = apply_filter_nip99(listings, &filter);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "any-platform-game");
     }
 }

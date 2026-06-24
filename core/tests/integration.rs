@@ -999,6 +999,8 @@ fn test_nip99_listing(id: &str, merchant_npub: &str, created_at: u64) -> Nip99Li
         images: vec!["https://example.com/img.png".to_string()],
         geohash: None,
         tags: vec!["indie".to_string()],
+        platforms: vec![],
+        nip94_event_id: None,
         status: Some("active".to_string()),
         merchant_npub: merchant_npub.to_string(),
         created_at,
