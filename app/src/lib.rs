@@ -5160,37 +5160,87 @@ pub fn App() -> impl IntoView {
                 {
                     web_sys::console::log_1(&format!("Fetching profile for: {}", npub).into());
                 }
-                match invoke_fetch_profile(npub.clone(), None).await {
-                    Ok(profile) => {
+                let mut baseline_profile = auth.profile.get();
+
+                match invoke_get_cached_profile(npub.clone()).await {
+                    Ok(Some(profile)) => {
                         #[cfg(debug_assertions)]
                         {
                             web_sys::console::log_1(
-                                &format!("Profile fetched: {:?}", profile.name).into(),
+                                &format!("Profile loaded from backend cache: {:?}", profile.name)
+                                    .into(),
                             );
                         }
-                        auth.profile.set(Some(profile.clone()));
+                        baseline_profile = Some(profile.clone());
+                        auth.profile.set(Some(profile));
+                    }
+                    _ => {
+                        #[cfg(debug_assertions)]
+                        {
+                            web_sys::console::log_1(
+                                &"Profile not in backend cache, will fetch from relays".into(),
+                            );
+                        }
+                    }
+                }
 
-                        // Also save profile to saved users for display on login screen
-                        spawn_local(async move {
-                            match invoke_fetch_and_save_user_profile().await {
-                                Ok(_) => {
-                                    #[cfg(debug_assertions)]
-                                    {
-                                        web_sys::console::log_1(
-                                            &"Profile saved to saved users".into(),
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    #[cfg(debug_assertions)]
-                                    {
-                                        web_sys::console::log_1(
-                                            &format!("Failed to save profile: {}", e).into(),
-                                        );
-                                    }
-                                }
+                // Stale-while-revalidate: always fetch from relays for fresh metadata.
+                match invoke_fetch_profile(npub.clone(), None).await {
+                    Ok(profile) => {
+                        let changed = baseline_profile
+                            .as_ref()
+                            .map(|cached| {
+                                cached.npub != profile.npub
+                                    || cached.name != profile.name
+                                    || cached.display_name != profile.display_name
+                                    || cached.about != profile.about
+                                    || cached.picture != profile.picture
+                                    || cached.website != profile.website
+                                    || cached.nip05 != profile.nip05
+                                    || cached.lud16 != profile.lud16
+                                    || cached.nip05_verified != profile.nip05_verified
+                            })
+                            .unwrap_or(true);
+
+                        if changed {
+                            #[cfg(debug_assertions)]
+                            {
+                                web_sys::console::log_1(
+                                    &format!("Profile updated from relays: {:?}", profile.name)
+                                        .into(),
+                                );
                             }
-                        });
+                            auth.profile.set(Some(profile.clone()));
+
+                            // Save latest profile for future startup/account list display.
+                            spawn_local(async move {
+                                match invoke_fetch_and_save_user_profile().await {
+                                    Ok(_) => {
+                                        #[cfg(debug_assertions)]
+                                        {
+                                            web_sys::console::log_1(
+                                                &"Profile saved to saved users".into(),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        #[cfg(debug_assertions)]
+                                        {
+                                            web_sys::console::log_1(
+                                                &format!("Failed to save profile: {}", e).into(),
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        } else {
+                            #[cfg(debug_assertions)]
+                            {
+                                web_sys::console::log_1(
+                                    &"Profile unchanged after relay fetch".into(),
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         #[cfg(debug_assertions)]
