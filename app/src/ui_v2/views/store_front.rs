@@ -1,9 +1,10 @@
 use leptos::prelude::*;
 
 use crate::models::GameListing;
-use crate::ui_v2::views::marketplace_loader::use_marketplace_listings;
+use crate::ui_v2::views::marketplace_loader::use_marketplace_listings_with_limit;
 
 const FALLBACK_COVER: &str = "https://lh3.googleusercontent.com/aida-public/AB6AXuDcG9Zo3aR9Vrpk5pP2jenw1AoVFoOzbAQ-t57kQtlbwGQVsLLwmHyFuyzRVsOh71iN4mHyhfw0Sx4YgdJ9duL9ANv3Xa1W7jYKWeVgj5_rE7KzitErwV3dtgEFGsGCSXtFQxyw6tQoGmP3V-Ci9Vs9_ZQXh6WXrFi6eperEaPm3YutXUIImUuC5sKm2hgyVb6sMBnpn0Imy94ETrJ9WO2XeC6tTMddB6EA-x1LgnN3Ezj_dPitegkcYmXGBSWZyCTZgxINu01kmdM";
+const STORE_FRONT_LISTING_LIMIT: usize = 3;
 
 fn first_valid_image(images: &[String]) -> String {
     images
@@ -25,7 +26,7 @@ pub fn StoreFrontView(
     on_select: Callback<GameListing>,
     on_view_all: Callback<()>,
 ) -> impl IntoView {
-    let marketplace = use_marketplace_listings();
+    let marketplace = use_marketplace_listings_with_limit(STORE_FRONT_LISTING_LIMIT);
     let listings = marketplace.listings;
     let loading = marketplace.loading;
     let error = marketplace.error;
@@ -161,7 +162,6 @@ pub fn StoreFrontView(
                                     {listings
                                         .get()
                                         .into_iter()
-                                        .take(3)
                                         .enumerate()
                                         .map(|(index, listing)| {
                                             let selected = listing.clone();

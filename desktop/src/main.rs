@@ -613,14 +613,16 @@ async fn fetch_marketplace_stream(
     state: tauri::State<'_, AppState>,
     limit: usize,
     since_days: Option<u64>,
+    until_secs: Option<u64>,
 ) -> Result<(), String> {
     use std::collections::HashMap;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
     tracing::info!(
-        "fetch_marketplace_stream called: limit={}, since_days={:?}",
+        "fetch_marketplace_stream called: limit={}, since_days={:?}, until_secs={:?}",
         limit,
-        since_days
+        since_days,
+        until_secs
     );
 
     let mut cached_emitted = 0usize;
@@ -628,7 +630,7 @@ async fn fetch_marketplace_stream(
 
     match state
         .marketplace_cache
-        .load_listings(limit, since_days)
+        .load_listings(limit, since_days, until_secs)
         .await
     {
         Ok(cached) => {
@@ -669,6 +671,7 @@ async fn fetch_marketplace_stream(
         &relay_manager,
         limit,
         since_days,
+        until_secs,
         move |product| {
             let listing = GameListing::from_listing(product);
             let key = listing_cache_key(&listing);

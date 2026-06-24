@@ -8,14 +8,20 @@ use crate::ui_v2::views::marketplace_loader::{
 };
 
 const FALLBACK_COVER: &str = "https://lh3.googleusercontent.com/aida-public/AB6AXuDcG9Zo3aR9Vrpk5pP2jenw1AoVFoOzbAQ-t57kQtlbwGQVsLLwmHyFuyzRVsOh71iN4mHyhfw0Sx4YgdJ9duL9ANv3Xa1W7jYKWeVgj5_rE7KzitErwV3dtgEFGsGCSXtFQxyw6tQoGmP3V-Ci9Vs9_ZQXh6WXrFi6eperEaPm3YutXUIImUuC5sKm2hgyVb6sMBnpn0Imy94ETrJ9WO2XeC6tTMddB6EA-x1LgnN3Ezj_dPitegkcYmXGBSWZyCTZgxINu01kmdM";
+const BROWSE_INITIAL_VISIBLE_COUNT: usize = 12;
+const BROWSE_VISIBLE_INCREMENT: usize = 12;
 
 #[component]
 pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
     let marketplace = use_marketplace_listings();
     let listings = marketplace.listings;
     let loading = marketplace.loading;
+    let loading_more = marketplace.loading_more;
     let error = marketplace.error;
     let received_count = marketplace.received_count;
+    let requested_limit = marketplace.requested_limit;
+    let has_more = marketplace.has_more;
+    let visible_count = RwSignal::new(BROWSE_INITIAL_VISIBLE_COUNT);
 
     let featured_listing = Signal::derive(move || listings.get().first().cloned());
 
@@ -64,7 +70,12 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                         <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-8">
                             {move || {
                                 let all = listings.get();
-                                let cards = all.iter().skip(1).cloned().collect::<Vec<_>>();
+                                let cards = all
+                                    .iter()
+                                    .skip(1)
+                                    .take(visible_count.get())
+                                    .cloned()
+                                    .collect::<Vec<_>>();
 
                                 cards
                                     .into_iter()
@@ -103,14 +114,87 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                 }
             }}
 
-            <div class="mt-16 flex justify-center">
-                <button class="px-10 py-4 bg-surface-container-low border border-outline-variant/15 text-on-surface-variant font-bold rounded-full hover:bg-surface-container-high hover:text-on-surface transition-all active:scale-95 flex items-center gap-3">
-                    <span class="material-symbols-outlined">"expand_more"</span>
-                    "Load More..."
-                </button>
-            </div>
+            {move || {
+                let total_cards = listings.get().len().saturating_sub(1);
+                if !loading.get()
+                    && !loading_more.get()
+                    && can_load_more_browse_cards(visible_count.get(), total_cards, has_more.get())
+                {
+                    view! {
+                        <div class="mt-16 flex justify-center">
+                            <button
+                                class="px-10 py-4 bg-surface-container-low border border-outline-variant/15 text-on-surface-variant font-bold rounded-full hover:bg-surface-container-high hover:text-on-surface transition-all active:scale-95 flex items-center gap-3"
+                                on:click=move |_| {
+                                    let total_cards = listings.get_untracked().len().saturating_sub(1);
+                                    let next_visible = next_visible_count(
+                                        visible_count.get_untracked(),
+                                        total_cards,
+                                        BROWSE_VISIBLE_INCREMENT,
+                                    );
+                                    visible_count.set(next_visible);
+                                    let required_limit = required_listing_limit(next_visible);
+                                    if next_fetch_limit(listings.get_untracked().len(), required_limit).is_some() {
+                                        requested_limit.update(|limit| {
+                                            *limit = (*limit).max(required_limit);
+                                        });
+                                    }
+                                }
+                            >
+                                <span class="material-symbols-outlined">"expand_more"</span>
+                                "Load More..."
+                            </button>
+                        </div>
+                    }
+                    .into_any()
+                } else if loading_more.get() {
+                    view! {
+                        <div class="mt-16 flex justify-center">
+                            <div class="px-8 py-4 bg-surface-container-low border border-outline-variant/15 text-on-surface-variant font-bold rounded-full flex items-center gap-3">
+                                <span class="material-symbols-outlined animate-spin">"progress_activity"</span>
+                                "Loading more products..."
+                            </div>
+                        </div>
+                    }
+                    .into_any()
+                } else if !loading.get() && total_cards > 0 && !has_more.get() {
+                    view! {
+                        <div class="mt-16 flex justify-center">
+                            <div class="max-w-md rounded-xl border border-outline-variant/15 bg-surface-container-low px-6 py-4 text-center text-on-surface-variant">
+                                <p class="font-bold text-on-surface">"No more products to load"</p>
+                                <p class="mt-1 text-sm">"You've reached the end of the currently available marketplace listings."</p>
+                            </div>
+                        </div>
+                    }
+                    .into_any()
+                } else {
+                    view! { <></> }.into_any()
+                }
+            }}
         </section>
     }
+}
+
+fn next_visible_count(current: usize, total: usize, increment: usize) -> usize {
+    let _ = total;
+    current.saturating_add(increment)
+}
+
+fn has_more_browse_cards(visible: usize, total: usize) -> bool {
+    visible < total
+}
+
+fn can_load_more_browse_cards(visible: usize, total_cards: usize, has_more: bool) -> bool {
+    has_more_browse_cards(visible, total_cards) || has_more
+}
+
+fn required_listing_limit(visible_cards: usize) -> usize {
+    visible_cards.saturating_add(1)
+}
+
+fn next_fetch_limit(loaded_count: usize, requested_limit: usize) -> Option<usize> {
+    requested_limit
+        .checked_sub(loaded_count)
+        .filter(|limit| *limit > 0)
 }
 
 fn render_listing_card(listing: GameListing, on_select: Callback<GameListing>) -> AnyView {
@@ -208,4 +292,40 @@ fn render_featured_card(listing: GameListing, on_select: Callback<GameListing>) 
         </article>
     }
     .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_more_increases_desired_visible_count_beyond_loaded_total() {
+        assert_eq!(next_visible_count(12, 30, 12), 24);
+        assert_eq!(next_visible_count(24, 30, 12), 36);
+        assert_eq!(next_visible_count(36, 30, 12), 48);
+    }
+
+    #[test]
+    fn has_more_browse_cards_detects_hidden_items() {
+        assert!(has_more_browse_cards(12, 30));
+        assert!(!has_more_browse_cards(30, 30));
+        assert!(!has_more_browse_cards(31, 30));
+    }
+
+    #[test]
+    fn next_fetch_limit_only_requests_missing_products() {
+        assert_eq!(next_fetch_limit(12, 24), Some(12));
+        assert_eq!(next_fetch_limit(24, 24), None);
+        assert_eq!(next_fetch_limit(30, 24), None);
+    }
+
+    #[test]
+    fn load_more_remains_available_after_underfilled_page() {
+        assert!(can_load_more_browse_cards(72, 55, true));
+    }
+
+    #[test]
+    fn load_more_disappears_when_no_hidden_cards_and_exhausted() {
+        assert!(!can_load_more_browse_cards(72, 55, false));
+    }
 }

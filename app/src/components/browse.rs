@@ -95,7 +95,9 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                     }
                 });
 
-                match invoke_fetch_marketplace_stream(50, Some(30), on_listing, on_complete).await {
+                match invoke_fetch_marketplace_stream(50, Some(30), None, on_listing, on_complete)
+                    .await
+                {
                     Ok((product_cleanup, completion_cleanup)) => {
                         // Stream command has returned; unregister listeners.
                         product_cleanup();

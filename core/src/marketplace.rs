@@ -474,7 +474,7 @@ pub(crate) async fn fetch_nip15_stalls_impl(
     limit: usize,
     since_days: Option<u64>,
 ) -> Result<Vec<Nip15Stall>, String> {
-    let filter = build_filter(Kind::Custom(30017), limit, since_days);
+    let filter = build_filter(Kind::Custom(30017), limit, since_days, None);
 
     let manager = relay_manager.lock().await;
 
@@ -531,7 +531,7 @@ pub(crate) async fn fetch_nip15_products_impl(
     limit: usize,
     since_days: Option<u64>,
 ) -> Result<Vec<Nip15Product>, String> {
-    let filter = build_filter(Kind::Custom(30018), limit, since_days);
+    let filter = build_filter(Kind::Custom(30018), limit, since_days, None);
 
     let manager = relay_manager.lock().await;
 
@@ -601,7 +601,7 @@ where
     use std::collections::HashSet;
     use tokio::sync::Mutex;
 
-    let filter = build_filter(Kind::Custom(30018), limit, since_days);
+    let filter = build_filter(Kind::Custom(30018), limit, since_days, None);
 
     tracing::info!(
         "Streaming NIP-15 products: kind=30018, limit={}, since_days={:?}",
@@ -672,12 +672,20 @@ where
 
 // ── Internal parsing helpers ──────────────────────────────────────────────────
 
-fn build_filter(kind: Kind, limit: usize, since_days: Option<u64>) -> Filter {
+fn build_filter(
+    kind: Kind,
+    limit: usize,
+    since_days: Option<u64>,
+    until_secs: Option<u64>,
+) -> Filter {
     let mut f = Filter::new().kind(kind).limit(limit);
     if let Some(days) = since_days {
         // Saturating sub guards against underflow on very large values.
         let since_unix = Timestamp::now().as_secs().saturating_sub(days * 86_400);
         f = f.since(Timestamp::from(since_unix));
+    }
+    if let Some(until) = until_secs {
+        f = f.until(Timestamp::from(until));
     }
     f
 }
@@ -835,7 +843,7 @@ pub(crate) async fn fetch_nip99_listings_impl(
     limit: usize,
     since_days: Option<u64>,
 ) -> Result<Vec<Nip99Listing>, String> {
-    let filter = build_filter(Kind::Custom(30402), limit, since_days);
+    let filter = build_filter(Kind::Custom(30402), limit, since_days, None);
 
     let manager = relay_manager.lock().await;
 
@@ -882,6 +890,7 @@ pub async fn fetch_nip99_listings_streaming<F>(
     relay_manager: &Arc<tokio::sync::Mutex<RelayManager>>,
     limit: usize,
     since_days: Option<u64>,
+    until_secs: Option<u64>,
     mut on_product: F,
 ) -> Result<u32, String>
 where
@@ -890,12 +899,13 @@ where
     use std::collections::HashSet;
     use tokio::sync::Mutex;
 
-    let filter = build_filter(Kind::Custom(30402), limit, since_days);
+    let filter = build_filter(Kind::Custom(30402), limit, since_days, until_secs);
 
     tracing::info!(
-        "Streaming NIP-99 listings: kind=30402, limit={}, since_days={:?}",
+        "Streaming NIP-99 listings: kind=30402, limit={}, since_days={:?}, until_secs={:?}",
         limit,
-        since_days
+        since_days,
+        until_secs
     );
 
     let manager = relay_manager.lock().await;

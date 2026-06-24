@@ -903,12 +903,14 @@ pub async fn invoke_fetch_marketplace(
 /// # Arguments
 /// * `limit` - Maximum products to fetch
 /// * `since_days` - Time window for events
+/// * `until_secs` - Optional cursor for fetching products older than a timestamp
 /// * `on_listing` - Callback invoked for each product
 /// * `on_complete` - Optional callback invoked when streaming completes
 #[cfg(not(feature = "web"))]
 pub async fn invoke_fetch_marketplace_stream<F, C>(
     limit: usize,
     since_days: Option<u64>,
+    until_secs: Option<u64>,
     mut on_listing: F,
     on_complete: Option<C>,
 ) -> Result<(impl FnOnce(), impl FnOnce()), String>
@@ -958,6 +960,7 @@ where
     let args = serde_json::json!({
         "limit": limit,
         "since_days": since_days,
+        "until_secs": until_secs,
     });
 
     let result: Result<(), String> =
@@ -978,6 +981,7 @@ where
 pub async fn invoke_fetch_marketplace_stream<F, C>(
     _limit: usize,
     _since_days: Option<u64>,
+    _until_secs: Option<u64>,
     _on_listing: F,
     _on_complete: Option<C>,
 ) -> Result<(impl FnOnce(), impl FnOnce()), String>

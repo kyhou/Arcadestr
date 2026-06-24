@@ -1055,7 +1055,7 @@ async fn int_01_full_listing_publish_retrieve_cycle() {
         .expect("cache upsert should succeed");
 
     let loaded = cache
-        .load_listings(20, None)
+        .load_listings(20, None, None)
         .await
         .expect("cache load should succeed");
 
@@ -1223,7 +1223,7 @@ async fn int_04_marketplace_cache_streaming_callback_collection() {
     }
 
     let cached_first = cache
-        .load_listings(20, None)
+        .load_listings(20, None, None)
         .await
         .expect("cache load should succeed");
 
@@ -1262,7 +1262,7 @@ async fn int_04_marketplace_cache_streaming_callback_collection() {
     assert_eq!(streamed.len(), 20, "callback collection should dedup by id");
 
     let loaded = cache
-        .load_listings(50, None)
+        .load_listings(50, None, None)
         .await
         .expect("final cache load should succeed");
 

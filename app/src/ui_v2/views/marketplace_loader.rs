@@ -7,12 +7,17 @@ use crate::invoke_fetch_marketplace_stream;
 use crate::models::{GameListing, ListingSource};
 use crate::store::{try_use_marketplace_store, DEFAULT_LISTING_TTL_SECS};
 
+const DEFAULT_MARKETPLACE_LISTING_LIMIT: usize = 50;
+
 #[derive(Clone, Copy)]
 pub struct MarketplaceListingsState {
     pub listings: RwSignal<Vec<GameListing>>,
     pub loading: RwSignal<bool>,
+    pub loading_more: RwSignal<bool>,
     pub error: RwSignal<Option<String>>,
     pub received_count: RwSignal<usize>,
+    pub requested_limit: RwSignal<usize>,
+    pub has_more: RwSignal<bool>,
 }
 
 pub struct ListingPresentation {
@@ -49,29 +54,47 @@ pub fn listing_publisher(listing: &GameListing) -> String {
 }
 
 pub fn use_marketplace_listings() -> MarketplaceListingsState {
+    use_marketplace_listings_with_limit(DEFAULT_MARKETPLACE_LISTING_LIMIT)
+}
+
+pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsState {
     let marketplace_store = try_use_marketplace_store();
     let listings = RwSignal::new(Vec::<GameListing>::new());
     let loading = RwSignal::new(true);
+    let loading_more = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let received_count = RwSignal::new(0);
-
-    // Track if we've already fetched to prevent duplicate fetches
-    let has_fetched = RwSignal::new(false);
+    let requested_limit = RwSignal::new(limit);
+    let has_more = RwSignal::new(true);
+    let last_requested_limit = RwSignal::new(0usize);
 
     Effect::new(move |_| {
-        // Prevent re-running if we've already fetched
-        if has_fetched.get() {
+        let target_limit = requested_limit.get();
+        if target_limit <= last_requested_limit.get() {
             return;
         }
+        last_requested_limit.set(target_limit);
 
         let store = marketplace_store.clone();
         spawn_local(async move {
-            loading.set(true);
+            let loaded_count = listings.get_untracked().len();
+            let page_limit = next_fetch_limit(loaded_count, target_limit).unwrap_or(target_limit);
+            let until_secs = if loaded_count > 0 {
+                older_page_until_secs(&listings.get_untracked())
+            } else {
+                None
+            };
+
+            let is_initial_load = loaded_count == 0;
+            loading.set(is_initial_load);
+            loading_more.set(!is_initial_load);
             error.set(None);
-            received_count.set(0);
+            if loaded_count == 0 {
+                received_count.set(0);
+            }
 
             if crate::debug_storefront_bypass_enabled() {
-                let mocked = debug_mock_listings();
+                let mocked = recent_listings(debug_mock_listings(), target_limit);
                 if let Some(s) = &store {
                     s.clear();
                     s.put_many(mocked.clone());
@@ -79,7 +102,7 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
                 received_count.set(mocked.len());
                 listings.set(mocked);
                 loading.set(false);
-                has_fetched.set(true);
+                loading_more.set(false);
                 return;
             }
 
@@ -87,10 +110,10 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
                 Some(s) => {
                     let cached = s.get_all();
                     let needs_refresh = s.needs_refresh(DEFAULT_LISTING_TTL_SECS);
-                    if !cached.is_empty() && !needs_refresh {
-                        listings.set(cached);
+                    if !cached.is_empty() && !needs_refresh && cached.len() >= target_limit {
+                        listings.set(recent_listings(cached, target_limit));
                         loading.set(false);
-                        has_fetched.set(true);
+                        loading_more.set(false);
                         false
                     } else {
                         true
@@ -115,6 +138,12 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
                         listings.update(|items| {
                             if !items.iter().any(|existing| existing.id == listing.id) {
                                 items.push(listing);
+                                items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                                items.truncate(target_limit);
+                            }
+
+                            if has_reached_listing_limit(items.len(), target_limit) {
+                                loading.set(false);
                             }
                         });
                     });
@@ -127,22 +156,38 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
                             if let Some(s) = &store_for_complete {
                                 s.mark_fresh();
                             }
+                            has_more.set(has_more_after_page(
+                                loaded_count,
+                                listings.get_untracked().len(),
+                            ));
                             loading.set(false);
-                            has_fetched.set(true);
+                            loading_more.set(false);
                         });
                     }
                 });
 
-                match invoke_fetch_marketplace_stream(50, Some(30), on_listing, on_complete).await {
+                match invoke_fetch_marketplace_stream(
+                    page_limit,
+                    Some(30),
+                    until_secs,
+                    on_listing,
+                    on_complete,
+                )
+                .await
+                {
                     Ok((product_cleanup, completion_cleanup)) => {
                         // Stream command has returned; unregister listeners.
                         product_cleanup();
                         completion_cleanup();
 
                         // Fallback in case completion event was missed.
-                        if loading.get_untracked() {
+                        if loading.get_untracked() || loading_more.get_untracked() {
+                            has_more.set(has_more_after_page(
+                                loaded_count,
+                                listings.get_untracked().len(),
+                            ));
                             loading.set(false);
-                            has_fetched.set(true);
+                            loading_more.set(false);
                         }
                     }
                     Err(e) => {
@@ -150,18 +195,18 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
                             if let Some(s) = &store {
                                 let cached = s.get_all();
                                 if !cached.is_empty() {
-                                    listings.set(cached);
+                                    listings.set(recent_listings(cached, target_limit));
                                     loading.set(false);
-                                    has_fetched.set(true);
+                                    loading_more.set(false);
                                 } else {
                                     error.set(Some(e));
                                     loading.set(false);
-                                    has_fetched.set(true);
+                                    loading_more.set(false);
                                 }
                             } else {
                                 error.set(Some(e));
                                 loading.set(false);
-                                has_fetched.set(true);
+                                loading_more.set(false);
                             }
                         });
                     }
@@ -173,9 +218,40 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
     MarketplaceListingsState {
         listings,
         loading,
+        loading_more,
         error,
         received_count,
+        requested_limit,
+        has_more,
     }
+}
+
+fn recent_listings(mut listings: Vec<GameListing>, limit: usize) -> Vec<GameListing> {
+    listings.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    listings.truncate(limit);
+    listings
+}
+
+fn has_reached_listing_limit(listing_count: usize, limit: usize) -> bool {
+    limit > 0 && listing_count >= limit
+}
+
+fn next_fetch_limit(loaded_count: usize, requested_limit: usize) -> Option<usize> {
+    requested_limit
+        .checked_sub(loaded_count)
+        .filter(|limit| *limit > 0)
+}
+
+fn older_page_until_secs(listings: &[GameListing]) -> Option<u64> {
+    listings
+        .iter()
+        .map(|listing| listing.created_at)
+        .min()
+        .map(|oldest| oldest.saturating_sub(1))
+}
+
+fn has_more_after_page(before_count: usize, after_count: usize) -> bool {
+    after_count > before_count
 }
 
 fn debug_mock_listings() -> Vec<GameListing> {
@@ -311,5 +387,38 @@ mod tests {
         assert_eq!(presentation.cta_label, "Buy Now");
         assert!(!presentation.is_free);
         assert_eq!(presentation.price_hint.as_deref(), Some("~$4.25 USD"));
+    }
+
+    #[test]
+    fn recent_listings_returns_limited_newest_first() {
+        let listings = debug_mock_listings();
+
+        let recent = recent_listings(listings, 2);
+
+        let ids = recent
+            .into_iter()
+            .map(|listing| listing.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["debug-dune-settlers", "debug-bit-runners"]);
+    }
+
+    #[test]
+    fn limited_loader_can_show_once_limit_is_available() {
+        assert!(!has_reached_listing_limit(2, 3));
+        assert!(has_reached_listing_limit(3, 3));
+        assert!(has_reached_listing_limit(4, 3));
+    }
+
+    #[test]
+    fn older_page_cursor_excludes_already_loaded_oldest_listing() {
+        let listings = debug_mock_listings();
+
+        assert_eq!(older_page_until_secs(&listings), Some(1_710_000_000));
+    }
+
+    #[test]
+    fn pagination_exhausts_only_when_page_returns_no_new_items() {
+        assert!(has_more_after_page(50, 51));
+        assert!(!has_more_after_page(50, 50));
     }
 }

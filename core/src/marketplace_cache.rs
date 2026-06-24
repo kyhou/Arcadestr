@@ -22,42 +22,82 @@ impl MarketplaceCache {
         &self,
         limit: usize,
         since_days: Option<u64>,
+        until_secs: Option<u64>,
     ) -> Result<Vec<GameListing>, sqlx::Error> {
         let since_cutoff = since_days.map(|days| {
             let now = now_secs();
             now.saturating_sub((days as i64) * 86_400)
         });
+        let until_cutoff = until_secs.map(|secs| secs as i64);
 
-        let rows = if let Some(cutoff) = since_cutoff {
-            sqlx::query(
-                r#"
-                SELECT product_id, title, description, price_sats, download_url,
-                       publisher_npub, created_at, tags_json, lud16,
-                       images_json, summary, published_at, location, geohash, status
-                FROM marketplace_listings
-                WHERE created_at >= ?
-                ORDER BY created_at DESC
-                LIMIT ?
-                "#,
-            )
-            .bind(cutoff)
-            .bind(limit as i64)
-            .fetch_all(&self.db)
-            .await?
-        } else {
-            sqlx::query(
-                r#"
-                SELECT product_id, title, description, price_sats, download_url,
-                       publisher_npub, created_at, tags_json, lud16,
-                       images_json, summary, published_at, location, geohash, status
-                FROM marketplace_listings
-                ORDER BY created_at DESC
-                LIMIT ?
-                "#,
-            )
-            .bind(limit as i64)
-            .fetch_all(&self.db)
-            .await?
+        let rows = match (since_cutoff, until_cutoff) {
+            (Some(since), Some(until)) => {
+                sqlx::query(
+                    r#"
+                    SELECT product_id, title, description, price_sats, download_url,
+                           publisher_npub, created_at, tags_json, lud16,
+                           images_json, summary, published_at, location, geohash, status
+                    FROM marketplace_listings
+                    WHERE created_at >= ? AND created_at <= ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(since)
+                .bind(until)
+                .bind(limit as i64)
+                .fetch_all(&self.db)
+                .await?
+            }
+            (Some(since), None) => {
+                sqlx::query(
+                    r#"
+                    SELECT product_id, title, description, price_sats, download_url,
+                           publisher_npub, created_at, tags_json, lud16,
+                           images_json, summary, published_at, location, geohash, status
+                    FROM marketplace_listings
+                    WHERE created_at >= ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(since)
+                .bind(limit as i64)
+                .fetch_all(&self.db)
+                .await?
+            }
+            (None, Some(until)) => {
+                sqlx::query(
+                    r#"
+                    SELECT product_id, title, description, price_sats, download_url,
+                           publisher_npub, created_at, tags_json, lud16,
+                           images_json, summary, published_at, location, geohash, status
+                    FROM marketplace_listings
+                    WHERE created_at <= ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(until)
+                .bind(limit as i64)
+                .fetch_all(&self.db)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query(
+                    r#"
+                    SELECT product_id, title, description, price_sats, download_url,
+                           publisher_npub, created_at, tags_json, lud16,
+                           images_json, summary, published_at, location, geohash, status
+                    FROM marketplace_listings
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(limit as i64)
+                .fetch_all(&self.db)
+                .await?
+            }
         };
 
         Ok(rows
@@ -239,7 +279,7 @@ mod tests {
         assert_eq!(outcome, UpsertOutcome::Inserted);
 
         let loaded = cache
-            .load_listings(10, None)
+            .load_listings(10, None, None)
             .await
             .expect("load should succeed");
         assert_eq!(loaded.len(), 1);
@@ -319,7 +359,7 @@ mod tests {
             .expect("recent upsert should succeed");
 
         let loaded = cache
-            .load_listings(10, Some(30))
+            .load_listings(10, Some(30), None)
             .await
             .expect("load should succeed");
 
@@ -346,7 +386,7 @@ mod tests {
         }
 
         let loaded = cache
-            .load_listings(10, None)
+            .load_listings(10, None, None)
             .await
             .expect("load should succeed");
 
@@ -376,7 +416,7 @@ mod tests {
             .expect("second upsert should succeed");
 
         let loaded = cache
-            .load_listings(10, None)
+            .load_listings(10, None, None)
             .await
             .expect("load should succeed");
 
@@ -402,13 +442,44 @@ mod tests {
             .expect("new upsert should succeed");
 
         let loaded = cache
-            .load_listings(10, None)
+            .load_listings(10, None, None)
             .await
             .expect("load should succeed");
 
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].id, "new");
         assert_eq!(loaded[1].id, "old");
+    }
+
+    #[tokio::test]
+    async fn load_listings_respects_until_secs_cursor() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+
+        let cache = MarketplaceCache::new(db.pool().clone());
+        cache
+            .upsert_listing(&make_listing("old", 1_710_010_000, "Old"), None)
+            .await
+            .expect("old upsert should succeed");
+        cache
+            .upsert_listing(&make_listing("middle", 1_710_020_000, "Middle"), None)
+            .await
+            .expect("middle upsert should succeed");
+        cache
+            .upsert_listing(&make_listing("new", 1_710_030_000, "New"), None)
+            .await
+            .expect("new upsert should succeed");
+
+        let loaded = cache
+            .load_listings(10, None, Some(1_710_019_999))
+            .await
+            .expect("load should succeed");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "old");
     }
 
     #[tokio::test]
@@ -457,7 +528,7 @@ mod tests {
 
         // Load it back
         let loaded = cache
-            .load_listings(10, None)
+            .load_listings(10, None, None)
             .await
             .expect("load should succeed");
 
@@ -519,7 +590,7 @@ mod tests {
         assert_eq!(outcome, UpsertOutcome::Inserted);
 
         let loaded = cache
-            .load_listings(10, None)
+            .load_listings(10, None, None)
             .await
             .expect("load should succeed");
 
