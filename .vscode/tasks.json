@@ -1,0 +1,74 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "web:build:debug",
+      "type": "shell",
+      "command": "trunk",
+      "args": [
+        "build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/web",
+        "env": {
+          "NO_COLOR": "true"
+        }
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "web:build:release",
+      "type": "shell",
+      "command": "trunk",
+      "args": [
+        "build",
+        "--release"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/web",
+        "env": {
+          "NO_COLOR": "true"
+        }
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "desktop:build:debug",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "build",
+        "-p",
+        "arcadestr-desktop"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [
+        "$rustc"
+      ],
+      "dependsOn": [
+        "web:build:debug"
+      ],
+      "dependsOrder": "sequence"
+    },
+    {
+      "label": "tauri:dev",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "tauri",
+        "dev"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/desktop",
+        "env": {
+          "RUST_LOG": "debug"
+        }
+      },
+      "isBackground": true,
+      "problemMatcher": []
+    }
+  ]
+}

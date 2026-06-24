@@ -1,0 +1,56 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Tauri Desktop: debug backend",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "-p",
+          "arcadestr-desktop"
+        ],
+        "filter": {
+          "name": "arcadestr-desktop",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "debug"
+      },
+      "preLaunchTask": "web:build:debug",
+      "sourceLanguages": [
+        "rust"
+      ]
+    },
+    {
+      "name": "Tauri Desktop: attach to running app",
+      "type": "lldb",
+      "request": "attach",
+      "program": "${workspaceFolder}/target/debug/arcadestr-desktop",
+      "pid": "${command:pickProcess}",
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": [
+        "rust"
+      ]
+    },
+    {
+      "name": "Tauri Desktop: launch existing binary",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/arcadestr-desktop",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "debug"
+      },
+      "preLaunchTask": "web:build:debug",
+      "sourceLanguages": [
+        "rust"
+      ]
+    }
+  ]
+}
