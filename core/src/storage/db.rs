@@ -119,6 +119,9 @@ CREATE INDEX IF NOT EXISTS idx_users_expires ON users(expires_at);
 // Migration 5: NIP-58 achievement badge cache
 const MIGRATION_5_ACHIEVEMENTS: &str = include_str!("../../migrations/002_achievements.sql");
 
+// Migration 6: NIP-102 purchase receipts
+const MIGRATION_6_PURCHASES: &str = include_str!("../../migrations/003_purchases.sql");
+
 // List of all migrations in order
 const MIGRATIONS: &[&str] = &[
     MIGRATION_1_INITIAL,
@@ -126,6 +129,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_3_RELAYS_TABLE,
     MIGRATION_4_USERS_TABLE,
     MIGRATION_5_ACHIEVEMENTS,
+    MIGRATION_6_PURCHASES,
 ];
 
 /// Database connection pool for SQLite
