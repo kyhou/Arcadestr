@@ -34,11 +34,12 @@ Arcadestr is a **decentralized game marketplace** built on the NOSTR protocol wi
 1. **Browse Listings**: View published games with metadata (title, description, price, tags, images)
 2. **Publish Games**: Create NIP-15 product events (kind 30018) or NIP-99 classified listings (kind 30402)
 3. **Buy Games**: Generate Lightning invoices via LNURL-pay for paid games; direct download for free games
-4. **User Profiles**: Display NOSTR profiles (NIP-01 kind-0 metadata) with NIP-05 verification
+4. **User Profiles**: Display NOSTR profiles (NIP-01 kind-0 metadata) with NIP-05 verification and NIP-58 badges
 5. **Authentication**: Multiple signer support (NIP-07 browser extensions, NIP-46 remote signers)
 6. **Zap Payments**: NIP-57 Lightning zaps for game purchases
 7. **Marketplace Cache**: Persistent SQLite storage for offline browsing
 8. **Real-time Relay Status**: Live connection indicators with latency metrics
+9. **Achievements & Badges**: NIP-58 badge display on profiles, earned badge tracking, and achievement showcase
 
 ### Desktop vs Web Target
 
@@ -180,12 +181,13 @@ arcadestr/
 │   ├── Cargo.toml          # Leptos, wasm-bindgen dependencies
 │   └── src/
 │       ├── lib.rs          # Main app component, auth context, styles
-│       ├── models.rs       # GameListing, UserProfile, ZapRequest + NIP-49/NIP-05 IPC types
-│       ├── tauri_bridge.rs # Tauri command wrappers (invoke_*)
+│       ├── models.rs       # GameListing, UserProfile, ZapRequest, Badge types + NIP-49/NIP-05 IPC types
+│       ├── tauri_bridge.rs # Tauri command wrappers (invoke_*), badge fetch functions
 │       ├── tauri_invoke.rs # Low-level Tauri IPC (wasm-bindgen)
 │       ├── web_auth.rs     # NIP-07 browser extension auth (web target)
 │       ├── web_secure_store.rs # Secure storage for web target (AES-GCM encrypted)
 │       ├── qr.rs           # QR code generation for NIP-46 login
+│       ├── relay_state.rs  # Relay connection state management helpers
 │       ├── ui_v2/          # Stitch-based UI v2 components
 │       │   ├── mod.rs      # UI v2 module exports
 │       │   ├── shell.rs    # Main application shell
@@ -196,6 +198,7 @@ arcadestr/
 │       │   │   └── topbar.rs     # Top navigation bar
 │       │   └── views/      # Page-level views
 │       │       ├── mod.rs  # View exports
+│       │       ├── achievements.rs    # User achievements/badges view
 │       │       ├── browse_games.rs    # Game browsing view
 │       │       ├── game_detail.rs     # Game detail view
 │       │       ├── library.rs         # User's game library
@@ -209,6 +212,8 @@ arcadestr/
 │       │   ├── mod.rs      # Component exports
 │       │   ├── account_selector.rs   # Login/account switching UI
 │       │   ├── backup_manager.rs     # Backup/restore UI
+│       │   ├── badge_earned_modal.rs # Badge earned celebration modal
+│       │   ├── badge_showcase.rs     # Profile badge display component
 │       │   ├── browse.rs             # Game listing grid
 │       │   ├── detail.rs             # Game detail view with buy flow
 │       │   ├── nip49_modal.rs        # NIP-49 export modal (password confirm + copy)
@@ -231,13 +236,15 @@ arcadestr/
 │   │   └── command_contracts.rs # Pure command logic for testability
 │   └── tests/              # Desktop command layer tests
 │       ├── section6_command_layer_tests.rs # Auth and command contract tests
-│       └── section7_nip49_commands.rs      # NIP-49/NIP-05 command contract tests
+│       ├── section7_nip49_commands.rs      # NIP-49/NIP-05 command contract tests
+│       └── section8_badge_command_tests.rs # NIP-58 badge command tests
 │
 ├── core/                   # LIBRARY: Core business logic (NOSTR, storage, crypto)
 │   ├── Cargo.toml          # Native-only dependencies (tokio, sqlx, etc.)
 │   ├── src/
 │   │   ├── lib.rs          # Module exports, feature-gated (native vs wasm)
 │   │   ├── nostr.rs        # NOSTR client, event handling, relay management
+│   │   ├── achievements.rs   # NIP-58 badge parsing, validation, and caching
 │   │   ├── auth/           # Authentication state and account management
 │   │   │   ├── mod.rs      # AuthState, signer switching
 │   │   │   ├── auth_state.rs  # Core authentication logic
@@ -272,7 +279,7 @@ arcadestr/
 │   │   ├── nip05_validator.rs # NIP-05 validation service
 │   │   ├── user_cache.rs      # Persistent user profile cache
 │   │   ├── social_graph.rs   # Extended network discovery
-│   │   ├── extended_network.rs # 2nd-degree follow discovery
+│   │   ├── extended_network.rs # 2nd-degree follow discovery with relay filtering
 │   │   ├── subscriptions.rs  # Relay subscription management
 │   │   ├── lightning.rs      # NIP-57 zap payments
 │   │   ├── saved_users.rs    # Legacy saved users (JSON file)
@@ -283,8 +290,11 @@ arcadestr/
 │   │   │   └── nip46_mocks.rs # NIP-46 mock signer implementations
 │   │   └── wasm_stub.rs      # WASM-compatible stubs
 │   ├── migrations/           # SQLx database migrations
+│   │   ├── 001_initial_schema.sql  # Initial database schema
+│   │   └── 002_achievements.sql    # NIP-58 badge achievements tables
 │   └── tests/                # Core integration tests
-│       └── integration.rs    # NIP-65, relay hints, NIP-46 integration tests
+│       ├── integration.rs    # NIP-65, relay hints, NIP-46 integration tests
+│       └── integration_nip05.rs    # NIP-05 verification tests
 │
 ├── web/                    # BINARY: WASM web target (Trunk)
 │   ├── Cargo.toml          # WASM-only dependencies
@@ -598,6 +608,10 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `get_cached_profile` | `main.rs` | `npub: String` | `Option<UserProfile>` | Get single cached profile |
 | `get_version_info` | `main.rs` | None | `VersionInfo` | Get app version info |
 | `fetch_marketplace_stream` | `main.rs` | `limit: usize`, `since_days: Option<u64>` | `()` | Stream marketplace listings via events |
+| `fetch_profile_badges` | `main.rs` | `profile_identifier: String` | `Vec<ProfileBadgeEntry>` | Fetch NIP-58 badges for a profile (desktop only) |
+| `fetch_earned_badges` | `main.rs` | `profile_identifier: String` | `Vec<EarnedBadgeSummary>` | Fetch earned badges with definitions (desktop only) |
+| `get_network_discovery_settings` | `main.rs` | None | `NetworkDiscoverySettings` | Get relay discovery settings |
+| `set_allow_insecure_public_ws` | `main.rs` | `allow: bool` | `()` | Toggle allowing insecure ws:// relays for public hosts |
 
 ### 5.3 Event System
 
@@ -747,7 +761,8 @@ UiV2Root (app/src/ui_v2/shell.rs) - Stitch-based interface
 │   └── Game grid with filtering
 │
 ├── GameDetail (app/src/ui_v2/views/game_detail.rs)
-│   └── Rich media presentation
+│   ├── Rich media presentation
+│   └── BadgeShowcase (earned badges for game publisher)
 │
 ├── Library (app/src/ui_v2/views/library.rs)
 │   └── User's purchased games
@@ -756,13 +771,24 @@ UiV2Root (app/src/ui_v2/shell.rs) - Stitch-based interface
 │   └── NIP-46 QR code flow
 │
 ├── Profile (app/src/ui_v2/views/profile.rs)
-│   └── User profile management
+│   ├── User profile management
+│   └── BadgeShowcase (profile badges)
 │
 ├── Publish (app/src/ui_v2/views/publish.rs)
 │   └── NIP-15/NIP-99 publishing
 │
-└── Social (app/src/ui_v2/views/social.rs)
-    └── Social feed integration
+├── Social (app/src/ui_v2/views/social.rs)
+│   └── Social feed integration
+│
+└── Achievements (app/src/ui_v2/views/achievements.rs)
+    └── User's earned badges with definitions
+
+Badge Components:
+├── BadgeShowcase (app/src/components/badge_showcase.rs)
+│   └── Horizontal badge row for profile/game detail views
+│
+└── BadgeEarnedModal (app/src/components/badge_earned_modal.rs)
+    └── Accessible modal dialog for newly earned badges
 ```
 
 ### 6.3 State Management & Reactivity
@@ -1005,6 +1031,7 @@ fn main() {
 | `core::nip05_validator` | NIP-05 verification | `Nip05Validator`, `ValidationResult` | `validate()`, `check_cache()` |
 | `core::lightning` | Lightning payments | `ZapRequest`, `ZapInvoice` | `request_zap_invoice()` |
 | `core::social_graph` | Extended network | `SocialGraphDb` | `discover_network()` |
+| `core::achievements` | NIP-58 badges | `BadgeDefinition`, `BadgeAward`, `ProfileBadgeEntry` | `parse_badge_definition()`, `fetch_profile_badges()` |
 
 **Recent `core::storage::encryption` public surface additions (NIP-49 backend):**
 - `ScryptParams { n, r, p }`
@@ -1135,6 +1162,51 @@ pub struct Nip05Status {
 }
 ```
 
+#### NIP-58 Badge Models
+```rust
+// app/src/models.rs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BadgeDefinition {
+    pub coordinate: String,           // "30009:<issuer>:<badge_id>"
+    pub issuer_pubkey: String,        // Badge creator
+    pub badge_id: String,             // d-tag identifier
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub image_url: Option<String>,
+    pub image_dimensions: Option<String>,
+    pub thumb_url: Option<String>,
+    pub thumb_dimensions: Option<String>,
+    pub relay_url: Option<String>,
+    pub event_id: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BadgeAward {
+    pub event_id: String,
+    pub issuer_pubkey: String,
+    pub recipient_pubkey: String,
+    pub badge_coordinate: String,
+    pub relay_url: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileBadgeEntry {
+    pub definition: BadgeDefinition,
+    pub award: BadgeAward,
+    pub display_order: usize,
+    pub visible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EarnedBadgeSummary {
+    pub definition: BadgeDefinition,
+    pub award: BadgeAward,
+    pub visible_on_profile: bool,
+}
+```
+
 #### AuthState
 ```rust
 // core/src/auth/auth_state.rs
@@ -1167,6 +1239,7 @@ pub struct AppState {
     pub extended_network_follows: Arc<RwLock<Vec<String>>>,
     pub relay_hints: Option<Arc<RelayHints>>,
     pub nip05_validator: Arc<std::sync::Mutex<Nip05Validator>>,  // Background NIP-05 verification
+    pub badge_cache: Arc<Mutex<BadgeCache>>,  // NIP-58 badge caching
 }
 ```
 
@@ -1475,6 +1548,64 @@ async fn fetch_marketplace_stream(
     // 4. Emit "marketplace-complete" when done
 }
 ```
+
+### 8.9 NIP-58 Badge System
+
+NIP-58 defines badges/achievements as three event kinds working together:
+
+```rust
+// core/src/achievements.rs
+pub const KIND_BADGE_DEFINITION: u16 = 30009;    // Badge template (name, image, description)
+pub const KIND_BADGE_AWARD: u16 = 8;             // Award instance (who earned it)
+pub const KIND_PROFILE_BADGES_CURRENT: u16 = 10008;  // Which badges user displays
+```
+
+**Badge Definition** (Kind 30009):
+```rust
+pub struct BadgeDefinition {
+    pub coordinate: String,      // "30009:<issuer_pubkey>:<badge_id>"
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub image_url: Option<String>,
+    pub thumb_url: Option<String>,
+    // ...
+}
+```
+
+**Validation Flow**:
+```rust
+// core/src/achievements.rs
+pub fn parse_and_validate_profile_badges(
+    profile_badges_event: &Event,
+    badge_definitions: &HashMap<String, BadgeDefinition>,
+    badge_awards: &HashMap<String, BadgeAward>,
+) -> Result<Vec<ProfileBadgeEntry>, AchievementError> {
+    // 1. Verify event kind is 10008 or 30008
+    // 2. Verify a-tags reference valid badge definitions
+    // 3. Verify award issuer matches definition issuer
+    // 4. Verify award recipient matches profile owner
+    // 5. Return validated entries with display order
+}
+```
+
+**Fetching Strategy**:
+```rust
+// Try profile badges event first (kind 10008)
+let profile_badges = fetch_profile_badges_event(pubkey).await;
+if let Ok(entries) = profile_badges {
+    return entries;
+}
+
+// Fallback: fetch all award events (kind 8) where recipient is the user
+let earned_badges = fetch_badge_awards_for_recipient(pubkey).await;
+let definitions = fetch_badge_definitions(&earned_badges).await;
+merge_into_summaries(earned_badges, definitions)
+```
+
+**Caching**: Badge definitions and awards are cached in SQLite to avoid repeated relay fetches:
+- `badge_definitions` table: Stores kind 30009 events
+- `badge_awards` table: Stores kind 8 events with recipient index
+- `profile_badge_lists` table: Stores kind 10008/30008 events
 
 ---
 
@@ -2039,6 +2170,16 @@ console.log(window.__TAURI__.event);  // Should show listen/emit functions
 | **Streaming fetch** | Progressive data loading with callbacks |
 | **Tailwind CSS** | Utility-first CSS framework |
 | **Stitch** | AI-powered UI generation system |
+| **NIP-58** | Badges protocol - defines badge definitions, awards, and profile displays |
+| **BadgeDefinition** | Kind 30009 event defining a badge (name, image, description) |
+| **BadgeAward** | Kind 8 event awarding a badge to a specific user |
+| **ProfileBadgeEntry** | Combined badge definition + award for display |
+| **EarnedBadgeSummary** | Simplified badge data for achievements lists |
+| **BadgeShowcase** | UI component displaying a row of profile badges |
+| **BadgeEarnedModal** | Modal dialog celebrating newly earned badges |
+| **allow_insecure_public_ws** | Setting to allow ws:// (non-TLS) relays for public hosts |
+| **Relay snapshot** | Initial relay state fetched on UI startup to recover missed events |
+| **Relay state helpers** | `merge_relay_snapshot()` and `apply_relay_event()` for relay UI state |
 
 ---
 
@@ -2063,4 +2204,29 @@ All frontend→backend communication goes through `tauri_invoke.rs`, which uses 
 
 ---
 
-*Documentation generated for Arcadestr codebase. Last updated: 2026-04-09*
+## Recent Major Features (2026-05)
+
+### NIP-58 Badge System
+The codebase now supports NIP-58 badges/achievements:
+- **Badge definitions** (kind 30009): Templates defining badge name, image, description
+- **Badge awards** (kind 8): Events awarding badges to specific users
+- **Profile badges** (kind 10008): User's selected badges for display
+- **Validation**: Awards are validated against definitions, issuers must match
+- **Caching**: Badge data cached in SQLite with `core/migrations/002_achievements.sql`
+- **UI components**: `BadgeShowcase` for profile display, `BadgeEarnedModal` for celebrations
+- **Achievements page**: Full achievements view at `app/src/ui_v2/views/achievements.rs`
+
+### Network Discovery Settings
+New relay security setting `allow_insecure_public_ws`:
+- Controls whether ws:// (non-TLS) relays are allowed for public hosts
+- Local/private relays (localhost, 192.168.x.x) always allowed
+- Setting persisted and exposed via Tauri commands
+
+### Relay State Management Improvements
+- **Relay snapshot pattern**: UI fetches current relay state on startup to recover events emitted before listener setup
+- **Relay state helpers**: `merge_relay_snapshot()` and `apply_relay_event()` in `app/src/relay_state.rs`
+- Prevents missed relay events during startup race conditions
+
+---
+
+*Documentation generated for Arcadestr codebase. Last updated: 2026-05-06*
