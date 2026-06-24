@@ -4,6 +4,7 @@ use lightning_invoice::Bolt11Invoice;
 use nostr_sdk::Event;
 use sha2::{Digest, Sha256};
 use sqlx::{Pool, Row, Sqlite};
+use std::collections::HashSet;
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -20,12 +21,8 @@ pub enum PurchaseError {
     MissingTag(&'static str),
     #[error("receipt buyer p tag does not match authenticated buyer")]
     BuyerMismatch,
-    #[error("invalid preimage hex: {0}")]
-    InvalidPreimageHex(#[from] hex::FromHexError),
-    #[error("invalid bolt11 invoice: {0}")]
-    InvalidInvoice(String),
-    #[error("preimage hash does not match bolt11 payment hash")]
-    PaymentHashMismatch,
+    #[error("invalid payment proof: {0}")]
+    ProofInvalid(String),
     #[error("missing payment proof: expected bolt11 + preimage or zap receipt e tag")]
     MissingPaymentProof,
     #[error("failed to serialize raw event: {0}")]
@@ -106,23 +103,31 @@ impl PurchasesRepository {
         buyer_pubkey: &str,
         listing_coordinate: &str,
     ) -> Result<bool, PurchaseError> {
-        let row = sqlx::query(
+        let rows = sqlx::query(
             r#"
-            SELECT status
+            SELECT order_id, status
             FROM purchases
             WHERE buyer_pubkey = ? AND listing_coordinate = ?
             ORDER BY created_at DESC, event_id DESC
-            LIMIT 1
             "#,
         )
         .bind(buyer_pubkey)
         .bind(listing_coordinate)
-        .fetch_optional(&self.db)
+        .fetch_all(&self.db)
         .await?;
 
-        Ok(row
-            .map(|row| status_grants_ownership(row.get::<String, _>("status").as_str()))
-            .unwrap_or(false))
+        let mut seen_orders = HashSet::new();
+        for row in rows {
+            let order_id: String = row.get("order_id");
+            if seen_orders.insert(order_id) {
+                let status: String = row.get("status");
+                if status_grants_ownership(&status) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 }
 
@@ -175,15 +180,18 @@ fn validate_payment_proof(event: &Event) -> Result<Option<String>, PurchaseError
         return Err(PurchaseError::MissingPaymentProof);
     };
 
-    let preimage = hex::decode(preimage_hex)?;
+    let preimage = hex::decode(preimage_hex)
+        .map_err(|error| PurchaseError::ProofInvalid(format!("invalid preimage hex: {error}")))?;
     let invoice = Bolt11Invoice::from_str(&bolt11)
-        .map_err(|error| PurchaseError::InvalidInvoice(error.to_string()))?;
+        .map_err(|error| PurchaseError::ProofInvalid(format!("invalid bolt11 invoice: {error}")))?;
     let digest: [u8; 32] = Sha256::digest(&preimage).into();
     let digest_hex = hex::encode(digest);
     let payment_hash_hex = invoice.payment_hash().to_string();
 
     if digest_hex != payment_hash_hex {
-        return Err(PurchaseError::PaymentHashMismatch);
+        return Err(PurchaseError::ProofInvalid(
+            "preimage hash does not match bolt11 payment hash".to_string(),
+        ));
     }
 
     Ok(Some(payment_hash_hex))
@@ -198,12 +206,9 @@ fn required_tag_value(
 }
 
 fn tag_value(event: &Event, tag_name: &str) -> Option<String> {
-    event.tags.iter().find_map(|tag| {
-        let values = tag.clone().to_vec();
-        match values.as_slice() {
-            [name, value, ..] if name == tag_name && !value.is_empty() => Some(value.clone()),
-            _ => None,
-        }
+    event.tags.iter().find_map(|tag| match tag.as_slice() {
+        [name, value, ..] if name == tag_name && !value.is_empty() => Some(value.to_string()),
+        _ => None,
     })
 }
 
@@ -213,9 +218,14 @@ fn status_grants_ownership(status: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_and_validate_receipt, PurchasesRepository};
+    use super::{parse_and_validate_receipt, PurchaseError, PurchasesRepository};
     use crate::storage::Database;
+    use bitcoin::hashes::{sha256, Hash as _};
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lightning_invoice::{Currency, InvoiceBuilder};
+    use lightning_types::payment::PaymentSecret;
     use nostr_sdk::{Event, EventBuilder, Keys, Kind, Tag, TagKind};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     const LISTING_COORDINATE: &str =
@@ -243,6 +253,33 @@ mod tests {
         let mut tags = valid_tags(&buyer_hex);
         tags.push(Tag::custom(TagKind::custom("status"), [status]));
         receipt_event(Kind::Custom(1020), merchant, tags)
+    }
+
+    fn bolt11_with_preimage() -> (String, String) {
+        let preimage = [7_u8; 32];
+        let payment_hash = sha256::Hash::hash(&preimage);
+        let private_key = SecretKey::from_slice(&[42_u8; 32]).expect("private key is valid");
+        let invoice = InvoiceBuilder::new(Currency::Bitcoin)
+            .description("Arcadestr purchase receipt test".to_string())
+            .payment_hash(payment_hash)
+            .payment_secret(PaymentSecret([11_u8; 32]))
+            .duration_since_epoch(Duration::from_secs(1_700_000_000))
+            .min_final_cltv_expiry_delta(144)
+            .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
+            .expect("test invoice builds");
+
+        (invoice.to_string(), hex::encode(preimage))
+    }
+
+    fn bolt11_receipt(buyer_hex: &str, bolt11: &str, preimage_hex: &str) -> Vec<Tag> {
+        valid_tags(buyer_hex)
+            .into_iter()
+            .filter(|tag| tag.kind() != TagKind::e())
+            .chain([
+                Tag::custom(TagKind::custom("bolt11"), [bolt11]),
+                Tag::custom(TagKind::custom("preimage"), [preimage_hex]),
+            ])
+            .collect()
     }
 
     #[test]
@@ -345,12 +382,8 @@ mod tests {
         let buyer = Keys::generate();
         let merchant = Keys::generate();
         let buyer_hex = buyer.public_key().to_hex();
-        let mut tags = valid_tags(&buyer_hex)
-            .into_iter()
-            .filter(|tag| tag.kind() != TagKind::e())
-            .collect::<Vec<_>>();
-        tags.push(Tag::custom(TagKind::custom("bolt11"), ["lnbc1invalid"]));
-        tags.push(Tag::custom(TagKind::custom("preimage"), ["not-hex"]));
+        let (bolt11, _) = bolt11_with_preimage();
+        let tags = bolt11_receipt(&buyer_hex, &bolt11, "not-hex");
         let event = receipt_event(Kind::Custom(1020), &merchant, tags);
 
         // Act
@@ -358,7 +391,51 @@ mod tests {
             .expect_err("invalid preimage hex should be rejected");
 
         // Assert
-        assert!(error.to_string().contains("preimage"));
+        assert!(matches!(error, PurchaseError::ProofInvalid(_)));
+    }
+
+    #[test]
+    fn accepts_valid_bolt11_with_matching_preimage() {
+        // Arrange
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let (bolt11, preimage_hex) = bolt11_with_preimage();
+        let event = receipt_event(
+            Kind::Custom(1020),
+            &merchant,
+            bolt11_receipt(&buyer_hex, &bolt11, &preimage_hex),
+        );
+
+        // Act
+        let receipt = parse_and_validate_receipt(&event, &buyer_hex)
+            .expect("matching bolt11 and preimage should validate");
+
+        // Assert
+        assert!(receipt.payment_hash.is_some());
+        assert_eq!(receipt.order_id, "order-1");
+    }
+
+    #[test]
+    fn rejects_valid_bolt11_with_mismatched_preimage() {
+        // Arrange
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let (bolt11, _) = bolt11_with_preimage();
+        let mismatched_preimage = hex::encode([8_u8; 32]);
+        let event = receipt_event(
+            Kind::Custom(1020),
+            &merchant,
+            bolt11_receipt(&buyer_hex, &bolt11, &mismatched_preimage),
+        );
+
+        // Act
+        let error = parse_and_validate_receipt(&event, &buyer_hex)
+            .expect_err("mismatched preimage should be rejected");
+
+        // Assert
+        assert!(matches!(error, PurchaseError::ProofInvalid(_)));
     }
 
     #[test]
@@ -463,5 +540,43 @@ mod tests {
 
         // Assert
         assert!(!is_owned);
+    }
+
+    #[tokio::test]
+    async fn refunded_order_does_not_revoke_separate_paid_order() {
+        // Arrange
+        let temp_dir = TempDir::new().expect("temp dir is created");
+        let db_path = temp_dir.path().join("purchases.sqlite");
+        let db = Database::new(&db_path).await.expect("database opens");
+        let repository = PurchasesRepository::new(db.pool().clone());
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let mut paid_order =
+            parse_and_validate_receipt(&valid_receipt("paid", &buyer, &merchant), &buyer_hex)
+                .expect("paid receipt parses");
+        paid_order.order_id = "paid-order".to_string();
+        let mut refunded_order =
+            parse_and_validate_receipt(&valid_receipt("refunded", &buyer, &merchant), &buyer_hex)
+                .expect("refunded receipt parses");
+        refunded_order.order_id = "refunded-order".to_string();
+        refunded_order.created_at = paid_order.created_at + 1;
+
+        // Act
+        repository
+            .upsert_receipt(&paid_order)
+            .await
+            .expect("paid receipt is stored");
+        repository
+            .upsert_receipt(&refunded_order)
+            .await
+            .expect("refunded receipt is stored");
+        let is_owned = repository
+            .is_owned(&buyer_hex, LISTING_COORDINATE)
+            .await
+            .expect("ownership query succeeds");
+
+        // Assert
+        assert!(is_owned);
     }
 }
