@@ -74,7 +74,7 @@ pub struct AppState {
     /// Marketplace cache for persistent listing storage.
     pub marketplace_cache: Arc<MarketplaceCache>,
     /// Purchase receipts repository for ownership lookups.
-    pub purchases: Arc<Mutex<arcadestr_core::purchases::PurchasesRepository>>,
+    pub purchases: Arc<arcadestr_core::purchases::PurchasesRepository>,
     /// Extended network repository for 2nd-degree follow discovery.
     pub extended_network: Arc<RwLock<Option<Arc<Mutex<ExtendedNetworkRepository>>>>>,
     /// Follows list for extended network refresh cycles.
@@ -606,8 +606,6 @@ async fn fetch_marketplace(
         if let (Some(buyer_pubkey_hex), Some(coordinate)) = (&buyer_pubkey_hex, coordinate) {
             match state
                 .purchases
-                .lock()
-                .await
                 .is_owned(buyer_pubkey_hex, &coordinate)
                 .await
             {
@@ -672,8 +670,6 @@ async fn ingest_receipt(
         .map_err(|e| e.to_string())?;
     state
         .purchases
-        .lock()
-        .await
         .upsert_receipt(&receipt)
         .await
         .map_err(|e| e.to_string())
@@ -1052,8 +1048,8 @@ fn main() {
             }
 
             let marketplace_cache = Arc::new(MarketplaceCache::new(db.pool().clone()));
-            let purchases = Arc::new(Mutex::new(
-                arcadestr_core::purchases::PurchasesRepository::new(db.pool().clone()),
+            let purchases = Arc::new(arcadestr_core::purchases::PurchasesRepository::new(
+                db.pool().clone(),
             ));
 
             (

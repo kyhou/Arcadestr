@@ -139,6 +139,10 @@ pub fn parse_and_validate_receipt(
     event: &Event,
     buyer_pubkey_hex: &str,
 ) -> Result<StoredReceipt, PurchaseError> {
+    event.verify().map_err(|error| {
+        PurchaseError::ProofInvalid(format!("invalid event signature: {error}"))
+    })?;
+
     let kind = event.kind.as_u16();
     if kind != KIND_PURCHASE_RECEIPT {
         return Err(PurchaseError::WrongKind(kind));
@@ -150,6 +154,8 @@ pub fn parse_and_validate_receipt(
     }
 
     let listing_coordinate = required_tag_value(event, "a", "a tag")?;
+    validate_listing_coordinate_merchant(&listing_coordinate, &event.pubkey.to_hex())?;
+
     let order_id = required_tag_value(event, "order", "order tag")?;
     let payment_hash = validate_payment_proof(event)?;
     let status = tag_value(event, "status").unwrap_or_else(|| STATUS_PAID.to_string());
@@ -168,8 +174,47 @@ pub fn parse_and_validate_receipt(
     })
 }
 
+fn validate_listing_coordinate_merchant(
+    listing_coordinate: &str,
+    merchant_pubkey_hex: &str,
+) -> Result<(), PurchaseError> {
+    let mut parts = listing_coordinate.split(':');
+    let Some(kind) = parts.next() else {
+        return Err(PurchaseError::ProofInvalid(
+            "malformed listing coordinate: missing kind".to_string(),
+        ));
+    };
+    let Some(expected_merchant) = parts.next() else {
+        return Err(PurchaseError::ProofInvalid(
+            "malformed listing coordinate: missing merchant pubkey".to_string(),
+        ));
+    };
+    let Some(d_tag) = parts.next() else {
+        return Err(PurchaseError::ProofInvalid(
+            "malformed listing coordinate: missing d tag".to_string(),
+        ));
+    };
+
+    if kind != "30402" || expected_merchant.is_empty() || d_tag.is_empty() || parts.next().is_some()
+    {
+        return Err(PurchaseError::ProofInvalid(
+            "malformed listing coordinate".to_string(),
+        ));
+    }
+
+    if expected_merchant != merchant_pubkey_hex {
+        return Err(PurchaseError::ProofInvalid(
+            "listing coordinate merchant does not match receipt signer".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_payment_proof(event: &Event) -> Result<Option<String>, PurchaseError> {
     if tag_value(event, "e").is_some() {
+        // Optimistically accept zap receipt references for now; relay-level
+        // verification of the referenced zap receipt is deferred.
         return Ok(None);
     }
 
@@ -228,9 +273,12 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    const LISTING_COORDINATE: &str =
-        "30402:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:game";
+    const LISTING_D_TAG: &str = "game";
     const ZAP_EVENT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn listing_coordinate(merchant: &Keys) -> String {
+        format!("30402:{}:{LISTING_D_TAG}", merchant.public_key().to_hex())
+    }
 
     fn receipt_event(kind: Kind, merchant: &Keys, extra_tags: Vec<Tag>) -> Event {
         EventBuilder::new(kind, "")
@@ -239,10 +287,10 @@ mod tests {
             .expect("receipt event signs")
     }
 
-    fn valid_tags(buyer_hex: &str) -> Vec<Tag> {
+    fn valid_tags(buyer_hex: &str, merchant: &Keys) -> Vec<Tag> {
         vec![
             Tag::custom(TagKind::p(), [buyer_hex]),
-            Tag::custom(TagKind::a(), [LISTING_COORDINATE]),
+            Tag::custom(TagKind::a(), [listing_coordinate(merchant)]),
             Tag::custom(TagKind::custom("order"), ["order-1"]),
             Tag::custom(TagKind::e(), [ZAP_EVENT_ID]),
         ]
@@ -250,7 +298,7 @@ mod tests {
 
     fn valid_receipt(status: &str, buyer: &Keys, merchant: &Keys) -> Event {
         let buyer_hex = buyer.public_key().to_hex();
-        let mut tags = valid_tags(&buyer_hex);
+        let mut tags = valid_tags(&buyer_hex, merchant);
         tags.push(Tag::custom(TagKind::custom("status"), [status]));
         receipt_event(Kind::Custom(1020), merchant, tags)
     }
@@ -271,8 +319,13 @@ mod tests {
         (invoice.to_string(), hex::encode(preimage))
     }
 
-    fn bolt11_receipt(buyer_hex: &str, bolt11: &str, preimage_hex: &str) -> Vec<Tag> {
-        valid_tags(buyer_hex)
+    fn bolt11_receipt(
+        buyer_hex: &str,
+        merchant: &Keys,
+        bolt11: &str,
+        preimage_hex: &str,
+    ) -> Vec<Tag> {
+        valid_tags(buyer_hex, merchant)
             .into_iter()
             .filter(|tag| tag.kind() != TagKind::e())
             .chain([
@@ -288,7 +341,7 @@ mod tests {
         let buyer = Keys::generate();
         let merchant = Keys::generate();
         let buyer_hex = buyer.public_key().to_hex();
-        let event = receipt_event(Kind::TextNote, &merchant, valid_tags(&buyer_hex));
+        let event = receipt_event(Kind::TextNote, &merchant, valid_tags(&buyer_hex, &merchant));
 
         // Act
         let error = parse_and_validate_receipt(&event, &buyer_hex)
@@ -308,7 +361,7 @@ mod tests {
             Kind::Custom(1020),
             &merchant,
             vec![
-                Tag::custom(TagKind::a(), [LISTING_COORDINATE]),
+                Tag::custom(TagKind::a(), [listing_coordinate(&merchant)]),
                 Tag::custom(TagKind::custom("order"), ["order-1"]),
                 Tag::custom(TagKind::e(), [ZAP_EVENT_ID]),
             ],
@@ -330,7 +383,11 @@ mod tests {
         let merchant = Keys::generate();
         let buyer_hex = buyer.public_key().to_hex();
         let other_buyer_hex = other_buyer.public_key().to_hex();
-        let event = receipt_event(Kind::Custom(1020), &merchant, valid_tags(&other_buyer_hex));
+        let event = receipt_event(
+            Kind::Custom(1020),
+            &merchant,
+            valid_tags(&other_buyer_hex, &merchant),
+        );
 
         // Act
         let error = parse_and_validate_receipt(&event, &buyer_hex)
@@ -338,6 +395,65 @@ mod tests {
 
         // Assert
         assert!(error.to_string().contains("buyer"));
+    }
+
+    #[test]
+    fn rejects_invalid_signature_before_kind_validation() {
+        // Arrange
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let mut event = valid_receipt("paid", &buyer, &merchant);
+        event.kind = Kind::TextNote;
+
+        // Act
+        let error = parse_and_validate_receipt(&event, &buyer_hex)
+            .expect_err("invalid signature should be rejected first");
+
+        // Assert
+        assert!(matches!(error, PurchaseError::ProofInvalid(_)));
+    }
+
+    #[test]
+    fn rejects_malformed_listing_coordinate() {
+        // Arrange
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let mut tags = valid_tags(&buyer_hex, &merchant);
+        tags.retain(|tag| tag.kind() != TagKind::a());
+        tags.push(Tag::custom(TagKind::a(), ["30402:missing-d-tag"]));
+        let event = receipt_event(Kind::Custom(1020), &merchant, tags);
+
+        // Act
+        let error = parse_and_validate_receipt(&event, &buyer_hex)
+            .expect_err("malformed coordinate should be rejected");
+
+        // Assert
+        assert!(matches!(error, PurchaseError::ProofInvalid(_)));
+    }
+
+    #[test]
+    fn rejects_listing_coordinate_merchant_mismatch() {
+        // Arrange
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let other_merchant = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let mut tags = valid_tags(&buyer_hex, &merchant);
+        tags.retain(|tag| tag.kind() != TagKind::a());
+        tags.push(Tag::custom(
+            TagKind::a(),
+            [listing_coordinate(&other_merchant)],
+        ));
+        let event = receipt_event(Kind::Custom(1020), &merchant, tags);
+
+        // Act
+        let error = parse_and_validate_receipt(&event, &buyer_hex)
+            .expect_err("merchant mismatch should be rejected");
+
+        // Assert
+        assert!(matches!(error, PurchaseError::ProofInvalid(_)));
     }
 
     #[test]
@@ -360,7 +476,7 @@ mod tests {
             &merchant,
             vec![
                 Tag::custom(TagKind::p(), [buyer_hex.as_str()]),
-                Tag::custom(TagKind::a(), [LISTING_COORDINATE]),
+                Tag::custom(TagKind::a(), [listing_coordinate(&merchant)]),
                 Tag::custom(TagKind::e(), [ZAP_EVENT_ID]),
             ],
         );
@@ -383,7 +499,7 @@ mod tests {
         let merchant = Keys::generate();
         let buyer_hex = buyer.public_key().to_hex();
         let (bolt11, _) = bolt11_with_preimage();
-        let tags = bolt11_receipt(&buyer_hex, &bolt11, "not-hex");
+        let tags = bolt11_receipt(&buyer_hex, &merchant, &bolt11, "not-hex");
         let event = receipt_event(Kind::Custom(1020), &merchant, tags);
 
         // Act
@@ -404,7 +520,7 @@ mod tests {
         let event = receipt_event(
             Kind::Custom(1020),
             &merchant,
-            bolt11_receipt(&buyer_hex, &bolt11, &preimage_hex),
+            bolt11_receipt(&buyer_hex, &merchant, &bolt11, &preimage_hex),
         );
 
         // Act
@@ -427,7 +543,7 @@ mod tests {
         let event = receipt_event(
             Kind::Custom(1020),
             &merchant,
-            bolt11_receipt(&buyer_hex, &bolt11, &mismatched_preimage),
+            bolt11_receipt(&buyer_hex, &merchant, &bolt11, &mismatched_preimage),
         );
 
         // Act
@@ -444,7 +560,7 @@ mod tests {
         let buyer = Keys::generate();
         let merchant = Keys::generate();
         let buyer_hex = buyer.public_key().to_hex();
-        let tags = valid_tags(&buyer_hex)
+        let tags = valid_tags(&buyer_hex, &merchant)
             .into_iter()
             .filter(|tag| tag.kind() != TagKind::e())
             .collect::<Vec<_>>();
@@ -472,7 +588,7 @@ mod tests {
 
         // Assert
         assert_eq!(receipt.order_id, "order-1");
-        assert_eq!(receipt.listing_coordinate, LISTING_COORDINATE);
+        assert_eq!(receipt.listing_coordinate, listing_coordinate(&merchant));
         assert_eq!(receipt.buyer_pubkey, buyer_hex);
         assert_eq!(receipt.merchant_pubkey, merchant.public_key().to_hex());
         assert_eq!(receipt.status, "paid");
@@ -498,7 +614,7 @@ mod tests {
             .await
             .expect("receipt is stored");
         let is_owned = repository
-            .is_owned(&buyer_hex, LISTING_COORDINATE)
+            .is_owned(&buyer_hex, &listing_coordinate(&merchant))
             .await
             .expect("ownership query succeeds");
 
@@ -534,7 +650,7 @@ mod tests {
             .await
             .expect("refunded receipt is stored");
         let is_owned = repository
-            .is_owned(&buyer_hex, LISTING_COORDINATE)
+            .is_owned(&buyer_hex, &listing_coordinate(&merchant))
             .await
             .expect("ownership query succeeds");
 
@@ -572,7 +688,7 @@ mod tests {
             .await
             .expect("refunded receipt is stored");
         let is_owned = repository
-            .is_owned(&buyer_hex, LISTING_COORDINATE)
+            .is_owned(&buyer_hex, &listing_coordinate(&merchant))
             .await
             .expect("ownership query succeeds");
 
