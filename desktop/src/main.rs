@@ -26,8 +26,8 @@ use arcadestr_core::nip46::{
     SessionRestoreResult,
 };
 use arcadestr_core::nostr::{
-    parse_nip19_identifier, EventDeduplicator, GameListing, NostrClient, UserProfile,
-    DEFAULT_RELAYS,
+    parse_nip19_identifier, EventDeduplicator, GameListing as CoreGameListing, NostrClient,
+    UserProfile, DEFAULT_RELAYS,
 };
 use arcadestr_core::profile_fetcher::ProfileFetcher;
 use arcadestr_core::relay_cache::RelayCache;
@@ -39,6 +39,7 @@ use arcadestr_core::subscriptions::{
     run_notification_loop, SubscriptionRegistry,
 };
 use arcadestr_core::user_cache::UserCache;
+use nostr::nips::nip19::FromBech32;
 use nostr::nips::nip46::NostrConnectURI;
 use nostr::prelude::ToBech32;
 use tauri::Emitter;
@@ -46,6 +47,7 @@ use tauri::Emitter;
 mod command_contracts;
 mod nip46_commands;
 
+use arcadestr_app::models::GameListing as AppGameListing;
 use command_contracts::{
     ExportKeyRequest, ExportKeyResult, ImportKeyRequest, ImportKeyResult, Nip05Status,
     Nip49ExportResult, Nip49ImportRequest, VerifyNip05Request, VerifyNip05Result,
@@ -71,6 +73,8 @@ pub struct AppState {
     pub user_cache: Arc<UserCache>,
     /// Marketplace cache for persistent listing storage.
     pub marketplace_cache: Arc<MarketplaceCache>,
+    /// Purchase receipts repository for ownership lookups.
+    pub purchases: Arc<Mutex<arcadestr_core::purchases::PurchasesRepository>>,
     /// Extended network repository for 2nd-degree follow discovery.
     pub extended_network: Arc<RwLock<Option<Arc<Mutex<ExtendedNetworkRepository>>>>>,
     /// Follows list for extended network refresh cycles.
@@ -159,11 +163,11 @@ async fn set_allow_insecure_public_ws(
     Ok(())
 }
 
-fn listing_cache_key(listing: &GameListing) -> (String, String) {
+fn listing_cache_key(listing: &CoreGameListing) -> (String, String) {
     (listing.publisher_npub.clone(), listing.id.clone())
 }
 
-fn listing_signature(listing: &GameListing) -> String {
+fn listing_signature(listing: &CoreGameListing) -> String {
     let tags_json = serde_json::to_string(&listing.tags).unwrap_or_else(|_| "[]".to_string());
     format!(
         "{}|{}|{}|{}|{}|{}|{}|{}",
@@ -495,7 +499,7 @@ async fn disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// The event ID as a hex string on success.
 #[tauri::command]
 async fn publish_listing(
-    listing: GameListing,
+    listing: CoreGameListing,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     // Clone auth state before dropping the lock to avoid holding across await
@@ -524,7 +528,7 @@ async fn publish_listing(
 async fn fetch_listings(
     limit: usize,
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<GameListing>, String> {
+) -> Result<Vec<CoreGameListing>, String> {
     let nostr = state.nostr.lock().await;
 
     nostr.fetch_listings(limit).await.map_err(|e| e.to_string())
@@ -543,7 +547,7 @@ async fn fetch_listing_by_id(
     publisher_npub: String,
     listing_id: String,
     state: tauri::State<'_, AppState>,
-) -> Result<GameListing, String> {
+) -> Result<CoreGameListing, String> {
     let nostr = state.nostr.lock().await;
 
     nostr
@@ -564,7 +568,7 @@ async fn fetch_marketplace(
     limit: usize,
     since_days: Option<u64>,
     filter: Option<MarketplaceFilter>,
-) -> Result<Vec<GameListing>, String> {
+) -> Result<Vec<AppGameListing>, String> {
     let filter = filter.unwrap_or_default();
 
     tracing::info!(
@@ -589,14 +593,90 @@ async fn fetch_marketplace(
         filtered.len()
     );
 
-    // Map listings directly to GameListing.
-    let listings: Vec<GameListing> = filtered
-        .into_iter()
-        .map(GameListing::from_listing)
-        .collect();
+    let buyer_pubkey_hex = {
+        let auth = state.auth.lock().await;
+        auth.public_key().map(|public_key| public_key.to_hex())
+    };
+
+    let mut listings = Vec::with_capacity(filtered.len());
+    for product in filtered {
+        let coordinate = listing_coordinate(&product);
+        let mut listing = AppGameListing::from_listing(product);
+
+        if let (Some(buyer_pubkey_hex), Some(coordinate)) = (&buyer_pubkey_hex, coordinate) {
+            match state
+                .purchases
+                .lock()
+                .await
+                .is_owned(buyer_pubkey_hex, &coordinate)
+                .await
+            {
+                Ok(is_owned) => listing.is_owned = is_owned,
+                Err(error) => tracing::warn!(
+                    "fetch_marketplace: ownership lookup failed for {}: {}",
+                    coordinate,
+                    error
+                ),
+            }
+        } else if buyer_pubkey_hex.is_some() {
+            tracing::warn!(
+                "fetch_marketplace: unable to build ownership coordinate for listing '{}'",
+                listing.id
+            );
+        }
+
+        listings.push(listing);
+    }
 
     tracing::info!("fetch_marketplace: returning {} listings", listings.len());
     Ok(listings)
+}
+
+fn listing_coordinate(listing: &arcadestr_core::marketplace::Nip99Listing) -> Option<String> {
+    let merchant_pubkey = nostr::PublicKey::from_bech32(&listing.merchant_npub).ok()?;
+    Some(format!("30402:{}:{}", merchant_pubkey.to_hex(), listing.id))
+}
+
+#[tauri::command]
+fn get_platform_info() -> arcadestr_app::models::PlatformInfo {
+    arcadestr_app::models::PlatformInfo {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+    }
+}
+
+#[tauri::command]
+async fn install_game(
+    listing: AppGameListing,
+    _state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    tracing::info!(
+        "install_game called for listing '{}' ({})",
+        listing.title,
+        listing.id
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn ingest_receipt(
+    raw_event_json: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let event: nostr::Event = serde_json::from_str(&raw_event_json).map_err(|e| e.to_string())?;
+    let buyer_pubkey_hex = {
+        let auth = state.auth.lock().await;
+        auth.public_key().ok_or("not authenticated")?.to_hex()
+    };
+    let receipt = arcadestr_core::purchases::parse_and_validate_receipt(&event, &buyer_pubkey_hex)
+        .map_err(|e| e.to_string())?;
+    state
+        .purchases
+        .lock()
+        .await
+        .upsert_receipt(&receipt)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Streams NIP-15 products from relays with real-time updates via Tauri events.
@@ -651,7 +731,8 @@ async fn fetch_marketplace_stream(
     );
 
     let seen_signatures = StdArc::new(StdMutex::new(cached_signatures));
-    let relay_updates: StdArc<StdMutex<Vec<GameListing>>> = StdArc::new(StdMutex::new(Vec::new()));
+    let relay_updates: StdArc<StdMutex<Vec<CoreGameListing>>> =
+        StdArc::new(StdMutex::new(Vec::new()));
 
     // Clone window for use in the closure
     let window_for_closure = window.clone();
@@ -673,7 +754,7 @@ async fn fetch_marketplace_stream(
         since_days,
         until_secs,
         move |product| {
-            let listing = GameListing::from_listing(product);
+            let listing = CoreGameListing::from_listing(product);
             let key = listing_cache_key(&listing);
             let signature = listing_signature(&listing);
 
@@ -794,6 +875,61 @@ async fn request_invoice(
         .map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
+mod task4_tests {
+    use super::*;
+    use nostr::prelude::Keys;
+
+    fn listing_with_merchant_npub(
+        merchant_npub: String,
+    ) -> arcadestr_core::marketplace::Nip99Listing {
+        arcadestr_core::marketplace::Nip99Listing {
+            id: "game-v1".to_string(),
+            title: "Game".to_string(),
+            content: String::new(),
+            summary: None,
+            published_at: None,
+            location: None,
+            images: Vec::new(),
+            price_amount: None,
+            price_currency: None,
+            price_frequency: None,
+            geohash: None,
+            merchant_npub,
+            tags: Vec::new(),
+            created_at: 0,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            status: None,
+        }
+    }
+
+    #[test]
+    fn listing_coordinate_uses_kind_merchant_hex_and_d_tag() {
+        let merchant = Keys::generate();
+        let listing = listing_with_merchant_npub(
+            merchant
+                .public_key()
+                .to_bech32()
+                .expect("public key should encode as npub"),
+        );
+
+        let coordinate = listing_coordinate(&listing).expect("valid npub should build coordinate");
+
+        assert_eq!(
+            coordinate,
+            format!("30402:{}:game-v1", merchant.public_key().to_hex())
+        );
+    }
+
+    #[test]
+    fn listing_coordinate_rejects_invalid_merchant_npub() {
+        let listing = listing_with_merchant_npub("not-an-npub".to_string());
+
+        assert!(listing_coordinate(&listing).is_none());
+    }
+}
+
 fn main() {
     // Initialize tracing subscriber to see logs
     tracing_subscriber::fmt::init();
@@ -830,8 +966,8 @@ fn main() {
     // Create a single runtime for all initialization
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
-    let (database, nostr_client, user_cache, marketplace_cache, nip05_validator) = runtime
-        .block_on(async {
+    let (database, nostr_client, user_cache, marketplace_cache, purchases, nip05_validator) =
+        runtime.block_on(async {
             // Initialize database
             let db = arcadestr_core::storage::Database::new(&db_path)
                 .await
@@ -916,8 +1052,18 @@ fn main() {
             }
 
             let marketplace_cache = Arc::new(MarketplaceCache::new(db.pool().clone()));
+            let purchases = Arc::new(Mutex::new(
+                arcadestr_core::purchases::PurchasesRepository::new(db.pool().clone()),
+            ));
 
-            (db, client, cache, marketplace_cache, nip05_validator)
+            (
+                db,
+                client,
+                cache,
+                marketplace_cache,
+                purchases,
+                nip05_validator,
+            )
         });
     info!("Database initialized at: {}", db_path.display());
     info!("UserCache initialized");
@@ -2119,6 +2265,7 @@ fn main() {
             profile_fetcher,
             user_cache,
             marketplace_cache,
+            purchases,
             nip05_validator,
             http_client,
             extended_network: Arc::new(RwLock::new(None)),
@@ -2467,6 +2614,9 @@ fn main() {
             fetch_listing_by_id,
             fetch_marketplace,
             fetch_marketplace_stream,
+            get_platform_info,
+            install_game,
+            ingest_receipt,
             fetch_profile,
             fetch_earned_badges,
             fetch_profile_badges,
