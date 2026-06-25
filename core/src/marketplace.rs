@@ -249,8 +249,10 @@ pub struct Nip99Listing {
     /// Categories/keywords derived from `t` tags.
     pub tags: Vec<String>,
     /// Supported delivery platforms from `platform` tags.
+    #[serde(default)]
     pub platforms: Vec<String>,
     /// First NIP-94 metadata event id from `nip94` tags.
+    #[serde(default)]
     pub nip94_event_id: Option<String>,
     pub status: Option<String>,
     /// Bech32-encoded `npub` of the merchant who published this event.
@@ -1225,6 +1227,35 @@ mod tests {
 
         let listing = parse_listing(event).expect("listing should parse");
         assert_eq!(listing.nip94_event_id.as_deref(), Some("event-id-01"));
+    }
+
+    #[test]
+    fn legacy_listing_json_defaults_delivery_metadata() {
+        let json = r#"
+        {
+            "id": "legacy-listing",
+            "title": "Legacy Listing",
+            "content": "Markdown body",
+            "summary": null,
+            "published_at": null,
+            "location": null,
+            "price_amount": "1000",
+            "price_currency": "SATS",
+            "price_frequency": null,
+            "images": [],
+            "geohash": null,
+            "tags": [],
+            "status": "active",
+            "merchant_npub": "npub1merchant",
+            "created_at": 0
+        }
+        "#;
+
+        let listing: Nip99Listing =
+            serde_json::from_str(json).expect("legacy listing should deserialize");
+
+        assert!(listing.platforms.is_empty());
+        assert_eq!(listing.nip94_event_id, None);
     }
 
     #[test]
