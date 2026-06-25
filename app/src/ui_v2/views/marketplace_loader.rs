@@ -275,6 +275,9 @@ fn debug_mock_listings() -> Vec<GameListing> {
             lud16: "debug@arcadestr.dev".to_string(),
             event_id: None,
             created_at: 1_710_000_001,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            is_owned: false,
         },
         GameListing {
             id: "debug-bit-runners".to_string(),
@@ -295,6 +298,9 @@ fn debug_mock_listings() -> Vec<GameListing> {
             lud16: "debug@arcadestr.dev".to_string(),
             event_id: None,
             created_at: 1_710_000_002,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            is_owned: false,
         },
         GameListing {
             id: "debug-dune-settlers".to_string(),
@@ -315,6 +321,9 @@ fn debug_mock_listings() -> Vec<GameListing> {
             lud16: "debug@arcadestr.dev".to_string(),
             event_id: None,
             created_at: 1_710_000_003,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            is_owned: false,
         },
     ]
 }
@@ -366,6 +375,9 @@ mod tests {
             lud16: "test@example.com".into(),
             event_id: None,
             created_at: 0,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            is_owned: false,
         }
     }
 

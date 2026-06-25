@@ -153,6 +153,9 @@ pub fn PublishView() -> impl IntoView {
             created_at,
             event_id: None, // Will be set by the backend after publishing
             lud16: lud16_val,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            is_owned: false,
         };
 
         is_publishing.set(true);

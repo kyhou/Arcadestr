@@ -128,6 +128,24 @@ pub struct GameListing {
 
     // ── Timestamps ────────────────────────────────────────────────────────────
     pub created_at: u64,
+
+    /// Platform compatibility tags from ["platform", "<os>-<arch>"] event tags.
+    /// Examples: "linux-x86_64", "windows-x86_64", "macos-aarch64".
+    /// Empty vec means no platform restriction declared by publisher.
+    #[serde(default)]
+    pub platforms: Vec<String>,
+
+    /// NIP-94 (Kind 1063) event ID if the publisher linked a verifiable
+    /// file metadata event. Populated from the ["nip94", "<event-id>"] tag
+    /// on the Kind 30402 event. None means no cryptographic delivery link.
+    #[serde(default)]
+    pub nip94_event_id: Option<String>,
+
+    /// True when the authenticated user holds a valid NIP-102 Kind:1020
+    /// receipt for this listing. Populated server-side in fetch_marketplace;
+    /// always false for unauthenticated fetches.
+    #[serde(default)]
+    pub is_owned: bool,
 }
 
 impl GameListing {
@@ -184,6 +202,9 @@ impl GameListing {
             lud16: String::new(),
             event_id: None,
             created_at: product.created_at,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            is_owned: false,
         }
     }
 
@@ -224,7 +245,22 @@ impl GameListing {
             lud16: String::new(),
             event_id: None,
             created_at: listing.created_at,
+            platforms: listing.platforms,
+            nip94_event_id: listing.nip94_event_id,
+            is_owned: false,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformInfo {
+    pub os: String,
+    pub arch: String,
+}
+
+impl PlatformInfo {
+    pub fn tag(&self) -> String {
+        format!("{}-{}", self.os, self.arch)
     }
 }
 
@@ -377,6 +413,34 @@ pub enum MarketplaceView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_info_tag_joins_os_and_arch() {
+        let platform = PlatformInfo {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+        };
+
+        assert_eq!(platform.tag(), "linux-x86_64");
+    }
+
+    #[test]
+    fn game_listing_deserializes_missing_platform_metadata_as_defaults() {
+        let json = serde_json::json!({
+            "id": "listing-id",
+            "title": "Listing",
+            "description": "Description",
+            "publisher_npub": "npub1publisher",
+            "created_at": 1
+        });
+
+        let listing: GameListing = serde_json::from_value(json)
+            .expect("missing platform metadata must deserialize with defaults");
+
+        assert!(listing.platforms.is_empty());
+        assert_eq!(listing.nip94_event_id, None);
+        assert!(!listing.is_owned);
+    }
 
     #[test]
     fn earned_badge_summary_serializes_expected_field_names() {
