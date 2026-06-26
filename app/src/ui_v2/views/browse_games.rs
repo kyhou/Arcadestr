@@ -4,7 +4,9 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::models::{GameListing, PlatformInfo};
-use crate::tauri_bridge::{invoke_get_platform_info, invoke_install_game};
+use crate::tauri_bridge::invoke_get_platform_info;
+#[cfg(not(feature = "web"))]
+use crate::tauri_bridge::invoke_install_game;
 use crate::ui_v2::views::marketplace_loader::{
     listing_presentation, listing_publisher, use_marketplace_listings,
 };
@@ -12,6 +14,21 @@ use crate::ui_v2::views::marketplace_loader::{
 const FALLBACK_COVER: &str = "https://lh3.googleusercontent.com/aida-public/AB6AXuDcG9Zo3aR9Vrpk5pP2jenw1AoVFoOzbAQ-t57kQtlbwGQVsLLwmHyFuyzRVsOh71iN4mHyhfw0Sx4YgdJ9duL9ANv3Xa1W7jYKWeVgj5_rE7KzitErwV3dtgEFGsGCSXtFQxyw6tQoGmP3V-Ci9Vs9_ZQXh6WXrFi6eperEaPm3YutXUIImUuC5sKm2hgyVb6sMBnpn0Imy94ETrJ9WO2XeC6tTMddB6EA-x1LgnN3Ezj_dPitegkcYmXGBSWZyCTZgxINu01kmdM";
 const BROWSE_INITIAL_VISIBLE_COUNT: usize = 12;
 const BROWSE_VISIBLE_INCREMENT: usize = 12;
+const MAX_PLATFORM_AUTO_FETCHES: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlatformAutoFetchState {
+    baseline_displayed_count: usize,
+    baseline_loaded_count: usize,
+    attempts: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlatformAutoFetchDecision {
+    Wait,
+    Fetch,
+    Stop,
+}
 
 #[component]
 pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
@@ -27,6 +44,8 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
     let platform_info = RwSignal::new(None::<PlatformInfo>);
     let active_platform_filter = RwSignal::new(None::<String>);
     let platform_filter_initialized = RwSignal::new(false);
+    let platform_auto_fetch = RwSignal::new(None::<PlatformAutoFetchState>);
+    let install_error = RwSignal::new(None::<String>);
 
     Effect::new(move |_| {
         spawn_local(async move {
@@ -60,6 +79,40 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
 
     let featured_listing = Signal::derive(move || displayed_listings.get().first().cloned());
     let host_platform_tag = Signal::derive(move || platform_info.get().map(|info| info.tag()));
+
+    Effect::new(move |_| {
+        let decision = decide_platform_auto_fetch(
+            platform_auto_fetch.get(),
+            displayed_listings.get().len(),
+            listings.get().len(),
+            active_platform_filter.get().as_deref(),
+            has_more.get(),
+            MAX_PLATFORM_AUTO_FETCHES,
+        );
+
+        match decision {
+            PlatformAutoFetchDecision::Wait => {}
+            PlatformAutoFetchDecision::Stop => platform_auto_fetch.set(None),
+            PlatformAutoFetchDecision::Fetch => {
+                let loaded_count = listings.get_untracked().len();
+                let displayed_count = displayed_listings.get_untracked().len();
+                let attempts = platform_auto_fetch
+                    .get_untracked()
+                    .map(|state| state.attempts.saturating_add(1))
+                    .unwrap_or(1);
+
+                platform_auto_fetch.set(Some(PlatformAutoFetchState {
+                    baseline_displayed_count: displayed_count,
+                    baseline_loaded_count: loaded_count,
+                    attempts,
+                }));
+
+                requested_limit.update(|limit| {
+                    *limit = (*limit).max(loaded_count.saturating_add(BROWSE_VISIBLE_INCREMENT));
+                });
+            }
+        }
+    });
 
     view! {
         <section class="max-w-[1600px] mx-auto p-6 lg:p-10">
@@ -113,6 +166,12 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                 </div>
             </header>
 
+            <Show when=move || install_error.with(|message| message.is_some())>
+                <div class="mb-6 rounded-xl border border-error/30 bg-error-container/30 px-4 py-3 text-sm font-medium text-error">
+                    {move || install_error.get().unwrap_or_default()}
+                </div>
+            </Show>
+
             {move || {
                 if loading.get() {
                     view! {
@@ -156,6 +215,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                                         let card = render_listing_card(
                                             listing,
                                             on_select,
+                                            install_error,
                                             host_tag.clone(),
                                             active_filter.clone(),
                                         );
@@ -167,6 +227,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                                                     render_featured_card(
                                                         featured,
                                                         on_select,
+                                                        install_error,
                                                         host_tag.clone(),
                                                         active_filter.clone(),
                                                     ),
@@ -192,6 +253,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                                             render_featured_card(
                                                 featured,
                                                 on_select,
+                                                install_error,
                                                 host_tag,
                                                 active_filter,
                                             )
@@ -219,7 +281,10 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                             <button
                                 class="px-10 py-4 bg-surface-container-low border border-outline-variant/15 text-on-surface-variant font-bold rounded-full hover:bg-surface-container-high hover:text-on-surface transition-all active:scale-95 flex items-center gap-3"
                                 on:click=move |_| {
-                                    let total_cards = listings.get_untracked().len().saturating_sub(1);
+                                    let active_filter = active_platform_filter.get_untracked();
+                                    let displayed_count = displayed_listings.get_untracked().len();
+                                    let loaded_count = listings.get_untracked().len();
+                                    let total_cards = displayed_count.saturating_sub(1);
                                     let next_visible = next_visible_count(
                                         visible_count.get_untracked(),
                                         total_cards,
@@ -227,9 +292,28 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                                     );
                                     visible_count.set(next_visible);
                                     let required_limit = required_listing_limit(next_visible);
-                                    if next_fetch_limit(listings.get_untracked().len(), required_limit).is_some() {
+
+                                    let fetch_limit = platform_load_more_fetch_limit(
+                                        active_filter.as_deref(),
+                                        has_more.get_untracked(),
+                                        displayed_count.saturating_sub(1),
+                                        next_visible,
+                                        loaded_count,
+                                        BROWSE_VISIBLE_INCREMENT,
+                                    )
+                                    .or_else(|| next_fetch_limit(loaded_count, required_limit).map(|_| required_limit));
+
+                                    if let Some(fetch_limit) = fetch_limit {
+                                        if active_filter.is_some() && has_more.get_untracked() {
+                                            platform_auto_fetch.set(Some(PlatformAutoFetchState {
+                                                baseline_displayed_count: displayed_count,
+                                                baseline_loaded_count: loaded_count,
+                                                attempts: 0,
+                                            }));
+                                        }
+
                                         requested_limit.update(|limit| {
-                                            *limit = (*limit).max(required_limit);
+                                            *limit = (*limit).max(fetch_limit);
                                         });
                                     }
                                 }
@@ -246,6 +330,21 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                             <div class="px-8 py-4 bg-surface-container-low border border-outline-variant/15 text-on-surface-variant font-bold rounded-full flex items-center gap-3">
                                 <span class="material-symbols-outlined animate-spin">"progress_activity"</span>
                                 "Loading more products..."
+                            </div>
+                        </div>
+                    }
+                    .into_any()
+                } else if show_no_more_platform_message(
+                    active_platform_filter.get().as_deref(),
+                    has_more.get(),
+                    loading.get(),
+                    loading_more.get(),
+                ) {
+                    view! {
+                        <div class="mt-16 flex justify-center">
+                            <div class="max-w-md rounded-xl border border-outline-variant/15 bg-surface-container-low px-6 py-4 text-center text-on-surface-variant">
+                                <p class="font-bold text-on-surface">"No more games for this platform"</p>
+                                <p class="mt-1 text-sm">"Switch to All Platforms to browse incompatible or unrestricted listings."</p>
                             </div>
                         </div>
                     }
@@ -268,8 +367,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
     }
 }
 
-fn next_visible_count(current: usize, total: usize, increment: usize) -> usize {
-    let _ = total;
+fn next_visible_count(current: usize, _total: usize, increment: usize) -> usize {
     current.saturating_add(increment)
 }
 
@@ -289,6 +387,57 @@ fn next_fetch_limit(loaded_count: usize, requested_limit: usize) -> Option<usize
     requested_limit
         .checked_sub(loaded_count)
         .filter(|limit| *limit > 0)
+}
+
+fn platform_load_more_fetch_limit(
+    active_filter: Option<&str>,
+    has_more: bool,
+    displayed_cards: usize,
+    next_visible: usize,
+    loaded_count: usize,
+    increment: usize,
+) -> Option<usize> {
+    if active_filter.is_some() && has_more && displayed_cards <= next_visible {
+        Some(loaded_count.saturating_add(increment))
+    } else {
+        None
+    }
+}
+
+fn decide_platform_auto_fetch(
+    state: Option<PlatformAutoFetchState>,
+    current_displayed_count: usize,
+    current_loaded_count: usize,
+    active_filter: Option<&str>,
+    has_more: bool,
+    max_attempts: usize,
+) -> PlatformAutoFetchDecision {
+    let Some(state) = state else {
+        return PlatformAutoFetchDecision::Stop;
+    };
+
+    if active_filter.is_none()
+        || current_displayed_count > state.baseline_displayed_count
+        || !has_more
+        || state.attempts >= max_attempts
+    {
+        return PlatformAutoFetchDecision::Stop;
+    }
+
+    if current_loaded_count <= state.baseline_loaded_count {
+        PlatformAutoFetchDecision::Wait
+    } else {
+        PlatformAutoFetchDecision::Fetch
+    }
+}
+
+fn show_no_more_platform_message(
+    active_filter: Option<&str>,
+    has_more: bool,
+    loading: bool,
+    loading_more: bool,
+) -> bool {
+    active_filter.is_some() && !has_more && !loading && !loading_more
 }
 
 fn listing_matches_platform_filter(platforms: &[String], active_filter: Option<&str>) -> bool {
@@ -331,9 +480,60 @@ fn render_status_badges(
     .into_any()
 }
 
+#[cfg(not(feature = "web"))]
+fn render_install_button(
+    listing: GameListing,
+    install_error: RwSignal<Option<String>>,
+    class: &'static str,
+) -> AnyView {
+    view! {
+        <button
+            class=class
+            on:click=move |_| {
+                let listing = listing.clone();
+                install_error.set(None);
+                spawn_local(async move {
+                    match invoke_install_game(&listing).await {
+                        Ok(()) => install_error.set(None),
+                        Err(err) => install_error.set(Some(format!("Install failed: {}", err))),
+                    }
+                });
+            }
+        >
+            "Install"
+        </button>
+    }
+    .into_any()
+}
+
+#[cfg(feature = "web")]
+fn render_install_button(
+    _listing: GameListing,
+    _install_error: RwSignal<Option<String>>,
+    class: &'static str,
+) -> AnyView {
+    let disabled_class = if class.contains("px-8") {
+        "bg-surface-container-low text-on-surface-variant font-bold px-8 py-3 rounded-md text-base cursor-not-allowed opacity-70"
+    } else {
+        "bg-surface-container-low text-on-surface-variant font-bold py-2 px-6 rounded-lg text-sm cursor-not-allowed opacity-70"
+    };
+
+    view! {
+        <button
+            class=disabled_class
+            disabled=true
+            title="Game installation is only available in the desktop app."
+        >
+            "Install"
+        </button>
+    }
+    .into_any()
+}
+
 fn render_listing_card(
     listing: GameListing,
     on_select: Callback<GameListing>,
+    install_error: RwSignal<Option<String>>,
     host_tag: Option<String>,
     active_filter: Option<String>,
 ) -> AnyView {
@@ -377,20 +577,11 @@ fn render_listing_card(
                         <span class="text-xs text-on-surface">{meta.split_once(' ').map(|(_, v)| v.to_string()).unwrap_or_else(|| "Arcadestr".to_string())}</span>
                     </div>
                     {if listing.is_owned {
-                        view! {
-                            <button
-                                class="bg-secondary text-on-secondary font-bold py-2 px-6 rounded-lg text-sm hover:brightness-110 transition-all active:scale-95 shadow-lg shadow-secondary/10"
-                                on:click=move |_| {
-                                    let listing = install_listing.clone();
-                                    spawn_local(async move {
-                                        let _ = invoke_install_game(&listing).await;
-                                    });
-                                }
-                            >
-                                "Install"
-                            </button>
-                        }
-                        .into_any()
+                        render_install_button(
+                            install_listing,
+                            install_error,
+                            "bg-secondary text-on-secondary font-bold py-2 px-6 rounded-lg text-sm hover:brightness-110 transition-all active:scale-95 shadow-lg shadow-secondary/10",
+                        )
                     } else {
                         view! {
                             <button
@@ -416,6 +607,7 @@ fn render_listing_card(
 fn render_featured_card(
     listing: GameListing,
     on_select: Callback<GameListing>,
+    install_error: RwSignal<Option<String>>,
     host_tag: Option<String>,
     active_filter: Option<String>,
 ) -> AnyView {
@@ -449,20 +641,11 @@ fn render_featured_card(
                             <span class="text-xs text-on-surface-variant">"Access Perpetual Key"</span>
                         </div>
                         {if listing.is_owned {
-                            view! {
-                                <button
-                                    class="bg-secondary text-on-secondary font-bold px-8 py-3 rounded-md text-base hover:brightness-110 transition-all active:scale-95 shadow-xl shadow-secondary/20"
-                                    on:click=move |_| {
-                                        let listing = install_listing.clone();
-                                        spawn_local(async move {
-                                            let _ = invoke_install_game(&listing).await;
-                                        });
-                                    }
-                                >
-                                    "Install"
-                                </button>
-                            }
-                            .into_any()
+                            render_install_button(
+                                install_listing,
+                                install_error,
+                                "bg-secondary text-on-secondary font-bold px-8 py-3 rounded-md text-base hover:brightness-110 transition-all active:scale-95 shadow-xl shadow-secondary/20",
+                            )
                         } else {
                             view! {
                                 <button class="bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold px-8 py-3 rounded-md text-base hover:brightness-110 transition-all active:scale-95 shadow-xl shadow-primary/20" on:click=move |_| on_select.run(selected.clone())>
@@ -554,6 +737,70 @@ mod tests {
             &unrestricted,
             Some("linux-x86_64"),
             None
+        ));
+    }
+
+    #[test]
+    fn platform_load_more_requests_next_backend_page_when_filter_is_sparse() {
+        assert_eq!(
+            platform_load_more_fetch_limit(Some("linux-x86_64"), true, 3, 24, 60, 12),
+            Some(72)
+        );
+        assert_eq!(
+            platform_load_more_fetch_limit(None, true, 3, 24, 60, 12),
+            None
+        );
+        assert_eq!(
+            platform_load_more_fetch_limit(Some("linux-x86_64"), false, 3, 24, 60, 12),
+            None
+        );
+    }
+
+    #[test]
+    fn platform_auto_fetch_waits_for_batch_then_stops_after_growth_or_guard() {
+        let pending = PlatformAutoFetchState {
+            baseline_displayed_count: 3,
+            baseline_loaded_count: 60,
+            attempts: 0,
+        };
+
+        assert_eq!(
+            decide_platform_auto_fetch(Some(pending), 3, 60, Some("linux-x86_64"), true, 4),
+            PlatformAutoFetchDecision::Wait
+        );
+        assert_eq!(
+            decide_platform_auto_fetch(Some(pending), 3, 72, Some("linux-x86_64"), true, 4),
+            PlatformAutoFetchDecision::Fetch
+        );
+        assert_eq!(
+            decide_platform_auto_fetch(Some(pending), 4, 72, Some("linux-x86_64"), true, 4),
+            PlatformAutoFetchDecision::Stop
+        );
+
+        let guarded = PlatformAutoFetchState {
+            attempts: 4,
+            ..pending
+        };
+        assert_eq!(
+            decide_platform_auto_fetch(Some(guarded), 3, 72, Some("linux-x86_64"), true, 4),
+            PlatformAutoFetchDecision::Stop
+        );
+    }
+
+    #[test]
+    fn no_more_platform_message_only_shows_for_exhausted_filtered_view() {
+        assert!(show_no_more_platform_message(
+            Some("linux-x86_64"),
+            false,
+            false,
+            false,
+        ));
+        assert!(!show_no_more_platform_message(None, false, false, false));
+        assert!(!show_no_more_platform_message(
+            Some("linux-x86_64"),
+            true,
+            false,
+            false,
         ));
     }
 }
