@@ -1,8 +1,33 @@
 // Typed IPC bridge wrappers for NIP-49 and NIP-05 desktop commands.
 
 use crate::models::{
-    EarnedBadgeSummary, Nip05Status, Nip49ExportResult, Nip49ImportRequest, ProfileBadgeEntry,
+    EarnedBadgeSummary, GameListing, Nip05Status, Nip49ExportResult, Nip49ImportRequest,
+    PlatformInfo, ProfileBadgeEntry,
 };
+
+/// Invoke desktop `get_platform_info` command.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_get_platform_info() -> Result<PlatformInfo, String> {
+    crate::tauri_invoke::invoke("get_platform_info", serde_json::json!({})).await
+}
+
+/// Web fallback for `get_platform_info`.
+#[cfg(feature = "web")]
+pub async fn invoke_get_platform_info() -> Result<PlatformInfo, String> {
+    Err("Platform detection is only available in desktop builds.".to_string())
+}
+
+/// Invoke desktop `install_game` command.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_install_game(listing: &GameListing) -> Result<(), String> {
+    crate::tauri_invoke::invoke("install_game", serde_json::json!({ "listing": listing })).await
+}
+
+/// Web fallback for `install_game`.
+#[cfg(feature = "web")]
+pub async fn invoke_install_game(_listing: &GameListing) -> Result<(), String> {
+    Err("Game installation is only available in desktop builds.".to_string())
+}
 
 /// Invoke desktop `nip49_import` command.
 #[cfg(not(feature = "web"))]
