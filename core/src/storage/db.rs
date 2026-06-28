@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS marketplace_listings (
     tags_json TEXT NOT NULL DEFAULT '[]',
     images_json TEXT NOT NULL DEFAULT '[]',
     platforms_json TEXT NOT NULL DEFAULT '[]',
+    nip94_event_id TEXT,
     lud16 TEXT NOT NULL DEFAULT '',
     location TEXT,
     geohash TEXT,
@@ -250,6 +251,7 @@ impl Database {
         }
 
         Self::ensure_marketplace_cache_platforms_column(pool).await?;
+        Self::ensure_marketplace_cache_nip94_event_id_column(pool).await?;
 
         Ok(())
     }
@@ -281,6 +283,36 @@ impl Database {
                     e
                 ))
             })?;
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_marketplace_cache_nip94_event_id_column(
+        pool: &SqlitePool,
+    ) -> Result<(), DatabaseError> {
+        let column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('marketplace_listings') WHERE name = 'nip94_event_id'",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            DatabaseError::Migration(format!(
+                "Failed checking marketplace nip94_event_id column: {}",
+                e
+            ))
+        })?;
+
+        if column_count == 0 {
+            sqlx::query("ALTER TABLE marketplace_listings ADD COLUMN nip94_event_id TEXT")
+                .execute(pool)
+                .await
+                .map_err(|e| {
+                    DatabaseError::Migration(format!(
+                        "Failed adding marketplace nip94_event_id column: {}",
+                        e
+                    ))
+                })?;
         }
 
         Ok(())
@@ -811,6 +843,7 @@ mod tests {
         assert_eq!(listing.title, "Legacy Game");
         assert_eq!(listing.publisher_npub, "npub1legacy");
         assert_eq!(listing.platforms, Vec::<String>::new());
+        assert_eq!(listing.nip94_event_id, None);
     }
 
     #[tokio::test]

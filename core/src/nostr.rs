@@ -453,6 +453,9 @@ pub struct GameListing {
     /// Platform compatibility tags from ["platform", "<os>-<arch>"].
     #[serde(default)]
     pub platforms: Vec<String>,
+    /// Referenced NIP-94 file metadata event id for delivery metadata.
+    #[serde(default)]
+    pub nip94_event_id: Option<String>,
     /// Short summary or tagline for the listing (NIP-99).
     pub summary: Option<String>,
     /// Original publication timestamp if different from created_at (NIP-99).
@@ -506,6 +509,7 @@ impl GameListing {
             lud16: String::new(),
             images: product.images,
             platforms: Vec::new(),
+            nip94_event_id: None,
             summary: None,
             published_at: None,
             location: None,
@@ -543,6 +547,7 @@ impl GameListing {
             lud16: String::new(),
             images: listing.images,
             platforms: listing.platforms,
+            nip94_event_id: listing.nip94_event_id,
             summary: listing.summary,
             published_at: listing.published_at.map(|v| v as u64),
             location: listing.location,
@@ -1703,6 +1708,7 @@ pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
         lud16,
         images: Vec::new(), // Legacy format doesn't include images
         platforms,
+        nip94_event_id: None,
         summary: None,
         published_at: None,
         location: None,
@@ -1728,6 +1734,7 @@ mod listing_event_tests {
             tags: vec!["arcade".to_string()],
             lud16: String::new(),
             images: Vec::new(),
+            nip94_event_id: None,
             summary: None,
             published_at: None,
             location: None,

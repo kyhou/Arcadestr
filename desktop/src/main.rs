@@ -172,7 +172,7 @@ fn listing_signature(listing: &CoreGameListing) -> String {
     let platforms_json =
         serde_json::to_string(&listing.platforms).unwrap_or_else(|_| "[]".to_string());
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         listing.publisher_npub,
         listing.id,
         listing.title,
@@ -181,7 +181,8 @@ fn listing_signature(listing: &CoreGameListing) -> String {
         listing.download_url,
         listing.created_at,
         tags_json,
-        platforms_json
+        platforms_json,
+        listing.nip94_event_id.as_deref().unwrap_or_default()
     )
 }
 
@@ -654,7 +655,7 @@ fn app_listing_from_cached_listing(listing: CoreGameListing) -> AppGameListing {
         event_id: None,
         created_at: listing.created_at,
         platforms: listing.platforms,
-        nip94_event_id: None,
+        nip94_event_id: listing.nip94_event_id,
         is_owned: false,
     }
 }
@@ -1042,7 +1043,7 @@ mod task4_tests {
 
     #[test]
     fn listing_signature_includes_platform_tags() {
-        let mut linux_listing = CoreGameListing {
+        let linux_listing = CoreGameListing {
             id: "game-v1".to_string(),
             title: "Game".to_string(),
             description: "Description".to_string(),
@@ -1054,6 +1055,7 @@ mod task4_tests {
             lud16: String::new(),
             images: Vec::new(),
             platforms: vec!["linux-x86_64".to_string()],
+            nip94_event_id: None,
             summary: None,
             published_at: None,
             location: None,
@@ -1066,6 +1068,13 @@ mod task4_tests {
         assert_ne!(
             listing_signature(&linux_listing),
             listing_signature(&windows_listing)
+        );
+
+        let mut nip94_listing = linux_listing.clone();
+        nip94_listing.nip94_event_id = Some("nip94-event-1".to_string());
+        assert_ne!(
+            listing_signature(&linux_listing),
+            listing_signature(&nip94_listing)
         );
     }
 
@@ -1129,6 +1138,7 @@ mod task4_tests {
             lud16: "merchant@example.com".to_string(),
             images: vec!["https://example.com/cover.png".to_string()],
             platforms: vec!["linux-x86_64".to_string()],
+            nip94_event_id: Some("nip94-event-1".to_string()),
             summary: Some("Summary".to_string()),
             published_at: Some(6),
             location: None,
@@ -1139,9 +1149,9 @@ mod task4_tests {
         let listing = app_listing_from_cached_listing(cached);
 
         assert_eq!(listing.platforms, vec!["linux-x86_64"]);
+        assert_eq!(listing.nip94_event_id, Some("nip94-event-1".to_string()));
         assert_eq!(listing.price_sats, 21);
         assert_eq!(listing.currency, "SATS");
-        assert_eq!(listing.nip94_event_id, None);
         assert!(!listing.is_owned);
     }
 }
