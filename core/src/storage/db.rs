@@ -213,7 +213,6 @@ impl Database {
                 "price_amount",
                 "price_currency",
                 "price_frequency",
-                "platforms_json",
             ],
         )
         .await?;
@@ -248,6 +247,40 @@ impl Database {
                         e
                     ))
                 })?;
+        }
+
+        Self::ensure_marketplace_cache_platforms_column(pool).await?;
+
+        Ok(())
+    }
+
+    async fn ensure_marketplace_cache_platforms_column(
+        pool: &SqlitePool,
+    ) -> Result<(), DatabaseError> {
+        let column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('marketplace_listings') WHERE name = 'platforms_json'",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            DatabaseError::Migration(format!(
+                "Failed checking marketplace platforms_json column: {}",
+                e
+            ))
+        })?;
+
+        if column_count == 0 {
+            sqlx::query(
+                "ALTER TABLE marketplace_listings ADD COLUMN platforms_json TEXT NOT NULL DEFAULT '[]'",
+            )
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                DatabaseError::Migration(format!(
+                    "Failed adding marketplace platforms_json column: {}",
+                    e
+                ))
+            })?;
         }
 
         Ok(())
@@ -678,6 +711,106 @@ mod tests {
         .expect("table count query should succeed after re-init");
 
         assert_eq!(second_tables.0, 1);
+    }
+
+    #[tokio::test]
+    async fn opening_legacy_marketplace_cache_adds_platforms_column_without_dropping_rows() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("legacy-marketplace-cache.db");
+
+        let legacy_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true)
+                    .foreign_keys(true),
+            )
+            .await
+            .expect("legacy database should open");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE marketplace_listings (
+                publisher_npub TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT,
+                description TEXT NOT NULL,
+                status TEXT,
+                published_at INTEGER,
+                price_sats INTEGER NOT NULL,
+                price_amount TEXT,
+                price_currency TEXT,
+                price_frequency TEXT,
+                download_url TEXT NOT NULL,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                images_json TEXT NOT NULL DEFAULT '[]',
+                lud16 TEXT NOT NULL DEFAULT '',
+                location TEXT,
+                geohash TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                source_event_id TEXT,
+                PRIMARY KEY (publisher_npub, product_id)
+            )
+            "#,
+        )
+        .execute(&legacy_pool)
+        .await
+        .expect("legacy marketplace table should be created");
+
+        sqlx::query(
+            r#"
+            INSERT INTO marketplace_listings (
+                publisher_npub, product_id, title, summary, description, status,
+                published_at, price_sats, price_amount, price_currency, price_frequency,
+                download_url, tags_json, images_json, lud16, location, geohash,
+                created_at, updated_at, source_event_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("npub1legacy")
+        .bind("legacy-game")
+        .bind("Legacy Game")
+        .bind("Legacy summary")
+        .bind("Legacy description")
+        .bind("active")
+        .bind(1_710_000_000_i64)
+        .bind(2100_i64)
+        .bind("2100")
+        .bind("SATS")
+        .bind("once")
+        .bind("https://example.com/legacy.zip")
+        .bind(r#"["retro"]"#)
+        .bind(r#"["https://example.com/legacy.png"]"#)
+        .bind("merchant@example.com")
+        .bind("Online")
+        .bind("9q8yym")
+        .bind(1_710_000_001_i64)
+        .bind(1_710_000_002_i64)
+        .bind("event-legacy")
+        .execute(&legacy_pool)
+        .await
+        .expect("legacy row should be inserted");
+        legacy_pool.close().await;
+
+        let db = Database::new(&db_path)
+            .await
+            .expect("database upgrade should not drop legacy cache rows");
+        let cache = crate::marketplace_cache::MarketplaceCache::new(db.pool().clone());
+        let listings = cache
+            .load_listings(10, None, None)
+            .await
+            .expect("legacy row should load through marketplace cache");
+
+        assert_eq!(listings.len(), 1);
+        let listing = &listings[0];
+        assert_eq!(listing.id, "legacy-game");
+        assert_eq!(listing.title, "Legacy Game");
+        assert_eq!(listing.publisher_npub, "npub1legacy");
+        assert_eq!(listing.platforms, Vec::<String>::new());
     }
 
     #[tokio::test]
