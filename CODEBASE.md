@@ -2180,6 +2180,18 @@ console.log(window.__TAURI__.event);  // Should show listen/emit functions
 | **allow_insecure_public_ws** | Setting to allow ws:// (non-TLS) relays for public hosts |
 | **Relay snapshot** | Initial relay state fetched on UI startup to recover missed events |
 | **Relay state helpers** | `merge_relay_snapshot()` and `apply_relay_event()` for relay UI state |
+| **Platform tag** | NOSTR listing tag `['platform', '<os>-<arch>']` declaring compatible runtime targets. Values follow Rust `std::env::consts::{OS, ARCH}`; no platform tags means compatible everywhere. |
+
+### Platform tag examples
+
+| OS | Architecture | Platform tag |
+|----|--------------|--------------|
+| `linux` | `x86_64` | `linux-x86_64` |
+| `linux` | `aarch64` | `linux-aarch64` |
+| `windows` | `x86_64` | `windows-x86_64` |
+| `windows` | `aarch64` | `windows-aarch64` |
+| `macos` | `x86_64` | `macos-x86_64` |
+| `macos` | `aarch64` | `macos-aarch64` |
 
 ---
 

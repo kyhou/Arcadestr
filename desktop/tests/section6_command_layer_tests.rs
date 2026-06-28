@@ -122,6 +122,7 @@ fn sample_listing() -> GameListing {
         created_at: 1_710_000_000,
         tags: vec!["indie".to_string()],
         lud16: "seller@example.com".to_string(),
+        platforms: Vec::new(),
         images: vec!["https://example.com/cover.png".to_string()],
         summary: Some("summary".to_string()),
         published_at: Some(1_710_000_000),

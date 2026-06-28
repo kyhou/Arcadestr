@@ -169,8 +169,10 @@ fn listing_cache_key(listing: &CoreGameListing) -> (String, String) {
 
 fn listing_signature(listing: &CoreGameListing) -> String {
     let tags_json = serde_json::to_string(&listing.tags).unwrap_or_else(|_| "[]".to_string());
+    let platforms_json =
+        serde_json::to_string(&listing.platforms).unwrap_or_else(|_| "[]".to_string());
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
         listing.publisher_npub,
         listing.id,
         listing.title,
@@ -178,7 +180,8 @@ fn listing_signature(listing: &CoreGameListing) -> String {
         listing.price_sats,
         listing.download_url,
         listing.created_at,
-        tags_json
+        tags_json,
+        platforms_json
     )
 }
 
@@ -915,6 +918,35 @@ mod task4_tests {
         assert_eq!(
             coordinate,
             format!("30402:{}:game-v1", merchant.public_key().to_hex())
+        );
+    }
+
+    #[test]
+    fn listing_signature_includes_platform_tags() {
+        let mut linux_listing = CoreGameListing {
+            id: "game-v1".to_string(),
+            title: "Game".to_string(),
+            description: "Description".to_string(),
+            price_sats: 100,
+            download_url: "https://example.com/game.zip".to_string(),
+            publisher_npub: "npub1publisher".to_string(),
+            created_at: 1,
+            tags: Vec::new(),
+            lud16: String::new(),
+            images: Vec::new(),
+            platforms: vec!["linux-x86_64".to_string()],
+            summary: None,
+            published_at: None,
+            location: None,
+            geohash: None,
+            status: None,
+        };
+        let mut windows_listing = linux_listing.clone();
+        windows_listing.platforms = vec!["windows-x86_64".to_string()];
+
+        assert_ne!(
+            listing_signature(&linux_listing),
+            listing_signature(&windows_listing)
         );
     }
 

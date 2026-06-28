@@ -72,6 +72,55 @@ fn validate_listing(
     Ok(())
 }
 
+fn parse_platform_tags(input: &str) -> Result<Vec<String>, String> {
+    input
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(|tag| {
+            if tag.chars().any(char::is_whitespace) {
+                return Err("Platform tags cannot contain whitespace".to_string());
+            }
+            if !tag.contains('-') {
+                return Err("Platform tags must look like <os>-<arch>".to_string());
+            }
+            Ok(tag.to_string())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_platform_tags_trims_values_and_discards_empty_entries() {
+        let platforms = parse_platform_tags(" linux-x86_64, ,windows-x86_64, macos-aarch64 ")
+            .expect("valid platform tags should parse");
+
+        assert_eq!(
+            platforms,
+            vec!["linux-x86_64", "windows-x86_64", "macos-aarch64"]
+        );
+    }
+
+    #[test]
+    fn parse_platform_tags_rejects_whitespace_inside_tag() {
+        let err = parse_platform_tags("linux x86_64")
+            .expect_err("platform tags with whitespace should be rejected");
+
+        assert_eq!(err, "Platform tags cannot contain whitespace");
+    }
+
+    #[test]
+    fn parse_platform_tags_rejects_tags_without_os_arch_separator() {
+        let err =
+            parse_platform_tags("linux").expect_err("platform tags without '-' should be rejected");
+
+        assert_eq!(err, "Platform tags must look like <os>-<arch>");
+    }
+}
+
 /// Publish view component - form for creating new listings.
 #[component]
 pub fn PublishView() -> impl IntoView {
@@ -84,6 +133,7 @@ pub fn PublishView() -> impl IntoView {
     let price_sats = RwSignal::new(0u64);
     let download_url = RwSignal::new(String::new());
     let tags_input = RwSignal::new(String::new());
+    let platforms_input = RwSignal::new(String::new());
     let lud16 = RwSignal::new(String::new());
 
     // Status signals
@@ -128,6 +178,14 @@ pub fn PublishView() -> impl IntoView {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let platforms = match parse_platform_tags(&platforms_input.get()) {
+            Ok(platforms) => platforms,
+            Err(msg) => {
+                error_message.set(Some(msg));
+                return;
+            }
+        };
+
         // Get current timestamp
         #[cfg(target_arch = "wasm32")]
         let created_at = (js_sys::Date::now() as u64) / 1000;
@@ -153,7 +211,7 @@ pub fn PublishView() -> impl IntoView {
             created_at,
             event_id: None, // Will be set by the backend after publishing
             lud16: lud16_val,
-            platforms: Vec::new(),
+            platforms,
             nip94_event_id: None,
             is_owned: false,
         };
@@ -173,6 +231,7 @@ pub fn PublishView() -> impl IntoView {
                     price_sats.set(0);
                     download_url.set(String::new());
                     tags_input.set(String::new());
+                    platforms_input.set(String::new());
                     lud16.set(String::new());
                     is_publishing.set(false);
                 }
@@ -263,6 +322,21 @@ pub fn PublishView() -> impl IntoView {
                         on:input:target=move |ev| tags_input.set(ev.target().value())
                         disabled={move || is_publishing.get()}
                     />
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">"Platforms (comma-separated)"</label>
+                    <input
+                        class="form-input"
+                        type="text"
+                        placeholder="linux-x86_64, windows-x86_64, macos-aarch64"
+                        prop:value={move || platforms_input.get()}
+                        on:input:target=move |ev| platforms_input.set(ev.target().value())
+                        disabled={move || is_publishing.get()}
+                    />
+                    <small class="form-help">
+                        "Use <os>-<arch> tags from Rust constants, e.g. linux-x86_64, windows-x86_64, macos-aarch64. Leave empty for all platforms."
+                    </small>
                 </div>
 
                 <div class="form-group">

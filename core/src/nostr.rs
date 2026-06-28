@@ -450,6 +450,9 @@ pub struct GameListing {
     pub tags: Vec<String>,      // freeform tags e.g. ["rpg", "pixel-art"]
     pub lud16: String, // Lightning address for payments (e.g., "seller@walletofsatoshi.com")
     pub images: Vec<String>, // product images from NIP-99/NIP-15 events
+    /// Platform compatibility tags from ["platform", "<os>-<arch>"].
+    #[serde(default)]
+    pub platforms: Vec<String>,
     /// Short summary or tagline for the listing (NIP-99).
     pub summary: Option<String>,
     /// Original publication timestamp if different from created_at (NIP-99).
@@ -502,6 +505,7 @@ impl GameListing {
             tags: product.categories,
             lud16: String::new(),
             images: product.images,
+            platforms: Vec::new(),
             summary: None,
             published_at: None,
             location: None,
@@ -538,6 +542,7 @@ impl GameListing {
             tags: listing.tags,
             lud16: String::new(),
             images: listing.images,
+            platforms: listing.platforms,
             summary: listing.summary,
             published_at: listing.published_at.map(|v| v as u64),
             location: listing.location,
@@ -1619,6 +1624,14 @@ pub fn game_listing_to_event_builder(listing: &GameListing) -> EventBuilder {
         tags.push(Tag::custom(TagKind::Custom("t".into()), [tag.clone()]));
     }
 
+    // Add platform compatibility tags.
+    for platform in &listing.platforms {
+        tags.push(Tag::custom(
+            TagKind::Custom("platform".into()),
+            [platform.clone()],
+        ));
+    }
+
     EventBuilder::new(Kind::Custom(KIND_GAME_LISTING), content_json).tags(tags)
 }
 
@@ -1662,6 +1675,12 @@ pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
         .and_then(|t| t.content().map(|c| c.to_string()))
         .unwrap_or_default();
 
+    let platforms: Vec<String> = event
+        .tags
+        .filter(TagKind::Custom("platform".into()))
+        .filter_map(|t| t.content().map(|c| c.to_string()))
+        .collect();
+
     // Parse content
     let content: GameListingContent = serde_json::from_str(&event.content)
         .map_err(|e| NostrError::MalformedEvent(format!("Invalid content JSON: {}", e)))?;
@@ -1683,12 +1702,69 @@ pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
         tags,
         lud16,
         images: Vec::new(), // Legacy format doesn't include images
+        platforms,
         summary: None,
         published_at: None,
         location: None,
         geohash: None,
         status: None,
     })
+}
+
+#[cfg(test)]
+mod listing_event_tests {
+    use super::*;
+    use nostr_sdk::Keys;
+
+    fn sample_listing() -> GameListing {
+        GameListing {
+            id: "sample-game".to_string(),
+            title: "Sample Game".to_string(),
+            description: "A sample game".to_string(),
+            price_sats: 21,
+            download_url: "https://example.com/sample.zip".to_string(),
+            publisher_npub: "".to_string(),
+            created_at: 0,
+            tags: vec!["arcade".to_string()],
+            lud16: String::new(),
+            images: Vec::new(),
+            summary: None,
+            published_at: None,
+            location: None,
+            geohash: None,
+            status: None,
+            platforms: vec!["linux-x86_64".to_string(), "windows-x86_64".to_string()],
+        }
+    }
+
+    #[test]
+    fn game_listing_to_event_builder_emits_platform_tags() {
+        let keys = Keys::generate();
+        let event = game_listing_to_event_builder(&sample_listing())
+            .sign_with_keys(&keys)
+            .expect("listing event should be signed");
+
+        assert!(event
+            .tags
+            .iter()
+            .any(|tag| { tag.as_slice() == ["platform", "linux-x86_64"] }));
+        assert!(event
+            .tags
+            .iter()
+            .any(|tag| { tag.as_slice() == ["platform", "windows-x86_64"] }));
+    }
+
+    #[test]
+    fn event_to_game_listing_parses_platform_tags() {
+        let keys = Keys::generate();
+        let event = game_listing_to_event_builder(&sample_listing())
+            .sign_with_keys(&keys)
+            .expect("listing event should be signed");
+
+        let parsed = event_to_game_listing(&event).expect("listing event should parse");
+
+        assert_eq!(parsed.platforms, vec!["linux-x86_64", "windows-x86_64"]);
+    }
 }
 
 /// Signs an event using the Arcadestr ActiveSigner.

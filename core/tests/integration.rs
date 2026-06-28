@@ -976,6 +976,7 @@ fn test_game_listing(publisher_npub: String, id: &str) -> GameListing {
         created_at: 1_710_000_000,
         tags: vec!["action".to_string(), "indie".to_string()],
         lud16: "seller@example.com".to_string(),
+        platforms: Vec::new(),
         images: vec!["https://example.com/cover.png".to_string()],
         summary: Some("short summary".to_string()),
         published_at: Some(1_710_000_000),

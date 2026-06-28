@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS marketplace_listings (
     download_url TEXT NOT NULL,
     tags_json TEXT NOT NULL DEFAULT '[]',
     images_json TEXT NOT NULL DEFAULT '[]',
+    platforms_json TEXT NOT NULL DEFAULT '[]',
     lud16 TEXT NOT NULL DEFAULT '',
     location TEXT,
     geohash TEXT,
@@ -212,6 +213,7 @@ impl Database {
                 "price_amount",
                 "price_currency",
                 "price_frequency",
+                "platforms_json",
             ],
         )
         .await?;
