@@ -308,6 +308,8 @@ pub struct MarketplaceFilter {
 
     /// If non-empty, only return listings whose `platforms` field contains
     /// at least one of these values. An empty vec disables platform filtering.
+    /// Listings that declare no `["platform", ...]` tags are treated as
+    /// unrestricted and always pass platform filters regardless of active value.
     #[serde(default)]
     pub platforms: Vec<String>,
 }

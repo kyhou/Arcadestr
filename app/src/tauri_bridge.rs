@@ -29,6 +29,22 @@ pub async fn invoke_install_game(_listing: &GameListing) -> Result<(), String> {
     Err("Game installation is only available in desktop builds.".to_string())
 }
 
+/// Invoke desktop `ingest_receipt` command.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_ingest_receipt(raw_event_json: String) -> Result<(), String> {
+    crate::tauri_invoke::invoke(
+        "ingest_receipt",
+        serde_json::json!({ "rawEventJson": raw_event_json }),
+    )
+    .await
+}
+
+/// Web fallback for `ingest_receipt`.
+#[cfg(feature = "web")]
+pub async fn invoke_ingest_receipt(_raw_event_json: String) -> Result<(), String> {
+    Err("Receipt ingestion is only available in desktop builds.".to_string())
+}
+
 /// Invoke desktop `nip49_import` command.
 #[cfg(not(feature = "web"))]
 pub async fn invoke_nip49_import(request: Nip49ImportRequest) -> Result<String, String> {

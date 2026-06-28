@@ -603,28 +603,14 @@ async fn fetch_marketplace(
 
     let mut listings = Vec::with_capacity(filtered.len());
     for product in filtered {
-        let coordinate = listing_coordinate(&product);
-        let mut listing = AppGameListing::from_listing(product);
-
-        if let (Some(buyer_pubkey_hex), Some(coordinate)) = (&buyer_pubkey_hex, coordinate) {
-            match state
-                .purchases
-                .is_owned(buyer_pubkey_hex, &coordinate)
-                .await
-            {
-                Ok(is_owned) => listing.is_owned = is_owned,
-                Err(error) => tracing::warn!(
-                    "fetch_marketplace: ownership lookup failed for {}: {}",
-                    coordinate,
-                    error
-                ),
-            }
-        } else if buyer_pubkey_hex.is_some() {
-            tracing::warn!(
-                "fetch_marketplace: unable to build ownership coordinate for listing '{}'",
-                listing.id
-            );
-        }
+        let listing = AppGameListing::from_listing(product);
+        let listing = enrich_listing_ownership(
+            listing,
+            Arc::clone(&state.purchases),
+            buyer_pubkey_hex.clone(),
+            "fetch_marketplace",
+        )
+        .await;
 
         listings.push(listing);
     }
@@ -634,8 +620,74 @@ async fn fetch_marketplace(
 }
 
 fn listing_coordinate(listing: &arcadestr_core::marketplace::Nip99Listing) -> Option<String> {
-    let merchant_pubkey = nostr::PublicKey::from_bech32(&listing.merchant_npub).ok()?;
-    Some(format!("30402:{}:{}", merchant_pubkey.to_hex(), listing.id))
+    listing_coordinate_from_npub(&listing.merchant_npub, &listing.id).ok()
+}
+
+fn listing_coordinate_from_app_listing(listing: &AppGameListing) -> Result<String, String> {
+    listing_coordinate_from_npub(&listing.publisher_npub, &listing.id)
+}
+
+fn listing_coordinate_from_npub(publisher_npub: &str, listing_id: &str) -> Result<String, String> {
+    let merchant_pubkey = nostr::PublicKey::from_bech32(publisher_npub)
+        .map_err(|_| "invalid publisher pubkey".to_string())?;
+    Ok(format!("30402:{}:{}", merchant_pubkey.to_hex(), listing_id))
+}
+
+fn app_listing_from_cached_listing(listing: CoreGameListing) -> AppGameListing {
+    AppGameListing {
+        id: listing.id,
+        source: arcadestr_app::models::ListingSource::Nip99Listing,
+        title: listing.title,
+        description: listing.description,
+        images: listing.images,
+        download_url: listing.download_url,
+        price: listing.price_sats as f64,
+        currency: "SATS".to_string(),
+        price_sats: listing.price_sats,
+        quantity: None,
+        tags: listing.tags,
+        specs: Vec::new(),
+        publisher_npub: listing.publisher_npub,
+        stall_id: String::new(),
+        stall_name: None,
+        lud16: listing.lud16,
+        event_id: None,
+        created_at: listing.created_at,
+        platforms: listing.platforms,
+        nip94_event_id: None,
+        is_owned: false,
+    }
+}
+
+async fn enrich_listing_ownership(
+    mut listing: AppGameListing,
+    purchases: Arc<arcadestr_core::purchases::PurchasesRepository>,
+    buyer_pubkey_hex: Option<String>,
+    log_context: &'static str,
+) -> AppGameListing {
+    let Some(buyer_pubkey_hex) = buyer_pubkey_hex else {
+        return listing;
+    };
+
+    match listing_coordinate_from_app_listing(&listing) {
+        Ok(coordinate) => match purchases.is_owned(&buyer_pubkey_hex, &coordinate).await {
+            Ok(is_owned) => listing.is_owned = is_owned,
+            Err(error) => tracing::warn!(
+                "{}: ownership lookup failed for {}: {}",
+                log_context,
+                coordinate,
+                error
+            ),
+        },
+        Err(error) => tracing::warn!(
+            "{}: unable to build ownership coordinate for listing '{}': {}",
+            log_context,
+            listing.id,
+            error
+        ),
+    }
+
+    listing
 }
 
 #[tauri::command]
@@ -649,13 +701,33 @@ fn get_platform_info() -> arcadestr_app::models::PlatformInfo {
 #[tauri::command]
 async fn install_game(
     listing: AppGameListing,
-    _state: tauri::State<'_, AppState>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     tracing::info!(
         "install_game called for listing '{}' ({})",
         listing.title,
         listing.id
     );
+
+    let buyer_pubkey_hex = {
+        let auth = state.auth.lock().await;
+        auth.public_key()
+            .map(|public_key| public_key.to_hex())
+            .ok_or_else(|| "not authenticated".to_string())?
+    };
+
+    let coordinate = listing_coordinate_from_app_listing(&listing)?;
+    let is_owned = state
+        .purchases
+        .is_owned(&buyer_pubkey_hex, &coordinate)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if !is_owned {
+        return Err("purchase not found".to_string());
+    }
+
+    // TODO(nip94-delivery): download and verify the NIP-94 payload before install.
     Ok(())
 }
 
@@ -704,6 +776,11 @@ async fn fetch_marketplace_stream(
         until_secs
     );
 
+    let buyer_pubkey_hex = {
+        let auth = state.auth.lock().await;
+        auth.public_key().map(|public_key| public_key.to_hex())
+    };
+
     let mut cached_emitted = 0usize;
     let mut cached_signatures: HashMap<(String, String), String> = HashMap::new();
 
@@ -715,6 +792,15 @@ async fn fetch_marketplace_stream(
         Ok(cached) => {
             for listing in cached {
                 cached_signatures.insert(listing_cache_key(&listing), listing_signature(&listing));
+                let listing = app_listing_from_cached_listing(listing);
+                let listing = enrich_listing_ownership(
+                    listing,
+                    Arc::clone(&state.purchases),
+                    buyer_pubkey_hex.clone(),
+                    "fetch_marketplace_stream cache",
+                )
+                .await;
+
                 if window.emit("marketplace-product", &listing).is_ok() {
                     cached_emitted += 1;
                 }
@@ -732,11 +818,16 @@ async fn fetch_marketplace_stream(
     let seen_signatures = StdArc::new(StdMutex::new(cached_signatures));
     let relay_updates: StdArc<StdMutex<Vec<CoreGameListing>>> =
         StdArc::new(StdMutex::new(Vec::new()));
+    let emit_tasks: StdArc<StdMutex<Vec<tauri::async_runtime::JoinHandle<()>>>> =
+        StdArc::new(StdMutex::new(Vec::new()));
 
     // Clone window for use in the closure
     let window_for_closure = window.clone();
     let seen_signatures_for_closure = StdArc::clone(&seen_signatures);
     let relay_updates_for_closure = StdArc::clone(&relay_updates);
+    let emit_tasks_for_closure = StdArc::clone(&emit_tasks);
+    let purchases_for_closure = Arc::clone(&state.purchases);
+    let buyer_pubkey_hex_for_closure = buyer_pubkey_hex.clone();
 
     // Capture relay manager without holding the AppState nostr lock across awaits.
     let relay_manager = {
@@ -753,9 +844,9 @@ async fn fetch_marketplace_stream(
         since_days,
         until_secs,
         move |product| {
-            let listing = CoreGameListing::from_listing(product);
-            let key = listing_cache_key(&listing);
-            let signature = listing_signature(&listing);
+            let core_listing = CoreGameListing::from_listing(product.clone());
+            let key = listing_cache_key(&core_listing);
+            let signature = listing_signature(&core_listing);
 
             let should_emit = {
                 let mut known = seen_signatures_for_closure
@@ -778,13 +869,31 @@ async fn fetch_marketplace_stream(
                 let mut updates = relay_updates_for_closure
                     .lock()
                     .expect("relay updates mutex poisoned");
-                updates.push(listing.clone());
+                updates.push(core_listing);
             }
 
-            // Emit product to frontend
-            if let Err(e) = window_for_closure.emit("marketplace-product", &listing) {
-                tracing::debug!("Failed to emit marketplace-product: {}", e);
-            }
+            let listing = AppGameListing::from_listing(product);
+            let purchases = Arc::clone(&purchases_for_closure);
+            let buyer_pubkey_hex = buyer_pubkey_hex_for_closure.clone();
+            let window = window_for_closure.clone();
+            let task = tauri::async_runtime::spawn(async move {
+                let listing = enrich_listing_ownership(
+                    listing,
+                    purchases,
+                    buyer_pubkey_hex,
+                    "fetch_marketplace_stream",
+                )
+                .await;
+
+                if let Err(e) = window.emit("marketplace-product", &listing) {
+                    tracing::debug!("Failed to emit marketplace-product: {}", e);
+                }
+            });
+
+            let mut tasks = emit_tasks_for_closure
+                .lock()
+                .expect("emit tasks mutex poisoned");
+            tasks.push(task);
         },
     )
     .await;
@@ -795,6 +904,16 @@ async fn fetch_marketplace_stream(
         }
         Err(e) => {
             tracing::warn!("fetch_marketplace_stream: fetch error: {}", e);
+        }
+    }
+
+    let emit_handles = {
+        let mut tasks = emit_tasks.lock().expect("emit tasks mutex poisoned");
+        std::mem::take(&mut *tasks)
+    };
+    for handle in emit_handles {
+        if let Err(error) = handle.await {
+            tracing::warn!("fetch_marketplace_stream: emit task failed: {}", error);
         }
     }
 
@@ -955,6 +1074,75 @@ mod task4_tests {
         let listing = listing_with_merchant_npub("not-an-npub".to_string());
 
         assert!(listing_coordinate(&listing).is_none());
+    }
+
+    #[test]
+    fn app_listing_coordinate_uses_publisher_npub_and_listing_id() {
+        let merchant = Keys::generate();
+        let listing = AppGameListing {
+            id: "game-v1".to_string(),
+            source: arcadestr_app::models::ListingSource::Nip99Listing,
+            title: "Game".to_string(),
+            description: String::new(),
+            images: Vec::new(),
+            download_url: String::new(),
+            price: 0.0,
+            currency: String::new(),
+            price_sats: 0,
+            quantity: None,
+            tags: Vec::new(),
+            specs: Vec::new(),
+            publisher_npub: merchant
+                .public_key()
+                .to_bech32()
+                .expect("public key should encode as npub"),
+            stall_id: String::new(),
+            stall_name: None,
+            lud16: String::new(),
+            event_id: None,
+            created_at: 0,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            is_owned: false,
+        };
+
+        let coordinate = listing_coordinate_from_app_listing(&listing)
+            .expect("valid npub should build coordinate");
+
+        assert_eq!(
+            coordinate,
+            format!("30402:{}:game-v1", merchant.public_key().to_hex())
+        );
+    }
+
+    #[test]
+    fn cached_core_listing_maps_to_app_listing_with_defaults() {
+        let cached = CoreGameListing {
+            id: "game-v1".to_string(),
+            title: "Game".to_string(),
+            description: "Description".to_string(),
+            price_sats: 21,
+            download_url: "https://example.com/game.zip".to_string(),
+            publisher_npub: "npub1publisher".to_string(),
+            created_at: 7,
+            tags: vec!["arcade".to_string()],
+            lud16: "merchant@example.com".to_string(),
+            images: vec!["https://example.com/cover.png".to_string()],
+            platforms: vec!["linux-x86_64".to_string()],
+            summary: Some("Summary".to_string()),
+            published_at: Some(6),
+            location: None,
+            geohash: None,
+            status: Some("active".to_string()),
+        };
+
+        let listing = app_listing_from_cached_listing(cached);
+
+        assert_eq!(listing.platforms, vec!["linux-x86_64"]);
+        assert_eq!(listing.price_sats, 21);
+        assert_eq!(listing.currency, "SATS");
+        assert_eq!(listing.nip94_event_id, None);
+        assert!(!listing.is_owned);
     }
 }
 
