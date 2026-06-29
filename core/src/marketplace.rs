@@ -499,7 +499,7 @@ pub(crate) async fn fetch_nip15_stalls_impl(
     limit: usize,
     since_days: Option<u64>,
 ) -> Result<Vec<Nip15Stall>, String> {
-    let filter = build_filter(Kind::Custom(30017), limit, since_days, None);
+    let filter = build_filter(Kind::Custom(30017), limit, since_days, None, &[]);
 
     let manager = relay_manager.lock().await;
 
@@ -556,7 +556,7 @@ pub(crate) async fn fetch_nip15_products_impl(
     limit: usize,
     since_days: Option<u64>,
 ) -> Result<Vec<Nip15Product>, String> {
-    let filter = build_filter(Kind::Custom(30018), limit, since_days, None);
+    let filter = build_filter(Kind::Custom(30018), limit, since_days, None, &[]);
 
     let manager = relay_manager.lock().await;
 
@@ -626,7 +626,7 @@ where
     use std::collections::HashSet;
     use tokio::sync::Mutex;
 
-    let filter = build_filter(Kind::Custom(30018), limit, since_days, None);
+    let filter = build_filter(Kind::Custom(30018), limit, since_days, None, &[]);
 
     tracing::info!(
         "Streaming NIP-15 products: kind=30018, limit={}, since_days={:?}",
@@ -702,6 +702,7 @@ fn build_filter(
     limit: usize,
     since_days: Option<u64>,
     until_secs: Option<u64>,
+    tag_filter: &[&str],
 ) -> Filter {
     let mut f = Filter::new().kind(kind).limit(limit);
     if let Some(days) = since_days {
@@ -711,6 +712,12 @@ fn build_filter(
     }
     if let Some(until) = until_secs {
         f = f.until(Timestamp::from(until));
+    }
+    if !tag_filter.is_empty() {
+        f = f.custom_tags(
+            SingleLetterTag::lowercase(Alphabet::T),
+            tag_filter.iter().map(|tag| (*tag).to_string()).collect::<Vec<_>>(),
+        );
     }
     f
 }
@@ -882,7 +889,7 @@ pub(crate) async fn fetch_nip99_listings_impl(
     limit: usize,
     since_days: Option<u64>,
 ) -> Result<Vec<Nip99Listing>, String> {
-    let filter = build_filter(Kind::Custom(30402), limit, since_days, None);
+    let filter = build_filter(Kind::Custom(30402), limit, since_days, None, &["game"]);
 
     let manager = relay_manager.lock().await;
 
@@ -938,7 +945,7 @@ where
     use std::collections::HashSet;
     use tokio::sync::Mutex;
 
-    let filter = build_filter(Kind::Custom(30402), limit, since_days, until_secs);
+    let filter = build_filter(Kind::Custom(30402), limit, since_days, until_secs, &["game"]);
 
     tracing::info!(
         "Streaming NIP-99 listings: kind=30402, limit={}, since_days={:?}, until_secs={:?}",
@@ -1258,6 +1265,26 @@ mod tests {
 
         assert!(listing.platforms.is_empty());
         assert_eq!(listing.nip94_event_id, None);
+    }
+
+    #[test]
+    fn build_filter_includes_game_tag_filter() {
+        // Arrange / Act
+        let filter = build_filter(Kind::Custom(30402), 50, None, None, &["game"]);
+        let value = serde_json::to_value(&filter).expect("filter should serialize");
+
+        // Assert
+        assert_eq!(value.get("#t"), Some(&serde_json::json!(["game"])));
+    }
+
+    #[test]
+    fn build_filter_empty_tag_filter_omits_t_tag() {
+        // Arrange / Act
+        let filter = build_filter(Kind::Custom(30018), 50, None, None, &[]);
+        let value = serde_json::to_value(&filter).expect("filter should serialize");
+
+        // Assert
+        assert!(value.get("#t").is_none());
     }
 
     #[test]
