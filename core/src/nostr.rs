@@ -437,10 +437,30 @@ impl From<serde_json::Error> for NostrError {
     }
 }
 
+/// Identifies which Nostr event kind produced a game listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListingSource {
+    /// NIP-15 product event (kind 30018).
+    Nip15Product,
+    /// NIP-99 listing event (kind 30402/30403).
+    Nip99Listing,
+    /// Legacy game listing event (kind 30078).
+    Legacy,
+}
+
+impl Default for ListingSource {
+    fn default() -> Self {
+        Self::Legacy
+    }
+}
+
 /// Game listing data structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameListing {
     pub id: String, // unique slug / d-tag value, e.g. "my-game-v1"
+    #[serde(default)]
+    pub source: ListingSource,
     pub title: String,
     pub description: String,
     pub price_sats: u64,        // price in satoshis, 0 = free
@@ -460,6 +480,10 @@ pub struct GameListing {
     pub geohash: Option<String>,
     /// Listing status: active, sold, archived, etc. (NIP-99).
     pub status: Option<String>,
+    /// Original NIP-99 event JSON for debug-only inspection.
+    #[cfg(debug_assertions)]
+    #[serde(default)]
+    pub nip99_raw_event_json: Option<String>,
 }
 
 impl GameListing {
@@ -493,6 +517,7 @@ impl GameListing {
 
         GameListing {
             id: product.id,
+            source: ListingSource::Nip15Product,
             title: product.name,
             description: product.description.unwrap_or_default(),
             price_sats,
@@ -507,6 +532,8 @@ impl GameListing {
             location: None,
             geohash: None,
             status: None,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
         }
     }
 
@@ -529,6 +556,7 @@ impl GameListing {
 
         GameListing {
             id: listing.id,
+            source: ListingSource::Nip99Listing,
             title: listing.title,
             description: listing.content,
             price_sats,
@@ -543,6 +571,8 @@ impl GameListing {
             location: listing.location,
             geohash: listing.geohash,
             status: listing.status,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: listing.raw_event_json,
         }
     }
 }
@@ -1674,6 +1704,7 @@ pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
 
     Ok(GameListing {
         id,
+        source: ListingSource::Legacy,
         title,
         description: content.description,
         price_sats,
@@ -1688,6 +1719,8 @@ pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
         location: None,
         geohash: None,
         status: None,
+        #[cfg(debug_assertions)]
+        nip99_raw_event_json: None,
     })
 }
 

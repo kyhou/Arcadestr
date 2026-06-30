@@ -153,6 +153,8 @@ pub fn PublishView() -> impl IntoView {
             created_at,
             event_id: None, // Will be set by the backend after publishing
             lud16: lud16_val,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
         };
 
         is_publishing.set(true);

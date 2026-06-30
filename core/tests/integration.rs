@@ -9,7 +9,8 @@ use arcadestr_core::marketplace::Nip99Listing;
 use arcadestr_core::marketplace_cache::MarketplaceCache;
 use arcadestr_core::nip05_validator::{IdentityValidationState, Nip05IdentityValidator};
 use arcadestr_core::nostr::{
-    event_to_game_listing, game_listing_to_event_builder, GameListing, KIND_GAME_LISTING,
+    event_to_game_listing, game_listing_to_event_builder, GameListing, ListingSource,
+    KIND_GAME_LISTING,
 };
 use arcadestr_core::signers::NostrSigner;
 use arcadestr_core::storage::Database;
@@ -968,6 +969,7 @@ async fn profile_badge_queries_require_matching_award_recipient_and_coordinate()
 fn test_game_listing(publisher_npub: String, id: &str) -> GameListing {
     GameListing {
         id: id.to_string(),
+        source: ListingSource::Legacy,
         title: "Test Game".to_string(),
         description: "Integration scenario listing".to_string(),
         price_sats: 1_000,
@@ -1000,6 +1002,8 @@ fn test_nip99_listing(id: &str, merchant_npub: &str, created_at: u64) -> Nip99Li
         geohash: None,
         tags: vec!["indie".to_string()],
         status: Some("active".to_string()),
+        #[cfg(debug_assertions)]
+        raw_event_json: None,
         merchant_npub: merchant_npub.to_string(),
         created_at,
     }

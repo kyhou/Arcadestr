@@ -128,6 +128,11 @@ pub struct GameListing {
 
     // ── Timestamps ────────────────────────────────────────────────────────────
     pub created_at: u64,
+
+    /// Original NIP-99 event JSON for debug-only inspection.
+    #[cfg(debug_assertions)]
+    #[serde(default)]
+    pub nip99_raw_event_json: Option<String>,
 }
 
 impl GameListing {
@@ -184,6 +189,8 @@ impl GameListing {
             lud16: String::new(),
             event_id: None,
             created_at: product.created_at,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
         }
     }
 
@@ -224,6 +231,8 @@ impl GameListing {
             lud16: String::new(),
             event_id: None,
             created_at: listing.created_at,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: listing.raw_event_json,
         }
     }
 }
@@ -410,5 +419,40 @@ mod tests {
         assert!(value.get("visible_on_profile").is_some());
         assert!(value.get("definition").is_some());
         assert!(value.get("award").is_some());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn backend_nip99_listing_deserializes_with_nip99_source() {
+        // Arrange
+        let backend_listing = arcadestr_core::nostr::GameListing::from_listing(
+            arcadestr_core::marketplace::Nip99Listing {
+                id: "listing-source".to_string(),
+                title: "Source Listing".to_string(),
+                content: "Listing content".to_string(),
+                summary: Some("Short summary".to_string()),
+                published_at: Some(1_710_000_000),
+                location: Some("Remote".to_string()),
+                price_amount: Some("2100".to_string()),
+                price_currency: Some("SATS".to_string()),
+                price_frequency: None,
+                images: vec!["https://example.com/image.png".to_string()],
+                geohash: None,
+                tags: vec!["game".to_string()],
+                status: Some("active".to_string()),
+                #[cfg(debug_assertions)]
+                raw_event_json: Some(r#"{"kind":30402}"#.to_string()),
+                merchant_npub: "npub1seller".to_string(),
+                created_at: 1_710_000_001,
+            },
+        );
+        let ipc_value = serde_json::to_value(backend_listing).expect("backend listing serializes");
+
+        // Act
+        let frontend_listing: GameListing =
+            serde_json::from_value(ipc_value).expect("frontend listing deserializes");
+
+        // Assert
+        assert_eq!(frontend_listing.source, ListingSource::Nip99Listing);
     }
 }

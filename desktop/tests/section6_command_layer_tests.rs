@@ -1,7 +1,7 @@
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::http_client::{HttpClient, HttpClientError, ReqwestHttpClient};
 use arcadestr_core::nip46::ProfileMetadata;
-use arcadestr_core::nostr::{GameListing, UserProfile};
+use arcadestr_core::nostr::{GameListing, ListingSource, UserProfile};
 use async_trait::async_trait;
 use nostr::Keys;
 use nostr::ToBech32;
@@ -114,6 +114,7 @@ fn empty_vec_serializes_as_array_not_null() {
 fn sample_listing() -> GameListing {
     GameListing {
         id: "test-game-v1".to_string(),
+        source: ListingSource::Legacy,
         title: "Test Game".to_string(),
         description: "Section 6 test listing".to_string(),
         price_sats: 1000,
@@ -128,6 +129,8 @@ fn sample_listing() -> GameListing {
         location: Some("online".to_string()),
         geohash: None,
         status: Some("active".to_string()),
+        #[cfg(debug_assertions)]
+        nip99_raw_event_json: None,
     }
 }
 

@@ -6,9 +6,55 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::ProfileRow;
-use crate::models::{GameListing, UserProfile, ZapInvoice, ZapRequest};
+use crate::models::{GameListing, ListingSource, UserProfile, ZapInvoice, ZapRequest};
 use crate::store::try_use_profile_store;
 use crate::{invoke_fetch_profile, invoke_request_invoice, AuthContext};
+
+#[cfg(debug_assertions)]
+fn pretty_json_or_raw(raw_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw_json)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| raw_json.to_string())
+}
+
+#[cfg(debug_assertions)]
+fn nip99_debug_payload(listing: &GameListing) -> Option<String> {
+    if listing.source != ListingSource::Nip99Listing {
+        return None;
+    }
+
+    if let Some(raw_json) = listing
+        .nip99_raw_event_json
+        .as_deref()
+        .filter(|raw_json| !raw_json.trim().is_empty())
+    {
+        return Some(pretty_json_or_raw(raw_json));
+    }
+
+    let parsed_payload = serde_json::json!({
+        "source": listing.source,
+        "id": listing.id,
+        "title": listing.title,
+        "content": listing.description,
+        "images": listing.images,
+        "download_url": listing.download_url,
+        "price": listing.price,
+        "currency": listing.currency,
+        "price_sats": listing.price_sats,
+        "quantity": listing.quantity,
+        "tags": listing.tags,
+        "specs": listing.specs,
+        "publisher_npub": listing.publisher_npub,
+        "stall_id": listing.stall_id,
+        "stall_name": listing.stall_name,
+        "lud16": listing.lud16,
+        "event_id": listing.event_id,
+        "created_at": listing.created_at,
+    });
+
+    serde_json::to_string_pretty(&parsed_payload).ok()
+}
 
 /// Detail view component - displays full listing information with Buy flow.
 /// Uses ProfileStore cache to avoid redundant network fetches for seller profiles.
@@ -353,6 +399,46 @@ pub fn DetailView(
                     </div>
                 </div>
 
+                {{
+                    #[cfg(debug_assertions)]
+                    {
+                        nip99_debug_payload(&listing)
+                            .map(|payload| {
+                                view! {
+                                    <details
+                                        class="nip99-debug-box"
+                                        open=true
+                                        style:margin-top="16px"
+                                        style:padding="12px"
+                                        style:background="#111827"
+                                        style:border="1px solid #f5821f"
+                                        style:border-radius="8px"
+                                        style:color="#e5e7eb"
+                                    >
+                                        <summary style:cursor="pointer" style:font-weight="700" style:color="#f5821f">
+                                            "Debug: Raw NIP-99 Listing"
+                                        </summary>
+                                        <pre
+                                            style:margin-top="12px"
+                                            style:max-height="360px"
+                                            style:overflow="auto"
+                                            style:font-size="12px"
+                                            style:line-height="1.45"
+                                            style:white-space="pre-wrap"
+                                            style:word-break="break-word"
+                                        >
+                                            {payload}
+                                        </pre>
+                                    </details>
+                                }
+                            })
+                    }
+                    #[cfg(not(debug_assertions))]
+                    {
+                        None::<leptos::prelude::AnyView>
+                    }
+                }}
+
                 <div class="detail-actions">
                     {{
                         #[cfg(target_arch = "wasm32")]
@@ -470,5 +556,60 @@ pub fn DetailView(
                 }}
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ListingSource;
+
+    fn nip99_listing_with_raw(raw_event_json: Option<String>) -> GameListing {
+        GameListing {
+            id: "listing-debug".to_string(),
+            source: ListingSource::Nip99Listing,
+            title: "Debug Listing".to_string(),
+            description: "Raw listing content".to_string(),
+            images: vec!["https://example.com/image.png".to_string()],
+            download_url: "https://example.com/image.png".to_string(),
+            price: 2100.0,
+            currency: "SATS".to_string(),
+            price_sats: 2100,
+            quantity: None,
+            tags: vec!["game".to_string()],
+            specs: vec![],
+            publisher_npub: "npub1seller".to_string(),
+            stall_id: String::new(),
+            stall_name: None,
+            lud16: String::new(),
+            event_id: None,
+            created_at: 1_710_000_000,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: raw_event_json,
+        }
+    }
+
+    #[test]
+    fn nip99_debug_payload_prefers_pretty_raw_event_json() {
+        let listing = nip99_listing_with_raw(Some(
+            r#"{"kind":30402,"content":"raw content","tags":[["d","listing-debug"]]}"#.to_string(),
+        ));
+
+        let payload = nip99_debug_payload(&listing).expect("NIP-99 payload should render");
+
+        assert!(payload.contains("\"kind\": 30402"));
+        assert!(payload.contains("\"content\": \"raw content\""));
+        assert!(!payload.contains("price_sats"));
+    }
+
+    #[test]
+    fn nip99_debug_payload_falls_back_to_parsed_listing_fields() {
+        let listing = nip99_listing_with_raw(None);
+
+        let payload = nip99_debug_payload(&listing).expect("NIP-99 payload should render");
+
+        assert!(payload.contains("\"id\": \"listing-debug\""));
+        assert!(payload.contains("\"price_sats\": 2100"));
+        assert!(payload.contains("\"tags\": ["));
     }
 }
