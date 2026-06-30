@@ -1,4 +1,4 @@
-use crate::nostr::GameListing;
+use crate::nostr::{GameListing, ListingSource};
 use sqlx::{Pool, Row, Sqlite};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -113,6 +113,7 @@ impl MarketplaceCache {
 
                 GameListing {
                     id: row.get("product_id"),
+                    source: ListingSource::Nip99Listing,
                     title: row.get("title"),
                     description: row.get("description"),
                     price_sats: row.get::<i64, _>("price_sats").max(0) as u64,
@@ -131,6 +132,8 @@ impl MarketplaceCache {
                     location: row.get("location"),
                     geohash: row.get("geohash"),
                     status: row.get("status"),
+                    #[cfg(debug_assertions)]
+                    nip99_raw_event_json: None,
                 }
             })
             .collect())
@@ -257,6 +260,7 @@ mod tests {
     fn make_listing(id: &str, created_at: u64, title: &str) -> GameListing {
         GameListing {
             id: id.to_string(),
+            source: ListingSource::Nip99Listing,
             title: title.to_string(),
             description: "desc".to_string(),
             price_sats: 100,
@@ -273,6 +277,8 @@ mod tests {
             location: Some("Online".to_string()),
             geohash: None,
             status: Some("active".to_string()),
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
         }
     }
 
@@ -540,6 +546,7 @@ mod tests {
         // Create a GameListing with all NIP-99 fields populated
         let listing = GameListing {
             id: "complete-game-v1".to_string(),
+            source: ListingSource::Nip99Listing,
             title: "Complete NIP-99 Game".to_string(),
             description: "A fully featured game with all NIP-99 fields".to_string(),
             price_sats: 5000,
@@ -564,6 +571,8 @@ mod tests {
             location: Some("San Francisco, CA".to_string()),
             geohash: Some("9q8yym".to_string()),
             status: Some("active".to_string()),
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
         };
 
         // Upsert it to cache
@@ -615,6 +624,7 @@ mod tests {
         // Create a GameListing with empty images and None for optional fields
         let listing = GameListing {
             id: "minimal-game-v1".to_string(),
+            source: ListingSource::Nip99Listing,
             title: "Minimal Game".to_string(),
             description: "A game with minimal fields".to_string(),
             price_sats: 1000,
@@ -631,6 +641,8 @@ mod tests {
             location: None,
             geohash: None,
             status: None,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
         };
 
         // Upsert and load

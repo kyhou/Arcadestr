@@ -255,6 +255,10 @@ pub struct Nip99Listing {
     #[serde(default)]
     pub nip94_event_id: Option<String>,
     pub status: Option<String>,
+    /// Original Nostr event JSON for debug-only inspection.
+    #[cfg(debug_assertions)]
+    #[serde(default)]
+    pub raw_event_json: Option<String>,
     /// Bech32-encoded `npub` of the merchant who published this event.
     pub merchant_npub: String,
     pub created_at: u64,
@@ -716,7 +720,10 @@ fn build_filter(
     if !tag_filter.is_empty() {
         f = f.custom_tags(
             SingleLetterTag::lowercase(Alphabet::T),
-            tag_filter.iter().map(|tag| (*tag).to_string()).collect::<Vec<_>>(),
+            tag_filter
+                .iter()
+                .map(|tag| (*tag).to_string())
+                .collect::<Vec<_>>(),
         );
     }
     f
@@ -772,6 +779,9 @@ fn parse_product(event: Event) -> Result<Nip15Product, serde_json::Error> {
 }
 
 fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
+    #[cfg(debug_assertions)]
+    let raw_event_json = serde_json::to_string(&event).ok();
+
     let mut id: Option<String> = None;
     let mut title: Option<String> = None;
     let mut summary: Option<String> = None;
@@ -879,6 +889,8 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
         platforms,
         nip94_event_id,
         status,
+        #[cfg(debug_assertions)]
+        raw_event_json,
         merchant_npub: npub_of(&event.pubkey),
         created_at: event.created_at.as_secs(),
     })
@@ -945,7 +957,13 @@ where
     use std::collections::HashSet;
     use tokio::sync::Mutex;
 
-    let filter = build_filter(Kind::Custom(30402), limit, since_days, until_secs, &["game"]);
+    let filter = build_filter(
+        Kind::Custom(30402),
+        limit,
+        since_days,
+        until_secs,
+        &["game"],
+    );
 
     tracing::info!(
         "Streaming NIP-99 listings: kind=30402, limit={}, since_days={:?}, until_secs={:?}",
@@ -1076,6 +1094,39 @@ mod tests {
         builder
             .sign_with_keys(&keys)
             .expect("NIP-99 event should sign")
+    }
+
+    #[test]
+    fn nip99_listing_preserves_raw_event_json_for_debug_panel() {
+        // Arrange
+        let event = make_nip99_event(
+            30402,
+            "# Debug Listing\nRaw content",
+            vec![
+                vec!["d", "listing-debug-raw"],
+                vec!["title", "Debug Raw Listing"],
+                vec!["price", "2100", "SATS"],
+                vec!["image", "https://example.com/image.png"],
+            ],
+        );
+        let expected_id = event.id.to_string();
+
+        // Act
+        let listing = parse_listing(event).expect("listing should parse");
+        let raw_event_json = listing
+            .raw_event_json
+            .as_deref()
+            .expect("raw event JSON should be retained in debug builds");
+        let raw_event: serde_json::Value =
+            serde_json::from_str(raw_event_json).expect("raw event JSON should parse");
+
+        // Assert
+        assert_eq!(raw_event["id"].as_str(), Some(expected_id.as_str()));
+        assert_eq!(raw_event["kind"].as_u64(), Some(30_402));
+        assert_eq!(
+            raw_event["content"].as_str(),
+            Some("# Debug Listing\nRaw content")
+        );
     }
 
     #[test]

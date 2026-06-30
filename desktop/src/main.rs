@@ -26,8 +26,8 @@ use arcadestr_core::nip46::{
     SessionRestoreResult,
 };
 use arcadestr_core::nostr::{
-    parse_nip19_identifier, EventDeduplicator, GameListing as CoreGameListing, NostrClient,
-    UserProfile, DEFAULT_RELAYS,
+    parse_nip19_identifier, EventDeduplicator, GameListing as CoreGameListing, ListingSource,
+    NostrClient, UserProfile, DEFAULT_RELAYS,
 };
 use arcadestr_core::profile_fetcher::ProfileFetcher;
 use arcadestr_core::relay_cache::RelayCache;
@@ -657,6 +657,8 @@ fn app_listing_from_cached_listing(listing: CoreGameListing) -> AppGameListing {
         platforms: listing.platforms,
         nip94_event_id: listing.nip94_event_id,
         is_owned: false,
+        #[cfg(debug_assertions)]
+        nip99_raw_event_json: listing.nip99_raw_event_json,
     }
 }
 
@@ -1020,6 +1022,8 @@ mod task4_tests {
             platforms: Vec::new(),
             nip94_event_id: None,
             status: None,
+            #[cfg(debug_assertions)]
+            raw_event_json: None,
         }
     }
 
@@ -1045,6 +1049,7 @@ mod task4_tests {
     fn listing_signature_includes_platform_tags() {
         let linux_listing = CoreGameListing {
             id: "game-v1".to_string(),
+            source: ListingSource::Nip99Listing,
             title: "Game".to_string(),
             description: "Description".to_string(),
             price_sats: 100,
@@ -1061,6 +1066,8 @@ mod task4_tests {
             location: None,
             geohash: None,
             status: None,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
         };
         let mut windows_listing = linux_listing.clone();
         windows_listing.platforms = vec!["windows-x86_64".to_string()];
@@ -1113,6 +1120,8 @@ mod task4_tests {
             platforms: Vec::new(),
             nip94_event_id: None,
             is_owned: false,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
         };
 
         let coordinate = listing_coordinate_from_app_listing(&listing)
@@ -1128,6 +1137,7 @@ mod task4_tests {
     fn cached_core_listing_maps_to_app_listing_with_defaults() {
         let cached = CoreGameListing {
             id: "game-v1".to_string(),
+            source: ListingSource::Nip99Listing,
             title: "Game".to_string(),
             description: "Description".to_string(),
             price_sats: 21,
@@ -1144,6 +1154,8 @@ mod task4_tests {
             location: None,
             geohash: None,
             status: Some("active".to_string()),
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: Some(r#"{"kind":30402}"#.to_string()),
         };
 
         let listing = app_listing_from_cached_listing(cached);

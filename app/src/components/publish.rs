@@ -214,6 +214,8 @@ pub fn PublishView() -> impl IntoView {
             platforms,
             nip94_event_id: None,
             is_owned: false,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
         };
 
         is_publishing.set(true);
