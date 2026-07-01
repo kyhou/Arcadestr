@@ -986,6 +986,8 @@ fn test_game_listing(publisher_npub: String, id: &str) -> GameListing {
         location: Some("online".to_string()),
         geohash: None,
         status: Some("active".to_string()),
+        #[cfg(debug_assertions)]
+        nip99_raw_event_json: None,
     }
 }
 

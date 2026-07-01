@@ -139,6 +139,21 @@ impl MarketplaceCache {
             .collect())
     }
 
+    pub async fn latest_created_at(&self) -> Result<Option<u64>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT MAX(created_at) AS latest_created_at
+            FROM marketplace_listings
+            "#,
+        )
+        .fetch_one(&self.db)
+        .await?;
+
+        Ok(row
+            .get::<Option<i64>, _>("latest_created_at")
+            .map(|created_at| created_at.max(0) as u64))
+    }
+
     pub async fn upsert_listing(
         &self,
         listing: &GameListing,
@@ -531,6 +546,53 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "old");
+    }
+
+    #[tokio::test]
+    async fn latest_created_at_returns_none_for_empty_cache() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+
+        let cache = MarketplaceCache::new(db.pool().clone());
+        let latest = cache
+            .latest_created_at()
+            .await
+            .expect("latest timestamp query should succeed");
+
+        assert_eq!(latest, None);
+    }
+
+    #[tokio::test]
+    async fn latest_created_at_returns_newest_cached_listing() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+
+        let cache = MarketplaceCache::new(db.pool().clone());
+        cache
+            .upsert_listing(&make_listing("old", 1_710_010_000, "Old"), None)
+            .await
+            .expect("old upsert should succeed");
+        cache
+            .upsert_listing(&make_listing("new", 1_710_030_000, "New"), None)
+            .await
+            .expect("new upsert should succeed");
+        cache
+            .upsert_listing(&make_listing("middle", 1_710_020_000, "Middle"), None)
+            .await
+            .expect("middle upsert should succeed");
+
+        let latest = cache
+            .latest_created_at()
+            .await
+            .expect("latest timestamp query should succeed");
+
+        assert_eq!(latest, Some(1_710_030_000));
     }
 
     #[tokio::test]

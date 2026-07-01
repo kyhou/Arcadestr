@@ -708,11 +708,23 @@ fn build_filter(
     until_secs: Option<u64>,
     tag_filter: &[&str],
 ) -> Filter {
-    let mut f = Filter::new().kind(kind).limit(limit);
-    if let Some(days) = since_days {
+    let since_secs = since_days.map(|days| {
         // Saturating sub guards against underflow on very large values.
-        let since_unix = Timestamp::now().as_secs().saturating_sub(days * 86_400);
-        f = f.since(Timestamp::from(since_unix));
+        Timestamp::now().as_secs().saturating_sub(days * 86_400)
+    });
+    build_filter_since_secs(kind, limit, since_secs, until_secs, tag_filter)
+}
+
+fn build_filter_since_secs(
+    kind: Kind,
+    limit: usize,
+    since_secs: Option<u64>,
+    until_secs: Option<u64>,
+    tag_filter: &[&str],
+) -> Filter {
+    let mut f = Filter::new().kind(kind).limit(limit);
+    if let Some(since) = since_secs {
+        f = f.since(Timestamp::from(since));
     }
     if let Some(until) = until_secs {
         f = f.until(Timestamp::from(until));
@@ -901,14 +913,24 @@ pub(crate) async fn fetch_nip99_listings_impl(
     limit: usize,
     since_days: Option<u64>,
 ) -> Result<Vec<Nip99Listing>, String> {
-    let filter = build_filter(Kind::Custom(30402), limit, since_days, None, &["game"]);
+    let since_secs =
+        since_days.map(|days| Timestamp::now().as_secs().saturating_sub(days * 86_400));
+    fetch_nip99_listings_since_impl(relay_manager, limit, since_secs).await
+}
+
+pub(crate) async fn fetch_nip99_listings_since_impl(
+    relay_manager: &Arc<Mutex<RelayManager>>,
+    limit: usize,
+    since_secs: Option<u64>,
+) -> Result<Vec<Nip99Listing>, String> {
+    let filter = build_filter_since_secs(Kind::Custom(30402), limit, since_secs, None, &["game"]);
 
     let manager = relay_manager.lock().await;
 
     tracing::info!(
-        "Fetching NIP-99 listings with filter: kind=30402, limit={}, since_days={:?}",
+        "Fetching NIP-99 listings with filter: kind=30402, limit={}, since_secs={:?}",
         limit,
-        since_days
+        since_secs
     );
 
     let events = match manager.fetch_events_with_timeout(filter, 30).await {
@@ -949,6 +971,22 @@ pub async fn fetch_nip99_listings_streaming<F>(
     limit: usize,
     since_days: Option<u64>,
     until_secs: Option<u64>,
+    on_product: F,
+) -> Result<u32, String>
+where
+    F: FnMut(Nip99Listing) + Send + 'static,
+{
+    let since_secs =
+        since_days.map(|days| Timestamp::now().as_secs().saturating_sub(days * 86_400));
+    fetch_nip99_listings_streaming_since(relay_manager, limit, since_secs, until_secs, on_product)
+        .await
+}
+
+pub async fn fetch_nip99_listings_streaming_since<F>(
+    relay_manager: &Arc<tokio::sync::Mutex<RelayManager>>,
+    limit: usize,
+    since_secs: Option<u64>,
+    until_secs: Option<u64>,
     mut on_product: F,
 ) -> Result<u32, String>
 where
@@ -957,18 +995,18 @@ where
     use std::collections::HashSet;
     use tokio::sync::Mutex;
 
-    let filter = build_filter(
+    let filter = build_filter_since_secs(
         Kind::Custom(30402),
         limit,
-        since_days,
+        since_secs,
         until_secs,
         &["game"],
     );
 
     tracing::info!(
-        "Streaming NIP-99 listings: kind=30402, limit={}, since_days={:?}, until_secs={:?}",
+        "Streaming NIP-99 listings: kind=30402, limit={}, since_secs={:?}, until_secs={:?}",
         limit,
-        since_days,
+        since_secs,
         until_secs
     );
 
@@ -1074,6 +1112,7 @@ mod tests {
                 .map(|platform| (*platform).into())
                 .collect(),
             nip94_event_id: None,
+            raw_event_json: None,
         }
     }
 
@@ -1336,6 +1375,17 @@ mod tests {
 
         // Assert
         assert!(value.get("#t").is_none());
+    }
+
+    #[test]
+    fn build_filter_since_secs_uses_absolute_timestamp() {
+        // Arrange / Act
+        let filter =
+            build_filter_since_secs(Kind::Custom(30402), 50, Some(1_710_030_000), None, &[]);
+        let value = serde_json::to_value(&filter).expect("filter should serialize");
+
+        // Assert
+        assert_eq!(value.get("since"), Some(&serde_json::json!(1_710_030_000)));
     }
 
     #[test]

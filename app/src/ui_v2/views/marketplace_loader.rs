@@ -1,11 +1,23 @@
 //! Shared marketplace listing loader and presentation helpers for UI v2 views.
 
+use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::invoke_fetch_marketplace_stream;
 use crate::models::{GameListing, ListingSource};
 use crate::store::{try_use_marketplace_store, DEFAULT_LISTING_TTL_SECS};
+
+// ── Batch flusher for progressive listing updates ────────────────────────────
+//
+// Instead of updating the `listings` RwSignal on every individual Tauri event
+// (which can cause 200+ grid re-renders during streaming), we accumulate
+// incoming products into a buffer and flush them after a short debounce.
+// This batches rapid arrivals into fewer signal updates, drastically
+// reducing re-renders while keeping progressive loading responsive.
+//
 
 const DEFAULT_MARKETPLACE_LISTING_LIMIT: usize = 50;
 
@@ -124,35 +136,102 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
 
             if should_fetch {
                 let store_for_listing = store.clone();
-                let store_for_listing_ref = std::cell::RefCell::new(store_for_listing);
 
-                // Batch all updates for each listing to prevent cascading re-renders
-                let on_listing = move |listing: GameListing| {
-                    let store_opt = store_for_listing_ref.borrow().clone();
-                    batch(move || {
-                        received_count.update(|count| *count += 1);
-                        if let Some(s) = &store_opt {
-                            s.put_streaming(listing.clone());
-                        }
+                // ── Batch-flusher for progressive streaming ─────────────────
+                // Accumulates products and flushes to the listings signal
+                // after a short debounce. Each flush sorts and truncates once,
+                // reducing per-event re-renders while keeping loading progressive.
+                let buffer: Rc<RefCell<Vec<GameListing>>> = Rc::new(RefCell::new(Vec::new()));
+                let flush_queued: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-                        listings.update(|items| {
-                            if !items.iter().any(|existing| existing.id == listing.id) {
-                                items.push(listing);
-                                items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                                items.truncate(target_limit);
-                            }
+                let on_listing = {
+                    let buffer = Rc::clone(&buffer);
+                    let flush_queued = Rc::clone(&flush_queued);
+                    let listings = listings.clone();
+                    let loading = loading.clone();
+                    let store_for_listing = store_for_listing.clone();
 
-                            if has_reached_listing_limit(items.len(), target_limit) {
-                                loading.set(false);
+                    move |listing: GameListing| {
+                        // Immediately persist to the global store (deduplicating)
+                        let store_ref = store_for_listing.clone();
+                        let listing_for_store = listing.clone();
+                        batch(move || {
+                            received_count.update(|count| *count += 1);
+                            if let Some(s) = &store_ref {
+                                s.put_streaming(listing_for_store);
                             }
                         });
-                    });
+
+                        // Buffer for batched signal update
+                        buffer.borrow_mut().push(listing);
+
+                        // Schedule a debounced flush if not already queued
+                        if !flush_queued.replace(true) {
+                            let buffer = Rc::clone(&buffer);
+                            let flush_queued = Rc::clone(&flush_queued);
+                            let listings = listings.clone();
+                            let loading = loading.clone();
+
+                            spawn_local(async move {
+                                // Wait briefly so bursts of Tauri events coalesce
+                                // into one signal update while the UI remains responsive.
+                                TimeoutFuture::new(50).await;
+
+                                let queued: Vec<GameListing> =
+                                    std::mem::take(&mut *buffer.borrow_mut());
+                                flush_queued.set(false);
+
+                                if !queued.is_empty() {
+                                    batch(move || {
+                                        listings.update(|items| {
+                                            for item in queued {
+                                                if !items.iter().any(|e| e.id == item.id) {
+                                                    items.push(item);
+                                                    items.truncate(target_limit);
+                                                }
+                                            }
+                                            items.sort_unstable_by(|a, b| {
+                                                b.created_at.cmp(&a.created_at)
+                                            });
+
+                                            if has_reached_listing_limit(items.len(), target_limit)
+                                            {
+                                                loading.set(false);
+                                            }
+                                        });
+                                    });
+                                }
+                            });
+                        }
+                    }
                 };
 
-                let on_complete = Some({
+                let on_complete = {
+                    let buffer = Rc::clone(&buffer);
+                    let flush_queued = Rc::clone(&flush_queued);
+                    let listings = listings.clone();
+                    let loading = loading.clone();
+                    let loading_more = loading_more.clone();
                     let store_for_complete = store.clone();
+
                     move || {
+                        // Flush any remaining buffered items before finalising
+                        let remaining: Vec<GameListing> = std::mem::take(&mut *buffer.borrow_mut());
+                        flush_queued.set(false);
+
                         batch(move || {
+                            if !remaining.is_empty() {
+                                listings.update(|items| {
+                                    for item in remaining {
+                                        if !items.iter().any(|e| e.id == item.id) {
+                                            items.push(item);
+                                        }
+                                    }
+                                    items.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at));
+                                    items.truncate(target_limit);
+                                });
+                            }
+
                             if let Some(s) = &store_for_complete {
                                 s.mark_fresh();
                             }
@@ -164,7 +243,9 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                             loading_more.set(false);
                         });
                     }
-                });
+                };
+
+                let on_complete = Some(on_complete);
 
                 match invoke_fetch_marketplace_stream(
                     page_limit,
@@ -182,6 +263,9 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
 
                         // Fallback in case completion event was missed.
                         if loading.get_untracked() || loading_more.get_untracked() {
+                            listings.update(|items| {
+                                items.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at));
+                            });
                             has_more.set(has_more_after_page(
                                 loaded_count,
                                 listings.get_untracked().len(),

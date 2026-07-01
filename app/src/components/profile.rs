@@ -1,21 +1,20 @@
 // Profile view component - displays the logged-in user's full profile and their listings.
 
 use leptos::prelude::*;
-use wasm_bindgen_futures::spawn_local;
 
 use crate::components::ListingCard;
 use crate::models::{GameListing, MarketplaceView};
-use crate::{invoke_fetch_marketplace, AuthContext};
+use crate::ui_v2::views::marketplace_loader::use_marketplace_listings_with_limit;
+use crate::AuthContext;
 
 /// Profile view component - displays the logged-in user's full profile and their listings.
 #[component]
 pub fn ProfileView(set_view: WriteSignal<MarketplaceView>) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
 
-    // Reactive state for listings
-    let my_listings: RwSignal<Vec<GameListing>> = RwSignal::new(vec![]);
-    let listings_loading: RwSignal<bool> = RwSignal::new(true);
-    let listings_error: RwSignal<Option<String>> = RwSignal::new(None);
+    let marketplace_state = use_marketplace_listings_with_limit(50);
+    let listings_loading = marketplace_state.loading;
+    let listings_error = marketplace_state.error;
     let npub_copied: RwSignal<bool> = RwSignal::new(false);
 
     // Get profile from AuthContext
@@ -24,32 +23,17 @@ pub fn ProfileView(set_view: WriteSignal<MarketplaceView>) -> impl IntoView {
     // Get user's npub
     let npub = move || auth.npub.get();
 
-    // Fetch user's listings on mount
-    Effect::new(move |_| {
-        let current_npub = match npub() {
-            Some(n) => n,
-            None => return,
+    let marketplace_listings = marketplace_state.listings;
+    let auth_for_listings = auth.clone();
+    let my_listings = Signal::derive(move || {
+        let Some(current_npub) = auth_for_listings.npub.get() else {
+            return Vec::new();
         };
-
-        spawn_local(async move {
-            listings_loading.set(true);
-            listings_error.set(None);
-
-            match invoke_fetch_marketplace(50, Some(30), None).await {
-                Ok(all_listings) => {
-                    // Filter to only this user's listings
-                    let filtered: Vec<GameListing> = all_listings
-                        .into_iter()
-                        .filter(|l| l.publisher_npub == current_npub)
-                        .collect();
-                    my_listings.set(filtered);
-                }
-                Err(e) => {
-                    listings_error.set(Some(e));
-                }
-            }
-            listings_loading.set(false);
-        });
+        marketplace_listings
+            .get()
+            .into_iter()
+            .filter(|listing| listing.publisher_npub == current_npub)
+            .collect::<Vec<_>>()
     });
 
     // Copy npub to clipboard

@@ -871,6 +871,15 @@ impl NostrClient {
         crate::marketplace::fetch_nip99_listings_impl(&self.relay_manager, limit, since_days).await
     }
 
+    pub async fn fetch_nip99_listings_since(
+        &self,
+        limit: usize,
+        since_secs: Option<u64>,
+    ) -> Result<Vec<crate::marketplace::Nip99Listing>, String> {
+        crate::marketplace::fetch_nip99_listings_since_impl(&self.relay_manager, limit, since_secs)
+            .await
+    }
+
     /// Fetches a specific game listing by its ID and publisher.
     pub async fn fetch_listing_by_id(
         &self,
@@ -1758,6 +1767,7 @@ mod listing_event_tests {
     fn sample_listing() -> GameListing {
         GameListing {
             id: "sample-game".to_string(),
+            source: ListingSource::Nip99Listing,
             title: "Sample Game".to_string(),
             description: "A sample game".to_string(),
             price_sats: 21,
@@ -1774,6 +1784,8 @@ mod listing_event_tests {
             geohash: None,
             status: None,
             platforms: vec!["linux-x86_64".to_string(), "windows-x86_64".to_string()],
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
         }
     }
 

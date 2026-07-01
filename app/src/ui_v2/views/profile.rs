@@ -5,7 +5,8 @@ use crate::components::BadgeShowcase;
 use crate::models::GameListing;
 use crate::models::{Nip05Status, Nip49ExportResult};
 use crate::tauri_bridge::invoke_verify_nip05;
-use crate::{invoke_fetch_marketplace, AuthContext};
+use crate::ui_v2::views::marketplace_loader::use_marketplace_listings_with_limit;
+use crate::AuthContext;
 
 #[path = "../../components/nip05_badge.rs"]
 mod nip05_badge;
@@ -147,9 +148,9 @@ pub fn ProfileV2View(
 ) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
 
-    let my_listings: RwSignal<Vec<GameListing>> = RwSignal::new(vec![]);
-    let is_loading = RwSignal::new(true);
-    let error = RwSignal::new(None::<String>);
+    let marketplace_state = use_marketplace_listings_with_limit(50);
+    let is_loading = marketplace_state.loading;
+    let error = marketplace_state.error;
     let show_nip49_modal = RwSignal::new(false);
     let last_export_result = RwSignal::new(None::<Nip49ExportResult>);
     let nip05_status = RwSignal::new(default_nip05_status(
@@ -159,27 +160,17 @@ pub fn ProfileV2View(
     ));
     let last_auto_nip05_attempt = RwSignal::new(None::<String>);
 
-    Effect::new(move |_| {
-        let npub = match auth.npub.get() {
-            Some(value) => value,
-            None => return,
+    let marketplace_listings = marketplace_state.listings;
+    let auth_for_listings = auth.clone();
+    let my_listings = Signal::derive(move || {
+        let Some(npub) = auth_for_listings.npub.get() else {
+            return Vec::new();
         };
-
-        spawn_local(async move {
-            is_loading.set(true);
-            error.set(None);
-            match invoke_fetch_marketplace(50, Some(30), None).await {
-                Ok(all) => {
-                    let filtered = all
-                        .into_iter()
-                        .filter(|listing| listing.publisher_npub == npub)
-                        .collect::<Vec<_>>();
-                    my_listings.set(filtered);
-                }
-                Err(fetch_error) => error.set(Some(fetch_error)),
-            }
-            is_loading.set(false);
-        });
+        marketplace_listings
+            .get()
+            .into_iter()
+            .filter(|listing| listing.publisher_npub == npub)
+            .collect::<Vec<_>>()
     });
 
     let display_name = Signal::derive(move || {

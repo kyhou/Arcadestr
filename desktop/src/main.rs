@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
@@ -52,6 +52,8 @@ use command_contracts::{
     ExportKeyRequest, ExportKeyResult, ImportKeyRequest, ImportKeyResult, Nip05Status,
     Nip49ExportResult, Nip49ImportRequest, VerifyNip05Request, VerifyNip05Result,
 };
+
+const MARKETPLACE_REFRESH_OVERLAP_SECS: u64 = 86_400;
 
 /// Application state shared across Tauri commands.
 pub struct AppState {
@@ -184,6 +186,29 @@ fn listing_signature(listing: &CoreGameListing) -> String {
         platforms_json,
         listing.nip94_event_id.as_deref().unwrap_or_default()
     )
+}
+
+fn since_days_cutoff(since_days: Option<u64>) -> Option<u64> {
+    let days = since_days?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    Some(now.saturating_sub(days.saturating_mul(86_400)))
+}
+
+fn marketplace_refresh_since_secs(
+    latest_cached_created_at: Option<u64>,
+    since_days: Option<u64>,
+    until_secs: Option<u64>,
+) -> Option<u64> {
+    if until_secs.is_some() {
+        return since_days_cutoff(since_days);
+    }
+
+    latest_cached_created_at
+        .map(|latest| latest.saturating_sub(MARKETPLACE_REFRESH_OVERLAP_SECS))
+        .or_else(|| since_days_cutoff(since_days))
 }
 
 /// Generates a nostrconnect:// URI for client-initiated NIP-46 connections.
@@ -818,6 +843,22 @@ async fn fetch_marketplace_stream(
         cached_emitted
     );
 
+    let latest_cached_created_at = match state.marketplace_cache.latest_created_at().await {
+        Ok(latest) => latest,
+        Err(e) => {
+            tracing::warn!("fetch_marketplace_stream: failed to read cache cursor: {e}");
+            None
+        }
+    };
+    let refresh_since_secs =
+        marketplace_refresh_since_secs(latest_cached_created_at, since_days, until_secs);
+    tracing::info!(
+        "fetch_marketplace_stream: relay refresh cursor since_secs={:?} latest_cached_created_at={:?} overlap_secs={}",
+        refresh_since_secs,
+        latest_cached_created_at,
+        MARKETPLACE_REFRESH_OVERLAP_SECS
+    );
+
     let seen_signatures = StdArc::new(StdMutex::new(cached_signatures));
     let relay_updates: StdArc<StdMutex<Vec<CoreGameListing>>> =
         StdArc::new(StdMutex::new(Vec::new()));
@@ -841,10 +882,10 @@ async fn fetch_marketplace_stream(
     // Start streaming product fetch.
     // IMPORTANT: this await should not hold state.nostr lock, otherwise other commands
     // (e.g. get_connected_relays for topbar relay badge) can be blocked behind marketplace fetch.
-    let products = arcadestr_core::marketplace::fetch_nip99_listings_streaming(
+    let products = arcadestr_core::marketplace::fetch_nip99_listings_streaming_since(
         &relay_manager,
         limit,
-        since_days,
+        refresh_since_secs,
         until_secs,
         move |product| {
             let core_listing = CoreGameListing::from_listing(product.clone());
@@ -1025,6 +1066,23 @@ mod task4_tests {
             #[cfg(debug_assertions)]
             raw_event_json: None,
         }
+    }
+
+    #[test]
+    fn marketplace_refresh_cursor_uses_latest_cache_with_overlap() {
+        let since = marketplace_refresh_since_secs(Some(1_710_030_000), Some(30), None);
+
+        assert_eq!(
+            since,
+            Some(1_710_030_000 - MARKETPLACE_REFRESH_OVERLAP_SECS)
+        );
+    }
+
+    #[test]
+    fn marketplace_refresh_cursor_ignores_latest_cache_for_pagination() {
+        let since = marketplace_refresh_since_secs(Some(1_710_030_000), None, Some(1_710_000_000));
+
+        assert_eq!(since, None);
     }
 
     #[test]
