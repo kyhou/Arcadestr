@@ -1,0 +1,18 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-06-24T00:00:00Z",
+  "libraries": {
+    "lightning-invoice": {
+      "files": [
+        {
+          "filename": "bolt11-test-invoice-builder-0-32.md",
+          "topic": "BOLT11 test invoice construction with known preimage/payment hash",
+          "tech_stack": "Rust lightning-invoice 0.32",
+          "fetched": "2026-06-24T00:00:00Z",
+          "source": "Context7 API + docs.rs official Rustdoc",
+          "official_docs": "https://docs.rs/lightning-invoice/0.32.0/lightning_invoice/"
+        }
+      ]
+    }
+  }
+}

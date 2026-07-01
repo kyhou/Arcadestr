@@ -12,8 +12,8 @@ use crate::ui_v2::views::marketplace_loader::{
 };
 
 const FALLBACK_COVER: &str = "https://lh3.googleusercontent.com/aida-public/AB6AXuDcG9Zo3aR9Vrpk5pP2jenw1AoVFoOzbAQ-t57kQtlbwGQVsLLwmHyFuyzRVsOh71iN4mHyhfw0Sx4YgdJ9duL9ANv3Xa1W7jYKWeVgj5_rE7KzitErwV3dtgEFGsGCSXtFQxyw6tQoGmP3V-Ci9Vs9_ZQXh6WXrFi6eperEaPm3YutXUIImUuC5sKm2hgyVb6sMBnpn0Imy94ETrJ9WO2XeC6tTMddB6EA-x1LgnN3Ezj_dPitegkcYmXGBSWZyCTZgxINu01kmdM";
-const BROWSE_INITIAL_VISIBLE_COUNT: usize = 12;
-const BROWSE_VISIBLE_INCREMENT: usize = 12;
+const BROWSE_INITIAL_VISIBLE_COUNT: usize = 50;
+const BROWSE_VISIBLE_INCREMENT: usize = 50;
 const MAX_PLATFORM_AUTO_FETCHES: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -413,7 +413,7 @@ fn decide_platform_auto_fetch(
     max_attempts: usize,
 ) -> PlatformAutoFetchDecision {
     let Some(state) = state else {
-        return PlatformAutoFetchDecision::Stop;
+        return PlatformAutoFetchDecision::Wait;
     };
 
     if active_filter.is_none()
@@ -667,10 +667,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn browse_batches_show_fifty_products_at_a_time() {
+        assert_eq!(BROWSE_INITIAL_VISIBLE_COUNT, 50);
+        assert_eq!(BROWSE_VISIBLE_INCREMENT, 50);
+    }
+
+    #[test]
     fn load_more_increases_desired_visible_count_beyond_loaded_total() {
-        assert_eq!(next_visible_count(12, 30, 12), 24);
-        assert_eq!(next_visible_count(24, 30, 12), 36);
-        assert_eq!(next_visible_count(36, 30, 12), 48);
+        assert_eq!(next_visible_count(50, 120, 50), 100);
+        assert_eq!(next_visible_count(100, 120, 50), 150);
+        assert_eq!(next_visible_count(150, 120, 50), 200);
     }
 
     #[test]
@@ -743,16 +749,24 @@ mod tests {
     #[test]
     fn platform_load_more_requests_next_backend_page_when_filter_is_sparse() {
         assert_eq!(
-            platform_load_more_fetch_limit(Some("linux-x86_64"), true, 3, 24, 60, 12),
-            Some(72)
+            platform_load_more_fetch_limit(Some("linux-x86_64"), true, 3, 100, 60, 50),
+            Some(110)
         );
         assert_eq!(
-            platform_load_more_fetch_limit(None, true, 3, 24, 60, 12),
+            platform_load_more_fetch_limit(None, true, 3, 100, 60, 50),
             None
         );
         assert_eq!(
-            platform_load_more_fetch_limit(Some("linux-x86_64"), false, 3, 24, 60, 12),
+            platform_load_more_fetch_limit(Some("linux-x86_64"), false, 3, 100, 60, 50),
             None
+        );
+    }
+
+    #[test]
+    fn platform_auto_fetch_no_state_is_noop() {
+        assert_eq!(
+            decide_platform_auto_fetch(None, 0, 0, Some("linux-x86_64"), true, 4),
+            PlatformAutoFetchDecision::Wait
         );
     }
 

@@ -584,6 +584,9 @@ mod tests {
             lud16: String::new(),
             event_id: None,
             created_at: 1_710_000_000,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            is_owned: false,
             #[cfg(debug_assertions)]
             nip99_raw_event_json: raw_event_json,
         }
