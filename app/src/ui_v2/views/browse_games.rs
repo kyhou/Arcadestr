@@ -440,6 +440,10 @@ fn show_no_more_platform_message(
     active_filter.is_some() && !has_more && !loading && !loading_more
 }
 
+fn show_browse_empty_state(displayed_count: usize, loading: bool, loading_more: bool) -> bool {
+    displayed_count == 0 && !loading && !loading_more
+}
+
 fn listing_matches_platform_filter(platforms: &[String], active_filter: Option<&str>) -> bool {
     match active_filter {
         Some(tag) => platforms.is_empty() || platforms.iter().any(|platform| platform == tag),
@@ -816,5 +820,14 @@ mod tests {
             false,
             false,
         ));
+    }
+
+
+    #[test]
+    fn browse_empty_state_only_shows_after_loading_without_results() {
+        assert!(show_browse_empty_state(0, false, false));
+        assert!(!show_browse_empty_state(0, true, false));
+        assert!(!show_browse_empty_state(0, false, true));
+        assert!(!show_browse_empty_state(1, false, false));
     }
 }
