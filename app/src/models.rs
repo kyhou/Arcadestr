@@ -290,6 +290,11 @@ pub struct UserProfile {
 }
 
 impl UserProfile {
+    /// Returns true when the profile has user-visible metadata.
+    pub fn has_metadata(&self) -> bool {
+        self.display_name.is_some() || self.name.is_some() || self.picture.is_some()
+    }
+
     /// Returns the best available display name, falling back to truncated npub.
     pub fn display(&self) -> String {
         self.display_name
@@ -449,6 +454,28 @@ mod tests {
         assert!(listing.platforms.is_empty());
         assert_eq!(listing.nip94_event_id, None);
         assert!(!listing.is_owned);
+    }
+
+    #[test]
+    fn user_profile_has_metadata_when_identity_fields_are_present() {
+        let empty = UserProfile {
+            npub: "npub1example".to_string(),
+            ..Default::default()
+        };
+        let named = UserProfile {
+            npub: "npub1example".to_string(),
+            display_name: Some("Alice".to_string()),
+            ..Default::default()
+        };
+        let pictured = UserProfile {
+            npub: "npub1example".to_string(),
+            picture: Some("https://example.com/alice.png".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!empty.has_metadata());
+        assert!(named.has_metadata());
+        assert!(pictured.has_metadata());
     }
 
     #[test]

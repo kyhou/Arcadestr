@@ -5187,6 +5187,11 @@ pub fn App() -> impl IntoView {
                 // Stale-while-revalidate: always fetch from relays for fresh metadata.
                 match invoke_fetch_profile(npub.clone(), None).await {
                     Ok(profile) => {
+                        let preserves_visible_profile = !profile.has_metadata()
+                            && baseline_profile
+                                .as_ref()
+                                .map(|cached| cached.has_metadata())
+                                .unwrap_or(false);
                         let changed = baseline_profile
                             .as_ref()
                             .map(|cached| {
@@ -5202,7 +5207,15 @@ pub fn App() -> impl IntoView {
                             })
                             .unwrap_or(true);
 
-                        if changed {
+                        if preserves_visible_profile {
+                            #[cfg(debug_assertions)]
+                            {
+                                web_sys::console::log_1(
+                                    &"Relay refresh returned no profile metadata; keeping cached profile"
+                                        .into(),
+                                );
+                            }
+                        } else if changed {
                             #[cfg(debug_assertions)]
                             {
                                 web_sys::console::log_1(
@@ -5257,7 +5270,7 @@ pub fn App() -> impl IntoView {
                 if auth
                     .profile
                     .get()
-                    .map(|p| p.name.is_none() && p.display_name.is_none())
+                    .map(|p| !p.has_metadata())
                     .unwrap_or(true)
                 {
                     #[cfg(debug_assertions)]
@@ -5288,7 +5301,7 @@ pub fn App() -> impl IntoView {
                         web_sys::console::log_1(&"Retrying profile fetch...".into());
                     }
                     if let Ok(profile) = invoke_fetch_profile(npub.clone(), None).await {
-                        if profile.name.is_some() || profile.display_name.is_some() {
+                        if profile.has_metadata() {
                             #[cfg(debug_assertions)]
                             {
                                 web_sys::console::log_1(
