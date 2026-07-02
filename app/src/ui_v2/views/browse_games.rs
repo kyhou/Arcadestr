@@ -194,6 +194,20 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                         </div>
                     }
                     .into_any()
+                } else if show_browse_empty_state(
+                    displayed_listings.get().len(),
+                    loading.get(),
+                    loading_more.get(),
+                ) {
+                    view! {
+                        <div class="rounded-xl border border-outline-variant/15 bg-surface-container-high p-6 text-on-surface-variant">
+                            <p class="font-bold text-on-surface">"No products found"</p>
+                            <p class="mt-1 text-sm leading-relaxed">
+                                "No games match the current marketplace results or filters."
+                            </p>
+                        </div>
+                    }
+                    .into_any()
                 } else {
                     view! {
                         <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-8">
@@ -821,7 +835,6 @@ mod tests {
             false,
         ));
     }
-
 
     #[test]
     fn browse_empty_state_only_shows_after_loading_without_results() {
