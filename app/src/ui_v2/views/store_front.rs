@@ -21,6 +21,23 @@ fn first_valid_image(images: &[String]) -> String {
         .unwrap_or_else(|| FALLBACK_COVER.to_string())
 }
 
+fn show_store_front_empty_state(listing_count: usize, loading: bool, has_error: bool) -> bool {
+    listing_count == 0 && !loading && !has_error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_front_empty_state_only_shows_after_loading_without_results() {
+        assert!(show_store_front_empty_state(0, false, false));
+        assert!(!show_store_front_empty_state(0, true, false));
+        assert!(!show_store_front_empty_state(0, false, true));
+        assert!(!show_store_front_empty_state(1, false, false));
+    }
+}
+
 #[component]
 pub fn StoreFrontView(
     on_select: Callback<GameListing>,
@@ -153,6 +170,20 @@ pub fn StoreFrontView(
                             view! {
                                 <div class="bg-error-container/30 border border-error/30 rounded-xl p-6 text-error">
                                     {format!("Error: {}", fetch_error)}
+                                </div>
+                            }
+                            .into_any()
+                        } else if show_store_front_empty_state(
+                            listings.get().len(),
+                            loading.get(),
+                            error.get().is_some(),
+                        ) {
+                            view! {
+                                <div class="rounded-xl border border-outline-variant/15 bg-surface-container-high p-6 text-on-surface-variant">
+                                    <p class="font-bold text-on-surface">"No products found"</p>
+                                    <p class="mt-1 text-sm leading-relaxed">
+                                        "We could not find any marketplace listings from the connected relays. Try again later or check your relay connection."
+                                    </p>
                                 </div>
                             }
                             .into_any()
