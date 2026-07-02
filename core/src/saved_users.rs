@@ -232,11 +232,21 @@ pub fn update_user_profile(
     // Now update the user
     if let Some(user) = users.users.iter_mut().find(|u| u.id == user_id) {
         let user_npub = user.npub.clone();
-        user.display_name = display_name;
-        user.username = username;
-        user.picture = picture;
-        user.nip05 = nip05;
-        user.about = about;
+        if display_name.is_some() {
+            user.display_name = display_name;
+        }
+        if username.is_some() {
+            user.username = username;
+        }
+        if picture.is_some() {
+            user.picture = picture;
+        }
+        if nip05.is_some() {
+            user.nip05 = nip05;
+        }
+        if about.is_some() {
+            user.about = about;
+        }
         user.profile_updated_at = Some(chrono::Utc::now().timestamp());
         save_saved_users(&users)?;
         info!("Updated profile for user: {}", user_npub);
@@ -283,5 +293,62 @@ pub fn create_saved_user(
         nip05: None,
         about: None,
         profile_updated_at: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!("arcadestr_saved_users_{}_{}", name, nanos))
+    }
+
+    #[test]
+    fn update_user_profile_preserves_existing_metadata_when_refresh_is_empty() {
+        let users_dir = unique_test_dir("preserve_metadata");
+        set_users_dir(users_dir.clone());
+
+        let user = SavedUser {
+            id: "user-1".to_string(),
+            name: "Account".to_string(),
+            method: LoginMethod::Bunker,
+            relay: Some("wss://relay.example".to_string()),
+            uri: None,
+            private_key: None,
+            npub: "npub1example".to_string(),
+            created_at: 1,
+            last_used_at: None,
+            display_name: Some("Alice".to_string()),
+            username: Some("alice".to_string()),
+            picture: Some("https://example.com/alice.png".to_string()),
+            nip05: Some("alice@example.com".to_string()),
+            about: Some("Arcade publisher".to_string()),
+            profile_updated_at: Some(1),
+        };
+        save_saved_users(&SavedUsers { users: vec![user] }).expect("saved user should be written");
+
+        let users = update_user_profile("user-1", None, None, None, None, None)
+            .expect("empty refresh should not fail");
+        let updated = users
+            .users
+            .iter()
+            .find(|user| user.id == "user-1")
+            .expect("user should remain present");
+
+        assert_eq!(updated.display_name.as_deref(), Some("Alice"));
+        assert_eq!(updated.username.as_deref(), Some("alice"));
+        assert_eq!(
+            updated.picture.as_deref(),
+            Some("https://example.com/alice.png")
+        );
+        assert_eq!(updated.nip05.as_deref(), Some("alice@example.com"));
+        assert_eq!(updated.about.as_deref(), Some("Arcade publisher"));
+
+        let _ = std::fs::remove_dir_all(users_dir);
     }
 }
