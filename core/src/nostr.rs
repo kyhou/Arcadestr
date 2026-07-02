@@ -911,7 +911,7 @@ impl NostrClient {
     }
 
     /// Fetches user profile metadata (kind-0) from relays.
-    /// Uses indexer relays first, then falls back to full pool if not found.
+    /// Uses connected relays with bounded best-effort streaming.
     pub async fn fetch_profile(
         &self,
         npub: &str,
@@ -943,55 +943,11 @@ impl NostrClient {
             pubkey.to_hex()
         );
 
-        // Phase 1: Try indexer relays first (5s timeout)
-        tracing::info!("Phase 1: Querying indexer relays for profile...");
-        let indexer_events = {
-            let manager = self.relay_manager.lock().await;
-            let indexer_relays: Vec<String> =
-                INDEXER_RELAYS.iter().map(|&s| s.to_string()).collect();
-
-            match manager
-                .fetch_events_from_subset(filter.clone(), indexer_relays)
-                .await
-            {
-                Ok(events) => Ok(events),
-                Err(e) => {
-                    tracing::error!("Indexer relay query failed: {}", e);
-                    Err(e)
-                }
-            }
-        };
-
-        match indexer_events {
-            Ok(events) if !events.is_empty() => {
-                tracing::info!("Found profile on indexer relays! {} events", events.len());
-                if let Some(event) = events.first() {
-                    let profile = self.parse_profile_event(event, npub)?;
-
-                    // Save to cache
-                    if let Some(ref cache) = self.user_cache {
-                        if let Err(e) = cache.put(npub, &profile).await {
-                            tracing::warn!("Failed to save profile to cache: {}", e);
-                        }
-                    }
-
-                    return Ok(profile);
-                }
-            }
-            Ok(_) => {
-                tracing::debug!("No profile found on indexer relays");
-            }
-            Err(e) => {
-                tracing::warn!("Indexer relay query failed: {}", e);
-            }
-        }
-
-        // Phase 2: Fall back to full relay pool (8s timeout)
-        tracing::info!("Phase 2: Querying all relays for profile...");
+        tracing::info!("Querying connected relays for profile with best-effort streaming...");
         let events = {
             let manager = self.relay_manager.lock().await;
             manager
-                .fetch_events(filter)
+                .fetch_events_best_effort(filter)
                 .await
                 .map_err(|e| NostrError::RelayError(format!("Failed to fetch profile: {}", e)))?
         };
