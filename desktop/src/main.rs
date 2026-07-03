@@ -2256,8 +2256,12 @@ fn main() {
     /// Get the number of currently connected relays.
     #[tauri::command]
     async fn get_connected_relay_count(state: tauri::State<'_, AppState>) -> Result<usize, String> {
-        let nostr = state.nostr.lock().await;
-        Ok(nostr.get_relay_count().await)
+        let manager_arc = {
+            let nostr = state.nostr.lock().await;
+            nostr.relay_manager()
+        };
+        let manager = manager_arc.lock().await;
+        Ok(manager.get_connected_count().await)
     }
 
     /// Get the list of currently connected relay URLs.
@@ -2265,21 +2269,17 @@ fn main() {
     async fn get_connected_relays(
         state: tauri::State<'_, AppState>,
     ) -> Result<Vec<String>, String> {
-        let nostr = state.nostr.lock().await;
-        let manager_arc = nostr.relay_manager();
+        let manager_arc = {
+            let nostr = state.nostr.lock().await;
+            nostr.relay_manager()
+        };
         let manager = manager_arc.lock().await;
-        let client = manager.get_client();
-
-        let mut connected_urls = Vec::new();
-        let relays = client.relays().await;
-
-        for (url, relay) in relays {
-            if relay.is_connected() {
-                connected_urls.push(url.to_string());
-            }
-        }
-
-        Ok(connected_urls)
+        Ok(manager
+            .get_connected_relays()
+            .await
+            .into_iter()
+            .filter_map(|status| status.connected.then_some(status.url))
+            .collect())
     }
 
     /// Get extended network discovery statistics.
