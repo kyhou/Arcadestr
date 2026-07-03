@@ -58,7 +58,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                 let relays_for_listener = connected_relays_for_effect.clone();
                 let relay_count_for_listener = relay_count_for_effect;
 
-                if let Err(err) = crate::tauri_invoke::listen("relay-connection", move |payload| {
+                match crate::tauri_invoke::listen("relay-connection", move |payload| {
                     let event_type = payload
                         .get("type")
                         .and_then(|value| value.as_str())
@@ -75,9 +75,16 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                 })
                 .await
                 {
-                    web_sys::console::error_1(
-                        &format!("[UiV2Root] Failed to subscribe relay listener: {}", err).into(),
-                    );
+                    Ok(cleanup) => {
+                        // UiV2Root is app-lifetime; keep the JS callback alive for live relay events.
+                        std::mem::forget(cleanup);
+                    }
+                    Err(err) => {
+                        web_sys::console::error_1(
+                            &format!("[UiV2Root] Failed to subscribe relay listener: {}", err)
+                                .into(),
+                        );
+                    }
                 }
             }
 
