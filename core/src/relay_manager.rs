@@ -170,10 +170,6 @@ impl RelayManager {
         for relay in &relays {
             match self.client.add_relay(relay).await {
                 Ok(_) => {
-                    // Emit event for each successfully added relay
-                    if let Some(sender) = &self.event_sender {
-                        let _ = sender.send(RelayConnectionEvent::connected(relay));
-                    }
                     info!("Relay {} connection attempt: Ok(())", relay);
                 }
                 Err(e) => {
@@ -681,12 +677,7 @@ impl RelayManager {
                     // Trigger connection
                     self.client.connect().await;
 
-                    // Emit event immediately
-                    if let Some(sender) = &self.event_sender {
-                        let _ = sender.send(RelayConnectionEvent::connected(&url));
-                    }
-
-                    info!("Connected to discovered relay: {}", url);
+                    info!("Initiated connection to discovered relay: {}", url);
                 }
                 Err(e) => {
                     warn!("Failed to add discovered relay {}: {}", url, e);
@@ -760,7 +751,7 @@ impl RelayManager {
         let last_states = self.last_known_states.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
 
             loop {
                 interval.tick().await;
@@ -839,6 +830,26 @@ mod tests {
 
         let new_count = manager.get_relay_pool().await.get_relays().await.len();
         assert_eq!(new_count, initial_count + 1);
+    }
+
+    #[tokio::test]
+    async fn test_relay_manager_does_not_emit_connected_before_monitor_confirms_connection() {
+        let (sender, mut receiver) = broadcast::channel(16);
+
+        let _manager = RelayManager::new(
+            "test_events".to_string(),
+            RelayManagerConfig::default(),
+            Some(sender),
+        )
+        .await
+        .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_millis(25), receiver.recv()).await;
+
+        assert!(
+            received.is_err(),
+            "relay add attempts must not be reported as established connections"
+        );
     }
 
     #[tokio::test]
