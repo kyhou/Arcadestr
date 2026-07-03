@@ -32,14 +32,16 @@ Arcadestr is a **decentralized game marketplace** built on the NOSTR protocol wi
 ### Main User-Facing Features
 
 1. **Browse Listings**: View published games with metadata (title, description, price, tags, images)
-2. **Publish Games**: Create NIP-15 product events (kind 30018) or NIP-99 classified listings (kind 30402)
-3. **Buy Games**: Generate Lightning invoices via LNURL-pay for paid games; direct download for free games
-4. **User Profiles**: Display NOSTR profiles (NIP-01 kind-0 metadata) with NIP-05 verification and NIP-58 badges
+2. **Publish Games**: Create NIP-15 product events (kind 30018) or NIP-99 classified listings (kind 30402) with platform compatibility tags
+3. **Buy Games**: Generate Lightning invoices via LNURL-pay for paid games; direct download for free games; NIP-102 purchase receipt ingestion for ownership tracking
+4. **Ownership & Install**: Track purchased games via NIP-102 kind-1020 receipts; one-click install for owned titles; platform-aware listing visibility
 5. **Authentication**: Multiple signer support (NIP-07 browser extensions, NIP-46 remote signers)
 6. **Zap Payments**: NIP-57 Lightning zaps for game purchases
 7. **Marketplace Cache**: Persistent SQLite storage for offline browsing
 8. **Real-time Relay Status**: Live connection indicators with latency metrics
 9. **Achievements & Badges**: NIP-58 badge display on profiles, earned badge tracking, and achievement showcase
+10. **Platform Filtering**: Browse games filtered by host platform (OS/arch) with automatic platform detection
+11. **Marketplace Empty States**: Graceful UI when no listings are found, with distinct messages for browse vs store front
 
 ### Desktop vs Web Target
 
@@ -74,11 +76,15 @@ Both targets share the same UI components from the `app` crate, but the desktop 
 | **chacha20poly1305** | 0.10 | XChaCha20-Poly1305 for NIP-49 | `core/src/storage/encryption.rs` |
 | **bech32** | 0.9 | NIP-49 `ncryptsec1...` encoding/decoding | `core/src/storage/encryption.rs` |
 | **reqwest** | 0.12 | HTTP client for NIP-05/NIP-57 | `core/src/nostr.rs`, `core/src/lightning.rs` |
+| **lightning-invoice** | 0.32 | Bolt11 invoice parsing for purchase receipts | `core/src/purchases.rs` |
+| **sha2** | 0.10 | SHA-256 hashing for payment proof verification | `core/src/purchases.rs` |
 | **wasm-bindgen** | 0.2 | WASM/JavaScript interop | `app/`, `web/` crates |
 | **web-sys** | 0.3 | Browser API bindings | `app/src/web_auth.rs` |
 | **qrcode** | 0.14 | QR code generation for NIP-46 | `app/Cargo.toml` |
 | **gloo-timers** | 0.3 | WASM timer utilities | `app/Cargo.toml` |
 | **aes-gcm** | 0.10 | AES-256-GCM encryption (WASM) | `app/Cargo.toml` |
+| **bitcoin** | 0.32 | Bitcoin types for payment proofs (dev) | `core/Cargo.toml` |
+| **lightning-types** | 0.1 | Lightning types for invoice validation (dev) | `core/Cargo.toml` |
 | **tailwindcss** | latest | CSS framework | `web/tailwind.config.js` |
 | **trunk** | latest | WASM build tool and dev server | `web/Trunk.toml` |
 | **tracing** | 0.1 | Structured logging | Throughout codebase |
@@ -129,6 +135,12 @@ arcadestr/
 ├── NOSTRCONNECT_IMPLEMENTATION.md  # NIP-46 implementation notes
 ├── COMMANDS.md             # Available CLI commands
 ├── test_nostrconnect.sh    # Test script for NIP-46
+├── .vscode/                # VS Code workspace config and debug launcher
+│   ├── launch.json         # Debug configurations (backend, webview)
+│   ├── tasks.json          # Build tasks for debugging
+│   ├── settings.json       # Workspace settings
+│   ├── extensions.json     # Recommended extensions
+│   └── BACKEND_DEBUG.md    # Backend debugging guide
 │
 ├── core/                   # LIBRARY: Core business logic (NOSTR, storage, crypto)
 │   ├── Cargo.toml          # Native-only dependencies (tokio, sqlx, etc.)
@@ -173,9 +185,12 @@ arcadestr/
 │   │   ├── subscriptions.rs  # Relay subscription management
 │   │   ├── lightning.rs      # NIP-57 zap payments
 │   │   ├── saved_users.rs    # Legacy saved users (JSON file)
+│   │   ├── purchases.rs      # NIP-102 purchase receipt persistence and verification
 │   │   ├── version.rs        # Version constants
 │   │   └── wasm_stub.rs      # WASM-compatible stubs
 │   └── migrations/           # SQLx database migrations
+│       ├── 001_initial_schema.sql  # Initial database schema
+│       └── 002_achievements.sql    # NIP-58 badge achievements tables
 │
 ├── app/                    # LIBRARY: Leptos UI components (shared)
 │   ├── Cargo.toml          # Leptos, wasm-bindgen dependencies
@@ -283,6 +298,7 @@ arcadestr/
 │   │   ├── subscriptions.rs  # Relay subscription management
 │   │   ├── lightning.rs      # NIP-57 zap payments
 │   │   ├── saved_users.rs    # Legacy saved users (JSON file)
+│   │   ├── purchases.rs      # NIP-102 purchase receipt persistence and verification
 │   │   ├── version.rs        # Version constants
 │   │   ├── test_helpers.rs   # HTTP mocking and test utilities
 │   │   ├── test_helpers/     # Test helper modules
@@ -291,7 +307,8 @@ arcadestr/
 │   │   └── wasm_stub.rs      # WASM-compatible stubs
 │   ├── migrations/           # SQLx database migrations
 │   │   ├── 001_initial_schema.sql  # Initial database schema
-│   │   └── 002_achievements.sql    # NIP-58 badge achievements tables
+│   │   ├── 002_achievements.sql    # NIP-58 badge achievements tables
+│   │   └── 003_purchases.sql      # NIP-102 purchase receipts table
 │   └── tests/                # Core integration tests
 │       ├── integration.rs    # NIP-65, relay hints, NIP-46 integration tests
 │       └── integration_nip05.rs    # NIP-05 verification tests
@@ -586,7 +603,7 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `publish_listing` | `main.rs` | `listing: GameListing` | `String` | Publishes kind-30078 event |
 | `fetch_listings` | `main.rs` | `limit: usize` | `Vec<GameListing>` | Fetches recent listings |
 | `fetch_listing_by_id` | `main.rs` | `publisher_npub: String`, `listing_id: String` | `GameListing` | Fetches specific listing |
-| `fetch_marketplace` | `main.rs` | `limit: usize`, `since_days: Option<u64>`, `filter: Option<MarketplaceFilter>` | `Vec<GameListing>` | Fetches NIP-99 marketplace listings with optional filtering |
+| `fetch_marketplace` | `main.rs` | `limit: usize`, `since_days: Option<u64>`, `filter: Option<MarketplaceFilter>` | `Vec<AppGameListing>` | Fetches NIP-99 marketplace listings with optional filtering and ownership enrichment |
 | `fetch_profile` | `main.rs` | `npub: String`, `additional_relays: Option<Vec<String>>` | `UserProfile` | Fetches NIP-01 metadata |
 | `request_invoice` | `main.rs` | `zap_request: ZapRequest` | `ZapInvoice` | Generates Lightning invoice |
 | `get_saved_users` | `main.rs` | None | `String` | Returns saved users JSON |
@@ -607,7 +624,10 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `get_cached_profiles` | `main.rs` | None | `Vec<UserProfile>` | Get all cached profiles |
 | `get_cached_profile` | `main.rs` | `npub: String` | `Option<UserProfile>` | Get single cached profile |
 | `get_version_info` | `main.rs` | None | `VersionInfo` | Get app version info |
-| `fetch_marketplace_stream` | `main.rs` | `limit: usize`, `since_days: Option<u64>` | `()` | Stream marketplace listings via events |
+| `fetch_marketplace_stream` | `main.rs` | `limit: usize`, `since_days: Option<u64>`, `until_secs: Option<u64>` | `()` | Stream marketplace listings via events with incremental cache refresh |
+| `get_platform_info` | `main.rs` | None | `PlatformInfo` | Returns host OS/arch for platform-aware filtering |
+| `install_game` | `main.rs` | `listing: GameListing` | `()` | Verifies ownership via purchase receipts, installs owned game |
+| `ingest_receipt` | `main.rs` | `raw_event_json: String` | `()` | Parses and persists a NIP-102 kind-1020 purchase receipt |
 | `fetch_profile_badges` | `main.rs` | `profile_identifier: String` | `Vec<ProfileBadgeEntry>` | Fetch NIP-58 badges for a profile (desktop only) |
 | `fetch_earned_badges` | `main.rs` | `profile_identifier: String` | `Vec<EarnedBadgeSummary>` | Fetch earned badges with definitions (desktop only) |
 | `get_network_discovery_settings` | `main.rs` | None | `NetworkDiscoverySettings` | Get relay discovery settings |
@@ -721,14 +741,15 @@ App (app/src/lib.rs)
 │   └── Loading states
 │
 ├── DetailView (app/src/components/detail.rs)
-│   ├── Game details (title, description, screenshots)
+│   ├── Game details (title, description, screenshots, platform tags)
 │   ├── Publisher profile (ProfileDisplayName, ProfileAvatar)
 │   ├── Buy flow (ZapRequest → Lightning invoice)
-│   └── Download button
+│   ├── Install button (requires ownership via purchase receipts)
+│   └── Debug: Raw NIP-99 JSON collapsible panel (debug builds only)
 │
 ├── ProfileView (app/src/components/profile.rs)
 │   ├── User metadata (name, picture, nip05)
-│   └── Published games list
+│   └── Published games list (sourced from marketplace_loader shared state via `use_marketplace_listings_with_limit`)
 │
 ├── PublishView (app/src/components/publish.rs)
 │   ├── Form fields (title, description, price, etc.)
@@ -749,20 +770,27 @@ App (app/src/lib.rs)
 └── DebugOverlay (app/src/lib.rs) - Debug information overlay
 
 UiV2Root (app/src/ui_v2/shell.rs) - Stitch-based interface
+│   └── Keeps relay listener cleanup alive via `std::mem::forget`
 │
 ├── TopBar (app/src/ui_v2/components/topbar.rs)
 │   └── NavItem components
 │
 ├── StoreFront (app/src/ui_v2/views/store_front.rs)
 │   ├── Featured game showcase
-│   └── Category browsing
+│   ├── Category browsing
+│   └── Empty state when no listings found (after load completes)
 │
 ├── BrowseGames (app/src/ui_v2/views/browse_games.rs)
-│   └── Game grid with filtering
+│   ├── Platform filter dropdown (auto-detects host OS/arch)
+│   ├── Platform-aware auto-fetch (loads more if active filter has < 50 results)
+│   ├── Install button with ownership check via purchase receipts
+│   ├── Error banner for install failures
+│   └── Empty state when no products match filters
 │
 ├── GameDetail (app/src/ui_v2/views/game_detail.rs)
 │   ├── Rich media presentation
-│   └── BadgeShowcase (earned badges for game publisher)
+│   ├── BadgeShowcase (earned badges for game publisher)
+│   └── Debug: Raw NIP-99 JSON panel (visible only in debug builds)
 │
 ├── Library (app/src/ui_v2/views/library.rs)
 │   └── User's purchased games
@@ -772,9 +800,16 @@ UiV2Root (app/src/ui_v2/shell.rs) - Stitch-based interface
 │
 ├── Profile (app/src/ui_v2/views/profile.rs)
 │   ├── User profile management
-│   └── BadgeShowcase (profile badges)
+│   ├── BadgeShowcase (profile badges)
+│   └── Listings sourced from marketplace_loader (shared reactive state)
+│
+├── MarketplaceLoader (app/src/ui_v2/views/marketplace_loader.rs)
+│   ├── Batch-flusher debounce pattern (50ms) for progressive listing updates
+│   ├── Shared via `use_marketplace_listings` / `use_marketplace_listings_with_limit`
+│   └── Caches and deduplicates listings across views
 │
 ├── Publish (app/src/ui_v2/views/publish.rs)
+│   ├── Platform tags input (comma-separated, validated as `<os>-<arch>`)
 │   └── NIP-15/NIP-99 publishing
 │
 ├── Social (app/src/ui_v2/views/social.rs)
@@ -1032,6 +1067,7 @@ fn main() {
 | `core::lightning` | Lightning payments | `ZapRequest`, `ZapInvoice` | `request_zap_invoice()` |
 | `core::social_graph` | Extended network | `SocialGraphDb` | `discover_network()` |
 | `core::achievements` | NIP-58 badges | `BadgeDefinition`, `BadgeAward`, `ProfileBadgeEntry` | `parse_badge_definition()`, `fetch_profile_badges()` |
+| `core::purchases` | NIP-102 purchase receipts | `PurchasesRepository`, `StoredReceipt` | `parse_and_validate_receipt()`, `upsert_receipt()`, `is_owned()` |
 
 **Recent `core::storage::encryption` public surface additions (NIP-49 backend):**
 - `ScryptParams { n, r, p }`
@@ -1101,9 +1137,18 @@ pub struct GameListing {
     pub geohash: Option<String>,     // Geohash for location
     pub status: Option<String>,     // Listing status ("active", etc.)
     
+    // Platform metadata
+    pub platforms: Vec<String>,        // Platform compatibility tags (e.g. "linux-x86_64")
+    pub nip94_event_id: Option<String>, // NIP-94 file metadata event id for delivery
+    pub is_owned: bool,                // True if user holds a valid purchase receipt
+
     // Timestamps
     pub created_at: u64,               // Event creation timestamp
     pub event_id: Option<String>,    // NOSTR event ID (hex)
+    
+    // Debug (debug builds only)
+    #[cfg(debug_assertions)]
+    pub nip99_raw_event_json: Option<String>,  // Raw event JSON for debug
 }
 
 /// Source of the listing data
@@ -1130,6 +1175,22 @@ pub struct UserProfile {
     pub nip05: Option<String>,
     pub lud16: Option<String>,
     pub nip05_verified: bool,
+}
+```
+
+#### PlatformInfo
+```rust
+// app/src/models.rs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformInfo {
+    pub os: String,
+    pub arch: String,
+}
+
+impl PlatformInfo {
+    pub fn tag(&self) -> String {
+        format!("{}-{}", self.os, self.arch)
+    }
 }
 ```
 
@@ -1238,6 +1299,7 @@ pub struct AppState {
     pub extended_network: Arc<RwLock<Option<Arc<Mutex<ExtendedNetworkRepository>>>>>,
     pub extended_network_follows: Arc<RwLock<Vec<String>>>,
     pub relay_hints: Option<Arc<RelayHints>>,
+    pub purchases: Arc<arcadestr_core::purchases::PurchasesRepository>,  // NIP-102 purchase receipt store
     pub nip05_validator: Arc<std::sync::Mutex<Nip05Validator>>,  // Background NIP-05 verification
     pub badge_cache: Arc<Mutex<BadgeCache>>,  // NIP-58 badge caching
 }
@@ -1484,7 +1546,7 @@ where
 
 ### 8.7 Marketplace Cache with Upsert
 
-Listings are cached in SQLite with change detection:
+Listings are cached in SQLite with change detection. Schema includes `platforms_json` (JSON array of platform tags) and `nip94_event_id` (NIP-94 file metadata reference):
 
 ```rust
 // core/src/marketplace_cache.rs
@@ -1499,6 +1561,11 @@ pub struct MarketplaceCache {
 }
 
 impl MarketplaceCache {
+    pub async fn latest_created_at(&self) -> Result<Option<u64>, sqlx::Error> {
+        // Returns the newest created_at from cached listings
+        // Used for incremental refresh cursor
+    }
+
     pub async fn upsert_listing(
         &self,
         listing: &GameListing,
@@ -1506,32 +1573,35 @@ impl MarketplaceCache {
     ) -> Result<UpsertOutcome, sqlx::Error> {
         // Uses INSERT ... ON CONFLICT with field-by-field comparison
         // Only updates if something actually changed
+        // Compares platforms_json and nip94_event_id for change detection
     }
 }
 ```
 
 ### 8.8 Streaming Marketplace Fetch
 
-The marketplace uses streaming instead of batch fetch:
+The marketplace uses streaming instead of batch fetch, with **incremental cache refresh**:
 
 ```rust
 // core/src/marketplace.rs
-pub async fn fetch_nip99_listings_streaming<F>(
-    relay_manager: Arc<Mutex<RelayManager>>,
+pub async fn fetch_nip99_listings_streaming_since<F>(
+    relay_manager: &Arc<tokio::sync::Mutex<RelayManager>>,
     limit: usize,
-    since_days: Option<u64>,
-    on_product: F,  // Callback for each product
-) -> Result<usize, MarketplaceError>
+    since_secs: Option<u64>,
+    until_secs: Option<u64>,
+    mut on_product: F,
+) -> Result<u32, String>
 where
-    F: Fn(Nip99Listing) + Send + 'static,
+    F: FnMut(Nip99Listing) + Send + 'static,
 {
     // Fetches from multiple relays concurrently
     // Calls callback for each unique product
     // Deduplicates by event ID
+    // Filters relay queries to only ['game'] t-tags
 }
 ```
 
-The Tauri command emits events for each listing:
+The Tauri command orchestrates an **incremental refresh**:
 
 ```rust
 // desktop/src/main.rs
@@ -1541,13 +1611,23 @@ async fn fetch_marketplace_stream(
     state: tauri::State<'_, AppState>,
     limit: usize,
     since_days: Option<u64>,
+    until_secs: Option<u64>,
 ) -> Result<(), String> {
     // 1. Load cached listings first (fast initial render)
-    // 2. Stream from relays
-    // 3. Emit "marketplace-product" event for each new listing
-    // 4. Emit "marketplace-complete" when done
+    // 2. Compute refresh cursor from latest_cached_created_at with 24h overlap
+    // 3. Stream from relays using fetch_nip99_listings_streaming_since
+    // 4. Enrich each listing with ownership data via async emit tasks
+    // 5. Wait for all ownership lookups before marking complete
+    // 6. Emit "marketplace-complete" when done
 }
 ```
+
+**Key improvements over batch fetch:**
+
+- **Cursor-based refresh**: Uses `marketplace_cache.latest_created_at()` to compute `since_secs`, fetching only events newer than the latest cached item with a 24-hour overlap (`MARKETPLACE_REFRESH_OVERLAP_SECS = 86400`) to catch updates to existing listings.
+- **Ownership enrichment**: Each listing is checked against the `PurchasesRepository` before being emitted, setting `is_owned=true` for listings the authenticated user has purchased.
+- **Async emit tasks**: Ownership lookups are spawned as background tasks so they don't block the streaming pipeline. All tasks are awaited before completion.
+- **Platform tag filtering**: Relay queries filter to `['game']` t-tags, reducing noise from non-game NIP-99 listings.
 
 ### 8.9 NIP-58 Badge System
 
@@ -2181,6 +2261,14 @@ console.log(window.__TAURI__.event);  // Should show listen/emit functions
 | **Relay snapshot** | Initial relay state fetched on UI startup to recover missed events |
 | **Relay state helpers** | `merge_relay_snapshot()` and `apply_relay_event()` for relay UI state |
 | **Platform tag** | NOSTR listing tag `['platform', '<os>-<arch>']` declaring compatible runtime targets. Values follow Rust `std::env::consts::{OS, ARCH}`; no platform tags means compatible everywhere. |
+| **PlatformInfo** | Struct returning host OS and arch from `std::env::consts`, used to auto-filter browse view to compatible listings |
+| **NIP-102** | Purchase Receipt protocol — defines kind-1020 events that prove a buyer purchased a specific listing |
+| **Purchase receipt** | Kind 1020 event containing order id, listing coordinate, payment proof (bolt11 + preimage), and status (`paid`, `fulfilled`, etc.) |
+| **PurchasesRepository** | SQLite-backed store for NIP-102 receipts, providing `is_owned()` checks for ownership enrichment |
+| **Batch flusher** | Debounce pattern in `marketplace_loader.rs` that buffers incoming listings for 50ms before updating the reactive signal, reducing grid re-renders during relay streaming |
+| **Incremental refresh** | Cache-aware fetch strategy using `latest_created_at()` cursor with overlap to only pull new/changed listings from relays |
+| **Ownership enrichment** | The process of setting `is_owned=true` on listings by checking `PurchasesRepository` before presenting to the user |
+| **NIP-94** | File metadata events (kind 1063) referenced via `["nip94", "<event-id>"]` tag for verifiable delivery metadata |
 
 ### Platform tag examples
 
@@ -2216,29 +2304,64 @@ All frontend→backend communication goes through `tauri_invoke.rs`, which uses 
 
 ---
 
-## Recent Major Features (2026-05)
+## Recent Major Features (2026-06)
 
-### NIP-58 Badge System
-The codebase now supports NIP-58 badges/achievements:
-- **Badge definitions** (kind 30009): Templates defining badge name, image, description
-- **Badge awards** (kind 8): Events awarding badges to specific users
-- **Profile badges** (kind 10008): User's selected badges for display
-- **Validation**: Awards are validated against definitions, issuers must match
-- **Caching**: Badge data cached in SQLite with `core/migrations/002_achievements.sql`
-- **UI components**: `BadgeShowcase` for profile display, `BadgeEarnedModal` for celebrations
-- **Achievements page**: Full achievements view at `app/src/ui_v2/views/achievements.rs`
+### Platform Ownership & Filtering
+The codebase now supports platform-aware game publishing and browsing:
+- **Platform tags**: Publishers declare OS/arch compatibility via `["platform", "<os>-<arch>"]` tags on kind 30402 events
+- **PlatformInfo type**: `app/src/models.rs` — `PlatformInfo { os, arch }` with `tag()` helper for comparison
+- **Platform filter**: Browse view auto-detects host platform and offers "My Platform" filter dropdown; auto-fetches more listings when active filter yields fewer than 50 results
+- **Platform validation**: Comma-separated input in publish form with `parse_platform_tags()` — rejects whitespace and missing OS-arch separator
+- **Desktop install command**: `install_game` verifies ownership via purchase receipts before allowing download
 
-### Network Discovery Settings
-New relay security setting `allow_insecure_public_ws`:
-- Controls whether ws:// (non-TLS) relays are allowed for public hosts
-- Local/private relays (localhost, 192.168.x.x) always allowed
-- Setting persisted and exposed via Tauri commands
+### NIP-102 Purchase Receipts
+New purchase ownership system with NIP-102 kind-1020 receipts:
+- **`core/src/purchases.rs`**: Full receipt parsing, validation, and persistence (698 lines)
+- **`core/migrations/003_purchases.sql`**: `purchases` table with indexes on buyer, order, and coordinate
+- **Parsing**: Validates event kind 1020, buyer p-tag, merchant p-tag, listing coordinate, and payment proof (bolt11 + preimage or zap receipt e-tag)
+- **Ownership enrichment**: `enrich_listing_ownership()` called on each listing in `fetch_marketplace` and streamed events — sets `is_owned` flag from `PurchasesRepository`
+- **Tauri commands**: `ingest_receipt` (parses + persists), `install_game` (checks ownership before install), `get_platform_info` (returns host OS/arch)
+- **Bridge functions**: `invoke_ingest_receipt`, `invoke_install_game`, `invoke_get_platform_info` in `app/src/tauri_bridge.rs`
+- **Dependencies**: `lightning-invoice`, `sha2` for Bolt11 parsing and payment proof hashing
 
-### Relay State Management Improvements
-- **Relay snapshot pattern**: UI fetches current relay state on startup to recover events emitted before listener setup
-- **Relay state helpers**: `merge_relay_snapshot()` and `apply_relay_event()` in `app/src/relay_state.rs`
-- Prevents missed relay events during startup race conditions
+### Marketplace Incremental Refresh
+Cache-aware streaming reduces relay load and startup time:
+- **Cursor-based**: Uses `marketplace_cache.latest_created_at()` to fetch only events newer than the latest cached item
+- **24h overlap**: `MARKETPLACE_REFRESH_OVERLAP_SECS = 86400` ensures updates to existing listings aren't missed
+- **`fetch_nip99_listings_streaming_since`**: New streaming function accepting raw `since_secs` instead of `since_days`
+- **`marketplace_refresh_since_secs`**: Helper that computes the effective since value, preferring cache cursor over user-specified window
+- **Cache signature**: `listing_signature()` now includes `platforms_json` and `nip94_event_id` for accurate change detection
+
+### Marketplace Empty States
+Graceful UI when no listings are found:
+- **Browse empty state**: `show_browse_empty_state()` in `browse_games.rs` — shown after loading completes with no platform-matching results
+- **Store front empty state**: `show_store_front_empty_state()` in `store_front.rs` — shown when loading finishes without errors and zero listings
+- Both states show contextual messages guiding the user
+
+### Profile View Refactor
+Profile view now shares marketplace state instead of fetching independently:
+- Uses `use_marketplace_listings_with_limit(50)` from `marketplace_loader.rs`
+- Filters to current user's npub via derived signal
+- Eliminates redundant relay fetch on profile page load
+
+### Relay Manager Fix: Premature Connected Events
+Relay manager no longer emits `RelayConnectionEvent::Connected` before the monitor confirms the connection:
+- Connected events only fire after the monitor tick validates the relay is actually responding
+- Fixes race condition where UI shows a relay as connected while it's still handshaking
+
+### VS Code Debug Configuration
+New `.vscode/` workspace with full debug setup:
+- **launch.json**: Multiple debug configurations (backend binary, webview, test suite)
+- **tasks.json**: Build tasks that compile before debugging
+- **BACKEND_DEBUG.md**: Step-by-step guide for attaching LLDB/rr to the Tauri process
+- **settings.json**: Workspace-specific Rust analyzer and editor settings
+
+### Debug NIP-99 Raw JSON Panel
+New debug-only UI component in `detail.rs` for inspecting NIP-99 events:
+- Collapsible panel with pretty-printed raw event JSON
+- Visible only in `#[cfg(debug_assertions)]` builds
+- Fallback to reconstructed payload when no raw JSON is available
 
 ---
 
-*Documentation generated for Arcadestr codebase. Last updated: 2026-05-06*
+*Documentation generated for Arcadestr codebase. Last updated: 2026-07-02*
