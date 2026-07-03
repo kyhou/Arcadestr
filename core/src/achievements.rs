@@ -200,6 +200,20 @@ pub async fn fetch_user_badges(
         .map_err(|error| AchievementError::Storage(error.to_string()))
 }
 
+/// Return cached earned badges without relay access.
+///
+/// # Errors
+/// Returns `AchievementError` when storage access fails.
+pub async fn cached_user_badges(
+    database: &crate::storage::Database,
+    profile_pubkey: &str,
+) -> Result<Vec<EarnedBadgeSummary>, AchievementError> {
+    database
+        .earned_badges_for_profile(profile_pubkey)
+        .await
+        .map_err(|error| AchievementError::Storage(error.to_string()))
+}
+
 /// Fetch profile-selected badges, preferring kind 10008 over deprecated 30008.
 ///
 /// # Errors
@@ -265,6 +279,20 @@ pub async fn fetch_profile_badges(
 
     cache_awards_for_profile(&client, database, profile_pubkey, profile_public_key).await?;
 
+    database
+        .profile_badges_for_profile(profile_pubkey)
+        .await
+        .map_err(|error| AchievementError::Storage(error.to_string()))
+}
+
+/// Return cached profile-selected badges without relay access.
+///
+/// # Errors
+/// Returns `AchievementError` when storage access fails.
+pub async fn cached_profile_badges(
+    database: &crate::storage::Database,
+    profile_pubkey: &str,
+) -> Result<Vec<ProfileBadgeEntry>, AchievementError> {
     database
         .profile_badges_for_profile(profile_pubkey)
         .await

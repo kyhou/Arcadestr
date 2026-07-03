@@ -1,10 +1,11 @@
 //! Achievements view for displaying verified NIP-58 earned badges.
 
 use crate::models::EarnedBadgeSummary;
-use crate::tauri_bridge::fetch_earned_badges;
+use crate::tauri_bridge::{fetch_earned_badges, get_cached_earned_badges};
 use crate::AuthContext;
+use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
-use tracing::warn;
+use tracing::{info, warn};
 use wasm_bindgen_futures::spawn_local;
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,12 @@ mod tests {
             "Could not load achievements. Please try again."
         );
     }
+
+    #[test]
+    fn relay_refresh_yields_only_after_cached_render() {
+        assert!(should_yield_before_relay_refresh(true));
+        assert!(!should_yield_before_relay_refresh(false));
+    }
 }
 
 fn format_award_date(created_at: u64) -> String {
@@ -55,6 +62,10 @@ fn should_apply_generation(request_generation: u64, current_generation: u64) -> 
 
 fn achievements_error_message() -> &'static str {
     "Could not load achievements. Please try again."
+}
+
+fn should_yield_before_relay_refresh(cached_rendered: bool) -> bool {
+    cached_rendered
 }
 
 fn short_pubkey(pubkey: &str) -> String {
@@ -107,8 +118,30 @@ pub fn AchievementsView() -> impl IntoView {
         state.set(AchievementsState::Loading);
 
         spawn_local(async move {
+            let mut cached_rendered = false;
+            match get_cached_earned_badges(requested_profile_pubkey.clone()).await {
+                Ok(cached) if !cached.is_empty() => {
+                    let cached_count = cached.len();
+                    if should_apply_generation(generation, request_generation.get_untracked()) {
+                        state.set(AchievementsState::Ready(cached));
+                        cached_rendered = true;
+                        info!(
+                            count = cached_count,
+                            "rendered cached earned achievements before relay refresh"
+                        );
+                    }
+                }
+                Ok(_) => info!("no cached earned achievements found before relay refresh"),
+                Err(error) => warn!("failed to load cached achievements: {}", error),
+            }
+
+            if should_yield_before_relay_refresh(cached_rendered) {
+                TimeoutFuture::new(0).await;
+            }
+
             match fetch_earned_badges(requested_profile_pubkey).await {
                 Ok(badges) => {
+                    info!(count = badges.len(), "relay refreshed earned achievements");
                     if should_apply_generation(generation, request_generation.get_untracked()) {
                         if badges.is_empty() {
                             state.set(AchievementsState::Empty);
@@ -120,7 +153,9 @@ pub fn AchievementsView() -> impl IntoView {
                 Err(error) => {
                     warn!("failed to fetch achievements: {}", error);
                     if should_apply_generation(generation, request_generation.get_untracked()) {
-                        state.set(AchievementsState::Error);
+                        if !matches!(state.get_untracked(), AchievementsState::Ready(_)) {
+                            state.set(AchievementsState::Error);
+                        }
                     }
                 }
             }

@@ -104,6 +104,46 @@ pub async fn invoke_verify_nip05(
     Err("verify_nip05 is only available in desktop builds".to_string())
 }
 
+/// Invoke desktop `get_cached_earned_badges` command.
+#[cfg(not(feature = "web"))]
+pub async fn get_cached_earned_badges(
+    profile_pubkey: String,
+) -> Result<Vec<EarnedBadgeSummary>, String> {
+    crate::tauri_invoke::invoke(
+        "get_cached_earned_badges",
+        serde_json::json!({ "profilePubkey": profile_pubkey }),
+    )
+    .await
+}
+
+/// Web fallback for `get_cached_earned_badges`.
+#[cfg(feature = "web")]
+pub async fn get_cached_earned_badges(
+    _profile_pubkey: String,
+) -> Result<Vec<EarnedBadgeSummary>, String> {
+    Err("Badge relay display is not yet available on the web target.".to_string())
+}
+
+/// Invoke desktop `get_cached_profile_badges` command.
+#[cfg(not(feature = "web"))]
+pub async fn get_cached_profile_badges(
+    profile_pubkey: String,
+) -> Result<Vec<ProfileBadgeEntry>, String> {
+    crate::tauri_invoke::invoke(
+        "get_cached_profile_badges",
+        serde_json::json!({ "profilePubkey": profile_pubkey }),
+    )
+    .await
+}
+
+/// Web fallback for `get_cached_profile_badges`.
+#[cfg(feature = "web")]
+pub async fn get_cached_profile_badges(
+    _profile_pubkey: String,
+) -> Result<Vec<ProfileBadgeEntry>, String> {
+    Err("Badge relay display is not yet available on the web target.".to_string())
+}
+
 /// Invoke desktop `fetch_earned_badges` command.
 #[cfg(not(feature = "web"))]
 pub async fn fetch_earned_badges(

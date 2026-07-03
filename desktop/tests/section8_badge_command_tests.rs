@@ -16,6 +16,12 @@ pub struct AppState {
 #[path = "../src/command_contracts.rs"]
 mod command_contracts;
 
+impl command_contracts::BadgeCommandState for AppState {
+    fn badge_command_handles(&self) -> (Arc<Mutex<NostrClient>>, Arc<Database>) {
+        (self.nostr.clone(), self.database.clone())
+    }
+}
+
 #[test]
 fn fetch_earned_badges_command_name_serializes_empty_vec() {
     let payload: Vec<arcadestr_core::achievements::EarnedBadgeSummary> = Vec::new();
@@ -32,6 +38,12 @@ fn fetch_profile_badges_command_name_serializes_empty_vec() {
         .expect("profile badge payload serializes");
 
     assert_eq!(value, json!([]));
+}
+
+#[test]
+fn cached_badge_command_functions_are_exposed() {
+    let _ = command_contracts::get_cached_earned_badges::<AppState>;
+    let _ = command_contracts::get_cached_profile_badges::<AppState>;
 }
 
 #[test]

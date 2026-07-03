@@ -1,8 +1,12 @@
 //! Profile badge showcase for NIP-58 achievements.
 
 use crate::models::{EarnedBadgeSummary, ProfileBadgeEntry};
-use crate::tauri_bridge::{fetch_earned_badges, fetch_profile_badges};
+use crate::tauri_bridge::{
+    fetch_earned_badges, fetch_profile_badges, get_cached_earned_badges, get_cached_profile_badges,
+};
+use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
+use tracing::{info, warn};
 use wasm_bindgen_futures::spawn_local;
 
 const SHOWCASE_FALLBACK_LIMIT: usize = 8;
@@ -39,11 +43,58 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
 
         state.set(BadgeShowcaseState::Loading);
         spawn_local(async move {
+            let mut cached_rendered = false;
+            let cached_profile_result: Result<Vec<ProfileBadgeEntry>, String> =
+                get_cached_profile_badges(requested_profile_identifier.clone()).await;
+
+            match cached_profile_result {
+                Ok(profile_entries) if !profile_entries.is_empty() => {
+                    let cached_count = profile_entries.len();
+                    if generation == request_generation.get_untracked() {
+                        state.set(BadgeShowcaseState::Ready(profile_entries_to_summaries(
+                            profile_entries,
+                        )));
+                        cached_rendered = true;
+                        info!(
+                            count = cached_count,
+                            "rendered cached profile badge showcase before relay refresh"
+                        );
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    match get_cached_earned_badges(requested_profile_identifier.clone()).await {
+                        Ok(earned) => {
+                            let capped = cap_fallback_badges(earned);
+                            if !capped.is_empty()
+                                && generation == request_generation.get_untracked()
+                            {
+                                let cached_count = capped.len();
+                                state.set(BadgeShowcaseState::Ready(capped));
+                                cached_rendered = true;
+                                info!(
+                                    count = cached_count,
+                                    "rendered cached earned badge showcase before relay refresh"
+                                );
+                            }
+                        }
+                        Err(error) => warn!("failed to load cached badge showcase: {}", error),
+                    }
+                }
+            }
+
+            if should_yield_before_relay_refresh(cached_rendered) {
+                TimeoutFuture::new(0).await;
+            }
+
             let profile_result: Result<Vec<ProfileBadgeEntry>, String> =
                 fetch_profile_badges(requested_profile_identifier.clone()).await;
 
             match profile_result {
                 Ok(profile_entries) if !profile_entries.is_empty() => {
+                    info!(
+                        count = profile_entries.len(),
+                        "relay refreshed profile badge showcase"
+                    );
                     if generation == request_generation.get_untracked() {
                         state.set(BadgeShowcaseState::Ready(profile_entries_to_summaries(
                             profile_entries,
@@ -52,6 +103,10 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                 }
                 Ok(_) | Err(_) => match fetch_earned_badges(requested_profile_identifier).await {
                     Ok(earned) => {
+                        info!(
+                            count = earned.len(),
+                            "relay refreshed earned badge showcase fallback"
+                        );
                         let capped = cap_fallback_badges(earned);
                         if generation == request_generation.get_untracked() {
                             if capped.is_empty() {
@@ -63,7 +118,9 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                     }
                     Err(error) => {
                         if generation == request_generation.get_untracked() {
-                            state.set(BadgeShowcaseState::Error(error));
+                            if !matches!(state.get_untracked(), BadgeShowcaseState::Ready(_)) {
+                                state.set(BadgeShowcaseState::Error(error));
+                            }
                         }
                     }
                 },
@@ -119,6 +176,10 @@ fn profile_entries_to_summaries(mut entries: Vec<ProfileBadgeEntry>) -> Vec<Earn
 fn cap_fallback_badges(mut earned: Vec<EarnedBadgeSummary>) -> Vec<EarnedBadgeSummary> {
     earned.truncate(SHOWCASE_FALLBACK_LIMIT);
     earned
+}
+
+fn should_yield_before_relay_refresh(cached_rendered: bool) -> bool {
+    cached_rendered
 }
 
 fn render_badge_chip(badge: EarnedBadgeSummary) -> impl IntoView {
@@ -192,5 +253,11 @@ mod tests {
         assert_eq!(capped.len(), SHOWCASE_FALLBACK_LIMIT);
         assert_eq!(capped[0].definition.badge_id, "badge-0");
         assert_eq!(capped[7].definition.badge_id, "badge-7");
+    }
+
+    #[test]
+    fn relay_refresh_yields_only_after_cached_showcase_render() {
+        assert!(should_yield_before_relay_refresh(true));
+        assert!(!should_yield_before_relay_refresh(false));
     }
 }

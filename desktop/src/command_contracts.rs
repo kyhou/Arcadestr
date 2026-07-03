@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{error, info};
 
 fn normalize_profile_pubkey_identifier(profile_pubkey: &str) -> Result<String, CommandError> {
     let trimmed = profile_pubkey.trim();
@@ -443,6 +443,50 @@ pub fn serialize_fetch_profile_badges_result(
     serde_json::to_value(badges).map_err(|error| CommandError::InvalidInput(error.to_string()))
 }
 
+pub async fn get_cached_earned_badges<S>(
+    state: &S,
+    profile_pubkey: String,
+) -> Result<Vec<EarnedBadgeSummary>, CommandError>
+where
+    S: BadgeCommandState + ?Sized,
+{
+    let normalized_pubkey = normalize_profile_pubkey_identifier(&profile_pubkey)?;
+    let (_, database) = state.badge_command_handles();
+
+    let badges =
+        arcadestr_core::achievements::cached_user_badges(database.as_ref(), &normalized_pubkey)
+            .await
+            .map_err(|error| CommandError::Achievements(error.to_string()))?;
+    info!(
+        profile_pubkey = %normalized_pubkey,
+        count = badges.len(),
+        "loaded cached earned badges"
+    );
+    Ok(badges)
+}
+
+pub async fn get_cached_profile_badges<S>(
+    state: &S,
+    profile_pubkey: String,
+) -> Result<Vec<ProfileBadgeEntry>, CommandError>
+where
+    S: BadgeCommandState + ?Sized,
+{
+    let normalized_pubkey = normalize_profile_pubkey_identifier(&profile_pubkey)?;
+    let (_, database) = state.badge_command_handles();
+
+    let badges =
+        arcadestr_core::achievements::cached_profile_badges(database.as_ref(), &normalized_pubkey)
+            .await
+            .map_err(|error| CommandError::Achievements(error.to_string()))?;
+    info!(
+        profile_pubkey = %normalized_pubkey,
+        count = badges.len(),
+        "loaded cached profile badges"
+    );
+    Ok(badges)
+}
+
 pub async fn fetch_earned_badges<S>(
     state: &S,
     profile_pubkey: String,
@@ -462,9 +506,19 @@ where
         manager.get_client_arc()
     };
 
-    arcadestr_core::achievements::fetch_user_badges(client, database.as_ref(), &normalized_pubkey)
-        .await
-        .map_err(|error| CommandError::Achievements(error.to_string()))
+    let badges = arcadestr_core::achievements::fetch_user_badges(
+        client,
+        database.as_ref(),
+        &normalized_pubkey,
+    )
+    .await
+    .map_err(|error| CommandError::Achievements(error.to_string()))?;
+    info!(
+        profile_pubkey = %normalized_pubkey,
+        count = badges.len(),
+        "refreshed earned badges from relays"
+    );
+    Ok(badges)
 }
 
 pub async fn fetch_profile_badges<S>(
@@ -486,13 +540,19 @@ where
         manager.get_client_arc()
     };
 
-    arcadestr_core::achievements::fetch_profile_badges(
+    let badges = arcadestr_core::achievements::fetch_profile_badges(
         client,
         database.as_ref(),
         &normalized_pubkey,
     )
     .await
-    .map_err(|error| CommandError::Achievements(error.to_string()))
+    .map_err(|error| CommandError::Achievements(error.to_string()))?;
+    info!(
+        profile_pubkey = %normalized_pubkey,
+        count = badges.len(),
+        "refreshed profile badges from relays"
+    );
+    Ok(badges)
 }
 
 #[cfg(test)]

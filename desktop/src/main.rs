@@ -2528,6 +2528,26 @@ fn main() {
     }
 
     #[tauri::command]
+    async fn get_cached_earned_badges(
+        state: tauri::State<'_, AppState>,
+        profile_pubkey: String,
+    ) -> Result<Vec<arcadestr_core::achievements::EarnedBadgeSummary>, String> {
+        command_contracts::get_cached_earned_badges(state.inner(), profile_pubkey)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[tauri::command]
+    async fn get_cached_profile_badges(
+        state: tauri::State<'_, AppState>,
+        profile_pubkey: String,
+    ) -> Result<Vec<arcadestr_core::achievements::ProfileBadgeEntry>, String> {
+        command_contracts::get_cached_profile_badges(state.inner(), profile_pubkey)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[tauri::command]
     async fn fetch_earned_badges(
         state: tauri::State<'_, AppState>,
         profile_pubkey: String,
@@ -2914,6 +2934,8 @@ fn main() {
             install_game,
             ingest_receipt,
             fetch_profile,
+            get_cached_earned_badges,
+            get_cached_profile_badges,
             fetch_earned_badges,
             fetch_profile_badges,
             fetch_profile_with_hints,

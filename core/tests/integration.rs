@@ -382,6 +382,47 @@ async fn earned_badges_for_profile_joins_awards_to_definitions() {
 }
 
 #[tokio::test]
+async fn cached_user_badges_returns_persisted_badges_without_relay_client() {
+    let db_path = temp_db_path("cached-user-badges");
+    let db = Database::new(&db_path)
+        .await
+        .expect("database should initialize");
+    let issuer = Keys::generate().public_key().to_hex();
+    let recipient = Keys::generate().public_key().to_hex();
+    let definition = badge_definition(
+        &issuer,
+        "first_clear",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        1,
+    );
+    let award = badge_award(
+        &issuer,
+        &recipient,
+        &definition.coordinate,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        2,
+    );
+
+    db.cache_badge_definition(&definition, r#"{"kind":30009}"#)
+        .await
+        .expect("definition should cache");
+    db.cache_badge_award(&award, r#"{"kind":8}"#)
+        .await
+        .expect("award should cache");
+
+    let earned = arcadestr_core::achievements::cached_user_badges(&db, &recipient)
+        .await
+        .expect("cached earned badges should query");
+
+    assert_eq!(earned.len(), 1);
+    assert_eq!(earned[0].definition.coordinate, definition.coordinate);
+    assert_eq!(earned[0].award.event_id, award.event_id);
+
+    db.close().await;
+    std::fs::remove_file(db_path).expect("test database should be removed");
+}
+
+#[tokio::test]
 async fn cache_profile_badge_list_replaces_entries_in_transaction() {
     let db_path = temp_db_path("profile-badge-replace");
     let db = Database::new(&db_path)
@@ -473,6 +514,66 @@ async fn cache_profile_badge_list_replaces_entries_in_transaction() {
     assert_eq!(profile_badges[0].award.event_id, second_award.event_id);
     assert_eq!(profile_badges[0].display_order, 0);
     assert!(profile_badges[0].visible);
+
+    db.close().await;
+    std::fs::remove_file(db_path).expect("test database should be removed");
+}
+
+#[tokio::test]
+async fn cached_profile_badges_returns_persisted_selection_without_relay_client() {
+    let db_path = temp_db_path("cached-profile-badges");
+    let db = Database::new(&db_path)
+        .await
+        .expect("database should initialize");
+    let issuer = Keys::generate().public_key().to_hex();
+    let profile = Keys::generate().public_key().to_hex();
+    let definition = badge_definition(
+        &issuer,
+        "first_clear",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        1,
+    );
+    let award = badge_award(
+        &issuer,
+        &profile,
+        &definition.coordinate,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        2,
+    );
+    let list = arcadestr_core::achievements::ProfileBadgeList {
+        profile_pubkey: profile.clone(),
+        event_id: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+        kind: arcadestr_core::achievements::KIND_PROFILE_BADGES_CURRENT,
+        created_at: 3,
+        entries: vec![arcadestr_core::achievements::ProfileBadgeSelection {
+            badge_coordinate: definition.coordinate.clone(),
+            award_event_id: award.event_id.clone(),
+            relay_url: Some("wss://relay.example.com".to_string()),
+            display_order: 0,
+        }],
+    };
+
+    db.cache_badge_definition(&definition, r#"{"kind":30009}"#)
+        .await
+        .expect("definition should cache");
+    db.cache_badge_award(&award, r#"{"kind":8}"#)
+        .await
+        .expect("award should cache");
+    db.cache_profile_badge_list(&list, r#"{"kind":10008}"#)
+        .await
+        .expect("profile badge list should cache");
+
+    let profile_badges = arcadestr_core::achievements::cached_profile_badges(&db, &profile)
+        .await
+        .expect("cached profile badges should query");
+
+    assert_eq!(profile_badges.len(), 1);
+    assert_eq!(
+        profile_badges[0].definition.coordinate,
+        definition.coordinate
+    );
+    assert_eq!(profile_badges[0].award.event_id, award.event_id);
+    assert_eq!(profile_badges[0].display_order, 0);
 
     db.close().await;
     std::fs::remove_file(db_path).expect("test database should be removed");
