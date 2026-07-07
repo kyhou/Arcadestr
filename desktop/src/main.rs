@@ -157,9 +157,13 @@ fn parse_debug_relay_cli_args(args: Vec<String>) -> Result<DebugRelayCliOptions,
         if arg == "--relay" {
             let relay = args
                 .next()
-                .ok_or_else(|| "--relay requires a relay URL".to_string())?;
+                .filter(|relay| !relay.starts_with("--"))
+                .ok_or_else(|| "--relay requires a URL".to_string())?;
             options.relays.push(relay);
         } else if let Some(relay) = arg.strip_prefix("--relay=") {
+            if relay.is_empty() || relay.starts_with("--") {
+                return Err("--relay requires a URL".to_string());
+            }
             options.relays.push(relay.to_string());
         } else if arg == "--block-discovery" {
             saw_block_discovery = true;
@@ -181,16 +185,23 @@ fn parse_debug_relay_env(
     relays: Option<String>,
     block_discovery: Option<String>,
 ) -> Result<DebugRelayEnvOptions, String> {
-    let relays = relays
-        .map(|value| {
-            value
+    let relays = match relays {
+        Some(value) => {
+            let relays = value
                 .split(',')
                 .map(str::trim)
                 .filter(|relay| !relay.is_empty())
                 .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+                .collect::<Vec<_>>();
+
+            if relays.is_empty() {
+                return Err("ARCADESTR_RELAYS requires at least one relay URL".to_string());
+            }
+
+            relays
+        }
+        None => Vec::new(),
+    };
 
     let block_discovery = block_discovery.as_deref().map(parse_bool_env).transpose()?;
 
@@ -1482,6 +1493,50 @@ mod debug_relay_config_tests {
         .expect_err("conflicting flags should fail");
 
         assert!(err.contains("cannot be used together"));
+    }
+
+    #[test]
+    fn test_relay_flag_rejects_discovery_flag_as_missing_value() {
+        let err = parse_debug_relay_cli_args(vec![
+            "--relay".to_string(),
+            "--block-discovery".to_string(),
+        ])
+        .expect_err("relay flag should reject another flag as its value");
+
+        assert!(err.contains("--relay requires"));
+    }
+
+    #[test]
+    fn test_whitespace_only_env_relay_config_is_rejected() {
+        let err = parse_debug_relay_env(Some(" , \t ".to_string()), None)
+            .expect_err("env relay config without relay URLs should fail");
+
+        assert!(err.contains("ARCADESTR_RELAYS"));
+    }
+
+    #[test]
+    fn test_legacy_settings_json_defaults_debug_relay_fields() {
+        let settings: NetworkDiscoverySettings =
+            serde_json::from_str(r#"{"allow_insecure_public_ws":true}"#)
+                .expect("legacy settings JSON should deserialize");
+
+        assert!(settings.allow_insecure_public_ws);
+        assert_eq!(settings.debug_relays, None);
+        assert_eq!(settings.block_discovery, None);
+    }
+
+    #[test]
+    fn test_no_debug_relay_sources_resolves_to_discovery_defaults() {
+        let resolved = resolve_debug_relay_options(
+            DebugRelayCliOptions::default(),
+            DebugRelayEnvOptions::default(),
+            &NetworkDiscoverySettings::default(),
+        )
+        .expect("empty relay sources should resolve");
+
+        assert_eq!(resolved.relays, None);
+        assert!(!resolved.block_discovery);
+        assert_eq!(resolved.source, None);
     }
 }
 
