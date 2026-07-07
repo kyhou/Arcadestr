@@ -144,9 +144,13 @@ impl RelayManager {
     /// Create new relay manager for a profile
     pub async fn new(
         profile_id: String,
-        config: RelayManagerConfig,
+        mut config: RelayManagerConfig,
         event_sender: Option<broadcast::Sender<RelayConnectionEvent>>,
     ) -> Result<Self, RelayManagerError> {
+        if let Some(debug_relays) = config.debug_relays.take() {
+            config.debug_relays = Some(normalize_relay_urls(debug_relays)?);
+        }
+
         let client = Client::default();
         let pool = Arc::new(RelayPool::new(profile_id));
 
@@ -159,10 +163,44 @@ impl RelayManager {
             last_known_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
 
-        // Initialize with default relays
-        manager.initialize_default_relays().await?;
+        if let Some(debug_relays) = manager.config.debug_relays.clone() {
+            manager.initialize_debug_relays(&debug_relays).await?;
+        } else {
+            manager.initialize_default_relays().await?;
+        }
 
         Ok(manager)
+    }
+
+    /// Returns true when relay discovery is blocked by debug relay configuration.
+    pub fn blocks_discovery(&self) -> bool {
+        self.config.debug_relays.is_some() && self.config.block_discovery
+    }
+
+    /// Returns the configured debug relays, if any.
+    pub fn debug_relays(&self) -> Option<Vec<String>> {
+        self.config.debug_relays.clone()
+    }
+
+    /// Returns true when debug relays are configured.
+    pub fn has_debug_relays(&self) -> bool {
+        self.config.debug_relays.is_some()
+    }
+
+    async fn initialize_debug_relays(&self, relays: &[String]) -> Result<(), RelayManagerError> {
+        for relay in relays {
+            if self
+                .pool
+                .add_relay(relay.clone(), RelaySource::Default)
+                .await
+            {
+                debug!("Added debug relay: {}", relay);
+            }
+        }
+
+        self.connect_all_relays().await?;
+
+        Ok(())
     }
 
     /// Add initial default relays
@@ -701,6 +739,23 @@ impl RelayManager {
 
     /// Add a discovered relay to the pool
     pub async fn add_discovered_relay(&self, url: String) -> Result<(), RelayManagerError> {
+        let mut normalized_urls = normalize_relay_urls(vec![url])?;
+        let Some(url) = normalized_urls.pop() else {
+            return Ok(());
+        };
+
+        if self.blocks_discovery() {
+            if let Some(debug_relays) = &self.config.debug_relays {
+                if !debug_relays.contains(&url) {
+                    debug!(
+                        "Discovery is blocked; ignoring relay outside debug set: {}",
+                        url
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         // Check if we're at capacity
         let current_count = self.pool.get_relays().await.len();
         if current_count >= self.config.max_relays {
@@ -960,6 +1015,79 @@ mod tests {
             vec![
                 "wss://relay.example.com/".to_string(),
                 "ws://localhost:8080/".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_relay_manager_debug_relays_replace_defaults() {
+        let config = RelayManagerConfig {
+            debug_relays: Some(vec!["wss://debug.example.com".to_string()]),
+            block_discovery: true,
+            ..RelayManagerConfig::default()
+        };
+
+        let manager = RelayManager::new("debug".to_string(), config, None)
+            .await
+            .expect("manager should initialize");
+
+        let pool = manager.get_relay_pool().await;
+        let mut relays = pool.get_relays().await;
+        relays.sort();
+
+        assert_eq!(relays, vec!["wss://debug.example.com/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_relay_manager_block_discovery_ignores_new_relays() {
+        let config = RelayManagerConfig {
+            debug_relays: Some(vec!["wss://debug.example.com".to_string()]),
+            block_discovery: true,
+            ..RelayManagerConfig::default()
+        };
+
+        let manager = RelayManager::new("blocked".to_string(), config, None)
+            .await
+            .expect("manager should initialize");
+
+        manager
+            .add_discovered_relay("wss://other.example.com".to_string())
+            .await
+            .expect("blocked discovery should be a no-op");
+
+        let pool = manager.get_relay_pool().await;
+        let mut relays = pool.get_relays().await;
+        relays.sort();
+
+        assert_eq!(relays, vec!["wss://debug.example.com/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_relay_manager_allow_discovery_adds_new_relays() {
+        let config = RelayManagerConfig {
+            debug_relays: Some(vec!["wss://debug.example.com".to_string()]),
+            block_discovery: false,
+            ..RelayManagerConfig::default()
+        };
+
+        let manager = RelayManager::new("allowed".to_string(), config, None)
+            .await
+            .expect("manager should initialize");
+
+        manager
+            .add_discovered_relay("wss://other.example.com".to_string())
+            .await
+            .expect("discovery should be allowed");
+
+        let pool = manager.get_relay_pool().await;
+        let mut relays = pool.get_relays().await;
+        relays.sort();
+
+        assert_eq!(
+            relays,
+            vec![
+                "wss://debug.example.com/".to_string(),
+                "wss://other.example.com/".to_string(),
             ]
         );
     }
