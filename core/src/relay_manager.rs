@@ -25,6 +25,10 @@ pub struct RelayManagerConfig {
     pub connection_poll_timeout_ms: u64,
     /// Poll interval for connection readiness in milliseconds
     pub connection_poll_interval_ms: u64,
+    /// Optional debug relays used to replace startup relays
+    pub debug_relays: Option<Vec<String>>,
+    /// Whether runtime discovery should avoid adding relays
+    pub block_discovery: bool,
 }
 
 impl Default for RelayManagerConfig {
@@ -34,6 +38,8 @@ impl Default for RelayManagerConfig {
             query_timeout_secs: 10,
             connection_poll_timeout_ms: 3000, // 3s max wait for initial relay readiness
             connection_poll_interval_ms: 50,  // Poll every 50ms (reduced from 100ms)
+            debug_relays: None,
+            block_discovery: false,
         }
     }
 }
@@ -51,6 +57,48 @@ pub enum RelayManagerError {
     Lock,
     #[error("Failed to publish event: {0}")]
     Publish(String),
+    #[error("Invalid relay URL `{0}`: {1}")]
+    InvalidRelayUrl(String, String),
+}
+
+/// Normalizes relay URLs while preserving first-seen order.
+///
+/// # Errors
+/// Returns [`RelayManagerError::InvalidRelayUrl`] for empty, malformed, or non-WebSocket URLs.
+pub fn normalize_relay_urls(relays: Vec<String>) -> Result<Vec<String>, RelayManagerError> {
+    let mut normalized = Vec::new();
+
+    for relay in relays {
+        let trimmed = relay.trim();
+
+        if trimmed.is_empty() {
+            return Err(RelayManagerError::InvalidRelayUrl(
+                relay,
+                "empty relay URL".to_string(),
+            ));
+        }
+
+        let parsed = url::Url::parse(trimmed).map_err(|e| {
+            RelayManagerError::InvalidRelayUrl(trimmed.to_string(), e.to_string())
+        })?;
+
+        match parsed.scheme() {
+            "ws" | "wss" => {}
+            scheme => {
+                return Err(RelayManagerError::InvalidRelayUrl(
+                    trimmed.to_string(),
+                    format!("unsupported scheme `{}`", scheme),
+                ));
+            }
+        }
+
+        let relay = parsed.to_string();
+        if !normalized.contains(&relay) {
+            normalized.push(relay);
+        }
+    }
+
+    Ok(normalized)
 }
 
 /// Result of sending an event to a specific relay
@@ -878,6 +926,44 @@ mod tests {
         assert_eq!(config.query_timeout_secs, 10);
         assert_eq!(config.connection_poll_timeout_ms, 3000);
         assert_eq!(config.connection_poll_interval_ms, 50);
+    }
+
+    #[test]
+    fn test_relay_manager_config_default_debug_fields() {
+        let config = RelayManagerConfig::default();
+
+        assert_eq!(config.debug_relays, None);
+        assert!(!config.block_discovery);
+    }
+
+    #[test]
+    fn test_normalize_relay_urls_rejects_invalid_values() {
+        let err = normalize_relay_urls(vec![
+            "".to_string(),
+            "https://relay.example.com".to_string(),
+            "not a url".to_string(),
+        ])
+        .expect_err("invalid relays should fail");
+
+        assert!(err.to_string().contains("Invalid relay URL"));
+    }
+
+    #[test]
+    fn test_normalize_relay_urls_accepts_ws_and_wss_and_deduplicates() {
+        let relays = normalize_relay_urls(vec![
+            "wss://relay.example.com".to_string(),
+            "ws://localhost:8080".to_string(),
+            "wss://relay.example.com".to_string(),
+        ])
+        .expect("valid relays should normalize");
+
+        assert_eq!(
+            relays,
+            vec![
+                "wss://relay.example.com".to_string(),
+                "ws://localhost:8080".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
