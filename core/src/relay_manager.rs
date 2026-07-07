@@ -960,8 +960,8 @@ mod tests {
         assert_eq!(
             relays,
             vec![
-                "wss://relay.example.com".to_string(),
-                "ws://localhost:8080".to_string(),
+                "wss://relay.example.com/".to_string(),
+                "ws://localhost:8080/".to_string(),
             ]
         );
     }
