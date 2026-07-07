@@ -33,6 +33,7 @@ use arcadestr_core::profile_fetcher::ProfileFetcher;
 use arcadestr_core::relay_cache::RelayCache;
 use arcadestr_core::relay_events::{RelayConnectionEvent, RelayStatus};
 use arcadestr_core::relay_hints::RelayHints;
+use arcadestr_core::relay_manager::normalize_relay_urls;
 use arcadestr_core::social_graph::SocialGraphDb;
 use arcadestr_core::subscriptions::{
     dispatch_ephemeral_read, dispatch_ephemeral_reads_batch, dispatch_permanent_subscriptions,
@@ -102,15 +103,155 @@ impl command_contracts::BadgeCommandState for AppState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NetworkDiscoverySettings {
+    #[serde(default)]
     allow_insecure_public_ws: bool,
+    #[serde(default)]
+    debug_relays: Option<Vec<String>>,
+    #[serde(default)]
+    block_discovery: Option<bool>,
 }
 
 impl Default for NetworkDiscoverySettings {
     fn default() -> Self {
         Self {
             allow_insecure_public_ws: false,
+            debug_relays: None,
+            block_discovery: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugRelayConfigSource {
+    Cli,
+    Environment,
+    Settings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DebugRelayCliOptions {
+    relays: Vec<String>,
+    block_discovery: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DebugRelayEnvOptions {
+    relays: Vec<String>,
+    block_discovery: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedDebugRelayOptions {
+    relays: Option<Vec<String>>,
+    block_discovery: bool,
+    source: Option<DebugRelayConfigSource>,
+}
+
+fn parse_debug_relay_cli_args(args: Vec<String>) -> Result<DebugRelayCliOptions, String> {
+    let mut options = DebugRelayCliOptions::default();
+    let mut saw_block_discovery = false;
+    let mut saw_allow_discovery = false;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        if arg == "--relay" {
+            let relay = args
+                .next()
+                .ok_or_else(|| "--relay requires a relay URL".to_string())?;
+            options.relays.push(relay);
+        } else if let Some(relay) = arg.strip_prefix("--relay=") {
+            options.relays.push(relay.to_string());
+        } else if arg == "--block-discovery" {
+            saw_block_discovery = true;
+            options.block_discovery = Some(true);
+        } else if arg == "--allow-discovery" {
+            saw_allow_discovery = true;
+            options.block_discovery = Some(false);
+        }
+    }
+
+    if saw_block_discovery && saw_allow_discovery {
+        return Err("--block-discovery and --allow-discovery cannot be used together".to_string());
+    }
+
+    Ok(options)
+}
+
+fn parse_debug_relay_env(
+    relays: Option<String>,
+    block_discovery: Option<String>,
+) -> Result<DebugRelayEnvOptions, String> {
+    let relays = relays
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|relay| !relay.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let block_discovery = block_discovery.as_deref().map(parse_bool_env).transpose()?;
+
+    Ok(DebugRelayEnvOptions {
+        relays,
+        block_discovery,
+    })
+}
+
+fn parse_bool_env(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "invalid boolean value `{value}`; expected true/1/yes/on or false/0/no/off"
+        )),
+    }
+}
+
+fn resolve_debug_relay_options(
+    cli: DebugRelayCliOptions,
+    env: DebugRelayEnvOptions,
+    settings: &NetworkDiscoverySettings,
+) -> Result<ResolvedDebugRelayOptions, String> {
+    let (relays, block_discovery, source) = if !cli.relays.is_empty() {
+        (
+            cli.relays,
+            cli.block_discovery,
+            Some(DebugRelayConfigSource::Cli),
+        )
+    } else if !env.relays.is_empty() {
+        (
+            env.relays,
+            env.block_discovery,
+            Some(DebugRelayConfigSource::Environment),
+        )
+    } else if let Some(relays) = settings
+        .debug_relays
+        .clone()
+        .filter(|relays| !relays.is_empty())
+    {
+        (
+            relays,
+            settings.block_discovery,
+            Some(DebugRelayConfigSource::Settings),
+        )
+    } else {
+        return Ok(ResolvedDebugRelayOptions {
+            relays: None,
+            block_discovery: false,
+            source: None,
+        });
+    };
+
+    let relays = normalize_relay_urls(relays).map_err(|err| err.to_string())?;
+
+    Ok(ResolvedDebugRelayOptions {
+        relays: Some(relays),
+        block_discovery: block_discovery.unwrap_or(true),
+        source,
+    })
 }
 
 fn settings_file_path() -> std::path::PathBuf {
@@ -1226,6 +1367,124 @@ mod task4_tests {
     }
 }
 
+#[cfg(test)]
+mod debug_relay_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_debug_relays_override_env_and_settings() {
+        let settings = NetworkDiscoverySettings {
+            allow_insecure_public_ws: false,
+            debug_relays: Some(vec!["wss://settings.example.com".to_string()]),
+            block_discovery: Some(false),
+        };
+
+        let cli = parse_debug_relay_cli_args(vec![
+            "--relay".to_string(),
+            "wss://cli.example.com".to_string(),
+            "--block-discovery".to_string(),
+        ])
+        .expect("cli should parse");
+
+        let env = parse_debug_relay_env(
+            Some("wss://env.example.com".to_string()),
+            Some("false".to_string()),
+        )
+        .expect("env should parse");
+
+        let resolved =
+            resolve_debug_relay_options(cli, env, &settings).expect("options should resolve");
+
+        assert_eq!(
+            resolved.relays,
+            Some(vec!["wss://cli.example.com/".to_string()])
+        );
+        assert!(resolved.block_discovery);
+        assert_eq!(resolved.source, Some(DebugRelayConfigSource::Cli));
+    }
+
+    #[test]
+    fn test_env_debug_relays_override_settings() {
+        let settings = NetworkDiscoverySettings {
+            allow_insecure_public_ws: false,
+            debug_relays: Some(vec!["wss://settings.example.com".to_string()]),
+            block_discovery: Some(false),
+        };
+
+        let cli = DebugRelayCliOptions::default();
+        let env = parse_debug_relay_env(
+            Some("wss://env.example.com".to_string()),
+            Some("true".to_string()),
+        )
+        .expect("env should parse");
+
+        let resolved =
+            resolve_debug_relay_options(cli, env, &settings).expect("options should resolve");
+
+        assert_eq!(
+            resolved.relays,
+            Some(vec!["wss://env.example.com/".to_string()])
+        );
+        assert!(resolved.block_discovery);
+        assert_eq!(resolved.source, Some(DebugRelayConfigSource::Environment));
+    }
+
+    #[test]
+    fn test_settings_debug_relays_default_to_block_discovery() {
+        let settings = NetworkDiscoverySettings {
+            allow_insecure_public_ws: false,
+            debug_relays: Some(vec!["wss://settings.example.com".to_string()]),
+            block_discovery: None,
+        };
+
+        let resolved = resolve_debug_relay_options(
+            DebugRelayCliOptions::default(),
+            DebugRelayEnvOptions::default(),
+            &settings,
+        )
+        .expect("options should resolve");
+
+        assert_eq!(
+            resolved.relays,
+            Some(vec!["wss://settings.example.com/".to_string()])
+        );
+        assert!(resolved.block_discovery);
+        assert_eq!(resolved.source, Some(DebugRelayConfigSource::Settings));
+    }
+
+    #[test]
+    fn test_allow_discovery_sets_block_discovery_false() {
+        let cli = parse_debug_relay_cli_args(vec![
+            "--relay".to_string(),
+            "wss://cli.example.com".to_string(),
+            "--allow-discovery".to_string(),
+        ])
+        .expect("cli should parse");
+
+        let resolved = resolve_debug_relay_options(
+            cli,
+            DebugRelayEnvOptions::default(),
+            &NetworkDiscoverySettings::default(),
+        )
+        .expect("options should resolve");
+
+        assert!(!resolved.block_discovery);
+    }
+
+    #[test]
+    fn test_conflicting_discovery_flags_are_rejected() {
+        let err = parse_debug_relay_cli_args(vec![
+            "--relay".to_string(),
+            "wss://cli.example.com".to_string(),
+            "--block-discovery".to_string(),
+            "--allow-discovery".to_string(),
+        ])
+        .expect_err("conflicting flags should fail");
+
+        assert!(err.contains("cannot be used together"));
+    }
+}
+
 fn main() {
     // Initialize tracing subscriber to see logs
     tracing_subscriber::fmt::init();
@@ -1277,6 +1536,8 @@ fn main() {
                 query_timeout_secs: 10,
                 connection_poll_timeout_ms: 3000,
                 connection_poll_interval_ms: 50,
+                debug_relays: None,
+                block_discovery: false,
             };
 
             let client = match NostrClient::new_with_cache(
