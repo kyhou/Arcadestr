@@ -25,9 +25,9 @@ pub struct RelayManagerConfig {
     pub connection_poll_timeout_ms: u64,
     /// Poll interval for connection readiness in milliseconds
     pub connection_poll_interval_ms: u64,
-    /// Optional debug relays used to replace startup relays
+    /// Optional debug relays resolved by the application layer.
     pub debug_relays: Option<Vec<String>>,
-    /// Whether runtime discovery should avoid adding relays
+    /// Whether runtime relay discovery should be disabled when debug relays are active.
     pub block_discovery: bool,
 }
 
@@ -938,14 +938,12 @@ mod tests {
 
     #[test]
     fn test_normalize_relay_urls_rejects_invalid_values() {
-        let err = normalize_relay_urls(vec![
-            "".to_string(),
-            "https://relay.example.com".to_string(),
-            "not a url".to_string(),
-        ])
-        .expect_err("invalid relays should fail");
+        for invalid_relay in ["", "https://relay.example.com", "not a url"] {
+            let err = normalize_relay_urls(vec![invalid_relay.to_string()])
+                .expect_err("invalid relays should fail");
 
-        assert!(err.to_string().contains("Invalid relay URL"));
+            assert!(err.to_string().contains("Invalid relay URL"));
+        }
     }
 
     #[test]
