@@ -226,32 +226,25 @@ fn resolve_debug_relay_options(
     env: DebugRelayEnvOptions,
     settings: &NetworkDiscoverySettings,
 ) -> Result<ResolvedDebugRelayOptions, String> {
-    let (relays, block_discovery, source) = if !cli.relays.is_empty() {
-        (
-            cli.relays,
-            cli.block_discovery,
-            Some(DebugRelayConfigSource::Cli),
-        )
+    let block_discovery = cli
+        .block_discovery
+        .or(env.block_discovery)
+        .or(settings.block_discovery);
+
+    let (relays, source) = if !cli.relays.is_empty() {
+        (cli.relays, Some(DebugRelayConfigSource::Cli))
     } else if !env.relays.is_empty() {
-        (
-            env.relays,
-            env.block_discovery,
-            Some(DebugRelayConfigSource::Environment),
-        )
+        (env.relays, Some(DebugRelayConfigSource::Environment))
     } else if let Some(relays) = settings
         .debug_relays
         .clone()
         .filter(|relays| !relays.is_empty())
     {
-        (
-            relays,
-            settings.block_discovery,
-            Some(DebugRelayConfigSource::Settings),
-        )
+        (relays, Some(DebugRelayConfigSource::Settings))
     } else {
         return Ok(ResolvedDebugRelayOptions {
             relays: None,
-            block_discovery: false,
+            block_discovery: block_discovery.unwrap_or(false),
             source: None,
         });
     };
@@ -1480,6 +1473,69 @@ mod debug_relay_config_tests {
         .expect("options should resolve");
 
         assert!(!resolved.block_discovery);
+    }
+
+    #[test]
+    fn test_cli_allow_discovery_overrides_env_block_for_env_relays() {
+        let cli = parse_debug_relay_cli_args(vec!["--allow-discovery".to_string()])
+            .expect("cli should parse");
+        let env = parse_debug_relay_env(
+            Some("wss://env.example.com".to_string()),
+            Some("true".to_string()),
+        )
+        .expect("env should parse");
+
+        let resolved = resolve_debug_relay_options(cli, env, &NetworkDiscoverySettings::default())
+            .expect("options should resolve");
+
+        assert_eq!(
+            resolved.relays,
+            Some(vec!["wss://env.example.com/".to_string()])
+        );
+        assert!(!resolved.block_discovery);
+        assert_eq!(resolved.source, Some(DebugRelayConfigSource::Environment));
+    }
+
+    #[test]
+    fn test_env_allow_discovery_overrides_settings_block_for_settings_relays() {
+        let settings = NetworkDiscoverySettings {
+            allow_insecure_public_ws: false,
+            debug_relays: Some(vec!["wss://settings.example.com".to_string()]),
+            block_discovery: Some(true),
+        };
+        let env = parse_debug_relay_env(None, Some("false".to_string()))
+            .expect("env should parse");
+
+        let resolved = resolve_debug_relay_options(DebugRelayCliOptions::default(), env, &settings)
+            .expect("options should resolve");
+
+        assert_eq!(
+            resolved.relays,
+            Some(vec!["wss://settings.example.com/".to_string()])
+        );
+        assert!(!resolved.block_discovery);
+        assert_eq!(resolved.source, Some(DebugRelayConfigSource::Settings));
+    }
+
+    #[test]
+    fn test_cli_block_discovery_overrides_settings_allow_for_settings_relays() {
+        let settings = NetworkDiscoverySettings {
+            allow_insecure_public_ws: false,
+            debug_relays: Some(vec!["wss://settings.example.com".to_string()]),
+            block_discovery: Some(false),
+        };
+        let cli = parse_debug_relay_cli_args(vec!["--block-discovery".to_string()])
+            .expect("cli should parse");
+
+        let resolved = resolve_debug_relay_options(cli, DebugRelayEnvOptions::default(), &settings)
+            .expect("options should resolve");
+
+        assert_eq!(
+            resolved.relays,
+            Some(vec!["wss://settings.example.com/".to_string()])
+        );
+        assert!(resolved.block_discovery);
+        assert_eq!(resolved.source, Some(DebugRelayConfigSource::Settings));
     }
 
     #[test]
