@@ -675,11 +675,12 @@ impl NostrClient {
         relays: Vec<String>,
         config: Option<RelayManagerConfig>,
     ) -> Result<Self, NostrError> {
-        use tracing::{error, info, warn};
+        use tracing::info;
 
         info!("Creating NostrClient for profile: {}", profile_id);
 
         let config = config.unwrap_or_default();
+        let has_debug_relays = config.debug_relays.is_some();
 
         // Create the broadcast channel for relay events
         let (relay_event_sender, _) = broadcast::channel(RELAY_EVENT_CHANNEL_CAPACITY);
@@ -691,12 +692,14 @@ impl NostrClient {
                     NostrError::RelayError(format!("Failed to create relay manager: {}", e))
                 })?;
 
-        // Add any additional relays from params
-        for relay in &relays {
-            if !DEFAULT_RELAYS.contains(&relay.as_str())
-                && !INDEXER_RELAYS.contains(&relay.as_str())
-            {
-                let _ = relay_manager.add_discovered_relay(relay.clone()).await;
+        // Add any additional relays from params unless debug relays replace discovery.
+        if !has_debug_relays {
+            for relay in &relays {
+                if !DEFAULT_RELAYS.contains(&relay.as_str())
+                    && !INDEXER_RELAYS.contains(&relay.as_str())
+                {
+                    let _ = relay_manager.add_discovered_relay(relay.clone()).await;
+                }
             }
         }
 
@@ -717,7 +720,7 @@ impl NostrClient {
         user_cache: Arc<UserCache>,
         config: Option<RelayManagerConfig>,
     ) -> Result<Self, NostrError> {
-        use tracing::{info, warn};
+        use tracing::info;
 
         info!(
             "Creating NostrClient with {} relays and user cache for profile: {}",
@@ -726,6 +729,7 @@ impl NostrClient {
         );
 
         let config = config.unwrap_or_default();
+        let has_debug_relays = config.debug_relays.is_some();
 
         // Create the broadcast channel for relay events
         let (relay_event_sender, _) = broadcast::channel(RELAY_EVENT_CHANNEL_CAPACITY);
@@ -737,12 +741,14 @@ impl NostrClient {
                     NostrError::RelayError(format!("Failed to create relay manager: {}", e))
                 })?;
 
-        // Add any additional relays from params
-        for relay in &relays {
-            if !DEFAULT_RELAYS.contains(&relay.as_str())
-                && !INDEXER_RELAYS.contains(&relay.as_str())
-            {
-                let _ = relay_manager.add_discovered_relay(relay.clone()).await;
+        // Add any additional relays from params unless debug relays replace discovery.
+        if !has_debug_relays {
+            for relay in &relays {
+                if !DEFAULT_RELAYS.contains(&relay.as_str())
+                    && !INDEXER_RELAYS.contains(&relay.as_str())
+                {
+                    let _ = relay_manager.add_discovered_relay(relay.clone()).await;
+                }
             }
         }
 
@@ -987,12 +993,29 @@ impl NostrClient {
         Ok(profile)
     }
 
+    async fn blocked_discovery_relays(&self) -> Option<Vec<String>> {
+        let manager = self.relay_manager.lock().await;
+
+        if manager.blocks_discovery() {
+            return manager.debug_relays();
+        }
+
+        None
+    }
+
     /// Fetch profile with NIP-65 relay discovery
     /// First discovers the user's relays, connects to them, then fetches profile
     pub async fn fetch_profile_with_relay_discovery(
         &self,
         npub: &str,
     ) -> Result<UserProfile, NostrError> {
+        if self.blocked_discovery_relays().await.is_some() {
+            tracing::debug!(
+                "Relay discovery is blocked; fetching profile without NIP-65 discovery"
+            );
+            return self.fetch_profile(npub, None).await;
+        }
+
         // First, try to discover the user's relays via NIP-65
         tracing::info!("Discovering relays for {} via NIP-65...", npub);
 
@@ -1201,6 +1224,12 @@ impl NostrClient {
     /// Fetch Kind 10002 (relay list metadata) for a pubkey
     /// Uses unified relay pool through RelayManager
     pub async fn fetch_relay_list(&self, npub: &str) -> Result<CachedRelayList, NostrError> {
+        if self.blocked_discovery_relays().await.is_some() {
+            return Err(NostrError::RelayError(
+                "relay discovery is blocked by debug relay configuration".to_string(),
+            ));
+        }
+
         let pubkey = PublicKey::parse(npub)
             .map_err(|e| NostrError::MalformedEvent(format!("Invalid npub: {}", e)))?;
 
@@ -1344,6 +1373,14 @@ impl NostrClient {
         cache: &RelayCache,
         user_npub: Option<&str>, // authenticated user's npub for Tier 3
     ) -> Result<RelayDiscoveryResult, NostrError> {
+        if let Some(relays) = self.blocked_discovery_relays().await {
+            return Ok(RelayDiscoveryResult {
+                write_relays: relays.clone(),
+                read_relays: relays,
+                source: RelayDiscoverySource::GlobalFallback,
+            });
+        }
+
         // Check cache first
         if let Some(cached) = cache.get_relay_list(npub) {
             let is_stale = cache.is_stale(npub);
@@ -1435,6 +1472,14 @@ impl NostrClient {
         relay_cache: &RelayCache,
         hint_store: Option<&RelayHints>,
     ) -> RelayDiscoveryResult {
+        if let Some(relays) = self.blocked_discovery_relays().await {
+            return RelayDiscoveryResult {
+                write_relays: relays.clone(),
+                read_relays: relays,
+                source: RelayDiscoverySource::GlobalFallback,
+            };
+        }
+
         // Tier 1: NIP-65 from cache
         if let Some(cached) = relay_cache.get_relay_list(pubkey) {
             return RelayDiscoveryResult {
@@ -2317,6 +2362,81 @@ mod nip65_tests {
                 // npub may be invalid, which is fine for this test
             }
         }
+    }
+
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "{}_{}_{}.db",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+
+        std::env::temp_dir().join(unique)
+    }
+
+    #[tokio::test]
+    async fn test_nostr_client_debug_relays_skip_constructor_relays() {
+        let config = RelayManagerConfig {
+            debug_relays: Some(vec!["wss://debug.example.com".to_string()]),
+            block_discovery: false,
+            ..RelayManagerConfig::default()
+        };
+
+        let client = NostrClient::new(
+            "debug-client".to_string(),
+            vec!["wss://extra.example.com".to_string()],
+            Some(config),
+        )
+        .await
+        .expect("client should initialize");
+
+        let manager = client.relay_manager();
+        let manager = manager.lock().await;
+        let pool = manager.get_relay_pool().await;
+        let mut relays = pool.get_relays().await;
+        relays.sort();
+
+        assert_eq!(relays, vec!["wss://debug.example.com/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_get_relays_for_pubkey_returns_debug_relays_when_blocked() {
+        let db_path = temp_db_path("debug_blocked_relays");
+        let cache = RelayCache::new(&db_path).expect("cache should initialize");
+
+        let config = RelayManagerConfig {
+            debug_relays: Some(vec!["wss://debug.example.com".to_string()]),
+            block_discovery: true,
+            ..RelayManagerConfig::default()
+        };
+
+        let client = NostrClient::new("debug-discovery".to_string(), vec![], Some(config))
+            .await
+            .expect("client should initialize");
+
+        let result = client
+            .get_relays_for_pubkey(
+                "npub180cvv07t6ndx4weylg3jtvsvgp87u4qa3gtlgcy7m0c3sn5zxa9s8my3zg",
+                &cache,
+                None,
+            )
+            .await
+            .expect("blocked discovery should return debug relays");
+
+        assert_eq!(
+            result.read_relays,
+            vec!["wss://debug.example.com/".to_string()]
+        );
+        assert_eq!(
+            result.write_relays,
+            vec!["wss://debug.example.com/".to_string()]
+        );
+
+        let _ = std::fs::remove_file(db_path);
     }
 }
 
