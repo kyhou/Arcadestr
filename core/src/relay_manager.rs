@@ -739,22 +739,33 @@ impl RelayManager {
 
     /// Add a discovered relay to the pool
     pub async fn add_discovered_relay(&self, url: String) -> Result<(), RelayManagerError> {
-        let mut normalized_urls = normalize_relay_urls(vec![url])?;
-        let Some(url) = normalized_urls.pop() else {
-            return Ok(());
-        };
+        let url = if self.blocks_discovery() {
+            let Ok(mut normalized_urls) = normalize_relay_urls(vec![url.clone()]) else {
+                debug!("Discovery is blocked; ignoring invalid relay hint: {}", url);
+                return Ok(());
+            };
+            let Some(normalized_url) = normalized_urls.pop() else {
+                return Ok(());
+            };
 
-        if self.blocks_discovery() {
             if let Some(debug_relays) = &self.config.debug_relays {
-                if !debug_relays.contains(&url) {
+                if !debug_relays.contains(&normalized_url) {
                     debug!(
                         "Discovery is blocked; ignoring relay outside debug set: {}",
-                        url
+                        normalized_url
                     );
                     return Ok(());
                 }
             }
-        }
+
+            normalized_url
+        } else {
+            let mut normalized_urls = normalize_relay_urls(vec![url])?;
+            let Some(normalized_url) = normalized_urls.pop() else {
+                return Ok(());
+            };
+            normalized_url
+        };
 
         // Check if we're at capacity
         let current_count = self.pool.get_relays().await.len();
@@ -1054,6 +1065,30 @@ mod tests {
             .add_discovered_relay("wss://other.example.com".to_string())
             .await
             .expect("blocked discovery should be a no-op");
+
+        let pool = manager.get_relay_pool().await;
+        let mut relays = pool.get_relays().await;
+        relays.sort();
+
+        assert_eq!(relays, vec!["wss://debug.example.com/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_relay_manager_block_discovery_ignores_invalid_relay_hints() {
+        let config = RelayManagerConfig {
+            debug_relays: Some(vec!["wss://debug.example.com".to_string()]),
+            block_discovery: true,
+            ..RelayManagerConfig::default()
+        };
+
+        let manager = RelayManager::new("blocked_invalid".to_string(), config, None)
+            .await
+            .expect("manager should initialize");
+
+        manager
+            .add_discovered_relay("not a url".to_string())
+            .await
+            .expect("invalid relay hints should be ignored when discovery is blocked");
 
         let pool = manager.get_relay_pool().await;
         let mut relays = pool.get_relays().await;
