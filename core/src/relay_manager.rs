@@ -78,9 +78,8 @@ pub fn normalize_relay_urls(relays: Vec<String>) -> Result<Vec<String>, RelayMan
             ));
         }
 
-        let parsed = url::Url::parse(trimmed).map_err(|e| {
-            RelayManagerError::InvalidRelayUrl(trimmed.to_string(), e.to_string())
-        })?;
+        let parsed = url::Url::parse(trimmed)
+            .map_err(|e| RelayManagerError::InvalidRelayUrl(trimmed.to_string(), e.to_string()))?;
 
         match parsed.scheme() {
             "ws" | "wss" => {}
