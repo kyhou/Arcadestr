@@ -229,21 +229,31 @@ fn resolve_debug_relay_options(
     env: DebugRelayEnvOptions,
     settings: &NetworkDiscoverySettings,
 ) -> Result<ResolvedDebugRelayOptions, String> {
-    let block_discovery = cli
-        .block_discovery
-        .or(env.block_discovery)
-        .or(settings.block_discovery);
-
-    let (relays, source) = if !cli.relays.is_empty() {
-        (cli.relays, Some(DebugRelayConfigSource::Cli))
+    let (relays, source, block_discovery) = if !cli.relays.is_empty() {
+        (
+            cli.relays,
+            Some(DebugRelayConfigSource::Cli),
+            cli.block_discovery.unwrap_or(true),
+        )
     } else if !env.relays.is_empty() {
-        (env.relays, Some(DebugRelayConfigSource::Environment))
+        (
+            env.relays,
+            Some(DebugRelayConfigSource::Environment),
+            cli.block_discovery.or(env.block_discovery).unwrap_or(true),
+        )
     } else if let Some(relays) = settings
         .debug_relays
         .clone()
         .filter(|relays| !relays.is_empty())
     {
-        (relays, Some(DebugRelayConfigSource::Settings))
+        (
+            relays,
+            Some(DebugRelayConfigSource::Settings),
+            cli.block_discovery
+                .or(env.block_discovery)
+                .or(settings.block_discovery)
+                .unwrap_or(true),
+        )
     } else {
         return Ok(ResolvedDebugRelayOptions {
             relays: None,
@@ -256,7 +266,7 @@ fn resolve_debug_relay_options(
 
     Ok(ResolvedDebugRelayOptions {
         relays: Some(relays),
-        block_discovery: block_discovery.unwrap_or(true),
+        block_discovery,
         source,
     })
 }
@@ -1517,6 +1527,103 @@ mod debug_relay_config_tests {
         .expect("options should resolve");
 
         assert!(!resolved.block_discovery);
+    }
+
+    #[test]
+    fn test_cli_relay_defaults_to_block_discovery_ignoring_settings_allow() {
+        let settings = NetworkDiscoverySettings {
+            allow_insecure_public_ws: false,
+            debug_relays: Some(vec!["wss://settings.example.com".to_string()]),
+            block_discovery: Some(false),
+        };
+        let cli = parse_debug_relay_cli_args(vec![
+            "--relay".to_string(),
+            "wss://debug.example".to_string(),
+        ])
+        .expect("cli should parse");
+
+        let resolved = resolve_debug_relay_options(
+            cli,
+            DebugRelayEnvOptions::default(),
+            &settings,
+        )
+        .expect("options should resolve");
+
+        assert_eq!(
+            resolved.relays,
+            Some(vec!["wss://debug.example/".to_string()])
+        );
+        assert!(resolved.block_discovery);
+        assert_eq!(resolved.source, Some(DebugRelayConfigSource::Cli));
+    }
+
+    #[test]
+    fn test_env_relay_defaults_to_block_discovery_ignoring_settings_allow() {
+        let settings = NetworkDiscoverySettings {
+            allow_insecure_public_ws: false,
+            debug_relays: Some(vec!["wss://settings.example.com".to_string()]),
+            block_discovery: Some(false),
+        };
+        let env = parse_debug_relay_env(Some("wss://env.example".to_string()), None)
+            .expect("env should parse");
+
+        let resolved = resolve_debug_relay_options(
+            DebugRelayCliOptions::default(),
+            env,
+            &settings,
+        )
+        .expect("options should resolve");
+
+        assert_eq!(
+            resolved.relays,
+            Some(vec!["wss://env.example/".to_string()])
+        );
+        assert!(resolved.block_discovery);
+        assert_eq!(resolved.source, Some(DebugRelayConfigSource::Environment));
+    }
+
+    #[test]
+    fn test_settings_relay_uses_settings_allow_when_no_higher_priority_inputs() {
+        let settings = NetworkDiscoverySettings {
+            allow_insecure_public_ws: false,
+            debug_relays: Some(vec!["wss://settings.example.com".to_string()]),
+            block_discovery: Some(false),
+        };
+
+        let resolved = resolve_debug_relay_options(
+            DebugRelayCliOptions::default(),
+            DebugRelayEnvOptions::default(),
+            &settings,
+        )
+        .expect("options should resolve");
+
+        assert_eq!(
+            resolved.relays,
+            Some(vec!["wss://settings.example.com/".to_string()])
+        );
+        assert!(!resolved.block_discovery);
+        assert_eq!(resolved.source, Some(DebugRelayConfigSource::Settings));
+    }
+
+    #[test]
+    fn test_cli_allow_discovery_overrides_env_block_for_env_relay_source() {
+        let cli = parse_debug_relay_cli_args(vec!["--allow-discovery".to_string()])
+            .expect("cli should parse");
+        let env = parse_debug_relay_env(
+            Some("wss://env.example".to_string()),
+            Some("true".to_string()),
+        )
+        .expect("env should parse");
+
+        let resolved = resolve_debug_relay_options(cli, env, &NetworkDiscoverySettings::default())
+            .expect("options should resolve");
+
+        assert_eq!(
+            resolved.relays,
+            Some(vec!["wss://env.example/".to_string()])
+        );
+        assert!(!resolved.block_discovery);
+        assert_eq!(resolved.source, Some(DebugRelayConfigSource::Environment));
     }
 
     #[test]
