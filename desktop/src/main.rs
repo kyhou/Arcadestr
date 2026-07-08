@@ -187,12 +187,17 @@ fn parse_debug_relay_env(
 ) -> Result<DebugRelayEnvOptions, String> {
     let relays = match relays {
         Some(value) => {
-            let relays = value
-                .split(',')
-                .map(str::trim)
-                .filter(|relay| !relay.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>();
+            let mut relays = Vec::new();
+
+            for relay in value.split(',').map(str::trim) {
+                if relay.is_empty() {
+                    return Err(
+                        "ARCADESTR_RELAYS contains an empty relay URL entry".to_string(),
+                    );
+                }
+
+                relays.push(relay.to_owned());
+            }
 
             if relays.is_empty() {
                 return Err("ARCADESTR_RELAYS requires at least one relay URL".to_string());
@@ -1564,8 +1569,16 @@ mod debug_relay_config_tests {
 
     #[test]
     fn test_whitespace_only_env_relay_config_is_rejected() {
-        let err = parse_debug_relay_env(Some(" , \t ".to_string()), None)
+        let err = parse_debug_relay_env(Some(" \t  \n ".to_string()), None)
             .expect_err("env relay config without relay URLs should fail");
+
+        assert!(err.contains("ARCADESTR_RELAYS"));
+    }
+
+    #[test]
+    fn test_env_relay_config_with_internal_empty_token_is_rejected() {
+        let err = parse_debug_relay_env(Some("wss://a.example.com, ,wss://b.example.com".to_string()), None)
+            .expect_err("env relay config with empty relay token should fail");
 
         assert!(err.contains("ARCADESTR_RELAYS"));
     }
