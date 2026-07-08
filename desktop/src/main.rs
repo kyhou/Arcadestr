@@ -3120,7 +3120,21 @@ fn main() {
                         if en_option.is_none() {
                             drop(en_option); // Release read lock
 
-                            info!("Triggering extended network discovery after session restore");
+                            let discovery_blocked = {
+                                let relay_manager = {
+                                    let nostr = nostr_for_restore.lock().await;
+                                    nostr.relay_manager()
+                                };
+                                let manager = relay_manager.lock().await;
+                                manager.blocks_discovery()
+                            };
+
+                            if discovery_blocked {
+                                info!(
+                                    "Skipping extended network discovery because debug relay discovery is blocked"
+                                );
+                            } else {
+                                info!("Triggering extended network discovery after session restore");
 
                             // Get user npub from the restored session
                             let user_npub = {
@@ -3307,6 +3321,7 @@ fn main() {
                                 }
                             } else {
                                 warn!("Could not determine user npub after restore, skipping extended network discovery");
+                            }
                             }
                         } else {
                             info!("Extended network already initialized, skipping discovery after restore");
