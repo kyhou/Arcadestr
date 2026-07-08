@@ -263,6 +263,27 @@ fn resolve_debug_relay_options(
     })
 }
 
+fn build_startup_relay_config(
+    debug_relay_options: &ResolvedDebugRelayOptions,
+) -> (arcadestr_core::relay_manager::RelayManagerConfig, Vec<String>) {
+    let relay_config = arcadestr_core::relay_manager::RelayManagerConfig {
+        max_relays: 100,
+        query_timeout_secs: 10,
+        connection_poll_timeout_ms: 3000,
+        connection_poll_interval_ms: 50,
+        debug_relays: debug_relay_options.relays.clone(),
+        block_discovery: debug_relay_options.block_discovery,
+    };
+
+    let startup_relays = if debug_relay_options.relays.is_some() {
+        vec![]
+    } else {
+        DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
+    };
+
+    (relay_config, startup_relays)
+}
+
 fn settings_file_path() -> std::path::PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -1607,6 +1628,42 @@ mod debug_relay_config_tests {
         assert!(!resolved.block_discovery);
         assert_eq!(resolved.source, None);
     }
+
+    #[test]
+    fn test_startup_relay_config_uses_debug_relays_without_defaults() {
+        let resolved = ResolvedDebugRelayOptions {
+            relays: Some(vec!["wss://debug.example.com/".to_string()]),
+            block_discovery: true,
+            source: Some(DebugRelayConfigSource::Cli),
+        };
+
+        let (relay_config, startup_relays) = build_startup_relay_config(&resolved);
+
+        assert_eq!(
+            relay_config.debug_relays,
+            Some(vec!["wss://debug.example.com/".to_string()])
+        );
+        assert!(relay_config.block_discovery);
+        assert!(startup_relays.is_empty());
+    }
+
+    #[test]
+    fn test_startup_relay_config_uses_default_startup_relays_without_debug_mode() {
+        let resolved = ResolvedDebugRelayOptions {
+            relays: None,
+            block_discovery: false,
+            source: None,
+        };
+
+        let (relay_config, startup_relays) = build_startup_relay_config(&resolved);
+
+        assert_eq!(relay_config.debug_relays, None);
+        assert!(!relay_config.block_discovery);
+        assert_eq!(
+            startup_relays,
+            DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+    }
 }
 
 fn main() {
@@ -1642,6 +1699,40 @@ fn main() {
     // Create subscription_registry BEFORE the async block (needed for validator spawn order)
     let subscription_registry = Arc::new(SubscriptionRegistry::new());
 
+    let network_settings = load_network_discovery_settings();
+
+    let debug_relay_options = {
+        let cli = parse_debug_relay_cli_args(std::env::args().skip(1).collect()).unwrap_or_else(
+            |e| {
+                eprintln!("Invalid debug relay CLI options: {}", e);
+                std::process::exit(2);
+            },
+        );
+
+        let env = parse_debug_relay_env(
+            std::env::var("ARCADESTR_RELAYS").ok(),
+            std::env::var("ARCADESTR_BLOCK_DISCOVERY").ok(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Invalid debug relay environment options: {}", e);
+            std::process::exit(2);
+        });
+
+        resolve_debug_relay_options(cli, env, &network_settings).unwrap_or_else(|e| {
+            eprintln!("Invalid debug relay configuration: {}", e);
+            std::process::exit(2);
+        })
+    };
+
+    if let Some(relays) = &debug_relay_options.relays {
+        info!(
+            "Debug relay mode active from {:?}: {} relay(s), block_discovery={}",
+            debug_relay_options.source,
+            relays.len(),
+            debug_relay_options.block_discovery
+        );
+    }
+
     // Create a single runtime for all initialization
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
@@ -1655,20 +1746,13 @@ fn main() {
             let cache = Arc::new(UserCache::new(db.pool().clone()));
 
             // Initialize NostrClient with relay manager
-            let relay_config = arcadestr_core::relay_manager::RelayManagerConfig {
-                max_relays: 100,
-                query_timeout_secs: 10,
-                connection_poll_timeout_ms: 3000,
-                connection_poll_interval_ms: 50,
-                debug_relays: None,
-                block_discovery: false,
-            };
+            let (relay_config, startup_relays) = build_startup_relay_config(&debug_relay_options);
 
             let client = match NostrClient::new_with_cache(
                 "default".to_string(),
-                DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
+                startup_relays,
                 cache.clone(),
-                Some(relay_config),
+                Some(relay_config.clone()),
             )
             .await
             {
@@ -1677,9 +1761,14 @@ fn main() {
                     eprintln!("Warning: Failed to initialize NostrClient: {}", e);
                     eprintln!("The app will start but relay functionality may be limited.");
                     // Create a client with no relays - user can retry later
-                    NostrClient::new_with_cache("default".to_string(), vec![], cache.clone(), None)
-                        .await
-                        .expect("Failed to create empty client")
+                    NostrClient::new_with_cache(
+                        "default".to_string(),
+                        vec![],
+                        cache.clone(),
+                        Some(relay_config.clone()),
+                    )
+                    .await
+                    .expect("Failed to create empty client")
                 }
             };
 
@@ -1691,7 +1780,7 @@ fn main() {
                 "default".to_string(),
                 vec![],
                 cache.clone(),
-                None,
+                Some(relay_config.clone()),
             )
             .await
             {
@@ -1713,16 +1802,21 @@ fn main() {
                 Err(_) => {
                     // If we can't unwrap (because validator is still using it), create a new empty client
                     warn!("Client is shared, creating new client for main use");
-                    NostrClient::new_with_cache("default".to_string(), vec![], cache.clone(), None)
-                        .await
-                        .expect("Failed to create fallback client")
+                    NostrClient::new_with_cache(
+                        "default".to_string(),
+                        vec![],
+                        cache.clone(),
+                        Some(relay_config.clone()),
+                    )
+                    .await
+                    .expect("Failed to create fallback client")
                 }
             };
 
-            // Connect to default relays immediately to reduce query latency
-            info!("Connecting to default relays before starting Tauri...");
+            // Connect to configured relays immediately to reduce query latency
+            info!("Connecting to configured relays before starting Tauri...");
             client.connect().await;
-            info!("Default relay connections initiated");
+            info!("Configured relay connections initiated");
 
             // Start connection monitoring for real-time relay status updates
             {
@@ -2447,6 +2541,21 @@ fn main() {
         app_handle: tauri::AppHandle,
     ) {
         use tracing::{info, warn};
+
+        {
+            let relay_manager = {
+                let nostr = state.nostr.lock().await;
+                nostr.relay_manager()
+            };
+            let manager = relay_manager.lock().await;
+
+            if manager.blocks_discovery() {
+                info!(
+                    "Skipping extended network discovery because debug relay discovery is blocked"
+                );
+                return;
+            }
+        }
 
         // Get config directory for database paths
         let config_dir = dirs::data_local_dir()
