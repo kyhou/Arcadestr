@@ -191,9 +191,7 @@ fn parse_debug_relay_env(
 
             for relay in value.split(',').map(str::trim) {
                 if relay.is_empty() {
-                    return Err(
-                        "ARCADESTR_RELAYS contains an empty relay URL entry".to_string(),
-                    );
+                    return Err("ARCADESTR_RELAYS contains an empty relay URL entry".to_string());
                 }
 
                 relays.push(relay.to_owned());
@@ -265,7 +263,10 @@ fn resolve_debug_relay_options(
 
 fn build_startup_relay_config(
     debug_relay_options: &ResolvedDebugRelayOptions,
-) -> (arcadestr_core::relay_manager::RelayManagerConfig, Vec<String>) {
+) -> (
+    arcadestr_core::relay_manager::RelayManagerConfig,
+    Vec<String>,
+) {
     let relay_config = arcadestr_core::relay_manager::RelayManagerConfig {
         max_relays: 100,
         query_timeout_secs: 10,
@@ -1546,8 +1547,7 @@ mod debug_relay_config_tests {
             debug_relays: Some(vec!["wss://settings.example.com".to_string()]),
             block_discovery: Some(true),
         };
-        let env = parse_debug_relay_env(None, Some("false".to_string()))
-            .expect("env should parse");
+        let env = parse_debug_relay_env(None, Some("false".to_string())).expect("env should parse");
 
         let resolved = resolve_debug_relay_options(DebugRelayCliOptions::default(), env, &settings)
             .expect("options should resolve");
@@ -1615,8 +1615,11 @@ mod debug_relay_config_tests {
 
     #[test]
     fn test_env_relay_config_with_internal_empty_token_is_rejected() {
-        let err = parse_debug_relay_env(Some("wss://a.example.com, ,wss://b.example.com".to_string()), None)
-            .expect_err("env relay config with empty relay token should fail");
+        let err = parse_debug_relay_env(
+            Some("wss://a.example.com, ,wss://b.example.com".to_string()),
+            None,
+        )
+        .expect_err("env relay config with empty relay token should fail");
 
         assert!(err.contains("ARCADESTR_RELAYS"));
     }
@@ -1705,7 +1708,10 @@ mod debug_relay_config_tests {
         assert!(!relay_config.block_discovery);
         assert_eq!(
             startup_relays,
-            DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            DEFAULT_RELAYS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -1749,12 +1755,11 @@ fn main() {
     });
 
     let debug_relay_options = {
-        let cli = parse_debug_relay_cli_args(std::env::args().skip(1).collect()).unwrap_or_else(
-            |e| {
+        let cli =
+            parse_debug_relay_cli_args(std::env::args().skip(1).collect()).unwrap_or_else(|e| {
                 eprintln!("Invalid debug relay CLI options: {}", e);
                 std::process::exit(2);
-            },
-        );
+            });
 
         let env = parse_debug_relay_env(
             std::env::var("ARCADESTR_RELAYS").ok(),
