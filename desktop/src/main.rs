@@ -249,7 +249,7 @@ fn resolve_debug_relay_options(
     } else {
         return Ok(ResolvedDebugRelayOptions {
             relays: None,
-            block_discovery: block_discovery.unwrap_or(false),
+            block_discovery: false,
             source: None,
         });
     };
@@ -291,14 +291,31 @@ fn settings_file_path() -> std::path::PathBuf {
         .join("settings.json")
 }
 
-fn load_network_discovery_settings() -> NetworkDiscoverySettings {
+fn parse_network_discovery_settings(content: &str) -> Result<NetworkDiscoverySettings, String> {
+    serde_json::from_str::<NetworkDiscoverySettings>(content)
+        .map_err(|e| format!("failed to parse settings.json: {e}"))
+}
+
+fn try_load_network_discovery_settings() -> Result<NetworkDiscoverySettings, String> {
     let path = settings_file_path();
-    let content = match std::fs::read_to_string(path) {
+    let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
-        Err(_) => return NetworkDiscoverySettings::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(NetworkDiscoverySettings::default());
+        }
+        Err(e) => {
+            return Err(format!(
+                "failed to read settings.json at {}: {e}",
+                path.display()
+            ));
+        }
     };
 
-    serde_json::from_str::<NetworkDiscoverySettings>(&content).unwrap_or_default()
+    parse_network_discovery_settings(&content)
+}
+
+fn load_network_discovery_settings() -> NetworkDiscoverySettings {
+    try_load_network_discovery_settings().unwrap_or_default()
 }
 
 fn save_network_discovery_settings(settings: &NetworkDiscoverySettings) -> Result<(), String> {
@@ -1630,6 +1647,33 @@ mod debug_relay_config_tests {
     }
 
     #[test]
+    fn test_block_discovery_without_relay_source_is_ignored() {
+        let cli = DebugRelayCliOptions {
+            relays: Vec::new(),
+            block_discovery: Some(true),
+        };
+
+        let resolved = resolve_debug_relay_options(
+            cli,
+            DebugRelayEnvOptions::default(),
+            &NetworkDiscoverySettings::default(),
+        )
+        .expect("block flag without relays should resolve to normal startup");
+
+        assert_eq!(resolved.relays, None);
+        assert!(!resolved.block_discovery);
+        assert_eq!(resolved.source, None);
+    }
+
+    #[test]
+    fn test_parse_network_discovery_settings_reports_malformed_json() {
+        let err = parse_network_discovery_settings("{not valid json")
+            .expect_err("malformed settings JSON should be reported");
+
+        assert!(err.contains("failed to parse settings.json"));
+    }
+
+    #[test]
     fn test_startup_relay_config_uses_debug_relays_without_defaults() {
         let resolved = ResolvedDebugRelayOptions {
             relays: Some(vec!["wss://debug.example.com/".to_string()]),
@@ -1699,7 +1743,10 @@ fn main() {
     // Create subscription_registry BEFORE the async block (needed for validator spawn order)
     let subscription_registry = Arc::new(SubscriptionRegistry::new());
 
-    let network_settings = load_network_discovery_settings();
+    let network_settings = try_load_network_discovery_settings().unwrap_or_else(|e| {
+        eprintln!("Invalid network discovery settings: {}", e);
+        std::process::exit(2);
+    });
 
     let debug_relay_options = {
         let cli = parse_debug_relay_cli_args(std::env::args().skip(1).collect()).unwrap_or_else(
