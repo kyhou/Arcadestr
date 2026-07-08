@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use nostr_sdk::prelude::*;
 use serde::Serialize;
 
-use crate::relay_cache::RelayCache;
+use crate::relay_cache::{CachedRelayList, RelayCache};
 use crate::relay_hints::RelayHints;
+use crate::relay_manager::normalize_relay_urls;
 
 /// Connection type for lifecycle management
 #[derive(Clone, PartialEq, Debug)]
@@ -269,6 +270,58 @@ pub async fn dispatch_permanent_subscriptions(
     }
 }
 
+/// Returns whether an ephemeral relay can be used under debug policy.
+pub fn ephemeral_read_relay_allowed(
+    relay_url: &str,
+    blocks_discovery: bool,
+    debug_relays: Option<&[String]>,
+) -> bool {
+    if !blocks_discovery {
+        return true;
+    }
+
+    let Some(debug_relays) = debug_relays else {
+        tracing::debug!("Discovery is blocked; no debug relays allow ephemeral reads");
+        return false;
+    };
+
+    let Ok(mut normalized_urls) = normalize_relay_urls(vec![relay_url.to_string()]) else {
+        tracing::debug!(
+            "Discovery is blocked; skipping invalid ephemeral read relay: {}",
+            relay_url
+        );
+        return false;
+    };
+
+    let Some(normalized_url) = normalized_urls.pop() else {
+        return false;
+    };
+
+    if debug_relays.contains(&normalized_url) {
+        true
+    } else {
+        tracing::debug!(
+            "Discovery is blocked; skipping ephemeral read relay outside debug set: {}",
+            normalized_url
+        );
+        false
+    }
+}
+
+/// Selects the first cached relay allowed by debug policy.
+fn select_ephemeral_read_relay(
+    cached: &CachedRelayList,
+    blocks_discovery: bool,
+    debug_relays: Option<&[String]>,
+) -> Option<String> {
+    cached
+        .read_relays
+        .iter()
+        .chain(cached.write_relays.iter())
+        .find(|url| ephemeral_read_relay_allowed(url, blocks_discovery, debug_relays))
+        .cloned()
+}
+
 /// Dispatch ephemeral read connection for uncovered pubkey (Fix 5)
 pub async fn dispatch_ephemeral_read(
     client: &Client,
@@ -326,6 +379,28 @@ pub async fn dispatch_ephemeral_reads_batch(
         } else {
             None
         };
+
+        if let Some(url) = relay_url {
+            dispatch_ephemeral_read(client, pubkey, &url, registry).await;
+        } else {
+            tracing::warn!("No relay found for ephemeral read: {}", pubkey);
+        }
+    }
+}
+
+/// Dispatch ephemeral reads while enforcing debug relay policy.
+pub async fn dispatch_ephemeral_reads_batch_with_policy(
+    client: &Client,
+    pubkeys: &[String],
+    relay_cache: &Arc<RelayCache>,
+    registry: &Arc<SubscriptionRegistry>,
+    blocks_discovery: bool,
+    debug_relays: Option<&[String]>,
+) {
+    for pubkey in pubkeys {
+        let relay_url = relay_cache.get_relay_list(pubkey).and_then(|cached| {
+            select_ephemeral_read_relay(&cached, blocks_discovery, debug_relays)
+        });
 
         if let Some(url) = relay_url {
             dispatch_ephemeral_read(client, pubkey, &url, registry).await;
@@ -407,4 +482,59 @@ fn sanitize_relay_url(url: &str) -> String {
         .replace("ws://", "")
         .replace("/", "_")
         .replace(":", "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ephemeral_read_relay_policy_allows_all_when_discovery_unblocked() {
+        // Arrange
+        let debug_relays = Some(vec!["wss://debug.example/".to_string()]);
+
+        // Act
+        let allowed =
+            ephemeral_read_relay_allowed("wss://cached.example", false, debug_relays.as_deref());
+
+        // Assert
+        assert!(allowed);
+    }
+
+    #[test]
+    fn test_ephemeral_read_relay_policy_filters_to_debug_relays_when_blocked() {
+        // Arrange
+        let debug_relays = Some(vec!["wss://debug.example/".to_string()]);
+
+        // Act
+        let debug_allowed =
+            ephemeral_read_relay_allowed("wss://debug.example", true, debug_relays.as_deref());
+        let cached_allowed =
+            ephemeral_read_relay_allowed("wss://cached.example", true, debug_relays.as_deref());
+
+        // Assert
+        assert!(debug_allowed);
+        assert!(!cached_allowed);
+    }
+
+    #[test]
+    fn test_select_ephemeral_read_relay_uses_later_debug_relay_when_blocked() {
+        // Arrange
+        let debug_relays = Some(vec!["wss://debug.example/".to_string()]);
+        let cached = crate::relay_cache::CachedRelayList {
+            pubkey: "pubkey".to_string(),
+            read_relays: vec![
+                "wss://cached.example".to_string(),
+                "wss://debug.example".to_string(),
+            ],
+            write_relays: vec![],
+            updated_at: 0,
+        };
+
+        // Act
+        let selected = select_ephemeral_read_relay(&cached, true, debug_relays.as_deref());
+
+        // Assert
+        assert_eq!(selected.as_deref(), Some("wss://debug.example"));
+    }
 }

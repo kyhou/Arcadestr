@@ -36,7 +36,7 @@ use arcadestr_core::relay_hints::RelayHints;
 use arcadestr_core::relay_manager::normalize_relay_urls;
 use arcadestr_core::social_graph::SocialGraphDb;
 use arcadestr_core::subscriptions::{
-    dispatch_ephemeral_read, dispatch_ephemeral_reads_batch, dispatch_permanent_subscriptions,
+    dispatch_ephemeral_reads_batch_with_policy, dispatch_permanent_subscriptions,
     run_notification_loop, SubscriptionRegistry,
 };
 use arcadestr_core::user_cache::UserCache;
@@ -2187,7 +2187,6 @@ fn main() {
         bunker_relay: Option<String>, // NEW PARAMETER
     ) -> (UserProfile, Vec<String>) {
         use arcadestr_core::nostr::{build_relay_map, score_relays, select_relays};
-        use arcadestr_core::subscriptions::dispatch_ephemeral_read;
         use arcadestr_core::CachedRelayList;
         use std::collections::HashSet;
 
@@ -2459,14 +2458,24 @@ fn main() {
         if !selection.uncovered_pubkeys.is_empty() {
             let client = nostr.lock().await;
             let manager = client.relay_manager();
-            let manager_guard = manager.lock().await;
-            let inner_client = manager_guard.get_client();
+            drop(client);
 
-            dispatch_ephemeral_reads_batch(
-                inner_client,
+            let (inner_client, blocks_discovery, debug_relays) = {
+                let manager_guard = manager.lock().await;
+                (
+                    manager_guard.get_client_arc(),
+                    manager_guard.blocks_discovery(),
+                    manager_guard.debug_relays(),
+                )
+            };
+
+            dispatch_ephemeral_reads_batch_with_policy(
+                inner_client.as_ref(),
                 &selection.uncovered_pubkeys,
                 &relay_cache,
                 &subscription_registry,
+                blocks_discovery,
+                debug_relays.as_deref(),
             )
             .await;
 
