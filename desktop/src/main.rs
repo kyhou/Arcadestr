@@ -1542,12 +1542,8 @@ mod debug_relay_config_tests {
         ])
         .expect("cli should parse");
 
-        let resolved = resolve_debug_relay_options(
-            cli,
-            DebugRelayEnvOptions::default(),
-            &settings,
-        )
-        .expect("options should resolve");
+        let resolved = resolve_debug_relay_options(cli, DebugRelayEnvOptions::default(), &settings)
+            .expect("options should resolve");
 
         assert_eq!(
             resolved.relays,
@@ -1567,12 +1563,8 @@ mod debug_relay_config_tests {
         let env = parse_debug_relay_env(Some("wss://env.example".to_string()), None)
             .expect("env should parse");
 
-        let resolved = resolve_debug_relay_options(
-            DebugRelayCliOptions::default(),
-            env,
-            &settings,
-        )
-        .expect("options should resolve");
+        let resolved = resolve_debug_relay_options(DebugRelayCliOptions::default(), env, &settings)
+            .expect("options should resolve");
 
         assert_eq!(
             resolved.relays,
