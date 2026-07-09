@@ -61,6 +61,7 @@ fn hero_buy_panel_metadata(
     vec![
         format!("Publisher: {}", stall_name.unwrap_or("Independent")),
         release_label.to_string(),
+        format!("Protocol: {protocol_label}"),
     ]
 }
 
