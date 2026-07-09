@@ -710,6 +710,30 @@ pub const UI_V2_STYLES: &str = r#"
   display: grid;
   gap: var(--v2-space-2);
   align-content: start;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.v2-detail-buy-panel .v2-btn-primary,
+.v2-detail-buy-panel .v2-btn-secondary,
+.v2-detail-buy-panel .v2-btn-ghost {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: var(--v2-space-2) var(--v2-space-3);
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.v2-detail-buy-panel > * {
+  min-width: 0;
+}
+
+.v2-detail-buy-panel .v2-social-meta {
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .v2-detail-price {
@@ -1734,3 +1758,39 @@ pub const UI_V2_STYLES: &str = r#"
   }
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detail_buy_panel_buttons_are_full_width_touch_targets() {
+        let buy_panel_rule = ".v2-detail-buy-panel .v2-btn-primary";
+        let rule_start = UI_V2_STYLES
+            .find(buy_panel_rule)
+            .expect("detail buy panel button rule should exist");
+        let rule = &UI_V2_STYLES[rule_start..];
+        let rule = &rule[..rule.find('}').expect("rule should close")];
+
+        assert!(rule.contains("width: 100%;"));
+        assert!(rule.contains("max-width: 100%;"));
+        assert!(rule.contains("min-width: 0;"));
+        assert!(rule.contains("min-height:"));
+        assert!(rule.contains("padding:"));
+        assert!(rule.contains("overflow-wrap: anywhere;"));
+    }
+
+    #[test]
+    fn detail_buy_panel_metadata_wraps_long_values() {
+        let meta_rule = ".v2-detail-buy-panel .v2-social-meta";
+        let rule_start = UI_V2_STYLES
+            .find(meta_rule)
+            .expect("detail buy panel metadata rule should exist");
+        let rule = &UI_V2_STYLES[rule_start..];
+        let rule = &rule[..rule.find('}').expect("rule should close")];
+
+        assert!(rule.contains("min-width: 0;"));
+        assert!(rule.contains("max-width: 100%;"));
+        assert!(rule.contains("overflow-wrap: anywhere;"));
+    }
+}
