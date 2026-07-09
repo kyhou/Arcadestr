@@ -276,6 +276,24 @@ impl PlatformInfo {
 // ── UserProfile ───────────────────────────────────────────────────────────────
 // (unchanged from original)
 
+pub fn npub_fallback_label(npub: &str) -> String {
+    let char_count = npub.chars().count();
+    if char_count <= 24 {
+        return npub.to_string();
+    }
+
+    let prefix = npub.chars().take(12).collect::<String>();
+    let suffix = npub
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}...{suffix}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserProfile {
     pub npub: String,
@@ -300,13 +318,7 @@ impl UserProfile {
         self.display_name
             .clone()
             .or_else(|| self.name.clone())
-            .unwrap_or_else(|| {
-                if self.npub.len() > 16 {
-                    format!("{}...", &self.npub[..16])
-                } else {
-                    self.npub.clone()
-                }
-            })
+            .unwrap_or_else(|| npub_fallback_label(&self.npub))
     }
 }
 
@@ -476,6 +488,21 @@ mod tests {
         assert!(!empty.has_metadata());
         assert!(named.has_metadata());
         assert!(pictured.has_metadata());
+    }
+
+    #[test]
+    fn user_profile_display_falls_back_to_abbreviated_npub() {
+        let profile = UserProfile {
+            npub: "npub1vcq8nv3l2wcjdecvyk0xhqacdwa505fqn6zpqwmwpd6syj3d9l".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(profile.display(), "npub1vcq8nv3...6syj3d9l");
+    }
+
+    #[test]
+    fn npub_fallback_label_keeps_short_values_unchanged() {
+        assert_eq!(npub_fallback_label("npub1short"), "npub1short");
     }
 
     #[test]

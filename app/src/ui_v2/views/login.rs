@@ -2,6 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::BackupManager;
+use crate::models::npub_fallback_label;
 use crate::ui_v2::theme::UI_V2_STYLES;
 use crate::{
     invoke_check_qr_connection, invoke_connect_bunker, invoke_connect_nip07,
@@ -531,7 +532,7 @@ pub fn LoginV2View() -> impl IntoView {
                                                     .clone()
                                                     .or(acc.username.clone())
                                                     .or(acc.name.clone())
-                                                    .unwrap_or(acc.npub.clone());
+                                                    .unwrap_or_else(|| npub_fallback_label(&acc.npub));
                                                 let account_avatar = acc.picture.clone();
                                                 let is_current = acc.is_current;
                                                 let avatar_fallback = account_label

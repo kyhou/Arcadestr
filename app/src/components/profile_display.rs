@@ -1,6 +1,7 @@
 //! Profile display name component - shows display_name or name or npub fallback
 
 use crate::components::ProfileAvatar;
+use crate::models::npub_fallback_label;
 use crate::store::profiles::use_profile;
 use leptos::prelude::*;
 
@@ -34,16 +35,9 @@ pub fn ProfileDisplayName(
                         }.into_any()
                     }
                     None => {
-                        // Show truncated npub as fallback
-                        let display = if let Some(len) = truncate_npub {
-                            if npub.len() > len {
-                                format!("{}...", &npub[..len])
-                            } else {
-                                npub.clone()
-                            }
-                        } else {
-                            npub.clone()
-                        };
+                        // Show the shared human-facing npub fallback label.
+                        let _ = truncate_npub;
+                        let display = npub_fallback_label(&npub);
                         view! {
                             <span class="npub-fallback" style:font-family="monospace" style:color="#666">
                                 {display}

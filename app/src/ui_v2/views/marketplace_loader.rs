@@ -7,7 +7,7 @@ use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::invoke_fetch_marketplace_stream;
-use crate::models::{GameListing, ListingSource};
+use crate::models::{npub_fallback_label, GameListing, ListingSource};
 use crate::store::{try_use_marketplace_store, DEFAULT_LISTING_TTL_SECS};
 
 // ── Batch flusher for progressive listing updates ────────────────────────────
@@ -62,7 +62,7 @@ pub fn listing_publisher(listing: &GameListing) -> String {
         .stall_name
         .clone()
         .map(|name| format!("by {}", name))
-        .unwrap_or_else(|| format!("by {}", short_npub(&listing.publisher_npub)))
+        .unwrap_or_else(|| format!("by {}", npub_fallback_label(&listing.publisher_npub)))
 }
 
 pub fn use_marketplace_listings() -> MarketplaceListingsState {
@@ -433,13 +433,6 @@ fn format_usd_hint(price_sats: u64) -> String {
     format!("~${:.2} USD", usd)
 }
 
-fn short_npub(npub: &str) -> String {
-    if npub.len() <= 16 {
-        return npub.to_string();
-    }
-    format!("{}...{}", &npub[..8], &npub[npub.len() - 4..])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +484,16 @@ mod tests {
         assert_eq!(presentation.cta_label, "Buy Now");
         assert!(!presentation.is_free);
         assert_eq!(presentation.price_hint.as_deref(), Some("~$4.25 USD"));
+    }
+
+    #[test]
+    fn listing_publisher_falls_back_to_abbreviated_npub() {
+        let mut listing = listing_with_sats(21_000);
+        listing.stall_name = None;
+        listing.publisher_npub =
+            "npub1vcq8nv3l2wcjdecvyk0xhqacdwa505fqn6zpqwmwpd6syj3d9l".to_string();
+
+        assert_eq!(listing_publisher(&listing), "by npub1vcq8nv3...6syj3d9l");
     }
 
     #[test]

@@ -4616,11 +4616,7 @@ fn MainView(relay_count: RwSignal<usize>) -> impl IntoView {
             }
             name
         } else if let Some(n) = get_npub() {
-            let name = if n.len() > 16 {
-                format!("{}...", &n[..16])
-            } else {
-                n
-            };
+            let name = crate::models::npub_fallback_label(&n);
             #[cfg(debug_assertions)]
             {
                 web_sys::console::log_1(&format!("Display name from npub: {}", name).into());

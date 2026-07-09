@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::models::GameListing;
+use crate::models::{npub_fallback_label, GameListing};
 use crate::relay_state::{apply_relay_event, merge_relay_snapshot};
 use crate::ui_v2::components::{NavItem, TopBar};
 use crate::ui_v2::theme::UI_V2_STYLES;
@@ -139,7 +139,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
         auth.profile
             .get()
             .map(|profile| profile.display())
-            .or_else(|| auth.npub.get())
+            .or_else(|| auth.npub.get().map(|npub| npub_fallback_label(&npub)))
             .unwrap_or_else(|| "Neon Curator".to_string())
     });
     let avatar_url = Signal::derive(move || {

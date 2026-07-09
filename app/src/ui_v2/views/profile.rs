@@ -2,8 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::BadgeShowcase;
-use crate::models::GameListing;
-use crate::models::{Nip05Status, Nip49ExportResult};
+use crate::models::{npub_fallback_label, GameListing, Nip05Status, Nip49ExportResult};
 use crate::tauri_bridge::invoke_verify_nip05;
 use crate::ui_v2::views::marketplace_loader::use_marketplace_listings_with_limit;
 use crate::AuthContext;
@@ -177,7 +176,7 @@ pub fn ProfileV2View(
         auth.profile
             .get()
             .map(|profile| profile.display())
-            .or_else(|| auth.npub.get())
+            .or_else(|| auth.npub.get().map(|npub| npub_fallback_label(&npub)))
             .unwrap_or_else(|| "Unknown".to_string())
     });
 

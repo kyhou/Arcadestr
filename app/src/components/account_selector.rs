@@ -1,4 +1,4 @@
-use crate::models::Nip49ImportRequest;
+use crate::models::{npub_fallback_label, Nip49ImportRequest};
 use crate::store::profiles::use_profile;
 use crate::{AuthContext, StoredAccount};
 use leptos::prelude::*;
@@ -13,6 +13,18 @@ const BECH32_CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 enum AddAccountTab {
     ExistingMethods,
     ImportFromBackup,
+}
+
+fn stored_account_display_name(
+    display_name: Option<String>,
+    username: Option<String>,
+    account_name: Option<String>,
+    npub: &str,
+) -> String {
+    display_name
+        .or(username)
+        .or(account_name)
+        .unwrap_or_else(|| npub_fallback_label(npub))
 }
 
 fn validate_nip49_password(password: &str) -> Result<(), String> {
@@ -346,6 +358,7 @@ pub fn AccountSelector(
                                             let account_name_for_display = account_name.clone();
                                             let stored_disp_name = stored_display_name.clone();
                                             let stored_user = stored_username.clone();
+                                            let account_npub_for_display = account_npub.clone();
 
                                             move || {
                                                 // First try reactive profile store
@@ -353,10 +366,12 @@ pub fn AccountSelector(
                                                     Some(profile) => profile.display(),
                                                     None => {
                                                         // Use stored data: display_name > username > account name > npub
-                                                        stored_disp_name.clone()
-                                                            .or_else(|| stored_user.clone())
-                                                            .or_else(|| account_name_for_display.clone())
-                                                            .unwrap_or_else(|| "Unnamed Account".to_string())
+                                                        stored_account_display_name(
+                                                            stored_disp_name.clone(),
+                                                            stored_user.clone(),
+                                                            account_name_for_display.clone(),
+                                                            &account_npub_for_display,
+                                                        )
                                                     }
                                                 }
                                             }
@@ -509,5 +524,34 @@ pub fn AccountSelector(
                 </Show>
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_account_display_name_prefers_named_fields() {
+        let display = stored_account_display_name(
+            Some("Display".to_string()),
+            Some("username".to_string()),
+            Some("Account".to_string()),
+            "npub1vcq8nv3l2wcjdecvyk0xhqacdwa505fqn6zpqwmwpd6syj3d9l",
+        );
+
+        assert_eq!(display, "Display");
+    }
+
+    #[test]
+    fn stored_account_display_name_falls_back_to_abbreviated_npub() {
+        let display = stored_account_display_name(
+            None,
+            None,
+            None,
+            "npub1vcq8nv3l2wcjdecvyk0xhqacdwa505fqn6zpqwmwpd6syj3d9l",
+        );
+
+        assert_eq!(display, "npub1vcq8nv3...6syj3d9l");
     }
 }
