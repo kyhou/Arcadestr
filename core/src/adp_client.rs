@@ -247,8 +247,16 @@ impl AdpClient {
 
     /// Downloads a game archive to `dest`.
     ///
+    /// Builds either a token-authenticated download URL or a NIP-98
+    /// `Authorization` header before streaming the response to disk.
+    ///
     /// # Errors
-    /// Always returns [`AdpClientError::NotImplemented`] in Gate 1.
+    /// Returns [`AdpClientError::Auth`] when NIP-98 authentication cannot be
+    /// built, [`AdpClientError::DownloadOwnership`] for HTTP 403 responses,
+    /// [`AdpClientError::DownloadDistribution`] for HTTP 451 responses,
+    /// [`AdpClientError::DownloadProtocol`] for other unsuccessful download
+    /// statuses, or [`AdpClientError::Http`] when the HTTP stream or local file
+    /// write fails.
     pub async fn download(
         &self,
         game_coordinate: &str,
@@ -256,13 +264,19 @@ impl AdpClient {
         dest: &Path,
         mut on_progress: impl FnMut(u64, Option<u64>) + Send,
     ) -> Result<DownloadOutcome, AdpClientError> {
+        let encoded_coordinate = urlencoding::encode(game_coordinate);
         let (url, headers) = match auth {
-            DownloadAuth::Token(token) => (
-                self.url(&format!("/game/{game_coordinate}?token={token}")),
-                Vec::new(),
-            ),
+            DownloadAuth::Token(token) => {
+                let encoded_token = urlencoding::encode(&token);
+                (
+                    self.url(&format!(
+                        "/game/{encoded_coordinate}?token={encoded_token}"
+                    )),
+                    Vec::new(),
+                )
+            }
             DownloadAuth::Nip98 { signer } => {
-                let url = self.url(&format!("/game/{game_coordinate}"));
+                let url = self.url(&format!("/game/{encoded_coordinate}"));
                 let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
                 (url, vec![("Authorization".to_string(), auth_header)])
             }
@@ -359,7 +373,7 @@ mod tests {
         let token = "download-token";
         let coordinate = "30406:publisher:test-game";
         let http = Arc::new(MockHttpClient::new().with_download_response(
-            "https://dist.example.com/game/30406:publisher:test-game?token=download-token",
+            "https://dist.example.com/game/30406%3Apublisher%3Atest-game?token=download-token",
             expected_bytes.as_slice(),
         ));
         let client = AdpClient::new("https://dist.example.com", http);
@@ -389,9 +403,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_percent_encodes_coordinate_and_token() {
+        let coordinate = "30406:publisher/game name";
+        let token = "token with spaces&scope=bad";
+        let expected_url = "https://dist.example.com/game/30406%3Apublisher%2Fgame%20name?token=token%20with%20spaces%26scope%3Dbad";
+        let http = Arc::new(MockHttpClient::new().with_download_response(
+            expected_url,
+            b"encoded download",
+        ));
+        let client = AdpClient::new("https://dist.example.com", http.clone());
+        let dest = temp_download_path("encoded-url");
+
+        client
+            .download(
+                coordinate,
+                DownloadAuth::Token(token.to_string()),
+                &dest,
+                |_bytes, _total| {},
+            )
+            .await
+            .expect("download should encode URL components");
+
+        assert_eq!(http.call_count(expected_url), 1);
+        assert_eq!(http.last_requested_url().as_deref(), Some(expected_url));
+
+        let _ = std::fs::remove_file(dest);
+    }
+
+    #[tokio::test]
     async fn download_with_nip98_sets_authorization_header() {
         let coordinate = "30406:publisher:test-game";
-        let url = "https://dist.example.com/game/30406:publisher:test-game";
+        let url = "https://dist.example.com/game/30406%3Apublisher%3Atest-game";
         let http = Arc::new(MockHttpClient::new().with_download_response(url, b"nip98 bytes"));
         let client = AdpClient::new("https://dist.example.com", http.clone());
         let signer = LocalSigner::from_hex(
@@ -428,7 +470,7 @@ mod tests {
     #[tokio::test]
     async fn download_403_returns_ownership_error() {
         let coordinate = "30406:publisher:test-game";
-        let url = "https://dist.example.com/game/30406:publisher:test-game?token=expired-token";
+        let url = "https://dist.example.com/game/30406%3Apublisher%3Atest-game?token=expired-token";
         let http = Arc::new(MockHttpClient::new().with_download_error(
             url,
             HttpClientError::StatusWithBody {
@@ -456,7 +498,7 @@ mod tests {
     #[tokio::test]
     async fn download_451_returns_distribution_error() {
         let coordinate = "30406:publisher:test-game";
-        let url = "https://dist.example.com/game/30406:publisher:test-game?token=valid-token";
+        let url = "https://dist.example.com/game/30406%3Apublisher%3Atest-game?token=valid-token";
         let http = Arc::new(MockHttpClient::new().with_download_error(
             url,
             HttpClientError::StatusWithBody {
