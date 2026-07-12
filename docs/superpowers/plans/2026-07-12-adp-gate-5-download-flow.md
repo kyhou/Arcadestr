@@ -20,6 +20,15 @@
 - `install_game` must preflight local ownership before any ADP download request. If the buyer has no valid local receipt for the coordinate, fail clearly with a client-side `purchase not found` / `you do not own this game` error and do not fall through to Path B/NIP-98.
 - Gate 5 live purchase setup uses the Gate 4 fixture/manual-preimage Path B purchase flow (`gen_test_invoice`/manual preimage style), not live NWC wallet chasing.
 
+## Logged Future Testing-Seam Decision
+
+Gate 5 hit the cross-crate `core::test_helpers` visibility wall again while adding desktop-side install tests. This is now a repeated pattern, not a one-off. Before Gate 6 or future desktop-side ADP test work, decide explicitly between:
+
+- adding a deliberate `test-utils` Cargo feature that exposes reusable `core` HTTP mocks to dependent crate tests; or
+- keeping duplicated local mocks per crate as the standing convention.
+
+For Gate 5, keep the local-mock-per-crate approach to avoid widening `core::test_helpers` visibility incidentally.
+
 ## Files and Responsibilities
 
 - Modify `core/src/adp_client.rs`

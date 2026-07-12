@@ -907,7 +907,7 @@ fn get_platform_info() -> arcadestr_app::models::PlatformInfo {
 
 type InstallFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-trait FreshListingFetcher {
+trait FreshListingFetcher: Send + Sync {
     fn fetch<'a>(&'a self, coordinate: &'a str) -> InstallFuture<'a, Result<nostr::Event, String>>;
 }
 
@@ -1377,16 +1377,135 @@ async fn request_invoice(
 mod install_game_tests {
     use super::*;
 
+    use std::collections::{HashMap, VecDeque};
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use arcadestr_core::adp_storage::{DownloadToken, DownloadTokensRepository};
     use arcadestr_core::file_hash::sha256_file;
+    use arcadestr_core::http_client::{HttpClientError, HttpDownloadOutcome};
     use arcadestr_core::purchases::StoredReceipt;
     use arcadestr_core::storage::Database;
-    use arcadestr_core::test_helpers::http_mocks::MockHttpClient;
     use nostr::nips::nip19::ToBech32;
     use nostr::{Event, EventBuilder, Keys, Kind, Tag, TagKind, Timestamp};
     use tokio::sync::{Mutex as AsyncMutex, RwLock};
+
+    #[derive(Clone, Default)]
+    struct MockHttpClient {
+        state: Arc<Mutex<MockHttpState>>,
+    }
+
+    #[derive(Default)]
+    struct MockHttpState {
+        download_responses: HashMap<String, VecDeque<Vec<u8>>>,
+        download_headers: HashMap<String, Vec<(String, String)>>,
+        requested_urls: Vec<String>,
+        call_counts: HashMap<String, usize>,
+    }
+
+    impl MockHttpClient {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_download_response(self, url: &str, body: impl Into<Vec<u8>>) -> Self {
+            self.state
+                .lock()
+                .expect("mock http state mutex poisoned")
+                .download_responses
+                .entry(url.to_string())
+                .or_default()
+                .push_back(body.into());
+            self
+        }
+
+        fn call_count(&self, url: &str) -> usize {
+            self.state
+                .lock()
+                .expect("mock http state mutex poisoned")
+                .call_counts
+                .get(url)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn last_download_headers(&self, url: &str) -> Option<Vec<(String, String)>> {
+            self.state
+                .lock()
+                .expect("mock http state mutex poisoned")
+                .download_headers
+                .get(url)
+                .cloned()
+        }
+
+        fn last_requested_url(&self) -> Option<String> {
+            self.state
+                .lock()
+                .expect("mock http state mutex poisoned")
+                .requested_urls
+                .last()
+                .cloned()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for MockHttpClient {
+        async fn get_json(&self, _url: &str) -> Result<serde_json::Value, HttpClientError> {
+            Err(HttpClientError::Request(
+                "get_json path should not be used in install_game tests".to_string(),
+            ))
+        }
+
+        async fn get_json_no_redirects(
+            &self,
+            _url: &str,
+        ) -> Result<serde_json::Value, HttpClientError> {
+            Err(HttpClientError::Request(
+                "get_json_no_redirects path should not be used in install_game tests".to_string(),
+            ))
+        }
+
+        async fn post_json(
+            &self,
+            _url: &str,
+            _body: serde_json::Value,
+            _headers: Vec<(String, String)>,
+        ) -> Result<serde_json::Value, HttpClientError> {
+            Err(HttpClientError::Request(
+                "post_json path should not be used in install_game tests".to_string(),
+            ))
+        }
+
+        async fn download_to_path(
+            &self,
+            url: &str,
+            headers: Vec<(String, String)>,
+            dest: &Path,
+            on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<HttpDownloadOutcome, HttpClientError> {
+            let bytes = {
+                let mut state = self.state.lock().expect("mock http state mutex poisoned");
+                state.requested_urls.push(url.to_string());
+                *state.call_counts.entry(url.to_string()).or_insert(0) += 1;
+                state.download_headers.insert(url.to_string(), headers);
+                state
+                    .download_responses
+                    .get_mut(url)
+                    .and_then(VecDeque::pop_front)
+                    .ok_or_else(|| {
+                        HttpClientError::Request(format!(
+                            "No mock download response configured for URL: {url}"
+                        ))
+                    })?
+            };
+
+            std::fs::write(dest, &bytes).map_err(|error| HttpClientError::Request(error.to_string()))?;
+            let bytes_written = bytes.len() as u64;
+            on_progress(bytes_written, Some(bytes_written));
+            Ok(HttpDownloadOutcome { bytes_written })
+        }
+    }
 
     struct StaticFreshListingFetcher {
         event: Event,
@@ -1575,7 +1694,8 @@ mod install_game_tests {
         let artifact_bytes = b"owned artifact";
         let file_hash = sha256_hex(artifact_bytes).await;
         let server_url = "https://dist.example.com";
-        let encoded_coordinate = urlencoding::encode(&coordinate(&merchant, listing_id));
+        let coordinate = coordinate(&merchant, listing_id);
+        let encoded_coordinate = urlencoding::encode(&coordinate);
         let download_url = format!("{server_url}/game/{encoded_coordinate}");
         let http = MockHttpClient::new().with_download_response(&download_url, artifact_bytes);
         let state = app_state_with_http(
