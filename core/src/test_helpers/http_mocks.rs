@@ -1,16 +1,18 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::http_client::{HttpClient, HttpClientError};
+use crate::http_client::{HttpClient, HttpClientError, HttpDownloadOutcome};
 
 #[derive(Default)]
 struct MockState {
     responses: HashMap<String, VecDeque<Result<Value, HttpClientError>>>,
     no_redirect_responses: HashMap<String, VecDeque<Result<Value, HttpClientError>>>,
     post_responses: HashMap<String, VecDeque<Result<Value, HttpClientError>>>,
+    download_responses: HashMap<String, VecDeque<Result<Vec<u8>, HttpClientError>>>,
     prefix_responses: Vec<(String, VecDeque<Result<Value, HttpClientError>>)>,
     call_counts: HashMap<String, usize>,
     no_redirect_call_counts: HashMap<String, usize>,
@@ -18,6 +20,7 @@ struct MockState {
     requested_urls: Vec<String>,
     post_bodies: HashMap<String, Value>,
     post_headers: HashMap<String, Vec<(String, String)>>,
+    download_headers: HashMap<String, Vec<(String, String)>>,
 }
 
 /// In-memory HTTP mock for unit tests.
@@ -48,6 +51,16 @@ impl MockHttpClient {
 
     pub fn with_post_error_response(self, url: &str, err: HttpClientError) -> Self {
         self.push_post_response(url, Err(err));
+        self
+    }
+
+    pub fn with_download_response(self, url: &str, body: impl Into<Vec<u8>>) -> Self {
+        self.push_download_response(url, Ok(body.into()));
+        self
+    }
+
+    pub fn with_download_error(self, url: &str, err: HttpClientError) -> Self {
+        self.push_download_response(url, Err(err));
         self
     }
 
@@ -149,6 +162,15 @@ impl MockHttpClient {
             .cloned()
     }
 
+    pub fn last_download_headers(&self, url: &str) -> Option<Vec<(String, String)>> {
+        self.state
+            .lock()
+            .expect("mock_http_client state mutex poisoned")
+            .download_headers
+            .get(url)
+            .cloned()
+    }
+
     pub fn last_requested_url(&self) -> Option<String> {
         self.state
             .lock()
@@ -189,6 +211,18 @@ impl MockHttpClient {
             .expect("mock_http_client state mutex poisoned");
         state
             .post_responses
+            .entry(url.to_string())
+            .or_default()
+            .push_back(response);
+    }
+
+    fn push_download_response(&self, url: &str, response: Result<Vec<u8>, HttpClientError>) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("mock_http_client state mutex poisoned");
+        state
+            .download_responses
             .entry(url.to_string())
             .or_default()
             .push_back(response);
@@ -300,6 +334,47 @@ impl HttpClient for MockHttpClient {
                 url
             ))),
         }
+    }
+
+    async fn download_to_path(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        dest: &Path,
+        on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> Result<HttpDownloadOutcome, HttpClientError> {
+        let response = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("mock_http_client state mutex poisoned");
+
+            state.requested_urls.push(url.to_string());
+            *state.call_counts.entry(url.to_string()).or_insert(0) += 1;
+            state.download_headers.insert(url.to_string(), headers);
+
+            match state.download_responses.get_mut(url) {
+                Some(queue) if !queue.is_empty() => queue.pop_front(),
+                _ => None,
+            }
+        };
+
+        let bytes = match response {
+            Some(Ok(bytes)) => bytes,
+            Some(Err(err)) => return Err(err),
+            None => {
+                return Err(HttpClientError::Request(format!(
+                    "No mock download response configured for URL: {}",
+                    url
+                )))
+            }
+        };
+
+        std::fs::write(dest, &bytes).map_err(|e| HttpClientError::Request(e.to_string()))?;
+        let bytes_written = bytes.len() as u64;
+        on_progress(bytes_written, Some(bytes_written));
+
+        Ok(HttpDownloadOutcome { bytes_written })
     }
 }
 

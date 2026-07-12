@@ -37,6 +37,18 @@ pub enum AdpClientError {
     /// The requested operation belongs to a later implementation gate.
     #[error("ADP operation is not implemented in Gate 1: {0}")]
     NotImplemented(&'static str),
+
+    /// The server rejected the buyer's ownership proof.
+    #[error("ADP download ownership/auth failure: {0}")]
+    DownloadOwnership(String),
+
+    /// The server is no longer authorized to distribute the listing.
+    #[error("ADP download server no longer distributes this listing: {0}")]
+    DownloadDistribution(String),
+
+    /// The server returned a protocol-level download error.
+    #[error("ADP download protocol error: {0}")]
+    DownloadProtocol(String),
 }
 
 /// Public metadata returned by `GET /.well-known/adp`.
@@ -88,11 +100,10 @@ pub struct PurchaseConfirmResponse {
     pub token_expires_at: i64,
 }
 
-/// Download authentication strategy for a later gate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DownloadAuth {
+/// Download authentication strategy for game archive fetches.
+pub enum DownloadAuth<'a> {
     Token(String),
-    Nip98,
+    Nip98 { signer: &'a dyn NostrSigner },
 }
 
 /// Result of an ADP download operation in a later gate.
@@ -240,16 +251,60 @@ impl AdpClient {
     /// Always returns [`AdpClientError::NotImplemented`] in Gate 1.
     pub async fn download(
         &self,
-        _game_coordinate: &str,
-        _auth: DownloadAuth,
-        _dest: &Path,
-        _on_progress: impl FnMut(u64, Option<u64>),
+        game_coordinate: &str,
+        auth: DownloadAuth<'_>,
+        dest: &Path,
+        mut on_progress: impl FnMut(u64, Option<u64>) + Send,
     ) -> Result<DownloadOutcome, AdpClientError> {
-        Err(AdpClientError::NotImplemented("download"))
+        let (url, headers) = match auth {
+            DownloadAuth::Token(token) => (
+                self.url(&format!("/game/{game_coordinate}?token={token}")),
+                Vec::new(),
+            ),
+            DownloadAuth::Nip98 { signer } => {
+                let url = self.url(&format!("/game/{game_coordinate}"));
+                let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
+                (url, vec![("Authorization".to_string(), auth_header)])
+            }
+        };
+
+        let outcome = self
+            .http
+            .download_to_path(&url, headers, dest, &mut on_progress)
+            .await
+            .map_err(map_download_error)?;
+
+        Ok(DownloadOutcome {
+            bytes_written: outcome.bytes_written,
+        })
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+}
+
+fn map_download_error(err: HttpClientError) -> AdpClientError {
+    match err {
+        HttpClientError::Status(403) => {
+            AdpClientError::DownloadOwnership("ownership check failed".to_string())
+        }
+        HttpClientError::StatusWithBody { status: 403, body } => {
+            AdpClientError::DownloadOwnership(body)
+        }
+        HttpClientError::Status(451) => AdpClientError::DownloadDistribution(
+            "server is not authorized to distribute this file".to_string(),
+        ),
+        HttpClientError::StatusWithBody { status: 451, body } => {
+            AdpClientError::DownloadDistribution(body)
+        }
+        HttpClientError::Status(status) => {
+            AdpClientError::DownloadProtocol(format!("HTTP status {status}"))
+        }
+        HttpClientError::StatusWithBody { status, body } => {
+            AdpClientError::DownloadProtocol(format!("HTTP status {status}: {body}"))
+        }
+        other => AdpClientError::Http(other),
     }
 }
 
@@ -267,6 +322,7 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::signers::LocalSigner;
     use crate::test_helpers::http_mocks::MockHttpClient;
 
     #[tokio::test]
@@ -295,6 +351,148 @@ mod tests {
             http.call_count("https://dist.example.com/.well-known/adp"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn download_with_token_streams_file_and_reports_progress() {
+        let expected_bytes = b"downloaded artifact bytes";
+        let token = "download-token";
+        let coordinate = "30406:publisher:test-game";
+        let http = Arc::new(MockHttpClient::new().with_download_response(
+            "https://dist.example.com/game/30406:publisher:test-game?token=download-token",
+            expected_bytes.as_slice(),
+        ));
+        let client = AdpClient::new("https://dist.example.com", http);
+        let dest = temp_download_path("token-streams");
+        let mut progress_events = Vec::new();
+
+        let outcome = client
+            .download(
+                coordinate,
+                DownloadAuth::Token(token.to_string()),
+                &dest,
+                |bytes, total| progress_events.push((bytes, total)),
+            )
+            .await
+            .expect("download should stream to disk");
+
+        assert_eq!(
+            std::fs::read(&dest).expect("downloaded file should exist"),
+            expected_bytes
+        );
+        assert_eq!(outcome.bytes_written, expected_bytes.len() as u64);
+        assert!(progress_events
+            .iter()
+            .any(|event| event.0 == expected_bytes.len() as u64));
+
+        let _ = std::fs::remove_file(dest);
+    }
+
+    #[tokio::test]
+    async fn download_with_nip98_sets_authorization_header() {
+        let coordinate = "30406:publisher:test-game";
+        let url = "https://dist.example.com/game/30406:publisher:test-game";
+        let http = Arc::new(MockHttpClient::new().with_download_response(url, b"nip98 bytes"));
+        let client = AdpClient::new("https://dist.example.com", http.clone());
+        let signer = LocalSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("test signer should be valid");
+        let dest = temp_download_path("nip98-auth");
+
+        let _outcome = client
+            .download(
+                coordinate,
+                DownloadAuth::Nip98 { signer: &signer },
+                &dest,
+                |_bytes, _total| {},
+            )
+            .await
+            .expect("download should use NIP-98 auth");
+
+        let headers = http
+            .last_download_headers(url)
+            .expect("download headers should be captured");
+        let auth = headers
+            .iter()
+            .find(|(name, _)| name == "Authorization")
+            .map(|(_, value)| value.as_str())
+            .expect("Authorization header should be set");
+        assert!(auth.starts_with("Nostr "));
+        assert_eq!(http.call_count(url), 1);
+        assert_eq!(http.last_requested_url().as_deref(), Some(url));
+
+        let _ = std::fs::remove_file(dest);
+    }
+
+    #[tokio::test]
+    async fn download_403_returns_ownership_error() {
+        let coordinate = "30406:publisher:test-game";
+        let url = "https://dist.example.com/game/30406:publisher:test-game?token=expired-token";
+        let http = Arc::new(MockHttpClient::new().with_download_error(
+            url,
+            HttpClientError::StatusWithBody {
+                status: 403,
+                body: "ownership check failed".to_string(),
+            },
+        ));
+        let client = AdpClient::new("https://dist.example.com", http);
+        let dest = temp_download_path("ownership-error");
+
+        let err = client
+            .download(
+                coordinate,
+                DownloadAuth::Token("expired-token".to_string()),
+                &dest,
+                |_bytes, _total| {},
+            )
+            .await
+            .expect_err("403 should map to ownership/auth failure");
+
+        assert!(err.to_string().contains("ownership/auth failure"));
+        let _ = std::fs::remove_file(dest);
+    }
+
+    #[tokio::test]
+    async fn download_451_returns_distribution_error() {
+        let coordinate = "30406:publisher:test-game";
+        let url = "https://dist.example.com/game/30406:publisher:test-game?token=valid-token";
+        let http = Arc::new(MockHttpClient::new().with_download_error(
+            url,
+            HttpClientError::StatusWithBody {
+                status: 451,
+                body: "server not authorized".to_string(),
+            },
+        ));
+        let client = AdpClient::new("https://dist.example.com", http);
+        let dest = temp_download_path("distribution-error");
+
+        let err = client
+            .download(
+                coordinate,
+                DownloadAuth::Token("valid-token".to_string()),
+                &dest,
+                |_bytes, _total| {},
+            )
+            .await
+            .expect_err("451 should map to distribution authorization failure");
+
+        assert!(
+            err.to_string().contains("no longer distributes")
+                || err.to_string().contains("authorized")
+        );
+        let _ = std::fs::remove_file(dest);
+    }
+
+    fn temp_download_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "arcadestr-adp-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ))
     }
 
     #[tokio::test]
