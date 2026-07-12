@@ -1,5 +1,8 @@
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use tokio::io::AsyncWriteExt;
 
 use arcadestr_core::adp_storage::{InstalledGame, InstalledGamesRepository};
 use arcadestr_core::file_hash::sha256_file;
@@ -21,14 +24,12 @@ pub(crate) async fn verify_and_record_downloaded_game(
     })?;
 
     if actual_hash != expected_hash {
-        let quarantine_path = available_corrupt_artifact_path(dest_path).await?;
-        tokio::fs::rename(dest_path, &quarantine_path)
+        let quarantine_path = quarantine_corrupt_artifact(dest_path)
             .await
             .map_err(|err| {
                 format!(
-                    "downloaded file hash mismatch: expected {expected_hash}, got {actual_hash}; failed to quarantine at {}: {err}",
-                    quarantine_path.display()
-                )
+                "downloaded file hash mismatch: expected {expected_hash}, got {actual_hash}; {err}"
+            )
             })?;
         return Err(format!(
             "downloaded file hash mismatch: expected {expected_hash}, got {actual_hash}; quarantined at {}",
@@ -51,7 +52,7 @@ pub(crate) async fn verify_and_record_downloaded_game(
             installed_at,
         })
         .await
-        .map_err(|err| err.to_string())
+        .map_err(|err| format!("failed to record installed game {game_coordinate}: {err}"))
 }
 
 #[allow(dead_code)]
@@ -70,24 +71,18 @@ fn corrupt_artifact_path_with_suffix(dest_path: &Path, suffix: Option<usize>) ->
     dest_path.with_file_name(corrupt_name)
 }
 
-async fn available_corrupt_artifact_path(dest_path: &Path) -> Result<PathBuf, String> {
+async fn quarantine_corrupt_artifact(dest_path: &Path) -> Result<PathBuf, String> {
     let primary = corrupt_artifact_path(dest_path);
-    if !tokio::fs::try_exists(&primary)
-        .await
-        .map_err(|err| format!("failed to inspect quarantine path {}: {err}", primary.display()))?
-    {
-        return Ok(primary);
+    match copy_artifact_to_reserved_quarantine(dest_path, &primary).await? {
+        Some(quarantine_path) => return Ok(quarantine_path),
+        None => {}
     }
 
     for index in 1..=1024 {
         let candidate = corrupt_artifact_path_with_suffix(dest_path, Some(index));
-        if !tokio::fs::try_exists(&candidate).await.map_err(|err| {
-            format!(
-                "failed to inspect quarantine path {}: {err}",
-                candidate.display()
-            )
-        })? {
-            return Ok(candidate);
+        match copy_artifact_to_reserved_quarantine(dest_path, &candidate).await? {
+            Some(quarantine_path) => return Ok(quarantine_path),
+            None => continue,
         }
     }
 
@@ -95,6 +90,74 @@ async fn available_corrupt_artifact_path(dest_path: &Path) -> Result<PathBuf, St
         "no available quarantine path for {} after 1024 attempts",
         dest_path.display()
     ))
+}
+
+async fn copy_artifact_to_reserved_quarantine(
+    source_path: &Path,
+    quarantine_path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let mut target = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(quarantine_path)
+        .await
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to reserve quarantine path {}: {err}",
+                quarantine_path.display()
+            ));
+        }
+    };
+
+    let mut source = match tokio::fs::File::open(source_path).await {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = tokio::fs::remove_file(quarantine_path).await;
+            return Err(format!(
+                "failed to open corrupt artifact {} for quarantine: {err}",
+                source_path.display()
+            ));
+        }
+    };
+
+    if let Err(err) = tokio::io::copy(&mut source, &mut target).await {
+        let _ = tokio::fs::remove_file(quarantine_path).await;
+        return Err(format!(
+            "failed to copy corrupt artifact to quarantine path {}: {err}",
+            quarantine_path.display()
+        ));
+    }
+
+    if let Err(err) = target.flush().await {
+        let _ = tokio::fs::remove_file(quarantine_path).await;
+        return Err(format!(
+            "failed to flush quarantine path {}: {err}",
+            quarantine_path.display()
+        ));
+    }
+
+    if let Err(err) = target.sync_all().await {
+        let _ = tokio::fs::remove_file(quarantine_path).await;
+        return Err(format!(
+            "failed to sync quarantine path {}: {err}",
+            quarantine_path.display()
+        ));
+    }
+
+    drop(target);
+    drop(source);
+
+    tokio::fs::remove_file(source_path).await.map_err(|err| {
+        format!(
+            "failed to remove original corrupt artifact {} after quarantine: {err}",
+            source_path.display()
+        )
+    })?;
+
+    Ok(Some(quarantine_path.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -212,6 +275,67 @@ mod tests {
             .expect("lookup should work")
             .is_none());
         assert!(quarantine_path.exists());
+        assert!(!final_install_path.exists());
+
+        db.close().await;
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .expect("test dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn install_preserves_existing_corrupt_artifact_when_quarantining_hash_mismatch() {
+        let dir = unique_test_dir("hash-mismatch-existing-quarantine");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test dir should be created");
+        let db = test_db(&dir).await;
+        let repo = InstalledGamesRepository::new(db.pool().clone());
+        let expected_bytes = b"verified artifact bytes";
+        let expected_hash = sha256_hex(expected_bytes, &dir).await;
+        let coordinate = "30402:publisher:corrupt-game-with-existing-quarantine";
+        let final_install_path = dir.join("corrupt-game.zip");
+        let quarantine_path = corrupt_artifact_path(&final_install_path);
+        let suffixed_quarantine_path =
+            corrupt_artifact_path_with_suffix(&final_install_path, Some(1));
+        let existing_quarantine_bytes = b"previous corrupt artifact";
+        let corrupt_bytes = b"new corrupt bytes";
+        tokio::fs::write(&quarantine_path, existing_quarantine_bytes)
+            .await
+            .expect("existing quarantine artifact should be written");
+        tokio::fs::write(&final_install_path, corrupt_bytes)
+            .await
+            .expect("corrupt artifact should be written");
+
+        let err = verify_and_record_downloaded_game(
+            &repo,
+            coordinate,
+            &final_install_path,
+            &expected_hash,
+            None,
+            "https://dist.example.com",
+        )
+        .await
+        .expect_err("hash mismatch should fail");
+
+        assert!(err.contains("hash"));
+        assert!(repo
+            .get(coordinate)
+            .await
+            .expect("lookup should work")
+            .is_none());
+        assert_eq!(
+            tokio::fs::read(&quarantine_path)
+                .await
+                .expect("existing quarantine should remain readable"),
+            existing_quarantine_bytes
+        );
+        assert_eq!(
+            tokio::fs::read(&suffixed_quarantine_path)
+                .await
+                .expect("new quarantine should be readable"),
+            corrupt_bytes
+        );
         assert!(!final_install_path.exists());
 
         db.close().await;
