@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -16,7 +17,7 @@ use tracing::{error, info, warn};
 use arcadestr_core::signers::NostrSigner;
 
 use arcadestr_core::auth::AuthState;
-use arcadestr_core::adp_client::{AdpClient, DownloadAuth};
+use arcadestr_core::adp_client::{AdpClient, AdpClientError, DownloadAuth};
 use arcadestr_core::adp_storage::{DownloadTokensRepository, InstalledGamesRepository};
 use arcadestr_core::extended_network::ExtendedNetworkRepository;
 use arcadestr_core::http_client::{HttpClient, ReqwestHttpClient};
@@ -965,15 +966,34 @@ fn listing_tag_value(event: &nostr::Event, tag_name: &str) -> Option<String> {
     })
 }
 
+fn coordinate_artifact_dir_name(coordinate: &str) -> String {
+    let digest = Sha256::digest(coordinate.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn deterministic_artifact_path(app_data_dir: &Path, coordinate: &str) -> PathBuf {
-    let safe_coordinate: String = coordinate
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect();
     app_data_dir
         .join("games")
-        .join(safe_coordinate)
+        .join(coordinate_artifact_dir_name(coordinate))
         .join("artifact.bin")
+}
+
+fn desktop_download_error(error: AdpClientError) -> String {
+    match error {
+        AdpClientError::DownloadOwnership(message) => {
+            format!("download rejected: you do not own this game or the proof is invalid: {message}")
+        }
+        AdpClientError::DownloadDistribution(message) => {
+            format!("download rejected: this server no longer distributes this listing: {message}")
+        }
+        AdpClientError::DownloadProtocol(message) => {
+            format!("download failed because the ADP server returned an invalid response: {message}")
+        }
+        AdpClientError::Http(message) => format!("download HTTP request failed: {message}"),
+        AdpClientError::Auth(message) => format!("download authentication failed: {message}"),
+        AdpClientError::Io(message) => format!("download file I/O failed: {message}"),
+        other => format!("download failed: {other}"),
+    }
 }
 
 fn now_unix_i64() -> Result<i64, String> {
@@ -1048,7 +1068,7 @@ async fn install_game_with_fetcher<R: tauri::Runtime>(
             }
         })
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(desktop_download_error)?;
 
     let installed_games = InstalledGamesRepository::new(state.database.pool().clone());
     install::verify_and_record_downloaded_game(
@@ -1862,6 +1882,30 @@ mod install_game_tests {
         assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
         assert_eq!(http.call_count(&fresh_download_url), 1);
         assert_eq!(http.call_count(&stale_download_url), 0);
+    }
+
+    #[test]
+    fn deterministic_artifact_path_distinguishes_punctuation_collisions() {
+        let base = std::path::PathBuf::from("/tmp/arcadestr-install-path-test");
+        let colon_coordinate = "30402:abcdef:game:v1";
+        let question_coordinate = "30402:abcdef:game?v1";
+
+        assert_eq!(
+            colon_coordinate
+                .chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+                .collect::<String>(),
+            question_coordinate
+                .chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+                .collect::<String>(),
+            "fixture should represent the old underscore-collision behavior"
+        );
+
+        assert_ne!(
+            deterministic_artifact_path(&base, colon_coordinate),
+            deterministic_artifact_path(&base, question_coordinate)
+        );
     }
 }
 

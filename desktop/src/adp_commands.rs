@@ -240,18 +240,24 @@ pub(crate) async fn fetch_listing_event_by_coordinate(
 
     let developer_pubkey = nostr::PublicKey::from_hex(developer)
         .map_err(|err| format!("invalid coordinate developer pubkey: {err}"))?;
-    let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
-    let events = relay_manager
-        .lock()
-        .await
-        .fetch_events_with_timeout(
+    let relay_client = {
+        let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+        let manager = relay_manager.lock().await;
+        manager.get_client_arc()
+    };
+    let timeout_duration = std::time::Duration::from_secs(10);
+    let events = tokio::time::timeout(
+        timeout_duration,
+        relay_client.fetch_events(
             nostr::Filter::new()
                 .kind(nostr::Kind::Custom(30402))
                 .author(developer_pubkey)
                 .identifier(d_tag),
-            10,
-        )
+            timeout_duration,
+        ),
+    )
         .await
+        .map_err(|_| "listing event fetch timed out".to_string())?
         .map_err(|err| err.to_string())?;
     events
         .into_iter()

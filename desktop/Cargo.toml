@@ -17,6 +17,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nostr = { version = "0.44" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 rand = "0.10.0"
 urlencoding = "2.1"
 url = "2"
