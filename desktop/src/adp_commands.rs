@@ -921,6 +921,21 @@ mod tests {
                     ))
                 })
         }
+
+        async fn download_to_path(
+            &self,
+            _url: &str,
+            _headers: Vec<(String, String)>,
+            _dest: &std::path::Path,
+            _on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<
+            arcadestr_core::http_client::HttpDownloadOutcome,
+            arcadestr_core::http_client::HttpClientError,
+        > {
+            Err(arcadestr_core::http_client::HttpClientError::Request(
+                "download_to_path path should not be used in local desktop mock tests".to_string(),
+            ))
+        }
     }
 
     #[tokio::test]

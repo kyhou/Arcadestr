@@ -1,5 +1,7 @@
 use arcadestr_core::auth::AuthState;
-use arcadestr_core::http_client::{HttpClient, HttpClientError, ReqwestHttpClient};
+use arcadestr_core::http_client::{
+    HttpClient, HttpClientError, HttpDownloadOutcome, ReqwestHttpClient,
+};
 use arcadestr_core::storage::{encrypt_private_key_nip49, serialize_ncryptsec, ScryptParams};
 use async_trait::async_trait;
 use nostr::Keys;
@@ -67,6 +69,18 @@ impl HttpClient for StaticNoRedirectHttpClient {
     ) -> Result<Value, HttpClientError> {
         Err(HttpClientError::Request(
             "post_json path should not be used in NIP-49 command tests".to_string(),
+        ))
+    }
+
+    async fn download_to_path(
+        &self,
+        _url: &str,
+        _headers: Vec<(String, String)>,
+        _dest: &std::path::Path,
+        _on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> Result<HttpDownloadOutcome, HttpClientError> {
+        Err(HttpClientError::Request(
+            "download_to_path path should not be used in NIP-49 command tests".to_string(),
         ))
     }
 }
