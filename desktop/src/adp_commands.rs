@@ -1096,6 +1096,57 @@ mod tests {
         (publisher_npub, listing_id)
     }
 
+    fn live_app_listing_from_coordinate(coordinate: &str) -> arcadestr_app::models::GameListing {
+        let mut parts = coordinate.splitn(3, ':');
+        assert_eq!(parts.next(), Some("30402"));
+        let publisher_hex = parts.next().expect("coordinate publisher should exist");
+        let listing_id = parts.next().expect("coordinate d tag should exist");
+        let publisher_npub = nostr::PublicKey::from_hex(publisher_hex)
+            .expect("coordinate publisher should parse")
+            .to_bech32()
+            .expect("coordinate publisher should encode as npub");
+
+        arcadestr_app::models::GameListing {
+            id: listing_id.to_string(),
+            source: arcadestr_app::models::ListingSource::Nip99Listing,
+            title: format!("ADP live fixture {listing_id}"),
+            description: "ADP Gate 5 live install fixture".to_string(),
+            images: Vec::new(),
+            download_url: String::new(),
+            price: 1.0,
+            currency: "SATS".to_string(),
+            price_sats: 1,
+            quantity: None,
+            tags: Vec::new(),
+            specs: Vec::new(),
+            publisher_npub,
+            stall_id: String::new(),
+            stall_name: None,
+            lud16: String::new(),
+            event_id: None,
+            created_at: 1_700_000_000,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            is_owned: true,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
+        }
+    }
+
+    fn live_listing_file_hash(event: &nostr::Event) -> String {
+        tag_values(event, "file_hash")
+            .into_iter()
+            .find_map(|values| values.get(1).cloned())
+            .expect("live listing should include file_hash tag")
+    }
+
+    fn live_listing_server_url(event: &nostr::Event) -> String {
+        tag_values(event, "server")
+            .into_iter()
+            .find_map(|values| values.get(1).cloned())
+            .expect("live listing should include server tag")
+    }
+
     struct LiveConfirmPurchaseInput<'a> {
         app: &'a tauri::App<tauri::test::MockRuntime>,
         server_url: &'a str,
@@ -1204,7 +1255,8 @@ mod tests {
             .expect("ownership lookup should succeed");
         assert!(owned, "receipt persistence should flip is_owned");
 
-        let token_repo = DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
+        let token_repo =
+            DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
         let token = token_repo
             .valid_token(&coordinate, &server_url, now_unix_i64().expect("clock should work"))
             .await
@@ -1276,7 +1328,8 @@ mod tests {
             .expect("ownership lookup should succeed");
         assert!(owned, "manual receipt persistence should flip is_owned");
 
-        let token_repo = DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
+        let token_repo =
+            DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
         let token = token_repo
             .valid_token(&coordinate, &server_url, now_unix_i64().expect("clock should work"))
             .await
@@ -1284,5 +1337,164 @@ mod tests {
             .expect("download token should be stored");
         assert_eq!(token.token, response.download_token);
         println!("ADP_GATE4_MANUAL_DOWNLOAD_TOKEN={}", response.download_token);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ADP_TEST_SERVER_URL, ARCADESTR_RELAYS, ADP_TEST_GAME_COORDINATE, ADP_TEST_MANUAL_BOLT11, and ADP_TEST_MANUAL_PREIMAGE"]
+    async fn live_install_game_path_a_and_path_b() {
+        eprintln!("ADP_GATE5_STAGE=test_start");
+        let server_url = std::env::var("ADP_TEST_SERVER_URL")
+            .expect("ADP_TEST_SERVER_URL must be set for live Gate 5 test");
+        let coordinate = std::env::var("ADP_TEST_GAME_COORDINATE")
+            .expect("ADP_TEST_GAME_COORDINATE must be set for live Gate 5 test");
+        let bolt11 = std::env::var("ADP_TEST_MANUAL_BOLT11")
+            .expect("ADP_TEST_MANUAL_BOLT11 must be set for live Gate 5 test");
+        let preimage = std::env::var("ADP_TEST_MANUAL_PREIMAGE")
+            .expect("ADP_TEST_MANUAL_PREIMAGE must be set for live Gate 5 test");
+        let relays = live_relays_from_env();
+
+        eprintln!("ADP_GATE5_STAGE=app_init_start");
+        let app = live_test_app(relays).await;
+        eprintln!("ADP_GATE5_STAGE=app_init_ok");
+        let state = app.state::<AppState>();
+        let listing_event = fetch_listing_event_by_coordinate(&state, &coordinate)
+            .await
+            .expect("live listing event should fetch before install");
+        let expected_file_hash = live_listing_file_hash(&listing_event);
+        let listing_server_url = live_listing_server_url(&listing_event);
+        assert_eq!(
+            listing_server_url, server_url,
+            "ADP_TEST_SERVER_URL must match the listing server tag used by install_game"
+        );
+        let listing = live_app_listing_from_coordinate(&coordinate);
+        let (publisher_npub, listing_id) = listing_parts_from_coordinate(&coordinate);
+        let fresh_listing_fetcher = crate::RelayFreshListingFetcher {
+            state: state.clone(),
+        };
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .expect("live test app data dir should resolve");
+
+        eprintln!("ADP_GATE5_STAGE=manual_confirm_purchase_start");
+        let response = confirm_purchase(
+            ConfirmPurchaseRequest {
+                publisher_npub,
+                listing_id,
+                server_url: server_url.clone(),
+                bolt11,
+                preimage,
+            },
+            app.state::<AppState>(),
+        )
+        .await
+        .expect("manual preimage purchase confirmation should persist receipt and token");
+        eprintln!("ADP_GATE5_STAGE=manual_confirm_purchase_ok");
+        assert!(!response.download_token.is_empty());
+        assert!(response.token_expires_at > 0);
+
+        let token_repo =
+            DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
+        let cached_token = token_repo
+            .valid_token(&coordinate, &server_url, now_unix_i64().expect("clock should work"))
+            .await
+            .expect("download token lookup should succeed")
+            .expect("download token should be stored before Path A");
+        assert_eq!(cached_token.token, response.download_token);
+        println!("ADP_GATE5_PATH_A_TOKEN_PRESENT=true");
+
+        eprintln!("ADP_GATE5_STAGE=path_a_install_start");
+        crate::install_game_with_fetcher(
+            listing.clone(),
+            &state,
+            Some(app.handle()),
+            app_data_dir.clone(),
+            &fresh_listing_fetcher,
+        )
+        .await
+        .expect("Path A install with cached token should succeed");
+        let installed_repo = arcadestr_core::adp_storage::InstalledGamesRepository::new(
+            app.state::<AppState>().database.pool().clone(),
+        );
+        let path_a_row = installed_repo
+            .get(&coordinate)
+            .await
+            .expect("Path A installed game lookup should succeed")
+            .expect("Path A installed_games row should exist");
+        assert!(
+            path_a_row.file_path.exists(),
+            "Path A artifact should exist at {}",
+            path_a_row.file_path.display()
+        );
+        let path_a_hash = sha256_file(&path_a_row.file_path)
+            .await
+            .expect("Path A artifact hash should compute");
+        assert_eq!(path_a_hash, expected_file_hash);
+        assert_eq!(path_a_row.file_hash, expected_file_hash);
+        let installed_games = crate::get_installed_games(app.state::<AppState>())
+            .await
+            .expect("get_installed_games should be callable in live test");
+        assert!(installed_games
+            .iter()
+            .any(|game| game.game_coordinate == coordinate));
+        println!(
+            "ADP_GATE5_PATH_A_INSTALL_OK=true artifact_exists=true sha256_match=true \
+             installed_games_row=true get_installed_games_includes_coordinate=true"
+        );
+
+        token_repo
+            .delete(&coordinate, &server_url)
+            .await
+            .expect("Path B should delete local token row");
+        let token_after_delete = token_repo
+            .valid_token(&coordinate, &server_url, now_unix_i64().expect("clock should work"))
+            .await
+            .expect("download token lookup after delete should succeed");
+        assert!(token_after_delete.is_none());
+        println!("ADP_GATE5_PATH_B_LOCAL_TOKEN_DELETED=true");
+        tokio::fs::remove_file(&path_a_row.file_path)
+            .await
+            .expect("Path B should remove Path A artifact before reinstall");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        eprintln!("ADP_GATE5_STAGE=path_b_install_start");
+        crate::install_game_with_fetcher(
+            listing,
+            &state,
+            Some(app.handle()),
+            app_data_dir,
+            &fresh_listing_fetcher,
+        )
+        .await
+        .expect("Path B install without local token should succeed");
+        let path_b_row = installed_repo
+            .get(&coordinate)
+            .await
+            .expect("Path B installed game lookup should succeed")
+            .expect("Path B installed_games row should exist");
+        assert!(
+            path_b_row.file_path.exists(),
+            "Path B artifact should exist at {}",
+            path_b_row.file_path.display()
+        );
+        let path_b_hash = sha256_file(&path_b_row.file_path)
+            .await
+            .expect("Path B artifact hash should compute");
+        assert_eq!(path_b_hash, expected_file_hash);
+        assert_eq!(path_b_row.file_hash, expected_file_hash);
+        assert!(
+            path_b_row.installed_at > path_a_row.installed_at,
+            "Path B should replace installed_games row after reinstall"
+        );
+        let token_after_path_b = token_repo
+            .valid_token(&coordinate, &server_url, now_unix_i64().expect("clock should work"))
+            .await
+            .expect("download token lookup after Path B should succeed");
+        assert!(token_after_path_b.is_none());
+        println!(
+            "ADP_GATE5_PATH_B_NIP98_INSTALL_OK=true artifact_exists=true sha256_match=true \
+             installed_games_row=true local_token_deleted_before_install=true \
+             local_token_absent_after_install=true"
+        );
     }
 }
