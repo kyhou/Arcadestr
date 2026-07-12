@@ -29,6 +29,29 @@ pub async fn invoke_install_game(_listing: &GameListing) -> Result<(), String> {
     Err("Game installation is only available in desktop builds.".to_string())
 }
 
+/// Installed ADP game returned by `get_installed_games`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct InstalledGame {
+    pub game_coordinate: String,
+    pub file_path: String,
+    pub file_hash: String,
+    pub version: Option<String>,
+    pub server_url: String,
+    pub installed_at: i64,
+}
+
+/// Invoke desktop `get_installed_games` command.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_get_installed_games() -> Result<Vec<InstalledGame>, String> {
+    crate::tauri_invoke::invoke("get_installed_games", serde_json::json!({})).await
+}
+
+/// Web fallback for `get_installed_games`.
+#[cfg(feature = "web")]
+pub async fn invoke_get_installed_games() -> Result<Vec<InstalledGame>, String> {
+    Ok(Vec::new())
+}
+
 /// Invoke desktop `ingest_receipt` command.
 #[cfg(not(feature = "web"))]
 pub async fn invoke_ingest_receipt(raw_event_json: String) -> Result<(), String> {
@@ -234,7 +257,11 @@ pub async fn invoke_pay_nwc_invoice(
 pub async fn invoke_confirm_purchase(
     request: ConfirmPurchaseRequest,
 ) -> Result<ConfirmPurchaseResponse, String> {
-    crate::tauri_invoke::invoke("confirm_purchase", serde_json::json!({ "request": request })).await
+    crate::tauri_invoke::invoke(
+        "confirm_purchase",
+        serde_json::json!({ "request": request }),
+    )
+    .await
 }
 
 #[cfg(feature = "web")]

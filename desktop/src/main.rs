@@ -16,9 +16,9 @@ use tracing::{error, info, warn};
 #[allow(unused_imports)]
 use arcadestr_core::signers::NostrSigner;
 
-use arcadestr_core::auth::AuthState;
 use arcadestr_core::adp_client::{AdpClient, AdpClientError, DownloadAuth};
 use arcadestr_core::adp_storage::{DownloadTokensRepository, InstalledGamesRepository};
+use arcadestr_core::auth::AuthState;
 use arcadestr_core::extended_network::ExtendedNetworkRepository;
 use arcadestr_core::http_client::{HttpClient, ReqwestHttpClient};
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
@@ -906,6 +906,41 @@ fn get_platform_info() -> arcadestr_app::models::PlatformInfo {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct InstalledGame {
+    game_coordinate: String,
+    file_path: String,
+    file_hash: String,
+    version: Option<String>,
+    server_url: String,
+    installed_at: i64,
+}
+
+impl From<arcadestr_core::adp_storage::InstalledGame> for InstalledGame {
+    fn from(value: arcadestr_core::adp_storage::InstalledGame) -> Self {
+        Self {
+            game_coordinate: value.game_coordinate,
+            file_path: value.file_path.to_string_lossy().into_owned(),
+            file_hash: value.file_hash,
+            version: value.version,
+            server_url: value.server_url,
+            installed_at: value.installed_at,
+        }
+    }
+}
+
+#[tauri::command]
+async fn get_installed_games(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<InstalledGame>, String> {
+    let repo = InstalledGamesRepository::new(state.database.pool().clone());
+    let installed_games = repo.list().await.map_err(|error| error.to_string())?;
+    Ok(installed_games
+        .into_iter()
+        .map(InstalledGame::from)
+        .collect())
+}
+
 type InstallFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 trait FreshListingFetcher: Send + Sync {
@@ -918,7 +953,9 @@ struct RelayFreshListingFetcher<'a> {
 
 impl FreshListingFetcher for RelayFreshListingFetcher<'_> {
     fn fetch<'a>(&'a self, coordinate: &'a str) -> InstallFuture<'a, Result<nostr::Event, String>> {
-        Box::pin(async move { adp_commands::fetch_listing_event_by_coordinate(&self.state, coordinate).await })
+        Box::pin(async move {
+            adp_commands::fetch_listing_event_by_coordinate(&self.state, coordinate).await
+        })
     }
 }
 
@@ -981,13 +1018,17 @@ fn deterministic_artifact_path(app_data_dir: &Path, coordinate: &str) -> PathBuf
 fn desktop_download_error(error: AdpClientError) -> String {
     match error {
         AdpClientError::DownloadOwnership(message) => {
-            format!("download rejected: you do not own this game or the proof is invalid: {message}")
+            format!(
+                "download rejected: you do not own this game or the proof is invalid: {message}"
+            )
         }
         AdpClientError::DownloadDistribution(message) => {
             format!("download rejected: this server no longer distributes this listing: {message}")
         }
         AdpClientError::DownloadProtocol(message) => {
-            format!("download failed because the ADP server returned an invalid response: {message}")
+            format!(
+                "download failed because the ADP server returned an invalid response: {message}"
+            )
         }
         AdpClientError::Http(message) => format!("download HTTP request failed: {message}"),
         AdpClientError::Auth(message) => format!("download authentication failed: {message}"),
@@ -1048,9 +1089,12 @@ async fn install_game_with_fetcher<R: tauri::Runtime>(
 
     let dest_path = deterministic_artifact_path(&app_data_dir, &coordinate);
     if let Some(parent) = dest_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| format!("failed to create install directory {}: {error}", parent.display()))?;
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            format!(
+                "failed to create install directory {}: {error}",
+                parent.display()
+            )
+        })?;
     }
 
     let adp_client = AdpClient::new(metadata.server_url.clone(), Arc::clone(&state.http_client));
@@ -1111,7 +1155,9 @@ async fn install_game(
         .path()
         .app_data_dir()
         .map_err(|error| format!("failed to resolve app data directory: {error}"))?;
-    let fetcher = RelayFreshListingFetcher { state: state.clone() };
+    let fetcher = RelayFreshListingFetcher {
+        state: state.clone(),
+    };
     install_game_with_fetcher(listing, &state, Some(&app_handle), app_data_dir, &fetcher).await
 }
 
@@ -1402,7 +1448,10 @@ mod install_game_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    use arcadestr_core::adp_storage::{DownloadToken, DownloadTokensRepository};
+    use arcadestr_core::adp_storage::{
+        DownloadToken, DownloadTokensRepository, InstalledGame as CoreInstalledGame,
+        InstalledGamesRepository as CoreInstalledGamesRepository,
+    };
     use arcadestr_core::file_hash::sha256_file;
     use arcadestr_core::http_client::{HttpClientError, HttpDownloadOutcome};
     use arcadestr_core::purchases::StoredReceipt;
@@ -1520,7 +1569,8 @@ mod install_game_tests {
                     })?
             };
 
-            std::fs::write(dest, &bytes).map_err(|error| HttpClientError::Request(error.to_string()))?;
+            std::fs::write(dest, &bytes)
+                .map_err(|error| HttpClientError::Request(error.to_string()))?;
             let bytes_written = bytes.len() as u64;
             on_progress(bytes_written, Some(bytes_written));
             Ok(HttpDownloadOutcome { bytes_written })
@@ -1533,10 +1583,7 @@ mod install_game_tests {
     }
 
     impl FreshListingFetcher for StaticFreshListingFetcher {
-        fn fetch<'a>(
-            &'a self,
-            _coordinate: &'a str,
-        ) -> InstallFuture<'a, Result<Event, String>> {
+        fn fetch<'a>(&'a self, _coordinate: &'a str) -> InstallFuture<'a, Result<Event, String>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(self.event.clone()) })
         }
@@ -1623,6 +1670,48 @@ mod install_game_tests {
             nip05_validator,
             http_client,
         }
+    }
+
+    #[tokio::test]
+    async fn get_installed_games_returns_recorded_installs() {
+        let database = test_db("get-installed-games").await;
+        let repo = CoreInstalledGamesRepository::new(database.pool().clone());
+        let older = CoreInstalledGame {
+            game_coordinate: "30402:developer:older-game".to_string(),
+            file_path: unique_test_path("older-game", "zip"),
+            file_hash: "older-hash".to_string(),
+            version: Some("1.0.0".to_string()),
+            server_url: "https://dist.example.com".to_string(),
+            installed_at: 100,
+        };
+        let newer = CoreInstalledGame {
+            game_coordinate: "30402:developer:newer-game".to_string(),
+            file_path: unique_test_path("newer-game", "zip"),
+            file_hash: "newer-hash".to_string(),
+            version: Some("2.0.0".to_string()),
+            server_url: "https://dist.example.com".to_string(),
+            installed_at: 200,
+        };
+        repo.record(&older).await.expect("older game should record");
+        repo.record(&newer).await.expect("newer game should record");
+
+        let buyer = Keys::generate();
+        let app_state =
+            app_state_with_http(&buyer, database, Arc::new(MockHttpClient::new())).await;
+        let app = tauri::test::mock_builder()
+            .manage(app_state)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock Tauri app should build");
+
+        let installed_games = get_installed_games(app.state::<AppState>())
+            .await
+            .expect("installed games should list");
+
+        assert_eq!(installed_games.len(), 2);
+        assert_eq!(installed_games[0].game_coordinate, newer.game_coordinate);
+        assert_eq!(installed_games[0].installed_at, newer.installed_at);
+        assert_eq!(installed_games[1].game_coordinate, older.game_coordinate);
+        assert_eq!(installed_games[1].installed_at, older.installed_at);
     }
 
     fn app_listing(merchant: &Keys, listing_id: &str) -> AppGameListing {
@@ -1859,7 +1948,13 @@ mod install_game_tests {
         grant_ownership(&state, &buyer, &merchant, listing_id).await;
         let fetch_calls = Arc::new(AtomicUsize::new(0));
         let fetcher = StaticFreshListingFetcher {
-            event: listing_event(&merchant, listing_id, fresh_server_url, &fresh_hash, "2.0.0"),
+            event: listing_event(
+                &merchant,
+                listing_id,
+                fresh_server_url,
+                &fresh_hash,
+                "2.0.0",
+            ),
             calls: Arc::clone(&fetch_calls),
         };
         let mut stale_listing = app_listing(&merchant, listing_id);
@@ -4278,6 +4373,7 @@ fn main() {
             fetch_marketplace,
             fetch_marketplace_stream,
             get_platform_info,
+            get_installed_games,
             install_game,
             ingest_receipt,
             fetch_profile,
