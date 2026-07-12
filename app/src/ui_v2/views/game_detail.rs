@@ -387,7 +387,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         })
     };
 
-    let install_coordinate = listing.id.clone();
+    let install_listing_id = listing.id.clone();
     let download_complete_cleanup: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(None));
     let download_complete_disposed = Rc::new(RefCell::new(false));
     let download_complete_registration_started = Rc::new(RefCell::new(false));
@@ -401,12 +401,12 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         }
         *download_complete_registration_started_for_effect.borrow_mut() = true;
 
-        let install_coordinate = install_coordinate.clone();
+        let install_listing_id = install_listing_id.clone();
         let cleanup_handle = Rc::clone(&download_complete_cleanup_for_effect);
         let disposed = Rc::clone(&download_complete_disposed_for_effect);
         spawn_local(async move {
             if let Ok(listener) = listen_download_complete(move |payload| {
-                if payload.game_coordinate == install_coordinate {
+                if payload.listing_id == install_listing_id {
                     purchase_confirmed.set(true);
                     install_complete.set(true);
                     install_loading.set(false);

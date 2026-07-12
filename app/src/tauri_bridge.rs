@@ -44,6 +44,7 @@ pub struct InstalledGame {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct DownloadCompletePayload {
     pub game_coordinate: String,
+    pub listing_id: String,
     pub file_path: String,
 }
 

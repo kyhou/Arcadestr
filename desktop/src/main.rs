@@ -969,6 +969,7 @@ struct DownloadProgressPayload {
 #[derive(Debug, Clone, Serialize)]
 struct DownloadCompletePayload {
     game_coordinate: String,
+    listing_id: String,
     file_path: String,
 }
 
@@ -1064,6 +1065,7 @@ async fn install_game_with_fetcher<R: tauri::Runtime>(
         (buyer_pubkey_hex, signer)
     };
 
+    let listing_id = listing.id.clone();
     let coordinate = listing_coordinate_from_app_listing(&listing)?;
     let is_owned = state
         .purchases
@@ -1130,6 +1132,7 @@ async fn install_game_with_fetcher<R: tauri::Runtime>(
             "download-complete",
             DownloadCompletePayload {
                 game_coordinate: coordinate,
+                listing_id,
                 file_path: dest_path.to_string_lossy().to_string(),
             },
         )
