@@ -1,4 +1,8 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use leptos::prelude::*;
+use send_wrapper::SendWrapper;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::{BadgeEarnedModal, ProfileRow};
@@ -9,8 +13,8 @@ use crate::tauri_bridge::{
     RequestLnurlInvoiceRequest,
 };
 use crate::tauri_bridge::{
-    invoke_confirm_purchase, invoke_connect_nwc_wallet, invoke_pay_nwc_invoice,
-    invoke_request_lnurl_invoice,
+    invoke_confirm_purchase, invoke_connect_nwc_wallet, invoke_install_game,
+    invoke_pay_nwc_invoice, invoke_request_lnurl_invoice, listen_download_complete,
 };
 use crate::{invoke_fetch_profile, AuthContext};
 
@@ -160,6 +164,8 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let nwc_connected: RwSignal<bool> = RwSignal::new(false);
     let manual_preimage = RwSignal::new(String::new());
     let purchase_confirmed: RwSignal<bool> = RwSignal::new(listing.is_owned);
+    let install_loading: RwSignal<bool> = RwSignal::new(false);
+    let install_complete: RwSignal<bool> = RwSignal::new(false);
 
     // Seller profile state.
     let seller_profile: RwSignal<Option<UserProfile>> = RwSignal::new(None);
@@ -355,26 +361,76 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     };
 
     let on_download = {
-        let download_url = download_url.clone();
+        let listing = listing.clone();
         Callback::new(move |()| {
-            if download_url.trim().is_empty() {
-                buy_error.set(Some("No download URL available".to_string()));
+            if listing.download_url.trim().is_empty() {
+                buy_error.set(Some("No ADP download URL available".to_string()));
                 return;
             }
 
-            #[cfg(target_arch = "wasm32")]
-            {
-                if let Some(win) = leptos::web_sys::window() {
-                    let _ = win.location().set_href(&download_url);
+            install_loading.set(true);
+            buy_error.set(None);
+            let listing = listing.clone();
+            spawn_local(async move {
+                match invoke_install_game(&listing).await {
+                    Ok(()) => {
+                        purchase_confirmed.set(true);
+                        install_complete.set(true);
+                        install_loading.set(false);
+                    }
+                    Err(err) => {
+                        buy_error.set(Some(format!("Install failed: {err}")));
+                        install_loading.set(false);
+                    }
                 }
-            }
-
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let _ = &download_url;
-            }
+            });
         })
     };
+
+    let install_coordinate = listing.id.clone();
+    let download_complete_cleanup: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(None));
+    let download_complete_disposed = Rc::new(RefCell::new(false));
+    let download_complete_registration_started = Rc::new(RefCell::new(false));
+    let download_complete_cleanup_for_effect = Rc::clone(&download_complete_cleanup);
+    let download_complete_disposed_for_effect = Rc::clone(&download_complete_disposed);
+    let download_complete_registration_started_for_effect =
+        Rc::clone(&download_complete_registration_started);
+    Effect::new(move |_| {
+        if *download_complete_registration_started_for_effect.borrow() {
+            return;
+        }
+        *download_complete_registration_started_for_effect.borrow_mut() = true;
+
+        let install_coordinate = install_coordinate.clone();
+        let cleanup_handle = Rc::clone(&download_complete_cleanup_for_effect);
+        let disposed = Rc::clone(&download_complete_disposed_for_effect);
+        spawn_local(async move {
+            if let Ok(listener) = listen_download_complete(move |payload| {
+                if payload.game_coordinate == install_coordinate {
+                    purchase_confirmed.set(true);
+                    install_complete.set(true);
+                    install_loading.set(false);
+                }
+            })
+            .await
+            {
+                if *disposed.borrow() {
+                    listener();
+                } else {
+                    *cleanup_handle.borrow_mut() = Some(listener);
+                }
+            }
+        });
+    });
+
+    let download_complete_cleanup_for_teardown = SendWrapper::new(Rc::clone(&download_complete_cleanup));
+    let download_complete_disposed_for_teardown = SendWrapper::new(Rc::clone(&download_complete_disposed));
+    on_cleanup(move || {
+        *download_complete_disposed_for_teardown.borrow_mut() = true;
+        if let Some(cleanup) = download_complete_cleanup_for_teardown.borrow_mut().take() {
+            cleanup();
+        }
+    });
 
     let publisher_npub_for_fetch = publisher_npub.clone();
     let profile_store_for_fetch = try_use_profile_store();
@@ -436,10 +492,32 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                         if purchase_confirmed.get() {
                             view! {
                                 <>
-                                    <button class="v2-btn-primary" on:click=move |_| on_download.run(()) disabled=move || !has_download_url>
-                                        "Install"
+                                    <button
+                                        class="v2-btn-primary"
+                                        on:click=move |_| on_download.run(())
+                                        disabled=move || !has_download_url || install_loading.get() || install_complete.get()
+                                    >
+                                        {move || {
+                                            if install_complete.get() {
+                                                "Installed"
+                                            } else if install_loading.get() {
+                                                "Installing..."
+                                            } else {
+                                                "Install"
+                                            }
+                                        }}
                                     </button>
-                                    <p class="v2-social-meta">"Purchase confirmed. Download token stored."</p>
+                                    <p class="v2-social-meta">
+                                        {move || {
+                                            if install_complete.get() {
+                                                "Installed. Runtime execution and extraction are not available in this gate."
+                                            } else if install_loading.get() {
+                                                "Installing game artifact..."
+                                            } else {
+                                                "Purchase confirmed. Download token stored."
+                                            }
+                                        }}
+                                    </p>
                                 </>
                             }.into_any()
                         } else if buy_loading.get() {
@@ -494,14 +572,23 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                 </>
                             }.into_any()
                         } else if listing.price_sats == 0 {
+                            let free_button_label = buy_button_label.clone();
                             view! {
                                 <>
                                     <button
                                         class="v2-btn-primary"
                                         on:click=move |_| on_download.run(())
-                                        disabled=move || !has_download_url
+                                        disabled=move || !has_download_url || install_loading.get() || install_complete.get()
                                     >
-                                        {buy_button_label.clone()}
+                                        {move || {
+                                            if install_complete.get() {
+                                                "Installed".to_string()
+                                            } else if install_loading.get() {
+                                                "Installing...".to_string()
+                                            } else {
+                                                free_button_label.clone()
+                                            }
+                                        }}
                                     </button>
                                     <button class="v2-btn-ghost">"Add to Library"</button>
                                 </>

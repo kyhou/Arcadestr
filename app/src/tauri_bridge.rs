@@ -40,6 +40,13 @@ pub struct InstalledGame {
     pub installed_at: i64,
 }
 
+/// Completion payload emitted after an ADP install finishes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DownloadCompletePayload {
+    pub game_coordinate: String,
+    pub file_path: String,
+}
+
 /// Invoke desktop `get_installed_games` command.
 #[cfg(not(feature = "web"))]
 pub async fn invoke_get_installed_games() -> Result<Vec<InstalledGame>, String> {
@@ -293,6 +300,30 @@ where
     F: FnMut(PublishProgressPayload) + 'static,
 {
     Err("ADP publishing is only available in desktop builds.".to_string())
+}
+
+/// Listen for desktop `download-complete` events.
+#[cfg(not(feature = "web"))]
+pub async fn listen_download_complete<F>(mut callback: F) -> Result<Box<dyn FnOnce()>, String>
+where
+    F: FnMut(DownloadCompletePayload) + 'static,
+{
+    let cleanup = crate::tauri_invoke::listen("download-complete", move |value| {
+        if let Ok(payload) = serde_json::from_value::<DownloadCompletePayload>(value) {
+            callback(payload);
+        }
+    })
+    .await?;
+    Ok(Box::new(cleanup))
+}
+
+/// Web fallback for `download-complete` events.
+#[cfg(feature = "web")]
+pub async fn listen_download_complete<F>(_callback: F) -> Result<Box<dyn FnOnce()>, String>
+where
+    F: FnMut(DownloadCompletePayload) + 'static,
+{
+    Err("ADP installation events are only available in desktop builds.".to_string())
 }
 
 /// Invoke desktop `nip49_import` command.

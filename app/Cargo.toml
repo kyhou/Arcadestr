@@ -30,6 +30,7 @@ web-sys = { version = "0.3", features = [
 ] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
+send_wrapper = "0.6"
 aes-gcm = "0.10"
 base64 = "0.22"
 getrandom = { version = "0.2", features = ["js"] }
