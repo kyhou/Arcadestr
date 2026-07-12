@@ -908,6 +908,69 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
     })
 }
 
+/// Returns true when `target_coordinate` appears from at least `min_relays` distinct relays.
+pub(crate) fn listing_seen_on_min_relays(
+    relay_events: &[(String, Vec<Event>)],
+    target_coordinate: &str,
+    min_relays: usize,
+) -> bool {
+    use std::collections::HashSet;
+
+    let mut relays = HashSet::new();
+    for (relay_url, events) in relay_events {
+        if events
+            .iter()
+            .any(|event| event_matches_coordinate(event, target_coordinate))
+        {
+            relays.insert(relay_url.clone());
+        }
+    }
+    relays.len() >= min_relays
+}
+
+type RelayEventsByUrl = Vec<(String, Vec<Event>)>;
+
+/// Confirms a NIP-99 listing is visible from at least `min_relays` distinct relays.
+pub async fn confirm_nip99_listing_propagated(
+    relay_manager: &Arc<Mutex<RelayManager>>,
+    target_coordinate: &str,
+    min_relays: usize,
+) -> Result<bool, String> {
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    let filter = build_filter_since_secs(Kind::Custom(30402), 50, None, None, &["game"]);
+    let relay_events: StdArc<StdMutex<RelayEventsByUrl>> = StdArc::new(StdMutex::new(Vec::new()));
+    let relay_events_clone = StdArc::clone(&relay_events);
+
+    let manager = relay_manager.lock().await;
+    manager
+        .fetch_events_streaming(filter, 5, 5, move |relay_url, events| {
+            if let Ok(mut collected) = relay_events_clone.lock() {
+                collected.push((relay_url.to_string(), events));
+            }
+        })
+        .await
+        .map_err(|err| err.to_string())?;
+    drop(manager);
+
+    let collected = relay_events
+        .lock()
+        .map_err(|_| "relay propagation collection mutex poisoned".to_string())?;
+    Ok(listing_seen_on_min_relays(
+        &collected,
+        target_coordinate,
+        min_relays,
+    ))
+}
+
+fn event_matches_coordinate(event: &Event, target_coordinate: &str) -> bool {
+    parse_listing(event.clone())
+        .map(|listing| {
+            format!("30402:{}:{}", event.pubkey.to_hex(), listing.id) == target_coordinate
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) async fn fetch_nip99_listings_impl(
     relay_manager: &Arc<Mutex<RelayManager>>,
     limit: usize,
@@ -1515,6 +1578,54 @@ mod tests {
 
         let result = apply_filter_nip99(listings, &filter);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn propagation_count_requires_target_listing_from_two_relays() {
+        let event = make_nip99_event(
+            30402,
+            "Title",
+            vec![vec!["d", "game"], vec!["title", "Title"], vec!["t", "game"]],
+        );
+        let target = format!("30402:{}:game", event.pubkey.to_hex());
+        let relays = vec![
+            ("wss://relay-one.example".to_string(), vec![event.clone()]),
+            ("wss://relay-two.example".to_string(), vec![event]),
+        ];
+
+        assert!(listing_seen_on_min_relays(&relays, &target, 2));
+    }
+
+    #[test]
+    fn propagation_count_rejects_single_relay_visibility() {
+        let event = make_nip99_event(
+            30402,
+            "Title",
+            vec![vec!["d", "game"], vec!["title", "Title"], vec!["t", "game"]],
+        );
+        let target = format!("30402:{}:game", event.pubkey.to_hex());
+        let relays = vec![("wss://relay-one.example".to_string(), vec![event])];
+
+        assert!(!listing_seen_on_min_relays(&relays, &target, 2));
+    }
+
+    #[test]
+    fn propagation_count_ignores_wrong_coordinates() {
+        let event = make_nip99_event(
+            30402,
+            "Title",
+            vec![
+                vec!["d", "other-game"],
+                vec!["title", "Title"],
+                vec!["t", "game"],
+            ],
+        );
+        let relays = vec![
+            ("wss://relay-one.example".to_string(), vec![event.clone()]),
+            ("wss://relay-two.example".to_string(), vec![event]),
+        ];
+
+        assert!(!listing_seen_on_min_relays(&relays, "30402:pubkey:game", 2));
     }
 
     #[test]

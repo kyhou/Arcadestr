@@ -788,9 +788,13 @@ UiV2Root (app/src/ui_v2/shell.rs) - Stitch-based interface
 │   └── Empty state when no products match filters
 │
 ├── GameDetail (app/src/ui_v2/views/game_detail.rs)
-│   ├── Rich media presentation
-│   ├── BadgeShowcase (earned badges for game publisher)
-│   └── Debug: Raw NIP-99 JSON panel (visible only in debug builds)
+│   ├── Hero section with gradient overlay background and metadata
+│   ├── Buy panel with Lightning invoice flow (request, copy, open wallet)
+│   ├── Free download or "No Lightning address" fallback
+│   ├── Seller profile with ProfileRow (about, NIP-05, lud16, website)
+│   ├── Specs and gallery sections
+│   ├── BadgeEarnedModal integration (debug-only preview)
+│   └── First 4 tag chips displayed
 │
 ├── Library (app/src/ui_v2/views/library.rs)
 │   └── User's purchased games
@@ -1059,7 +1063,7 @@ fn main() {
 | `core::nip46` | NIP-46 implementation | `AppSignerState`, `ProfileMetadata` | `init_signer_session()`, `save_profile_to_keyring()` |
 | `core::storage` | Persistent storage | `Database`, `MasterKey` | `new()`, `encrypt()`, `decrypt()` |
 | `core::relay_cache` | NIP-65 relay caching | `RelayCache`, `CachedRelayList` | `save_relay_list()`, `get_relay_list()` |
-| `core::relay_manager` | Background relay pool | `RelayManager`, `RelayManagerConfig` | `fetch_streaming()`, `add_relay()` |
+| `core::relay_manager` | Background relay pool | `RelayManager`, `RelayManagerConfig` | `fetch_streaming()`, `add_relay()`, `normalize_relay_urls()` |
 | `core::relay_events` | Real-time relay status | `RelayConnectionEvent`, `RelayStatus` | Event broadcast channel |
 | `core::marketplace_cache` | Listing persistence | `MarketplaceCache`, `UpsertOutcome` | `upsert_listing()`, `load_listings()` |
 | `core::profile_fetcher` | Batched profile fetching | `ProfileFetcher`, `LruProfileCache` | `enqueue_many()`, `fetch_batch()` |
@@ -1068,6 +1072,7 @@ fn main() {
 | `core::social_graph` | Extended network | `SocialGraphDb` | `discover_network()` |
 | `core::achievements` | NIP-58 badges | `BadgeDefinition`, `BadgeAward`, `ProfileBadgeEntry` | `parse_badge_definition()`, `fetch_profile_badges()` |
 | `core::purchases` | NIP-102 purchase receipts | `PurchasesRepository`, `StoredReceipt` | `parse_and_validate_receipt()`, `upsert_receipt()`, `is_owned()` |
+| `core::subscriptions` | Relay subscription lifecycle | `SubscriptionRegistry` | `dispatch_ephemeral_reads_batch_with_policy()`, `dispatch_permanent_subscriptions()`, `run_notification_loop()` |
 
 **Recent `core::storage::encryption` public surface additions (NIP-49 backend):**
 - `ScryptParams { n, r, p }`
@@ -1290,18 +1295,19 @@ pub struct PendingNostrConnect {
 pub struct AppState {
     pub auth: Arc<Mutex<AuthState>>,
     pub nostr: Arc<Mutex<NostrClient>>,
+    pub database: Arc<arcadestr_core::storage::Database>,  // Shared SQLite for command contracts
     pub relay_cache: Arc<RelayCache>,
     pub deduplicator: Arc<Mutex<EventDeduplicator>>,
     pub subscription_registry: Arc<SubscriptionRegistry>,
     pub profile_fetcher: Arc<ProfileFetcher>,
     pub user_cache: Arc<UserCache>,
     pub marketplace_cache: Arc<MarketplaceCache>,  // Persistent listing storage
+    pub purchases: Arc<arcadestr_core::purchases::PurchasesRepository>,  // NIP-102 purchase receipt store
     pub extended_network: Arc<RwLock<Option<Arc<Mutex<ExtendedNetworkRepository>>>>>,
     pub extended_network_follows: Arc<RwLock<Vec<String>>>,
     pub relay_hints: Option<Arc<RelayHints>>,
-    pub purchases: Arc<arcadestr_core::purchases::PurchasesRepository>,  // NIP-102 purchase receipt store
     pub nip05_validator: Arc<std::sync::Mutex<Nip05Validator>>,  // Background NIP-05 verification
-    pub badge_cache: Arc<Mutex<BadgeCache>>,  // NIP-58 badge caching
+    pub http_client: Arc<dyn HttpClient>,  // Shared HTTP client for NIP-05 and LNURL
 }
 ```
 
@@ -2103,6 +2109,26 @@ cargo build -p arcadestr-desktop
 rust-gdb target/debug/arcadestr-desktop
 ```
 
+**Debug Relay Selection**:
+```bash
+# Override relay selection during development via environment variables
+ARCADESTR_RELAYS="wss://relay.example.com" cargo tauri dev
+
+# Block runtime relay discovery (NIP-65 gossip) when using debug relays
+ARCADESTR_BLOCK_DISCOVERY=1 cargo tauri dev
+
+# Or use CLI args (highest precedence over env vars and settings):
+cargo tauri dev -- --relay "wss://debug.local" --block-discovery
+
+# Precedence chain: CLI args > Environment vars > NetworkDiscoverySettings > Defaults
+```
+Configuration is resolved at startup via `build_startup_relay_config()` in `desktop/src/main.rs`. Three tiers are checked:
+1. CLI args (`--relay <url>`, `--block-discovery`, `--allow-discovery`)
+2. Environment variables (`ARCADESTR_RELAYS`, `ARCADESTR_BLOCK_DISCOVERY`)
+3. `NetworkDiscoverySettings` JSON (`debug_relays`, `block_discovery` fields)
+
+When debug relays are active, `dispatch_ephemeral_reads_batch_with_policy()` skips relay discovery for uncovered pubkeys, and `RelayManagerConfig.block_discovery` prevents NIP-65 gossip from adding new relays at runtime.
+
 ### 11.2 Frontend Debugging
 
 **Open DevTools in Tauri**:
@@ -2304,7 +2330,30 @@ All frontend→backend communication goes through `tauri_invoke.rs`, which uses 
 
 ---
 
-## Recent Major Features (2026-06)
+## Recent Major Features (2026-07)
+
+### Game Detail View Consolidation
+The GameDetail view was rewritten as a fully standalone component:
+- **Standalone implementation**: No longer wraps `DetailView` — directly renders hero section, buy panel, metadata, specs, gallery, and seller profile
+- **Buy flow**: Inline `ZapRequest` → Lightning invoice with copy/open-wallet actions; free download fallback; "No Lightning address" disabled state
+- **Seller profile**: Fetches publisher profile via `ProfileRow` on mount, caches in `ProfileStore`, displays about, NIP-05, lud16, website
+- **Gradient hero**: Background image with `linear-gradient` overlay and metadata (publisher, release date, protocol)
+- **Overflow-safe metadata**: Buy panel CSS (`min-width: 0; max-width: 100%; overflow-wrap: anywhere;`) protects against long values breaking layout
+- **Debug badge preview**: `debug_badge_preview()` mock shown in debug builds after invoice creation
+
+### Centralized Npub Fallback Display
+Truncated npub formatting centralized into `npub_fallback_label()` at `app/src/models.rs:279`:
+- Returns first 12 characters + `...` + last 8 characters of bech32 npub, e.g. `npub1vcq8nv3...6syj3d9l`
+- Replaces 6 inline truncation sites across the UI (account selector, profile display, marketplace loader, login, shell, app root)
+- Also used by `listing_publisher()` for stall-name-less games
+- Skips truncation for npubs ≤ 24 characters
+
+### Debug Relay Selection
+New development workflow for testing with specific relays:
+- **Three-tier configuration**: CLI args (`--relay`, `--block-discovery`, `--allow-discovery`) override env vars (`ARCADESTR_RELAYS`, `ARCADESTR_BLOCK_DISCOVERY`), which override `NetworkDiscoverySettings` JSON
+- **`RelayManagerConfig.debug_relays`** / **`RelayManagerConfig.block_discovery`** : Runtime config fields that restrict the relay pool to specified relays and disable NIP-65 gossip discovery
+- **`normalize_relay_urls()`**: New public validator in `relay_manager` — rejects non-websocket schemes, deduplicates, strips trailing slashes
+- **`dispatch_ephemeral_reads_batch_with_policy()`**: Subscription dispatch that skips relay discovery when `block_discovery` is true
 
 ### Platform Ownership & Filtering
 The codebase now supports platform-aware game publishing and browsing:
@@ -2364,4 +2413,4 @@ New debug-only UI component in `detail.rs` for inspecting NIP-99 events:
 
 ---
 
-*Documentation generated for Arcadestr codebase. Last updated: 2026-07-02*
+*Documentation generated for Arcadestr codebase. Last updated: 2026-07-09*

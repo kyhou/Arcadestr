@@ -28,6 +28,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 async-trait = "0.1"
+tauri = { workspace = true, features = ["test"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -1,7 +1,7 @@
 //! NIP-102 purchase receipt persistence and verification.
 
 use lightning_invoice::Bolt11Invoice;
-use nostr_sdk::Event;
+use nostr_sdk::{Event, PublicKey};
 use sha2::{Digest, Sha256};
 use sqlx::{Pool, Row, Sqlite};
 use std::collections::HashSet;
@@ -139,6 +139,29 @@ pub fn parse_and_validate_receipt(
     event: &Event,
     buyer_pubkey_hex: &str,
 ) -> Result<StoredReceipt, PurchaseError> {
+    parse_and_validate_receipt_inner(event, buyer_pubkey_hex, None)
+}
+
+/// Parse and validate a NIP-102 receipt against an ADP listing delegation snapshot.
+///
+/// # Errors
+/// Returns `PurchaseError` when required tags, payment proof, or signer authorization is invalid.
+pub fn parse_and_validate_receipt_with_listing(
+    event: &Event,
+    buyer_pubkey_hex: &str,
+    listing_event: &Event,
+) -> Result<StoredReceipt, PurchaseError> {
+    listing_event.verify().map_err(|error| {
+        PurchaseError::ProofInvalid(format!("invalid listing signature: {error}"))
+    })?;
+    parse_and_validate_receipt_inner(event, buyer_pubkey_hex, Some(listing_event))
+}
+
+fn parse_and_validate_receipt_inner(
+    event: &Event,
+    buyer_pubkey_hex: &str,
+    listing_event: Option<&Event>,
+) -> Result<StoredReceipt, PurchaseError> {
     event.verify().map_err(|error| {
         PurchaseError::ProofInvalid(format!("invalid event signature: {error}"))
     })?;
@@ -154,7 +177,10 @@ pub fn parse_and_validate_receipt(
     }
 
     let listing_coordinate = required_tag_value(event, "a", "a tag")?;
-    validate_listing_coordinate_merchant(&listing_coordinate, &event.pubkey.to_hex())?;
+    match listing_event {
+        Some(listing) => validate_adp_receipt_signer(&listing_coordinate, event, listing)?,
+        None => validate_listing_coordinate_merchant(&listing_coordinate, &event.pubkey.to_hex())?,
+    }
 
     let order_id = required_tag_value(event, "order", "order tag")?;
     let payment_hash = validate_payment_proof(event)?;
@@ -172,6 +198,121 @@ pub fn parse_and_validate_receipt(
         created_at: event.created_at.as_secs(),
         raw_event,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FulfillmentDelegation {
+    pubkey: PublicKey,
+    valid_from: u64,
+    revoked_at: Option<u64>,
+}
+
+impl FulfillmentDelegation {
+    fn authorizes_at(&self, at: u64, listing_created_at: u64) -> bool {
+        if self.valid_from > at {
+            return false;
+        }
+        match self.revoked_at {
+            Some(revoked_at) => revoked_at.max(listing_created_at) > at,
+            None => true,
+        }
+    }
+}
+
+fn validate_adp_receipt_signer(
+    listing_coordinate: &str,
+    receipt: &Event,
+    listing: &Event,
+) -> Result<(), PurchaseError> {
+    let expected_coordinate = listing_coordinate_from_listing(listing)?;
+    if expected_coordinate != listing_coordinate {
+        return Err(PurchaseError::ProofInvalid(
+            "receipt listing coordinate does not match listing event".to_string(),
+        ));
+    }
+
+    if receipt.pubkey == listing.pubkey {
+        return Ok(());
+    }
+
+    let receipt_created_at = receipt.created_at.as_secs();
+    let listing_created_at = listing.created_at.as_secs();
+    let mut revocation_hit: Option<(u64, u64)> = None;
+
+    for delegation in fulfillment_delegations(listing)? {
+        if delegation.pubkey != receipt.pubkey {
+            continue;
+        }
+        if delegation.authorizes_at(receipt_created_at, listing_created_at) {
+            return Ok(());
+        }
+        if delegation.valid_from > receipt_created_at {
+            continue;
+        }
+        if let Some(revoked_at) = delegation.revoked_at {
+            let effective_revoked_at = revoked_at.max(listing_created_at);
+            if effective_revoked_at <= receipt_created_at {
+                revocation_hit = Some((effective_revoked_at, receipt_created_at));
+            }
+        }
+    }
+
+    if let Some((revoked_at, created_at)) = revocation_hit {
+        return Err(PurchaseError::ProofInvalid(format!(
+            "fulfillment key was revoked at {revoked_at}, receipt created_at {created_at} is at or after revocation"
+        )));
+    }
+
+    Err(PurchaseError::ProofInvalid(
+        "receipt signer is not authorized by listing fulfillment_pubkey tags".to_string(),
+    ))
+}
+
+fn listing_coordinate_from_listing(listing: &Event) -> Result<String, PurchaseError> {
+    if listing.kind.as_u16() != 30402 {
+        return Err(PurchaseError::ProofInvalid(
+            "listing event is not kind 30402".to_string(),
+        ));
+    }
+    let d_tag = required_tag_value(listing, "d", "listing d tag")?;
+    Ok(format!("30402:{}:{}", listing.pubkey.to_hex(), d_tag))
+}
+
+fn fulfillment_delegations(listing: &Event) -> Result<Vec<FulfillmentDelegation>, PurchaseError> {
+    listing
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let values = tag.clone().to_vec();
+            (values.first().map(String::as_str) == Some("fulfillment_pubkey")).then_some(values)
+        })
+        .map(|values| {
+            let pubkey_hex = values.get(1).ok_or(PurchaseError::MissingTag(
+                "fulfillment_pubkey.pubkey",
+            ))?;
+            let valid_from = values
+                .get(2)
+                .ok_or(PurchaseError::MissingTag("fulfillment_pubkey.valid_from"))?
+                .parse::<u64>()
+                .map_err(|_| PurchaseError::MissingTag("fulfillment_pubkey.valid_from"))?;
+            let pubkey = PublicKey::from_hex(pubkey_hex)
+                .map_err(|_| PurchaseError::MissingTag("fulfillment_pubkey.pubkey"))?;
+            let revoked_at = values
+                .get(3)
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| PurchaseError::MissingTag("fulfillment_pubkey.revoked_at"))
+                })
+                .transpose()?;
+            Ok(FulfillmentDelegation {
+                pubkey,
+                valid_from,
+                revoked_at,
+            })
+        })
+        .collect()
 }
 
 fn validate_listing_coordinate_merchant(
@@ -263,13 +404,16 @@ fn status_grants_ownership(status: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_and_validate_receipt, PurchaseError, PurchasesRepository};
+    use super::{
+        parse_and_validate_receipt, parse_and_validate_receipt_with_listing, PurchaseError,
+        PurchasesRepository,
+    };
     use crate::storage::Database;
     use bitcoin::hashes::{sha256, Hash as _};
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
     use lightning_invoice::{Currency, InvoiceBuilder};
     use lightning_types::payment::PaymentSecret;
-    use nostr_sdk::{Event, EventBuilder, Keys, Kind, Tag, TagKind};
+    use nostr_sdk::{Event, EventBuilder, Keys, Kind, Tag, TagKind, Timestamp};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -285,6 +429,36 @@ mod tests {
             .tags(extra_tags)
             .sign_with_keys(merchant)
             .expect("receipt event signs")
+    }
+
+    fn receipt_event_at(kind: Kind, signer: &Keys, extra_tags: Vec<Tag>, created_at: u64) -> Event {
+        EventBuilder::new(kind, "")
+            .tags(extra_tags)
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(signer)
+            .expect("receipt event signs")
+    }
+
+    fn listing_event_at(
+        merchant: &Keys,
+        fulfillment: &Keys,
+        valid_from: u64,
+        revoked_at: Option<u64>,
+        created_at: u64,
+    ) -> Event {
+        let valid_from = valid_from.to_string();
+        let revoked_at = revoked_at.map(|value| value.to_string()).unwrap_or_default();
+        EventBuilder::new(Kind::Custom(30402), "")
+            .tags([
+                Tag::custom(TagKind::d(), [LISTING_D_TAG]),
+                Tag::custom(
+                    TagKind::custom("fulfillment_pubkey"),
+                    [fulfillment.public_key().to_hex(), valid_from, revoked_at],
+                ),
+            ])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(merchant)
+            .expect("listing event signs")
     }
 
     fn valid_tags(buyer_hex: &str, merchant: &Keys) -> Vec<Tag> {
@@ -333,6 +507,150 @@ mod tests {
                 Tag::custom(TagKind::custom("preimage"), [preimage_hex]),
             ])
             .collect()
+    }
+
+    #[test]
+    fn validates_direct_developer_receipt_with_listing() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let fulfillment = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let listing = listing_event_at(&merchant, &fulfillment, 1_700_000_000, None, 1_700_000_000);
+        let receipt = receipt_event_at(
+            Kind::Custom(1020),
+            &merchant,
+            valid_tags(&buyer_hex, &merchant),
+            1_700_000_100,
+        );
+
+        let stored = parse_and_validate_receipt_with_listing(&receipt, &buyer_hex, &listing)
+            .expect("direct developer receipt should validate");
+
+        assert_eq!(stored.listing_coordinate, listing_coordinate(&merchant));
+    }
+
+    #[test]
+    fn validates_active_delegated_fulfillment_receipt_with_listing() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let fulfillment = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let listing = listing_event_at(&merchant, &fulfillment, 1_700_000_000, None, 1_700_000_000);
+        let receipt = receipt_event_at(
+            Kind::Custom(1020),
+            &fulfillment,
+            valid_tags(&buyer_hex, &merchant),
+            1_700_000_100,
+        );
+
+        let stored = parse_and_validate_receipt_with_listing(&receipt, &buyer_hex, &listing)
+            .expect("active delegated receipt should validate");
+
+        assert_eq!(stored.merchant_pubkey, fulfillment.public_key().to_hex());
+    }
+
+    #[test]
+    fn rejects_delegated_receipt_before_valid_from() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let fulfillment = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let listing = listing_event_at(&merchant, &fulfillment, 1_700_000_000, None, 1_700_000_000);
+        let receipt = receipt_event_at(
+            Kind::Custom(1020),
+            &fulfillment,
+            valid_tags(&buyer_hex, &merchant),
+            1_699_999_999,
+        );
+
+        assert!(parse_and_validate_receipt_with_listing(&receipt, &buyer_hex, &listing).is_err());
+    }
+
+    #[test]
+    fn rejects_delegated_receipt_at_or_after_revoked_at() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let fulfillment = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let listing = listing_event_at(
+            &merchant,
+            &fulfillment,
+            1_700_000_000,
+            Some(1_735_000_000),
+            1_700_000_000,
+        );
+        let receipt = receipt_event_at(
+            Kind::Custom(1020),
+            &fulfillment,
+            valid_tags(&buyer_hex, &merchant),
+            1_735_000_000,
+        );
+
+        assert!(parse_and_validate_receipt_with_listing(&receipt, &buyer_hex, &listing).is_err());
+    }
+
+    #[test]
+    fn validates_delegated_receipt_before_revoked_at() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let fulfillment = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let listing = listing_event_at(
+            &merchant,
+            &fulfillment,
+            1_700_000_000,
+            Some(1_735_000_000),
+            1_700_000_000,
+        );
+        let receipt = receipt_event_at(
+            Kind::Custom(1020),
+            &fulfillment,
+            valid_tags(&buyer_hex, &merchant),
+            1_734_999_999,
+        );
+
+        assert!(parse_and_validate_receipt_with_listing(&receipt, &buyer_hex, &listing).is_ok());
+    }
+
+    #[test]
+    fn clamps_revoked_at_older_than_listing_created_at() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let fulfillment = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let listing = listing_event_at(
+            &merchant,
+            &fulfillment,
+            1_500_000_000,
+            Some(1_600_000_000),
+            1_700_000_000,
+        );
+        let receipt = receipt_event_at(
+            Kind::Custom(1020),
+            &fulfillment,
+            valid_tags(&buyer_hex, &merchant),
+            1_650_000_000,
+        );
+
+        assert!(parse_and_validate_receipt_with_listing(&receipt, &buyer_hex, &listing).is_ok());
+    }
+
+    #[test]
+    fn rejects_receipt_signer_matching_no_listing_delegation() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let fulfillment = Keys::generate();
+        let stranger = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let listing = listing_event_at(&merchant, &fulfillment, 1_700_000_000, None, 1_700_000_000);
+        let receipt = receipt_event_at(
+            Kind::Custom(1020),
+            &stranger,
+            valid_tags(&buyer_hex, &merchant),
+            1_700_000_100,
+        );
+
+        assert!(parse_and_validate_receipt_with_listing(&receipt, &buyer_hex, &listing).is_err());
     }
 
     #[test]

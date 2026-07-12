@@ -58,6 +58,17 @@ impl HttpClient for StaticNoRedirectHttpClient {
 
         self.response.clone()
     }
+
+    async fn post_json(
+        &self,
+        _url: &str,
+        _body: Value,
+        _headers: Vec<(String, String)>,
+    ) -> Result<Value, HttpClientError> {
+        Err(HttpClientError::Request(
+            "post_json path should not be used in NIP-49 command tests".to_string(),
+        ))
+    }
 }
 
 fn create_test_state(active_private_key: Option<&str>) -> AppState {

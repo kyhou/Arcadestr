@@ -45,6 +45,7 @@ use nostr::nips::nip46::NostrConnectURI;
 use nostr::prelude::ToBech32;
 use tauri::Emitter;
 
+mod adp_commands;
 mod command_contracts;
 mod nip46_commands;
 
@@ -716,33 +717,6 @@ async fn disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let mut auth = state.auth.lock().await;
     auth.disconnect();
     Ok(())
-}
-
-/// Publishes a game listing as a signed NOSTR event.
-///
-/// # Arguments
-/// * `listing` - The game listing to publish
-///
-/// # Returns
-/// The event ID as a hex string on success.
-#[tauri::command]
-async fn publish_listing(
-    listing: CoreGameListing,
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    // Clone auth state before dropping the lock to avoid holding across await
-    let auth_snapshot = {
-        let auth = state.auth.lock().await;
-        auth.clone()
-    };
-
-    let nostr = state.nostr.lock().await;
-
-    nostr
-        .publish_listing(&listing, &auth_snapshot)
-        .await
-        .map(|id| id.to_hex())
-        .map_err(|e| e.to_string())
 }
 
 /// Fetches recent game listings from relays.
@@ -3594,7 +3568,12 @@ fn main() {
             get_public_key,
             is_authenticated,
             disconnect,
-            publish_listing,
+            adp_commands::check_adp_server,
+            adp_commands::connect_nwc_wallet,
+            adp_commands::request_lnurl_invoice,
+            adp_commands::pay_nwc_invoice,
+            adp_commands::confirm_purchase,
+            adp_commands::publish_adp_listing,
             fetch_listings,
             fetch_listing_by_id,
             fetch_marketplace,

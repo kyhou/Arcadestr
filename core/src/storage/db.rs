@@ -124,7 +124,17 @@ const MIGRATION_5_ACHIEVEMENTS: &str = include_str!("../../migrations/002_achiev
 // Migration 6: NIP-102 purchase receipts
 const MIGRATION_6_PURCHASES: &str = include_str!("../../migrations/003_purchases.sql");
 
-// List of all migrations in order
+// Migration 7: ADP provisioning relationships
+const MIGRATION_7_ADP_PROVISIONING: &str =
+    include_str!("../../migrations/004_adp_provisioning.sql");
+
+// Migration 8: ADP download token cache
+const MIGRATION_8_DOWNLOAD_TOKENS: &str = include_str!("../../migrations/005_download_tokens.sql");
+
+// Migration 9: ADP installed games
+const MIGRATION_9_INSTALLED_GAMES: &str = include_str!("../../migrations/006_installed_games.sql");
+
+// List of all migrations in applied order; migration filenames currently lag user_version numbers.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_1_INITIAL,
     MIGRATION_2_GAMES_TABLE,
@@ -132,6 +142,9 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_4_USERS_TABLE,
     MIGRATION_5_ACHIEVEMENTS,
     MIGRATION_6_PURCHASES,
+    MIGRATION_7_ADP_PROVISIONING,
+    MIGRATION_8_DOWNLOAD_TOKENS,
+    MIGRATION_9_INSTALLED_GAMES,
 ];
 
 /// Database connection pool for SQLite
@@ -860,5 +873,23 @@ mod tests {
             .expect("pragma user_version query should succeed");
 
         assert_eq!(user_version as usize, MIGRATIONS.len());
+    }
+
+    #[tokio::test]
+    async fn adp_gate2_tables_exist_after_migrations() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = Database::new(&db_path).await.unwrap();
+
+        for table in ["adp_provisioning", "download_tokens", "installed_games"] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(exists, 1, "{table} table should exist");
+        }
     }
 }

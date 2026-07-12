@@ -17,6 +17,8 @@ pub enum HttpClientError {
     RedirectBlocked(String),
     #[error("HTTP status not successful: {0}")]
     Status(u16),
+    #[error("HTTP status not successful: {status} body: {body}")]
+    StatusWithBody { status: u16, body: String },
     #[error("HTTP JSON decode failed: {0}")]
     Json(String),
 }
@@ -29,11 +31,37 @@ pub trait HttpClient: Send + Sync {
 
     /// Fetch URL and decode JSON payload while forbidding redirect following.
     async fn get_json_no_redirects(&self, url: &str) -> Result<Value, HttpClientError>;
+
+    /// Post JSON to a URL and decode the JSON response.
+    async fn post_json(
+        &self,
+        url: &str,
+        body: Value,
+        headers: Vec<(String, String)>,
+    ) -> Result<Value, HttpClientError>;
 }
 
 /// Production HTTP client backed by `reqwest`.
 pub struct ReqwestHttpClient {
     client: reqwest::Client,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_error_displays_response_body_when_available() {
+        let err = HttpClientError::StatusWithBody {
+            status: 400,
+            body: "{\"error\":\"missing tag\"}".to_string(),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "HTTP status not successful: 400 body: {\"error\":\"missing tag\"}"
+        );
+    }
 }
 
 impl ReqwestHttpClient {
@@ -66,7 +94,12 @@ impl HttpClient for ReqwestHttpClient {
         }
 
         if !response.status().is_success() {
-            return Err(HttpClientError::Status(response.status().as_u16()));
+            let status = response.status().as_u16();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|err| format!("<failed to read error body: {err}>"));
+            return Err(HttpClientError::StatusWithBody { status, body });
         }
 
         response
@@ -77,5 +110,42 @@ impl HttpClient for ReqwestHttpClient {
 
     async fn get_json_no_redirects(&self, url: &str) -> Result<Value, HttpClientError> {
         self.get_json(url).await
+    }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        body: Value,
+        headers: Vec<(String, String)>,
+    ) -> Result<Value, HttpClientError> {
+        let mut request = self.client.post(url).json(&body);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| HttpClientError::Request(e.to_string()))?;
+
+        if response.status().is_redirection() {
+            return Err(HttpClientError::RedirectBlocked(
+                response.status().to_string(),
+            ));
+        }
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|err| format!("<failed to read error body: {err}>"));
+            return Err(HttpClientError::StatusWithBody { status, body });
+        }
+
+        response
+            .json::<Value>()
+            .await
+            .map_err(|e| HttpClientError::Json(e.to_string()))
     }
 }

@@ -59,6 +59,17 @@ impl HttpClient for MockNoRedirectHttpClient {
             }
         }))
     }
+
+    async fn post_json(
+        &self,
+        _url: &str,
+        _body: serde_json::Value,
+        _headers: Vec<(String, String)>,
+    ) -> Result<serde_json::Value, HttpClientError> {
+        Err(HttpClientError::Request(
+            "post_json path should not be used in command layer tests".to_string(),
+        ))
+    }
 }
 
 #[test]

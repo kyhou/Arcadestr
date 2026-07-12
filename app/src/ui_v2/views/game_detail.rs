@@ -2,12 +2,17 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::{BadgeEarnedModal, ProfileRow};
-use crate::models::{
-    BadgeAward, BadgeDefinition, EarnedBadgeSummary, GameListing, ListingSource, UserProfile,
-    ZapInvoice, ZapRequest,
-};
+use crate::models::{BadgeAward, BadgeDefinition, EarnedBadgeSummary, GameListing, ListingSource, UserProfile};
 use crate::store::try_use_profile_store;
-use crate::{invoke_fetch_profile, invoke_request_invoice, AuthContext};
+use crate::tauri_bridge::{
+    ConfirmPurchaseRequest, ConnectNwcWalletRequest, PayNwcInvoiceRequest,
+    RequestLnurlInvoiceRequest,
+};
+use crate::tauri_bridge::{
+    invoke_confirm_purchase, invoke_connect_nwc_wallet, invoke_pay_nwc_invoice,
+    invoke_request_lnurl_invoice,
+};
+use crate::{invoke_fetch_profile, AuthContext};
 
 fn format_timestamp(ts: u64) -> String {
     #[cfg(target_arch = "wasm32")]
@@ -63,6 +68,15 @@ fn hero_buy_panel_metadata(
         release_label.to_string(),
         format!("Protocol: {protocol_label}"),
     ]
+}
+
+
+fn adp_server_url_from_download_url(download_url: &str) -> Option<String> {
+    let marker = "/game/";
+    download_url
+        .find(marker)
+        .map(|index| download_url[..index].trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[component]
@@ -138,10 +152,14 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     );
 
     // Buy flow state.
-    let invoice: RwSignal<Option<ZapInvoice>> = RwSignal::new(None);
+    let invoice: RwSignal<Option<String>> = RwSignal::new(None);
     let buy_loading: RwSignal<bool> = RwSignal::new(false);
     let buy_error: RwSignal<Option<String>> = RwSignal::new(None);
     let show_invoice: RwSignal<bool> = RwSignal::new(false);
+    let nwc_connection_input = RwSignal::new(String::new());
+    let nwc_connected: RwSignal<bool> = RwSignal::new(false);
+    let manual_preimage = RwSignal::new(String::new());
+    let purchase_confirmed: RwSignal<bool> = RwSignal::new(listing.is_owned);
 
     // Seller profile state.
     let seller_profile: RwSignal<Option<UserProfile>> = RwSignal::new(None);
@@ -154,39 +172,29 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         let on_invoice_created = on_invoice_created.clone();
 
         Callback::new(move |()| {
-            let buyer_npub = match auth.npub.get() {
-                Some(npub) => npub,
-                None => {
-                    buy_error.set(Some("Not authenticated".to_string()));
-                    return;
-                }
-            };
-
-            let event_id = listing
-                .event_id
-                .clone()
-                .unwrap_or_else(|| listing.id.clone());
-
-            let zap_req = ZapRequest {
-                seller_npub: listing.publisher_npub.clone(),
-                seller_lud16: listing.lud16.clone(),
-                listing_event_id: event_id,
-                amount_sats: listing.price_sats,
-                buyer_npub,
-                relays: vec![
-                    "wss://relay.damus.io".to_string(),
-                    "wss://relay.nostr.band".to_string(),
-                ],
-            };
+            if auth.npub.get().is_none() {
+                buy_error.set(Some("Not authenticated".to_string()));
+                return;
+            }
+            if listing.price_sats == 0 {
+                buy_error.set(Some("Free downloads are handled by Install.".to_string()));
+                return;
+            }
+            if listing.lud16.trim().is_empty() {
+                buy_error.set(Some("No Lightning address".to_string()));
+                return;
+            }
 
             buy_loading.set(true);
             buy_error.set(None);
             show_invoice.set(false);
 
+            let lud16 = listing.lud16.clone();
+            let amount_sats = listing.price_sats;
             spawn_local(async move {
-                match invoke_request_invoice(zap_req).await {
-                    Ok(zap_invoice) => {
-                        invoice.set(Some(zap_invoice));
+                match invoke_request_lnurl_invoice(RequestLnurlInvoiceRequest { lud16, amount_sats }).await {
+                    Ok(response) => {
+                        invoice.set(Some(response.bolt11));
                         show_invoice.set(true);
                         buy_loading.set(false);
                         on_invoice_created.run(());
@@ -203,9 +211,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let on_copy_invoice = Callback::new(move |()| {
         #[cfg(target_arch = "wasm32")]
         {
-            if let Some(inv) = invoice.get() {
+            if let Some(bolt11) = invoice.get() {
                 if let Some(window) = leptos::web_sys::window() {
-                    let _ = window.navigator().clipboard().write_text(&inv.bolt11);
+                    let _ = window.navigator().clipboard().write_text(&bolt11);
                 }
             }
         }
@@ -219,8 +227,8 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let on_open_wallet = Callback::new(move |()| {
         #[cfg(target_arch = "wasm32")]
         {
-            if let Some(inv) = invoice.get() {
-                let lightning_uri = format!("lightning:{}", inv.bolt11);
+            if let Some(bolt11) = invoice.get() {
+                let lightning_uri = format!("lightning:{}", bolt11);
                 if let Some(win) = leptos::web_sys::window() {
                     let _ = win.location().set_href(&lightning_uri);
                 }
@@ -232,6 +240,119 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             let _ = invoice;
         }
     });
+
+    let confirm_with_preimage = {
+        let listing = listing.clone();
+        move |preimage: String| {
+            let Some(bolt11) = invoice.get() else {
+                buy_error.set(Some("Request an invoice before confirming purchase".to_string()));
+                return;
+            };
+            let publisher_npub = listing.publisher_npub.clone();
+            let listing_id = listing.id.clone();
+            let server_url = match adp_server_url_from_download_url(&listing.download_url) {
+                Some(server_url) => server_url,
+                None => {
+                    buy_error.set(Some("Listing does not include an ADP download URL".to_string()));
+                    return;
+                }
+            };
+
+            buy_loading.set(true);
+            buy_error.set(None);
+            spawn_local(async move {
+                let request = ConfirmPurchaseRequest {
+                    publisher_npub,
+                    listing_id,
+                    server_url,
+                    bolt11,
+                    preimage,
+                };
+                match invoke_confirm_purchase(request).await {
+                    Ok(_) => {
+                        purchase_confirmed.set(true);
+                        buy_loading.set(false);
+                    }
+                    Err(err) => {
+                        let message = if err.contains("402") {
+                            "Payment proof was rejected. Check the invoice preimage.".to_string()
+                        } else if err.contains("409") {
+                            purchase_confirmed.set(true);
+                            "Purchase already confirmed. You can install this game.".to_string()
+                        } else if err.contains("404") {
+                            "This game is not hosted on the selected ADP server.".to_string()
+                        } else if err.contains("500") {
+                            "The ADP server is not authorized to fulfill this listing.".to_string()
+                        } else {
+                            err
+                        };
+                        buy_error.set(Some(message));
+                        buy_loading.set(false);
+                    }
+                }
+            });
+        }
+    };
+
+    let on_connect_nwc = Callback::new(move |()| {
+        let connection_string = nwc_connection_input.get();
+        if connection_string.trim().is_empty() {
+            buy_error.set(Some("Paste a Nostr Wallet Connect string first".to_string()));
+            return;
+        }
+        buy_loading.set(true);
+        buy_error.set(None);
+        spawn_local(async move {
+            match invoke_connect_nwc_wallet(ConnectNwcWalletRequest { connection_string }).await {
+                Ok(_) => {
+                    nwc_connected.set(true);
+                    buy_loading.set(false);
+                }
+                Err(err) => {
+                    buy_error.set(Some(err));
+                    buy_loading.set(false);
+                }
+            }
+        });
+    });
+
+    let on_pay_nwc = {
+        let confirm_with_preimage = confirm_with_preimage.clone();
+        Callback::new(move |()| {
+            let Some(bolt11) = invoice.get() else {
+                buy_error.set(Some("Request an invoice before paying".to_string()));
+                return;
+            };
+            buy_loading.set(true);
+            buy_error.set(None);
+            let confirm_with_preimage = confirm_with_preimage.clone();
+            spawn_local(async move {
+                match invoke_pay_nwc_invoice(PayNwcInvoiceRequest { bolt11 }).await {
+                    Ok(result) => {
+                        manual_preimage.set(result.preimage.clone());
+                        buy_loading.set(false);
+                        confirm_with_preimage(result.preimage);
+                    }
+                    Err(err) => {
+                        buy_error.set(Some(err));
+                        buy_loading.set(false);
+                    }
+                }
+            });
+        })
+    };
+
+    let on_confirm_manual = {
+        let confirm_with_preimage = confirm_with_preimage.clone();
+        Callback::new(move |()| {
+            let preimage = manual_preimage.get();
+            if preimage.trim().is_empty() {
+                buy_error.set(Some("Paste the payment preimage first".to_string()));
+                return;
+            }
+            confirm_with_preimage(preimage);
+        })
+    };
 
     let on_download = {
         let download_url = download_url.clone();
@@ -312,10 +433,19 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     </button>
 
                     {move || {
-                        if buy_loading.get() {
+                        if purchase_confirmed.get() {
+                            view! {
+                                <>
+                                    <button class="v2-btn-primary" on:click=move |_| on_download.run(()) disabled=move || !has_download_url>
+                                        "Install"
+                                    </button>
+                                    <p class="v2-social-meta">"Purchase confirmed. Download token stored."</p>
+                                </>
+                            }.into_any()
+                        } else if buy_loading.get() {
                             view! {
                                 <button class="v2-btn-primary" disabled=true>
-                                    "Requesting invoice..."
+                                    "Processing purchase..."
                                 </button>
                             }.into_any()
                         } else if show_invoice.get() {
@@ -323,11 +453,11 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                 <>
                                     <div class="v2-panel" style:padding="8px" style:font-size="0.8rem">
                                         <p style:word-break="break-all">
-                                            {move || invoice.get().map(|inv| {
-                                                if inv.bolt11.len() > 40 {
-                                                    format!("{}...", &inv.bolt11[..40])
+                                            {move || invoice.get().map(|bolt11| {
+                                                if bolt11.len() > 40 {
+                                                    format!("{}...", &bolt11[..40])
                                                 } else {
-                                                    inv.bolt11.clone()
+                                                    bolt11
                                                 }
                                             }).unwrap_or_default()}
                                         </p>
@@ -337,6 +467,29 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                     </button>
                                     <button class="v2-btn-secondary" on:click=move |_| on_open_wallet.run(())>
                                         "Open in Wallet"
+                                    </button>
+                                    <input
+                                        class="v2-input"
+                                        type="password"
+                                        placeholder="nostr+walletconnect://..."
+                                        prop:value=move || nwc_connection_input.get()
+                                        on:input:target=move |ev| nwc_connection_input.set(ev.target().value())
+                                    />
+                                    <button class="v2-btn-secondary" on:click=move |_| on_connect_nwc.run(())>
+                                        {move || if nwc_connected.get() { "NWC Connected" } else { "Connect NWC Wallet" }}
+                                    </button>
+                                    <button class="v2-btn-primary" on:click=move |_| on_pay_nwc.run(()) disabled=move || !nwc_connected.get()>
+                                        "Pay with Connected Wallet"
+                                    </button>
+                                    <input
+                                        class="v2-input"
+                                        type="text"
+                                        placeholder="Paste payment preimage"
+                                        prop:value=move || manual_preimage.get()
+                                        on:input:target=move |ev| manual_preimage.set(ev.target().value())
+                                    />
+                                    <button class="v2-btn-secondary" on:click=move |_| on_confirm_manual.run(())>
+                                        "Confirm Manual Payment"
                                     </button>
                                 </>
                             }.into_any()

@@ -10,10 +10,14 @@ use crate::http_client::{HttpClient, HttpClientError};
 struct MockState {
     responses: HashMap<String, VecDeque<Result<Value, HttpClientError>>>,
     no_redirect_responses: HashMap<String, VecDeque<Result<Value, HttpClientError>>>,
+    post_responses: HashMap<String, VecDeque<Result<Value, HttpClientError>>>,
     prefix_responses: Vec<(String, VecDeque<Result<Value, HttpClientError>>)>,
     call_counts: HashMap<String, usize>,
     no_redirect_call_counts: HashMap<String, usize>,
+    post_call_counts: HashMap<String, usize>,
     requested_urls: Vec<String>,
+    post_bodies: HashMap<String, Value>,
+    post_headers: HashMap<String, Vec<(String, String)>>,
 }
 
 /// In-memory HTTP mock for unit tests.
@@ -34,6 +38,16 @@ impl MockHttpClient {
 
     pub fn with_error_response(self, url: &str, err: HttpClientError) -> Self {
         self.push_response(url, Err(err));
+        self
+    }
+
+    pub fn with_json_post_response(self, url: &str, body: Value) -> Self {
+        self.push_post_response(url, Ok(body));
+        self
+    }
+
+    pub fn with_post_error_response(self, url: &str, err: HttpClientError) -> Self {
+        self.push_post_response(url, Err(err));
         self
     }
 
@@ -107,6 +121,34 @@ impl MockHttpClient {
             .unwrap_or(0)
     }
 
+    pub fn post_call_count(&self, url: &str) -> usize {
+        self.state
+            .lock()
+            .expect("mock_http_client state mutex poisoned")
+            .post_call_counts
+            .get(url)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn last_json_post_body(&self, url: &str) -> Option<Value> {
+        self.state
+            .lock()
+            .expect("mock_http_client state mutex poisoned")
+            .post_bodies
+            .get(url)
+            .cloned()
+    }
+
+    pub fn last_json_post_headers(&self, url: &str) -> Option<Vec<(String, String)>> {
+        self.state
+            .lock()
+            .expect("mock_http_client state mutex poisoned")
+            .post_headers
+            .get(url)
+            .cloned()
+    }
+
     pub fn last_requested_url(&self) -> Option<String> {
         self.state
             .lock()
@@ -135,6 +177,18 @@ impl MockHttpClient {
             .expect("mock_http_client state mutex poisoned");
         state
             .no_redirect_responses
+            .entry(url.to_string())
+            .or_default()
+            .push_back(response);
+    }
+
+    fn push_post_response(&self, url: &str, response: Result<Value, HttpClientError>) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("mock_http_client state mutex poisoned");
+        state
+            .post_responses
             .entry(url.to_string())
             .or_default()
             .push_back(response);
@@ -219,6 +273,32 @@ impl HttpClient for MockHttpClient {
                     )))
                 }
             },
+        }
+    }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        body: Value,
+        headers: Vec<(String, String)>,
+    ) -> Result<Value, HttpClientError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("mock_http_client state mutex poisoned");
+
+        state.requested_urls.push(url.to_string());
+        *state.call_counts.entry(url.to_string()).or_insert(0) += 1;
+        *state.post_call_counts.entry(url.to_string()).or_insert(0) += 1;
+        state.post_bodies.insert(url.to_string(), body);
+        state.post_headers.insert(url.to_string(), headers);
+
+        match state.post_responses.get_mut(url) {
+            Some(queue) if !queue.is_empty() => pop_response(queue),
+            _ => Err(HttpClientError::Request(format!(
+                "No mock POST response configured for URL: {}",
+                url
+            ))),
         }
     }
 }
