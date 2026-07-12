@@ -47,6 +47,7 @@ use tauri::Emitter;
 
 mod adp_commands;
 mod command_contracts;
+mod install;
 mod nip46_commands;
 
 use arcadestr_app::models::GameListing as AppGameListing;
