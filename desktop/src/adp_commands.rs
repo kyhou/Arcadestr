@@ -222,7 +222,7 @@ async fn request_lnurl_invoice_with_http(
     Ok(RequestLnurlInvoiceResponse { bolt11 })
 }
 
-async fn fetch_listing_event_by_coordinate(
+pub(crate) async fn fetch_listing_event_by_coordinate(
     state: &State<'_, AppState>,
     coordinate: &str,
 ) -> Result<nostr::Event, String> {

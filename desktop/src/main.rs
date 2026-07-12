@@ -3,6 +3,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
@@ -13,6 +16,8 @@ use tracing::{error, info, warn};
 use arcadestr_core::signers::NostrSigner;
 
 use arcadestr_core::auth::AuthState;
+use arcadestr_core::adp_client::{AdpClient, DownloadAuth};
+use arcadestr_core::adp_storage::{DownloadTokensRepository, InstalledGamesRepository};
 use arcadestr_core::extended_network::ExtendedNetworkRepository;
 use arcadestr_core::http_client::{HttpClient, ReqwestHttpClient};
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
@@ -900,22 +905,102 @@ fn get_platform_info() -> arcadestr_app::models::PlatformInfo {
     }
 }
 
-#[tauri::command]
-async fn install_game(
-    listing: AppGameListing,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    tracing::info!(
-        "install_game called for listing '{}' ({})",
-        listing.title,
-        listing.id
-    );
+type InstallFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-    let buyer_pubkey_hex = {
+trait FreshListingFetcher {
+    fn fetch<'a>(&'a self, coordinate: &'a str) -> InstallFuture<'a, Result<nostr::Event, String>>;
+}
+
+struct RelayFreshListingFetcher<'a> {
+    state: tauri::State<'a, AppState>,
+}
+
+impl FreshListingFetcher for RelayFreshListingFetcher<'_> {
+    fn fetch<'a>(&'a self, coordinate: &'a str) -> InstallFuture<'a, Result<nostr::Event, String>> {
+        Box::pin(async move { adp_commands::fetch_listing_event_by_coordinate(&self.state, coordinate).await })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DownloadProgressPayload {
+    game_coordinate: String,
+    bytes: u64,
+    total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DownloadCompletePayload {
+    game_coordinate: String,
+    file_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct FreshListingMetadata {
+    server_url: String,
+    file_hash: String,
+    version: Option<String>,
+}
+
+fn extract_fresh_listing_metadata(event: &nostr::Event) -> Result<FreshListingMetadata, String> {
+    let server_url = listing_tag_value(event, "server")
+        .ok_or_else(|| "fresh listing is missing server tag".to_string())?;
+    let file_hash = listing_tag_value(event, "file_hash")
+        .ok_or_else(|| "fresh listing is missing file_hash tag".to_string())?;
+    let version = listing_tag_value(event, "version");
+
+    Ok(FreshListingMetadata {
+        server_url,
+        file_hash,
+        version,
+    })
+}
+
+fn listing_tag_value(event: &nostr::Event, tag_name: &str) -> Option<String> {
+    event.tags.iter().find_map(|tag| {
+        let values = tag.clone().to_vec();
+        match (values.first(), values.get(1)) {
+            (Some(name), Some(value)) if name == tag_name => Some(value.clone()),
+            _ => None,
+        }
+    })
+}
+
+fn deterministic_artifact_path(app_data_dir: &Path, coordinate: &str) -> PathBuf {
+    let safe_coordinate: String = coordinate
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    app_data_dir
+        .join("games")
+        .join(safe_coordinate)
+        .join("artifact.bin")
+}
+
+fn now_unix_i64() -> Result<i64, String> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs() as i64)
+}
+
+async fn install_game_with_fetcher<R: tauri::Runtime>(
+    listing: AppGameListing,
+    state: &AppState,
+    app: Option<&tauri::AppHandle<R>>,
+    app_data_dir: PathBuf,
+    fresh_listing_fetcher: &dyn FreshListingFetcher,
+) -> Result<(), String> {
+    let (buyer_pubkey_hex, signer) = {
         let auth = state.auth.lock().await;
-        auth.public_key()
+        let buyer_pubkey_hex = auth
+            .public_key()
             .map(|public_key| public_key.to_hex())
-            .ok_or_else(|| "not authenticated".to_string())?
+            .ok_or_else(|| "not authenticated".to_string())?;
+        let signer = auth
+            .signer()
+            .cloned()
+            .ok_or_else(|| "not authenticated".to_string())?;
+        (buyer_pubkey_hex, signer)
     };
 
     let coordinate = listing_coordinate_from_app_listing(&listing)?;
@@ -926,11 +1011,88 @@ async fn install_game(
         .map_err(|error| error.to_string())?;
 
     if !is_owned {
-        return Err("purchase not found".to_string());
+        return Err("purchase not found: you do not own this game".to_string());
     }
 
-    // TODO(nip94-delivery): download and verify the NIP-94 payload before install.
+    let fresh_listing = fresh_listing_fetcher.fetch(&coordinate).await?;
+    let metadata = extract_fresh_listing_metadata(&fresh_listing)?;
+    let tokens = DownloadTokensRepository::new(state.database.pool().clone());
+    let auth = match tokens
+        .valid_token(&coordinate, &metadata.server_url, now_unix_i64()?)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        Some(token) => DownloadAuth::Token(token.token),
+        None => DownloadAuth::Nip98 { signer: &signer },
+    };
+
+    let dest_path = deterministic_artifact_path(&app_data_dir, &coordinate);
+    if let Some(parent) = dest_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| format!("failed to create install directory {}: {error}", parent.display()))?;
+    }
+
+    let adp_client = AdpClient::new(metadata.server_url.clone(), Arc::clone(&state.http_client));
+    adp_client
+        .download(&coordinate, auth, &dest_path, |bytes, total| {
+            if let Some(app) = app {
+                let _ = app.emit(
+                    "download-progress",
+                    DownloadProgressPayload {
+                        game_coordinate: coordinate.clone(),
+                        bytes,
+                        total,
+                    },
+                );
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let installed_games = InstalledGamesRepository::new(state.database.pool().clone());
+    install::verify_and_record_downloaded_game(
+        &installed_games,
+        &coordinate,
+        &dest_path,
+        &metadata.file_hash,
+        metadata.version,
+        &metadata.server_url,
+    )
+    .await?;
+
+    if let Some(app) = app {
+        app.emit(
+            "download-complete",
+            DownloadCompletePayload {
+                game_coordinate: coordinate,
+                file_path: dest_path.to_string_lossy().to_string(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    }
+
     Ok(())
+}
+
+#[tauri::command]
+async fn install_game(
+    listing: AppGameListing,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    tracing::info!(
+        "install_game called for listing '{}' ({})",
+        listing.title,
+        listing.id
+    );
+
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("failed to resolve app data directory: {error}"))?;
+    let fetcher = RelayFreshListingFetcher { state: state.clone() };
+    install_game_with_fetcher(listing, &state, Some(&app_handle), app_data_dir, &fetcher).await
 }
 
 #[tauri::command]
@@ -1209,6 +1371,378 @@ async fn request_invoice(
     request_zap_invoice(&zap_request, &auth_snapshot)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod install_game_tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arcadestr_core::adp_storage::{DownloadToken, DownloadTokensRepository};
+    use arcadestr_core::file_hash::sha256_file;
+    use arcadestr_core::purchases::StoredReceipt;
+    use arcadestr_core::storage::Database;
+    use arcadestr_core::test_helpers::http_mocks::MockHttpClient;
+    use nostr::nips::nip19::ToBech32;
+    use nostr::{Event, EventBuilder, Keys, Kind, Tag, TagKind, Timestamp};
+    use tokio::sync::{Mutex as AsyncMutex, RwLock};
+
+    struct StaticFreshListingFetcher {
+        event: Event,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FreshListingFetcher for StaticFreshListingFetcher {
+        fn fetch<'a>(
+            &'a self,
+            _coordinate: &'a str,
+        ) -> InstallFuture<'a, Result<Event, String>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(self.event.clone()) })
+        }
+    }
+
+    async fn test_db(prefix: &str) -> Database {
+        let path = unique_test_path(prefix, "db");
+        Database::new(&path)
+            .await
+            .expect("test database should open")
+    }
+
+    fn unique_test_path(prefix: &str, extension: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}.{extension}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after epoch")
+                .as_nanos()
+        ))
+    }
+
+    async fn app_state_with_http(
+        buyer: &Keys,
+        database: Database,
+        http_client: Arc<dyn HttpClient>,
+    ) -> AppState {
+        let user_cache = Arc::new(UserCache::new(database.pool().clone()));
+        let nostr = NostrClient::new_with_cache(
+            "install-game-test".to_string(),
+            vec![],
+            user_cache.clone(),
+            None,
+        )
+        .await
+        .expect("test nostr client should initialize");
+        let validator_client = NostrClient::new_with_cache(
+            "install-game-validator".to_string(),
+            vec![],
+            user_cache.clone(),
+            None,
+        )
+        .await
+        .expect("test validator client should initialize");
+        let nip05_validator = Arc::new(std::sync::Mutex::new(Nip05Validator::spawn(
+            Arc::new(validator_client),
+            user_cache.clone(),
+        )));
+        let mut auth = AuthState::new();
+        auth.connect_with_key(&buyer.secret_key().to_secret_hex())
+            .expect("test buyer should authenticate");
+        let relay_cache = Arc::new(
+            RelayCache::new(unique_test_path("install-game-relay-cache", "db"))
+                .expect("relay cache should open"),
+        );
+        let relay_hints = Arc::new(
+            RelayHints::new(unique_test_path("install-game-relay-hints", "db"))
+                .expect("relay hints should open"),
+        );
+        let marketplace_cache = Arc::new(MarketplaceCache::new(database.pool().clone()));
+        let purchases = Arc::new(arcadestr_core::purchases::PurchasesRepository::new(
+            database.pool().clone(),
+        ));
+        let profile_fetcher = Arc::new({
+            let mut fetcher = ProfileFetcher::with_persistent_cache(user_cache.clone());
+            fetcher.with_nip05_validator(nip05_validator.clone());
+            fetcher
+        });
+
+        AppState {
+            auth: Arc::new(AsyncMutex::new(auth)),
+            nostr: Arc::new(AsyncMutex::new(nostr)),
+            database: Arc::new(database),
+            relay_cache,
+            deduplicator: Arc::new(AsyncMutex::new(EventDeduplicator::new(10_000))),
+            subscription_registry: Arc::new(SubscriptionRegistry::new()),
+            profile_fetcher,
+            user_cache,
+            marketplace_cache,
+            purchases,
+            extended_network: Arc::new(RwLock::new(None)),
+            extended_network_follows: Arc::new(RwLock::new(Vec::new())),
+            relay_hints: Some(relay_hints),
+            nip05_validator,
+            http_client,
+        }
+    }
+
+    fn app_listing(merchant: &Keys, listing_id: &str) -> AppGameListing {
+        AppGameListing {
+            id: listing_id.to_string(),
+            source: arcadestr_app::models::ListingSource::Nip99Listing,
+            title: "Fresh Install Test".to_string(),
+            description: "listing".to_string(),
+            images: Vec::new(),
+            download_url: String::new(),
+            price: 1.0,
+            currency: "SATS".to_string(),
+            price_sats: 1,
+            quantity: None,
+            tags: Vec::new(),
+            specs: Vec::new(),
+            publisher_npub: merchant
+                .public_key()
+                .to_bech32()
+                .expect("merchant npub should encode"),
+            stall_id: String::new(),
+            stall_name: None,
+            lud16: String::new(),
+            event_id: None,
+            created_at: 1_700_000_000,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            is_owned: false,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
+        }
+    }
+
+    fn coordinate(merchant: &Keys, listing_id: &str) -> String {
+        format!("30402:{}:{listing_id}", merchant.public_key().to_hex())
+    }
+
+    fn listing_event(
+        merchant: &Keys,
+        listing_id: &str,
+        server_url: &str,
+        file_hash: &str,
+        version: &str,
+    ) -> Event {
+        EventBuilder::new(Kind::Custom(30402), "")
+            .tags([
+                Tag::custom(TagKind::d(), [listing_id]),
+                Tag::custom(TagKind::custom("server"), [server_url]),
+                Tag::custom(TagKind::custom("file_hash"), [file_hash]),
+                Tag::custom(TagKind::custom("version"), [version]),
+            ])
+            .custom_created_at(Timestamp::from(1_700_000_100))
+            .sign_with_keys(merchant)
+            .expect("listing event should sign")
+    }
+
+    async fn grant_ownership(state: &AppState, buyer: &Keys, merchant: &Keys, listing_id: &str) {
+        let receipt = StoredReceipt {
+            event_id: format!("receipt-{listing_id}"),
+            order_id: format!("order-{listing_id}"),
+            listing_coordinate: coordinate(merchant, listing_id),
+            buyer_pubkey: buyer.public_key().to_hex(),
+            merchant_pubkey: merchant.public_key().to_hex(),
+            payment_hash: None,
+            status: "paid".to_string(),
+            created_at: 1_700_000_200,
+            raw_event: "{}".to_string(),
+        };
+        state
+            .purchases
+            .upsert_receipt(&receipt)
+            .await
+            .expect("test receipt should persist");
+    }
+
+    async fn sha256_hex(bytes: &[u8]) -> String {
+        let path = unique_test_path("install-game-hash", "bin");
+        tokio::fs::write(&path, bytes)
+            .await
+            .expect("hash fixture should write");
+        sha256_file(&path).await.expect("hash fixture should hash")
+    }
+
+    #[tokio::test]
+    async fn install_game_unpurchased_listing_fails_before_download_request() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let listing_id = "not-owned";
+        let artifact_bytes = b"owned artifact";
+        let file_hash = sha256_hex(artifact_bytes).await;
+        let server_url = "https://dist.example.com";
+        let encoded_coordinate = urlencoding::encode(&coordinate(&merchant, listing_id));
+        let download_url = format!("{server_url}/game/{encoded_coordinate}");
+        let http = MockHttpClient::new().with_download_response(&download_url, artifact_bytes);
+        let state = app_state_with_http(
+            &buyer,
+            test_db("install-game-unpurchased").await,
+            Arc::new(http.clone()),
+        )
+        .await;
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = StaticFreshListingFetcher {
+            event: listing_event(&merchant, listing_id, server_url, &file_hash, "1.0.0"),
+            calls: fetch_calls,
+        };
+
+        let err = install_game_with_fetcher(
+            app_listing(&merchant, listing_id),
+            &state,
+            None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
+            unique_test_path("install-game-unpurchased-data", "dir"),
+            &fetcher,
+        )
+        .await
+        .expect_err("unpurchased listing should fail locally");
+
+        assert!(err.contains("purchase") || err.contains("own"));
+        assert_eq!(http.call_count(&download_url), 0);
+    }
+
+    #[tokio::test]
+    async fn install_game_uses_cached_token_path_a() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let listing_id = "token-path-a";
+        let artifact_bytes = b"token artifact";
+        let file_hash = sha256_hex(artifact_bytes).await;
+        let server_url = "https://dist.example.com";
+        let coordinate = coordinate(&merchant, listing_id);
+        let encoded_coordinate = urlencoding::encode(&coordinate);
+        let download_url = format!("{server_url}/game/{encoded_coordinate}?token=token-path-a");
+        let http = MockHttpClient::new().with_download_response(&download_url, artifact_bytes);
+        let state = app_state_with_http(
+            &buyer,
+            test_db("install-game-token").await,
+            Arc::new(http.clone()),
+        )
+        .await;
+        grant_ownership(&state, &buyer, &merchant, listing_id).await;
+        DownloadTokensRepository::new(state.database.pool().clone())
+            .upsert(&DownloadToken {
+                game_coordinate: coordinate.clone(),
+                server_url: server_url.to_string(),
+                token: "token-path-a".to_string(),
+                expires_at: 4_000_000_000,
+            })
+            .await
+            .expect("token should persist");
+        let fetcher = StaticFreshListingFetcher {
+            event: listing_event(&merchant, listing_id, server_url, &file_hash, "1.0.0"),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+
+        install_game_with_fetcher(
+            app_listing(&merchant, listing_id),
+            &state,
+            None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
+            unique_test_path("install-game-token-data", "dir"),
+            &fetcher,
+        )
+        .await
+        .expect("token path install should succeed");
+
+        assert_eq!(http.call_count(&download_url), 1);
+    }
+
+    #[tokio::test]
+    async fn install_game_without_token_uses_nip98_path_b() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let listing_id = "nip98-path-b";
+        let artifact_bytes = b"nip98 artifact";
+        let file_hash = sha256_hex(artifact_bytes).await;
+        let server_url = "https://dist.example.com";
+        let coordinate = coordinate(&merchant, listing_id);
+        let encoded_coordinate = urlencoding::encode(&coordinate);
+        let download_url = format!("{server_url}/game/{encoded_coordinate}");
+        let http = MockHttpClient::new().with_download_response(&download_url, artifact_bytes);
+        let state = app_state_with_http(
+            &buyer,
+            test_db("install-game-nip98").await,
+            Arc::new(http.clone()),
+        )
+        .await;
+        grant_ownership(&state, &buyer, &merchant, listing_id).await;
+        let fetcher = StaticFreshListingFetcher {
+            event: listing_event(&merchant, listing_id, server_url, &file_hash, "1.0.0"),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+
+        install_game_with_fetcher(
+            app_listing(&merchant, listing_id),
+            &state,
+            None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
+            unique_test_path("install-game-nip98-data", "dir"),
+            &fetcher,
+        )
+        .await
+        .expect("nip98 path install should succeed");
+
+        let headers = http
+            .last_download_headers(&download_url)
+            .expect("download headers should be recorded");
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "Authorization" && value.starts_with("Nostr ")));
+        assert!(!http
+            .last_requested_url()
+            .expect("download URL should be recorded")
+            .contains("token="));
+    }
+
+    #[tokio::test]
+    async fn install_game_refetches_listing_event_before_download() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let listing_id = "fresh-listing";
+        let fresh_bytes = b"fresh artifact bytes";
+        let fresh_hash = sha256_hex(fresh_bytes).await;
+        let stale_server_url = "https://stale.example.com";
+        let fresh_server_url = "https://fresh.example.com";
+        let coordinate = coordinate(&merchant, listing_id);
+        let encoded_coordinate = urlencoding::encode(&coordinate);
+        let stale_download_url = format!("{stale_server_url}/game/{encoded_coordinate}");
+        let fresh_download_url = format!("{fresh_server_url}/game/{encoded_coordinate}");
+        let http = MockHttpClient::new().with_download_response(&fresh_download_url, fresh_bytes);
+        let state = app_state_with_http(
+            &buyer,
+            test_db("install-game-fresh").await,
+            Arc::new(http.clone()),
+        )
+        .await;
+        grant_ownership(&state, &buyer, &merchant, listing_id).await;
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = StaticFreshListingFetcher {
+            event: listing_event(&merchant, listing_id, fresh_server_url, &fresh_hash, "2.0.0"),
+            calls: Arc::clone(&fetch_calls),
+        };
+        let mut stale_listing = app_listing(&merchant, listing_id);
+        stale_listing.download_url = stale_download_url.clone();
+        stale_listing.specs = vec![
+            ("server".to_string(), stale_server_url.to_string()),
+            ("file_hash".to_string(), "stale-hash".to_string()),
+        ];
+
+        install_game_with_fetcher(
+            stale_listing,
+            &state,
+            None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
+            unique_test_path("install-game-fresh-data", "dir"),
+            &fetcher,
+        )
+        .await
+        .expect("fresh listing install should succeed");
+
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(http.call_count(&fresh_download_url), 1);
+        assert_eq!(http.call_count(&stale_download_url), 0);
+    }
 }
 
 #[cfg(test)]
