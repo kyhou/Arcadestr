@@ -18,6 +18,8 @@ use crate::tauri_bridge::{
 };
 use crate::{invoke_fetch_profile, AuthContext};
 
+type DownloadCompleteCleanup = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
 fn format_timestamp(ts: u64) -> String {
     #[cfg(target_arch = "wasm32")]
     {
@@ -175,7 +177,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
 
     let on_buy = {
         let listing = listing.clone();
-        let on_invoice_created = on_invoice_created.clone();
 
         Callback::new(move |()| {
             if auth.npub.get().is_none() {
@@ -388,7 +389,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     };
 
     let install_listing_id = listing.id.clone();
-    let download_complete_cleanup: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(None));
+    let download_complete_cleanup: DownloadCompleteCleanup = Rc::new(RefCell::new(None));
     let download_complete_disposed = Rc::new(RefCell::new(false));
     let download_complete_registration_started = Rc::new(RefCell::new(false));
     let download_complete_cleanup_for_effect = Rc::clone(&download_complete_cleanup);
