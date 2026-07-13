@@ -277,7 +277,8 @@ impl AdpClient {
             }
             DownloadAuth::Nip98 { signer } => {
                 let url = self.url(&format!("/game/{encoded_coordinate}"));
-                let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
+                let auth_url = self.url(&format!("/game/{game_coordinate}"));
+                let auth_header = build_nip98_auth_header(signer, &auth_url, "GET").await?;
                 (url, vec![("Authorization".to_string(), auth_header)])
             }
         };
@@ -334,7 +335,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use base64::Engine;
     use serde_json::json;
+    use serde_json::Value;
 
     use crate::signers::LocalSigner;
     use crate::test_helpers::http_mocks::MockHttpClient;
@@ -461,6 +464,20 @@ mod tests {
             .map(|(_, value)| value.as_str())
             .expect("Authorization header should be set");
         assert!(auth.starts_with("Nostr "));
+        let encoded = auth
+            .strip_prefix("Nostr ")
+            .expect("Authorization should use Nostr scheme");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("Authorization should contain base64 event JSON");
+        let event: Value = serde_json::from_slice(&decoded).expect("event JSON should decode");
+        assert_eq!(
+            event["tags"],
+            json!([
+                ["u", "https://dist.example.com/game/30406:publisher:test-game"],
+                ["method", "GET"]
+            ])
+        );
         assert_eq!(http.call_count(url), 1);
         assert_eq!(http.last_requested_url().as_deref(), Some(url));
 
