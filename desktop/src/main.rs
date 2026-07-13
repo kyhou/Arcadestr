@@ -3995,7 +3995,14 @@ fn main() {
     /// Version info structure for frontend
     type VersionInfo = command_contracts::VersionInfo;
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    #[cfg(debug_assertions)]
+    {
+        builder = builder.plugin(tauri_plugin_mcp_bridge::init());
+    }
+
+    builder
         .manage(AppState {
             auth: Arc::new(Mutex::new(AuthState::new())),
             nostr: nostr_client.clone(),
