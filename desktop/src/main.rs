@@ -18,7 +18,7 @@ use arcadestr_core::signers::NostrSigner;
 
 use arcadestr_core::adp_client::{AdpClient, AdpClientError, DownloadAuth};
 use arcadestr_core::adp_storage::{DownloadTokensRepository, InstalledGamesRepository};
-use arcadestr_core::auth::AuthState;
+use arcadestr_core::auth::{AccountManager, AuthState};
 use arcadestr_core::extended_network::ExtendedNetworkRepository;
 use arcadestr_core::http_client::{HttpClient, ReqwestHttpClient};
 use arcadestr_core::lightning::{request_zap_invoice, ZapInvoice, ZapRequest};
@@ -2658,6 +2658,11 @@ fn main() {
     // Create a single runtime for all initialization
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
+    let account_manager = runtime
+        .block_on(AccountManager::new(&keys_dir))
+        .expect("Failed to initialize local account manager");
+    info!("Local account manager initialized");
+
     let (database, nostr_client, user_cache, marketplace_cache, purchases, nip05_validator) =
         runtime.block_on(async {
             // Initialize database
@@ -4022,6 +4027,7 @@ fn main() {
             relay_hints: Some(relay_hints.clone()),
         })
         .manage(Arc::new(Mutex::new(AppSignerState::new())))
+        .manage(Arc::new(account_manager))
         .setup(move |app| {
             // Ensure window is visible and focused
             if let Some(window) = app.get_webview_window("main") {
@@ -4427,6 +4433,7 @@ fn main() {
             nip46_commands::logout_nip46,
             nip46_commands::has_accounts,
             nip46_commands::load_active_account,
+            nip46_commands::login_with_nsec,
             nip46_commands::attempt_reconnect,
             #[cfg(debug_assertions)]
             test_extended_network_discovery,
