@@ -269,9 +269,7 @@ impl AdpClient {
             DownloadAuth::Token(token) => {
                 let encoded_token = urlencoding::encode(&token);
                 (
-                    self.url(&format!(
-                        "/game/{encoded_coordinate}?token={encoded_token}"
-                    )),
+                    self.url(&format!("/game/{encoded_coordinate}?token={encoded_token}")),
                     Vec::new(),
                 )
             }
@@ -410,10 +408,9 @@ mod tests {
         let coordinate = "30406:publisher/game name";
         let token = "token with spaces&scope=bad";
         let expected_url = "https://dist.example.com/game/30406%3Apublisher%2Fgame%20name?token=token%20with%20spaces%26scope%3Dbad";
-        let http = Arc::new(MockHttpClient::new().with_download_response(
-            expected_url,
-            b"encoded download",
-        ));
+        let http = Arc::new(
+            MockHttpClient::new().with_download_response(expected_url, b"encoded download"),
+        );
         let client = AdpClient::new("https://dist.example.com", http.clone());
         let dest = temp_download_path("encoded-url");
 
@@ -474,7 +471,10 @@ mod tests {
         assert_eq!(
             event["tags"],
             json!([
-                ["u", "https://dist.example.com/game/30406:publisher:test-game"],
+                [
+                    "u",
+                    "https://dist.example.com/game/30406:publisher:test-game"
+                ],
                 ["method", "GET"]
             ])
         );

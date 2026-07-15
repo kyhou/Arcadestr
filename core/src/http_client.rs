@@ -68,10 +68,7 @@ fn temp_sibling_path(dest: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    dest.with_file_name(format!(
-        ".{filename}.{}.{nonce}.tmp",
-        std::process::id()
-    ))
+    dest.with_file_name(format!(".{filename}.{}.{nonce}.tmp", std::process::id()))
 }
 
 /// Production HTTP client backed by `reqwest`.

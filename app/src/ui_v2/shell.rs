@@ -121,7 +121,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let connected_relays_signal = Signal::derive(move || connected_relays.get());
     let connection_status = Signal::derive(move || auth.connection_status.get());
     let connection_error = Signal::derive(move || auth.connection_error.get());
-    let search_placeholder = Signal::derive(move || match current_view.get() {
+    let search_placeholder = Memo::new(move |_| match current_view.get() {
         UiV2View::Store => "Search curated games...",
         UiV2View::BrowseAll => "Search games, developers, notes...",
         UiV2View::Detail(_) => "Search curated worlds...",
@@ -129,7 +129,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
         UiV2View::Social => "Search the protocol...",
         _ => "Search games...",
     });
-    let browse_active = Signal::derive(move || {
+    let browse_active = Memo::new(move |_| {
         matches!(
             current_view.get(),
             UiV2View::BrowseAll | UiV2View::Detail(_)
@@ -319,8 +319,8 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                 connection_status={connection_status}
                 connection_error={connection_error}
                 on_open_profile={Callback::new(set_profile)}
-                search_placeholder={search_placeholder.get()}
-                browse_active={browse_active.get()}
+                search_placeholder={search_placeholder.into()}
+                browse_active={browse_active.into()}
             />
 
             <main class="md:pl-64 pt-20 min-h-screen pb-24 md:pb-0">

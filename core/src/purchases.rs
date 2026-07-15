@@ -287,9 +287,9 @@ fn fulfillment_delegations(listing: &Event) -> Result<Vec<FulfillmentDelegation>
             (values.first().map(String::as_str) == Some("fulfillment_pubkey")).then_some(values)
         })
         .map(|values| {
-            let pubkey_hex = values.get(1).ok_or(PurchaseError::MissingTag(
-                "fulfillment_pubkey.pubkey",
-            ))?;
+            let pubkey_hex = values
+                .get(1)
+                .ok_or(PurchaseError::MissingTag("fulfillment_pubkey.pubkey"))?;
             let valid_from = values
                 .get(2)
                 .ok_or(PurchaseError::MissingTag("fulfillment_pubkey.valid_from"))?
@@ -447,7 +447,9 @@ mod tests {
         created_at: u64,
     ) -> Event {
         let valid_from = valid_from.to_string();
-        let revoked_at = revoked_at.map(|value| value.to_string()).unwrap_or_default();
+        let revoked_at = revoked_at
+            .map(|value| value.to_string())
+            .unwrap_or_default();
         EventBuilder::new(Kind::Custom(30402), "")
             .tags([
                 Tag::custom(TagKind::d(), [LISTING_D_TAG]),

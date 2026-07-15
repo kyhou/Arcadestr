@@ -4003,6 +4003,7 @@ fn main() {
     }
 
     builder
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             auth: Arc::new(Mutex::new(AuthState::new())),
             nostr: nostr_client.clone(),
@@ -4373,6 +4374,9 @@ fn main() {
             is_authenticated,
             disconnect,
             adp_commands::check_adp_server,
+            adp_commands::discover_adp_servers,
+            adp_commands::hash_build_file,
+            adp_commands::select_build_file,
             adp_commands::connect_nwc_wallet,
             adp_commands::request_lnurl_invoice,
             adp_commands::pay_nwc_invoice,

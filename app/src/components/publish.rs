@@ -4,21 +4,63 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::tauri_bridge::{
-    invoke_check_adp_server, invoke_publish_adp_listing, listen_publish_progress,
-    PublishAdpListingRequest, PublishProgressPayload,
+    invoke_check_adp_server, invoke_discover_adp_servers, invoke_hash_build_file,
+    invoke_publish_adp_listing, invoke_select_build_file, listen_publish_progress,
+    AdpServerAnnouncement, FulfillmentMode, HashBuildFileRequest, PublishAdpListingRequest,
+    PublishProgressPayload,
 };
 use crate::AuthContext;
 
-/// Validates ADP listing fields before publishing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerEntry {
+    url: String,
+    label: String,
+    reachability: ServerStatus,
+    upload: ServerStatus,
+    auto_operator: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerStatus {
+    Idle,
+    Pending,
+    Ok,
+    Failed,
+}
+
+impl ServerStatus {
+    fn label(self) -> &'static str {
+        match self {
+            ServerStatus::Idle => "not checked",
+            ServerStatus::Pending => "pending",
+            ServerStatus::Ok => "ok",
+            ServerStatus::Failed => "failed",
+        }
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            ServerStatus::Idle => "text-on-surface-variant",
+            ServerStatus::Pending => "text-secondary",
+            ServerStatus::Ok => "text-secondary",
+            ServerStatus::Failed => "text-error",
+        }
+    }
+}
+
 fn validate_listing(
     id: &str,
     title: &str,
     description: &str,
-    server_url: &str,
-    file_path: &str,
-    version: &str,
     price_sats: u64,
     lud16: &str,
+    fulfillment_enabled: bool,
+    servers: &[ServerEntry],
+    file_path: &Option<String>,
+    file_hash: &Option<String>,
+    version: &str,
+    fulfillment_mode: &FulfillmentMode,
+    operator_url: &str,
 ) -> Result<(), String> {
     if id.is_empty() {
         return Err("Listing ID is required".to_string());
@@ -46,20 +88,8 @@ fn validate_listing(
     if description.len() > 2000 {
         return Err("Description must be 2000 characters or less".to_string());
     }
-    if server_url.is_empty() {
-        return Err("ADP server URL is required".to_string());
-    }
-    if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
-        return Err("ADP server URL must start with http:// or https://".to_string());
-    }
-    if file_path.is_empty() {
-        return Err("Build file path is required".to_string());
-    }
-    if version.is_empty() {
-        return Err("Version is required".to_string());
-    }
     if price_sats > 0 && lud16.is_empty() {
-        return Err("Lightning address is required for priced ADP listings".to_string());
+        return Err("Lightning address (lud16) is required for priced listings".to_string());
     }
     if !lud16.is_empty() {
         let parts: Vec<&str> = lud16.split('@').collect();
@@ -67,7 +97,53 @@ fn validate_listing(
             return Err("Lightning address must look like name@example.com".to_string());
         }
     }
+    if fulfillment_enabled {
+        if servers.is_empty() {
+            return Err("Add at least one distribution server for fulfillment".to_string());
+        }
+        if let Some(bad_url) = servers
+            .iter()
+            .map(|server| server.url.as_str())
+            .find(|url| !(url.starts_with("http://") || url.starts_with("https://")))
+        {
+            return Err(format!(
+                "Server URL must start with http:// or https://: {bad_url}"
+            ));
+        }
+        if file_path.as_deref().unwrap_or_default().is_empty() || file_hash.is_none() {
+            return Err(
+                "Select a build file and wait for its hash before publishing fulfillment"
+                    .to_string(),
+            );
+        }
+        if version.trim().is_empty() {
+            return Err("Version is required for fulfillment".to_string());
+        }
+        match fulfillment_mode {
+            FulfillmentMode::None => {
+                return Err("Choose a fulfillment signing mode".to_string());
+            }
+            FulfillmentMode::Direct => {}
+            FulfillmentMode::Delegate => {
+                if operator_url.trim().is_empty() {
+                    return Err("Operator URL is required for delegated fulfillment".to_string());
+                }
+                if !(operator_url.starts_with("http://") || operator_url.starts_with("https://")) {
+                    return Err("Operator URL must start with http:// or https://".to_string());
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+fn parse_csv_values(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn parse_platform_tags(input: &str) -> Result<Vec<String>, String> {
@@ -119,7 +195,7 @@ mod tests {
     }
 }
 
-/// Publish view component - form for creating ADP listings.
+/// Publish view component - form for creating NIP-99 listings with optional ADP fulfillment.
 #[component]
 pub fn PublishView() -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
@@ -127,34 +203,115 @@ pub fn PublishView() -> impl IntoView {
     let id = RwSignal::new(String::new());
     let title = RwSignal::new(String::new());
     let description = RwSignal::new(String::new());
+    let image_input = RwSignal::new(String::new());
+    let tag_input = RwSignal::new(String::new());
     let price_sats = RwSignal::new(0u64);
     let platforms_input = RwSignal::new(String::new());
     let lud16 = RwSignal::new(String::new());
-    let server_url = RwSignal::new(String::new());
-    let file_path = RwSignal::new(String::new());
+    let fulfillment_enabled = RwSignal::new(false);
+    let fulfillment_mode = RwSignal::new(FulfillmentMode::None);
+    let discovered_servers = RwSignal::new(Vec::<AdpServerAnnouncement>::new());
+    let discovery_error = RwSignal::new(None::<String>);
+    let servers = RwSignal::new(Vec::<ServerEntry>::new());
+    let custom_server = RwSignal::new(String::new());
+    let operator_url = RwSignal::new(String::new());
+    let operator_auto_added = RwSignal::new(None::<String>);
+    let file_path = RwSignal::new(None::<String>);
+    let file_hash = RwSignal::new(None::<String>);
     let version = RwSignal::new(String::new());
 
     let is_publishing = RwSignal::new(false);
-    let is_checking_server = RwSignal::new(false);
-    let server_ok = RwSignal::new(false);
+    let is_hashing = RwSignal::new(false);
     let success_message = RwSignal::new(None::<String>);
     let error_message = RwSignal::new(None::<String>);
     let progress_events = RwSignal::new(Vec::<PublishProgressPayload>::new());
 
-    let on_check_server = move |_| {
-        let url = server_url.get();
-        is_checking_server.set(true);
-        server_ok.set(false);
+    let add_server = move |url: String, label: String, auto_operator: bool| {
+        let trimmed = url.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        servers.update(|entries| {
+            if entries.iter().any(|entry| entry.url == trimmed) {
+                return;
+            }
+            entries.push(ServerEntry {
+                url: trimmed.clone(),
+                label,
+                reachability: ServerStatus::Pending,
+                upload: ServerStatus::Idle,
+                auto_operator,
+            });
+        });
+        let servers_for_check = servers;
+        spawn_local(async move {
+            let status = match invoke_check_adp_server(trimmed.clone()).await {
+                Ok(_) => ServerStatus::Ok,
+                Err(_) => ServerStatus::Failed,
+            };
+            servers_for_check.update(|entries| {
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.url == trimmed) {
+                    entry.reachability = status;
+                }
+            });
+        });
+    };
+
+    let remove_server = move |url: String| {
+        servers.update(|entries| entries.retain(|entry| entry.url != url));
+    };
+
+    let sync_operator_server = move |new_url: String| {
+        if let Some(old_url) = operator_auto_added.get_untracked() {
+            servers.update(|entries| {
+                entries.retain(|entry| !(entry.auto_operator && entry.url == old_url))
+            });
+        }
+        if new_url.trim().is_empty() {
+            operator_auto_added.set(None);
+            return;
+        }
+        operator_auto_added.set(Some(new_url.clone()));
+        add_server(new_url, "Operator server".to_string(), true);
+    };
+
+    Effect::new(move |_| {
+        spawn_local(async move {
+            match invoke_discover_adp_servers().await {
+                Ok(found) => {
+                    discovered_servers.set(found);
+                    discovery_error.set(None);
+                }
+                Err(err) => {
+                    discovery_error.set(Some(format!("Couldn't reach relays for discovery: {err}")))
+                }
+            }
+        });
+    });
+
+    let on_add_custom_server = move |_| {
+        let url = custom_server.get();
+        add_server(url.clone(), url.clone(), false);
+        custom_server.set(String::new());
+    };
+
+    let on_select_file = move |_| {
+        is_hashing.set(true);
         error_message.set(None);
         spawn_local(async move {
-            match invoke_check_adp_server(url).await {
-                Ok(info) => {
-                    server_ok.set(true);
-                    success_message.set(Some(format!("ADP server reachable: {}", info.pubkey)));
+            match invoke_select_build_file().await {
+                Ok(Some(path)) => {
+                    file_path.set(Some(path.clone()));
+                    file_hash.set(None);
+                    match invoke_hash_build_file(HashBuildFileRequest { file_path: path }).await {
+                        Ok(hash) => file_hash.set(Some(hash)),
+                        Err(err) => error_message.set(Some(err)),
+                    }
                 }
+                Ok(None) => {}
                 Err(err) => error_message.set(Some(err)),
             }
-            is_checking_server.set(false);
+            is_hashing.set(false);
         });
     };
 
@@ -167,27 +324,35 @@ pub fn PublishView() -> impl IntoView {
         let id_val = id.get();
         let title_val = title.get();
         let description_val = description.get();
-        let server_url_val = server_url.get();
-        let file_path_val = file_path.get();
-        let version_val = version.get();
         let lud16_val = lud16.get();
         let price_val = price_sats.get();
+        let servers_val = servers.get();
+        let file_path_val = file_path.get();
+        let file_hash_val = file_hash.get();
+        let version_val = version.get();
+        let fulfillment_enabled_val = fulfillment_enabled.get();
+        let fulfillment_mode_val = if fulfillment_enabled_val {
+            fulfillment_mode.get()
+        } else {
+            FulfillmentMode::None
+        };
+        let operator_url_val = operator_url.get();
 
         if let Err(msg) = validate_listing(
             &id_val,
             &title_val,
             &description_val,
-            &server_url_val,
-            &file_path_val,
-            &version_val,
             price_val,
             &lud16_val,
+            fulfillment_enabled_val,
+            &servers_val,
+            &file_path_val,
+            &file_hash_val,
+            &version_val,
+            &fulfillment_mode_val,
+            &operator_url_val,
         ) {
             error_message.set(Some(msg));
-            return;
-        }
-        if !server_ok.get() {
-            error_message.set(Some("Check the ADP server before publishing".to_string()));
             return;
         }
 
@@ -205,9 +370,13 @@ pub fn PublishView() -> impl IntoView {
             description: description_val,
             price_sats: price_val,
             lud16: (!lud16_val.is_empty()).then_some(lud16_val),
-            server_url: server_url_val,
+            tags: parse_csv_values(&tag_input.get()),
+            images: parse_csv_values(&image_input.get()),
+            fulfillment_mode: fulfillment_mode_val,
+            operator_url: (!operator_url_val.trim().is_empty()).then_some(operator_url_val),
+            servers: servers_val.into_iter().map(|entry| entry.url).collect(),
             file_path: file_path_val,
-            version: version_val,
+            version: (!version_val.trim().is_empty()).then_some(version_val),
             platforms,
         };
 
@@ -215,9 +384,31 @@ pub fn PublishView() -> impl IntoView {
         success_message.set(None);
         error_message.set(None);
         progress_events.set(Vec::new());
+        servers.update(|entries| {
+            for entry in entries {
+                entry.upload = ServerStatus::Idle;
+            }
+        });
 
         spawn_local(async move {
             let _listener = listen_publish_progress(move |payload| {
+                if payload.step == "upload" {
+                    if let Some(server_url) = payload.server_url.clone() {
+                        let status = match payload.status.as_str() {
+                            "pending" => ServerStatus::Pending,
+                            "ok" => ServerStatus::Ok,
+                            "error" => ServerStatus::Failed,
+                            _ => ServerStatus::Idle,
+                        };
+                        servers.update(|entries| {
+                            if let Some(entry) =
+                                entries.iter_mut().find(|entry| entry.url == server_url)
+                            {
+                                entry.upload = status;
+                            }
+                        });
+                    }
+                }
                 progress_events.update(|events| events.push(payload));
             })
             .await
@@ -225,19 +416,7 @@ pub fn PublishView() -> impl IntoView {
 
             match invoke_publish_adp_listing(request).await {
                 Ok(result) => {
-                    success_message.set(Some(format!(
-                        "Published ADP listing {} ({})",
-                        result.upload.game_coordinate, result.upload.download_url
-                    )));
-                    id.set(String::new());
-                    title.set(String::new());
-                    description.set(String::new());
-                    price_sats.set(0);
-                    platforms_input.set(String::new());
-                    lud16.set(String::new());
-                    file_path.set(String::new());
-                    version.set(String::new());
-                    server_ok.set(false);
+                    success_message.set(Some(format!("Published listing {}", result.event_id)));
                 }
                 Err(err) => error_message.set(Some(err)),
             }
@@ -246,88 +425,213 @@ pub fn PublishView() -> impl IntoView {
     };
 
     view! {
-        <div class="publish-container">
-            <h2 class="publish-title">"Publish ADP Game"</h2>
-
-            <div class="publish-form">
-                <div class="form-group">
-                    <label class="form-label">"Listing ID / Slug"</label>
-                    <input class="form-input" type="text" placeholder="my-game-v1"
-                        prop:value={move || id.get()} on:input:target=move |ev| id.set(ev.target().value()) disabled={move || is_publishing.get()} />
+        <div class="max-w-6xl mx-auto px-8 py-10">
+            <header class="mb-10 flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                <div>
+                    <h1 class="text-5xl font-extrabold font-headline tracking-tighter mb-2">"Publish "<span class="text-primary italic">"New Game"</span></h1>
+                    <p class="text-on-surface-variant max-w-xl">"Create a Buy-only listing, or add the fulfillment tier for one-click install. Metadata is signed by your active Nostr signer."</p>
                 </div>
-
-                <div class="form-group">
-                    <label class="form-label">"Title"</label>
-                    <input class="form-input" type="text" placeholder="My Awesome Game"
-                        prop:value={move || title.get()} on:input:target=move |ev| title.set(ev.target().value()) disabled={move || is_publishing.get()} />
-                </div>
-
-                <div class="form-group">
-                    <label class="form-label">"Description"</label>
-                    <textarea class="form-textarea" rows=4 placeholder="Describe your game..."
-                        prop:value={move || description.get()} on:input:target=move |ev| description.set(ev.target().value()) disabled={move || is_publishing.get()} />
-                </div>
-
-                <div class="form-group">
-                    <label class="form-label">"Price (satoshis) — 0 for free"</label>
-                    <input class="form-input" type="number" min=0 prop:value={move || price_sats.get().to_string()}
-                        on:input:target=move |ev| {
-                            if let Ok(val) = ev.target().value().parse::<u64>() {
-                                price_sats.set(val);
-                            }
-                        }
-                        disabled={move || is_publishing.get()} />
-                </div>
-
-                <div class="form-group">
-                    <label class="form-label">"ADP Server URL"</label>
-                    <input class="form-input" type="text" placeholder="http://localhost:9099"
-                        prop:value={move || server_url.get()} on:input:target=move |ev| { server_url.set(ev.target().value()); server_ok.set(false); }
-                        disabled={move || is_publishing.get()} />
-                    <button class="secondary-button" on:click={on_check_server} disabled={move || is_publishing.get() || is_checking_server.get()}>
-                        {move || if server_ok.get() { "Server OK" } else if is_checking_server.get() { "Checking..." } else { "Check Server" }}
-                    </button>
-                </div>
-
-                <div class="form-group">
-                    <label class="form-label">"Build File Path"</label>
-                    <input class="form-input" type="text" placeholder="/path/to/game.zip"
-                        prop:value={move || file_path.get()} on:input:target=move |ev| file_path.set(ev.target().value()) disabled={move || is_publishing.get()} />
-                </div>
-
-                <div class="form-group">
-                    <label class="form-label">"Version"</label>
-                    <input class="form-input" type="text" placeholder="1.0.0"
-                        prop:value={move || version.get()} on:input:target=move |ev| version.set(ev.target().value()) disabled={move || is_publishing.get()} />
-                </div>
-
-                <div class="form-group">
-                    <label class="form-label">"Platforms (comma-separated)"</label>
-                    <input class="form-input" type="text" placeholder="linux-x86_64, windows-x86_64"
-                        prop:value={move || platforms_input.get()} on:input:target=move |ev| platforms_input.set(ev.target().value()) disabled={move || is_publishing.get()} />
-                </div>
-
-                <div class="form-group">
-                    <label class="form-label">"Lightning Address (lud16)"</label>
-                    <input class="form-input" type="text" placeholder="you@example.com"
-                        prop:value={move || lud16.get()} on:input:target=move |ev| lud16.set(ev.target().value()) disabled={move || is_publishing.get()} />
-                </div>
-
-                <div class="publish-progress">
-                    <h3>"Publish progress"</h3>
-                    <ul>
-                        {move || progress_events.get().into_iter().map(|event| view! {
-                            <li>{format!("{}: {}{}", event.step, event.status, event.message.map(|m| format!(" — {m}")).unwrap_or_default())}</li>
-                        }).collect_view()}
-                    </ul>
-                </div>
-
-                <button class="publish-button" on:click={on_submit} disabled={move || is_publishing.get()}>
-                    {move || if is_publishing.get() { "Publishing..." } else { "Publish ADP Listing" }}
+                <button class="px-8 py-3 rounded-md bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold shadow-lg shadow-primary/20 active:scale-95 transition-all" on:click={on_submit} disabled={move || is_publishing.get()}>
+                    {move || if is_publishing.get() { "Publishing..." } else { "Publish to Nostr" }}
                 </button>
+            </header>
 
-                {move || success_message.get().map(|msg| view! { <div class="success-message">{msg}</div> })}
-                {move || error_message.get().map(|msg| view! { <div class="error-message">{msg}</div> })}
+            <div class="grid grid-cols-12 gap-8">
+                <div class="col-span-12 lg:col-span-8 space-y-8">
+                    <section class="bg-surface-container-high/60 backdrop-blur-2xl border border-outline-variant/15 rounded-3xl p-8">
+                        <h2 class="text-2xl font-bold font-headline mb-6">"Game Details"</h2>
+                        <div class="space-y-5">
+                            <div>
+                                <label class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Listing ID / Slug"</label>
+                                <input class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" placeholder="my-game-v1" prop:value={move || id.get()} on:input:target=move |ev| id.set(ev.target().value()) disabled={move || is_publishing.get()} />
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Title"</label>
+                                <input class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" placeholder="Neon Drifter" prop:value={move || title.get()} on:input:target=move |ev| title.set(ev.target().value()) disabled={move || is_publishing.get()} />
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Description"</label>
+                                <textarea class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" rows=5 placeholder="Tell players about your game..." prop:value={move || description.get()} on:input:target=move |ev| description.set(ev.target().value()) disabled={move || is_publishing.get()} />
+                            </div>
+                            <div class="grid md:grid-cols-2 gap-5">
+                                <div>
+                                    <label class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Tags"</label>
+                                    <input class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" placeholder="arcade, multiplayer" prop:value={move || tag_input.get()} on:input:target=move |ev| tag_input.set(ev.target().value()) disabled={move || is_publishing.get()} />
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Image URLs"</label>
+                                    <input class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" placeholder="https://..." prop:value={move || image_input.get()} on:input:target=move |ev| image_input.set(ev.target().value()) disabled={move || is_publishing.get()} />
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="bg-surface-container-high/60 backdrop-blur-2xl border border-outline-variant/15 rounded-3xl p-8">
+                        <h2 class="text-2xl font-bold font-headline mb-2">"Distribution & Fulfillment"</h2>
+                        <p class="text-sm text-on-surface-variant mb-6">"Without fulfillment fields this listing remains Buy-only. Enable fulfillment only when you want automated install/download."</p>
+                        <label class="flex items-center gap-3 p-4 rounded-xl bg-surface-container/50 mb-6">
+                            <input type="checkbox" checked={move || fulfillment_enabled.get()} on:change:target=move |ev| {
+                                let enabled = ev.target().checked();
+                                fulfillment_enabled.set(enabled);
+                                if !enabled { fulfillment_mode.set(FulfillmentMode::None); }
+                            } />
+                            <span class="font-bold">"Enable automated install fulfillment"</span>
+                        </label>
+
+                        <Show when=move || fulfillment_enabled.get()>
+                            <div class="space-y-6">
+                                <div class="grid md:grid-cols-2 gap-4">
+                                    <button class="rounded-xl bg-surface-container-highest p-4 text-left" on:click=move |_| fulfillment_mode.set(FulfillmentMode::Direct)>
+                                        <span class="block font-bold text-secondary">"Sign fulfillment with my own key"</span>
+                                        <span class="text-xs text-on-surface-variant">"Uses the authenticated signer pubkey. No provisioning event."</span>
+                                    </button>
+                                    <button class="rounded-xl bg-surface-container-highest p-4 text-left" on:click=move |_| fulfillment_mode.set(FulfillmentMode::Delegate)>
+                                        <span class="block font-bold text-secondary">"Delegate to an operator"</span>
+                                        <span class="text-xs text-on-surface-variant">"Calls /provision and publishes kind:30406."</span>
+                                    </button>
+                                </div>
+
+                                <Show when=move || matches!(fulfillment_mode.get(), FulfillmentMode::Delegate)>
+                                    <div class="rounded-2xl bg-surface-container/50 p-4 space-y-3">
+                                        <label class="block text-xs font-bold uppercase tracking-widest text-secondary">"Operator URL"</label>
+                                        <div class="flex gap-2">
+                                            <input class="flex-1 bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="https://operator.example.com" prop:value={move || operator_url.get()} on:input:target=move |ev| {
+                                                let next = ev.target().value();
+                                                operator_url.set(next.clone());
+                                                if operator_auto_added.get_untracked().is_some() { sync_operator_server(next); }
+                                            } />
+                                            <select class="bg-surface-container-highest border-none rounded-md p-3 text-on-surface" on:change:target=move |ev| {
+                                                let selected = ev.target().value();
+                                                if !selected.is_empty() { operator_url.set(selected); }
+                                            }>
+                                                <option value="">"Copy from server"</option>
+                                                {move || servers.get().into_iter().map(|server| {
+                                                    let url = server.url.clone();
+                                                    let text = url.clone();
+                                                    view! { <option value={url}>{text}</option> }
+                                                }).collect_view()}
+                                            </select>
+                                        </div>
+                                        <label class="flex items-center gap-2 text-sm text-on-surface-variant">
+                                            <input type="checkbox" checked={move || operator_auto_added.get().is_some()} on:change:target=move |ev| {
+                                                if ev.target().checked() {
+                                                    sync_operator_server(operator_url.get());
+                                                } else if let Some(old_url) = operator_auto_added.get_untracked() {
+                                                    servers.update(|entries| entries.retain(|entry| !(entry.auto_operator && entry.url == old_url)));
+                                                    operator_auto_added.set(None);
+                                                }
+                                            } />
+                                            "Also add this as a distribution server"
+                                        </label>
+                                    </div>
+                                </Show>
+
+                                <div class="rounded-2xl bg-surface-container/50 p-4 space-y-4">
+                                    <div class="flex items-center justify-between gap-3">
+                                        <h3 class="font-bold">"Discovered servers"</h3>
+                                        <span class="text-xs text-on-surface-variant">"Live relay query; manual entry still works if discovery fails."</span>
+                                    </div>
+                                    {move || discovery_error.get().map(|msg| view! { <div class="rounded-xl border border-error/30 bg-error-container/30 px-4 py-3 text-sm font-medium text-error">{msg}</div> })}
+                                    <div class="space-y-2">
+                                        {move || discovered_servers.get().into_iter().map(|server| {
+                                            let checked_url = server.url.clone();
+                                            let label = server.name.clone().unwrap_or_else(|| server.url.clone());
+                                            let url_for_checked = checked_url.clone();
+                                            let url_for_change = checked_url.clone();
+                                            let label_for_change = label.clone();
+                                            let label_display = label.clone();
+                                            view! {
+                                                <label class="flex items-center justify-between gap-3 rounded-xl bg-surface-container-highest p-3">
+                                                    <span><input type="checkbox" class="mr-3" checked={move || servers.get().iter().any(|entry| entry.url == url_for_checked)} on:change:target=move |ev| {
+                                                        if ev.target().checked() { add_server(url_for_change.clone(), label_for_change.clone(), false); }
+                                                        else { remove_server(url_for_change.clone()); }
+                                                    } />{label_display}</span>
+                                                    <span class="text-xs text-on-surface-variant">{server.supported_adp.unwrap_or_default()}</span>
+                                                </label>
+                                            }
+                                        }).collect_view()}
+                                    </div>
+                                    <div class="flex gap-2">
+                                        <input class="flex-1 bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="Add custom server URL" prop:value={move || custom_server.get()} on:input:target=move |ev| custom_server.set(ev.target().value()) />
+                                        <button class="px-4 py-2 rounded-md bg-secondary text-on-secondary font-bold" on:click={on_add_custom_server}>"Add"</button>
+                                    </div>
+                                    <div class="space-y-2">
+                                        {move || servers.get().into_iter().map(|server| {
+                                            let reachability = server.reachability;
+                                            let upload = server.upload;
+                                            let url = server.url.clone();
+                                            view! {
+                                                <div class="flex items-center justify-between gap-3 rounded-xl bg-surface-container-highest p-3">
+                                                    <div>
+                                                        <p class="text-sm font-bold">{server.label}</p>
+                                                        <p class="text-xs text-on-surface-variant">{server.url}</p>
+                                                    </div>
+                                                    <div class="text-right text-xs">
+                                                        <p class={reachability.class()}>{format!("reachability: {}", reachability.label())}</p>
+                                                        <p class={upload.class()}>{format!("upload: {}", upload.label())}</p>
+                                                    </div>
+                                                    <button class="text-error text-sm" on:click=move |_| remove_server(url.clone())>"Remove"</button>
+                                                </div>
+                                            }
+                                        }).collect_view()}
+                                    </div>
+                                </div>
+
+                                <div class="grid md:grid-cols-2 gap-5">
+                                    <div>
+                                        <label class="block text-xs font-bold uppercase tracking-widest text-secondary mb-2">"Build File"</label>
+                                        <button class="w-full rounded-md bg-surface-container-highest p-3 text-left" on:click={on_select_file} disabled={move || is_hashing.get()}>
+                                            {move || if is_hashing.get() { "Hashing...".to_string() } else { file_path.get().unwrap_or_else(|| "Select archive".to_string()) }}
+                                        </button>
+                                        <p class="text-xs text-on-surface-variant mt-2">{move || file_hash.get().map(|hash| format!("SHA-256: {}...{}", &hash[..12], &hash[hash.len() - 12..])).unwrap_or_else(|| "Hash appears after file selection.".to_string())}</p>
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-bold uppercase tracking-widest text-secondary mb-2">"Version"</label>
+                                        <input class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="1.0.0" prop:value={move || version.get()} on:input:target=move |ev| version.set(ev.target().value()) />
+                                    </div>
+                                </div>
+                            </div>
+                        </Show>
+                    </section>
+                </div>
+
+                <aside class="col-span-12 lg:col-span-4 space-y-8">
+                    <section class="bg-surface-container-high/60 backdrop-blur-2xl border border-outline-variant/15 rounded-3xl p-6">
+                        <h3 class="text-lg font-bold font-headline mb-5">"Pricing & Metadata"</h3>
+                        <div class="space-y-5">
+                            <div>
+                                <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2">"Pricing (sats)"</label>
+                                <input class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" type="number" min=0 prop:value={move || price_sats.get().to_string()} on:input:target=move |ev| { if let Ok(val) = ev.target().value().parse::<u64>() { price_sats.set(val); } } />
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2">"Lightning Address (lud16)"</label>
+                                <input class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="you@example.com" prop:value={move || lud16.get()} on:input:target=move |ev| lud16.set(ev.target().value()) />
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2">"Platforms"</label>
+                                <input class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="linux-x86_64, windows-x86_64" prop:value={move || platforms_input.get()} on:input:target=move |ev| platforms_input.set(ev.target().value()) />
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="bg-surface-container-high/60 backdrop-blur-2xl border border-outline-variant/15 rounded-3xl p-6">
+                        <h3 class="text-lg font-bold font-headline mb-5">"Nostr Identity"</h3>
+                        <p class="text-[10px] font-bold uppercase tracking-widest text-tertiary mb-2">"Authenticated signer"</p>
+                        <div class="bg-surface-container-highest rounded-md p-3 text-xs font-mono text-on-surface break-all">{move || auth.npub.get().unwrap_or_else(|| "Not authenticated".to_string())}</div>
+                        <p class="text-xs text-on-surface-variant mt-3">"This value is read-only and comes from the active NIP-46 session."</p>
+                    </section>
+
+                    <section class="bg-gradient-to-br from-surface-container-high to-surface-container-lowest border border-outline-variant/10 rounded-3xl p-6">
+                        <p class="text-[10px] font-bold uppercase tracking-widest text-primary-dim mb-4">"Publish status"</p>
+                        {move || error_message.get().map(|msg| view! { <div class="mb-4 rounded-xl border border-error/30 bg-error-container/30 px-4 py-3 text-sm font-medium text-error">{msg}</div> })}
+                        {move || success_message.get().map(|msg| view! { <div class="mb-4 rounded-xl border border-secondary/30 bg-secondary-container/30 px-4 py-3 text-sm font-medium text-secondary">{msg}</div> })}
+                        <ul class="space-y-2 text-xs text-on-surface-variant">
+                            {move || progress_events.get().into_iter().map(|event| view! {
+                                <li>{format!("{}{}: {}{}", event.step, event.server_url.map(|url| format!(" ({url})")).unwrap_or_default(), event.status, event.message.map(|m| format!(" - {m}")).unwrap_or_default())}</li>
+                            }).collect_view()}
+                        </ul>
+                    </section>
+                </aside>
             </div>
         </div>
     }

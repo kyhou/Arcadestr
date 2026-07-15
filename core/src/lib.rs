@@ -73,6 +73,8 @@ pub mod nip98_client;
 
 #[cfg(feature = "native")]
 pub mod adp_client;
+#[cfg(feature = "native")]
+pub mod adp_discovery;
 
 #[cfg(feature = "native")]
 pub mod lnurlp;
@@ -168,7 +170,10 @@ mod nwc_client_contract_tests {
 
         let error = parse_pay_invoice_response_json(response).unwrap_err();
 
-        assert_eq!(error.to_string(), "NWC wallet error PAYMENT_FAILED: route failed");
+        assert_eq!(
+            error.to_string(),
+            "NWC wallet error PAYMENT_FAILED: route failed"
+        );
     }
 
     #[test]
@@ -186,19 +191,22 @@ mod nwc_client_contract_tests {
 
         assert_eq!(event.kind, Kind::WalletConnectRequest);
         assert!(event.tags.iter().any(|tag| tag.kind() == TagKind::p()));
-        assert!(event.tags.iter().any(|tag| {
-            tag.as_slice() == ["encryption", "nip44_v2"]
-        }));
-        assert_ne!(event.content, build_pay_invoice_request_json("lnbc1fixedamountinvoice").unwrap());
+        assert!(event
+            .tags
+            .iter()
+            .any(|tag| { tag.as_slice() == ["encryption", "nip44_v2"] }));
+        assert_ne!(
+            event.content,
+            build_pay_invoice_request_json("lnbc1fixedamountinvoice").unwrap()
+        );
     }
 
     #[test]
     fn pay_invoice_response_event_validates_correlation_and_decrypts_preimage() {
         let wallet_keys = Keys::generate();
-        let client_secret = SecretKey::from_hex(
-            "0000000000000000000000000000000000000000000000000000000000000002",
-        )
-        .unwrap();
+        let client_secret =
+            SecretKey::from_hex("0000000000000000000000000000000000000000000000000000000000000002")
+                .unwrap();
         let client_keys = Keys::new(client_secret);
         let uri = format!(
             "nostr+walletconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
@@ -206,7 +214,8 @@ mod nwc_client_contract_tests {
             client_keys.secret_key().to_secret_hex()
         );
         let connection = NwcConnection::parse(&uri).unwrap();
-        let request = build_pay_invoice_request_event(&connection, "lnbc1fixedamountinvoice").unwrap();
+        let request =
+            build_pay_invoice_request_event(&connection, "lnbc1fixedamountinvoice").unwrap();
         let response_json = r#"{
             "result_type": "pay_invoice",
             "error": null,
@@ -220,7 +229,10 @@ mod nwc_client_contract_tests {
         )
         .unwrap();
         let response = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
-            .tags([Tag::public_key(client_keys.public_key()), Tag::event(request.id)])
+            .tags([
+                Tag::public_key(client_keys.public_key()),
+                Tag::event(request.id),
+            ])
             .sign_with_keys(&wallet_keys)
             .unwrap();
 
