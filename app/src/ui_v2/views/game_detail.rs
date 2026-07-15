@@ -6,15 +6,17 @@ use send_wrapper::SendWrapper;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::{BadgeEarnedModal, ProfileRow};
-use crate::models::{BadgeAward, BadgeDefinition, EarnedBadgeSummary, GameListing, ListingSource, UserProfile};
-use crate::store::try_use_profile_store;
-use crate::tauri_bridge::{
-    ConfirmPurchaseRequest, ConnectNwcWalletRequest, PayNwcInvoiceRequest,
-    RequestLnurlInvoiceRequest,
+use crate::models::{
+    BadgeAward, BadgeDefinition, EarnedBadgeSummary, GameListing, ListingSource, UserProfile,
 };
+use crate::store::try_use_profile_store;
 use crate::tauri_bridge::{
     invoke_confirm_purchase, invoke_connect_nwc_wallet, invoke_install_game,
     invoke_pay_nwc_invoice, invoke_request_lnurl_invoice, listen_download_complete,
+};
+use crate::tauri_bridge::{
+    ConfirmPurchaseRequest, ConnectNwcWalletRequest, PayNwcInvoiceRequest,
+    RequestLnurlInvoiceRequest,
 };
 use crate::{invoke_fetch_profile, AuthContext};
 
@@ -75,7 +77,6 @@ fn hero_buy_panel_metadata(
         format!("Protocol: {protocol_label}"),
     ]
 }
-
 
 fn adp_server_url_from_download_url(download_url: &str) -> Option<String> {
     let marker = "/game/";
@@ -199,7 +200,12 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             let lud16 = listing.lud16.clone();
             let amount_sats = listing.price_sats;
             spawn_local(async move {
-                match invoke_request_lnurl_invoice(RequestLnurlInvoiceRequest { lud16, amount_sats }).await {
+                match invoke_request_lnurl_invoice(RequestLnurlInvoiceRequest {
+                    lud16,
+                    amount_sats,
+                })
+                .await
+                {
                     Ok(response) => {
                         invoice.set(Some(response.bolt11));
                         show_invoice.set(true);
@@ -252,7 +258,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         let listing = listing.clone();
         move |preimage: String| {
             let Some(bolt11) = invoice.get() else {
-                buy_error.set(Some("Request an invoice before confirming purchase".to_string()));
+                buy_error.set(Some(
+                    "Request an invoice before confirming purchase".to_string(),
+                ));
                 return;
             };
             let publisher_npub = listing.publisher_npub.clone();
@@ -260,7 +268,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             let server_url = match adp_server_url_from_download_url(&listing.download_url) {
                 Some(server_url) => server_url,
                 None => {
-                    buy_error.set(Some("Listing does not include an ADP download URL".to_string()));
+                    buy_error.set(Some(
+                        "Listing does not include an ADP download URL".to_string(),
+                    ));
                     return;
                 }
             };
@@ -304,7 +314,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let on_connect_nwc = Callback::new(move |()| {
         let connection_string = nwc_connection_input.get();
         if connection_string.trim().is_empty() {
-            buy_error.set(Some("Paste a Nostr Wallet Connect string first".to_string()));
+            buy_error.set(Some(
+                "Paste a Nostr Wallet Connect string first".to_string(),
+            ));
             return;
         }
         buy_loading.set(true);
@@ -424,8 +436,10 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         });
     });
 
-    let download_complete_cleanup_for_teardown = SendWrapper::new(Rc::clone(&download_complete_cleanup));
-    let download_complete_disposed_for_teardown = SendWrapper::new(Rc::clone(&download_complete_disposed));
+    let download_complete_cleanup_for_teardown =
+        SendWrapper::new(Rc::clone(&download_complete_cleanup));
+    let download_complete_disposed_for_teardown =
+        SendWrapper::new(Rc::clone(&download_complete_disposed));
     on_cleanup(move || {
         *download_complete_disposed_for_teardown.borrow_mut() = true;
         if let Some(cleanup) = download_complete_cleanup_for_teardown.borrow_mut().take() {

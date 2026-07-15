@@ -73,7 +73,8 @@ fn corrupt_artifact_path_with_suffix(dest_path: &Path, suffix: Option<usize>) ->
 
 async fn quarantine_corrupt_artifact(dest_path: &Path) -> Result<PathBuf, String> {
     let primary = corrupt_artifact_path(dest_path);
-    if let Some(quarantine_path) = copy_artifact_to_reserved_quarantine(dest_path, &primary).await? {
+    if let Some(quarantine_path) = copy_artifact_to_reserved_quarantine(dest_path, &primary).await?
+    {
         return Ok(quarantine_path);
     }
 

@@ -8,11 +8,11 @@ pub fn TopBar(
     connection_status: Signal<String>,
     connection_error: Signal<Option<String>>,
     on_open_profile: Callback<()>,
-    #[prop(optional)] search_placeholder: Option<&'static str>,
-    #[prop(optional)] browse_active: Option<bool>,
+    #[prop(optional)] search_placeholder: Option<Signal<&'static str>>,
+    #[prop(optional)] browse_active: Option<Signal<bool>>,
 ) -> impl IntoView {
-    let placeholder = search_placeholder.unwrap_or("Search games...");
-    let browse_active = browse_active.unwrap_or(false);
+    let placeholder = search_placeholder.unwrap_or_else(|| Signal::derive(|| "Search games..."));
+    let browse_active = browse_active.unwrap_or_else(|| Signal::derive(|| false));
     let relay_menu_open = RwSignal::new(false);
 
     view! {
@@ -21,7 +21,7 @@ pub fn TopBar(
                 <span class="text-2xl font-bold bg-gradient-to-r from-[#b6a0ff] to-[#7e51ff] bg-clip-text text-transparent font-headline tracking-tight">"Arcadestr"</span>
                 <nav class="hidden md:flex gap-8 items-center">
                     <a
-                        class={if browse_active {
+                        class={move || if browse_active.get() {
                             "text-[#f1f3fc]/60 hover:text-[#f1f3fc] transition-colors font-['Space_Grotesk'] tracking-tight"
                         } else {
                             "text-[#b6a0ff] font-bold border-b-2 border-[#b6a0ff] pb-1 font-['Space_Grotesk'] tracking-tight"
@@ -31,7 +31,7 @@ pub fn TopBar(
                         "Discover"
                     </a>
                     <a
-                        class={if browse_active {
+                        class={move || if browse_active.get() {
                             "text-[#b6a0ff] font-bold border-b-2 border-[#b6a0ff] pb-1 font-['Space_Grotesk'] tracking-tight"
                         } else {
                             "text-[#f1f3fc]/60 hover:text-[#f1f3fc] transition-colors font-['Space_Grotesk'] tracking-tight"
@@ -95,7 +95,7 @@ pub fn TopBar(
                 </Show>
 
                 <div class="relative hidden lg:block">
-                    <input class="w-64 bg-surface-container-highest border-none rounded-md px-4 py-2 text-sm focus:ring-2 focus:ring-secondary/40 placeholder:text-on-surface-variant" placeholder={placeholder} type="text" />
+                    <input class="w-64 bg-surface-container-highest border-none rounded-md px-4 py-2 text-sm focus:ring-2 focus:ring-secondary/40 placeholder:text-on-surface-variant" placeholder={move || placeholder.get()} type="text" />
                     <span class="material-symbols-outlined absolute right-3 top-2 text-on-surface-variant text-lg">"search"</span>
                 </div>
 

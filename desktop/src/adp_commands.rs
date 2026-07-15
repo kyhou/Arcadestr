@@ -7,25 +7,39 @@ use arcadestr_core::adp_client::{
     AdpClient, AdpServerInfo, PurchaseConfirmRequest as CorePurchaseConfirmRequest,
     PurchaseConfirmResponse as CorePurchaseConfirmResponse, UploadResponse,
 };
+use arcadestr_core::adp_discovery::{
+    discover_adp_servers as discover_adp_servers_core, AdpServerAnnouncement,
+};
 use arcadestr_core::adp_publish::{
     build_adp_listing_event_builder, build_provisioning_acceptance_event_builder, AdpListingInput,
 };
 use arcadestr_core::adp_storage::{
     AdpProvisioning, AdpProvisioningRepository, DownloadToken, DownloadTokensRepository,
 };
+use arcadestr_core::auth::AuthState;
 use arcadestr_core::file_hash::sha256_file;
 use arcadestr_core::http_client::HttpClient;
 use arcadestr_core::lnurlp::{request_invoice, resolve_lud16};
 use arcadestr_core::marketplace::confirm_nip99_listing_propagated;
+use arcadestr_core::nip46::AppSignerState;
 use arcadestr_core::nwc_client::{
     load_default_nwc_connection, save_default_nwc_connection, NwcClient,
 };
-use arcadestr_core::signers::NostrSigner;
+use arcadestr_core::signers::{ActiveSigner, NostrSigner, SignerError};
 use nostr::nips::nip19::FromBech32;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
+use tauri_plugin_dialog::DialogExt;
 
 use crate::AppState;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FulfillmentMode {
+    None,
+    Direct,
+    Delegate,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PublishAdpListingRequest {
@@ -34,26 +48,80 @@ pub struct PublishAdpListingRequest {
     pub description: String,
     pub price_sats: u64,
     pub lud16: Option<String>,
-    pub server_url: String,
-    pub file_path: String,
-    pub version: String,
+    pub tags: Vec<String>,
+    pub images: Vec<String>,
+    pub fulfillment_mode: FulfillmentMode,
+    pub operator_url: Option<String>,
+    pub servers: Vec<String>,
+    pub file_path: Option<String>,
+    pub version: Option<String>,
     pub platforms: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublishServerUploadResult {
+    pub server_url: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub upload: Option<UploadResponse>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublishAdpListingResult {
     pub event_id: String,
-    pub acceptance_event_id: String,
-    pub fulfillment_pubkey: String,
-    pub file_hash: String,
-    pub upload: UploadResponse,
+    pub acceptance_event_id: Option<String>,
+    pub fulfillment_pubkey: Option<String>,
+    pub file_hash: Option<String>,
+    pub uploads: Vec<PublishServerUploadResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublishProgressPayload {
     pub step: String,
     pub status: String,
+    pub server_url: Option<String>,
     pub message: Option<String>,
+}
+
+struct SdkSignerAdapter(Arc<dyn nostr::signer::NostrSigner>);
+
+#[async_trait::async_trait]
+impl NostrSigner for SdkSignerAdapter {
+    async fn get_public_key(&self) -> Result<nostr::PublicKey, SignerError> {
+        self.0
+            .get_public_key()
+            .await
+            .map_err(|err| SignerError::SigningFailed(err.to_string()))
+    }
+
+    async fn sign_event(
+        &self,
+        unsigned: nostr::UnsignedEvent,
+    ) -> Result<nostr::Event, SignerError> {
+        self.0
+            .sign_event(unsigned)
+            .await
+            .map_err(|err| SignerError::SigningFailed(err.to_string()))
+    }
+}
+
+async fn resolve_publish_signer(
+    signer_state: &Arc<tokio::sync::Mutex<AppSignerState>>,
+    auth: &AuthState,
+) -> Result<Arc<dyn NostrSigner>, String> {
+    let active_client = { signer_state.lock().await.active_client.clone() };
+    if let Some(client) = active_client {
+        let signer = client
+            .signer()
+            .await
+            .map_err(|err| format!("failed to access active signer: {err}"))?;
+        return Ok(Arc::new(SdkSignerAdapter(signer)));
+    }
+
+    auth.signer()
+        .cloned()
+        .map(|signer: ActiveSigner| Arc::new(signer) as Arc<dyn NostrSigner>)
+        .ok_or_else(|| "not authenticated".to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,6 +174,11 @@ pub struct ConfirmPurchaseResponse {
     pub token_expires_at: i64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct HashBuildFileRequest {
+    pub file_path: String,
+}
+
 #[tauri::command]
 pub async fn check_adp_server(
     server_url: String,
@@ -113,6 +186,35 @@ pub async fn check_adp_server(
 ) -> Result<AdpServerInfo, String> {
     let client = AdpClient::new(server_url, Arc::clone(&state.http_client));
     client.well_known().await.map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn discover_adp_servers(
+    state: State<'_, AppState>,
+) -> Result<Vec<AdpServerAnnouncement>, String> {
+    let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+    discover_adp_servers_core(&relay_manager)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn hash_build_file(request: HashBuildFileRequest) -> Result<String, String> {
+    sha256_file(std::path::Path::new(&request.file_path))
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn select_build_file<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<Option<String>, String> {
+    let path = app
+        .dialog()
+        .file()
+        .blocking_pick_file()
+        .map(|path| path.to_string());
+    Ok(path)
 }
 
 #[tauri::command]
@@ -127,8 +229,8 @@ pub async fn request_lnurl_invoice(
 pub async fn connect_nwc_wallet(
     request: ConnectNwcWalletRequest,
 ) -> Result<ConnectNwcWalletResponse, String> {
-    let connection = save_default_nwc_connection(&request.connection_string)
-        .map_err(|err| err.to_string())?;
+    let connection =
+        save_default_nwc_connection(&request.connection_string).map_err(|err| err.to_string())?;
     Ok(nwc_connection_response(&connection))
 }
 
@@ -172,7 +274,8 @@ pub async fn confirm_purchase(
         .map_err(|err| err.to_string())?
         .to_hex();
 
-    let game_coordinate = listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
+    let game_coordinate =
+        listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
     let listing_event = fetch_listing_event_by_coordinate(&state, &game_coordinate).await?;
     let listing_for_validation = listing_event.clone();
     let client = AdpClient::new(request.server_url.clone(), Arc::clone(&state.http_client));
@@ -227,7 +330,9 @@ pub(crate) async fn fetch_listing_event_by_coordinate(
     coordinate: &str,
 ) -> Result<nostr::Event, String> {
     let mut parts = coordinate.splitn(3, ':');
-    let kind = parts.next().ok_or_else(|| "missing coordinate kind".to_string())?;
+    let kind = parts
+        .next()
+        .ok_or_else(|| "missing coordinate kind".to_string())?;
     let developer = parts
         .next()
         .ok_or_else(|| "missing coordinate developer".to_string())?;
@@ -256,9 +361,9 @@ pub(crate) async fn fetch_listing_event_by_coordinate(
             timeout_duration,
         ),
     )
-        .await
-        .map_err(|_| "listing event fetch timed out".to_string())?
-        .map_err(|err| err.to_string())?;
+    .await
+    .map_err(|_| "listing event fetch timed out".to_string())?
+    .map_err(|err| err.to_string())?;
     events
         .into_iter()
         .max_by_key(|event| event.created_at.as_secs())
@@ -307,79 +412,168 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     request: PublishAdpListingRequest,
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
+    signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
 ) -> Result<PublishAdpListingResult, String> {
-    emit_progress(&app, "check-server", "pending", None)?;
-    let adp_client = AdpClient::new(request.server_url.clone(), Arc::clone(&state.http_client));
-    let server_info = adp_client
-        .well_known()
-        .await
-        .map_err(|err| progress_error(&app, "check-server", err))?;
-    emit_progress(&app, "check-server", "ok", Some(server_info.pubkey.clone()))?;
-
-    emit_progress(&app, "hash-file", "pending", None)?;
-    let file_hash = sha256_file(std::path::Path::new(&request.file_path))
-        .await
-        .map_err(|err| progress_error(&app, "hash-file", err))?;
-    emit_progress(&app, "hash-file", "ok", Some(file_hash.clone()))?;
-
     let auth_snapshot = { state.auth.lock().await.clone() };
-    let signer = auth_snapshot
-        .signer()
-        .ok_or_else(|| "not authenticated".to_string())?;
+    let signer = resolve_publish_signer(signer_state.inner(), &auth_snapshot).await?;
     let developer_pubkey = signer
         .get_public_key()
         .await
         .map_err(|err| err.to_string())?;
     let developer_npub = developer_pubkey.to_hex();
 
-    let provisioning_repo = AdpProvisioningRepository::new(state.database.pool().clone());
-    let scope = request.d_tag.as_str();
+    let mut file_hash = None;
+    let mut fulfillment_pubkey = None;
+    let mut fulfillment_valid_from = None;
+    let mut acceptance_event_id = None;
 
-    emit_progress(&app, "provision", "pending", None)?;
-    let provisioning = resolve_provisioning(ResolveProvisioningInput {
-        provisioning_repo: &provisioning_repo,
-        adp_client: &adp_client,
-        signer,
-        developer_pubkey,
-        developer_npub: &developer_npub,
-        server_url: &request.server_url,
-        scope,
-        server_info: &server_info,
-    })
-    .await
-    .map_err(|err| progress_error(&app, "provision", err))?;
-    let (fulfillment_pubkey, acceptance_event_id, fulfillment_valid_from) = match provisioning {
-        ProvisioningDecision::Reused {
-            fulfillment_pubkey,
-            acceptance_event_id,
-            valid_from,
-        } => {
+    match request.fulfillment_mode {
+        FulfillmentMode::None => {}
+        FulfillmentMode::Direct => {
+            if request.servers.is_empty() {
+                return Err(
+                    "at least one distribution server is required for fulfillment".to_string(),
+                );
+            }
+            let file_path = request
+                .file_path
+                .as_deref()
+                .ok_or_else(|| "build file is required for fulfillment".to_string())?;
+            let version = request
+                .version
+                .as_deref()
+                .ok_or_else(|| "version is required for fulfillment".to_string())?;
+            if version.trim().is_empty() {
+                return Err("version is required for fulfillment".to_string());
+            }
+
+            emit_progress(&app, "hash-file", "pending", None)?;
+            let hash = sha256_file(std::path::Path::new(file_path))
+                .await
+                .map_err(|err| progress_error(&app, "hash-file", err))?;
+            emit_progress(&app, "hash-file", "ok", Some(hash.clone()))?;
+            file_hash = Some(hash);
+            fulfillment_pubkey = Some(developer_npub.clone());
+            fulfillment_valid_from = Some(
+                now_unix_i64()?
+                    .try_into()
+                    .map_err(|_| "current time is negative".to_string())?,
+            );
+        }
+        FulfillmentMode::Delegate => {
+            if request.servers.is_empty() {
+                return Err(
+                    "at least one distribution server is required for fulfillment".to_string(),
+                );
+            }
+            let operator_url = request
+                .operator_url
+                .as_deref()
+                .ok_or_else(|| "operator URL is required for delegated fulfillment".to_string())?;
+            if operator_url.trim().is_empty() {
+                return Err("operator URL is required for delegated fulfillment".to_string());
+            }
+            let file_path = request
+                .file_path
+                .as_deref()
+                .ok_or_else(|| "build file is required for fulfillment".to_string())?;
+            let version = request
+                .version
+                .as_deref()
+                .ok_or_else(|| "version is required for fulfillment".to_string())?;
+            if version.trim().is_empty() {
+                return Err("version is required for fulfillment".to_string());
+            }
+
             emit_progress(
                 &app,
-                "provision",
-                "ok",
-                Some("reused existing provisioning".into()),
+                "check-operator",
+                "pending",
+                Some(operator_url.to_string()),
             )?;
-            (fulfillment_pubkey, acceptance_event_id, valid_from)
-        }
-        ProvisioningDecision::Created {
-            fulfillment_pubkey,
-            acceptance_event_id,
-            valid_from,
-            acceptance_event,
-            row,
-        } => {
-            publish_event(&state, &acceptance_event)
+            let adp_client =
+                AdpClient::new(operator_url.to_string(), Arc::clone(&state.http_client));
+            let server_info = adp_client
+                .well_known()
                 .await
-                .map_err(|err| progress_error(&app, "provision", err))?;
-            provisioning_repo
-                .upsert(&row)
+                .map_err(|err| progress_error(&app, "check-operator", err))?;
+            emit_progress(
+                &app,
+                "check-operator",
+                "ok",
+                Some(server_info.pubkey.clone()),
+            )?;
+
+            emit_progress(&app, "hash-file", "pending", None)?;
+            let hash = sha256_file(std::path::Path::new(file_path))
                 .await
-                .map_err(|err| progress_error(&app, "provision", err))?;
-            emit_progress(&app, "provision", "ok", Some("created provisioning".into()))?;
-            (fulfillment_pubkey, acceptance_event_id, valid_from)
+                .map_err(|err| progress_error(&app, "hash-file", err))?;
+            emit_progress(&app, "hash-file", "ok", Some(hash.clone()))?;
+            file_hash = Some(hash);
+
+            let provisioning_repo = AdpProvisioningRepository::new(state.database.pool().clone());
+            let scope = request.d_tag.as_str();
+
+            emit_progress(&app, "provision", "pending", None)?;
+            let provisioning = resolve_provisioning(ResolveProvisioningInput {
+                provisioning_repo: &provisioning_repo,
+                adp_client: &adp_client,
+                signer: signer.as_ref(),
+                developer_pubkey,
+                developer_npub: &developer_npub,
+                server_url: operator_url,
+                scope,
+                server_info: &server_info,
+            })
+            .await
+            .map_err(|err| progress_error(&app, "provision", err))?;
+
+            match provisioning {
+                ProvisioningDecision::Reused {
+                    fulfillment_pubkey: reused_pubkey,
+                    acceptance_event_id: reused_acceptance_event_id,
+                    valid_from,
+                } => {
+                    emit_progress(
+                        &app,
+                        "provision",
+                        "ok",
+                        Some("reused existing provisioning".into()),
+                    )?;
+                    fulfillment_pubkey = Some(reused_pubkey);
+                    acceptance_event_id = Some(reused_acceptance_event_id);
+                    fulfillment_valid_from = Some(
+                        valid_from
+                            .try_into()
+                            .map_err(|_| "provisioning valid_from is negative".to_string())?,
+                    );
+                }
+                ProvisioningDecision::Created {
+                    fulfillment_pubkey: created_pubkey,
+                    acceptance_event_id: created_acceptance_event_id,
+                    valid_from,
+                    acceptance_event,
+                    row,
+                } => {
+                    publish_event(&state, &acceptance_event)
+                        .await
+                        .map_err(|err| progress_error(&app, "provision", err))?;
+                    provisioning_repo
+                        .upsert(&row)
+                        .await
+                        .map_err(|err| progress_error(&app, "provision", err))?;
+                    emit_progress(&app, "provision", "ok", Some("created provisioning".into()))?;
+                    fulfillment_pubkey = Some(created_pubkey);
+                    acceptance_event_id = Some(created_acceptance_event_id);
+                    fulfillment_valid_from = Some(
+                        valid_from
+                            .try_into()
+                            .map_err(|_| "provisioning valid_from is negative".to_string())?,
+                    );
+                }
+            }
         }
-    };
+    }
 
     emit_progress(&app, "publish-listing", "pending", None)?;
     let listing_input = AdpListingInput {
@@ -388,13 +582,13 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         description: request.description.clone(),
         price_sats: request.price_sats,
         lud16: request.lud16.clone(),
-        server_url: request.server_url.clone(),
+        tags: request.tags.clone(),
+        images: request.images.clone(),
+        servers: request.servers.clone(),
         file_hash: file_hash.clone(),
         version: request.version.clone(),
         fulfillment_pubkey: fulfillment_pubkey.clone(),
-        fulfillment_valid_from: fulfillment_valid_from
-            .try_into()
-            .map_err(|_| "provisioning valid_from is negative".to_string())?,
+        fulfillment_valid_from,
         platforms: request.platforms.clone(),
     };
     let listing_builder =
@@ -430,23 +624,70 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     }
     emit_progress(&app, "confirm-propagation", "ok", Some(coordinate.clone()))?;
 
-    emit_progress(&app, "upload", "pending", None)?;
-    let upload = adp_client
-        .upload(
-            signer,
-            &listing_event,
-            std::path::Path::new(&request.file_path),
-        )
-        .await
-        .map_err(|err| progress_error(&app, "upload", err))?;
-    emit_progress(&app, "upload", "ok", Some(upload.download_url.clone()))?;
+    let mut uploads = Vec::new();
+    if !matches!(request.fulfillment_mode, FulfillmentMode::None) {
+        let file_path = request
+            .file_path
+            .as_deref()
+            .ok_or_else(|| "build file is required for fulfillment".to_string())?;
+        let mut upload_errors = Vec::new();
+        for server_url in &request.servers {
+            emit_server_progress(&app, "upload", "pending", Some(server_url.clone()), None)?;
+            let adp_client = AdpClient::new(server_url.clone(), Arc::clone(&state.http_client));
+            match adp_client
+                .upload(
+                    signer.as_ref(),
+                    &listing_event,
+                    std::path::Path::new(file_path),
+                )
+                .await
+            {
+                Ok(upload) => {
+                    emit_server_progress(
+                        &app,
+                        "upload",
+                        "ok",
+                        Some(server_url.clone()),
+                        Some(upload.download_url.clone()),
+                    )?;
+                    uploads.push(PublishServerUploadResult {
+                        server_url: server_url.clone(),
+                        status: "ok".to_string(),
+                        error: None,
+                        upload: Some(upload),
+                    });
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    emit_server_progress(
+                        &app,
+                        "upload",
+                        "error",
+                        Some(server_url.clone()),
+                        Some(message.clone()),
+                    )?;
+                    upload_errors.push(format!("{server_url}: {message}"));
+                    uploads.push(PublishServerUploadResult {
+                        server_url: server_url.clone(),
+                        status: "error".to_string(),
+                        error: Some(message),
+                        upload: None,
+                    });
+                }
+            }
+        }
+
+        if !upload_errors.is_empty() {
+            return Err(format!("upload failed for: {}", upload_errors.join("; ")));
+        }
+    }
 
     Ok(PublishAdpListingResult {
         event_id: listing_event.id.to_hex(),
         acceptance_event_id,
         fulfillment_pubkey,
         file_hash,
-        upload,
+        uploads,
     })
 }
 
@@ -476,8 +717,11 @@ struct ResolveProvisioningInput<'a> {
     server_info: &'a AdpServerInfo,
 }
 
-async fn resolve_provisioning(input: ResolveProvisioningInput<'_>) -> Result<ProvisioningDecision, String> {
-    if let Some(existing) = input.provisioning_repo
+async fn resolve_provisioning(
+    input: ResolveProvisioningInput<'_>,
+) -> Result<ProvisioningDecision, String> {
+    if let Some(existing) = input
+        .provisioning_repo
         .active_for_scope(input.developer_npub, input.server_url, Some(input.scope))
         .await
         .map_err(|err| err.to_string())?
@@ -489,7 +733,8 @@ async fn resolve_provisioning(input: ResolveProvisioningInput<'_>) -> Result<Pro
         });
     }
 
-    let provision = input.adp_client
+    let provision = input
+        .adp_client
         .provision(input.signer, Some(input.scope))
         .await
         .map_err(|err| err.to_string())?;
@@ -497,14 +742,18 @@ async fn resolve_provisioning(input: ResolveProvisioningInput<'_>) -> Result<Pro
         &input.server_info.pubkey,
         &provision.fulfillment_pubkey,
     );
-    let acceptance_event = input.signer
+    let acceptance_event = input
+        .signer
         .sign_event(acceptance_builder.build(input.developer_pubkey))
         .await
         .map_err(|err| err.to_string())?;
     let acceptance_event_id = acceptance_event.id.to_hex();
     let now = now_unix_i64()?;
     let row = AdpProvisioning {
-        id: format!("{}:{}:{}", input.developer_npub, input.server_url, input.scope),
+        id: format!(
+            "{}:{}:{}",
+            input.developer_npub, input.server_url, input.scope
+        ),
         developer_npub: input.developer_npub.to_string(),
         server_url: input.server_url.to_string(),
         operator_pubkey: input.server_info.pubkey.clone(),
@@ -545,11 +794,22 @@ fn emit_progress<R: tauri::Runtime>(
     status: &str,
     message: Option<String>,
 ) -> Result<(), String> {
+    emit_server_progress(app, step, status, None, message)
+}
+
+fn emit_server_progress<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    step: &str,
+    status: &str,
+    server_url: Option<String>,
+    message: Option<String>,
+) -> Result<(), String> {
     app.emit(
         "publish-progress",
         PublishProgressPayload {
             step: step.to_string(),
             status: status.to_string(),
+            server_url,
             message,
         },
     )
@@ -588,6 +848,7 @@ mod tests {
     use arcadestr_core::http_client::{HttpClient, ReqwestHttpClient};
     use arcadestr_core::marketplace_cache::MarketplaceCache;
     use arcadestr_core::nip05_validator::Nip05Validator;
+    use arcadestr_core::nip46::AppSignerState;
     use arcadestr_core::nostr::{EventDeduplicator, NostrClient};
     use arcadestr_core::profile_fetcher::ProfileFetcher;
     use arcadestr_core::relay_cache::RelayCache;
@@ -597,10 +858,33 @@ mod tests {
     use arcadestr_core::storage::Database;
     use arcadestr_core::subscriptions::SubscriptionRegistry;
     use arcadestr_core::user_cache::UserCache;
-    use nostr::nips::nip19::ToBech32;
+    use nostr::{nips::nip19::ToBech32, Keys};
     use serde_json::json;
     use tauri::Manager;
     use tokio::sync::{Mutex as AsyncMutex, RwLock};
+
+    #[tokio::test]
+    async fn restored_nip46_client_signer_is_used_when_legacy_auth_is_empty() {
+        let keys = Keys::generate();
+        let expected_pubkey = keys.public_key();
+        let client = nostr_sdk::Client::new(keys);
+        let signer_state = Arc::new(AsyncMutex::new(AppSignerState {
+            active_client: Some(client),
+            ..AppSignerState::new()
+        }));
+
+        let resolved = resolve_publish_signer(&signer_state, &AuthState::new())
+            .await
+            .expect("active NIP-46 signer should be resolved");
+
+        assert_eq!(
+            resolved
+                .get_public_key()
+                .await
+                .expect("resolved signer should expose public key"),
+            expected_pubkey
+        );
+    }
 
     async fn test_db() -> Database {
         let path = std::env::temp_dir().join(format!(
@@ -667,7 +951,8 @@ mod tests {
         );
         assert_eq!(response.relays, vec!["wss://relay.example.com".to_string()]);
         assert_eq!(response.lud16.as_deref(), Some("buyer@example.com"));
-        assert!(!format!("{response:?}").contains("0000000000000000000000000000000000000000000000000000000000000002"));
+        assert!(!format!("{response:?}")
+            .contains("0000000000000000000000000000000000000000000000000000000000000002"));
     }
 
     fn unique_test_path(prefix: &str, extension: &str) -> PathBuf {
@@ -767,6 +1052,7 @@ mod tests {
                 nip05_validator,
                 http_client,
             })
+            .manage(Arc::new(AsyncMutex::new(AppSignerState::new())))
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("mock Tauri app should build")
     }
@@ -810,23 +1096,30 @@ mod tests {
             .expect("published listing event should be returned by a relay")
     }
 
-    fn assert_live_listing_tags(event: &nostr::Event, result: &PublishAdpListingResult, lud16: &str) {
+    fn assert_live_listing_tags(
+        event: &nostr::Event,
+        result: &PublishAdpListingResult,
+        lud16: &str,
+    ) {
+        let file_hash = result.file_hash.as_ref().expect("file hash should be set");
+        let fulfillment_pubkey = result
+            .fulfillment_pubkey
+            .as_ref()
+            .expect("fulfillment pubkey should be set");
+
         assert!(
             !tag_values(event, "server").is_empty(),
             "missing server tag"
         );
         assert_eq!(
             tag_values(event, "file_hash")[0],
-            vec!["file_hash", result.file_hash.as_str()]
+            vec!["file_hash", file_hash.as_str()]
         );
         assert_eq!(
             tag_values(event, "version")[0],
             vec!["version", "0.0.1-live"]
         );
-        assert_eq!(
-            tag_values(event, "lud16")[0],
-            vec!["lud16", lud16]
-        );
+        assert_eq!(tag_values(event, "lud16")[0], vec!["lud16", lud16]);
         assert_eq!(
             tag_values(event, "platform")[0],
             vec!["platform", "linux-x86_64"]
@@ -837,7 +1130,7 @@ mod tests {
         let fulfillment_tag = &fulfillment_tags[0];
         assert_eq!(fulfillment_tag.len(), 4);
         assert_eq!(fulfillment_tag[0], "fulfillment_pubkey");
-        assert_eq!(fulfillment_tag[1], result.fulfillment_pubkey);
+        assert_eq!(&fulfillment_tag[1], fulfillment_pubkey);
         assert!(
             fulfillment_tag[2].parse::<u64>().is_ok(),
             "fulfillment_pubkey valid_from should be a unix timestamp"
@@ -1014,8 +1307,8 @@ mod tests {
     async fn live_publish_adp_listing_uploads_and_propagates_to_two_relays() {
         let server_url = std::env::var("ADP_TEST_SERVER_URL")
             .expect("ADP_TEST_SERVER_URL must be set for live ADP publish test");
-        let lud16 = std::env::var("ADP_TEST_LUD16")
-            .unwrap_or_else(|_| "seller@example.com".to_string());
+        let lud16 =
+            std::env::var("ADP_TEST_LUD16").unwrap_or_else(|_| "seller@example.com".to_string());
         let price_sats = std::env::var("ADP_TEST_PRICE_SATS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -1050,29 +1343,53 @@ mod tests {
             description: "Small live ADP command-level publish test fixture".to_string(),
             price_sats,
             lud16: Some(lud16.clone()),
-            server_url,
-            file_path: file_path.display().to_string(),
-            version: "0.0.1-live".to_string(),
+            tags: vec![],
+            images: vec![],
+            fulfillment_mode: FulfillmentMode::Delegate,
+            operator_url: Some(server_url.clone()),
+            servers: vec![server_url.clone()],
+            file_path: Some(file_path.display().to_string()),
+            version: Some("0.0.1-live".to_string()),
             platforms: vec!["linux-x86_64".to_string()],
         };
 
-        let result = publish_adp_listing(request, app.handle().clone(), app.state::<AppState>())
-            .await
-            .expect("live ADP publish command should complete");
+        let result = publish_adp_listing(
+            request,
+            app.handle().clone(),
+            app.state::<AppState>(),
+            app.state::<Arc<AsyncMutex<AppSignerState>>>(),
+        )
+        .await
+        .expect("live ADP publish command should complete");
 
-        assert_eq!(result.file_hash.len(), 64);
+        let file_hash = result.file_hash.as_ref().expect("file hash should be set");
+        let acceptance_event_id = result
+            .acceptance_event_id
+            .as_ref()
+            .expect("acceptance event id should be set");
+        let fulfillment_pubkey = result
+            .fulfillment_pubkey
+            .as_ref()
+            .expect("fulfillment pubkey should be set");
+        let upload = result
+            .uploads
+            .first()
+            .and_then(|upload| upload.upload.as_ref())
+            .expect("upload should succeed");
+
+        assert_eq!(file_hash.len(), 64);
         assert!(!result.event_id.is_empty());
-        assert!(!result.acceptance_event_id.is_empty());
-        assert!(!result.fulfillment_pubkey.is_empty());
-        assert!(!result.upload.download_url.is_empty());
-        assert_eq!(result.upload.file_hash, result.file_hash);
+        assert!(!acceptance_event_id.is_empty());
+        assert!(!fulfillment_pubkey.is_empty());
+        assert!(!upload.download_url.is_empty());
+        assert_eq!(&upload.file_hash, file_hash);
         assert!(
-            result.upload.game_coordinate.contains(&d_tag),
+            upload.game_coordinate.contains(&d_tag),
             "upload response should reference the published listing coordinate"
         );
         println!("ADP_LIVE_EVENT_ID={}", result.event_id);
-        println!("ADP_LIVE_GAME_COORDINATE={}", result.upload.game_coordinate);
-        println!("ADP_LIVE_DOWNLOAD_URL={}", result.upload.download_url);
+        println!("ADP_LIVE_GAME_COORDINATE={}", upload.game_coordinate);
+        println!("ADP_LIVE_DOWNLOAD_URL={}", upload.download_url);
 
         let listing_event = fetch_live_listing_event(&app, &result.event_id).await;
         assert_live_listing_tags(&listing_event, &result, &lud16);
@@ -1156,10 +1473,18 @@ mod tests {
         use_nwc_payment: bool,
     }
 
-    async fn live_confirm_purchase_pass(input: LiveConfirmPurchaseInput<'_>) -> ConfirmPurchaseResponse {
-        eprintln!("ADP_GATE4_STAGE=confirm_pass_start nwc={}", input.use_nwc_payment);
+    async fn live_confirm_purchase_pass(
+        input: LiveConfirmPurchaseInput<'_>,
+    ) -> ConfirmPurchaseResponse {
+        eprintln!(
+            "ADP_GATE4_STAGE=confirm_pass_start nwc={}",
+            input.use_nwc_payment
+        );
         let (publisher_npub, listing_id) = listing_parts_from_coordinate(input.coordinate);
-        eprintln!("ADP_GATE4_STAGE=request_invoice_start nwc={}", input.use_nwc_payment);
+        eprintln!(
+            "ADP_GATE4_STAGE=request_invoice_start nwc={}",
+            input.use_nwc_payment
+        );
         let invoice = request_lnurl_invoice(
             RequestLnurlInvoiceRequest {
                 lud16: input.lud16.to_string(),
@@ -1169,7 +1494,10 @@ mod tests {
         )
         .await
         .expect("LNURL invoice should resolve and request");
-        eprintln!("ADP_GATE4_STAGE=request_invoice_ok nwc={}", input.use_nwc_payment);
+        eprintln!(
+            "ADP_GATE4_STAGE=request_invoice_ok nwc={}",
+            input.use_nwc_payment
+        );
         let preimage = if input.use_nwc_payment {
             eprintln!("ADP_GATE4_STAGE=pay_nwc_start primary");
             arcadestr_core::nwc_client::NwcClient::new(input.nwc_connection.clone())
@@ -1185,9 +1513,15 @@ mod tests {
                 .expect("test backend should pay second invoice for manual-path preimage")
                 .preimage
         };
-        eprintln!("ADP_GATE4_STAGE=pay_preimage_ok nwc={}", input.use_nwc_payment);
+        eprintln!(
+            "ADP_GATE4_STAGE=pay_preimage_ok nwc={}",
+            input.use_nwc_payment
+        );
 
-        eprintln!("ADP_GATE4_STAGE=confirm_purchase_start nwc={}", input.use_nwc_payment);
+        eprintln!(
+            "ADP_GATE4_STAGE=confirm_purchase_start nwc={}",
+            input.use_nwc_payment
+        );
         confirm_purchase(
             ConfirmPurchaseRequest {
                 publisher_npub,
@@ -1220,8 +1554,9 @@ mod tests {
         let app = live_test_app(relays).await;
         eprintln!("ADP_GATE4_STAGE=app_init_ok");
         eprintln!("ADP_GATE4_STAGE=parse_nwc_start");
-        let nwc_connection = arcadestr_core::nwc_client::NwcConnection::parse(&nwc_connection_string)
-            .expect("buyer NWC connection string should parse");
+        let nwc_connection =
+            arcadestr_core::nwc_client::NwcConnection::parse(&nwc_connection_string)
+                .expect("buyer NWC connection string should parse");
         let connect_result = nwc_connection_response(&nwc_connection);
         eprintln!("ADP_GATE4_STAGE=parse_nwc_ok");
         assert!(!connect_result.wallet_pubkey.is_empty());
@@ -1258,7 +1593,11 @@ mod tests {
         let token_repo =
             DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
         let token = token_repo
-            .valid_token(&coordinate, &server_url, now_unix_i64().expect("clock should work"))
+            .valid_token(
+                &coordinate,
+                &server_url,
+                now_unix_i64().expect("clock should work"),
+            )
             .await
             .expect("download token lookup should succeed")
             .expect("download token should be stored");
@@ -1331,12 +1670,19 @@ mod tests {
         let token_repo =
             DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
         let token = token_repo
-            .valid_token(&coordinate, &server_url, now_unix_i64().expect("clock should work"))
+            .valid_token(
+                &coordinate,
+                &server_url,
+                now_unix_i64().expect("clock should work"),
+            )
             .await
             .expect("download token lookup should succeed")
             .expect("download token should be stored");
         assert_eq!(token.token, response.download_token);
-        println!("ADP_GATE4_MANUAL_DOWNLOAD_TOKEN={}", response.download_token);
+        println!(
+            "ADP_GATE4_MANUAL_DOWNLOAD_TOKEN={}",
+            response.download_token
+        );
     }
 
     #[tokio::test]
@@ -1396,7 +1742,11 @@ mod tests {
         let token_repo =
             DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
         let cached_token = token_repo
-            .valid_token(&coordinate, &server_url, now_unix_i64().expect("clock should work"))
+            .valid_token(
+                &coordinate,
+                &server_url,
+                now_unix_i64().expect("clock should work"),
+            )
             .await
             .expect("download token lookup should succeed")
             .expect("download token should be stored before Path A");
@@ -1447,7 +1797,11 @@ mod tests {
             .await
             .expect("Path B should delete local token row");
         let token_after_delete = token_repo
-            .valid_token(&coordinate, &server_url, now_unix_i64().expect("clock should work"))
+            .valid_token(
+                &coordinate,
+                &server_url,
+                now_unix_i64().expect("clock should work"),
+            )
             .await
             .expect("download token lookup after delete should succeed");
         assert!(token_after_delete.is_none());
@@ -1487,7 +1841,11 @@ mod tests {
             "Path B should replace installed_games row after reinstall"
         );
         let token_after_path_b = token_repo
-            .valid_token(&coordinate, &server_url, now_unix_i64().expect("clock should work"))
+            .valid_token(
+                &coordinate,
+                &server_url,
+                now_unix_i64().expect("clock should work"),
+            )
             .await
             .expect("download token lookup after Path B should succeed");
         assert!(token_after_path_b.is_none());

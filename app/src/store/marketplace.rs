@@ -6,7 +6,8 @@
 use crate::models::GameListing;
 use leptos::prelude::*;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default TTL for cached listings (5 minutes)
 pub const DEFAULT_LISTING_TTL_SECS: u64 = 300;
@@ -15,7 +16,7 @@ pub const DEFAULT_LISTING_TTL_SECS: u64 = 300;
 #[derive(Clone, Debug)]
 pub struct MarketplaceStore {
     listings: RwSignal<HashMap<String, GameListing>>,
-    last_fetch_time: RwSignal<Option<Instant>>,
+    last_fetch_time: RwSignal<Option<u64>>,
 }
 
 impl MarketplaceStore {
@@ -88,15 +89,14 @@ impl MarketplaceStore {
         match self.last_fetch_time.get_untracked() {
             None => true,
             Some(last_fetch) => {
-                let elapsed = last_fetch.elapsed();
-                elapsed > Duration::from_secs(ttl_secs)
+                current_time_millis().saturating_sub(last_fetch) > ttl_secs.saturating_mul(1000)
             }
         }
     }
 
     /// Update the last fetch timestamp to now
     pub fn mark_fresh(&self) {
-        self.last_fetch_time.set(Some(Instant::now()));
+        self.last_fetch_time.set(Some(current_time_millis()));
     }
 
     /// Clear all listings and reset fetch time
@@ -119,6 +119,19 @@ impl MarketplaceStore {
             .cloned()
             .collect()
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn current_time_millis() -> u64 {
+    js_sys::Date::now().max(0.0) as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 impl Default for MarketplaceStore {

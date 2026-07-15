@@ -43,7 +43,6 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
     let visible_count = RwSignal::new(BROWSE_INITIAL_VISIBLE_COUNT);
     let platform_info = RwSignal::new(None::<PlatformInfo>);
     let active_platform_filter = RwSignal::new(None::<String>);
-    let platform_filter_initialized = RwSignal::new(false);
     let platform_auto_fetch = RwSignal::new(None::<PlatformAutoFetchState>);
     let install_error = RwSignal::new(None::<String>);
 
@@ -53,17 +52,6 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                 platform_info.set(Some(info));
             }
         });
-    });
-
-    Effect::new(move |_| {
-        if platform_filter_initialized.get_untracked() {
-            return;
-        }
-
-        if let Some(info) = platform_info.get() {
-            active_platform_filter.set(Some(info.tag()));
-            platform_filter_initialized.set(true);
-        }
     });
 
     let displayed_listings = Signal::derive(move || {
@@ -133,7 +121,6 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                                     if active_platform_filter.get().is_some() { "host" } else { "all" }
                                 }
                                 on:change=move |ev| {
-                                    platform_filter_initialized.set(true);
                                     match event_target_value(&ev).as_str() {
                                         "host" => {
                                             if let Some(tag) = host_platform_tag.get_untracked() {
@@ -195,7 +182,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                     }
                     .into_any()
                 } else if show_browse_empty_state(
-                    displayed_listings.get().len(),
+                    listings.get().len(),
                     loading.get(),
                     loading_more.get(),
                 ) {
@@ -204,6 +191,22 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>) -> impl IntoView {
                             <p class="font-bold text-on-surface">"No products found"</p>
                             <p class="mt-1 text-sm leading-relaxed">
                                 "No games match the current marketplace results or filters."
+                            </p>
+                        </div>
+                    }
+                    .into_any()
+                } else if show_filtered_empty_state(
+                    displayed_listings.get().len(),
+                    listings.get().len(),
+                    active_platform_filter.get().as_deref(),
+                    loading.get(),
+                    loading_more.get(),
+                ) {
+                    view! {
+                        <div class="rounded-xl border border-outline-variant/15 bg-surface-container-high p-6 text-on-surface-variant">
+                            <p class="font-bold text-on-surface">"No games match this platform"</p>
+                            <p class="mt-1 text-sm leading-relaxed">
+                                "Switch to All Platforms to browse every marketplace listing."
                             </p>
                         </div>
                     }
@@ -456,6 +459,16 @@ fn show_no_more_platform_message(
 
 fn show_browse_empty_state(displayed_count: usize, loading: bool, loading_more: bool) -> bool {
     displayed_count == 0 && !loading && !loading_more
+}
+
+fn show_filtered_empty_state(
+    displayed_count: usize,
+    loaded_count: usize,
+    active_filter: Option<&str>,
+    loading: bool,
+    loading_more: bool,
+) -> bool {
+    displayed_count == 0 && loaded_count > 0 && active_filter.is_some() && !loading && !loading_more
 }
 
 fn listing_matches_platform_filter(platforms: &[String], active_filter: Option<&str>) -> bool {
@@ -842,5 +855,38 @@ mod tests {
         assert!(!show_browse_empty_state(0, true, false));
         assert!(!show_browse_empty_state(0, false, true));
         assert!(!show_browse_empty_state(1, false, false));
+    }
+
+    #[test]
+    fn filtered_empty_state_is_distinct_from_empty_marketplace() {
+        assert!(show_filtered_empty_state(
+            0,
+            3,
+            Some("linux-x86_64"),
+            false,
+            false
+        ));
+        assert!(!show_filtered_empty_state(
+            0,
+            0,
+            Some("linux-x86_64"),
+            false,
+            false
+        ));
+        assert!(!show_filtered_empty_state(
+            1,
+            3,
+            Some("linux-x86_64"),
+            false,
+            false
+        ));
+        assert!(!show_filtered_empty_state(0, 3, None, false, false));
+        assert!(!show_filtered_empty_state(
+            0,
+            3,
+            Some("linux-x86_64"),
+            true,
+            false
+        ));
     }
 }

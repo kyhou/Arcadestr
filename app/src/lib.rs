@@ -5156,7 +5156,7 @@ pub fn App() -> impl IntoView {
                 {
                     web_sys::console::log_1(&format!("Fetching profile for: {}", npub).into());
                 }
-                let mut baseline_profile = auth.profile.get();
+                let mut baseline_profile = auth.profile.get_untracked();
 
                 match invoke_get_cached_profile(npub.clone()).await {
                     Ok(Some(profile)) => {

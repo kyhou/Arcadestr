@@ -87,15 +87,28 @@ pub struct AdpServerInfo {
 
 /// Request payload for the ADP publish command.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FulfillmentMode {
+    None,
+    Direct,
+    Delegate,
+}
+
+/// Request payload for the ADP publish command.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PublishAdpListingRequest {
     pub d_tag: String,
     pub title: String,
     pub description: String,
     pub price_sats: u64,
     pub lud16: Option<String>,
-    pub server_url: String,
-    pub file_path: String,
-    pub version: String,
+    pub tags: Vec<String>,
+    pub images: Vec<String>,
+    pub fulfillment_mode: FulfillmentMode,
+    pub operator_url: Option<String>,
+    pub servers: Vec<String>,
+    pub file_path: Option<String>,
+    pub version: Option<String>,
     pub platforms: Vec<String>,
 }
 
@@ -107,14 +120,23 @@ pub struct UploadResponse {
     pub download_url: String,
 }
 
+/// Per-server upload status returned by ADP publish results.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PublishServerUploadResult {
+    pub server_url: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub upload: Option<UploadResponse>,
+}
+
 /// Result returned by the ADP publish command.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PublishAdpListingResult {
     pub event_id: String,
-    pub acceptance_event_id: String,
-    pub fulfillment_pubkey: String,
-    pub file_hash: String,
-    pub upload: UploadResponse,
+    pub acceptance_event_id: Option<String>,
+    pub fulfillment_pubkey: Option<String>,
+    pub file_hash: Option<String>,
+    pub uploads: Vec<PublishServerUploadResult>,
 }
 
 /// Progress event payload emitted during ADP publishing.
@@ -122,7 +144,23 @@ pub struct PublishAdpListingResult {
 pub struct PublishProgressPayload {
     pub step: String,
     pub status: String,
+    pub server_url: Option<String>,
     pub message: Option<String>,
+}
+
+/// ADP server announcement discovered from relays.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AdpServerAnnouncement {
+    pub pubkey: String,
+    pub url: String,
+    pub name: Option<String>,
+    pub supported_adp: Option<String>,
+    pub contact: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HashBuildFileRequest {
+    pub file_path: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -189,6 +227,42 @@ pub async fn invoke_check_adp_server(server_url: String) -> Result<AdpServerInfo
 #[cfg(feature = "web")]
 pub async fn invoke_check_adp_server(_server_url: String) -> Result<AdpServerInfo, String> {
     Err("ADP server checks are only available in desktop builds.".to_string())
+}
+
+/// Invoke desktop `discover_adp_servers` command.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_discover_adp_servers() -> Result<Vec<AdpServerAnnouncement>, String> {
+    crate::tauri_invoke::invoke("discover_adp_servers", serde_json::json!({})).await
+}
+
+/// Web fallback for `discover_adp_servers`.
+#[cfg(feature = "web")]
+pub async fn invoke_discover_adp_servers() -> Result<Vec<AdpServerAnnouncement>, String> {
+    Ok(Vec::new())
+}
+
+/// Invoke desktop `select_build_file` command.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_select_build_file() -> Result<Option<String>, String> {
+    crate::tauri_invoke::invoke("select_build_file", serde_json::json!({})).await
+}
+
+/// Web fallback for `select_build_file`.
+#[cfg(feature = "web")]
+pub async fn invoke_select_build_file() -> Result<Option<String>, String> {
+    Err("Build file selection is only available in desktop builds.".to_string())
+}
+
+/// Invoke desktop `hash_build_file` command.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_hash_build_file(request: HashBuildFileRequest) -> Result<String, String> {
+    crate::tauri_invoke::invoke("hash_build_file", serde_json::json!({ "request": request })).await
+}
+
+/// Web fallback for `hash_build_file`.
+#[cfg(feature = "web")]
+pub async fn invoke_hash_build_file(_request: HashBuildFileRequest) -> Result<String, String> {
+    Err("Build file hashing is only available in desktop builds.".to_string())
 }
 
 /// Invoke desktop `publish_adp_listing` command.

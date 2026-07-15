@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+use arcadestr_core::auth::{Account, AccountInfo, AccountManager, AuthState};
 use arcadestr_core::nip46::{
     activate_profile, attempt_manual_reconnect, cancel_bunker_retry, clear_last_active_profile_id,
     delete_profile_from_keyring, generate_login_qr, get_profile_metadata_by_id,
@@ -18,6 +19,86 @@ use arcadestr_core::nip46::{
     save_profile_to_keyring, set_last_active_profile_id, wait_for_qr_connection, AppSignerState,
     ConnectionState, PendingQrState, ProfileMetadata,
 };
+
+fn local_account_json(account: &AccountInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": account.id,
+        "name": account.display_name,
+        "npub": account.npub,
+        "signing_mode": "local",
+        "last_used": account.last_used,
+        "is_current": account.is_active,
+        "picture": account.picture,
+        "display_name": account.display_name,
+        "username": serde_json::Value::Null,
+        "nip05": serde_json::Value::Null,
+        "about": serde_json::Value::Null,
+    })
+}
+
+fn local_account_login_json(account: &Account, name: Option<String>) -> serde_json::Value {
+    serde_json::json!({
+        "account": {
+            "id": account.id,
+            "name": name.or_else(|| account.display_name.clone()),
+            "npub": account.npub,
+            "signing_mode": "local",
+            "last_used": account.last_used,
+            "is_current": true,
+        }
+    })
+}
+
+async fn activate_local_account(
+    account_manager: &AccountManager,
+    account: &Account,
+    auth: &mut AuthState,
+) -> Result<(), String> {
+    let nsec = account_manager
+        .get_nsec(account)
+        .map_err(|err| err.to_string())?;
+    auth.connect_with_key(&nsec)
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// Create and activate an encrypted local account from an nsec.
+#[tauri::command]
+pub async fn login_with_nsec(
+    nsec: String,
+    name: Option<String>,
+    account_manager: State<'_, Arc<AccountManager>>,
+    app_state: State<'_, crate::AppState>,
+    signer_state: State<'_, Arc<Mutex<AppSignerState>>>,
+) -> Result<serde_json::Value, String> {
+    let account = account_manager
+        .login_with_nsec(&nsec)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    if let Some(display_name) = name.clone() {
+        account_manager
+            .update_profile(&account.id, Some(display_name), None)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+
+    cancel_bunker_retry(signer_state.inner()).await;
+    clear_last_active_profile_id();
+    {
+        let mut signer_guard = signer_state.lock().await;
+        signer_guard.active_client = None;
+        signer_guard.active_profile_id = None;
+        signer_guard.connection_state = ConnectionState::Disconnected;
+    }
+
+    {
+        let mut auth = app_state.auth.lock().await;
+        activate_local_account(account_manager.inner(), &account, &mut auth).await?;
+    }
+
+    Ok(local_account_login_json(&account, name))
+}
 
 /// Called by Leptos when the user submits a bunker URI or NIP-05 address.
 /// Flow A entry point - BLOCKING VERSION (waits for handshake).
@@ -410,6 +491,7 @@ pub async fn check_qr_connection(
 pub async fn list_saved_profiles(
     signer_state: State<'_, Arc<Mutex<AppSignerState>>>,
     app_state: State<'_, crate::AppState>,
+    account_manager: State<'_, Arc<AccountManager>>,
 ) -> Result<serde_json::Value, String> {
     info!("list_saved_profiles called");
 
@@ -474,6 +556,18 @@ pub async fn list_saved_profiles(
         accounts_list.push(account_json);
     }
 
+    let local_accounts = account_manager
+        .list_accounts()
+        .await
+        .map_err(|err| err.to_string())?;
+    for account in local_accounts {
+        if !accounts_list.iter().any(|entry| {
+            entry.get("npub").and_then(|value| value.as_str()) == Some(account.npub.as_str())
+        }) {
+            accounts_list.push(local_account_json(&account));
+        }
+    }
+
     info!(
         "Returning {} unique profiles (single_profile_mode: {})",
         accounts_list.len(),
@@ -490,11 +584,41 @@ pub async fn switch_profile(
     profile_id: String,
     state: State<'_, Arc<Mutex<AppSignerState>>>,
     app_handle: AppHandle,
+    app_state: State<'_, crate::AppState>,
+    account_manager: State<'_, Arc<AccountManager>>,
 ) -> Result<serde_json::Value, String> {
     info!("switch_profile called: profile_id={}", profile_id);
 
     // STEP 1: Cancel any existing bunker retry task
     cancel_bunker_retry(state.inner()).await;
+
+    if let Some(account) = account_manager
+        .get_account(&profile_id)
+        .await
+        .map_err(|err| err.to_string())?
+    {
+        let account = account_manager
+            .switch_account(&account.id)
+            .await
+            .map_err(|err| err.to_string())?;
+        clear_last_active_profile_id();
+        {
+            let mut signer_guard = state.lock().await;
+            signer_guard.active_client = None;
+            signer_guard.active_profile_id = None;
+            signer_guard.connection_state = ConnectionState::Disconnected;
+        }
+        {
+            let mut auth = app_state.auth.lock().await;
+            activate_local_account(account_manager.inner(), &account, &mut auth).await?;
+        }
+        let npub = account.npub.clone();
+        let _ = app_handle.emit("auth_success", npub);
+        return Ok(local_account_login_json(
+            &account,
+            account.display_name.clone(),
+        ));
+    }
 
     // Get the profile metadata to find the bunker pubkey
     let metadata = match get_profile_metadata_by_id(&profile_id) {
@@ -668,14 +792,68 @@ pub async fn attempt_reconnect(
     }
 }
 
+#[cfg(test)]
+mod local_account_tests {
+    use super::*;
+    use nostr::{Keys, ToBech32};
+
+    #[test]
+    fn local_account_login_response_contains_local_signing_metadata() {
+        let keys = Keys::generate();
+        let npub = keys
+            .public_key()
+            .to_bech32()
+            .expect("generated public key should encode");
+        let account = Account {
+            id: "user_test".to_string(),
+            pubkey: keys.public_key().to_hex(),
+            npub: npub.clone(),
+            signing_mode: arcadestr_core::auth::SigningMode::Local,
+            encrypted_nsec: None,
+            display_name: None,
+            picture: None,
+            created_at: 0,
+            last_used: 0,
+            is_active: true,
+        };
+
+        let result = local_account_login_json(&account, Some("Local test".to_string()));
+
+        assert_eq!(result["account"]["npub"], npub);
+        assert_eq!(result["account"]["signing_mode"], "local");
+        assert_eq!(result["account"]["name"], "Local test");
+    }
+}
+
 /// Delete a saved profile permanently (removes from keyring).
 /// If it is the active profile, logout first.
 #[tauri::command]
 pub async fn delete_profile(
     profile_id: String,
     state: State<'_, Arc<Mutex<AppSignerState>>>,
+    app_state: State<'_, crate::AppState>,
+    account_manager: State<'_, Arc<AccountManager>>,
 ) -> Result<(), String> {
     info!("delete_profile called: profile_id={}", profile_id);
+
+    if account_manager
+        .get_account(&profile_id)
+        .await
+        .map_err(|err| err.to_string())?
+        .is_some()
+    {
+        account_manager
+            .delete_account(&profile_id)
+            .await
+            .map_err(|err| err.to_string())?;
+        let mut auth = app_state.auth.lock().await;
+        auth.disconnect();
+        let mut signer_guard = state.lock().await;
+        signer_guard.active_client = None;
+        signer_guard.active_profile_id = None;
+        signer_guard.connection_state = ConnectionState::Disconnected;
+        return Ok(());
+    }
 
     // Get the profile metadata to find the bunker pubkey
     let metadata = match get_profile_metadata_by_id(&profile_id) {
@@ -792,9 +970,11 @@ pub async fn ping_bunker(
 pub async fn logout_nip46(
     state: State<'_, Arc<Mutex<AppSignerState>>>,
     app_handle: AppHandle,
+    app_state: State<'_, crate::AppState>,
 ) -> Result<(), String> {
     info!("logout_nip46 called");
     logout(state.inner()).await;
+    app_state.auth.lock().await.disconnect();
 
     // Emit logout event to notify frontend
     let _ = app_handle.emit("auth_logout", ());
@@ -805,10 +985,14 @@ pub async fn logout_nip46(
 
 /// Check if any saved profiles exist (for startup check)
 #[tauri::command]
-pub async fn has_accounts() -> Result<bool, String> {
+pub async fn has_accounts(account_manager: State<'_, Arc<AccountManager>>) -> Result<bool, String> {
     info!("has_accounts called");
     let profiles = list_profile_index();
-    Ok(!profiles.is_empty())
+    let has_local_accounts = account_manager
+        .has_accounts()
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(!profiles.is_empty() || has_local_accounts)
 }
 
 /// Load the currently active account if one exists
@@ -816,6 +1000,8 @@ pub async fn has_accounts() -> Result<bool, String> {
 #[tauri::command]
 pub async fn load_active_account(
     state: State<'_, Arc<Mutex<AppSignerState>>>,
+    app_state: State<'_, crate::AppState>,
+    account_manager: State<'_, Arc<AccountManager>>,
 ) -> Result<serde_json::Value, String> {
     info!("load_active_account called");
 
@@ -877,6 +1063,21 @@ pub async fn load_active_account(
                 }
             }
         }
+    }
+
+    drop(state_guard);
+
+    if let Some(account) = account_manager
+        .load_active_account()
+        .await
+        .map_err(|err| err.to_string())?
+    {
+        let mut auth = app_state.auth.lock().await;
+        activate_local_account(account_manager.inner(), &account, &mut auth).await?;
+        return Ok(local_account_login_json(
+            &account,
+            account.display_name.clone(),
+        ));
     }
 
     // No active account
