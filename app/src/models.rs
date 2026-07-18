@@ -38,6 +38,33 @@ impl Default for ListingSource {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum AcquisitionPolicy {
+    #[default]
+    Gated,
+    Public,
+    TimedAccess {
+        starts_at: u64,
+        ends_at: u64,
+    },
+}
+
+impl AcquisitionPolicy {
+    pub fn allows_access_at(&self, now: u64) -> bool {
+        match self {
+            Self::Gated => false,
+            Self::Public => true,
+            Self::TimedAccess { starts_at, ends_at } => *starts_at <= now && now < *ends_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CampaignPointer {
+    pub root_event_id: String,
+    pub relay_hint: Option<String>,
+}
+
 /// A game (or any digital product) available in the marketplace.
 ///
 /// This type is the shared currency between the Tauri backend and the Leptos
@@ -141,6 +168,14 @@ pub struct GameListing {
     #[serde(default)]
     pub nip94_event_id: Option<String>,
 
+    /// Explicit current access policy from the signed NIP-99 listing.
+    #[serde(default)]
+    pub acquisition: AcquisitionPolicy,
+
+    /// Advisory campaign root pointers from the signed listing.
+    #[serde(default)]
+    pub campaigns: Vec<CampaignPointer>,
+
     /// True when the authenticated user holds a valid NIP-102 Kind:1020
     /// receipt for this listing. Populated server-side in fetch_marketplace;
     /// always false for unauthenticated fetches.
@@ -209,6 +244,8 @@ impl GameListing {
             created_at: product.created_at,
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: crate::models::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             is_owned: false,
             #[cfg(debug_assertions)]
             nip99_raw_event_json: None,
@@ -254,6 +291,22 @@ impl GameListing {
             created_at: listing.created_at,
             platforms: listing.platforms,
             nip94_event_id: listing.nip94_event_id,
+            acquisition: match listing.acquisition {
+                arcadestr_core::marketplace::AcquisitionPolicy::Gated => AcquisitionPolicy::Gated,
+                arcadestr_core::marketplace::AcquisitionPolicy::Public => AcquisitionPolicy::Public,
+                arcadestr_core::marketplace::AcquisitionPolicy::TimedAccess {
+                    starts_at,
+                    ends_at,
+                } => AcquisitionPolicy::TimedAccess { starts_at, ends_at },
+            },
+            campaigns: listing
+                .campaigns
+                .into_iter()
+                .map(|pointer| CampaignPointer {
+                    root_event_id: pointer.root_event_id.to_hex(),
+                    relay_hint: pointer.relay_hint,
+                })
+                .collect(),
             is_owned: false,
             #[cfg(debug_assertions)]
             nip99_raw_event_json: listing.raw_event_json,

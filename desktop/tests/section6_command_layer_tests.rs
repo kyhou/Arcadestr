@@ -150,6 +150,8 @@ fn sample_listing() -> GameListing {
         lud16: "seller@example.com".to_string(),
         platforms: Vec::new(),
         nip94_event_id: None,
+        acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
+        campaigns: Vec::new(),
         images: vec!["https://example.com/cover.png".to_string()],
         summary: Some("summary".to_string()),
         published_at: Some(1_710_000_000),

@@ -229,6 +229,35 @@ pub struct Nip15Product {
     pub created_at: u64,
 }
 
+/// Current listing policy for callers without durable ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AcquisitionPolicy {
+    #[default]
+    Gated,
+    Public,
+    TimedAccess {
+        starts_at: u64,
+        ends_at: u64,
+    },
+}
+
+impl AcquisitionPolicy {
+    pub fn allows_access_at(&self, now: u64) -> bool {
+        match self {
+            Self::Gated => false,
+            Self::Public => true,
+            Self::TimedAccess { starts_at, ends_at } => *starts_at <= now && now < *ends_at,
+        }
+    }
+}
+
+/// Advisory pointer to an immutable campaign root event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CampaignPointer {
+    pub root_event_id: nostr::EventId,
+    pub relay_hint: Option<String>,
+}
+
 /// A NIP-99 listing (kind 30402/30403) enriched with event-level metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Nip99Listing {
@@ -254,6 +283,12 @@ pub struct Nip99Listing {
     /// First NIP-94 metadata event id from `nip94` tags.
     #[serde(default)]
     pub nip94_event_id: Option<String>,
+    /// Current explicit access policy. Missing or malformed tags fail closed.
+    #[serde(default)]
+    pub acquisition: AcquisitionPolicy,
+    /// Advisory campaign discovery pointers.
+    #[serde(default)]
+    pub campaigns: Vec<CampaignPointer>,
     pub status: Option<String>,
     /// Original Nostr event JSON for debug-only inspection.
     #[cfg(debug_assertions)]
@@ -808,6 +843,9 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
     let mut tags: Vec<String> = Vec::new();
     let mut platforms: Vec<String> = Vec::new();
     let mut nip94_event_id: Option<String> = None;
+    let mut acquisition = AcquisitionPolicy::Gated;
+    let mut acquisition_seen = false;
+    let mut campaigns = Vec::new();
 
     for tag in event.tags.iter() {
         let v = tag.clone().to_vec();
@@ -878,6 +916,38 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
                     nip94_event_id = v.get(1).cloned();
                 }
             }
+            Some("acquisition") if !acquisition_seen => {
+                acquisition_seen = true;
+                acquisition = match v.as_slice() {
+                    [_, mode] if mode == "public" => AcquisitionPolicy::Public,
+                    [_, mode, starts, ends] if mode == "timed-access" => {
+                        match (starts.parse::<u64>(), ends.parse::<u64>()) {
+                            (Ok(starts_at), Ok(ends_at)) if starts_at < ends_at => {
+                                AcquisitionPolicy::TimedAccess { starts_at, ends_at }
+                            }
+                            _ => AcquisitionPolicy::Gated,
+                        }
+                    }
+                    _ => AcquisitionPolicy::Gated,
+                };
+            }
+            Some("campaign") => {
+                let relay_hint = match v.as_slice() {
+                    [_, _] => Some(None),
+                    [_, _, relay] if nostr::RelayUrl::parse(relay).is_ok() => {
+                        Some(Some(relay.clone()))
+                    }
+                    _ => None,
+                };
+                if let (Some(root), Some(relay_hint)) = (v.get(1), relay_hint) {
+                    if let Ok(root_event_id) = nostr::EventId::from_hex(root) {
+                        campaigns.push(CampaignPointer {
+                            root_event_id,
+                            relay_hint,
+                        });
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -900,6 +970,8 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
         tags,
         platforms,
         nip94_event_id,
+        acquisition,
+        campaigns,
         status,
         #[cfg(debug_assertions)]
         raw_event_json,
@@ -1175,6 +1247,8 @@ mod tests {
                 .map(|platform| (*platform).into())
                 .collect(),
             nip94_event_id: None,
+            acquisition: AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             raw_event_json: None,
         }
     }
@@ -1639,5 +1713,112 @@ mod tests {
         let result = apply_filter_nip99(listings, &filter);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "any-platform-game");
+    }
+
+    #[test]
+    fn explicit_public_acquisition_is_parsed() {
+        let event = make_nip99_event(
+            30402,
+            "Description",
+            vec![
+                vec!["d", "game"],
+                vec!["title", "Game"],
+                vec!["acquisition", "public"],
+            ],
+        );
+
+        let listing = parse_listing(event).expect("listing parses");
+        assert_eq!(listing.acquisition, AcquisitionPolicy::Public);
+        assert!(listing.acquisition.allows_access_at(1));
+    }
+
+    #[test]
+    fn timed_access_obeys_half_open_interval() {
+        let event = make_nip99_event(
+            30402,
+            "Description",
+            vec![
+                vec!["d", "game"],
+                vec!["title", "Game"],
+                vec!["acquisition", "timed-access", "100", "200"],
+            ],
+        );
+
+        let listing = parse_listing(event).expect("listing parses");
+        assert!(listing.acquisition.allows_access_at(100));
+        assert!(listing.acquisition.allows_access_at(199));
+        assert!(!listing.acquisition.allows_access_at(200));
+    }
+
+    #[test]
+    fn malformed_timed_access_fails_closed() {
+        for acquisition in [
+            vec!["acquisition", "timed-access", "bad", "200"],
+            vec!["acquisition", "timed-access", "200", "100"],
+            vec!["acquisition", "timed-access", "100"],
+        ] {
+            let event = make_nip99_event(
+                30402,
+                "Description",
+                vec![vec!["d", "game"], vec!["title", "Game"], acquisition],
+            );
+
+            let listing = parse_listing(event).expect("listing remains parseable");
+            assert_eq!(listing.acquisition, AcquisitionPolicy::Gated);
+        }
+    }
+
+    #[test]
+    fn zero_price_without_acquisition_remains_gated() {
+        let event = make_nip99_event(
+            30402,
+            "Description",
+            vec![
+                vec!["d", "game"],
+                vec!["title", "Game"],
+                vec!["price", "0", "SATS"],
+            ],
+        );
+
+        let listing = parse_listing(event).expect("listing parses");
+        assert_eq!(listing.acquisition, AcquisitionPolicy::Gated);
+    }
+
+    #[test]
+    fn campaign_pointer_preserves_optional_relay_hint() {
+        let event_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let event = make_nip99_event(
+            30402,
+            "Description",
+            vec![
+                vec!["d", "game"],
+                vec!["title", "Game"],
+                vec!["campaign", event_id, "wss://relay.example.com"],
+            ],
+        );
+
+        let listing = parse_listing(event).expect("listing parses");
+        assert_eq!(listing.campaigns.len(), 1);
+        assert_eq!(listing.campaigns[0].root_event_id.to_hex(), event_id);
+        assert_eq!(
+            listing.campaigns[0].relay_hint.as_deref(),
+            Some("wss://relay.example.com")
+        );
+    }
+
+    #[test]
+    fn malformed_campaign_pointer_is_ignored() {
+        let event = make_nip99_event(
+            30402,
+            "Description",
+            vec![
+                vec!["d", "game"],
+                vec!["title", "Game"],
+                vec!["campaign", "not-an-event-id", "not-a-relay"],
+            ],
+        );
+
+        let listing = parse_listing(event).expect("listing parses");
+        assert!(listing.campaigns.is_empty());
     }
 }

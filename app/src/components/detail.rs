@@ -586,6 +586,8 @@ mod tests {
             created_at: 1_710_000_000,
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: crate::models::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             is_owned: false,
             #[cfg(debug_assertions)]
             nip99_raw_event_json: raw_event_json,

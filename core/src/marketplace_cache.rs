@@ -124,6 +124,8 @@ impl MarketplaceCache {
                     lud16: row.get("lud16"),
                     platforms,
                     nip94_event_id: row.get("nip94_event_id"),
+                    acquisition: crate::marketplace::AcquisitionPolicy::Gated,
+                    campaigns: Vec::new(),
                     images,
                     summary: row.get("summary"),
                     published_at: row
@@ -286,6 +288,8 @@ mod tests {
             lud16: "merchant@example.com".to_string(),
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: crate::marketplace::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             images: vec!["https://example.com/image1.png".to_string()],
             summary: Some("A test game".to_string()),
             published_at: Some(created_at),
@@ -623,6 +627,8 @@ mod tests {
             lud16: "seller@walletofsatoshi.com".to_string(),
             platforms: vec!["linux-x86_64".to_string()],
             nip94_event_id: Some("nip94-event-complete".to_string()),
+            acquisition: crate::marketplace::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             images: vec![
                 "https://example.com/image1.png".to_string(),
                 "https://example.com/image2.png".to_string(),
@@ -697,6 +703,8 @@ mod tests {
             lud16: "minimal@example.com".to_string(),
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: crate::marketplace::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             images: vec![], // Empty images
             summary: None,
             published_at: None,

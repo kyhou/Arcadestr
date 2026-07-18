@@ -7,20 +7,37 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::components::{BadgeEarnedModal, ProfileRow};
 use crate::models::{
-    BadgeAward, BadgeDefinition, EarnedBadgeSummary, GameListing, ListingSource, UserProfile,
+    AcquisitionPolicy, BadgeAward, BadgeDefinition, EarnedBadgeSummary, GameListing, ListingSource,
+    UserProfile,
 };
 use crate::store::try_use_profile_store;
 use crate::tauri_bridge::{
-    invoke_confirm_purchase, invoke_connect_nwc_wallet, invoke_install_game,
-    invoke_pay_nwc_invoice, invoke_request_lnurl_invoice, listen_download_complete,
+    invoke_claim_entitlement, invoke_confirm_purchase, invoke_connect_nwc_wallet,
+    invoke_discover_campaigns, invoke_install_game, invoke_pay_nwc_invoice,
+    invoke_request_lnurl_invoice, listen_download_complete,
 };
 use crate::tauri_bridge::{
-    ConfirmPurchaseRequest, ConnectNwcWalletRequest, PayNwcInvoiceRequest,
-    RequestLnurlInvoiceRequest,
+    CampaignPointerInput, ClaimEntitlementRequest, ConfirmPurchaseRequest, ConnectNwcWalletRequest,
+    DiscoverCampaignsRequest, DiscoveredCampaign, PayNwcInvoiceRequest, RequestLnurlInvoiceRequest,
 };
 use crate::{invoke_fetch_profile, AuthContext};
 
 type DownloadCompleteCleanup = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
+fn current_unix_secs() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (js_sys::Date::now() / 1000.0) as u64
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default()
+    }
+}
 
 fn format_timestamp(ts: u64) -> String {
     #[cfg(target_arch = "wasm32")]
@@ -126,15 +143,22 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         .first()
         .cloned()
         .unwrap_or_else(|| "Game".to_string());
-    let price_label = if listing.price_sats > 0 {
-        format!("{} Sats", listing.price_sats)
-    } else {
-        "Free".to_string()
+    let direct_access = listing.acquisition.allows_access_at(current_unix_secs());
+    let price_label = match &listing.acquisition {
+        AcquisitionPolicy::Public => "Public access".to_string(),
+        AcquisitionPolicy::TimedAccess { .. } if direct_access => "Timed access".to_string(),
+        _ if listing.price_sats > 0 => format!("{} Sats", listing.price_sats),
+        _ => "Gated".to_string(),
     };
-    let buy_button_label = if listing.price_sats > 0 {
-        format!("Buy with Lightning - {} sats", listing.price_sats)
-    } else {
-        "Free - Download".to_string()
+    let buy_button_label = match &listing.acquisition {
+        AcquisitionPolicy::Public => "Public install".to_string(),
+        AcquisitionPolicy::TimedAccess { .. } if direct_access => {
+            "Install during access window".to_string()
+        }
+        _ if listing.price_sats > 0 => {
+            format!("Buy with Lightning - {} sats", listing.price_sats)
+        }
+        _ => "Ownership required".to_string(),
     };
     let release_label = format_timestamp(listing.created_at);
     let protocol_label = match listing.source {
@@ -148,8 +172,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let publisher_npub = listing.publisher_npub.clone();
     let seller_lud16 = listing.lud16.clone();
     let has_lightning = !seller_lud16.trim().is_empty();
-    let download_url = listing.download_url.clone();
-    let has_download_url = !download_url.trim().is_empty();
     let title = listing.title.clone();
     let description = listing.description.clone();
     let hero_metadata = hero_buy_panel_metadata(
@@ -169,6 +191,8 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let purchase_confirmed: RwSignal<bool> = RwSignal::new(listing.is_owned);
     let install_loading: RwSignal<bool> = RwSignal::new(false);
     let install_complete: RwSignal<bool> = RwSignal::new(false);
+    let campaigns: RwSignal<Vec<DiscoveredCampaign>> = RwSignal::new(Vec::new());
+    let campaign_loading: RwSignal<bool> = RwSignal::new(true);
 
     // Seller profile state.
     let seller_profile: RwSignal<Option<UserProfile>> = RwSignal::new(None);
@@ -376,11 +400,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let on_download = {
         let listing = listing.clone();
         Callback::new(move |()| {
-            if listing.download_url.trim().is_empty() {
-                buy_error.set(Some("No ADP download URL available".to_string()));
-                return;
-            }
-
             install_loading.set(true);
             buy_error.set(None);
             let listing = listing.clone();
@@ -447,6 +466,61 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         }
     });
 
+    let campaign_publisher = listing.publisher_npub.clone();
+    let campaign_listing_id = listing.id.clone();
+    let campaign_pointers = listing
+        .campaigns
+        .iter()
+        .map(|pointer| CampaignPointerInput {
+            root_event_id: pointer.root_event_id.clone(),
+            relay_hint: pointer.relay_hint.clone(),
+        })
+        .collect::<Vec<_>>();
+    Effect::new(move |_| {
+        let request = DiscoverCampaignsRequest {
+            publisher_npub: campaign_publisher.clone(),
+            listing_id: campaign_listing_id.clone(),
+            pointers: campaign_pointers.clone(),
+        };
+        spawn_local(async move {
+            campaign_loading.set(true);
+            match invoke_discover_campaigns(request).await {
+                Ok(discovered) => campaigns.set(discovered),
+                Err(error) => buy_error.set(Some(format!("Campaign discovery failed: {error}"))),
+            }
+            campaign_loading.set(false);
+        });
+    });
+
+    let claim_listing = listing.clone();
+    let on_claim = Callback::new(move |campaign: DiscoveredCampaign| {
+        if auth.npub.get().is_none() {
+            buy_error.set(Some("Not authenticated".to_string()));
+            return;
+        }
+        let Some(server_url) = adp_server_url_from_download_url(&claim_listing.download_url) else {
+            buy_error.set(Some(
+                "Listing does not include an ADP download URL".to_string(),
+            ));
+            return;
+        };
+        buy_loading.set(true);
+        buy_error.set(None);
+        let request = ClaimEntitlementRequest {
+            publisher_npub: claim_listing.publisher_npub.clone(),
+            listing_id: claim_listing.id.clone(),
+            campaign_event_id: campaign.root_event_id,
+            server_url,
+        };
+        spawn_local(async move {
+            match invoke_claim_entitlement(request).await {
+                Ok(_) => purchase_confirmed.set(true),
+                Err(error) => buy_error.set(Some(error)),
+            }
+            buy_loading.set(false);
+        });
+    });
+
     let publisher_npub_for_fetch = publisher_npub.clone();
     let profile_store_for_fetch = try_use_profile_store();
 
@@ -504,13 +578,57 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     </button>
 
                     {move || {
+                        if campaign_loading.get() {
+                            view! { <p class="v2-social-meta">"Checking claim campaigns..."</p> }
+                                .into_any()
+                        } else {
+                            let cards = campaigns
+                                .get()
+                                .into_iter()
+                                .filter(|campaign| {
+                                    matches!(
+                                        campaign.classification.as_str(),
+                                        "upcoming" | "active" | "ended" | "cancelled"
+                                    )
+                                })
+                                .map(|campaign| {
+                                    let claim_campaign = campaign.clone();
+                                    let on_claim = on_claim.clone();
+                                    let is_active = campaign.classification == "active";
+                                    view! {
+                                        <div class="v2-panel" style:padding="10px">
+                                            <strong>{format!("Claim campaign: {}", campaign.campaign_id)}</strong>
+                                            <p class="v2-social-meta">
+                                                {format!(
+                                                    "{} - {} | {}",
+                                                    campaign.starts_at,
+                                                    campaign.ends_at,
+                                                    campaign.classification
+                                                )}
+                                            </p>
+                                            <button
+                                                class="v2-btn-primary"
+                                                on:click=move |_| on_claim.run(claim_campaign.clone())
+                                                disabled=move || !is_active || buy_loading.get()
+                                            >
+                                                {if is_active { "Claim" } else { "Unavailable" }}
+                                            </button>
+                                        </div>
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            view! { <>{cards}</> }.into_any()
+                        }
+                    }}
+
+                    {move || {
                         if purchase_confirmed.get() {
                             view! {
                                 <>
                                     <button
                                         class="v2-btn-primary"
                                         on:click=move |_| on_download.run(())
-                                        disabled=move || !has_download_url || install_loading.get() || install_complete.get()
+                                        disabled=move || install_loading.get() || install_complete.get()
                                     >
                                         {move || {
                                             if install_complete.get() {
@@ -586,14 +704,14 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                     </button>
                                 </>
                             }.into_any()
-                        } else if listing.price_sats == 0 {
+                        } else if direct_access {
                             let free_button_label = buy_button_label.clone();
                             view! {
                                 <>
                                     <button
                                         class="v2-btn-primary"
                                         on:click=move |_| on_download.run(())
-                                        disabled=move || !has_download_url || install_loading.get() || install_complete.get()
+                                        disabled=move || install_loading.get() || install_complete.get()
                                     >
                                         {move || {
                                             if install_complete.get() {
@@ -607,6 +725,12 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                     </button>
                                     <button class="v2-btn-ghost">"Add to Library"</button>
                                 </>
+                            }.into_any()
+                        } else if listing.price_sats == 0 {
+                            view! {
+                                <button class="v2-btn-primary" disabled=true>
+                                    "Ownership required"
+                                </button>
                             }.into_any()
                         } else if !has_lightning {
                             view! {

@@ -213,6 +213,63 @@ pub struct ConfirmPurchaseResponse {
     pub token_expires_at: i64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ClaimEntitlementRequest {
+    pub publisher_npub: String,
+    pub listing_id: String,
+    pub campaign_event_id: String,
+    pub server_url: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ClaimEntitlementResponse {
+    pub grant: serde_json::Value,
+    pub download_token: String,
+    pub token_expires_at: i64,
+    pub already_claimed: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DiscoverCampaignsRequest {
+    pub publisher_npub: String,
+    pub listing_id: String,
+    pub pointers: Vec<CampaignPointerInput>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CampaignPointerInput {
+    pub root_event_id: String,
+    pub relay_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DiscoveredCampaign {
+    pub root_event_id: String,
+    pub campaign_id: String,
+    pub starts_at: u64,
+    pub ends_at: u64,
+    pub classification: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PublishCampaignRequest {
+    pub publisher_npub: String,
+    pub listing_id: String,
+    pub campaign_id: String,
+    pub starts_at: Option<u64>,
+    pub ends_at: Option<u64>,
+    pub predecessor_event_id: Option<String>,
+    pub cancel: bool,
+    pub update_listing_pointer: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PublishCampaignResponse {
+    pub event_id: String,
+    pub root_event_id: String,
+    pub listing_event_id: Option<String>,
+}
+
 /// Invoke desktop `check_adp_server` command.
 #[cfg(not(feature = "web"))]
 pub async fn invoke_check_adp_server(server_url: String) -> Result<AdpServerInfo, String> {
@@ -351,6 +408,60 @@ pub async fn invoke_confirm_purchase(
     _request: ConfirmPurchaseRequest,
 ) -> Result<ConfirmPurchaseResponse, String> {
     Err("ADP purchase confirmation is only available in desktop builds.".to_string())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_claim_entitlement(
+    request: ClaimEntitlementRequest,
+) -> Result<ClaimEntitlementResponse, String> {
+    crate::tauri_invoke::invoke(
+        "claim_entitlement",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_claim_entitlement(
+    _request: ClaimEntitlementRequest,
+) -> Result<ClaimEntitlementResponse, String> {
+    Err("ADP entitlement claims are only available in desktop builds.".to_string())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_discover_campaigns(
+    request: DiscoverCampaignsRequest,
+) -> Result<Vec<DiscoveredCampaign>, String> {
+    crate::tauri_invoke::invoke(
+        "discover_campaigns",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_discover_campaigns(
+    _request: DiscoverCampaignsRequest,
+) -> Result<Vec<DiscoveredCampaign>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_publish_campaign(
+    request: PublishCampaignRequest,
+) -> Result<PublishCampaignResponse, String> {
+    crate::tauri_invoke::invoke(
+        "publish_campaign",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_publish_campaign(
+    _request: PublishCampaignRequest,
+) -> Result<PublishCampaignResponse, String> {
+    Err("Campaign publishing is only available in desktop builds.".to_string())
 }
 
 /// Listen for desktop `publish-progress` events.

@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arcadestr_core::adp_client::{
-    AdpClient, AdpServerInfo, PurchaseConfirmRequest as CorePurchaseConfirmRequest,
+    AdpClient, AdpServerInfo, EntitlementClaimRequest as CoreEntitlementClaimRequest,
+    PurchaseConfirmRequest as CorePurchaseConfirmRequest,
     PurchaseConfirmResponse as CorePurchaseConfirmResponse, UploadResponse,
 };
 use arcadestr_core::adp_discovery::{
@@ -175,6 +176,63 @@ pub struct ConfirmPurchaseResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ClaimEntitlementRequest {
+    pub publisher_npub: String,
+    pub listing_id: String,
+    pub campaign_event_id: String,
+    pub server_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimEntitlementResponse {
+    pub grant: nostr::Event,
+    pub download_token: String,
+    pub token_expires_at: i64,
+    pub already_claimed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscoverCampaignsRequest {
+    pub publisher_npub: String,
+    pub listing_id: String,
+    pub pointers: Vec<CampaignPointerInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CampaignPointerInput {
+    pub root_event_id: String,
+    pub relay_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveredCampaign {
+    pub root_event_id: String,
+    pub campaign_id: String,
+    pub starts_at: u64,
+    pub ends_at: u64,
+    pub classification: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublishCampaignRequest {
+    pub publisher_npub: String,
+    pub listing_id: String,
+    pub campaign_id: String,
+    pub starts_at: Option<u64>,
+    pub ends_at: Option<u64>,
+    pub predecessor_event_id: Option<String>,
+    pub cancel: bool,
+    pub update_listing_pointer: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublishCampaignResponse {
+    pub event_id: String,
+    pub root_event_id: String,
+    pub listing_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct HashBuildFileRequest {
     pub file_path: String,
 }
@@ -196,6 +254,192 @@ pub async fn discover_adp_servers(
     discover_adp_servers_core(&relay_manager)
         .await
         .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn discover_campaigns(
+    request: DiscoverCampaignsRequest,
+    state: State<'_, AppState>,
+) -> Result<Vec<DiscoveredCampaign>, String> {
+    let coordinate = listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
+    let publisher = nostr::PublicKey::from_bech32(&request.publisher_npub)
+        .map_err(|_| "invalid publisher pubkey".to_string())?;
+    let pointers = request
+        .pointers
+        .into_iter()
+        .filter_map(|pointer| {
+            nostr::EventId::from_hex(&pointer.root_event_id)
+                .ok()
+                .map(
+                    |root_event_id| arcadestr_core::marketplace::CampaignPointer {
+                        root_event_id,
+                        relay_hint: pointer.relay_hint,
+                    },
+                )
+        })
+        .collect::<Vec<_>>();
+    let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+    let relay_manager = relay_manager.lock().await;
+    let report = arcadestr_core::campaign_discovery::CampaignDiscoveryService::new(&relay_manager)
+        .discover(&pointers, publisher, &coordinate, now_unix_i64()? as u64)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    Ok(report
+        .campaigns
+        .into_iter()
+        .filter_map(|candidate| {
+            let state = candidate.campaign.state_at(now_unix_i64().ok()? as u64)?;
+            Some(DiscoveredCampaign {
+                root_event_id: candidate.campaign.root_event_id.to_hex(),
+                campaign_id: candidate.campaign.campaign_id,
+                starts_at: state.terms.starts,
+                ends_at: state.terms.ends,
+                classification: match candidate.classification {
+                    arcadestr_core::campaign_discovery::CampaignClassification::Upcoming => {
+                        "upcoming"
+                    }
+                    arcadestr_core::campaign_discovery::CampaignClassification::Active => "active",
+                    arcadestr_core::campaign_discovery::CampaignClassification::Ended => "ended",
+                    arcadestr_core::campaign_discovery::CampaignClassification::Cancelled => {
+                        "cancelled"
+                    }
+                    arcadestr_core::campaign_discovery::CampaignClassification::Invalid => {
+                        "invalid"
+                    }
+                }
+                .to_string(),
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn publish_campaign(
+    request: PublishCampaignRequest,
+    state: State<'_, AppState>,
+    signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+) -> Result<PublishCampaignResponse, String> {
+    let auth_snapshot = { state.auth.lock().await.clone() };
+    let signer = resolve_publish_signer(signer_state.inner(), &auth_snapshot).await?;
+    let publisher = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let expected_publisher = nostr::PublicKey::from_bech32(&request.publisher_npub)
+        .map_err(|_| "invalid publisher pubkey".to_string())?;
+    if publisher != expected_publisher {
+        return Err("active signer is not the listing publisher".into());
+    }
+    let coordinate = listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
+    let listing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
+    let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+    let manager = relay_manager.lock().await;
+    let report = arcadestr_core::campaign_discovery::CampaignDiscoveryService::new(&manager)
+        .discover(&[], publisher, &coordinate, now_unix_i64()? as u64)
+        .await
+        .map_err(|error| error.to_string())?;
+    drop(manager);
+    let existing = report
+        .campaigns
+        .into_iter()
+        .find(|candidate| candidate.campaign.campaign_id == request.campaign_id);
+    let predecessor = request
+        .predecessor_event_id
+        .as_deref()
+        .map(nostr::EventId::from_hex)
+        .transpose()
+        .map_err(|_| "invalid predecessor event id".to_string())?;
+
+    let params = if request.cancel {
+        let predecessor =
+            predecessor.ok_or_else(|| "cancellation requires predecessor".to_string())?;
+        arcadestr_core::campaign::CampaignBuildParams::cancel(
+            request.campaign_id.clone(),
+            coordinate.clone(),
+            predecessor,
+        )
+    } else {
+        arcadestr_core::campaign::CampaignBuildParams::active(
+            request.campaign_id.clone(),
+            coordinate.clone(),
+            request
+                .starts_at
+                .ok_or_else(|| "campaign start is required".to_string())?,
+            request
+                .ends_at
+                .ok_or_else(|| "campaign end is required".to_string())?,
+            predecessor,
+        )
+    };
+    if predecessor.is_none() && existing.is_some() {
+        return Err("campaign id already exists".into());
+    }
+    let builder = arcadestr_core::campaign::build_campaign_event_builder(&params)
+        .map_err(|error| error.to_string())?;
+    let event = signer
+        .sign_event(builder.build(publisher))
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let (root_event_id, mut prospective) = if let Some(existing) = existing {
+        let expected_tip = existing
+            .campaign
+            .events
+            .last()
+            .map(|node| node.event.id)
+            .ok_or_else(|| "campaign chain is empty".to_string())?;
+        if predecessor != Some(expected_tip) {
+            return Err("predecessor is not the current campaign tip".into());
+        }
+        (existing.campaign.root_event_id, existing.campaign.events)
+    } else {
+        (event.id, Vec::new())
+    };
+    prospective.push(
+        arcadestr_core::campaign::parse_campaign_event(&event)
+            .map_err(|error| error.to_string())?,
+    );
+    arcadestr_core::campaign::resolve_campaign(&prospective, publisher, &coordinate)
+        .map_err(|error| error.to_string())?;
+    publish_event(&state, &event).await?;
+
+    let listing_event_id = if request.update_listing_pointer {
+        let mut tags = listing
+            .tags
+            .iter()
+            .filter(|tag| {
+                let values = (*tag).clone().to_vec();
+                values.first().map(String::as_str) != Some("campaign")
+                    || values.get(1).map(String::as_str) != Some(root_event_id.to_hex().as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !request.cancel {
+            tags.push(
+                nostr::Tag::parse(["campaign", root_event_id.to_hex().as_str()])
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let listing_update = signer
+            .sign_event(
+                nostr::EventBuilder::new(nostr::Kind::Custom(30402), listing.content)
+                    .tags(tags)
+                    .build(publisher),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        publish_event(&state, &listing_update).await?;
+        Some(listing_update.id.to_hex())
+    } else {
+        None
+    };
+
+    Ok(PublishCampaignResponse {
+        event_id: event.id.to_hex(),
+        root_event_id: root_event_id.to_hex(),
+        listing_event_id,
+    })
 }
 
 #[tauri::command]
@@ -300,6 +544,164 @@ pub async fn confirm_purchase(
         &listing_for_validation,
     )
     .await
+}
+
+#[tauri::command]
+pub async fn claim_entitlement(
+    request: ClaimEntitlementRequest,
+    state: State<'_, AppState>,
+) -> Result<ClaimEntitlementResponse, String> {
+    let auth_snapshot = { state.auth.lock().await.clone() };
+    let signer = auth_snapshot
+        .signer()
+        .ok_or_else(|| "not authenticated".to_string())?;
+    let buyer = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let game_coordinate =
+        listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
+    let campaign_root_id = nostr::EventId::from_hex(&request.campaign_event_id)
+        .map_err(|_| "invalid campaign event id".to_string())?;
+    let listing = fetch_listing_event_by_coordinate(&state, &game_coordinate).await?;
+    let publisher = listing.pubkey;
+    let pointer = arcadestr_core::marketplace::CampaignPointer {
+        root_event_id: campaign_root_id,
+        relay_hint: None,
+    };
+    let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+    let relay_manager_guard = relay_manager.lock().await;
+    let report =
+        arcadestr_core::campaign_discovery::CampaignDiscoveryService::new(&relay_manager_guard)
+            .discover(
+                &[pointer],
+                publisher,
+                &game_coordinate,
+                now_unix_i64()? as u64,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    drop(relay_manager_guard);
+    let campaign = report
+        .campaigns
+        .into_iter()
+        .find(|candidate| candidate.campaign.root_event_id == campaign_root_id)
+        .ok_or_else(|| "campaign is invalid or unavailable".to_string())?
+        .campaign;
+
+    let client = AdpClient::new(request.server_url.clone(), Arc::clone(&state.http_client));
+    let response = client
+        .entitlement_claim(
+            signer,
+            CoreEntitlementClaimRequest {
+                game_coordinate: game_coordinate.clone(),
+                campaign_event_id: request.campaign_event_id,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let parsed = arcadestr_core::entitlements::parse_entitlement_event(&response.grant)
+        .map_err(|error| format!("invalid grant response: {error}"))?;
+    if parsed.recipient != buyer {
+        return Err("invalid grant response: recipient mismatch".into());
+    }
+    if parsed.coordinate != game_coordinate {
+        return Err("invalid grant response: coordinate mismatch".into());
+    }
+    if parsed.source_event != campaign_root_id {
+        return Err("invalid grant response: campaign source mismatch".into());
+    }
+    let grant = arcadestr_core::entitlements::resolve_entitlement_grant(&[parsed.clone()])
+        .map_err(|error| format!("invalid grant response: {error}"))?;
+    let delegations = grant_issuance_delegations(&listing)?;
+    let authorization = if let Some(root_event_id) = parsed.authorization_event {
+        let relay_manager_guard = relay_manager.lock().await;
+        Some(
+            arcadestr_core::authorization::discover_authorization(
+                &relay_manager_guard,
+                root_event_id,
+                publisher,
+            )
+            .await
+            .map_err(|error| format!("invalid grant authorization: {error}"))?,
+        )
+    } else if parsed.event.pubkey == publisher {
+        None
+    } else {
+        return Err("invalid grant response: delegated grant has no authorization event".into());
+    };
+    arcadestr_core::entitlements::validate_adp_entitlement(
+        &grant,
+        &campaign,
+        authorization.as_ref(),
+        &delegations,
+    )
+    .map_err(|error| format!("invalid grant response: {error}"))?;
+
+    let entitlements = arcadestr_core::entitlements_repository::EntitlementsRepository::new(
+        state.database.pool().clone(),
+    );
+    entitlements
+        .ingest_event(
+            &response.grant,
+            &campaign,
+            authorization.as_ref(),
+            &delegations,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    DownloadTokensRepository::new(state.database.pool().clone())
+        .upsert(&DownloadToken {
+            game_coordinate: game_coordinate,
+            server_url: request.server_url,
+            token: response.download_token.clone(),
+            expires_at: response.token_expires_at,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    Ok(ClaimEntitlementResponse {
+        grant: response.grant,
+        download_token: response.download_token,
+        token_expires_at: response.token_expires_at,
+        already_claimed: response.already_claimed,
+    })
+}
+
+fn grant_issuance_delegations(
+    listing: &nostr::Event,
+) -> Result<Vec<arcadestr_core::entitlements::IssuanceDelegation>, String> {
+    listing
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let values = tag.clone().to_vec();
+            (values.first().map(String::as_str) == Some("fulfillment_pubkey")).then_some(values)
+        })
+        .map(|values| {
+            let pubkey = values
+                .get(1)
+                .and_then(|value| nostr::PublicKey::from_hex(value).ok())
+                .ok_or_else(|| "malformed fulfillment_pubkey tag".to_string())?;
+            let valid_from = values
+                .get(2)
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| "malformed fulfillment_pubkey valid_from".to_string())?;
+            let revoked_at = values
+                .get(3)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .map_err(|_| "malformed fulfillment_pubkey revoked_at".to_string())?
+                .map(|declared| declared.max(listing.created_at.as_secs()));
+            Ok(arcadestr_core::entitlements::IssuanceDelegation {
+                pubkey,
+                valid_from,
+                revoked_at,
+            })
+        })
+        .collect()
 }
 
 fn listing_coordinate_from_npub(publisher_npub: &str, listing_id: &str) -> Result<String, String> {
@@ -1444,6 +1846,8 @@ mod tests {
             created_at: 1_700_000_000,
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: arcadestr_app::models::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             is_owned: true,
             #[cfg(debug_assertions)]
             nip99_raw_event_json: None,

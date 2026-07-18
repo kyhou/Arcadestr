@@ -49,6 +49,23 @@ pub enum AdpClientError {
     /// The server returned a protocol-level download error.
     #[error("ADP download protocol error: {0}")]
     DownloadProtocol(String),
+
+    #[error("campaign has not started: {0}")]
+    ClaimCampaignNotStarted(String),
+    #[error("campaign has ended: {0}")]
+    ClaimCampaignEnded(String),
+    #[error("campaign is cancelled: {0}")]
+    ClaimCampaignCancelled(String),
+    #[error("campaign is invalid: {0}")]
+    ClaimInvalidCampaign(String),
+    #[error("claim coordinate mismatch: {0}")]
+    ClaimCoordinateMismatch(String),
+    #[error("claim response contains an invalid grant: {0}")]
+    ClaimInvalidGrantResponse(String),
+    #[error("server is not authorized to distribute this game: {0}")]
+    ClaimDistributionUnauthorized(String),
+    #[error("claim protocol failure: {0}")]
+    ClaimProtocol(String),
 }
 
 /// Public metadata returned by `GET /.well-known/adp`.
@@ -98,6 +115,23 @@ pub struct PurchaseConfirmResponse {
     pub receipt: Event,
     pub download_token: String,
     pub token_expires_at: i64,
+}
+
+/// Request sent to `POST /entitlement/claim`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EntitlementClaimRequest {
+    pub game_coordinate: String,
+    pub campaign_event_id: String,
+}
+
+/// Signed grant and short-lived download authorization returned by a claim.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EntitlementClaimResponse {
+    pub grant: Event,
+    pub download_token: String,
+    pub token_expires_at: i64,
+    #[serde(default)]
+    pub already_claimed: bool,
 }
 
 /// Download authentication strategy for game archive fetches.
@@ -245,6 +279,24 @@ impl AdpClient {
         Ok(serde_json::from_value(value)?)
     }
 
+    /// Claims an active publisher campaign using NIP-98 bound to this exact endpoint.
+    pub async fn entitlement_claim(
+        &self,
+        signer: &dyn NostrSigner,
+        request: EntitlementClaimRequest,
+    ) -> Result<EntitlementClaimResponse, AdpClientError> {
+        let url = self.url("/entitlement/claim");
+        let auth_header = build_nip98_auth_header(signer, &url, "POST").await?;
+        let body = serde_json::to_value(request)?;
+        let value = self
+            .http
+            .post_json(&url, body, vec![("Authorization".to_string(), auth_header)])
+            .await
+            .map_err(map_claim_error)?;
+        serde_json::from_value(value)
+            .map_err(|error| AdpClientError::ClaimInvalidGrantResponse(error.to_string()))
+    }
+
     /// Downloads a game archive to `dest`.
     ///
     /// Builds either a token-authenticated download URL or a NIP-98
@@ -318,6 +370,27 @@ fn map_download_error(err: HttpClientError) -> AdpClientError {
             AdpClientError::DownloadProtocol(format!("HTTP status {status}: {body}"))
         }
         other => AdpClientError::Http(other),
+    }
+}
+
+fn map_claim_error(error: HttpClientError) -> AdpClientError {
+    let (status, body) = match error {
+        HttpClientError::Status(status) => (status, format!("HTTP status {status}")),
+        HttpClientError::StatusWithBody { status, body } => (status, body),
+        other => return AdpClientError::Http(other),
+    };
+    let normalized = body.to_ascii_lowercase();
+    match status {
+        400 if normalized.contains("coordinate") => AdpClientError::ClaimCoordinateMismatch(body),
+        400 => AdpClientError::ClaimInvalidCampaign(body),
+        403 if normalized.contains("not started") => AdpClientError::ClaimCampaignNotStarted(body),
+        403 if normalized.contains("ended") || normalized.contains("expired") => {
+            AdpClientError::ClaimCampaignEnded(body)
+        }
+        403 if normalized.contains("cancel") => AdpClientError::ClaimCampaignCancelled(body),
+        403 => AdpClientError::ClaimInvalidCampaign(body),
+        451 => AdpClientError::ClaimDistributionUnauthorized(body),
+        _ => AdpClientError::ClaimProtocol(format!("HTTP status {status}: {body}")),
     }
 }
 
@@ -746,5 +819,91 @@ mod tests {
             .expect_err("missing file should fail before upload succeeds");
 
         assert!(!matches!(err, AdpClientError::NotImplemented("upload")));
+    }
+
+    #[tokio::test]
+    async fn entitlement_claim_posts_exact_request_with_nip98() {
+        let buyer = crate::signers::LocalSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("test private key should be valid");
+        let issuer = nostr::Keys::generate();
+        let grant = nostr::EventBuilder::new(
+            nostr::Kind::Custom(crate::adp_protocol::ENTITLEMENT_GRANT_KIND),
+            "",
+        )
+        .sign_with_keys(&issuer)
+        .expect("grant signs");
+        let url = "https://dist.example.com/entitlement/claim";
+        let http = Arc::new(MockHttpClient::new().with_json_post_response(
+            url,
+            json!({
+                "grant": grant,
+                "download_token": "claim-token",
+                "token_expires_at": 1_800_000_000i64,
+                "already_claimed": true
+            }),
+        ));
+        let client = AdpClient::new("https://dist.example.com", http.clone());
+
+        let response = client
+            .entitlement_claim(
+                &buyer,
+                EntitlementClaimRequest {
+                    game_coordinate: "30402:publisher:game".into(),
+                    campaign_event_id: "aa".repeat(32),
+                },
+            )
+            .await
+            .expect("claim succeeds");
+
+        assert_eq!(response.download_token, "claim-token");
+        assert!(response.already_claimed);
+        assert_eq!(
+            http.last_json_post_body(url),
+            Some(json!({
+                "game_coordinate": "30402:publisher:game",
+                "campaign_event_id": "aa".repeat(32)
+            }))
+        );
+        let headers = http
+            .last_json_post_headers(url)
+            .expect("claim headers recorded");
+        assert!(headers
+            .iter()
+            .any(|(name, value)| { name == "Authorization" && value.starts_with("Nostr ") }));
+    }
+
+    #[tokio::test]
+    async fn entitlement_claim_maps_distribution_error() {
+        let buyer = crate::signers::LocalSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("test private key should be valid");
+        let url = "https://dist.example.com/entitlement/claim";
+        let http = Arc::new(MockHttpClient::new().with_post_error_response(
+            url,
+            HttpClientError::StatusWithBody {
+                status: 451,
+                body: "server is not authorized".into(),
+            },
+        ));
+        let client = AdpClient::new("https://dist.example.com", http);
+
+        let error = client
+            .entitlement_claim(
+                &buyer,
+                EntitlementClaimRequest {
+                    game_coordinate: "30402:publisher:game".into(),
+                    campaign_event_id: "aa".repeat(32),
+                },
+            )
+            .await
+            .expect_err("claim must fail");
+
+        assert!(matches!(
+            error,
+            AdpClientError::ClaimDistributionUnauthorized(_)
+        ));
     }
 }

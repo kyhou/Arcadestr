@@ -75,6 +75,14 @@ pub mod nip98_client;
 pub mod adp_client;
 #[cfg(feature = "native")]
 pub mod adp_discovery;
+pub mod adp_protocol;
+pub mod authorization;
+pub mod campaign;
+#[cfg(feature = "native")]
+pub mod campaign_discovery;
+pub mod entitlements;
+#[cfg(feature = "native")]
+pub mod entitlements_repository;
 
 #[cfg(feature = "native")]
 pub mod lnurlp;
@@ -259,6 +267,8 @@ pub mod marketplace;
 #[cfg(feature = "native")]
 pub mod marketplace_cache;
 
+#[cfg(feature = "native")]
+pub mod ownership;
 #[cfg(feature = "native")]
 pub mod purchases;
 

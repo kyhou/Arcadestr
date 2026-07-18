@@ -361,6 +361,8 @@ fn debug_mock_listings() -> Vec<GameListing> {
             created_at: 1_710_000_001,
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: crate::models::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             is_owned: false,
             #[cfg(debug_assertions)]
             nip99_raw_event_json: None,
@@ -386,6 +388,8 @@ fn debug_mock_listings() -> Vec<GameListing> {
             created_at: 1_710_000_002,
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: crate::models::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             is_owned: false,
             #[cfg(debug_assertions)]
             nip99_raw_event_json: None,
@@ -411,6 +415,8 @@ fn debug_mock_listings() -> Vec<GameListing> {
             created_at: 1_710_000_003,
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: crate::models::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             is_owned: false,
             #[cfg(debug_assertions)]
             nip99_raw_event_json: None,
@@ -460,6 +466,8 @@ mod tests {
             created_at: 0,
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: crate::models::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             is_owned: false,
             #[cfg(debug_assertions)]
             nip99_raw_event_json: None,

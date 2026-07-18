@@ -134,6 +134,9 @@ const MIGRATION_8_DOWNLOAD_TOKENS: &str = include_str!("../../migrations/005_dow
 // Migration 9: ADP installed games
 const MIGRATION_9_INSTALLED_GAMES: &str = include_str!("../../migrations/006_installed_games.sql");
 
+// Migration 10: NIP-103 entitlement grant history
+const MIGRATION_10_ENTITLEMENTS: &str = include_str!("../../migrations/007_entitlements.sql");
+
 // List of all migrations in applied order; migration filenames currently lag user_version numbers.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_1_INITIAL,
@@ -145,6 +148,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_7_ADP_PROVISIONING,
     MIGRATION_8_DOWNLOAD_TOKENS,
     MIGRATION_9_INSTALLED_GAMES,
+    MIGRATION_10_ENTITLEMENTS,
 ];
 
 /// Database connection pool for SQLite

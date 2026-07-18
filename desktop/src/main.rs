@@ -812,7 +812,7 @@ async fn fetch_marketplace(
         let listing = AppGameListing::from_listing(product);
         let listing = enrich_listing_ownership(
             listing,
-            Arc::clone(&state.purchases),
+            Arc::clone(&state.database),
             buyer_pubkey_hex.clone(),
             "fetch_marketplace",
         )
@@ -861,6 +861,25 @@ fn app_listing_from_cached_listing(listing: CoreGameListing) -> AppGameListing {
         created_at: listing.created_at,
         platforms: listing.platforms,
         nip94_event_id: listing.nip94_event_id,
+        acquisition: match listing.acquisition {
+            arcadestr_core::marketplace::AcquisitionPolicy::Gated => {
+                arcadestr_app::models::AcquisitionPolicy::Gated
+            }
+            arcadestr_core::marketplace::AcquisitionPolicy::Public => {
+                arcadestr_app::models::AcquisitionPolicy::Public
+            }
+            arcadestr_core::marketplace::AcquisitionPolicy::TimedAccess { starts_at, ends_at } => {
+                arcadestr_app::models::AcquisitionPolicy::TimedAccess { starts_at, ends_at }
+            }
+        },
+        campaigns: listing
+            .campaigns
+            .into_iter()
+            .map(|pointer| arcadestr_app::models::CampaignPointer {
+                root_event_id: pointer.root_event_id.to_hex(),
+                relay_hint: pointer.relay_hint,
+            })
+            .collect(),
         is_owned: false,
         #[cfg(debug_assertions)]
         nip99_raw_event_json: listing.nip99_raw_event_json,
@@ -869,7 +888,7 @@ fn app_listing_from_cached_listing(listing: CoreGameListing) -> AppGameListing {
 
 async fn enrich_listing_ownership(
     mut listing: AppGameListing,
-    purchases: Arc<arcadestr_core::purchases::PurchasesRepository>,
+    database: Arc<arcadestr_core::storage::Database>,
     buyer_pubkey_hex: Option<String>,
     log_context: &'static str,
 ) -> AppGameListing {
@@ -878,15 +897,23 @@ async fn enrich_listing_ownership(
     };
 
     match listing_coordinate_from_app_listing(&listing) {
-        Ok(coordinate) => match purchases.is_owned(&buyer_pubkey_hex, &coordinate).await {
-            Ok(is_owned) => listing.is_owned = is_owned,
-            Err(error) => tracing::warn!(
-                "{}: ownership lookup failed for {}: {}",
-                log_context,
-                coordinate,
-                error
-            ),
-        },
+        Ok(coordinate) => {
+            let ownership = arcadestr_core::ownership::OwnershipService::new(
+                arcadestr_core::purchases::PurchasesRepository::new(database.pool().clone()),
+                arcadestr_core::entitlements_repository::EntitlementsRepository::new(
+                    database.pool().clone(),
+                ),
+            );
+            match ownership.is_owned(&buyer_pubkey_hex, &coordinate).await {
+                Ok(is_owned) => listing.is_owned = is_owned,
+                Err(error) => tracing::warn!(
+                    "{}: ownership lookup failed for {}: {}",
+                    log_context,
+                    coordinate,
+                    error
+                ),
+            }
+        }
         Err(error) => tracing::warn!(
             "{}: unable to build ownership coordinate for listing '{}': {}",
             log_context,
@@ -975,22 +1002,64 @@ struct DownloadCompletePayload {
 
 #[derive(Debug, Clone)]
 struct FreshListingMetadata {
-    server_url: String,
+    server_urls: Vec<String>,
     file_hash: String,
     version: Option<String>,
+    acquisition: arcadestr_core::marketplace::AcquisitionPolicy,
 }
 
 fn extract_fresh_listing_metadata(event: &nostr::Event) -> Result<FreshListingMetadata, String> {
-    let server_url = listing_tag_value(event, "server")
-        .ok_or_else(|| "fresh listing is missing server tag".to_string())?;
+    event
+        .verify()
+        .map_err(|_| "fresh listing has an invalid signature".to_string())?;
+    if event.kind.as_u16() != 30402 {
+        return Err("fresh listing is not kind 30402".to_string());
+    }
+    let server_urls = event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let values = tag.clone().to_vec();
+            (values.first().map(String::as_str) == Some("server"))
+                .then(|| values.get(1).cloned())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if server_urls.is_empty() {
+        return Err("fresh listing is missing server tag".to_string());
+    }
     let file_hash = listing_tag_value(event, "file_hash")
         .ok_or_else(|| "fresh listing is missing file_hash tag".to_string())?;
     let version = listing_tag_value(event, "version");
+    let acquisition = event
+        .tags
+        .iter()
+        .find_map(|tag| {
+            let values = tag.clone().to_vec();
+            (values.first().map(String::as_str) == Some("acquisition")).then_some(values)
+        })
+        .map(|values| match values.as_slice() {
+            [_, mode] if mode == "public" => arcadestr_core::marketplace::AcquisitionPolicy::Public,
+            [_, mode, starts, ends] if mode == "timed-access" => {
+                match (starts.parse::<u64>(), ends.parse::<u64>()) {
+                    (Ok(starts_at), Ok(ends_at)) if starts_at < ends_at => {
+                        arcadestr_core::marketplace::AcquisitionPolicy::TimedAccess {
+                            starts_at,
+                            ends_at,
+                        }
+                    }
+                    _ => arcadestr_core::marketplace::AcquisitionPolicy::Gated,
+                }
+            }
+            _ => arcadestr_core::marketplace::AcquisitionPolicy::Gated,
+        })
+        .unwrap_or_default();
 
     Ok(FreshListingMetadata {
-        server_url,
+        server_urls,
         file_hash,
         version,
+        acquisition,
     })
 }
 
@@ -1067,28 +1136,65 @@ async fn install_game_with_fetcher<R: tauri::Runtime>(
 
     let listing_id = listing.id.clone();
     let coordinate = listing_coordinate_from_app_listing(&listing)?;
-    let is_owned = state
-        .purchases
-        .is_owned(&buyer_pubkey_hex, &coordinate)
-        .await
-        .map_err(|error| error.to_string())?;
-
-    if !is_owned {
-        return Err("purchase not found: you do not own this game".to_string());
-    }
-
     let fresh_listing = fresh_listing_fetcher.fetch(&coordinate).await?;
+    let expected_coordinate = listing_coordinate_from_npub(
+        &fresh_listing
+            .pubkey
+            .to_bech32()
+            .map_err(|error| error.to_string())?,
+        &listing_tag_value(&fresh_listing, "d")
+            .ok_or_else(|| "fresh listing is missing d tag".to_string())?,
+    )?;
+    if expected_coordinate != coordinate {
+        return Err("fresh listing coordinate mismatch".into());
+    }
     let metadata = extract_fresh_listing_metadata(&fresh_listing)?;
     let tokens = DownloadTokensRepository::new(state.database.pool().clone());
-    let auth = match tokens
-        .valid_token(&coordinate, &metadata.server_url, now_unix_i64()?)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        Some(token) => DownloadAuth::Token(token.token),
-        None => DownloadAuth::Nip98 { signer: &signer },
-    };
+    let mut cached_token = None;
+    for server_url in &metadata.server_urls {
+        if let Some(token) = tokens
+            .valid_token(&coordinate, server_url, now_unix_i64()?)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            cached_token = Some((server_url.clone(), token.token));
+            break;
+        }
+    }
 
+    let has_durable_ownership = if cached_token.is_some() {
+        true
+    } else {
+        let ownership = arcadestr_core::ownership::OwnershipService::new(
+            arcadestr_core::purchases::PurchasesRepository::new(state.database.pool().clone()),
+            arcadestr_core::entitlements_repository::EntitlementsRepository::new(
+                state.database.pool().clone(),
+            ),
+        );
+        ownership
+            .is_owned(&buyer_pubkey_hex, &coordinate)
+            .await
+            .map_err(|error| error.to_string())?
+    };
+    if !has_durable_ownership
+        && !metadata
+            .acquisition
+            .allows_access_at(now_unix_i64()? as u64)
+    {
+        return Err("ownership or explicit current access not found".into());
+    }
+
+    let (server_url, auth) = match cached_token {
+        Some((server_url, token)) => (server_url, DownloadAuth::Token(token)),
+        None => (
+            metadata
+                .server_urls
+                .first()
+                .cloned()
+                .ok_or_else(|| "fresh listing has no authorized server".to_string())?,
+            DownloadAuth::Nip98 { signer: &signer },
+        ),
+    };
     let dest_path = deterministic_artifact_path(&app_data_dir, &coordinate);
     if let Some(parent) = dest_path.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|error| {
@@ -1099,7 +1205,7 @@ async fn install_game_with_fetcher<R: tauri::Runtime>(
         })?;
     }
 
-    let adp_client = AdpClient::new(metadata.server_url.clone(), Arc::clone(&state.http_client));
+    let adp_client = AdpClient::new(server_url.clone(), Arc::clone(&state.http_client));
     adp_client
         .download(&coordinate, auth, &dest_path, |bytes, total| {
             if let Some(app) = app {
@@ -1123,7 +1229,7 @@ async fn install_game_with_fetcher<R: tauri::Runtime>(
         &dest_path,
         &metadata.file_hash,
         metadata.version,
-        &metadata.server_url,
+        &server_url,
     )
     .await?;
 
@@ -1228,7 +1334,7 @@ async fn fetch_marketplace_stream(
                 let listing = app_listing_from_cached_listing(listing);
                 let listing = enrich_listing_ownership(
                     listing,
-                    Arc::clone(&state.purchases),
+                    Arc::clone(&state.database),
                     buyer_pubkey_hex.clone(),
                     "fetch_marketplace_stream cache",
                 )
@@ -1275,7 +1381,7 @@ async fn fetch_marketplace_stream(
     let seen_signatures_for_closure = StdArc::clone(&seen_signatures);
     let relay_updates_for_closure = StdArc::clone(&relay_updates);
     let emit_tasks_for_closure = StdArc::clone(&emit_tasks);
-    let purchases_for_closure = Arc::clone(&state.purchases);
+    let database_for_closure = Arc::clone(&state.database);
     let buyer_pubkey_hex_for_closure = buyer_pubkey_hex.clone();
 
     // Capture relay manager without holding the AppState nostr lock across awaits.
@@ -1322,13 +1428,13 @@ async fn fetch_marketplace_stream(
             }
 
             let listing = AppGameListing::from_listing(product);
-            let purchases = Arc::clone(&purchases_for_closure);
+            let database = Arc::clone(&database_for_closure);
             let buyer_pubkey_hex = buyer_pubkey_hex_for_closure.clone();
             let window = window_for_closure.clone();
             let task = tauri::async_runtime::spawn(async move {
                 let listing = enrich_listing_ownership(
                     listing,
-                    purchases,
+                    database,
                     buyer_pubkey_hex,
                     "fetch_marketplace_stream",
                 )
@@ -1742,6 +1848,8 @@ mod install_game_tests {
             created_at: 1_700_000_000,
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: arcadestr_app::models::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             is_owned: false,
             #[cfg(debug_assertions)]
             nip99_raw_event_json: None,
@@ -1771,6 +1879,30 @@ mod install_game_tests {
             .expect("listing event should sign")
     }
 
+    fn listing_event_with_acquisition(
+        merchant: &Keys,
+        listing_id: &str,
+        server_url: &str,
+        file_hash: &str,
+        acquisition: &[&str],
+    ) -> Event {
+        let mut tags = vec![
+            Tag::custom(TagKind::d(), [listing_id]),
+            Tag::custom(TagKind::custom("server"), [server_url]),
+            Tag::custom(TagKind::custom("file_hash"), [file_hash]),
+            Tag::custom(TagKind::custom("version"), ["1.0.0"]),
+        ];
+        tags.push(Tag::custom(
+            TagKind::custom("acquisition"),
+            acquisition.iter().copied(),
+        ));
+        EventBuilder::new(Kind::Custom(30402), "")
+            .tags(tags)
+            .custom_created_at(Timestamp::from(1_700_000_100))
+            .sign_with_keys(merchant)
+            .expect("listing event should sign")
+    }
+
     async fn grant_ownership(state: &AppState, buyer: &Keys, merchant: &Keys, listing_id: &str) {
         let receipt = StoredReceipt {
             event_id: format!("receipt-{listing_id}"),
@@ -1788,6 +1920,62 @@ mod install_game_tests {
             .upsert_receipt(&receipt)
             .await
             .expect("test receipt should persist");
+    }
+
+    async fn grant_entitlement_ownership(
+        state: &AppState,
+        buyer: &Keys,
+        merchant: &Keys,
+        listing_id: &str,
+    ) {
+        let coordinate = coordinate(merchant, listing_id);
+        let campaign_event = EventBuilder::new(
+            Kind::Custom(arcadestr_core::adp_protocol::ADP_CAMPAIGN_KIND),
+            "",
+        )
+        .tags([
+            Tag::custom(TagKind::d(), ["campaign"]),
+            Tag::custom(TagKind::custom("a"), [&coordinate]),
+            Tag::custom(TagKind::custom("mode"), ["claim"]),
+            Tag::custom(TagKind::custom("starts"), ["120"]),
+            Tag::custom(TagKind::custom("ends"), ["300"]),
+            Tag::custom(TagKind::custom("status"), ["active"]),
+        ])
+        .custom_created_at(Timestamp::from(100))
+        .sign_with_keys(merchant)
+        .expect("campaign signs");
+        let campaign = arcadestr_core::campaign::resolve_campaign(
+            &[
+                arcadestr_core::campaign::parse_campaign_event(&campaign_event)
+                    .expect("campaign parses"),
+            ],
+            merchant.public_key(),
+            &coordinate,
+        )
+        .expect("campaign resolves");
+        let grant = EventBuilder::new(
+            Kind::Custom(arcadestr_core::adp_protocol::ENTITLEMENT_GRANT_KIND),
+            "",
+        )
+        .tags([
+            Tag::custom(TagKind::d(), [format!("grant-{listing_id}")]),
+            Tag::custom(TagKind::p(), [buyer.public_key().to_hex()]),
+            Tag::custom(TagKind::custom("a"), [&coordinate]),
+            Tag::custom(
+                TagKind::custom("source_event"),
+                [campaign.root_event_id.to_hex()],
+            ),
+            Tag::custom(TagKind::custom("status"), ["granted"]),
+        ])
+        .custom_created_at(Timestamp::from(150))
+        .sign_with_keys(merchant)
+        .expect("grant signs");
+        arcadestr_core::entitlements_repository::EntitlementsRepository::new(
+            state.database.pool().clone(),
+        )
+        .ingest_event(&grant, &campaign, None, &[])
+        .await
+        .expect("entitlement persists");
     }
 
     async fn sha256_hex(bytes: &[u8]) -> String {
@@ -1834,6 +2022,168 @@ mod install_game_tests {
 
         assert!(err.contains("purchase") || err.contains("own"));
         assert_eq!(http.call_count(&download_url), 0);
+    }
+
+    #[tokio::test]
+    async fn fake_submitted_zero_price_cannot_bypass_ownership() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let listing_id = "zero-price-gated";
+        let artifact_bytes = b"gated artifact";
+        let file_hash = sha256_hex(artifact_bytes).await;
+        let server_url = "https://dist.example.com";
+        let coordinate = coordinate(&merchant, listing_id);
+        let encoded_coordinate = urlencoding::encode(&coordinate);
+        let download_url = format!("{server_url}/game/{encoded_coordinate}");
+        let http = MockHttpClient::new().with_download_response(&download_url, artifact_bytes);
+        let state = app_state_with_http(
+            &buyer,
+            test_db("install-game-zero-gated").await,
+            Arc::new(http.clone()),
+        )
+        .await;
+        let fetcher = StaticFreshListingFetcher {
+            event: listing_event(&merchant, listing_id, server_url, &file_hash, "1.0.0"),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut listing = app_listing(&merchant, listing_id);
+        listing.price = 0.0;
+        listing.price_sats = 0;
+
+        let error = install_game_with_fetcher(
+            listing,
+            &state,
+            None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
+            unique_test_path("install-game-zero-gated-data", "dir"),
+            &fetcher,
+        )
+        .await
+        .expect_err("caller zero price must not bypass ownership");
+
+        assert!(error.contains("own") || error.contains("access"));
+        assert_eq!(http.call_count(&download_url), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_public_listing_allows_install_without_ownership() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let listing_id = "public-game";
+        let artifact_bytes = b"public artifact";
+        let file_hash = sha256_hex(artifact_bytes).await;
+        let server_url = "https://dist.example.com";
+        let coordinate = coordinate(&merchant, listing_id);
+        let download_url = format!("{server_url}/game/{}", urlencoding::encode(&coordinate));
+        let http = MockHttpClient::new().with_download_response(&download_url, artifact_bytes);
+        let state = app_state_with_http(
+            &buyer,
+            test_db("install-game-public").await,
+            Arc::new(http.clone()),
+        )
+        .await;
+        let fetcher = StaticFreshListingFetcher {
+            event: listing_event_with_acquisition(
+                &merchant,
+                listing_id,
+                server_url,
+                &file_hash,
+                &["public"],
+            ),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+
+        install_game_with_fetcher(
+            app_listing(&merchant, listing_id),
+            &state,
+            None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
+            unique_test_path("install-game-public-data", "dir"),
+            &fetcher,
+        )
+        .await
+        .expect("signed public policy allows install");
+
+        assert_eq!(http.call_count(&download_url), 1);
+    }
+
+    #[tokio::test]
+    async fn timed_access_allows_only_inside_signed_window() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let server_url = "https://dist.example.com";
+        let now = now_unix_i64().expect("clock") as u64;
+
+        for (listing_id, starts, ends, allowed) in [
+            ("timed-active", now - 10, now + 1000, true),
+            ("timed-expired", now - 1000, now, false),
+        ] {
+            let artifact_bytes = listing_id.as_bytes();
+            let file_hash = sha256_hex(artifact_bytes).await;
+            let coordinate = coordinate(&merchant, listing_id);
+            let download_url = format!("{server_url}/game/{}", urlencoding::encode(&coordinate));
+            let http = MockHttpClient::new().with_download_response(&download_url, artifact_bytes);
+            let state =
+                app_state_with_http(&buyer, test_db(listing_id).await, Arc::new(http.clone()))
+                    .await;
+            let starts = starts.to_string();
+            let ends = ends.to_string();
+            let fetcher = StaticFreshListingFetcher {
+                event: listing_event_with_acquisition(
+                    &merchant,
+                    listing_id,
+                    server_url,
+                    &file_hash,
+                    &["timed-access", &starts, &ends],
+                ),
+                calls: Arc::new(AtomicUsize::new(0)),
+            };
+            let result = install_game_with_fetcher(
+                app_listing(&merchant, listing_id),
+                &state,
+                None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
+                unique_test_path(&format!("{listing_id}-data"), "dir"),
+                &fetcher,
+            )
+            .await;
+
+            assert_eq!(result.is_ok(), allowed, "{listing_id}");
+            assert_eq!(http.call_count(&download_url), usize::from(allowed));
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_grant_allows_current_gated_build_install() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let listing_id = "grant-owned";
+        let artifact_bytes = b"grant owned artifact";
+        let file_hash = sha256_hex(artifact_bytes).await;
+        let server_url = "https://dist.example.com";
+        let coordinate = coordinate(&merchant, listing_id);
+        let download_url = format!("{server_url}/game/{}", urlencoding::encode(&coordinate));
+        let http = MockHttpClient::new().with_download_response(&download_url, artifact_bytes);
+        let state = app_state_with_http(
+            &buyer,
+            test_db("install-game-grant-owned").await,
+            Arc::new(http.clone()),
+        )
+        .await;
+        grant_entitlement_ownership(&state, &buyer, &merchant, listing_id).await;
+        let fetcher = StaticFreshListingFetcher {
+            event: listing_event(&merchant, listing_id, server_url, &file_hash, "2.0.0"),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+
+        install_game_with_fetcher(
+            app_listing(&merchant, listing_id),
+            &state,
+            None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
+            unique_test_path("install-game-grant-owned-data", "dir"),
+            &fetcher,
+        )
+        .await
+        .expect("durable grant permits current gated build");
+
+        assert_eq!(http.call_count(&download_url), 1);
     }
 
     #[tokio::test]
@@ -2032,6 +2382,8 @@ mod task4_tests {
             created_at: 0,
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             status: None,
             #[cfg(debug_assertions)]
             raw_event_json: None,
@@ -2089,6 +2441,8 @@ mod task4_tests {
             images: Vec::new(),
             platforms: vec!["linux-x86_64".to_string()],
             nip94_event_id: None,
+            acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             summary: None,
             published_at: None,
             location: None,
@@ -2147,6 +2501,8 @@ mod task4_tests {
             created_at: 0,
             platforms: Vec::new(),
             nip94_event_id: None,
+            acquisition: arcadestr_app::models::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             is_owned: false,
             #[cfg(debug_assertions)]
             nip99_raw_event_json: None,
@@ -2177,6 +2533,8 @@ mod task4_tests {
             images: vec!["https://example.com/cover.png".to_string()],
             platforms: vec!["linux-x86_64".to_string()],
             nip94_event_id: Some("nip94-event-1".to_string()),
+            acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
             summary: Some("Summary".to_string()),
             published_at: Some(6),
             location: None,
@@ -4381,12 +4739,15 @@ fn main() {
             disconnect,
             adp_commands::check_adp_server,
             adp_commands::discover_adp_servers,
+            adp_commands::discover_campaigns,
+            adp_commands::publish_campaign,
             adp_commands::hash_build_file,
             adp_commands::select_build_file,
             adp_commands::connect_nwc_wallet,
             adp_commands::request_lnurl_invoice,
             adp_commands::pay_nwc_invoice,
             adp_commands::confirm_purchase,
+            adp_commands::claim_entitlement,
             adp_commands::publish_adp_listing,
             fetch_listings,
             fetch_listing_by_id,
