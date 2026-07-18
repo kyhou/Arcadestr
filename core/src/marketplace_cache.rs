@@ -36,7 +36,7 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
                     WHERE created_at >= ? AND created_at <= ?
                     ORDER BY created_at DESC
@@ -54,7 +54,7 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
                     WHERE created_at >= ?
                     ORDER BY created_at DESC
@@ -71,7 +71,7 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
                     WHERE created_at <= ?
                     ORDER BY created_at DESC
@@ -88,7 +88,7 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
                     ORDER BY created_at DESC
                     LIMIT ?
@@ -110,9 +110,13 @@ impl MarketplaceCache {
                 let platforms_json: String = row.get("platforms_json");
                 let platforms: Vec<String> =
                     serde_json::from_str(&platforms_json).unwrap_or_default();
+                let specs_json: String = row.get("specs_json");
+                let specs: Vec<(String, String)> =
+                    serde_json::from_str(&specs_json).unwrap_or_default();
 
                 GameListing {
                     id: row.get("product_id"),
+                    event_id: row.get("source_event_id"),
                     source: ListingSource::Nip99Listing,
                     title: row.get("title"),
                     description: row.get("description"),
@@ -121,6 +125,7 @@ impl MarketplaceCache {
                     publisher_npub: row.get("publisher_npub"),
                     created_at: row.get::<i64, _>("created_at").max(0) as u64,
                     tags,
+                    specs,
                     lud16: row.get("lud16"),
                     platforms,
                     nip94_event_id: row.get("nip94_event_id"),
@@ -175,6 +180,7 @@ impl MarketplaceCache {
         .is_some();
 
         let tags_json = serde_json::to_string(&listing.tags).unwrap_or_else(|_| "[]".to_string());
+        let specs_json = serde_json::to_string(&listing.specs).unwrap_or_else(|_| "[]".to_string());
         let images_json =
             serde_json::to_string(&listing.images).unwrap_or_else(|_| "[]".to_string());
         let platforms_json =
@@ -185,16 +191,17 @@ impl MarketplaceCache {
             r#"
             INSERT INTO marketplace_listings (
                 publisher_npub, product_id, title, description, price_sats,
-                download_url, tags_json, lud16, created_at, updated_at, source_event_id,
+                download_url, tags_json, specs_json, lud16, created_at, updated_at, source_event_id,
                 images_json, platforms_json, nip94_event_id, summary, published_at, location, geohash, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(publisher_npub, product_id) DO UPDATE SET
                 title = excluded.title,
                 description = excluded.description,
                 price_sats = excluded.price_sats,
                 download_url = excluded.download_url,
                 tags_json = excluded.tags_json,
+                specs_json = excluded.specs_json,
                 lud16 = excluded.lud16,
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at,
@@ -208,22 +215,36 @@ impl MarketplaceCache {
                 geohash = excluded.geohash,
                 status = excluded.status
             WHERE
-                marketplace_listings.title <> excluded.title OR
-                marketplace_listings.description <> excluded.description OR
-                marketplace_listings.price_sats <> excluded.price_sats OR
-                marketplace_listings.download_url <> excluded.download_url OR
-                marketplace_listings.tags_json <> excluded.tags_json OR
-                marketplace_listings.lud16 <> excluded.lud16 OR
-                marketplace_listings.created_at <> excluded.created_at OR
-                IFNULL(marketplace_listings.source_event_id, '') <> IFNULL(excluded.source_event_id, '') OR
-                marketplace_listings.images_json <> excluded.images_json OR
-                marketplace_listings.platforms_json <> excluded.platforms_json OR
-                IFNULL(marketplace_listings.nip94_event_id, '') <> IFNULL(excluded.nip94_event_id, '') OR
-                IFNULL(marketplace_listings.summary, '') <> IFNULL(excluded.summary, '') OR
-                IFNULL(marketplace_listings.published_at, 0) <> IFNULL(excluded.published_at, 0) OR
-                IFNULL(marketplace_listings.location, '') <> IFNULL(excluded.location, '') OR
-                IFNULL(marketplace_listings.geohash, '') <> IFNULL(excluded.geohash, '') OR
-                IFNULL(marketplace_listings.status, '') <> IFNULL(excluded.status, '')
+                (
+                    excluded.created_at > marketplace_listings.created_at OR
+                    (
+                        excluded.created_at = marketplace_listings.created_at AND
+                        excluded.source_event_id IS NOT NULL AND
+                        (
+                            marketplace_listings.source_event_id IS NULL OR
+                            excluded.source_event_id < marketplace_listings.source_event_id
+                        )
+                    )
+                ) AND
+                (
+                    marketplace_listings.title <> excluded.title OR
+                    marketplace_listings.description <> excluded.description OR
+                    marketplace_listings.price_sats <> excluded.price_sats OR
+                    marketplace_listings.download_url <> excluded.download_url OR
+                    marketplace_listings.tags_json <> excluded.tags_json OR
+                    marketplace_listings.specs_json <> excluded.specs_json OR
+                    marketplace_listings.lud16 <> excluded.lud16 OR
+                    marketplace_listings.created_at <> excluded.created_at OR
+                    marketplace_listings.source_event_id IS NOT excluded.source_event_id OR
+                    marketplace_listings.images_json <> excluded.images_json OR
+                    marketplace_listings.platforms_json <> excluded.platforms_json OR
+                    IFNULL(marketplace_listings.nip94_event_id, '') <> IFNULL(excluded.nip94_event_id, '') OR
+                    IFNULL(marketplace_listings.summary, '') <> IFNULL(excluded.summary, '') OR
+                    IFNULL(marketplace_listings.published_at, 0) <> IFNULL(excluded.published_at, 0) OR
+                    IFNULL(marketplace_listings.location, '') <> IFNULL(excluded.location, '') OR
+                    IFNULL(marketplace_listings.geohash, '') <> IFNULL(excluded.geohash, '') OR
+                    IFNULL(marketplace_listings.status, '') <> IFNULL(excluded.status, '')
+                )
             "#,
         )
         .bind(&listing.publisher_npub)
@@ -233,6 +254,7 @@ impl MarketplaceCache {
         .bind(listing.price_sats as i64)
         .bind(&listing.download_url)
         .bind(tags_json)
+        .bind(specs_json)
         .bind(&listing.lud16)
         .bind(listing.created_at as i64)
         .bind(now)
@@ -277,6 +299,7 @@ mod tests {
     fn make_listing(id: &str, created_at: u64, title: &str) -> GameListing {
         GameListing {
             id: id.to_string(),
+            event_id: None,
             source: ListingSource::Nip99Listing,
             title: title.to_string(),
             description: "desc".to_string(),
@@ -285,6 +308,7 @@ mod tests {
             publisher_npub: "npub1merchant".to_string(),
             created_at,
             tags: vec!["rpg".to_string()],
+            specs: Vec::new(),
             lud16: "merchant@example.com".to_string(),
             platforms: Vec::new(),
             nip94_event_id: None,
@@ -369,6 +393,7 @@ mod tests {
 
         let mut updated_listing = listing.clone();
         updated_listing.title = "Game Three Updated".to_string();
+        updated_listing.created_at += 1;
         let updated = cache
             .upsert_listing(&updated_listing, Some("event-2"))
             .await
@@ -393,6 +418,7 @@ mod tests {
         assert_eq!(inserted, UpsertOutcome::Inserted);
 
         listing.nip94_event_id = Some("nip94-event-1".to_string());
+        listing.created_at += 1;
         let updated = cache
             .upsert_listing(&listing, Some("event1"))
             .await
@@ -404,6 +430,165 @@ mod tests {
             .await
             .expect("listing should reload");
         assert_eq!(loaded[0].nip94_event_id, Some("nip94-event-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stale_listing_does_not_replace_newer_listing() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+        let cache = MarketplaceCache::new(db.pool().clone());
+        let newer_event_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let stale_event_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let newer = make_listing("game-stale", 1_710_000_100, "Newer title");
+        let stale = make_listing("game-stale", 1_710_000_099, "Stale title");
+
+        let inserted = cache
+            .upsert_listing(&newer, Some(newer_event_id))
+            .await
+            .expect("newer listing should insert");
+        assert_eq!(inserted, UpsertOutcome::Inserted);
+        sqlx::query(
+            "UPDATE marketplace_listings SET updated_at = 42 WHERE publisher_npub = ? AND product_id = ?",
+        )
+        .bind(&newer.publisher_npub)
+        .bind(&newer.id)
+        .execute(db.pool())
+        .await
+        .expect("updated_at sentinel should be stored");
+
+        let unchanged = cache
+            .upsert_listing(&stale, Some(stale_event_id))
+            .await
+            .expect("stale upsert should succeed");
+        assert_eq!(unchanged, UpsertOutcome::Unchanged);
+
+        let loaded = cache
+            .load_listings(1, None, None)
+            .await
+            .expect("listing should reload");
+        assert_eq!(loaded[0].title, "Newer title");
+        assert_eq!(loaded[0].event_id.as_deref(), Some(newer_event_id));
+        let updated_at: i64 = sqlx::query_scalar(
+            "SELECT updated_at FROM marketplace_listings WHERE publisher_npub = ? AND product_id = ?",
+        )
+        .bind(&newer.publisher_npub)
+        .bind(&newer.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("updated_at should reload");
+        assert_eq!(updated_at, 42);
+    }
+
+    #[tokio::test]
+    async fn equal_timestamp_higher_event_id_does_not_replace_lower_event_id() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+        let cache = MarketplaceCache::new(db.pool().clone());
+        let lower_event_id = "0000000000000000000000000000000000000000000000000000000000000001";
+        let higher_event_id = "0000000000000000000000000000000000000000000000000000000000000002";
+        let lower = make_listing("game-tie-lower", 1_710_000_200, "Lower ID title");
+        let higher = make_listing("game-tie-lower", 1_710_000_200, "Higher ID title");
+
+        cache
+            .upsert_listing(&lower, Some(lower_event_id))
+            .await
+            .expect("lower event ID should insert");
+        sqlx::query(
+            "UPDATE marketplace_listings SET updated_at = 43 WHERE publisher_npub = ? AND product_id = ?",
+        )
+        .bind(&lower.publisher_npub)
+        .bind(&lower.id)
+        .execute(db.pool())
+        .await
+        .expect("updated_at sentinel should be stored");
+
+        let unchanged = cache
+            .upsert_listing(&higher, Some(higher_event_id))
+            .await
+            .expect("higher event ID upsert should succeed");
+        assert_eq!(unchanged, UpsertOutcome::Unchanged);
+
+        let loaded = cache
+            .load_listings(1, None, None)
+            .await
+            .expect("listing should reload");
+        assert_eq!(loaded[0].title, "Lower ID title");
+        assert_eq!(loaded[0].event_id.as_deref(), Some(lower_event_id));
+        let updated_at: i64 = sqlx::query_scalar(
+            "SELECT updated_at FROM marketplace_listings WHERE publisher_npub = ? AND product_id = ?",
+        )
+        .bind(&lower.publisher_npub)
+        .bind(&lower.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("updated_at should reload");
+        assert_eq!(updated_at, 43);
+    }
+
+    #[tokio::test]
+    async fn equal_timestamp_lower_event_id_replaces_higher_event_id() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+        let cache = MarketplaceCache::new(db.pool().clone());
+        let lower_event_id = "0000000000000000000000000000000000000000000000000000000000000001";
+        let higher_event_id = "0000000000000000000000000000000000000000000000000000000000000002";
+        let higher = make_listing("game-tie-update", 1_710_000_300, "Higher ID title");
+        let lower = make_listing("game-tie-update", 1_710_000_300, "Lower ID title");
+
+        cache
+            .upsert_listing(&higher, Some(higher_event_id))
+            .await
+            .expect("higher event ID should insert");
+        let updated = cache
+            .upsert_listing(&lower, Some(lower_event_id))
+            .await
+            .expect("lower event ID upsert should succeed");
+        assert_eq!(updated, UpsertOutcome::Updated);
+
+        let loaded = cache
+            .load_listings(1, None, None)
+            .await
+            .expect("listing should reload");
+        assert_eq!(loaded[0].title, "Lower ID title");
+        assert_eq!(loaded[0].event_id.as_deref(), Some(lower_event_id));
+    }
+
+    #[tokio::test]
+    async fn equal_timestamp_empty_event_id_replaces_null_event_id() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+        let cache = MarketplaceCache::new(db.pool().clone());
+        let listing = make_listing("game-null-event-id", 1_710_000_400, "Event ID title");
+
+        let inserted = cache
+            .upsert_listing(&listing, None)
+            .await
+            .expect("null event ID should insert");
+        assert_eq!(inserted, UpsertOutcome::Inserted);
+
+        let updated = cache
+            .upsert_listing(&listing, Some(""))
+            .await
+            .expect("empty event ID upsert should succeed");
+        assert_eq!(updated, UpsertOutcome::Updated);
+
+        let loaded = cache
+            .load_listings(1, None, None)
+            .await
+            .expect("listing should reload");
+        assert_eq!(loaded[0].event_id.as_deref(), Some(""));
     }
 
     #[tokio::test]
@@ -612,6 +797,7 @@ mod tests {
         // Create a GameListing with all NIP-99 fields populated
         let listing = GameListing {
             id: "complete-game-v1".to_string(),
+            event_id: Some("event-complete-1".to_string()),
             source: ListingSource::Nip99Listing,
             title: "Complete NIP-99 Game".to_string(),
             description: "A fully featured game with all NIP-99 fields".to_string(),
@@ -624,6 +810,7 @@ mod tests {
                 "action".to_string(),
                 "multiplayer".to_string(),
             ],
+            specs: vec![("version".to_string(), "1.4.2".to_string())],
             lud16: "seller@walletofsatoshi.com".to_string(),
             platforms: vec!["linux-x86_64".to_string()],
             nip94_event_id: Some("nip94-event-complete".to_string()),
@@ -668,6 +855,8 @@ mod tests {
         assert_eq!(loaded_listing.publisher_npub, listing.publisher_npub);
         assert_eq!(loaded_listing.created_at, listing.created_at);
         assert_eq!(loaded_listing.tags, listing.tags);
+        assert_eq!(loaded_listing.specs, listing.specs);
+        assert_eq!(loaded_listing.event_id, listing.event_id);
         assert_eq!(loaded_listing.lud16, listing.lud16);
         assert_eq!(loaded_listing.images, listing.images);
         assert_eq!(loaded_listing.platforms, listing.platforms);
@@ -692,6 +881,7 @@ mod tests {
         // Create a GameListing with empty images and None for optional fields
         let listing = GameListing {
             id: "minimal-game-v1".to_string(),
+            event_id: Some("event-minimal-1".to_string()),
             source: ListingSource::Nip99Listing,
             title: "Minimal Game".to_string(),
             description: "A game with minimal fields".to_string(),
@@ -700,6 +890,7 @@ mod tests {
             publisher_npub: "npub1minimalpublisher".to_string(),
             created_at: 1_710_000_001,
             tags: vec![],
+            specs: Vec::new(),
             lud16: "minimal@example.com".to_string(),
             platforms: Vec::new(),
             nip94_event_id: None,

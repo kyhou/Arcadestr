@@ -27,6 +27,7 @@ use arcadestr_core::nwc_client::{
     load_default_nwc_connection, save_default_nwc_connection, NwcClient,
 };
 use arcadestr_core::signers::{ActiveSigner, NostrSigner, SignerError};
+use arcadestr_core::{is_replaceable_event_newer, is_sha256_hex};
 use nostr::nips::nip19::FromBech32;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
@@ -55,8 +56,19 @@ pub struct PublishAdpListingRequest {
     pub operator_url: Option<String>,
     pub servers: Vec<String>,
     pub file_path: Option<String>,
+    pub existing_file_hash: Option<String>,
+    pub existing_fulfillment_pubkey: Option<String>,
+    pub existing_fulfillment_valid_from: Option<u64>,
+    pub existing_fulfillment_revoked_at: Option<u64>,
     pub version: Option<String>,
     pub platforms: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveAdpOperatorRequest {
+    pub publisher_npub: String,
+    pub fulfillment_pubkey: String,
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +94,81 @@ pub struct PublishProgressPayload {
     pub status: String,
     pub server_url: Option<String>,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FulfillmentMetadata {
+    fulfillment_pubkey: Option<String>,
+    valid_from: Option<u64>,
+    revoked_at: Option<u64>,
+    should_provision: bool,
+}
+
+fn resolve_existing_fulfillment_metadata(
+    mode: &FulfillmentMode,
+    developer_pubkey: &str,
+    existing_pubkey: Option<&str>,
+    existing_valid_from: Option<u64>,
+    existing_revoked_at: Option<u64>,
+    now: u64,
+) -> Result<FulfillmentMetadata, String> {
+    match mode {
+        FulfillmentMode::None => {
+            if existing_pubkey.is_some()
+                || existing_valid_from.is_some()
+                || existing_revoked_at.is_some()
+            {
+                return Err(
+                    "existing fulfillment metadata cannot be cleared by an ordinary edit"
+                        .to_string(),
+                );
+            }
+            Ok(FulfillmentMetadata {
+                fulfillment_pubkey: None,
+                valid_from: None,
+                revoked_at: None,
+                should_provision: false,
+            })
+        }
+        FulfillmentMode::Direct => {
+            let key_is_unchanged = existing_pubkey == Some(developer_pubkey);
+            Ok(FulfillmentMetadata {
+                fulfillment_pubkey: Some(developer_pubkey.to_string()),
+                valid_from: if key_is_unchanged {
+                    existing_valid_from.or(Some(now))
+                } else {
+                    Some(now)
+                },
+                revoked_at: if key_is_unchanged {
+                    existing_revoked_at
+                } else {
+                    None
+                },
+                should_provision: false,
+            })
+        }
+        FulfillmentMode::Delegate => match existing_pubkey {
+            Some(pubkey) if pubkey == developer_pubkey => Ok(FulfillmentMetadata {
+                fulfillment_pubkey: None,
+                valid_from: None,
+                revoked_at: None,
+                should_provision: true,
+            }),
+            Some(pubkey) if !pubkey.is_empty() => Ok(FulfillmentMetadata {
+                fulfillment_pubkey: Some(pubkey.to_string()),
+                valid_from: existing_valid_from,
+                revoked_at: existing_revoked_at,
+                should_provision: false,
+            }),
+            Some(_) => Err("existing fulfillment key cannot be empty".to_string()),
+            None => Ok(FulfillmentMetadata {
+                fulfillment_pubkey: None,
+                valid_from: None,
+                revoked_at: None,
+                should_provision: true,
+            }),
+        },
+    }
 }
 
 struct SdkSignerAdapter(Arc<dyn nostr::signer::NostrSigner>);
@@ -204,6 +291,24 @@ pub struct CampaignPointerInput {
     pub relay_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscoverCampaignSummariesRequest {
+    pub publisher_npub: String,
+    pub listings: Vec<CampaignSummaryListingInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CampaignSummaryListingInput {
+    pub listing_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CampaignSummary {
+    pub listing_id: String,
+    pub active: usize,
+    pub upcoming: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoveredCampaign {
     pub root_event_id: String,
@@ -211,6 +316,9 @@ pub struct DiscoveredCampaign {
     pub starts_at: u64,
     pub ends_at: u64,
     pub classification: String,
+    pub event_id: Option<String>,
+    pub predecessor_event_id: Option<String>,
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -230,6 +338,15 @@ pub struct PublishCampaignResponse {
     pub event_id: String,
     pub root_event_id: String,
     pub listing_event_id: Option<String>,
+    pub pointer_update_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateCampaignPointerRequest {
+    pub publisher_npub: String,
+    pub listing_id: String,
+    pub campaign_root_id: String,
+    pub remove: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -290,6 +407,7 @@ pub async fn discover_campaigns(
         .into_iter()
         .filter_map(|candidate| {
             let state = candidate.campaign.state_at(now_unix_i64().ok()? as u64)?;
+            let tip = candidate.campaign.events.last();
             Some(DiscoveredCampaign {
                 root_event_id: candidate.campaign.root_event_id.to_hex(),
                 campaign_id: candidate.campaign.campaign_id,
@@ -309,9 +427,78 @@ pub async fn discover_campaigns(
                     }
                 }
                 .to_string(),
+                event_id: tip.map(|node| node.event.id.to_hex()),
+                predecessor_event_id: tip
+                    .and_then(|node| node.predecessor)
+                    .map(|event_id| event_id.to_hex()),
+                mode: "claim".to_string(),
             })
         })
         .collect())
+}
+
+#[tauri::command]
+pub async fn discover_campaign_summaries(
+    request: DiscoverCampaignSummariesRequest,
+    state: State<'_, AppState>,
+) -> Result<Vec<CampaignSummary>, String> {
+    let publisher = nostr::PublicKey::from_bech32(&request.publisher_npub)
+        .map_err(|_| "invalid publisher pubkey".to_string())?;
+    let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+    let relay_manager = relay_manager.lock().await;
+    let events = match relay_manager
+        .fetch_events_best_effort(
+            nostr::Filter::new()
+                .kind(nostr::Kind::Custom(
+                    arcadestr_core::adp_protocol::ADP_CAMPAIGN_KIND,
+                ))
+                .author(publisher),
+        )
+        .await
+    {
+        Ok(events) => events,
+        Err(arcadestr_core::relay_manager::RelayManagerError::QueryTimeout) => Vec::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    drop(relay_manager);
+    let now = now_unix_i64()? as u64;
+
+    request
+        .listings
+        .into_iter()
+        .map(|listing| {
+            let coordinate =
+                listing_coordinate_from_npub(&request.publisher_npub, &listing.listing_id)?;
+            let report = arcadestr_core::campaign_discovery::resolve_campaign_candidates_report(
+                &[],
+                &[],
+                &events,
+                &events,
+                publisher,
+                &coordinate,
+                now,
+            );
+            Ok(CampaignSummary {
+                listing_id: listing.listing_id,
+                active: report
+                    .campaigns
+                    .iter()
+                    .filter(|item| {
+                        item.classification
+                            == arcadestr_core::campaign_discovery::CampaignClassification::Active
+                    })
+                    .count(),
+                upcoming: report
+                    .campaigns
+                    .iter()
+                    .filter(|item| {
+                        item.classification
+                            == arcadestr_core::campaign_discovery::CampaignClassification::Upcoming
+                    })
+                    .count(),
+            })
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -404,42 +591,100 @@ pub async fn publish_campaign(
         .map_err(|error| error.to_string())?;
     publish_event(&state, &event).await?;
 
-    let listing_event_id = if request.update_listing_pointer {
-        let mut tags = listing
-            .tags
-            .iter()
-            .filter(|tag| {
-                let values = (*tag).clone().to_vec();
-                values.first().map(String::as_str) != Some("campaign")
-                    || values.get(1).map(String::as_str) != Some(root_event_id.to_hex().as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !request.cancel {
-            tags.push(
-                nostr::Tag::parse(["campaign", root_event_id.to_hex().as_str()])
-                    .map_err(|error| error.to_string())?,
-            );
+    let (listing_event_id, pointer_update_error) = if request.update_listing_pointer {
+        let pointer_result: Result<String, String> = async {
+            let mut tags = listing
+                .tags
+                .iter()
+                .filter(|tag| {
+                    let values = (*tag).clone().to_vec();
+                    values.first().map(String::as_str) != Some("campaign")
+                        || values.get(1).map(String::as_str)
+                            != Some(root_event_id.to_hex().as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !request.cancel {
+                tags.push(
+                    nostr::Tag::parse(["campaign", root_event_id.to_hex().as_str()])
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let listing_update = signer
+                .sign_event(
+                    nostr::EventBuilder::new(nostr::Kind::Custom(30402), listing.content.clone())
+                        .tags(tags)
+                        .build(publisher),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            publish_event(&state, &listing_update).await?;
+            Ok(listing_update.id.to_hex())
         }
-        let listing_update = signer
-            .sign_event(
-                nostr::EventBuilder::new(nostr::Kind::Custom(30402), listing.content)
-                    .tags(tags)
-                    .build(publisher),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        publish_event(&state, &listing_update).await?;
-        Some(listing_update.id.to_hex())
+        .await;
+        match pointer_result {
+            Ok(event_id) => (Some(event_id), None),
+            Err(error) => (None, Some(error)),
+        }
     } else {
-        None
+        (None, None)
     };
 
     Ok(PublishCampaignResponse {
         event_id: event.id.to_hex(),
         root_event_id: root_event_id.to_hex(),
         listing_event_id,
+        pointer_update_error,
     })
+}
+
+#[tauri::command]
+pub async fn update_campaign_pointer(
+    request: UpdateCampaignPointerRequest,
+    state: State<'_, AppState>,
+    signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+) -> Result<String, String> {
+    let auth_snapshot = { state.auth.lock().await.clone() };
+    let signer = resolve_publish_signer(signer_state.inner(), &auth_snapshot).await?;
+    let publisher = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let expected = nostr::PublicKey::from_bech32(&request.publisher_npub)
+        .map_err(|_| "invalid publisher pubkey".to_string())?;
+    if publisher != expected {
+        return Err("active signer is not the listing publisher".into());
+    }
+    let coordinate = listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
+    let listing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
+    let root = nostr::EventId::from_hex(&request.campaign_root_id)
+        .map_err(|_| "invalid campaign root event id".to_string())?;
+    let mut tags = listing
+        .tags
+        .iter()
+        .filter(|tag| {
+            let values = (*tag).clone().to_vec();
+            values.first().map(String::as_str) != Some("campaign")
+                || values.get(1).map(String::as_str) != Some(root.to_hex().as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !request.remove {
+        tags.push(
+            nostr::Tag::parse(["campaign", root.to_hex().as_str()])
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let updated = signer
+        .sign_event(
+            nostr::EventBuilder::new(nostr::Kind::Custom(30402), listing.content)
+                .tags(tags)
+                .build(publisher),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    publish_event(&state, &updated).await?;
+    Ok(updated.id.to_hex())
 }
 
 #[tauri::command]
@@ -766,10 +1011,36 @@ pub(crate) async fn fetch_listing_event_by_coordinate(
     .await
     .map_err(|_| "listing event fetch timed out".to_string())?
     .map_err(|err| err.to_string())?;
-    events
-        .into_iter()
-        .max_by_key(|event| event.created_at.as_secs())
-        .ok_or_else(|| "listing event not found on relays".to_string())
+    select_replaceable_event(events).ok_or_else(|| "listing event not found on relays".to_string())
+}
+
+fn select_replaceable_event(
+    events: impl IntoIterator<Item = nostr::Event>,
+) -> Option<nostr::Event> {
+    events.into_iter().reduce(|current, candidate| {
+        let candidate_id = candidate.id.to_hex();
+        let current_id = current.id.to_hex();
+        if is_replaceable_event_newer(
+            candidate.created_at.as_secs(),
+            Some(&candidate_id),
+            current.created_at.as_secs(),
+            Some(&current_id),
+        ) {
+            candidate
+        } else {
+            current
+        }
+    })
+}
+
+fn reusable_file_hash(existing_file_hash: Option<&str>) -> Result<String, String> {
+    let hash = existing_file_hash.ok_or_else(|| {
+        "build file or existing file hash is required for fulfillment".to_string()
+    })?;
+    if !is_sha256_hex(hash) {
+        return Err("existing file hash is invalid; select a replacement build file".to_string());
+    }
+    Ok(hash.to_string())
 }
 
 async fn persist_purchase_confirmation(
@@ -809,6 +1080,34 @@ async fn persist_purchase_confirmation(
     })
 }
 
+fn publisher_hex_from_npub(publisher_npub: &str) -> Result<String, String> {
+    nostr::PublicKey::from_bech32(publisher_npub)
+        .map(|publisher| publisher.to_hex())
+        .map_err(|err| format!("invalid publisher npub: {err}"))
+}
+
+fn unique_operator_url(matches: &[AdpProvisioning]) -> Option<String> {
+    match matches {
+        [entry] => Some(entry.server_url.clone()),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+pub async fn resolve_adp_operator(
+    request: ResolveAdpOperatorRequest,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let publisher_hex = publisher_hex_from_npub(&request.publisher_npub)?;
+    let provisioning_repo = AdpProvisioningRepository::new(state.database.pool().clone());
+    let matches = provisioning_repo
+        .for_fulfillment_scope(&publisher_hex, &request.fulfillment_pubkey, &request.scope)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(unique_operator_url(&matches))
+}
+
 #[tauri::command]
 pub async fn publish_adp_listing<R: tauri::Runtime>(
     request: PublishAdpListingRequest,
@@ -823,10 +1122,24 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         .await
         .map_err(|err| err.to_string())?;
     let developer_npub = developer_pubkey.to_hex();
+    let now: u64 = now_unix_i64()?
+        .try_into()
+        .map_err(|_| "current time is negative".to_string())?;
+    let FulfillmentMetadata {
+        fulfillment_pubkey: mut fulfillment_pubkey,
+        valid_from: mut fulfillment_valid_from,
+        revoked_at: fulfillment_revoked_at,
+        should_provision,
+    } = resolve_existing_fulfillment_metadata(
+        &request.fulfillment_mode,
+        &developer_npub,
+        request.existing_fulfillment_pubkey.as_deref(),
+        request.existing_fulfillment_valid_from,
+        request.existing_fulfillment_revoked_at,
+        now,
+    )?;
 
     let mut file_hash = None;
-    let mut fulfillment_pubkey = None;
-    let mut fulfillment_valid_from = None;
     let mut acceptance_event_id = None;
 
     match request.fulfillment_mode {
@@ -837,10 +1150,6 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                     "at least one distribution server is required for fulfillment".to_string(),
                 );
             }
-            let file_path = request
-                .file_path
-                .as_deref()
-                .ok_or_else(|| "build file is required for fulfillment".to_string())?;
             let version = request
                 .version
                 .as_deref()
@@ -849,18 +1158,17 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                 return Err("version is required for fulfillment".to_string());
             }
 
-            emit_progress(&app, "hash-file", "pending", None)?;
-            let hash = sha256_file(std::path::Path::new(file_path))
-                .await
-                .map_err(|err| progress_error(&app, "hash-file", err))?;
-            emit_progress(&app, "hash-file", "ok", Some(hash.clone()))?;
+            let hash = if let Some(file_path) = request.file_path.as_deref() {
+                emit_progress(&app, "hash-file", "pending", None)?;
+                let hash = sha256_file(std::path::Path::new(file_path))
+                    .await
+                    .map_err(|err| progress_error(&app, "hash-file", err))?;
+                emit_progress(&app, "hash-file", "ok", Some(hash.clone()))?;
+                hash
+            } else {
+                reusable_file_hash(request.existing_file_hash.as_deref())?
+            };
             file_hash = Some(hash);
-            fulfillment_pubkey = Some(developer_npub.clone());
-            fulfillment_valid_from = Some(
-                now_unix_i64()?
-                    .try_into()
-                    .map_err(|_| "current time is negative".to_string())?,
-            );
         }
         FulfillmentMode::Delegate => {
             if request.servers.is_empty() {
@@ -868,17 +1176,6 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                     "at least one distribution server is required for fulfillment".to_string(),
                 );
             }
-            let operator_url = request
-                .operator_url
-                .as_deref()
-                .ok_or_else(|| "operator URL is required for delegated fulfillment".to_string())?;
-            if operator_url.trim().is_empty() {
-                return Err("operator URL is required for delegated fulfillment".to_string());
-            }
-            let file_path = request
-                .file_path
-                .as_deref()
-                .ok_or_else(|| "build file is required for fulfillment".to_string())?;
             let version = request
                 .version
                 .as_deref()
@@ -887,91 +1184,110 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                 return Err("version is required for fulfillment".to_string());
             }
 
-            emit_progress(
-                &app,
-                "check-operator",
-                "pending",
-                Some(operator_url.to_string()),
-            )?;
-            let adp_client =
-                AdpClient::new(operator_url.to_string(), Arc::clone(&state.http_client));
-            let server_info = adp_client
-                .well_known()
-                .await
-                .map_err(|err| progress_error(&app, "check-operator", err))?;
-            emit_progress(
-                &app,
-                "check-operator",
-                "ok",
-                Some(server_info.pubkey.clone()),
-            )?;
-
-            emit_progress(&app, "hash-file", "pending", None)?;
-            let hash = sha256_file(std::path::Path::new(file_path))
-                .await
-                .map_err(|err| progress_error(&app, "hash-file", err))?;
-            emit_progress(&app, "hash-file", "ok", Some(hash.clone()))?;
+            let hash = if let Some(file_path) = request.file_path.as_deref() {
+                emit_progress(&app, "hash-file", "pending", None)?;
+                let hash = sha256_file(std::path::Path::new(file_path))
+                    .await
+                    .map_err(|err| progress_error(&app, "hash-file", err))?;
+                emit_progress(&app, "hash-file", "ok", Some(hash.clone()))?;
+                hash
+            } else {
+                reusable_file_hash(request.existing_file_hash.as_deref())?
+            };
             file_hash = Some(hash);
 
-            let provisioning_repo = AdpProvisioningRepository::new(state.database.pool().clone());
-            let scope = request.d_tag.as_str();
-
-            emit_progress(&app, "provision", "pending", None)?;
-            let provisioning = resolve_provisioning(ResolveProvisioningInput {
-                provisioning_repo: &provisioning_repo,
-                adp_client: &adp_client,
-                signer: signer.as_ref(),
-                developer_pubkey,
-                developer_npub: &developer_npub,
-                server_url: operator_url,
-                scope,
-                server_info: &server_info,
-            })
-            .await
-            .map_err(|err| progress_error(&app, "provision", err))?;
-
-            match provisioning {
-                ProvisioningDecision::Reused {
-                    fulfillment_pubkey: reused_pubkey,
-                    acceptance_event_id: reused_acceptance_event_id,
-                    valid_from,
-                } => {
-                    emit_progress(
-                        &app,
-                        "provision",
-                        "ok",
-                        Some("reused existing provisioning".into()),
-                    )?;
-                    fulfillment_pubkey = Some(reused_pubkey);
-                    acceptance_event_id = Some(reused_acceptance_event_id);
-                    fulfillment_valid_from = Some(
-                        valid_from
-                            .try_into()
-                            .map_err(|_| "provisioning valid_from is negative".to_string())?,
-                    );
+            if should_provision {
+                let operator_url = request.operator_url.as_deref().ok_or_else(|| {
+                    "operator URL is required for delegated fulfillment".to_string()
+                })?;
+                if operator_url.trim().is_empty() {
+                    return Err("operator URL is required for delegated fulfillment".to_string());
                 }
-                ProvisioningDecision::Created {
-                    fulfillment_pubkey: created_pubkey,
-                    acceptance_event_id: created_acceptance_event_id,
-                    valid_from,
-                    acceptance_event,
-                    row,
-                } => {
-                    publish_event(&state, &acceptance_event)
-                        .await
-                        .map_err(|err| progress_error(&app, "provision", err))?;
-                    provisioning_repo
-                        .upsert(&row)
-                        .await
-                        .map_err(|err| progress_error(&app, "provision", err))?;
-                    emit_progress(&app, "provision", "ok", Some("created provisioning".into()))?;
-                    fulfillment_pubkey = Some(created_pubkey);
-                    acceptance_event_id = Some(created_acceptance_event_id);
-                    fulfillment_valid_from = Some(
-                        valid_from
-                            .try_into()
-                            .map_err(|_| "provisioning valid_from is negative".to_string())?,
-                    );
+                emit_progress(
+                    &app,
+                    "check-operator",
+                    "pending",
+                    Some(operator_url.to_string()),
+                )?;
+                let adp_client =
+                    AdpClient::new(operator_url.to_string(), Arc::clone(&state.http_client));
+                let server_info = adp_client
+                    .well_known()
+                    .await
+                    .map_err(|err| progress_error(&app, "check-operator", err))?;
+                emit_progress(
+                    &app,
+                    "check-operator",
+                    "ok",
+                    Some(server_info.pubkey.clone()),
+                )?;
+
+                let provisioning_repo =
+                    AdpProvisioningRepository::new(state.database.pool().clone());
+                let scope = request.d_tag.as_str();
+
+                emit_progress(&app, "provision", "pending", None)?;
+                let provisioning = resolve_provisioning(ResolveProvisioningInput {
+                    provisioning_repo: &provisioning_repo,
+                    adp_client: &adp_client,
+                    signer: signer.as_ref(),
+                    developer_pubkey,
+                    developer_npub: &developer_npub,
+                    server_url: operator_url,
+                    scope,
+                    server_info: &server_info,
+                })
+                .await
+                .map_err(|err| progress_error(&app, "provision", err))?;
+
+                match provisioning {
+                    ProvisioningDecision::Reused {
+                        fulfillment_pubkey: reused_pubkey,
+                        acceptance_event_id: reused_acceptance_event_id,
+                        valid_from,
+                    } => {
+                        emit_progress(
+                            &app,
+                            "provision",
+                            "ok",
+                            Some("reused existing provisioning".into()),
+                        )?;
+                        fulfillment_pubkey = Some(reused_pubkey);
+                        acceptance_event_id = Some(reused_acceptance_event_id);
+                        fulfillment_valid_from = Some(
+                            valid_from
+                                .try_into()
+                                .map_err(|_| "provisioning valid_from is negative".to_string())?,
+                        );
+                    }
+                    ProvisioningDecision::Created {
+                        fulfillment_pubkey: created_pubkey,
+                        acceptance_event_id: created_acceptance_event_id,
+                        valid_from,
+                        acceptance_event,
+                        row,
+                    } => {
+                        publish_event(&state, &acceptance_event)
+                            .await
+                            .map_err(|err| progress_error(&app, "provision", err))?;
+                        provisioning_repo
+                            .upsert(&row)
+                            .await
+                            .map_err(|err| progress_error(&app, "provision", err))?;
+                        emit_progress(
+                            &app,
+                            "provision",
+                            "ok",
+                            Some("created provisioning".into()),
+                        )?;
+                        fulfillment_pubkey = Some(created_pubkey);
+                        acceptance_event_id = Some(created_acceptance_event_id);
+                        fulfillment_valid_from = Some(
+                            valid_from
+                                .try_into()
+                                .map_err(|_| "provisioning valid_from is negative".to_string())?,
+                        );
+                    }
                 }
             }
         }
@@ -991,6 +1307,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         version: request.version.clone(),
         fulfillment_pubkey: fulfillment_pubkey.clone(),
         fulfillment_valid_from,
+        fulfillment_revoked_at,
         platforms: request.platforms.clone(),
     };
     let listing_builder =
@@ -1027,11 +1344,10 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     emit_progress(&app, "confirm-propagation", "ok", Some(coordinate.clone()))?;
 
     let mut uploads = Vec::new();
-    if !matches!(request.fulfillment_mode, FulfillmentMode::None) {
-        let file_path = request
-            .file_path
-            .as_deref()
-            .ok_or_else(|| "build file is required for fulfillment".to_string())?;
+    if !matches!(request.fulfillment_mode, FulfillmentMode::None) && request.file_path.is_some() {
+        let file_path = request.file_path.as_deref().ok_or_else(|| {
+            "build file is required when uploading a replacement artifact".to_string()
+        })?;
         let mut upload_errors = Vec::new();
         for server_url in &request.servers {
             emit_server_progress(&app, "upload", "pending", Some(server_url.clone()), None)?;
@@ -1260,7 +1576,7 @@ mod tests {
     use arcadestr_core::storage::Database;
     use arcadestr_core::subscriptions::SubscriptionRegistry;
     use arcadestr_core::user_cache::UserCache;
-    use nostr::{nips::nip19::ToBech32, Keys};
+    use nostr::{nips::nip19::ToBech32, EventBuilder, Keys, Kind, Tag, TagKind, Timestamp};
     use serde_json::json;
     use tauri::Manager;
     use tokio::sync::{Mutex as AsyncMutex, RwLock};
@@ -1285,6 +1601,53 @@ mod tests {
                 .await
                 .expect("resolved signer should expose public key"),
             expected_pubkey
+        );
+    }
+
+    fn signed_listing_event(keys: &Keys, content: &str, created_at: u64) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(30402), content)
+            .tags([Tag::custom(TagKind::d(), ["same-coordinate"])])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .expect("listing event should sign")
+    }
+
+    #[test]
+    fn replaceable_selector_uses_lower_id_for_equal_timestamp_in_any_arrival_order() {
+        let keys = Keys::generate();
+        let first = signed_listing_event(&keys, "first", 100);
+        let second = signed_listing_event(&keys, "second", 100);
+        let expected_id = std::cmp::min(first.id.to_hex(), second.id.to_hex());
+
+        let forward = select_replaceable_event([first.clone(), second.clone()])
+            .expect("forward events should select a winner");
+        let reverse = select_replaceable_event([second, first])
+            .expect("reverse events should select a winner");
+
+        assert_eq!(forward.id.to_hex(), expected_id);
+        assert_eq!(reverse.id.to_hex(), expected_id);
+    }
+
+    #[test]
+    fn replaceable_selector_prefers_newer_timestamp() {
+        let keys = Keys::generate();
+        let older = signed_listing_event(&keys, "older", 100);
+        let newer = signed_listing_event(&keys, "newer", 101);
+
+        let selected = select_replaceable_event([newer.clone(), older])
+            .expect("events should select a winner");
+
+        assert_eq!(selected.id, newer.id);
+    }
+
+    #[test]
+    fn reusable_file_hash_rejects_malformed_metadata_and_preserves_valid_hash() {
+        let valid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        assert_eq!(reusable_file_hash(Some(valid)), Ok(valid.to_string()));
+        assert_eq!(
+            reusable_file_hash(Some("abc123")),
+            Err("existing file hash is invalid; select a replacement build file".to_string())
         );
     }
 
@@ -1704,6 +2067,156 @@ mod tests {
         assert_eq!(mock.post_call_count(provision_url), 1);
     }
 
+    #[test]
+    fn delegated_edit_preserves_existing_fulfillment_metadata_without_provisioning() {
+        let metadata = resolve_existing_fulfillment_metadata(
+            &FulfillmentMode::Delegate,
+            "developer-key",
+            Some("delegated-key"),
+            Some(123),
+            Some(456),
+            999,
+        )
+        .expect("existing delegated metadata should be accepted");
+
+        assert_eq!(
+            metadata.fulfillment_pubkey.as_deref(),
+            Some("delegated-key")
+        );
+        assert_eq!(metadata.valid_from, Some(123));
+        assert_eq!(metadata.revoked_at, Some(456));
+        assert!(!metadata.should_provision);
+    }
+
+    #[test]
+    fn direct_to_delegate_conversion_provisions_a_new_key() {
+        let metadata = resolve_existing_fulfillment_metadata(
+            &FulfillmentMode::Delegate,
+            "developer-key",
+            Some("developer-key"),
+            Some(123),
+            Some(456),
+            999,
+        )
+        .expect("direct to delegated conversion should be accepted");
+
+        assert!(metadata.fulfillment_pubkey.is_none());
+        assert!(metadata.valid_from.is_none());
+        assert!(metadata.revoked_at.is_none());
+        assert!(metadata.should_provision);
+    }
+
+    #[test]
+    fn new_delegated_listing_uses_provisioning_flow() {
+        let metadata = resolve_existing_fulfillment_metadata(
+            &FulfillmentMode::Delegate,
+            "developer-key",
+            None,
+            Some(123),
+            Some(456),
+            999,
+        )
+        .expect("new delegated metadata should be accepted");
+
+        assert!(metadata.fulfillment_pubkey.is_none());
+        assert!(metadata.valid_from.is_none());
+        assert!(metadata.revoked_at.is_none());
+        assert!(metadata.should_provision);
+    }
+
+    #[test]
+    fn delegate_to_direct_conversion_resets_metadata_for_the_changed_key() {
+        let metadata = resolve_existing_fulfillment_metadata(
+            &FulfillmentMode::Direct,
+            "developer-key",
+            Some("delegated-key"),
+            Some(123),
+            Some(456),
+            999,
+        )
+        .expect("direct metadata should be accepted");
+
+        assert_eq!(
+            metadata.fulfillment_pubkey.as_deref(),
+            Some("developer-key")
+        );
+        assert_eq!(metadata.valid_from, Some(999));
+        assert_eq!(metadata.revoked_at, None);
+        assert!(!metadata.should_provision);
+    }
+
+    #[test]
+    fn direct_edit_without_validity_uses_current_time_but_keeps_revocation() {
+        let metadata = resolve_existing_fulfillment_metadata(
+            &FulfillmentMode::Direct,
+            "developer-key",
+            Some("developer-key"),
+            None,
+            Some(456),
+            999,
+        )
+        .expect("direct metadata should be accepted");
+
+        assert_eq!(metadata.valid_from, Some(999));
+        assert_eq!(metadata.revoked_at, Some(456));
+    }
+
+    #[test]
+    fn ordinary_edit_cannot_silently_clear_existing_revoked_fulfillment() {
+        let error = resolve_existing_fulfillment_metadata(
+            &FulfillmentMode::None,
+            "developer-key",
+            Some("revoked-key"),
+            Some(123),
+            Some(456),
+            999,
+        )
+        .expect_err("existing fulfillment metadata must not be silently cleared");
+
+        assert!(error.contains("cannot be cleared"));
+    }
+
+    #[test]
+    fn publisher_npub_contract_converts_to_hex() {
+        let keys = Keys::generate();
+        let npub = keys
+            .public_key()
+            .to_bech32()
+            .expect("publisher npub should encode");
+
+        assert_eq!(
+            publisher_hex_from_npub(&npub).expect("publisher npub should parse"),
+            keys.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn unique_operator_contract_requires_exactly_one_row() {
+        let row = AdpProvisioning {
+            id: "one".to_string(),
+            developer_npub: "developer".to_string(),
+            server_url: "https://operator.example.com".to_string(),
+            operator_pubkey: "operator".to_string(),
+            scope: Some("game".to_string()),
+            fulfillment_pubkey: "fulfillment".to_string(),
+            attestation_event_id: "attestation".to_string(),
+            acceptance_event_id: "acceptance".to_string(),
+            valid_from: 123,
+            revoked_at: Some(456),
+            created_at: 123,
+        };
+        let mut second = row.clone();
+        second.id = "two".to_string();
+        second.server_url = "https://other.example.com".to_string();
+
+        assert_eq!(unique_operator_url(&[]), None);
+        assert_eq!(
+            unique_operator_url(std::slice::from_ref(&row)).as_deref(),
+            Some("https://operator.example.com")
+        );
+        assert_eq!(unique_operator_url(&[row, second]), None);
+    }
+
     #[tokio::test]
     #[ignore = "requires ADP_TEST_SERVER_URL and live local relays"]
     async fn live_publish_adp_listing_uploads_and_propagates_to_two_relays() {
@@ -1751,6 +2264,10 @@ mod tests {
             operator_url: Some(server_url.clone()),
             servers: vec![server_url.clone()],
             file_path: Some(file_path.display().to_string()),
+            existing_file_hash: None,
+            existing_fulfillment_pubkey: None,
+            existing_fulfillment_valid_from: None,
+            existing_fulfillment_revoked_at: None,
             version: Some("0.0.1-live".to_string()),
             platforms: vec!["linux-x86_64".to_string()],
         };

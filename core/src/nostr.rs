@@ -460,6 +460,8 @@ impl Default for ListingSource {
 pub struct GameListing {
     pub id: String, // unique slug / d-tag value, e.g. "my-game-v1"
     #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
     pub source: ListingSource,
     pub title: String,
     pub description: String,
@@ -468,6 +470,8 @@ pub struct GameListing {
     pub publisher_npub: String, // bech32 npub of the publisher
     pub created_at: u64,        // unix timestamp
     pub tags: Vec<String>,      // freeform tags e.g. ["rpg", "pixel-art"]
+    #[serde(default)]
+    pub specs: Vec<(String, String)>,
     pub lud16: String, // Lightning address for payments (e.g., "seller@walletofsatoshi.com")
     pub images: Vec<String>, // product images from NIP-99/NIP-15 events
     /// Platform compatibility tags from ["platform", "<os>-<arch>"].
@@ -529,6 +533,7 @@ impl GameListing {
 
         GameListing {
             id: product.id,
+            event_id: None,
             source: ListingSource::Nip15Product,
             title: product.name,
             description: product.description.unwrap_or_default(),
@@ -537,6 +542,7 @@ impl GameListing {
             publisher_npub: product.merchant_npub,
             created_at: product.created_at,
             tags: product.categories,
+            specs: product.specs,
             lud16: String::new(),
             images: product.images,
             platforms: Vec::new(),
@@ -570,8 +576,36 @@ impl GameListing {
             })
             .unwrap_or(0);
 
+        let mut specs = listing
+            .servers
+            .iter()
+            .map(|server| ("server".to_string(), server.clone()))
+            .collect::<Vec<_>>();
+        for (key, value) in [
+            ("file_hash", listing.file_hash.clone()),
+            ("version", listing.version.clone()),
+            ("fulfillment_pubkey", listing.fulfillment_pubkey.clone()),
+            (
+                "fulfillment_valid_from",
+                listing
+                    .fulfillment_valid_from
+                    .map(|value| value.to_string()),
+            ),
+            (
+                "fulfillment_revoked_at",
+                listing
+                    .fulfillment_revoked_at
+                    .map(|value| value.to_string()),
+            ),
+        ] {
+            if let Some(value) = value {
+                specs.push((key.to_string(), value));
+            }
+        }
+
         GameListing {
             id: listing.id,
+            event_id: Some(listing.event_id),
             source: ListingSource::Nip99Listing,
             title: listing.title,
             description: listing.content,
@@ -580,6 +614,7 @@ impl GameListing {
             publisher_npub: listing.merchant_npub,
             created_at: listing.created_at,
             tags: listing.tags,
+            specs,
             lud16: String::new(),
             images: listing.images,
             platforms: listing.platforms,
@@ -1748,6 +1783,7 @@ pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
 
     Ok(GameListing {
         id,
+        event_id: Some(event.id.to_hex()),
         source: ListingSource::Legacy,
         title,
         description: content.description,
@@ -1756,6 +1792,7 @@ pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
         publisher_npub,
         created_at: event.created_at.as_secs(),
         tags,
+        specs: Vec::new(),
         lud16,
         images: Vec::new(), // Legacy format doesn't include images
         platforms,
@@ -1780,6 +1817,7 @@ mod listing_event_tests {
     fn sample_listing() -> GameListing {
         GameListing {
             id: "sample-game".to_string(),
+            event_id: None,
             source: ListingSource::Nip99Listing,
             title: "Sample Game".to_string(),
             description: "A sample game".to_string(),
@@ -1788,6 +1826,7 @@ mod listing_event_tests {
             publisher_npub: "".to_string(),
             created_at: 0,
             tags: vec!["arcade".to_string()],
+            specs: Vec::new(),
             lud16: String::new(),
             images: Vec::new(),
             nip94_event_id: None,

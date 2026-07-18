@@ -139,6 +139,7 @@ fn empty_vec_serializes_as_array_not_null() {
 fn sample_listing() -> GameListing {
     GameListing {
         id: "test-game-v1".to_string(),
+        event_id: None,
         source: ListingSource::Legacy,
         title: "Test Game".to_string(),
         description: "Section 6 test listing".to_string(),
@@ -147,6 +148,7 @@ fn sample_listing() -> GameListing {
         publisher_npub: "npub1testpublisher".to_string(),
         created_at: 1_710_000_000,
         tags: vec!["indie".to_string()],
+        specs: Vec::new(),
         lud16: "seller@example.com".to_string(),
         platforms: Vec::new(),
         nip94_event_id: None,

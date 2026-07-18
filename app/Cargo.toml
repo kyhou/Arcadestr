@@ -37,7 +37,7 @@ getrandom = { version = "0.2", features = ["js"] }
 
 # Nostr re-export for web target (needed for ToBech32 trait)
 # This is used by web_auth.rs when web feature is enabled
-nostr = { version = "0.44", default-features = false, optional = true }
+nostr = { version = "0.44", default-features = false }
 
 # Tauri integration - only for WASM target with Tauri
 [target.'cfg(all(target_arch = "wasm32", not(feature = "web")))'.dependencies]
@@ -49,4 +49,4 @@ csr = ["leptos/csr"]
 hydrate = ["leptos/hydrate"]
 native = ["arcadestr-core/native"]
 wasm = ["arcadestr-core/wasm"]
-web = ["nostr"]
+web = []

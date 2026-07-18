@@ -18,6 +18,7 @@ pub struct AdpListingInput {
     pub version: Option<String>,
     pub fulfillment_pubkey: Option<String>,
     pub fulfillment_valid_from: Option<u64>,
+    pub fulfillment_revoked_at: Option<u64>,
     pub platforms: Vec<String>,
 }
 
@@ -93,12 +94,10 @@ pub fn build_adp_listing_event_builder(
                 .as_deref()
                 .is_some_and(|value| !value.is_empty()),
         ),
-        (
-            "fulfillment_valid_from",
-            input.fulfillment_valid_from.is_some(),
-        ),
     ];
-    let has_any_fulfillment = fulfillment_fields.iter().any(|(_, present)| *present);
+    let has_any_fulfillment = fulfillment_fields.iter().any(|(_, present)| *present)
+        || input.fulfillment_valid_from.is_some()
+        || input.fulfillment_revoked_at.is_some();
     let missing_fulfillment = fulfillment_fields
         .iter()
         .filter_map(|(name, present)| (!present).then_some(*name))
@@ -166,9 +165,12 @@ pub fn build_adp_listing_event_builder(
                     .expect("fulfillment_pubkey checked above"),
                 input
                     .fulfillment_valid_from
-                    .expect("fulfillment_valid_from checked above")
-                    .to_string(),
-                String::new(),
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                input
+                    .fulfillment_revoked_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
             ],
         ));
     }
@@ -263,6 +265,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             fulfillment_pubkey: Some("fulfillment-pubkey".to_string()),
             fulfillment_valid_from: Some(1_725_000_000),
+            fulfillment_revoked_at: Some(1_725_000_999),
             platforms: vec!["linux-x86_64".to_string(), "windows-x86_64".to_string()],
         };
 
@@ -307,7 +310,12 @@ mod tests {
         assert_eq!(tag_values(&event, "version")[0], vec!["version", "1.0.0"]);
         assert_eq!(
             tag_values(&event, "fulfillment_pubkey")[0],
-            vec!["fulfillment_pubkey", "fulfillment-pubkey", "1725000000", ""]
+            vec![
+                "fulfillment_pubkey",
+                "fulfillment-pubkey",
+                "1725000000",
+                "1725000999"
+            ]
         );
         assert_eq!(
             tag_values(&event, "lud16")[0],
@@ -331,6 +339,7 @@ mod tests {
             version: None,
             fulfillment_pubkey: None,
             fulfillment_valid_from: None,
+            fulfillment_revoked_at: None,
             platforms: vec![],
         };
 
@@ -356,6 +365,7 @@ mod tests {
             version: None,
             fulfillment_pubkey: None,
             fulfillment_valid_from: None,
+            fulfillment_revoked_at: None,
             platforms: vec!["linux-x86_64".to_string()],
         };
 
@@ -393,6 +403,7 @@ mod tests {
             version: None,
             fulfillment_pubkey: None,
             fulfillment_valid_from: None,
+            fulfillment_revoked_at: None,
             platforms: vec![],
         };
 
@@ -405,7 +416,7 @@ mod tests {
         ));
         assert!(err.to_string().contains("version"));
         assert!(err.to_string().contains("fulfillment_pubkey"));
-        assert!(err.to_string().contains("fulfillment_valid_from"));
+        assert!(!err.to_string().contains("fulfillment_valid_from"));
     }
 
     #[test]
@@ -423,6 +434,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             fulfillment_pubkey: Some("fulfillment-pubkey".to_string()),
             fulfillment_valid_from: Some(1_725_000_000),
+            fulfillment_revoked_at: None,
             platforms: vec![],
         };
 
@@ -450,6 +462,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             fulfillment_pubkey: Some(developer_pubkey.clone()),
             fulfillment_valid_from: Some(1_725_000_000),
+            fulfillment_revoked_at: None,
             platforms: vec![],
         };
 
@@ -464,6 +477,42 @@ mod tests {
                 "fulfillment_pubkey".to_string(),
                 developer_pubkey,
                 "1725000000".to_string(),
+                String::new(),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn fulfillment_tag_preserves_empty_validity_and_revocation_positions() {
+        let keys = Keys::generate();
+        let input = AdpListingInput {
+            d_tag: "legacy-delegated".to_string(),
+            title: "Legacy Delegated".to_string(),
+            description: "Existing fulfillment metadata without timestamps".to_string(),
+            price_sats: 0,
+            lud16: None,
+            tags: vec![],
+            images: vec![],
+            servers: vec!["https://dist.example.com".to_string()],
+            file_hash: Some("abc123".to_string()),
+            version: Some("1.0.0".to_string()),
+            fulfillment_pubkey: Some("fulfillment-pubkey".to_string()),
+            fulfillment_valid_from: None,
+            fulfillment_revoked_at: None,
+            platforms: vec![],
+        };
+
+        let event = build_adp_listing_event_builder(&input)
+            .expect("legacy fulfillment metadata should remain publishable")
+            .sign_with_keys(&keys)
+            .expect("event should sign");
+
+        assert_eq!(
+            tag_values(&event, "fulfillment_pubkey"),
+            vec![vec![
+                "fulfillment_pubkey".to_string(),
+                "fulfillment-pubkey".to_string(),
+                String::new(),
                 String::new(),
             ]]
         );

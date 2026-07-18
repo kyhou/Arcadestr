@@ -86,7 +86,7 @@ pub struct AdpServerInfo {
 }
 
 /// Request payload for the ADP publish command.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FulfillmentMode {
     None,
@@ -108,8 +108,20 @@ pub struct PublishAdpListingRequest {
     pub operator_url: Option<String>,
     pub servers: Vec<String>,
     pub file_path: Option<String>,
+    pub existing_file_hash: Option<String>,
+    pub existing_fulfillment_pubkey: Option<String>,
+    pub existing_fulfillment_valid_from: Option<u64>,
+    pub existing_fulfillment_revoked_at: Option<u64>,
     pub version: Option<String>,
     pub platforms: Vec<String>,
+}
+
+/// Request payload for resolving an edited listing's delegated operator.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ResolveAdpOperatorRequest {
+    pub publisher_npub: String,
+    pub fulfillment_pubkey: String,
+    pub scope: String,
 }
 
 /// Upload response nested in ADP publish results.
@@ -243,12 +255,36 @@ pub struct CampaignPointerInput {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DiscoverCampaignSummariesRequest {
+    pub publisher_npub: String,
+    pub listings: Vec<CampaignSummaryListingInput>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CampaignSummaryListingInput {
+    pub listing_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CampaignSummary {
+    pub listing_id: String,
+    pub active: usize,
+    pub upcoming: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct DiscoveredCampaign {
     pub root_event_id: String,
     pub campaign_id: String,
     pub starts_at: u64,
     pub ends_at: u64,
     pub classification: String,
+    #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub predecessor_event_id: Option<String>,
+    #[serde(default)]
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -268,6 +304,16 @@ pub struct PublishCampaignResponse {
     pub event_id: String,
     pub root_event_id: String,
     pub listing_event_id: Option<String>,
+    #[serde(default)]
+    pub pointer_update_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct UpdateCampaignPointerRequest {
+    pub publisher_npub: String,
+    pub listing_id: String,
+    pub campaign_root_id: String,
+    pub remove: bool,
 }
 
 /// Invoke desktop `check_adp_server` command.
@@ -332,6 +378,26 @@ pub async fn invoke_publish_adp_listing(
         serde_json::json!({ "request": request }),
     )
     .await
+}
+
+/// Invoke desktop `resolve_adp_operator` command.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_resolve_adp_operator(
+    request: ResolveAdpOperatorRequest,
+) -> Result<Option<String>, String> {
+    crate::tauri_invoke::invoke(
+        "resolve_adp_operator",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+/// Web fallback for `resolve_adp_operator`.
+#[cfg(feature = "web")]
+pub async fn invoke_resolve_adp_operator(
+    _request: ResolveAdpOperatorRequest,
+) -> Result<Option<String>, String> {
+    Ok(None)
 }
 
 /// Web fallback for `publish_adp_listing`.
@@ -439,6 +505,24 @@ pub async fn invoke_discover_campaigns(
     .await
 }
 
+#[cfg(not(feature = "web"))]
+pub async fn invoke_discover_campaign_summaries(
+    request: DiscoverCampaignSummariesRequest,
+) -> Result<Vec<CampaignSummary>, String> {
+    crate::tauri_invoke::invoke(
+        "discover_campaign_summaries",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_discover_campaign_summaries(
+    _request: DiscoverCampaignSummariesRequest,
+) -> Result<Vec<CampaignSummary>, String> {
+    Ok(Vec::new())
+}
+
 #[cfg(feature = "web")]
 pub async fn invoke_discover_campaigns(
     _request: DiscoverCampaignsRequest,
@@ -455,6 +539,24 @@ pub async fn invoke_publish_campaign(
         serde_json::json!({ "request": request }),
     )
     .await
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_update_campaign_pointer(
+    request: UpdateCampaignPointerRequest,
+) -> Result<String, String> {
+    crate::tauri_invoke::invoke(
+        "update_campaign_pointer",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_update_campaign_pointer(
+    _request: UpdateCampaignPointerRequest,
+) -> Result<String, String> {
+    Err("Campaign pointer updates are only available in desktop builds.".to_string())
 }
 
 #[cfg(feature = "web")]
@@ -649,4 +751,38 @@ pub async fn fetch_profile_badges(
     _profile_pubkey: String,
 ) -> Result<Vec<ProfileBadgeEntry>, String> {
     Err("Badge relay display is not yet available on the web target.".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publish_request_serialization_preserves_existing_fulfillment_metadata() {
+        let request = PublishAdpListingRequest {
+            d_tag: "game".to_string(),
+            title: "Game".to_string(),
+            description: "Description".to_string(),
+            price_sats: 0,
+            lud16: None,
+            tags: vec![],
+            images: vec![],
+            fulfillment_mode: FulfillmentMode::Delegate,
+            operator_url: Some("https://operator.example.com".to_string()),
+            servers: vec!["https://dist.example.com".to_string()],
+            file_path: None,
+            existing_file_hash: Some("hash".to_string()),
+            existing_fulfillment_pubkey: Some("delegated-key".to_string()),
+            existing_fulfillment_valid_from: Some(123),
+            existing_fulfillment_revoked_at: Some(456),
+            version: Some("1.0.0".to_string()),
+            platforms: vec!["linux-x86_64".to_string()],
+        };
+
+        let value = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(value["existing_fulfillment_pubkey"], "delegated-key");
+        assert_eq!(value["existing_fulfillment_valid_from"], 123);
+        assert_eq!(value["existing_fulfillment_revoked_at"], 456);
+    }
 }

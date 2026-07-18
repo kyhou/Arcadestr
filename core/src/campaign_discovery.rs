@@ -62,7 +62,7 @@ impl<'a> CampaignDiscoveryService<'a> {
                     .await
                     .or_else(|_| Ok::<_, RelayManagerError>(Vec::new()))?
             } else {
-                self.relays.fetch_events_best_effort(filter).await?
+                campaign_query_events(self.relays.fetch_events_best_effort(filter).await)?
             };
             pointer_events.extend(fetched);
         }
@@ -73,10 +73,8 @@ impl<'a> CampaignDiscoveryService<'a> {
                 SingleLetterTag::lowercase(Alphabet::A),
                 [coordinate.to_owned()],
             );
-        let fallback_events = self
-            .relays
-            .fetch_events_best_effort(fallback_filter)
-            .await?;
+        let fallback_events =
+            campaign_query_events(self.relays.fetch_events_best_effort(fallback_filter).await)?;
 
         let mut identities = HashSet::new();
         for event in pointer_events.iter().chain(&fallback_events) {
@@ -93,7 +91,9 @@ impl<'a> CampaignDiscoveryService<'a> {
                 .kind(Kind::Custom(ADP_CAMPAIGN_KIND))
                 .author(publisher)
                 .custom_tags(SingleLetterTag::lowercase(Alphabet::D), [campaign_id]);
-            chain_events.extend(self.relays.fetch_events_best_effort(filter).await?);
+            chain_events.extend(campaign_query_events(
+                self.relays.fetch_events_best_effort(filter).await,
+            )?);
         }
 
         Ok(resolve_campaign_candidates_report(
@@ -105,6 +105,16 @@ impl<'a> CampaignDiscoveryService<'a> {
             coordinate,
             now,
         ))
+    }
+}
+
+fn campaign_query_events(
+    result: Result<Vec<Event>, RelayManagerError>,
+) -> Result<Vec<Event>, CampaignDiscoveryError> {
+    match result {
+        Ok(events) => Ok(events),
+        Err(RelayManagerError::QueryTimeout) => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -208,5 +218,17 @@ pub fn classify_campaign(campaign: &ResolvedCampaign, now: u64) -> CampaignClass
         CampaignClassification::Active
     } else {
         CampaignClassification::Ended
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_campaign_query_is_not_an_error() {
+        let events = campaign_query_events(Err(RelayManagerError::QueryTimeout))
+            .expect("an empty relay result should mean no campaigns");
+        assert!(events.is_empty());
     }
 }

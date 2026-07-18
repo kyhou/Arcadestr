@@ -22,6 +22,8 @@
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
+pub use crate::is_replaceable_event_newer;
+
 // ── Internal deserialization helpers ─────────────────────────────────────────
 // These mirror the raw NIP-15 JSON structures and are private to this module.
 // Downstream code always works with the richer domain types below.
@@ -261,6 +263,9 @@ pub struct CampaignPointer {
 /// A NIP-99 listing (kind 30402/30403) enriched with event-level metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Nip99Listing {
+    /// Signed source event ID.
+    #[serde(default)]
+    pub event_id: String,
     /// Listing UUID from the `d` tag.
     pub id: String,
     pub title: String,
@@ -283,6 +288,24 @@ pub struct Nip99Listing {
     /// First NIP-94 metadata event id from `nip94` tags.
     #[serde(default)]
     pub nip94_event_id: Option<String>,
+    /// ADP distribution server URLs.
+    #[serde(default)]
+    pub servers: Vec<String>,
+    /// SHA-256 artifact hash advertised by ADP fulfillment.
+    #[serde(default)]
+    pub file_hash: Option<String>,
+    /// Published artifact version.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Publisher or delegated fulfillment key.
+    #[serde(default)]
+    pub fulfillment_pubkey: Option<String>,
+    /// First timestamp at which the fulfillment key is valid.
+    #[serde(default)]
+    pub fulfillment_valid_from: Option<u64>,
+    /// Optional fulfillment-key revocation timestamp.
+    #[serde(default)]
+    pub fulfillment_revoked_at: Option<u64>,
     /// Current explicit access policy. Missing or malformed tags fail closed.
     #[serde(default)]
     pub acquisition: AcquisitionPolicy,
@@ -843,6 +866,12 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
     let mut tags: Vec<String> = Vec::new();
     let mut platforms: Vec<String> = Vec::new();
     let mut nip94_event_id: Option<String> = None;
+    let mut servers = Vec::new();
+    let mut file_hash = None;
+    let mut version = None;
+    let mut fulfillment_pubkey = None;
+    let mut fulfillment_valid_from = None;
+    let mut fulfillment_revoked_at = None;
     let mut acquisition = AcquisitionPolicy::Gated;
     let mut acquisition_seen = false;
     let mut campaigns = Vec::new();
@@ -916,6 +945,31 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
                     nip94_event_id = v.get(1).cloned();
                 }
             }
+            Some("server") => {
+                if let Some(server) = v.get(1).filter(|server| !server.is_empty()) {
+                    servers.push(server.clone());
+                }
+            }
+            Some("file_hash") => {
+                if file_hash.is_none() {
+                    file_hash = v.get(1).filter(|hash| !hash.is_empty()).cloned();
+                }
+            }
+            Some("version") => {
+                if version.is_none() {
+                    version = v.get(1).filter(|value| !value.is_empty()).cloned();
+                }
+            }
+            Some("fulfillment_pubkey") => {
+                if fulfillment_pubkey.is_none() {
+                    fulfillment_pubkey = v.get(1).filter(|key| !key.is_empty()).cloned();
+                    fulfillment_valid_from = v.get(2).and_then(|value| value.parse().ok());
+                    fulfillment_revoked_at = v
+                        .get(3)
+                        .filter(|value| !value.is_empty())
+                        .and_then(|value| value.parse().ok());
+                }
+            }
             Some("acquisition") if !acquisition_seen => {
                 acquisition_seen = true;
                 acquisition = match v.as_slice() {
@@ -956,6 +1010,7 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
     let title = title.ok_or_else(|| "Missing required title tag".to_string())?;
 
     Ok(Nip99Listing {
+        event_id: event.id.to_hex(),
         id,
         title,
         content: event.content,
@@ -970,6 +1025,12 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
         tags,
         platforms,
         nip94_event_id,
+        servers,
+        file_hash,
+        version,
+        fulfillment_pubkey,
+        fulfillment_valid_from,
+        fulfillment_revoked_at,
         acquisition,
         campaigns,
         status,
@@ -1117,6 +1178,36 @@ where
         .await
 }
 
+fn record_replaceable_event(
+    seen: &mut std::collections::HashMap<String, (u64, String)>,
+    coordinate: String,
+    candidate_created_at: u64,
+    candidate_event_id: String,
+) -> (bool, bool) {
+    use std::collections::hash_map::Entry;
+
+    match seen.entry(coordinate) {
+        Entry::Vacant(entry) => {
+            entry.insert((candidate_created_at, candidate_event_id));
+            (true, true)
+        }
+        Entry::Occupied(mut entry) => {
+            let current = entry.get();
+            if is_replaceable_event_newer(
+                candidate_created_at,
+                Some(candidate_event_id.as_str()),
+                current.0,
+                Some(current.1.as_str()),
+            ) {
+                entry.insert((candidate_created_at, candidate_event_id));
+                (true, false)
+            } else {
+                (false, false)
+            }
+        }
+    }
+}
+
 pub async fn fetch_nip99_listings_streaming_since<F>(
     relay_manager: &Arc<tokio::sync::Mutex<RelayManager>>,
     limit: usize,
@@ -1127,7 +1218,7 @@ pub async fn fetch_nip99_listings_streaming_since<F>(
 where
     F: FnMut(Nip99Listing) + Send + 'static,
 {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use tokio::sync::Mutex;
 
     let filter = build_filter_since_secs(
@@ -1147,25 +1238,35 @@ where
 
     let manager = relay_manager.lock().await;
 
-    let seen_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let seen_coordinates: Arc<Mutex<HashMap<String, (u64, String)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let product_count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
 
-    let seen_ids_clone = Arc::clone(&seen_ids);
+    let seen_coordinates_clone = Arc::clone(&seen_coordinates);
     let product_count_clone = Arc::clone(&product_count);
 
     let result = manager
         .fetch_events_streaming(filter, 5, 5, move |_relay_url, events| {
             for event in events {
+                let coordinate_pubkey = event.pubkey.to_hex();
                 match parse_listing(event) {
                     Ok(product) => {
-                        if let Ok(mut seen) = seen_ids_clone.try_lock() {
-                            if !seen.contains(&product.id) {
-                                seen.insert(product.id.clone());
+                        if let Ok(mut seen) = seen_coordinates_clone.try_lock() {
+                            let coordinate = format!("30402:{coordinate_pubkey}:{}", product.id);
+                            let (accepted, is_first_coordinate) = record_replaceable_event(
+                                &mut seen,
+                                coordinate,
+                                product.created_at,
+                                product.event_id.clone(),
+                            );
+                            if accepted {
                                 drop(seen);
 
-                                if let Ok(mut count) = product_count_clone.try_lock() {
-                                    *count += 1;
-                                    drop(count);
+                                if is_first_coordinate {
+                                    if let Ok(mut count) = product_count_clone.try_lock() {
+                                        *count += 1;
+                                        drop(count);
+                                    }
                                 }
 
                                 on_product(product);
@@ -1227,6 +1328,7 @@ mod tests {
 
     fn make_nip99_listing(id: &str, platforms: &[&str]) -> Nip99Listing {
         Nip99Listing {
+            event_id: String::new(),
             id: id.into(),
             title: format!("Listing {id}"),
             content: "Markdown body".into(),
@@ -1247,6 +1349,12 @@ mod tests {
                 .map(|platform| (*platform).into())
                 .collect(),
             nip94_event_id: None,
+            servers: Vec::new(),
+            file_hash: None,
+            version: None,
+            fulfillment_pubkey: None,
+            fulfillment_valid_from: None,
+            fulfillment_revoked_at: None,
             acquisition: AcquisitionPolicy::Gated,
             campaigns: Vec::new(),
             raw_event_json: None,
@@ -1270,6 +1378,60 @@ mod tests {
         builder
             .sign_with_keys(&keys)
             .expect("NIP-99 event should sign")
+    }
+
+    #[test]
+    fn replaceable_event_ordering_covers_timestamp_and_event_id_cases() {
+        let cases = [
+            (11, Some("z"), 10, Some("a"), true),
+            (9, Some("a"), 10, Some("z"), false),
+            (10, Some("a"), 10, Some("b"), true),
+            (10, Some("b"), 10, Some("a"), false),
+            (10, Some("a"), 10, Some("a"), false),
+            (10, Some("a"), 10, None, true),
+            (10, None, 10, Some("a"), false),
+            (10, None, 10, None, false),
+        ];
+
+        for (candidate_created_at, candidate_id, current_created_at, current_id, expected) in cases
+        {
+            assert_eq!(
+                is_replaceable_event_newer(
+                    candidate_created_at,
+                    candidate_id,
+                    current_created_at,
+                    current_id,
+                ),
+                expected,
+                "candidate=({candidate_created_at}, {candidate_id:?}), current=({current_created_at}, {current_id:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn recording_replaceable_events_counts_only_the_first_coordinate() {
+        let mut seen = std::collections::HashMap::new();
+        let coordinate = "30402:publisher:game".to_string();
+        let mut count = 0;
+
+        let first = record_replaceable_event(&mut seen, coordinate.clone(), 10, "bbb".to_string());
+        count += u32::from(first.1);
+        assert_eq!(count, 1);
+
+        let replacement =
+            record_replaceable_event(&mut seen, coordinate.clone(), 20, "ccc".to_string());
+        count += u32::from(replacement.1);
+        assert_eq!(count, 1);
+
+        let stale = record_replaceable_event(&mut seen, coordinate, 15, "aaa".to_string());
+        count += u32::from(stale.1);
+
+        assert_eq!(first, (true, true));
+        assert_eq!(replacement, (true, false));
+        assert_eq!(stale, (false, false));
+        assert_eq!(count, 1);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen.values().next(), Some(&(20, "ccc".to_string())));
     }
 
     #[test]
@@ -1315,6 +1477,33 @@ mod tests {
 
         let listing = parse_listing(event).expect("active listing should parse");
         assert_eq!(listing.id, "listing-01");
+    }
+
+    #[test]
+    fn adp_listing_preserves_publisher_management_fields() {
+        let event = make_nip99_event(
+            30402,
+            "ADP listing",
+            vec![
+                vec!["d", "managed-game"],
+                vec!["title", "Managed Game"],
+                vec!["server", "http://localhost:9099"],
+                vec!["file_hash", "abc123"],
+                vec!["version", "1.4.2"],
+                vec!["fulfillment_pubkey", "delegate-key", "1700000000", ""],
+            ],
+        );
+        let event_id = event.id.to_hex();
+
+        let listing = parse_listing(event).expect("ADP listing should parse");
+
+        assert_eq!(listing.event_id, event_id);
+        assert_eq!(listing.servers, vec!["http://localhost:9099"]);
+        assert_eq!(listing.file_hash.as_deref(), Some("abc123"));
+        assert_eq!(listing.version.as_deref(), Some("1.4.2"));
+        assert_eq!(listing.fulfillment_pubkey.as_deref(), Some("delegate-key"));
+        assert_eq!(listing.fulfillment_valid_from, Some(1_700_000_000));
+        assert_eq!(listing.fulfillment_revoked_at, None);
     }
 
     #[test]

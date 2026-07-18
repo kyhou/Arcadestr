@@ -20,6 +20,12 @@ pub mod nip46;
 pub mod saved_users;
 pub mod version;
 
+mod replaceable_event;
+pub use replaceable_event::is_replaceable_event_newer;
+
+mod hash_validation;
+pub use hash_validation::is_sha256_hex;
+
 #[cfg(feature = "native")]
 pub mod relay_cache;
 

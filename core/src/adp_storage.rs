@@ -115,6 +115,34 @@ impl AdpProvisioningRepository {
         Ok(row.map(adp_provisioning_from_row))
     }
 
+    /// Finds all provisioning rows matching a developer, fulfillment key, and scope.
+    ///
+    /// Revoked rows are included so callers can resolve historical listing metadata.
+    ///
+    /// # Errors
+    /// Returns [`AdpStorageError`] if SQLite fails.
+    pub async fn for_fulfillment_scope(
+        &self,
+        developer_npub: &str,
+        fulfillment_pubkey: &str,
+        scope: &str,
+    ) -> Result<Vec<AdpProvisioning>, AdpStorageError> {
+        let rows = sqlx::query(
+            r#"SELECT id, developer_npub, server_url, operator_pubkey, scope,
+               fulfillment_pubkey, attestation_event_id, acceptance_event_id,
+               valid_from, revoked_at, created_at
+               FROM adp_provisioning
+               WHERE developer_npub = ? AND fulfillment_pubkey = ? AND scope = ?"#,
+        )
+        .bind(developer_npub)
+        .bind(fulfillment_pubkey)
+        .bind(scope)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(adp_provisioning_from_row).collect())
+    }
+
     /// Marks all rows for `fulfillment_pubkey` revoked.
     ///
     /// # Errors
@@ -372,6 +400,63 @@ mod tests {
         assert_eq!(first.id, second.id);
         assert_eq!(first.fulfillment_pubkey, second.fulfillment_pubkey);
         assert_eq!(first.scope, second.scope);
+    }
+
+    #[tokio::test]
+    async fn fulfillment_scope_lookup_returns_zero_exact_matches() {
+        let db = test_db().await;
+        let repo = AdpProvisioningRepository::new(db.pool().clone());
+        repo.upsert(&provisioning(Some("other-game")))
+            .await
+            .expect("insert should succeed");
+
+        let found = repo
+            .for_fulfillment_scope("developer", "fulfillment-game", "game")
+            .await
+            .expect("lookup should succeed");
+
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fulfillment_scope_lookup_returns_one_revoked_exact_match() {
+        let db = test_db().await;
+        let repo = AdpProvisioningRepository::new(db.pool().clone());
+        let mut entry = provisioning(Some("game"));
+        entry.revoked_at = Some(99);
+        repo.upsert(&entry).await.expect("insert should succeed");
+
+        let found = repo
+            .for_fulfillment_scope("developer", "fulfillment-game", "game")
+            .await
+            .expect("lookup should succeed");
+
+        assert_eq!(found, vec![entry]);
+    }
+
+    #[tokio::test]
+    async fn fulfillment_scope_lookup_returns_multiple_exact_matches() {
+        let db = test_db().await;
+        let repo = AdpProvisioningRepository::new(db.pool().clone());
+        let first = provisioning(Some("game"));
+        let mut second = first.clone();
+        second.id = "prov-game-second".to_string();
+        second.server_url = "https://operator-two.example.com".to_string();
+        repo.upsert(&first)
+            .await
+            .expect("first insert should succeed");
+        repo.upsert(&second)
+            .await
+            .expect("second insert should succeed");
+
+        let found = repo
+            .for_fulfillment_scope("developer", "fulfillment-game", "game")
+            .await
+            .expect("lookup should succeed");
+
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|entry| entry.id == first.id));
+        assert!(found.iter().any(|entry| entry.id == second.id));
     }
 
     #[tokio::test]

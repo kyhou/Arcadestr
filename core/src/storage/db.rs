@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS marketplace_listings (
     price_frequency TEXT,
     download_url TEXT NOT NULL,
     tags_json TEXT NOT NULL DEFAULT '[]',
+    specs_json TEXT NOT NULL DEFAULT '[]',
     images_json TEXT NOT NULL DEFAULT '[]',
     platforms_json TEXT NOT NULL DEFAULT '[]',
     nip94_event_id TEXT,
@@ -269,6 +270,7 @@ impl Database {
 
         Self::ensure_marketplace_cache_platforms_column(pool).await?;
         Self::ensure_marketplace_cache_nip94_event_id_column(pool).await?;
+        Self::ensure_marketplace_cache_specs_column(pool).await?;
 
         Ok(())
     }
@@ -330,6 +332,34 @@ impl Database {
                         e
                     ))
                 })?;
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_marketplace_cache_specs_column(pool: &SqlitePool) -> Result<(), DatabaseError> {
+        let column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('marketplace_listings') WHERE name = 'specs_json'",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|error| {
+            DatabaseError::Migration(format!(
+                "Failed checking marketplace specs_json column: {error}"
+            ))
+        })?;
+
+        if column_count == 0 {
+            sqlx::query(
+                "ALTER TABLE marketplace_listings ADD COLUMN specs_json TEXT NOT NULL DEFAULT '[]'",
+            )
+            .execute(pool)
+            .await
+            .map_err(|error| {
+                DatabaseError::Migration(format!(
+                    "Failed adding marketplace specs_json column: {error}"
+                ))
+            })?;
         }
 
         Ok(())

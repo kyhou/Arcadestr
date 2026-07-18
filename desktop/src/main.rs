@@ -380,8 +380,9 @@ fn listing_signature(listing: &CoreGameListing) -> String {
     let tags_json = serde_json::to_string(&listing.tags).unwrap_or_else(|_| "[]".to_string());
     let platforms_json =
         serde_json::to_string(&listing.platforms).unwrap_or_else(|_| "[]".to_string());
+    let specs_json = serde_json::to_string(&listing.specs).unwrap_or_else(|_| "[]".to_string());
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         listing.publisher_npub,
         listing.id,
         listing.title,
@@ -391,7 +392,9 @@ fn listing_signature(listing: &CoreGameListing) -> String {
         listing.created_at,
         tags_json,
         platforms_json,
-        listing.nip94_event_id.as_deref().unwrap_or_default()
+        listing.nip94_event_id.as_deref().unwrap_or_default(),
+        specs_json,
+        listing.event_id.as_deref().unwrap_or_default()
     )
 }
 
@@ -852,12 +855,12 @@ fn app_listing_from_cached_listing(listing: CoreGameListing) -> AppGameListing {
         price_sats: listing.price_sats,
         quantity: None,
         tags: listing.tags,
-        specs: Vec::new(),
+        specs: listing.specs,
         publisher_npub: listing.publisher_npub,
         stall_id: String::new(),
         stall_name: None,
         lud16: listing.lud16,
-        event_id: None,
+        event_id: listing.event_id,
         created_at: listing.created_at,
         platforms: listing.platforms,
         nip94_event_id: listing.nip94_event_id,
@@ -1482,7 +1485,11 @@ async fn fetch_marketplace_stream(
     let mut unchanged = 0usize;
 
     for listing in updates {
-        match state.marketplace_cache.upsert_listing(&listing, None).await {
+        match state
+            .marketplace_cache
+            .upsert_listing(&listing, listing.event_id.as_deref())
+            .await
+        {
             Ok(UpsertOutcome::Inserted) => upserted += 1,
             Ok(UpsertOutcome::Updated) => updated += 1,
             Ok(UpsertOutcome::Unchanged) => unchanged += 1,
@@ -2366,6 +2373,7 @@ mod task4_tests {
         merchant_npub: String,
     ) -> arcadestr_core::marketplace::Nip99Listing {
         arcadestr_core::marketplace::Nip99Listing {
+            event_id: String::new(),
             id: "game-v1".to_string(),
             title: "Game".to_string(),
             content: String::new(),
@@ -2382,6 +2390,12 @@ mod task4_tests {
             created_at: 0,
             platforms: Vec::new(),
             nip94_event_id: None,
+            servers: Vec::new(),
+            file_hash: None,
+            version: None,
+            fulfillment_pubkey: None,
+            fulfillment_valid_from: None,
+            fulfillment_revoked_at: None,
             acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
             campaigns: Vec::new(),
             status: None,
@@ -2429,6 +2443,7 @@ mod task4_tests {
     fn listing_signature_includes_platform_tags() {
         let linux_listing = CoreGameListing {
             id: "game-v1".to_string(),
+            event_id: None,
             source: ListingSource::Nip99Listing,
             title: "Game".to_string(),
             description: "Description".to_string(),
@@ -2437,6 +2452,7 @@ mod task4_tests {
             publisher_npub: "npub1publisher".to_string(),
             created_at: 1,
             tags: Vec::new(),
+            specs: Vec::new(),
             lud16: String::new(),
             images: Vec::new(),
             platforms: vec!["linux-x86_64".to_string()],
@@ -2521,6 +2537,7 @@ mod task4_tests {
     fn cached_core_listing_maps_to_app_listing_with_defaults() {
         let cached = CoreGameListing {
             id: "game-v1".to_string(),
+            event_id: None,
             source: ListingSource::Nip99Listing,
             title: "Game".to_string(),
             description: "Description".to_string(),
@@ -2529,6 +2546,7 @@ mod task4_tests {
             publisher_npub: "npub1publisher".to_string(),
             created_at: 7,
             tags: vec!["arcade".to_string()],
+            specs: Vec::new(),
             lud16: "merchant@example.com".to_string(),
             images: vec!["https://example.com/cover.png".to_string()],
             platforms: vec!["linux-x86_64".to_string()],
@@ -4740,7 +4758,9 @@ fn main() {
             adp_commands::check_adp_server,
             adp_commands::discover_adp_servers,
             adp_commands::discover_campaigns,
+            adp_commands::discover_campaign_summaries,
             adp_commands::publish_campaign,
+            adp_commands::update_campaign_pointer,
             adp_commands::hash_build_file,
             adp_commands::select_build_file,
             adp_commands::connect_nwc_wallet,
@@ -4748,6 +4768,7 @@ fn main() {
             adp_commands::pay_nwc_invoice,
             adp_commands::confirm_purchase,
             adp_commands::claim_entitlement,
+            adp_commands::resolve_adp_operator,
             adp_commands::publish_adp_listing,
             fetch_listings,
             fetch_listing_by_id,

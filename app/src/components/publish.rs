@@ -1,15 +1,18 @@
 // ADP publish view component.
 
 use leptos::prelude::*;
+use nostr::nips::nip19::FromBech32;
 use wasm_bindgen_futures::spawn_local;
+
+use arcadestr_core::is_sha256_hex;
 
 use crate::tauri_bridge::{
     invoke_check_adp_server, invoke_discover_adp_servers, invoke_hash_build_file,
-    invoke_publish_adp_listing, invoke_select_build_file, listen_publish_progress,
-    AdpServerAnnouncement, FulfillmentMode, HashBuildFileRequest, PublishAdpListingRequest,
-    PublishProgressPayload,
+    invoke_publish_adp_listing, invoke_resolve_adp_operator, invoke_select_build_file,
+    listen_publish_progress, AdpServerAnnouncement, FulfillmentMode, HashBuildFileRequest,
+    PublishAdpListingRequest, PublishProgressPayload, ResolveAdpOperatorRequest,
 };
-use crate::AuthContext;
+use crate::{AuthContext, GameListing};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServerEntry {
@@ -56,7 +59,7 @@ fn validate_listing(
     lud16: &str,
     fulfillment_enabled: bool,
     servers: &[ServerEntry],
-    file_path: &Option<String>,
+    _file_path: &Option<String>,
     file_hash: &Option<String>,
     version: &str,
     fulfillment_mode: &FulfillmentMode,
@@ -110,11 +113,20 @@ fn validate_listing(
                 "Server URL must start with http:// or https://: {bad_url}"
             ));
         }
-        if file_path.as_deref().unwrap_or_default().is_empty() || file_hash.is_none() {
-            return Err(
-                "Select a build file and wait for its hash before publishing fulfillment"
-                    .to_string(),
-            );
+        match file_hash.as_deref() {
+            None => {
+                return Err(
+                    "Select a build file and wait for its hash before publishing fulfillment"
+                        .to_string(),
+                );
+            }
+            Some(hash) if !is_sha256_hex(hash) => {
+                return Err(
+                    "Existing SHA-256 metadata is invalid; select a replacement build file"
+                        .to_string(),
+                );
+            }
+            Some(_) => {}
         }
         if version.trim().is_empty() {
             return Err("Version is required for fulfillment".to_string());
@@ -146,6 +158,14 @@ fn parse_csv_values(input: &str) -> Vec<String> {
         .collect()
 }
 
+fn format_sha256(hash: &str) -> String {
+    if !is_sha256_hex(hash) {
+        return "Invalid SHA-256 metadata".to_string();
+    }
+
+    format!("{}...{}", &hash[..12], &hash[52..])
+}
+
 fn parse_platform_tags(input: &str) -> Result<Vec<String>, String> {
     input
         .split(',')
@@ -163,9 +183,136 @@ fn parse_platform_tags(input: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+fn listing_spec(listing: &GameListing, key: &str) -> Option<String> {
+    listing
+        .specs
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
+}
+
+fn listing_servers(listing: &GameListing) -> Vec<String> {
+    listing
+        .specs
+        .iter()
+        .filter(|(name, value)| name == "server" && !value.is_empty())
+        .map(|(_, value)| value.clone())
+        .collect()
+}
+
+fn listing_fulfillment_mode(listing: &GameListing) -> FulfillmentMode {
+    let Some(fulfillment_pubkey) = listing_spec(listing, "fulfillment_pubkey") else {
+        return FulfillmentMode::None;
+    };
+    match nostr::PublicKey::from_bech32(&listing.publisher_npub) {
+        Ok(publisher) if publisher.to_hex() == fulfillment_pubkey => FulfillmentMode::Direct,
+        Ok(_) => FulfillmentMode::Delegate,
+        Err(_) => FulfillmentMode::None,
+    }
+}
+
+fn listing_fulfillment_metadata(
+    listing: &GameListing,
+) -> (Option<String>, Option<u64>, Option<u64>) {
+    (
+        listing_spec(listing, "fulfillment_pubkey"),
+        listing_spec(listing, "fulfillment_valid_from").and_then(|value| value.parse().ok()),
+        listing_spec(listing, "fulfillment_revoked_at").and_then(|value| value.parse().ok()),
+    )
+}
+
+fn initial_operator_url() -> String {
+    String::new()
+}
+
+fn operator_resolution_request(listing: &GameListing) -> Option<ResolveAdpOperatorRequest> {
+    if !matches!(listing_fulfillment_mode(listing), FulfillmentMode::Delegate) {
+        return None;
+    }
+    let fulfillment_pubkey = listing_spec(listing, "fulfillment_pubkey")?;
+    Some(ResolveAdpOperatorRequest {
+        publisher_npub: listing.publisher_npub.clone(),
+        fulfillment_pubkey,
+        scope: listing.id.clone(),
+    })
+}
+
+fn operator_prefill_update(
+    current_operator_url: &str,
+    resolution: Result<Option<String>, String>,
+) -> Option<String> {
+    if !current_operator_url.is_empty() {
+        return None;
+    }
+    match resolution {
+        Ok(Some(url)) => Some(url),
+        Ok(None) | Err(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn format_sha256_abbreviates_valid_ascii_hex() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        assert_eq!(format_sha256(hash), "0123456789ab...456789abcdef");
+    }
+
+    #[test]
+    fn format_sha256_rejects_malformed_metadata() {
+        for hash in [
+            "",
+            "abc123",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+            "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "é123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+        ] {
+            assert_eq!(format_sha256(hash), "Invalid SHA-256 metadata");
+        }
+    }
+
+    fn managed_listing(publisher_npub: String, fulfillment_pubkey: String) -> GameListing {
+        GameListing {
+            id: "managed-game".into(),
+            source: crate::models::ListingSource::Nip99Listing,
+            title: "Managed Game".into(),
+            description: "Description".into(),
+            images: Vec::new(),
+            download_url: String::new(),
+            price: 0.0,
+            currency: "SATS".into(),
+            price_sats: 0,
+            quantity: None,
+            tags: Vec::new(),
+            specs: vec![
+                ("server".into(), "http://localhost:9099".into()),
+                ("version".into(), "1.4.2".into()),
+                ("file_hash".into(), VALID_SHA256.into()),
+                ("fulfillment_pubkey".into(), fulfillment_pubkey),
+                ("fulfillment_valid_from".into(), "1710000000".into()),
+                ("fulfillment_revoked_at".into(), "1710000999".into()),
+            ],
+            publisher_npub,
+            stall_id: String::new(),
+            stall_name: None,
+            lud16: String::new(),
+            event_id: Some("event-id".into()),
+            created_at: 1,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            acquisition: crate::models::AcquisitionPolicy::Gated,
+            campaigns: Vec::new(),
+            is_owned: false,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
+        }
+    }
 
     #[test]
     fn parse_platform_tags_trims_values_and_discards_empty_entries() {
@@ -193,32 +340,224 @@ mod tests {
 
         assert_eq!(err, "Platform tags must look like <os>-<arch>");
     }
+
+    #[test]
+    fn existing_fulfillment_hash_does_not_require_reselecting_build_file() {
+        let result = validate_listing(
+            "managed-game",
+            "Managed Game",
+            "Description",
+            0,
+            "",
+            true,
+            &[ServerEntry {
+                url: "http://localhost:9099".into(),
+                label: "Published server".into(),
+                reachability: ServerStatus::Ok,
+                upload: ServerStatus::Idle,
+                auto_operator: false,
+            }],
+            &None,
+            &Some(VALID_SHA256.into()),
+            "1.4.2",
+            &FulfillmentMode::Delegate,
+            "http://localhost:9099",
+        );
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn malformed_existing_fulfillment_hash_requires_replacement_file() {
+        let result = validate_listing(
+            "managed-game",
+            "Managed Game",
+            "Description",
+            0,
+            "",
+            true,
+            &[ServerEntry {
+                url: "http://localhost:9099".into(),
+                label: "Published server".into(),
+                reachability: ServerStatus::Ok,
+                upload: ServerStatus::Idle,
+                auto_operator: false,
+            }],
+            &None,
+            &Some("abc123".into()),
+            "1.4.2",
+            &FulfillmentMode::Delegate,
+            "http://localhost:9099",
+        );
+
+        assert_eq!(
+            result,
+            Err("Existing SHA-256 metadata is invalid; select a replacement build file".into())
+        );
+    }
+
+    #[test]
+    fn delegated_publication_defaults_are_recovered_from_listing_specs() {
+        use nostr::nips::nip19::ToBech32;
+
+        let publisher = nostr::Keys::generate();
+        let delegate = nostr::Keys::generate();
+        let listing = managed_listing(
+            publisher
+                .public_key()
+                .to_bech32()
+                .expect("publisher npub should encode"),
+            delegate.public_key().to_hex(),
+        );
+
+        assert_eq!(listing_servers(&listing), vec!["http://localhost:9099"]);
+        assert_eq!(listing_spec(&listing, "version").as_deref(), Some("1.4.2"));
+        assert_eq!(
+            listing_spec(&listing, "file_hash").as_deref(),
+            Some(VALID_SHA256)
+        );
+        assert_eq!(
+            listing_fulfillment_mode(&listing),
+            FulfillmentMode::Delegate
+        );
+        assert_eq!(
+            listing_fulfillment_metadata(&listing),
+            (
+                Some(delegate.public_key().to_hex()),
+                Some(1_710_000_000),
+                Some(1_710_000_999),
+            )
+        );
+        assert_eq!(initial_operator_url(), "");
+
+        let request = operator_resolution_request(&listing)
+            .expect("delegated edit should request an exact local operator lookup");
+        assert_eq!(request.publisher_npub, listing.publisher_npub);
+        assert_eq!(request.fulfillment_pubkey, delegate.public_key().to_hex());
+        assert_eq!(request.scope, "managed-game");
+    }
+
+    #[test]
+    fn operator_prefill_only_applies_unique_success_to_empty_input() {
+        assert_eq!(
+            operator_prefill_update("", Ok(Some("https://operator.example.com".to_string())))
+                .as_deref(),
+            Some("https://operator.example.com")
+        );
+        assert_eq!(
+            operator_prefill_update(
+                "https://manual.example.com",
+                Ok(Some("https://operator.example.com".to_string()))
+            ),
+            None
+        );
+        assert_eq!(operator_prefill_update("", Ok(None)), None);
+        assert_eq!(
+            operator_prefill_update("", Err("lookup failed".to_string())),
+            None
+        );
+    }
 }
 
 /// Publish view component - form for creating NIP-99 listings with optional ADP fulfillment.
 #[component]
-pub fn PublishView() -> impl IntoView {
+pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
+    let editing = listing.is_some();
+    let published_servers = listing.as_ref().map(listing_servers).unwrap_or_default();
+    let published_fulfillment_mode = listing
+        .as_ref()
+        .map(listing_fulfillment_mode)
+        .unwrap_or(FulfillmentMode::None);
+    let existing_file_hash = listing
+        .as_ref()
+        .and_then(|item| listing_spec(item, "file_hash"));
+    let (
+        existing_fulfillment_pubkey,
+        existing_fulfillment_valid_from,
+        existing_fulfillment_revoked_at,
+    ) = listing
+        .as_ref()
+        .map(listing_fulfillment_metadata)
+        .unwrap_or((None, None, None));
+    let operator_resolution = listing.as_ref().and_then(operator_resolution_request);
 
-    let id = RwSignal::new(String::new());
-    let title = RwSignal::new(String::new());
-    let description = RwSignal::new(String::new());
-    let image_input = RwSignal::new(String::new());
-    let tag_input = RwSignal::new(String::new());
-    let price_sats = RwSignal::new(0u64);
-    let platforms_input = RwSignal::new(String::new());
-    let lud16 = RwSignal::new(String::new());
-    let fulfillment_enabled = RwSignal::new(false);
-    let fulfillment_mode = RwSignal::new(FulfillmentMode::None);
+    let id = RwSignal::new(
+        listing
+            .as_ref()
+            .map(|item| item.id.clone())
+            .unwrap_or_default(),
+    );
+    let title = RwSignal::new(
+        listing
+            .as_ref()
+            .map(|item| item.title.clone())
+            .unwrap_or_default(),
+    );
+    let description = RwSignal::new(
+        listing
+            .as_ref()
+            .map(|item| item.description.clone())
+            .unwrap_or_default(),
+    );
+    let image_input = RwSignal::new(
+        listing
+            .as_ref()
+            .map(|item| item.images.join(", "))
+            .unwrap_or_default(),
+    );
+    let tag_input = RwSignal::new(
+        listing
+            .as_ref()
+            .map(|item| item.tags.join(", "))
+            .unwrap_or_default(),
+    );
+    let price_sats = RwSignal::new(
+        listing
+            .as_ref()
+            .map(|item| item.price_sats)
+            .unwrap_or_default(),
+    );
+    let platforms_input = RwSignal::new(
+        listing
+            .as_ref()
+            .map(|item| item.platforms.join(", "))
+            .unwrap_or_default(),
+    );
+    let lud16 = RwSignal::new(
+        listing
+            .as_ref()
+            .map(|item| item.lud16.clone())
+            .unwrap_or_default(),
+    );
+    let fulfillment_enabled =
+        RwSignal::new(!matches!(published_fulfillment_mode, FulfillmentMode::None));
+    let fulfillment_mode = RwSignal::new(published_fulfillment_mode);
     let discovered_servers = RwSignal::new(Vec::<AdpServerAnnouncement>::new());
     let discovery_error = RwSignal::new(None::<String>);
-    let servers = RwSignal::new(Vec::<ServerEntry>::new());
+    let servers = RwSignal::new(
+        published_servers
+            .iter()
+            .map(|url| ServerEntry {
+                url: url.clone(),
+                label: "Published server".into(),
+                reachability: ServerStatus::Pending,
+                upload: ServerStatus::Idle,
+                auto_operator: false,
+            })
+            .collect::<Vec<_>>(),
+    );
     let custom_server = RwSignal::new(String::new());
-    let operator_url = RwSignal::new(String::new());
+    let operator_url = RwSignal::new(initial_operator_url());
     let operator_auto_added = RwSignal::new(None::<String>);
     let file_path = RwSignal::new(None::<String>);
-    let file_hash = RwSignal::new(None::<String>);
-    let version = RwSignal::new(String::new());
+    let file_hash = RwSignal::new(existing_file_hash);
+    let version = RwSignal::new(
+        listing
+            .as_ref()
+            .and_then(|item| listing_spec(item, "version"))
+            .unwrap_or_default(),
+    );
 
     let is_publishing = RwSignal::new(false);
     let is_hashing = RwSignal::new(false);
@@ -289,6 +628,20 @@ pub fn PublishView() -> impl IntoView {
         });
     });
 
+    if let Some(request) = operator_resolution {
+        Effect::new(move |_| {
+            let request = request.clone();
+            spawn_local(async move {
+                let resolution = invoke_resolve_adp_operator(request).await;
+                if let Some(resolved) =
+                    operator_prefill_update(&operator_url.get_untracked(), resolution)
+                {
+                    operator_url.set(resolved);
+                }
+            });
+        });
+    }
+
     let on_add_custom_server = move |_| {
         let url = custom_server.get();
         add_server(url.clone(), url.clone(), false);
@@ -296,6 +649,9 @@ pub fn PublishView() -> impl IntoView {
     };
 
     let on_select_file = move |_| {
+        if is_hashing.get_untracked() || is_publishing.get_untracked() {
+            return;
+        }
         is_hashing.set(true);
         error_message.set(None);
         spawn_local(async move {
@@ -316,6 +672,9 @@ pub fn PublishView() -> impl IntoView {
     };
 
     let on_submit = move |_| {
+        if is_hashing.get_untracked() || is_publishing.get_untracked() {
+            return;
+        }
         if auth.npub.get().is_none() {
             error_message.set(Some("Not authenticated".to_string()));
             return;
@@ -376,6 +735,10 @@ pub fn PublishView() -> impl IntoView {
             operator_url: (!operator_url_val.trim().is_empty()).then_some(operator_url_val),
             servers: servers_val.into_iter().map(|entry| entry.url).collect(),
             file_path: file_path_val,
+            existing_file_hash: file_hash_val,
+            existing_fulfillment_pubkey: existing_fulfillment_pubkey.clone(),
+            existing_fulfillment_valid_from,
+            existing_fulfillment_revoked_at,
             version: (!version_val.trim().is_empty()).then_some(version_val),
             platforms,
         };
@@ -391,7 +754,7 @@ pub fn PublishView() -> impl IntoView {
         });
 
         spawn_local(async move {
-            let _listener = listen_publish_progress(move |payload| {
+            let listener_cleanup = listen_publish_progress(move |payload| {
                 if payload.step == "upload" {
                     if let Some(server_url) = payload.server_url.clone() {
                         let status = match payload.status.as_str() {
@@ -414,7 +777,11 @@ pub fn PublishView() -> impl IntoView {
             .await
             .ok();
 
-            match invoke_publish_adp_listing(request).await {
+            let publish_result = invoke_publish_adp_listing(request).await;
+            if let Some(cleanup) = listener_cleanup {
+                cleanup();
+            }
+            match publish_result {
                 Ok(result) => {
                     success_message.set(Some(format!("Published listing {}", result.event_id)));
                 }
@@ -428,11 +795,11 @@ pub fn PublishView() -> impl IntoView {
         <div class="max-w-6xl mx-auto px-8 py-10">
             <header class="mb-10 flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
                 <div>
-                    <h1 class="text-5xl font-extrabold font-headline tracking-tighter mb-2">"Publish "<span class="text-primary italic">"New Game"</span></h1>
+                    <h1 class="text-5xl font-extrabold font-headline tracking-tighter mb-2">{if editing { "Edit " } else { "Publish " }}<span class="text-primary italic">{if editing { "Publication" } else { "New Game" }}</span></h1>
                     <p class="text-on-surface-variant max-w-xl">"Create a Buy-only listing, or add the fulfillment tier for one-click install. Metadata is signed by your active Nostr signer."</p>
                 </div>
-                <button class="px-8 py-3 rounded-md bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold shadow-lg shadow-primary/20 active:scale-95 transition-all" on:click={on_submit} disabled={move || is_publishing.get()}>
-                    {move || if is_publishing.get() { "Publishing..." } else { "Publish to Nostr" }}
+                <button class="px-8 py-3 rounded-md bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold shadow-lg shadow-primary/20 active:scale-95 transition-all" on:click={on_submit} disabled={move || is_hashing.get() || is_publishing.get()}>
+                    {move || if is_publishing.get() { "Publishing..." } else if editing { "Update publication" } else { "Publish to Nostr" }}
                 </button>
             </header>
 
@@ -580,10 +947,10 @@ pub fn PublishView() -> impl IntoView {
                                 <div class="grid md:grid-cols-2 gap-5">
                                     <div>
                                         <label class="block text-xs font-bold uppercase tracking-widest text-secondary mb-2">"Build File"</label>
-                                        <button class="w-full rounded-md bg-surface-container-highest p-3 text-left" on:click={on_select_file} disabled={move || is_hashing.get()}>
+                                        <button class="w-full rounded-md bg-surface-container-highest p-3 text-left" on:click={on_select_file} disabled={move || is_hashing.get() || is_publishing.get()}>
                                             {move || if is_hashing.get() { "Hashing...".to_string() } else { file_path.get().unwrap_or_else(|| "Select archive".to_string()) }}
                                         </button>
-                                        <p class="text-xs text-on-surface-variant mt-2">{move || file_hash.get().map(|hash| format!("SHA-256: {}...{}", &hash[..12], &hash[hash.len() - 12..])).unwrap_or_else(|| "Hash appears after file selection.".to_string())}</p>
+                                        <p class="text-xs text-on-surface-variant mt-2">{move || file_hash.get().map(|hash| format!("SHA-256: {}", format_sha256(&hash))).unwrap_or_else(|| "Hash appears after file selection.".to_string())}</p>
                                     </div>
                                     <div>
                                         <label class="block text-xs font-bold uppercase tracking-widest text-secondary mb-2">"Version"</label>

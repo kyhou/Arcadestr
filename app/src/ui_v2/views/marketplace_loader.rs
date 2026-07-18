@@ -1,9 +1,12 @@
 //! Shared marketplace listing loader and presentation helpers for UI v2 views.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+use std::rc::Rc;
+
+use arcadestr_core::is_replaceable_event_newer;
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::invoke_fetch_marketplace_stream;
@@ -143,20 +146,30 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                 // reducing per-event re-renders while keeping loading progressive.
                 let buffer: Rc<RefCell<Vec<GameListing>>> = Rc::new(RefCell::new(Vec::new()));
                 let flush_queued: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+                let received_coordinates: Rc<RefCell<HashSet<(String, String)>>> =
+                    Rc::new(RefCell::new(HashSet::new()));
 
                 let on_listing = {
                     let buffer = Rc::clone(&buffer);
                     let flush_queued = Rc::clone(&flush_queued);
+                    let received_coordinates = Rc::clone(&received_coordinates);
                     let listings = listings.clone();
                     let loading = loading.clone();
                     let store_for_listing = store_for_listing.clone();
 
                     move |listing: GameListing| {
+                        let is_first_coordinate = mark_received_coordinate(
+                            &mut *received_coordinates.borrow_mut(),
+                            &listing,
+                        );
+
                         // Immediately persist to the global store (deduplicating)
                         let store_ref = store_for_listing.clone();
                         let listing_for_store = listing.clone();
                         batch(move || {
-                            received_count.update(|count| *count += 1);
+                            if is_first_coordinate {
+                                received_count.update(|count| *count += 1);
+                            }
                             if let Some(s) = &store_ref {
                                 s.put_streaming(listing_for_store);
                             }
@@ -185,8 +198,7 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                                     batch(move || {
                                         listings.update(|items| {
                                             for item in queued {
-                                                if !items.iter().any(|e| e.id == item.id) {
-                                                    items.push(item);
+                                                if upsert_latest_listing(items, item) {
                                                     items.truncate(target_limit);
                                                 }
                                             }
@@ -223,9 +235,7 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                             if !remaining.is_empty() {
                                 listings.update(|items| {
                                     for item in remaining {
-                                        if !items.iter().any(|e| e.id == item.id) {
-                                            items.push(item);
-                                        }
+                                        let _ = upsert_latest_listing(items, item);
                                     }
                                     items.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at));
                                     items.truncate(target_limit);
@@ -314,6 +324,33 @@ fn recent_listings(mut listings: Vec<GameListing>, limit: usize) -> Vec<GameList
     listings.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     listings.truncate(limit);
     listings
+}
+
+fn mark_received_coordinate(seen: &mut HashSet<(String, String)>, listing: &GameListing) -> bool {
+    seen.insert((listing.publisher_npub.clone(), listing.id.clone()))
+}
+
+fn upsert_latest_listing(listings: &mut Vec<GameListing>, listing: GameListing) -> bool {
+    match listings.iter_mut().find(|current| {
+        current.publisher_npub == listing.publisher_npub && current.id == listing.id
+    }) {
+        Some(current)
+            if is_replaceable_event_newer(
+                listing.created_at,
+                listing.event_id.as_deref(),
+                current.created_at,
+                current.event_id.as_deref(),
+            ) =>
+        {
+            *current = listing;
+            false
+        }
+        Some(_) => false,
+        None => {
+            listings.push(listing);
+            true
+        }
+    }
 }
 
 fn has_reached_listing_limit(listing_count: usize, limit: usize) -> bool {
@@ -535,5 +572,57 @@ mod tests {
     fn pagination_exhausts_only_when_page_returns_no_new_items() {
         assert!(has_more_after_page(50, 51));
         assert!(!has_more_after_page(50, 50));
+    }
+
+    #[test]
+    fn upsert_latest_listing_rejects_stale_listing_after_newer_listing() {
+        let mut stale = listing_with_sats(0);
+        stale.created_at = 10;
+        let mut newer = stale.clone();
+        newer.created_at = 20;
+        let mut listings = Vec::new();
+
+        assert!(upsert_latest_listing(&mut listings, newer.clone()));
+        assert!(!upsert_latest_listing(&mut listings, stale));
+
+        assert_eq!(listings, vec![newer]);
+    }
+
+    #[test]
+    fn upsert_latest_listing_uses_lower_event_id_for_equal_timestamps_in_both_orders() {
+        let mut lower_id = listing_with_sats(0);
+        lower_id.created_at = 20;
+        lower_id.event_id = Some("aaa".into());
+        let mut higher_id = lower_id.clone();
+        higher_id.event_id = Some("bbb".into());
+
+        for arrivals in [
+            [higher_id.clone(), lower_id.clone()],
+            [lower_id.clone(), higher_id.clone()],
+        ] {
+            let mut listings = Vec::new();
+            for listing in arrivals {
+                upsert_latest_listing(&mut listings, listing);
+            }
+
+            assert_eq!(listings, vec![lower_id.clone()]);
+        }
+    }
+
+    #[test]
+    fn received_coordinates_count_replacements_only_once() {
+        let first = listing_with_sats(0);
+        let mut replacement = first.clone();
+        replacement.event_id = Some("replacement".into());
+        let mut other_publisher = first.clone();
+        other_publisher.publisher_npub = "npub1other".into();
+        let mut seen = std::collections::HashSet::new();
+
+        let unique_count = [first, replacement, other_publisher]
+            .iter()
+            .filter(|listing| mark_received_coordinate(&mut seen, listing))
+            .count();
+
+        assert_eq!(unique_count, 2);
     }
 }

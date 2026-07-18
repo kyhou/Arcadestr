@@ -7,7 +7,7 @@ use crate::ui_v2::components::{NavItem, TopBar};
 use crate::ui_v2::theme::UI_V2_STYLES;
 use crate::ui_v2::views::{
     AchievementsView, BrowseGamesView, GameDetailView, LibraryView, ProfileV2View, PublishV2View,
-    SocialView, StoreFrontView,
+    PublishViewState, SocialView, StoreFrontView,
 };
 use crate::{
     invoke_get_allow_insecure_public_ws, invoke_get_connected_relays, invoke_logout_nip46,
@@ -22,7 +22,7 @@ enum UiV2View {
     Library,
     Social,
     Achievements,
-    Publish,
+    Publish(PublishViewState),
     Profile,
     Settings,
 }
@@ -166,7 +166,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let set_library = move |_| current_view.set(UiV2View::Library);
     let set_social = move |_| current_view.set(UiV2View::Social);
     let set_achievements = move |_| current_view.set(UiV2View::Achievements);
-    let set_publish = move |_| current_view.set(UiV2View::Publish);
+    let set_publish = move |_| current_view.set(UiV2View::Publish(PublishViewState::Games));
     let set_profile = move |_| current_view.set(UiV2View::Profile);
     let set_settings = move |_| current_view.set(UiV2View::Settings);
     let on_select_listing = Callback::new(move |listing: GameListing| {
@@ -179,7 +179,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
         current_view.set(UiV2View::Store);
     });
     let on_open_publish_from_profile = Callback::new(move |_| {
-        current_view.set(UiV2View::Publish);
+        current_view.set(UiV2View::Publish(PublishViewState::Games));
     });
     let on_open_listing_from_profile = Callback::new(move |listing: GameListing| {
         current_view.set(UiV2View::Detail(listing));
@@ -266,7 +266,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                     <NavItem
                         label="Publish"
                         icon="upload"
-                        active={Signal::derive(move || current_view.get() == UiV2View::Publish)}
+                        active={Signal::derive(move || matches!(current_view.get(), UiV2View::Publish(_)))}
                         on_click={Callback::new(set_publish)}
                     />
                     <NavItem
@@ -359,8 +359,9 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                             view! { <div class="max-w-[1600px] mx-auto p-8"><AchievementsView /></div> }
                                 .into_any()
                         }
-                        UiV2View::Publish => {
-                            view! { <div class="max-w-[1600px] mx-auto p-8"><PublishV2View /></div> }
+                        UiV2View::Publish(state) => {
+                            let on_navigate = Callback::new(move |state| current_view.set(UiV2View::Publish(state)));
+                            view! { <div class="max-w-[1600px] mx-auto p-8"><PublishV2View state=state on_navigate=on_navigate /></div> }
                                 .into_any()
                         }
                         UiV2View::Profile => view! {

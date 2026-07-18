@@ -255,6 +255,32 @@ impl GameListing {
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     pub fn from_listing(listing: arcadestr_core::marketplace::Nip99Listing) -> Self {
         let download_url = listing.images.first().cloned().unwrap_or_default();
+        let mut specs = listing
+            .servers
+            .iter()
+            .map(|server| ("server".to_string(), server.clone()))
+            .collect::<Vec<_>>();
+        for (key, value) in [
+            ("file_hash", listing.file_hash.clone()),
+            ("version", listing.version.clone()),
+            ("fulfillment_pubkey", listing.fulfillment_pubkey.clone()),
+            (
+                "fulfillment_valid_from",
+                listing
+                    .fulfillment_valid_from
+                    .map(|value| value.to_string()),
+            ),
+            (
+                "fulfillment_revoked_at",
+                listing
+                    .fulfillment_revoked_at
+                    .map(|value| value.to_string()),
+            ),
+        ] {
+            if let Some(value) = value {
+                specs.push((key.to_string(), value));
+            }
+        }
 
         let parsed_amount = listing
             .price_amount
@@ -282,12 +308,12 @@ impl GameListing {
             price_sats,
             quantity: None,
             tags: listing.tags,
-            specs: Vec::new(),
+            specs,
             publisher_npub: listing.merchant_npub,
             stall_id: String::new(),
             stall_name: None,
             lud16: String::new(),
-            event_id: None,
+            event_id: Some(listing.event_id),
             created_at: listing.created_at,
             platforms: listing.platforms,
             nip94_event_id: listing.nip94_event_id,
@@ -598,6 +624,7 @@ mod tests {
         // Arrange
         let backend_listing = arcadestr_core::nostr::GameListing::from_listing(
             arcadestr_core::marketplace::Nip99Listing {
+                event_id: "event-id".to_string(),
                 id: "listing-source".to_string(),
                 title: "Source Listing".to_string(),
                 content: "Listing content".to_string(),
@@ -610,6 +637,16 @@ mod tests {
                 images: vec!["https://example.com/image.png".to_string()],
                 geohash: None,
                 tags: vec!["game".to_string()],
+                platforms: Vec::new(),
+                nip94_event_id: None,
+                servers: vec!["https://dist.example.com".to_string()],
+                file_hash: Some("abc123".to_string()),
+                version: Some("1.4.2".to_string()),
+                fulfillment_pubkey: Some("delegate".to_string()),
+                fulfillment_valid_from: Some(1_710_000_000),
+                fulfillment_revoked_at: None,
+                acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
+                campaigns: Vec::new(),
                 status: Some("active".to_string()),
                 #[cfg(debug_assertions)]
                 raw_event_json: Some(r#"{"kind":30402}"#.to_string()),
@@ -625,5 +662,12 @@ mod tests {
 
         // Assert
         assert_eq!(frontend_listing.source, ListingSource::Nip99Listing);
+        assert_eq!(frontend_listing.event_id.as_deref(), Some("event-id"));
+        assert!(frontend_listing
+            .specs
+            .contains(&("version".to_string(), "1.4.2".to_string())));
+        assert!(frontend_listing
+            .specs
+            .contains(&("server".to_string(), "https://dist.example.com".to_string())));
     }
 }

@@ -1070,6 +1070,7 @@ async fn profile_badge_queries_require_matching_award_recipient_and_coordinate()
 fn test_game_listing(publisher_npub: String, id: &str) -> GameListing {
     GameListing {
         id: id.to_string(),
+        event_id: None,
         source: ListingSource::Legacy,
         title: "Test Game".to_string(),
         description: "Integration scenario listing".to_string(),
@@ -1078,6 +1079,7 @@ fn test_game_listing(publisher_npub: String, id: &str) -> GameListing {
         publisher_npub,
         created_at: 1_710_000_000,
         tags: vec!["action".to_string(), "indie".to_string()],
+        specs: Vec::new(),
         lud16: "seller@example.com".to_string(),
         platforms: Vec::new(),
         nip94_event_id: None,
@@ -1096,6 +1098,7 @@ fn test_game_listing(publisher_npub: String, id: &str) -> GameListing {
 
 fn test_nip99_listing(id: &str, merchant_npub: &str, created_at: u64) -> Nip99Listing {
     Nip99Listing {
+        event_id: String::new(),
         id: id.to_string(),
         title: format!("Listing {id}"),
         content: "Markdown body".to_string(),
@@ -1110,6 +1113,12 @@ fn test_nip99_listing(id: &str, merchant_npub: &str, created_at: u64) -> Nip99Li
         tags: vec!["indie".to_string()],
         platforms: vec![],
         nip94_event_id: None,
+        servers: Vec::new(),
+        file_hash: None,
+        version: None,
+        fulfillment_pubkey: None,
+        fulfillment_valid_from: None,
+        fulfillment_revoked_at: None,
         acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
         campaigns: Vec::new(),
         status: Some("active".to_string()),

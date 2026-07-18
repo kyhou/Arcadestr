@@ -17,6 +17,6 @@ pub use game_detail::GameDetailView;
 pub use library::LibraryView;
 pub use login::LoginV2View;
 pub use profile::ProfileV2View;
-pub use publish::PublishV2View;
+pub use publish::{PublishV2View, PublishViewState};
 pub use social::SocialView;
 pub use store_front::StoreFrontView;
