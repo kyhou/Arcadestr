@@ -1,0 +1,20 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "mcp": {
+    "serena": {
+      "enabled": true
+    }
+  },
+
+  "watcher": {
+    "ignore": [
+      "target/**",
+      ".worktrees/**",
+      "desktop/gen/**",
+      "web/dist/**",
+      "*.db",
+      "*.log"
+    ]
+  }
+}

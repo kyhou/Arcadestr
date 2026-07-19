@@ -22,9 +22,9 @@
 
 ### What does this application do?
 
-This is a **reference implementation of ADP-01 (Arcadestr Distribution Protocol)** — an open HTTP protocol for serving gated digital game file downloads using **Nostr identities and event kinds** as the authentication and ownership layer.
+This is a **reference implementation of ADP-01 (Arcadestr Distribution Protocol)** — an open HTTP protocol for serving digital game file downloads using **Nostr identities and event kinds** as the authentication and ownership layer.
 
-A developer publishes a NIP-99 (`kind:30402`) game listing on Nostr relays with ADP extension tags (`server`, `file_hash`, `version`, `fulfillment_pubkey`, `lud16`). A buyer proves they own the game via a NIP-102 `kind:1020` receipt (signed either by the developer's key or a delegated fulfillment key). The server verifies the receipt and serves the file. Servers are interchangeable — no single operator is privileged.
+A developer publishes a NIP-99 (`kind:30402`) game listing on Nostr relays with ADP extension tags (`server`, `file_hash`, `version`, `fulfillment_pubkey`, `lud16`). For paid listings, a buyer proves they own the game via a NIP-102 `kind:1020` receipt (signed either by the developer's key or a delegated fulfillment key). A listing whose parsed `price` amount is zero bypasses the receipt ownership check, although the caller must still authenticate with NIP-98 or present a valid download token. Servers are interchangeable — no single operator is privileged.
 
 ### Who is it for?
 
@@ -37,7 +37,7 @@ A developer publishes a NIP-99 (`kind:30402`) game listing on Nostr relays with 
 - **Provisioning** — developers request a fulfillment key from an operator. The operator generates a keypair, publishes a `kind:30404` attestation to relays, encrypts the private key at rest, and returns the public key.
 - **Upload** — authenticated upload of game archives via multipart POST. The file's SHA-256 must match the listing's `file_hash` tag.
 - **Purchase confirmation** — buyer presents a zap receipt or bolt11+preimage as payment proof; the server signs a `kind:1020` NIP-102 receipt with a held fulfillment key and issues a short-lived download token.
-- **Download** — two-path ownership verification: Path A (fast, local) checks a server-issued download token; Path B (portable, cross-server) queries relays for `kind:1020` receipts. Both paths require the server to be named in the listing's `server` tags.
+- **Download** — Path A (fast, local) checks a server-issued download token; Path B (portable, cross-server) queries relays for `kind:1020` receipts for paid listings. NIP-98-authenticated downloads of zero-priced listings skip the receipt query. Every path requires the server to be named in the listing's `server` tags.
 - **File integrity** — every file read from disk is SHA-256 verified against the listing's `file_hash` before being served. A background task re-verifies all stored files on an interval.
 
 ### Desktop, web, or both?
@@ -89,7 +89,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 ├── .env.example                         # Template for env config (copy to .env)
 ├── ADP-01.md                            # The protocol spec this code implements
 ├── adp-01-roadmap-v3.md                 # Implementation roadmap / completion checklist
-├── VERIFICATION_REPORT.md                    # Build-time verification report (47 tests, green)
+├── VERIFICATION_REPORT.md                    # Historical verification report (records the earlier 47-test run)
 ├── README.md                            # Entry-point README (known to be partially stale)
 │
 ├── adp-core/                            # Protocol logic crate — no HTTP, no SQL
@@ -224,7 +224,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 
 External actors:
 - **Developer** — calls `POST /provision`, `POST /upload`, `POST /purchase/confirm` (via NIP-98 auth), manages listing tags on relays.
-- **Buyer** — calls `POST /purchase/confirm` (NIP-98 auth) with payment proof, then `GET /game/:coordinate` (via token or NIP-98 receipt proof).
+- **Buyer** — for paid listings, calls `POST /purchase/confirm` (NIP-98 auth) with payment proof, then `GET /game/:coordinate` via token or NIP-98 receipt proof. For zero-priced listings, calls `GET /game/:coordinate` with NIP-98 auth and no receipt.
 - **LSP (Lightning Service Provider)** — the LNURL-pay endpoint that signs `kind:9735` zap receipts; resolved from the listing's `lud16` tag.
 - **Relays** — Nostr relays store listings, receipts, and attestations. This server reads listing state fresh on every request that needs authorization-sensitive data.
 
@@ -256,7 +256,7 @@ The most instructive flow is a buyer purchasing and downloading a game:
 
 #### Step 2: Buyer downloads the game
 
-The download handler at `game.rs:download_handler` supports two ownership paths:
+The download handler at `game.rs:download_handler` first fetches and parses the current listing, then selects among two ownership paths plus a zero-price exception:
 
 **Path A (fast — local token)**:
 ```
@@ -275,8 +275,13 @@ Authorization: Nostr <base64>
 - Groups receipts by `order` id, resolves each order's status-chain tip via `latest_status_in_chain`.
 - If any tip has status `paid` or `fulfilled` and was signed by an authorized key per the (freshly fetched) listing delegation tags, ownership is proven.
 
-After ownership:
-- **Distribution authorization** — fetches the fresh listing from relays and checks `listing.distributes_via(server_url)`. Returns HTTP 451 ("Unavailable For Legal Reasons") if this server is not named in the listing's `server` tags. (HTTP 451 is a deliberate choice — it distinguishes "you're not authorized" from "you don't own this.")
+**Zero-priced listing exception**:
+- A request without `?token=` still verifies the NIP-98 token and extracts its pubkey.
+- `listing_is_free` parses the listing's `price` amount as `f64`; when the parsed amount is exactly `0.0`, the handler skips `verify_ownership_via_receipts`.
+- A missing/malformed price or nonnumeric amount is not treated as free and follows Path B. The currency is not inspected by `listing_is_free`.
+
+After the ownership check or zero-price bypass:
+- **Distribution authorization** — checks the already-fetched fresh listing with `listing.distributes_via(server_url)`. Returns HTTP 451 ("Unavailable For Legal Reasons") if this server is not named in the listing's `server` tags. (HTTP 451 is a deliberate choice — it distinguishes "you're not authorized" from "you don't own this.")
 - **File hash verification** — reads the file from disk and SHA-256 hashes it. If the hash doesn't match the listing's `file_hash`, returns 500 (data corruption detected).
 - **Conditional GET** — if the request's `If-None-Match` header matches the file hash's ETag, returns 304 Not Modified.
 - Otherwise returns the file with an `ETag` header.
@@ -321,8 +326,10 @@ Developer's listing (kind:30402) on relays
     │       Action: insert `download_tokens` row (15m TTL)
     │
     └──► game.rs: GET /game/:coordinate
+            Fetch fresh listing and parse its price
             Path A (fast): ?token= → resolves via `download_tokens`
-            Path B (portable): NIP-98 → queries relays for kind:1020
+            NIP-98 + zero price: skip receipt ownership check
+            Path B (portable, paid): NIP-98 → queries relays for kind:1020
                 └── verify_ownership_via_receipts
                     ├── fetch_receipts from relays
                     ├── group by order_id
@@ -647,11 +654,11 @@ This means the operator might be running a key for this listing but the listing'
 
 #### `GET /game/:game_coordinate` — `game.rs`
 
-The download handler implements two ownership paths and one distribution check:
+The download handler fetches the fresh listing before authentication, then implements two ownership paths, a zero-price bypass, and one distribution check:
 
-**Path A — download token** (lines 33-38): If `?token=` is present, look it up in SQLite. The token was issued by the same server during `POST /purchase/confirm`, scoped to the game coordinate. Fast path — no relay round trip.
+**Path A — download token** (lines 49-56): If `?token=` is present, look it up in SQLite. The token was issued by the same server during `POST /purchase/confirm`, scoped to the game coordinate. The fresh listing fetch still occurs, but no receipt relay query is needed.
 
-**Path B — portable receipt** (lines 55-71): If no token, require NIP-98 auth, extract buyer pubkey, and call `verify_ownership_via_receipts`. This function (lines 177-235):
+**Path B — portable receipt** (lines 57-88): If no token, require NIP-98 auth and extract the buyer pubkey. For a paid or unparseable-price listing, call `verify_ownership_via_receipts`, which starts at line 185:
 1. Calls `relay.fetch_receipts(buyer_pubkey, game_coordinate)` — gets all `kind:1020` events where `#p` = buyer and `#a` = coordinate.
 2. Groups events by `order_id`.
 3. For each group, calls `latest_status_in_chain` to find the chain tip.
@@ -659,9 +666,11 @@ The download handler implements two ownership paths and one distribution check:
 5. Calls `verify_signer_authorization(tip, listing)` — confirms the receipt's signer was authorized per the (freshly fetched) listing's delegation tags.
 6. If any order passes all checks, ownership is confirmed.
 
-**Distribution check** (lines 83-87): `listing.distributes_via(state.relay.server_url())`. If the server isn't named in the listing's `server` tags, returns HTTP 451.
+**Zero-price bypass** (lines 22-28 and 71-88): `listing_is_free` trims and parses only the amount component of `AdpListing::price` as `f64`. An amount equal to `0.0` skips the receipt query for an already NIP-98-authenticated caller. Missing prices, parse failures, and nonzero amounts do not bypass ownership; the helper does not constrain the currency.
 
-**File integrity** (lines 89-105): Looks up the file path by hash, re-verifies SHA-256 on every download, supports `If-None-Match` conditional requests.
+**Distribution check** (lines 91-95): `listing.distributes_via(state.relay.server_url())`. If the server isn't named in the listing's `server` tags, returns HTTP 451 even for a free listing.
+
+**File integrity** (lines 97-113): Looks up the file path by hash, re-verifies SHA-256 on every download, supports `If-None-Match` conditional requests.
 
 ---
 
@@ -845,28 +854,28 @@ Neither crate defines Cargo feature flags. The `nip44` feature of the `nostr` cr
 
 ```
 adp-core/tests/
-├── delegation_tests.rs          # 9 pure logic tests for verify_signer_authorization
-└── protocol_regression_tests.rs # 9 tests for listing parsing, receipts, attestations, zaps
+├── delegation_tests.rs          # 8 pure logic tests for verify_signer_authorization
+└── protocol_regression_tests.rs # 10 tests for listing parsing, receipts, attestations, zaps
 
 adp-server/tests/
-├── announcement_tests.rs    # kind:30403 event building
-├── error_mapping_tests.rs      # ApiError → HTTP status code mapping
-├── health_tests.rs             # GET /health endpoint
-├── keystore_tests.rs           # KeyStore idempotency and scope isolation
-├── lnurl_tests.rs              # LNURL resolution (wiremock)
-├── multi_relay_freshness_tests.rs # select_latest_listing logic
-└── route_integration_tests.rs  # Full integration test: provision→confirm→download→revoke→confirm-fails
+├── announcement_tests.rs          # 1 test: kind:30403 event building
+├── error_mapping_tests.rs         # 3 tests: ApiError → HTTP status code mapping
+├── health_tests.rs                # 1 test: GET /health endpoint
+├── keystore_tests.rs              # 5 tests: key round-trip, idempotency, scope isolation, lookup, revoke
+├── lnurl_tests.rs                 # 2 tests: LNURL resolution and malformed LUD16 (wiremock)
+├── multi_relay_freshness_tests.rs # 3 live-WebSocket tests: dead relay tolerance and latest listing selection
+└── route_integration_tests.rs     # 1 full lifecycle test: provision→confirm→download→revoke→confirm-fails
 ```
 
 Additionally, there are inline `#[cfg(test)] mod tests` in:
 - `adp-server/src/routes/upload.rs` (4 tests: file_hash required, delegated uploader)
-- `adp-server/src/routes/game.rs` (3 tests: receipt matching, ETag, file hash verification)
+- `adp-server/src/routes/game.rs` (6 tests: receipt matching, ETag, zero-price classification, file hash verification)
 - `adp-server/src/routes/purchase.rs` (3 tests: SATS/BTC/fiat price resolution)
 - `adp-server/src/relay.rs` (2 tests: select_latest_listing, receipt filter)
-- `adp-server/src/lnurl.rs` (3 tests: loopback detection, scheme selection)
+- `adp-server/src/lnurl.rs` (4 tests: exact loopback detection and scheme selection)
 - `adp-server/src/integrity.rs` (2 tests: file hash verification + mismatch rejection)
 
-Total (at last verification): **47 tests, 13 suites, ~0.05s runtime**.
+Total (verified with `cargo test --workspace`): **55 tests across 14 suites**.
 
 ### 10.2 What's Tested vs What's Not
 
@@ -877,11 +886,13 @@ Total (at last verification): **47 tests, 13 suites, ~0.05s runtime**.
 - Zap verification (buyer P tag, LSP pubkey mismatch)
 - Error-to-HTTP mapping (6 protocol variants + server-level variants)
 - Price resolution (SATS, BTC, fiat)
+- Zero-price listing classification
 - File hash verification (matching, mismatched)
 - Upload authorization (file hash required, delegated uploader)
 - LNURL resolution (wiremock-based happy path + malformed address)
 
 **Not tested:**
+- End-to-end download of a zero-priced listing; only `listing_is_free` is unit-tested, not the handler's NIP-98 requirement or receipt bypass
 - Multi-relay conflict (no integration test with two relays publishing different listing versions for the same coordinate)
 - LNURL transport errors (LNURL endpoint returning 404 or malformed JSON)
 - The actual relay network interaction (all relay tests use `MockRelay` or in-process `nostr-sdk` constructs)
@@ -1085,6 +1096,8 @@ These can be used in `curl` calls to `POST /purchase/confirm` with the bolt11/pr
 
 7. **sqlx migration path.** The `sqlx::migrate!("../migrations")` call in `storage.rs:29` uses a relative path from `adp-server/src/`. This works during `cargo run -p adp-server` (which runs from the workspace root), but may need adjustment if the working directory is different.
 
+8. **Free downloads still require authentication.** A listing with a `price` amount that parses to exactly zero bypasses receipt ownership verification, but a request without `?token=` must still carry a valid NIP-98 `Authorization` header. The helper parses the amount as `f64` and ignores currency, so any zero amount with a parseable numeric representation is treated as free; there is no end-to-end route test for this path yet.
+
 ---
 
 ## 13. Glossary
@@ -1107,7 +1120,8 @@ These can be used in `curl` calls to `POST /purchase/confirm` with the bolt11/pr
 | **Acceptance (provisioning)** | `kind:30406` event published by the developer accepting the operator's attestation. |
 | **Receipt** | `kind:1020` NIP-102 receipt confirming a purchase. Signed by the developer or a delegated fulfillment key. |
 | **Download token** | Short-lived UUID issued by `/purchase/confirm`. Enables fast Path A downloads without relay queries. |
-| **Path A / Path B** | Two ownership verification paths: Path A uses a local download token (fast, no relay). Path B queries relays for `kind:1020` receipts (portable across servers). |
+| **Path A / Path B** | Two ownership verification paths: Path A uses a local download token. Path B uses NIP-98 and, for paid listings, queries relays for `kind:1020` receipts. Zero-priced listings skip Path B's receipt query after NIP-98 authentication. |
+| **Free listing** | A listing whose `price` amount trims and parses as `f64` value `0.0`. Its download still requires NIP-98 or a valid token, but no purchase receipt. Currency is ignored by this classification. |
 | **Distribution authorization** | The check that a server is named in the listing's `server` tags. Independent of ownership proof. HTTP 451 if this check fails. |
 | **Backdating clamp** | The rule `effective_revoked_at = max(declared revoked_at, listing_event.created_at)`. Prevents stale delegation tags from retroactively invalidating receipts. |
 | **`kind:30403`** | Server announcement event — how clients discover ADP server. |
