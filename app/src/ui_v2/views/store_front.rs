@@ -2,24 +2,9 @@ use leptos::prelude::*;
 
 use crate::models::GameListing;
 use crate::ui_v2::views::marketplace_loader::use_marketplace_listings_with_limit;
+use crate::ui_v2::views::{use_fallback_cover, valid_cover_url, FALLBACK_COVER};
 
-const FALLBACK_COVER: &str = "https://lh3.googleusercontent.com/aida-public/AB6AXuDcG9Zo3aR9Vrpk5pP2jenw1AoVFoOzbAQ-t57kQtlbwGQVsLLwmHyFuyzRVsOh71iN4mHyhfw0Sx4YgdJ9duL9ANv3Xa1W7jYKWeVgj5_rE7KzitErwV3dtgEFGsGCSXtFQxyw6tQoGmP3V-Ci9Vs9_ZQXh6WXrFi6eperEaPm3YutXUIImUuC5sKm2hgyVb6sMBnpn0Imy94ETrJ9WO2XeC6tTMddB6EA-x1LgnN3Ezj_dPitegkcYmXGBSWZyCTZgxINu01kmdM";
 const STORE_FRONT_LISTING_LIMIT: usize = 3;
-
-fn first_valid_image(images: &[String]) -> String {
-    images
-        .iter()
-        .find(|url| {
-            let trimmed = url.trim();
-            !trimmed.is_empty()
-                && (trimmed.starts_with("https://") || trimmed.starts_with("http://"))
-                && !trimmed.contains('"')
-                && !trimmed.contains('\'')
-                && !trimmed.contains(')')
-        })
-        .cloned()
-        .unwrap_or_else(|| FALLBACK_COVER.to_string())
-}
 
 fn show_store_front_empty_state(listing_count: usize, loading: bool, has_error: bool) -> bool {
     listing_count == 0 && !loading && !has_error
@@ -60,9 +45,10 @@ pub fn StoreFrontView(
                         src=move || {
                             featured_listing
                                 .get()
-                                .map(|listing| first_valid_image(&listing.images))
+                                .and_then(|listing| valid_cover_url(&listing.images))
                                 .unwrap_or_else(|| FALLBACK_COVER.to_string())
                         }
+                        on:error=use_fallback_cover
                         alt="featured game cover"
                     />
                 </div>
@@ -215,12 +201,13 @@ pub fn StoreFrontView(
                                                 _ => "$5.80 USD".to_string(),
                                             };
                                             let cta_label = if index == 1 { "Play Now" } else { "Quick Buy" };
-                                            let image_url = first_valid_image(&listing.images);
+                                            let image_url = valid_cover_url(&listing.images)
+                                                .unwrap_or_else(|| FALLBACK_COVER.to_string());
 
                                             view! {
                                                 <button class="group bg-surface-container-high rounded-xl overflow-hidden hover:scale-[1.02] hover:bg-surface-bright transition-[transform,background-color] duration-300 ease-out motion-safe:will-change-transform text-left h-full flex flex-col" on:click=move |_| on_select.run(selected.clone())>
                                                     <div class="aspect-video relative">
-                                                        <img class="w-full h-full object-cover" src={image_url} alt="game cover" />
+                                                        <img class="w-full h-full object-cover" src={image_url} alt="game cover" on:error=use_fallback_cover />
                                                         <div class="absolute top-3 right-3 bg-background/80 backdrop-blur-md px-2 py-1 rounded text-[10px] font-bold text-tertiary">{format!("⚡ {}", zaps)}</div>
                                                     </div>
                                                     <div class="p-6 flex flex-1 flex-col">

@@ -17,6 +17,7 @@ use crate::tauri_bridge::{
     DiscoverCampaignSummariesRequest, DiscoverCampaignsRequest, DiscoveredCampaign,
     UpdateCampaignPointerRequest,
 };
+use crate::ui_v2::views::{use_fallback_cover, valid_cover_url};
 
 #[derive(Clone, PartialEq)]
 pub enum PublishViewState {
@@ -185,11 +186,11 @@ fn PublishedGamesView(on_navigate: Callback<PublishViewState>) -> impl IntoView 
                     <div class="grid gap-5 lg:grid-cols-2">
                         {move || listings.get().into_iter().map(|listing| {
                             let selected = listing.clone();
-                            let cover = listing.images.first().cloned();
+                            let cover = valid_cover_url(&listing.images);
                             let listing_id_for_counts = listing.id.clone();
                             view! {
                                 <article class="v2-panel flex min-w-0 max-w-full gap-5 overflow-hidden">
-                                    {cover.map(|url| view! { <img src=url alt="cover" class="h-28 w-24 rounded-xl object-cover" /> }.into_any()).unwrap_or_else(|| view! { <div class="h-28 w-24 rounded-xl bg-surface-container-highest flex items-center justify-center text-2xl">"🎮"</div> }.into_any())}
+                                    {cover.map(|url| view! { <img src=url alt="cover" class="h-28 w-24 rounded-xl object-cover" on:error=use_fallback_cover /> }.into_any()).unwrap_or_else(|| view! { <div class="h-28 w-24 rounded-xl bg-surface-container-highest flex items-center justify-center text-2xl">"🎮"</div> }.into_any())}
                                     <div class="min-w-0 flex-1">
                                         <h2 class="text-xl font-headline font-bold truncate">{listing.title.clone()}</h2>
                                         <p class="text-xs text-on-surface-variant truncate">{listing_coordinate(&listing)}</p>
@@ -264,7 +265,7 @@ fn GameManagementView(
         <section class="space-y-8">
             <button class="v2-btn-secondary" on:click=move |_| on_back.run(())>"Back to published games"</button>
             <header class="v2-panel flex flex-col gap-5 md:flex-row md:items-center">
-                {listing.images.first().cloned().map(|url| view! { <img src=url alt="cover" class="h-32 w-24 rounded-xl object-cover" /> }.into_any()).unwrap_or_else(|| view! { <div class="h-32 w-24 rounded-xl bg-surface-container-highest flex items-center justify-center text-3xl">"🎮"</div> }.into_any())}
+                {valid_cover_url(&listing.images).map(|url| view! { <img src=url alt="cover" class="h-32 w-24 rounded-xl object-cover" on:error=use_fallback_cover /> }.into_any()).unwrap_or_else(|| view! { <div class="h-32 w-24 rounded-xl bg-surface-container-highest flex items-center justify-center text-3xl">"🎮"</div> }.into_any())}
                 <div class="flex-1">
                     <p class="text-xs uppercase tracking-[0.2em] text-primary">"Manage publication"</p>
                     <h1 class="text-3xl font-headline font-bold">{listing.title.clone()}</h1>
@@ -304,6 +305,138 @@ fn GameManagementView(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CampaignConfirmation {
+    CancelCampaign,
+    RemovePointer,
+    DiscardChanges,
+}
+
+impl CampaignConfirmation {
+    fn title(self) -> &'static str {
+        match self {
+            Self::CancelCampaign => "Cancel campaign?",
+            Self::RemovePointer => "Remove listing pointer?",
+            Self::DiscardChanges => "Discard unsaved changes?",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::CancelCampaign => {
+                "This prevents new claims immediately. Entitlements already issued remain valid."
+            }
+            Self::RemovePointer => {
+                "The campaign cancellation remains authoritative either way. Remove its advisory pointer from the game listing too?"
+            }
+            Self::DiscardChanges => "Your unsaved campaign changes will be lost.",
+        }
+    }
+
+    fn reject_label(self) -> &'static str {
+        match self {
+            Self::CancelCampaign => "Keep campaign",
+            Self::RemovePointer => "Keep pointer",
+            Self::DiscardChanges => "Keep editing",
+        }
+    }
+
+    fn accept_label(self) -> &'static str {
+        match self {
+            Self::CancelCampaign => "Cancel campaign",
+            Self::RemovePointer => "Remove pointer",
+            Self::DiscardChanges => "Discard changes",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfirmationOutcome {
+    Close,
+    PromptRemovePointer,
+    CancelCampaign(bool),
+    DiscardChanges,
+}
+
+fn resolve_confirmation(
+    confirmation: CampaignConfirmation,
+    accepted: Option<bool>,
+    points_here: bool,
+) -> ConfirmationOutcome {
+    match (confirmation, accepted) {
+        (_, None) => ConfirmationOutcome::Close,
+        (CampaignConfirmation::DiscardChanges, Some(true)) => ConfirmationOutcome::DiscardChanges,
+        (CampaignConfirmation::DiscardChanges, Some(false))
+        | (CampaignConfirmation::CancelCampaign, Some(false)) => ConfirmationOutcome::Close,
+        (CampaignConfirmation::CancelCampaign, Some(true)) if points_here => {
+            ConfirmationOutcome::PromptRemovePointer
+        }
+        (CampaignConfirmation::CancelCampaign, Some(true)) => {
+            ConfirmationOutcome::CancelCampaign(false)
+        }
+        (CampaignConfirmation::RemovePointer, Some(remove_pointer)) => {
+            ConfirmationOutcome::CancelCampaign(remove_pointer)
+        }
+    }
+}
+
+#[component]
+fn CampaignConfirmationDialog(
+    confirmation: RwSignal<Option<CampaignConfirmation>>,
+    on_decision: Callback<Option<bool>>,
+) -> impl IntoView {
+    let dialog_ref = NodeRef::<leptos::html::Dialog>::new();
+    Effect::new(move |_| {
+        let Some(dialog) = dialog_ref.get() else {
+            return;
+        };
+        if confirmation.get().is_some() {
+            if dialog.open() {
+                dialog.close();
+            }
+            let _ = dialog.show_modal();
+        } else if dialog.open() {
+            dialog.close();
+        }
+    });
+
+    view! {
+        <dialog
+            node_ref=dialog_ref
+            class="m-auto w-full max-w-md bg-transparent p-4 text-on-surface backdrop:bg-black/70"
+            aria-label=move || confirmation.get().map(CampaignConfirmation::title).unwrap_or_default()
+            aria-description=move || confirmation.get().map(CampaignConfirmation::message).unwrap_or_default()
+            on:cancel=move |event: web_sys::Event| {
+                event.prevent_default();
+                on_decision.run(None);
+            }
+            on:click=move |_| on_decision.run(None)
+        >
+            <section
+                class="v2-panel space-y-5 border border-outline-variant/40 shadow-2xl"
+                on:click=move |event| event.stop_propagation()
+            >
+                <div class="space-y-2">
+                    <h2 class="text-xl font-headline font-bold">
+                        {move || confirmation.get().map(CampaignConfirmation::title).unwrap_or_default()}
+                    </h2>
+                    <p class="text-sm text-on-surface-variant">
+                        {move || confirmation.get().map(CampaignConfirmation::message).unwrap_or_default()}
+                    </p>
+                </div>
+                <div class="flex flex-wrap justify-end gap-3">
+                    <button class="v2-btn-secondary" on:click=move |_| on_decision.run(Some(false))>
+                        {move || confirmation.get().map(CampaignConfirmation::reject_label).unwrap_or_default()}
+                    </button>
+                    <button class="v2-btn-primary" on:click=move |_| on_decision.run(Some(true))>
+                        {move || confirmation.get().map(CampaignConfirmation::accept_label).unwrap_or_default()}
+                    </button>
+                </div>
+            </section>
+        </dialog>
+    }
+}
+
 fn campaign_row(
     campaign: DiscoveredCampaign,
     listing: GameListing,
@@ -325,6 +458,7 @@ fn campaign_row(
     let pointer_message = RwSignal::new(None::<String>);
     let action_in_progress = RwSignal::new(false);
     let action_completed = RwSignal::new(false);
+    let confirmation = RwSignal::new(None::<CampaignConfirmation>);
     let pointer_campaign = campaign.clone();
     let pointer_listing = listing.clone();
     let pointer_auth = auth.clone();
@@ -369,13 +503,10 @@ fn campaign_row(
     let cancel_campaign = campaign.clone();
     let cancel_listing = listing.clone();
     let cancel_navigate = on_navigate.clone();
-    let on_cancel = move |_| {
+    let cancel_with_pointer = Callback::new(move |remove_pointer: bool| {
         if action_in_progress.get_untracked() || action_completed.get_untracked() {
             return;
         }
-        let Some(remove_pointer) = confirm_cancellation(points_here) else {
-            return;
-        };
         let Some(publisher_npub) = auth.npub.get() else {
             cancel_message.set(Some("Authenticate as the publisher first".into()));
             return;
@@ -422,7 +553,25 @@ fn campaign_row(
                 }
             }
         });
-    };
+    });
+    let cancel_after_confirmation = cancel_with_pointer.clone();
+    let on_confirmation_decision = Callback::new(move |accepted: Option<bool>| {
+        let Some(current) = confirmation.get_untracked() else {
+            return;
+        };
+        match resolve_confirmation(current, accepted, points_here) {
+            ConfirmationOutcome::Close => confirmation.set(None),
+            ConfirmationOutcome::PromptRemovePointer => {
+                confirmation.set(Some(CampaignConfirmation::RemovePointer));
+            }
+            ConfirmationOutcome::CancelCampaign(remove_pointer) => {
+                confirmation.set(None);
+                cancel_after_confirmation.run(remove_pointer);
+            }
+            ConfirmationOutcome::DiscardChanges => confirmation.set(None),
+        }
+    });
+    let on_cancel = move |_| confirmation.set(Some(CampaignConfirmation::CancelCampaign));
     view! {
         <article class="rounded-2xl bg-surface-container-highest/70 p-4 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
             <div>
@@ -448,6 +597,7 @@ fn campaign_row(
             {move || action_completed.get().then(|| view! { <p class="text-sm text-secondary">"Completed"</p> })}
             {move || cancel_message.get().map(|message| view! { <p class="text-sm text-secondary">{message}</p> })}
             {move || pointer_message.get().map(|message| view! { <p class="text-sm text-secondary">{message}</p> })}
+            <CampaignConfirmationDialog confirmation=confirmation on_decision=on_confirmation_decision />
         </article>
     }
 }
@@ -502,6 +652,7 @@ fn CampaignEditorView(
     let completed = RwSignal::new(false);
     let message = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
+    let confirmation = RwSignal::new(None::<CampaignConfirmation>);
     let active = campaign
         .as_ref()
         .is_some_and(|item| item.classification == "active");
@@ -515,21 +666,13 @@ fn CampaignEditorView(
     let listing_for_cancel = listing.clone();
     let auth_for_cancel = auth.clone();
     let on_saved_for_cancel = on_saved.clone();
+    let on_back_now = on_back.clone();
     let back = Callback::new(move |()| {
-        #[cfg(target_arch = "wasm32")]
         if !completed.get_untracked() && form.get_untracked() != initial_snapshot {
-            let should_leave = web_sys::window()
-                .and_then(|window| {
-                    window
-                        .confirm_with_message("Discard unsaved campaign changes?")
-                        .ok()
-                })
-                .unwrap_or(false);
-            if !should_leave {
-                return;
-            }
+            confirmation.set(Some(CampaignConfirmation::DiscardChanges));
+            return;
         }
-        on_back.run(());
+        on_back_now.run(());
     });
     let listing_for_save = listing.clone();
     let on_saved_for_save = on_saved.clone();
@@ -630,18 +773,11 @@ fn CampaignEditorView(
             }
         });
     };
-    let cancel = move |_| {
+    let cancel_with_pointer = Callback::new(move |remove_pointer: bool| {
         if submitting.get_untracked() || completed.get_untracked() {
             return;
         }
         let Some(campaign) = campaign_for_cancel.clone() else {
-            return;
-        };
-        let points_here = listing_for_cancel
-            .campaigns
-            .iter()
-            .any(|pointer| pointer.root_event_id == campaign.root_event_id);
-        let Some(remove_pointer) = confirm_cancellation(points_here) else {
             return;
         };
         let Some(publisher_npub) = auth_for_cancel.npub.get() else {
@@ -686,12 +822,34 @@ fn CampaignEditorView(
                 }
             }
         });
-    };
+    });
+    let cancel_after_confirmation = cancel_with_pointer.clone();
+    let back_after_confirmation = on_back.clone();
+    let on_confirmation_decision = Callback::new(move |accepted: Option<bool>| {
+        let Some(current) = confirmation.get_untracked() else {
+            return;
+        };
+        match resolve_confirmation(current, accepted, initially_points_to_campaign) {
+            ConfirmationOutcome::Close => confirmation.set(None),
+            ConfirmationOutcome::PromptRemovePointer => {
+                confirmation.set(Some(CampaignConfirmation::RemovePointer));
+            }
+            ConfirmationOutcome::CancelCampaign(remove_pointer) => {
+                confirmation.set(None);
+                cancel_after_confirmation.run(remove_pointer);
+            }
+            ConfirmationOutcome::DiscardChanges => {
+                confirmation.set(None);
+                back_after_confirmation.run(());
+            }
+        }
+    });
+    let cancel = move |_| confirmation.set(Some(CampaignConfirmation::CancelCampaign));
     view! {
         <section class="max-w-3xl mx-auto space-y-6">
             <button class="v2-btn-secondary" on:click=move |_| back.run(())>"Back to game"</button>
             <header class="v2-panel flex gap-4 items-center">
-                {listing.images.first().cloned().map(|url| view! { <img src=url alt="cover" class="h-20 w-16 rounded-lg object-cover" /> }.into_any()).unwrap_or_else(|| view! { <div class="h-20 w-16 rounded-lg bg-surface-container-highest flex items-center justify-center text-2xl">"🎮"</div> }.into_any())}
+                {valid_cover_url(&listing.images).map(|url| view! { <img src=url alt="cover" class="h-20 w-16 rounded-lg object-cover" on:error=use_fallback_cover /> }.into_any()).unwrap_or_else(|| view! { <div class="h-20 w-16 rounded-lg bg-surface-container-highest flex items-center justify-center text-2xl">"🎮"</div> }.into_any())}
                 <div><p class="text-xs uppercase tracking-[0.2em] text-primary">{if editing { "Edit campaign" } else { "New campaign" }}</p><h1 class="text-3xl font-headline font-bold">{format!("{} for {}", if editing { "Edit campaign" } else { "New campaign" }, listing.title)}</h1></div>
             </header>
             <section class="v2-panel space-y-6">
@@ -705,6 +863,7 @@ fn CampaignEditorView(
                 {move || message.get().map(|text| view! { <p class="text-secondary">{text}</p> })}
                 <div class="flex flex-wrap gap-3 justify-end"><button class="v2-btn-secondary" on:click=move |_| back.run(())>{move || if terms_read_only { "Close" } else if completed.get() { "Back to game" } else { "Discard changes" }}</button>{move || completed.get().then(|| view! { <span class="v2-chip">"Completed"</span> })}{if cancellable { view! { <button class="v2-btn-secondary" disabled=move || submitting.get() || completed.get() on:click=cancel>"Cancel campaign"</button> }.into_any() } else { view! { <></> }.into_any() }}{if !terms_read_only { view! { <button class="v2-btn-primary" disabled=move || submitting.get() || completed.get() || live_validation.get().is_some() on:click=save>{move || if completed.get() { "Completed" } else if submitting.get() { "Publishing..." } else { "Save campaign" }}</button> }.into_any() } else { view! { <></> }.into_any() }}</div>
             </section>
+            <CampaignConfirmationDialog confirmation=confirmation on_decision=on_confirmation_decision />
         </section>
     }
 }
@@ -803,26 +962,47 @@ fn timezone_label() -> String {
     js_sys::Date::new_0().to_string().into()
 }
 
-#[cfg(target_arch = "wasm32")]
-fn confirm_cancellation(points_here: bool) -> Option<bool> {
-    let window = web_sys::window()?;
-    if !window
-        .confirm_with_message(
-            "This prevents new claims immediately.\nEntitlements already issued remain valid.",
-        )
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    Some(
-        points_here
-            && window
-                .confirm_with_message("Also remove this campaign's advisory listing pointer?")
-                .unwrap_or(false),
-    )
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[cfg(not(target_arch = "wasm32"))]
-fn confirm_cancellation(_points_here: bool) -> Option<bool> {
-    Some(false)
+    #[test]
+    fn cancellation_with_pointer_prompts_for_cleanup() {
+        assert_eq!(
+            resolve_confirmation(CampaignConfirmation::CancelCampaign, Some(true), true,),
+            ConfirmationOutcome::PromptRemovePointer
+        );
+    }
+
+    #[test]
+    fn declining_pointer_cleanup_still_cancels_campaign() {
+        assert_eq!(
+            resolve_confirmation(CampaignConfirmation::RemovePointer, Some(false), true,),
+            ConfirmationOutcome::CancelCampaign(false)
+        );
+    }
+
+    #[test]
+    fn dismissing_confirmation_does_not_take_action() {
+        assert_eq!(
+            resolve_confirmation(CampaignConfirmation::DiscardChanges, None, false),
+            ConfirmationOutcome::Close
+        );
+    }
+
+    #[test]
+    fn accepted_discard_leaves_editor() {
+        assert_eq!(
+            resolve_confirmation(CampaignConfirmation::DiscardChanges, Some(true), false,),
+            ConfirmationOutcome::DiscardChanges
+        );
+    }
+
+    #[test]
+    fn cancellation_without_pointer_does_not_prompt_for_cleanup() {
+        assert_eq!(
+            resolve_confirmation(CampaignConfirmation::CancelCampaign, Some(true), false,),
+            ConfirmationOutcome::CancelCampaign(false)
+        );
+    }
 }

@@ -11,7 +11,7 @@ use crate::ui_v2::views::marketplace_loader::{
     listing_presentation, listing_publisher, use_marketplace_listings,
 };
 
-const FALLBACK_COVER: &str = "https://lh3.googleusercontent.com/aida-public/AB6AXuDcG9Zo3aR9Vrpk5pP2jenw1AoVFoOzbAQ-t57kQtlbwGQVsLLwmHyFuyzRVsOh71iN4mHyhfw0Sx4YgdJ9duL9ANv3Xa1W7jYKWeVgj5_rE7KzitErwV3dtgEFGsGCSXtFQxyw6tQoGmP3V-Ci9Vs9_ZQXh6WXrFi6eperEaPm3YutXUIImUuC5sKm2hgyVb6sMBnpn0Imy94ETrJ9WO2XeC6tTMddB6EA-x1LgnN3Ezj_dPitegkcYmXGBSWZyCTZgxINu01kmdM";
+use crate::ui_v2::views::{use_fallback_cover, valid_cover_url, FALLBACK_COVER};
 const BROWSE_INITIAL_VISIBLE_COUNT: usize = 50;
 const BROWSE_VISIBLE_INCREMENT: usize = 50;
 const MAX_PLATFORM_AUTO_FETCHES: usize = 4;
@@ -571,11 +571,7 @@ fn render_listing_card(
     let selected = listing.clone();
     let install_listing = listing.clone();
     let presentation = listing_presentation(&listing);
-    let image_url = listing
-        .images
-        .first()
-        .cloned()
-        .unwrap_or_else(|| FALLBACK_COVER.to_string());
+    let image_url = valid_cover_url(&listing.images).unwrap_or_else(|| FALLBACK_COVER.to_string());
     let meta = listing
         .specs
         .first()
@@ -585,7 +581,7 @@ fn render_listing_card(
     view! {
         <article class="group relative flex flex-col bg-surface-container-high rounded-xl overflow-hidden transition-transform duration-300 hover:scale-[1.02] [transform:translateZ(0)] [backface-visibility:hidden]">
             <div class="relative aspect-[16/10] w-full overflow-hidden">
-                <img alt={listing.title.clone()} class="w-full h-full object-cover" src={image_url} />
+                <img alt={listing.title.clone()} class="w-full h-full object-cover" src={image_url} on:error=use_fallback_cover />
                 <div class="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent"></div>
                 {render_status_badges(&listing, host_tag.as_deref(), active_filter.as_deref())}
             </div>
@@ -644,18 +640,14 @@ fn render_featured_card(
 ) -> AnyView {
     let selected = listing.clone();
     let install_listing = listing.clone();
-    let image_url = listing
-        .images
-        .first()
-        .cloned()
-        .unwrap_or_else(|| FALLBACK_COVER.to_string());
+    let image_url = valid_cover_url(&listing.images).unwrap_or_else(|| FALLBACK_COVER.to_string());
     let presentation = listing_presentation(&listing);
 
     view! {
         <article class="md:col-span-2 group relative rounded-xl bg-surface-container-high overflow-hidden transition-transform duration-300 hover:scale-[1.02] [transform:translateZ(0)] [backface-visibility:hidden]">
             <div class="flex flex-col lg:flex-row h-full">
                 <div class="lg:w-3/5 relative aspect-[16/9] lg:aspect-auto bg-surface-high">
-                    <img alt={listing.title.clone()} class="w-full h-full object-cover" src={image_url} />
+                    <img alt={listing.title.clone()} class="w-full h-full object-cover" src={image_url} on:error=use_fallback_cover />
                     <div class="absolute inset-0 bg-gradient-to-r from-transparent via-black/20 to-surface-container-high hidden lg:block"></div>
                     {render_status_badges(&listing, host_tag.as_deref(), active_filter.as_deref())}
                 </div>

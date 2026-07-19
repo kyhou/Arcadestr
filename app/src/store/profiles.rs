@@ -24,6 +24,11 @@ impl ProfileStore {
         self.profiles.get().get(npub).cloned()
     }
 
+    /// Get a profile without subscribing the current reactive observer
+    pub fn get_untracked(&self, npub: &str) -> Option<UserProfile> {
+        self.profiles.get_untracked().get(npub).cloned()
+    }
+
     /// Add or update a single profile
     pub fn put(&self, profile: UserProfile) {
         self.profiles.update(|map| {
@@ -45,9 +50,19 @@ impl ProfileStore {
         self.profiles.get().contains_key(npub)
     }
 
+    /// Check for a profile without subscribing the current reactive observer
+    pub fn has_untracked(&self, npub: &str) -> bool {
+        self.profiles.get_untracked().contains_key(npub)
+    }
+
     /// Get all profiles as a vector
     pub fn get_all(&self) -> Vec<UserProfile> {
         self.profiles.get().values().cloned().collect()
+    }
+
+    /// Get all profiles without subscribing the current reactive observer
+    pub fn get_all_untracked(&self) -> Vec<UserProfile> {
+        self.profiles.get_untracked().values().cloned().collect()
     }
 
     /// Get the raw signal for reactive access

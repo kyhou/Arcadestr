@@ -102,7 +102,7 @@ pub fn DetailView(
             profile_loading.set(true);
 
             // First check if profile is already in cache
-            let cached_profile = store.as_ref().and_then(|s| s.get(&npub));
+            let cached_profile = store.as_ref().and_then(|s| s.get_untracked(&npub));
 
             if let Some(profile) = cached_profile {
                 // Use cached profile

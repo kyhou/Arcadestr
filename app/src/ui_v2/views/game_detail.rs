@@ -547,7 +547,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         spawn_local(async move {
             profile_loading.set(true);
 
-            let cached = store.as_ref().and_then(|s| s.get(&npub));
+            let cached = store.as_ref().and_then(|s| s.get_untracked(&npub));
             if let Some(profile) = cached {
                 seller_profile.set(Some(profile));
                 profile_loading.set(false);

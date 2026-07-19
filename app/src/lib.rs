@@ -170,7 +170,7 @@ pub async fn fetch_missing_profiles(npubs: Vec<String>) -> Result<Vec<UserProfil
         .into_iter()
         .filter(|npub| {
             if let Some(ref s) = store {
-                !s.has(npub)
+                !s.has_untracked(npub)
             } else {
                 true
             }
@@ -5114,8 +5114,11 @@ pub fn App() -> impl IntoView {
                     #[cfg(debug_assertions)]
                     {
                         web_sys::console::log_1(
-                            &format!("ProfileStore now has {} profiles", store.get_all().len())
-                                .into(),
+                            &format!(
+                                "ProfileStore now has {} profiles",
+                                store.get_all_untracked().len()
+                            )
+                            .into(),
                         );
                     }
                 } else {
@@ -5266,7 +5269,7 @@ pub fn App() -> impl IntoView {
                 let auth = auth.clone();
                 if auth
                     .profile
-                    .get()
+                    .get_untracked()
                     .map(|p| !p.has_metadata())
                     .unwrap_or(true)
                 {
