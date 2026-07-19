@@ -6,6 +6,8 @@ use wasm_bindgen_futures::spawn_local;
 
 use arcadestr_core::is_sha256_hex;
 
+use crate::campaign_management::datetime_local_to_unix;
+use crate::models::AcquisitionPolicy;
 use crate::tauri_bridge::{
     invoke_check_adp_server, invoke_discover_adp_servers, invoke_hash_build_file,
     invoke_publish_adp_listing, invoke_resolve_adp_operator, invoke_select_build_file,
@@ -29,6 +31,79 @@ enum ServerStatus {
     Pending,
     Ok,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcquisitionKind {
+    Gated,
+    Public,
+    TimedAccess,
+}
+
+impl AcquisitionKind {
+    fn value(self) -> &'static str {
+        match self {
+            Self::Gated => "gated",
+            Self::Public => "public",
+            Self::TimedAccess => "timed-access",
+        }
+    }
+
+    fn from_value(value: &str) -> Self {
+        match value {
+            "public" => Self::Public,
+            "timed-access" => Self::TimedAccess,
+            _ => Self::Gated,
+        }
+    }
+}
+
+fn acquisition_kind(policy: &AcquisitionPolicy) -> AcquisitionKind {
+    match policy {
+        AcquisitionPolicy::Gated => AcquisitionKind::Gated,
+        AcquisitionPolicy::Public => AcquisitionKind::Public,
+        AcquisitionPolicy::TimedAccess { .. } => AcquisitionKind::TimedAccess,
+    }
+}
+
+fn acquisition_policy_from_form(
+    kind: AcquisitionKind,
+    starts_at: &str,
+    ends_at: &str,
+) -> Result<AcquisitionPolicy, String> {
+    match kind {
+        AcquisitionKind::Gated => Ok(AcquisitionPolicy::Gated),
+        AcquisitionKind::Public => Ok(AcquisitionPolicy::Public),
+        AcquisitionKind::TimedAccess => {
+            if starts_at.trim().is_empty() {
+                return Err("Choose when timed access starts".to_string());
+            }
+            if ends_at.trim().is_empty() {
+                return Err("Choose when timed access ends".to_string());
+            }
+            let starts_at = datetime_local_to_unix(starts_at)
+                .ok_or_else(|| "Timed access start is invalid".to_string())?;
+            let ends_at = datetime_local_to_unix(ends_at)
+                .ok_or_else(|| "Timed access end is invalid".to_string())?;
+            if starts_at >= ends_at {
+                return Err("Timed access must end after it starts".to_string());
+            }
+            Ok(AcquisitionPolicy::TimedAccess { starts_at, ends_at })
+        }
+    }
+}
+
+fn datetime_local_value(value: u64) -> String {
+    let date = js_sys::Date::new(&(value as f64 * 1000.0).into());
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        date.get_full_year(),
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes(),
+        date.get_seconds()
+    )
 }
 
 impl ServerStatus {
@@ -457,6 +532,47 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn acquisition_kind_recovers_existing_policy() {
+        assert_eq!(
+            acquisition_kind(&AcquisitionPolicy::TimedAccess {
+                starts_at: 100,
+                ends_at: 200,
+            }),
+            AcquisitionKind::TimedAccess
+        );
+        assert_eq!(
+            acquisition_kind(&AcquisitionPolicy::Public),
+            AcquisitionKind::Public
+        );
+        assert_eq!(
+            acquisition_kind(&AcquisitionPolicy::Gated),
+            AcquisitionKind::Gated
+        );
+    }
+
+    #[test]
+    fn timed_acquisition_form_requires_ordered_dates() {
+        let policy = acquisition_policy_from_form(
+            AcquisitionKind::TimedAccess,
+            "2026-07-18T12:30",
+            "2026-07-18T13:30",
+        )
+        .expect("ordered dates should be accepted");
+        assert!(matches!(
+            policy,
+            AcquisitionPolicy::TimedAccess { starts_at, ends_at } if starts_at < ends_at
+        ));
+
+        let error = acquisition_policy_from_form(
+            AcquisitionKind::TimedAccess,
+            "2026-07-18T13:30",
+            "2026-07-18T12:30",
+        )
+        .expect_err("reversed dates should be rejected");
+        assert_eq!(error, "Timed access must end after it starts");
+    }
 }
 
 /// Publish view component - form for creating NIP-99 listings with optional ADP fulfillment.
@@ -481,6 +597,10 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
         .map(listing_fulfillment_metadata)
         .unwrap_or((None, None, None));
     let operator_resolution = listing.as_ref().and_then(operator_resolution_request);
+    let initial_acquisition = listing
+        .as_ref()
+        .map(|item| item.acquisition.clone())
+        .unwrap_or_default();
 
     let id = RwSignal::new(
         listing
@@ -530,6 +650,15 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
             .map(|item| item.lud16.clone())
             .unwrap_or_default(),
     );
+    let acquisition_kind = RwSignal::new(acquisition_kind(&initial_acquisition));
+    let acquisition_starts_at = RwSignal::new(match &initial_acquisition {
+        AcquisitionPolicy::TimedAccess { starts_at, .. } => datetime_local_value(*starts_at),
+        _ => String::new(),
+    });
+    let acquisition_ends_at = RwSignal::new(match &initial_acquisition {
+        AcquisitionPolicy::TimedAccess { ends_at, .. } => datetime_local_value(*ends_at),
+        _ => String::new(),
+    });
     let fulfillment_enabled =
         RwSignal::new(!matches!(published_fulfillment_mode, FulfillmentMode::None));
     let fulfillment_mode = RwSignal::new(published_fulfillment_mode);
@@ -696,6 +825,17 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
             FulfillmentMode::None
         };
         let operator_url_val = operator_url.get();
+        let acquisition = match acquisition_policy_from_form(
+            acquisition_kind.get(),
+            &acquisition_starts_at.get(),
+            &acquisition_ends_at.get(),
+        ) {
+            Ok(policy) => policy,
+            Err(msg) => {
+                error_message.set(Some(msg));
+                return;
+            }
+        };
 
         if let Err(msg) = validate_listing(
             &id_val,
@@ -740,6 +880,7 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
             existing_fulfillment_valid_from,
             existing_fulfillment_revoked_at,
             version: (!version_val.trim().is_empty()).then_some(version_val),
+            acquisition,
             platforms,
         };
 
@@ -974,6 +1115,32 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
                                 <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2">"Lightning Address (lud16)"</label>
                                 <input class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="you@example.com" prop:value={move || lud16.get()} on:input:target=move |ev| lud16.set(ev.target().value()) />
                             </div>
+                            <div>
+                                <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2" for="acquisition-policy">"Acquisition policy"</label>
+                                <select id="acquisition-policy" class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" prop:value=move || acquisition_kind.get().value() on:change:target=move |ev| acquisition_kind.set(AcquisitionKind::from_value(&ev.target().value())) disabled=move || is_publishing.get()>
+                                    <option value="gated">"Paid / gated"</option>
+                                    <option value="public">"Public access"</option>
+                                    <option value="timed-access">"Timed access"</option>
+                                </select>
+                                <p class="text-xs text-on-surface-variant mt-2">{move || match acquisition_kind.get() {
+                                    AcquisitionKind::Gated => "Access requires a purchase or entitlement.",
+                                    AcquisitionKind::Public => "Anyone can access the game without an entitlement.",
+                                    AcquisitionKind::TimedAccess => "Anyone can access the game during the selected window.",
+                                }}</p>
+                            </div>
+                            <Show when=move || matches!(acquisition_kind.get(), AcquisitionKind::TimedAccess)>
+                                <div class="grid gap-3">
+                                    <div>
+                                        <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2" for="acquisition-start">"Access starts"</label>
+                                        <input id="acquisition-start" class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" type="datetime-local" step="1" prop:value=move || acquisition_starts_at.get() on:input:target=move |ev| acquisition_starts_at.set(ev.target().value()) disabled=move || is_publishing.get() />
+                                    </div>
+                                    <div>
+                                        <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2" for="acquisition-end">"Access ends"</label>
+                                        <input id="acquisition-end" class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" type="datetime-local" step="1" prop:value=move || acquisition_ends_at.get() on:input:target=move |ev| acquisition_ends_at.set(ev.target().value()) disabled=move || is_publishing.get() />
+                                    </div>
+                                    <p class="text-xs text-on-surface-variant">"Times use your local timezone."</p>
+                                </div>
+                            </Show>
                             <div>
                                 <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2">"Platforms"</label>
                                 <input class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="linux-x86_64, windows-x86_64" prop:value={move || platforms_input.get()} on:input:target=move |ev| platforms_input.set(ev.target().value()) />

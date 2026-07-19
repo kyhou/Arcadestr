@@ -274,14 +274,29 @@ pub fn datetime_local_to_unix(value: &str) -> Option<u64> {
     let year = date_parts.next()??;
     let month = date_parts.next()??;
     let day = date_parts.next()??;
+    if date_parts.next().is_some() {
+        return None;
+    }
     let mut time_parts = time.split(':').map(|part| part.parse::<u64>().ok());
     let hour = time_parts.next()??;
     let minute = time_parts.next()??;
-    if month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || minute > 59 {
+    let second = match time_parts.next() {
+        Some(second) => second?,
+        None => 0,
+    };
+    if time_parts.next().is_some()
+        || month == 0
+        || month > 12
+        || day == 0
+        || day > 31
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
         return None;
     }
     let days = days_from_civil(year, month, day)?;
-    Some((days * 86_400 + hour * 3_600 + minute * 60) as u64)
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -367,6 +382,10 @@ mod tests {
         assert_eq!(
             datetime_local_to_unix("2026-07-18T12:30"),
             Some(1_784_377_800)
+        );
+        assert_eq!(
+            datetime_local_to_unix("2026-07-18T12:30:45"),
+            Some(1_784_377_845)
         );
     }
 

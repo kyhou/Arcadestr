@@ -61,6 +61,7 @@ pub struct PublishAdpListingRequest {
     pub existing_fulfillment_valid_from: Option<u64>,
     pub existing_fulfillment_revoked_at: Option<u64>,
     pub version: Option<String>,
+    pub acquisition: arcadestr_core::marketplace::AcquisitionPolicy,
     pub platforms: Vec<String>,
 }
 
@@ -1351,6 +1352,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         fulfillment_pubkey: fulfillment_pubkey.clone(),
         fulfillment_valid_from,
         fulfillment_revoked_at,
+        acquisition: request.acquisition.clone(),
         platforms: request.platforms.clone(),
     };
     let listing_builder =
@@ -1720,6 +1722,22 @@ mod tests {
     use arcadestr_core::subscriptions::SubscriptionRegistry;
     use arcadestr_core::user_cache::UserCache;
     use nostr::{nips::nip19::ToBech32, EventBuilder, Keys, Kind, Tag, TagKind, Timestamp};
+
+    #[test]
+    fn timed_acquisition_wire_format_deserializes_into_core_policy() {
+        let policy: arcadestr_core::marketplace::AcquisitionPolicy = serde_json::from_value(
+            serde_json::json!({ "TimedAccess": { "starts_at": 100, "ends_at": 200 } }),
+        )
+        .expect("app timed policy payload should deserialize");
+
+        assert_eq!(
+            policy,
+            arcadestr_core::marketplace::AcquisitionPolicy::TimedAccess {
+                starts_at: 100,
+                ends_at: 200,
+            }
+        );
+    }
     use serde_json::json;
     use tauri::Manager;
     use tokio::sync::{Mutex as AsyncMutex, RwLock};
@@ -2535,6 +2553,7 @@ mod tests {
             existing_fulfillment_valid_from: None,
             existing_fulfillment_revoked_at: None,
             version: Some("0.0.1-live".to_string()),
+            acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
             platforms: vec!["linux-x86_64".to_string()],
         };
 

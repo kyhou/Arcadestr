@@ -4,6 +4,7 @@ use nostr::{EventBuilder, Kind, Tag, TagKind};
 use thiserror::Error;
 
 use crate::authorization::FULFILLMENT_AUTHORIZATION_KIND;
+use crate::marketplace::AcquisitionPolicy;
 
 /// Input required to construct an ADP NIP-99 listing event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub struct AdpListingInput {
     pub fulfillment_pubkey: Option<String>,
     pub fulfillment_valid_from: Option<u64>,
     pub fulfillment_revoked_at: Option<u64>,
+    pub acquisition: AcquisitionPolicy,
     pub platforms: Vec<String>,
 }
 
@@ -36,6 +38,9 @@ pub enum AdpPublishError {
     /// Server tags must be absolute HTTP(S) URLs.
     #[error("malformed ADP server URL: {url}")]
     MalformedServerUrl { url: String },
+    /// Timed access requires a non-empty interval.
+    #[error("timed access end must be after its start")]
+    InvalidTimedAccess,
 }
 
 fn is_http_url(value: &str) -> bool {
@@ -74,6 +79,7 @@ pub fn build_fulfillment_authorization_event_builder(
 /// Returns [`AdpPublishError::MissingLud16`] when `price_sats > 0` and no LUD-16 is provided.
 /// Returns [`AdpPublishError::IncompleteFulfillmentTier`] when only part of the fulfillment tier is present.
 /// Returns [`AdpPublishError::MalformedServerUrl`] when a declared server is not an HTTP(S) URL.
+/// Returns [`AdpPublishError::InvalidTimedAccess`] when a timed policy has an empty interval.
 pub fn build_adp_listing_event_builder(
     input: &AdpListingInput,
 ) -> Result<EventBuilder, AdpPublishError> {
@@ -126,6 +132,13 @@ pub fn build_adp_listing_event_builder(
         }
     }
 
+    if matches!(
+        input.acquisition,
+        AcquisitionPolicy::TimedAccess { starts_at, ends_at } if starts_at >= ends_at
+    ) {
+        return Err(AdpPublishError::InvalidTimedAccess);
+    }
+
     let mut tags = vec![
         Tag::custom(TagKind::Custom("d".into()), [input.d_tag.clone()]),
         Tag::custom(TagKind::Custom("title".into()), [input.title.clone()]),
@@ -135,6 +148,19 @@ pub fn build_adp_listing_event_builder(
         ),
         Tag::custom(TagKind::Custom("t".into()), ["game".to_string()]),
     ];
+
+    tags.push(match &input.acquisition {
+        AcquisitionPolicy::Gated => Tag::custom(TagKind::Custom("acquisition".into()), ["gated"]),
+        AcquisitionPolicy::Public => Tag::custom(TagKind::Custom("acquisition".into()), ["public"]),
+        AcquisitionPolicy::TimedAccess { starts_at, ends_at } => Tag::custom(
+            TagKind::Custom("acquisition".into()),
+            [
+                "timed-access".to_string(),
+                starts_at.to_string(),
+                ends_at.to_string(),
+            ],
+        ),
+    });
 
     for image in &input.images {
         if !image.is_empty() {
@@ -276,6 +302,7 @@ mod tests {
             fulfillment_pubkey: Some("fulfillment-pubkey".to_string()),
             fulfillment_valid_from: Some(1_725_000_000),
             fulfillment_revoked_at: Some(1_725_000_999),
+            acquisition: AcquisitionPolicy::Gated,
             platforms: vec!["linux-x86_64".to_string(), "windows-x86_64".to_string()],
         };
 
@@ -285,6 +312,10 @@ mod tests {
             .expect("event should sign");
 
         assert_eq!(event.kind, Kind::Custom(30402));
+        assert_eq!(
+            tag_values(&event, "acquisition")[0],
+            vec!["acquisition", "gated"]
+        );
         assert_eq!(tag_values(&event, "d")[0], vec!["d", "my-game"]);
         assert_eq!(tag_values(&event, "title")[0], vec!["title", "My Game"]);
         assert_eq!(tag_values(&event, "price")[0], vec!["price", "2100", "sat"]);
@@ -334,6 +365,79 @@ mod tests {
         assert_eq!(tag_values(&event, "platform").len(), 2);
     }
 
+    #[tokio::test]
+    async fn emits_public_and_timed_acquisition_tags() {
+        let keys = Keys::generate();
+        let mut input = AdpListingInput {
+            d_tag: "public-game".to_string(),
+            title: "Public Game".to_string(),
+            description: "Publicly accessible".to_string(),
+            price_sats: 0,
+            lud16: None,
+            tags: vec![],
+            images: vec![],
+            servers: vec![],
+            file_hash: None,
+            version: None,
+            fulfillment_pubkey: None,
+            fulfillment_valid_from: None,
+            fulfillment_revoked_at: None,
+            acquisition: AcquisitionPolicy::Public,
+            platforms: vec![],
+        };
+
+        let public_event = build_adp_listing_event_builder(&input)
+            .expect("public listing should build")
+            .sign_with_keys(&keys)
+            .expect("public listing should sign");
+        assert_eq!(
+            tag_values(&public_event, "acquisition")[0],
+            vec!["acquisition", "public"]
+        );
+
+        input.acquisition = AcquisitionPolicy::TimedAccess {
+            starts_at: 100,
+            ends_at: 200,
+        };
+        let timed_event = build_adp_listing_event_builder(&input)
+            .expect("timed listing should build")
+            .sign_with_keys(&keys)
+            .expect("timed listing should sign");
+        assert_eq!(
+            tag_values(&timed_event, "acquisition")[0],
+            vec!["acquisition", "timed-access", "100", "200"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_timed_acquisition_window() {
+        let input = AdpListingInput {
+            d_tag: "invalid-timed-game".to_string(),
+            title: "Invalid Timed Game".to_string(),
+            description: "Invalid timed access".to_string(),
+            price_sats: 0,
+            lud16: None,
+            tags: vec![],
+            images: vec![],
+            servers: vec![],
+            file_hash: None,
+            version: None,
+            fulfillment_pubkey: None,
+            fulfillment_valid_from: None,
+            fulfillment_revoked_at: None,
+            acquisition: AcquisitionPolicy::TimedAccess {
+                starts_at: 200,
+                ends_at: 100,
+            },
+            platforms: vec![],
+        };
+
+        assert_eq!(
+            build_adp_listing_event_builder(&input).expect_err("invalid window should fail"),
+            AdpPublishError::InvalidTimedAccess
+        );
+    }
+
     #[test]
     fn priced_listing_requires_lud16() {
         let input = AdpListingInput {
@@ -350,6 +454,7 @@ mod tests {
             fulfillment_pubkey: None,
             fulfillment_valid_from: None,
             fulfillment_revoked_at: None,
+            acquisition: AcquisitionPolicy::Gated,
             platforms: vec![],
         };
 
@@ -376,6 +481,7 @@ mod tests {
             fulfillment_pubkey: None,
             fulfillment_valid_from: None,
             fulfillment_revoked_at: None,
+            acquisition: AcquisitionPolicy::Gated,
             platforms: vec!["linux-x86_64".to_string()],
         };
 
@@ -414,6 +520,7 @@ mod tests {
             fulfillment_pubkey: None,
             fulfillment_valid_from: None,
             fulfillment_revoked_at: None,
+            acquisition: AcquisitionPolicy::Gated,
             platforms: vec![],
         };
 
@@ -445,6 +552,7 @@ mod tests {
             fulfillment_pubkey: Some("fulfillment-pubkey".to_string()),
             fulfillment_valid_from: Some(1_725_000_000),
             fulfillment_revoked_at: None,
+            acquisition: AcquisitionPolicy::Gated,
             platforms: vec![],
         };
 
@@ -473,6 +581,7 @@ mod tests {
             fulfillment_pubkey: Some(developer_pubkey.clone()),
             fulfillment_valid_from: Some(1_725_000_000),
             fulfillment_revoked_at: None,
+            acquisition: AcquisitionPolicy::Gated,
             platforms: vec![],
         };
 
@@ -509,6 +618,7 @@ mod tests {
             fulfillment_pubkey: Some("fulfillment-pubkey".to_string()),
             fulfillment_valid_from: None,
             fulfillment_revoked_at: None,
+            acquisition: AcquisitionPolicy::Gated,
             platforms: vec![],
         };
 

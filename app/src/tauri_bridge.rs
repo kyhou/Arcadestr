@@ -113,6 +113,7 @@ pub struct PublishAdpListingRequest {
     pub existing_fulfillment_valid_from: Option<u64>,
     pub existing_fulfillment_revoked_at: Option<u64>,
     pub version: Option<String>,
+    pub acquisition: crate::models::AcquisitionPolicy,
     pub platforms: Vec<String>,
 }
 
@@ -776,6 +777,10 @@ mod tests {
             existing_fulfillment_valid_from: Some(123),
             existing_fulfillment_revoked_at: Some(456),
             version: Some("1.0.0".to_string()),
+            acquisition: crate::models::AcquisitionPolicy::TimedAccess {
+                starts_at: 100,
+                ends_at: 200,
+            },
             platforms: vec!["linux-x86_64".to_string()],
         };
 
@@ -784,5 +789,7 @@ mod tests {
         assert_eq!(value["existing_fulfillment_pubkey"], "delegated-key");
         assert_eq!(value["existing_fulfillment_valid_from"], 123);
         assert_eq!(value["existing_fulfillment_revoked_at"], 456);
+        assert_eq!(value["acquisition"]["TimedAccess"]["starts_at"], 100);
+        assert_eq!(value["acquisition"]["TimedAccess"]["ends_at"], 200);
     }
 }
