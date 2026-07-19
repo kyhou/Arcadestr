@@ -13,8 +13,8 @@ use crate::models::{
 use crate::store::try_use_profile_store;
 use crate::tauri_bridge::{
     invoke_claim_entitlement, invoke_confirm_purchase, invoke_connect_nwc_wallet,
-    invoke_discover_campaigns, invoke_install_game, invoke_pay_nwc_invoice,
-    invoke_request_lnurl_invoice, listen_download_complete,
+    invoke_discover_campaigns, invoke_get_installed_games, invoke_install_game,
+    invoke_pay_nwc_invoice, invoke_request_lnurl_invoice, listen_download_complete,
 };
 use crate::tauri_bridge::{
     CampaignPointerInput, ClaimEntitlementRequest, ConfirmPurchaseRequest, ConnectNwcWalletRequest,
@@ -37,6 +37,14 @@ fn current_unix_secs() -> u64 {
             .map(|duration| duration.as_secs())
             .unwrap_or_default()
     }
+}
+
+fn game_coordinate(listing: &GameListing) -> Option<String> {
+    use nostr::nips::nip19::FromBech32;
+
+    nostr::PublicKey::from_bech32(&listing.publisher_npub)
+        .ok()
+        .map(|publisher| format!("30402:{}:{}", publisher.to_hex(), listing.id))
 }
 
 fn format_timestamp(ts: u64) -> String {
@@ -215,6 +223,21 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let profile_loading: RwSignal<bool> = RwSignal::new(true);
 
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
+
+    if let Some(coordinate) = game_coordinate(&listing) {
+        Effect::new(move |_| {
+            let coordinate = coordinate.clone();
+            spawn_local(async move {
+                if let Ok(installed_games) = invoke_get_installed_games().await {
+                    install_complete.set(
+                        installed_games
+                            .iter()
+                            .any(|game| game.game_coordinate == coordinate),
+                    );
+                }
+            });
+        });
+    }
 
     let on_buy = {
         let listing = listing.clone();
@@ -623,13 +646,21 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                                     campaign.classification
                                                 )}
                                             </p>
-                                            <button
-                                                class="v2-btn-primary"
-                                                on:click=move |_| on_claim.run(claim_campaign.clone())
-                                                disabled=move || !is_active || buy_loading.get()
-                                            >
-                                                {if is_active { "Claim" } else { "Unavailable" }}
-                                            </button>
+                                            {move || if purchase_confirmed.get() {
+                                                view! { <p class="v2-social-meta">"Owned"</p> }.into_any()
+                                            } else {
+                                                let claim_campaign = claim_campaign.clone();
+                                                let on_claim = on_claim.clone();
+                                                view! {
+                                                    <button
+                                                        class="v2-btn-primary"
+                                                        on:click=move |_| on_claim.run(claim_campaign.clone())
+                                                        disabled=move || !is_active || buy_loading.get()
+                                                    >
+                                                        {if is_active { "Claim" } else { "Unavailable" }}
+                                                    </button>
+                                                }.into_any()
+                                            }}
                                         </div>
                                     }
                                 })
@@ -642,21 +673,19 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                         if purchase_confirmed.get() {
                             view! {
                                 <>
-                                    <button
-                                        class="v2-btn-primary"
-                                        on:click=move |_| on_download.run(())
-                                        disabled=move || install_loading.get() || install_complete.get()
-                                    >
-                                        {move || {
-                                            if install_complete.get() {
-                                                "Installed"
-                                            } else if install_loading.get() {
-                                                "Installing..."
-                                            } else {
-                                                "Install"
-                                            }
-                                        }}
-                                    </button>
+                                    {move || if install_complete.get() {
+                                        view! { <p class="v2-social-meta">"Installed"</p> }.into_any()
+                                    } else {
+                                        view! {
+                                            <button
+                                                class="v2-btn-primary"
+                                                on:click=move |_| on_download.run(())
+                                                disabled=move || install_loading.get()
+                                            >
+                                                {move || if install_loading.get() { "Installing..." } else { "Install" }}
+                                            </button>
+                                        }.into_any()
+                                    }}
                                     <p class="v2-social-meta">
                                         {move || {
                                             if install_complete.get() {
@@ -725,21 +754,24 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                             let free_button_label = buy_button_label.clone();
                             view! {
                                 <>
-                                    <button
-                                        class="v2-btn-primary"
-                                        on:click=move |_| on_download.run(())
-                                        disabled=move || install_loading.get() || install_complete.get()
-                                    >
-                                        {move || {
-                                            if install_complete.get() {
-                                                "Installed".to_string()
-                                            } else if install_loading.get() {
-                                                "Installing...".to_string()
-                                            } else {
-                                                free_button_label.clone()
-                                            }
-                                        }}
-                                    </button>
+                                    {move || if install_complete.get() {
+                                        view! { <p class="v2-social-meta">"Installed"</p> }.into_any()
+                                    } else {
+                                        let free_button_label = free_button_label.clone();
+                                        view! {
+                                            <button
+                                                class="v2-btn-primary"
+                                                on:click=move |_| on_download.run(())
+                                                disabled=move || install_loading.get()
+                                            >
+                                                {move || if install_loading.get() {
+                                                    "Installing...".to_string()
+                                                } else {
+                                                    free_button_label.clone()
+                                                }}
+                                            </button>
+                                        }.into_any()
+                                    }}
                                     <button class="v2-btn-ghost">"Add to Library"</button>
                                 </>
                             }.into_any()
