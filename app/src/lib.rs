@@ -920,18 +920,23 @@ where
     C: FnOnce() + 'static,
 {
     use crate::tauri_invoke::listen;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let product_event = format!("marketplace-product-{request_id}");
+    let complete_event = format!("marketplace-complete-{request_id}");
 
     // Set up listener for products before starting fetch
-    let product_listener = listen(
-        "marketplace-product",
-        move |data| match serde_json::from_value::<GameListing>(data) {
+    let product_listener = listen(&product_event, move |data| {
+        match serde_json::from_value::<GameListing>(data) {
             Ok(listing) => on_listing(listing),
             Err(e) => {
                 #[cfg(target_arch = "wasm32")]
                 web_sys::console::warn_1(&format!("Failed to parse listing: {}", e).into());
             }
-        },
-    )
+        }
+    })
     .await;
 
     let product_cleanup = match product_listener {
@@ -941,7 +946,7 @@ where
 
     // Set up completion listener
     let completion_callback = std::cell::RefCell::new(on_complete);
-    let completion_listener = listen("marketplace-complete", move |_data| {
+    let completion_listener = listen(&complete_event, move |_data| {
         if let Some(callback) = completion_callback.borrow_mut().take() {
             callback();
         }
@@ -962,6 +967,7 @@ where
         "limit": limit,
         "since_days": since_days,
         "until_secs": until_secs,
+        "requestId": request_id.to_string(),
     });
 
     let result: Result<(), String> =

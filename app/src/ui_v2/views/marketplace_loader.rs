@@ -9,9 +9,9 @@ use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::invoke_fetch_marketplace_stream;
 use crate::models::{npub_fallback_label, GameListing, ListingSource};
 use crate::store::{try_use_marketplace_store, DEFAULT_LISTING_TTL_SECS};
+use crate::{invoke_fetch_marketplace_stream, AuthContext};
 
 // ── Batch flusher for progressive listing updates ────────────────────────────
 //
@@ -73,6 +73,7 @@ pub fn use_marketplace_listings() -> MarketplaceListingsState {
 }
 
 pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsState {
+    let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let marketplace_store = try_use_marketplace_store();
     let listings = RwSignal::new(Vec::<GameListing>::new());
     let loading = RwSignal::new(true);
@@ -82,8 +83,23 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
     let requested_limit = RwSignal::new(limit);
     let has_more = RwSignal::new(true);
     let last_requested_limit = RwSignal::new(0usize);
+    let loaded_account = RwSignal::new(None::<Option<String>>);
+    let request_generation = RwSignal::new(0u64);
 
     Effect::new(move |_| {
+        let active_account = auth.npub.get();
+        if loaded_account.get_untracked().as_ref() != Some(&active_account) {
+            loaded_account.set(Some(active_account));
+            request_generation.update(|generation| *generation += 1);
+            last_requested_limit.set(0);
+            listings.set(Vec::new());
+            received_count.set(0);
+            has_more.set(true);
+            if let Some(store) = &marketplace_store {
+                store.clear();
+            }
+        }
+        let generation = request_generation.get_untracked();
         let target_limit = requested_limit.get();
         if target_limit <= last_requested_limit.get() {
             return;
@@ -158,6 +174,9 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                     let store_for_listing = store_for_listing.clone();
 
                     move |listing: GameListing| {
+                        if request_generation.get_untracked() != generation {
+                            return;
+                        }
                         let is_first_coordinate = mark_received_coordinate(
                             &mut *received_coordinates.borrow_mut(),
                             &listing,
@@ -227,6 +246,9 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                     let store_for_complete = store.clone();
 
                     move || {
+                        if request_generation.get_untracked() != generation {
+                            return;
+                        }
                         // Flush any remaining buffered items before finalising
                         let remaining: Vec<GameListing> = std::mem::take(&mut *buffer.borrow_mut());
                         flush_queued.set(false);
@@ -271,6 +293,10 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                         product_cleanup();
                         completion_cleanup();
 
+                        if request_generation.get_untracked() != generation {
+                            return;
+                        }
+
                         // Fallback in case completion event was missed.
                         if loading.get_untracked() || loading_more.get_untracked() {
                             listings.update(|items| {
@@ -285,6 +311,9 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                         }
                     }
                     Err(e) => {
+                        if request_generation.get_untracked() != generation {
+                            return;
+                        }
                         batch(move || {
                             if let Some(s) = &store {
                                 let cached = s.get_all();

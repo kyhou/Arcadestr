@@ -1307,6 +1307,7 @@ async fn fetch_marketplace_stream(
     limit: usize,
     since_days: Option<u64>,
     until_secs: Option<u64>,
+    request_id: String,
 ) -> Result<(), String> {
     use std::collections::HashMap;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
@@ -1322,6 +1323,8 @@ async fn fetch_marketplace_stream(
         let auth = state.auth.lock().await;
         auth.public_key().map(|public_key| public_key.to_hex())
     };
+    let product_event = format!("marketplace-product-{request_id}");
+    let complete_event = format!("marketplace-complete-{request_id}");
 
     let mut cached_emitted = 0usize;
     let mut cached_signatures: HashMap<(String, String), String> = HashMap::new();
@@ -1343,7 +1346,7 @@ async fn fetch_marketplace_stream(
                 )
                 .await;
 
-                if window.emit("marketplace-product", &listing).is_ok() {
+                if window.emit(&product_event, &listing).is_ok() {
                     cached_emitted += 1;
                 }
             }
@@ -1386,6 +1389,7 @@ async fn fetch_marketplace_stream(
     let emit_tasks_for_closure = StdArc::clone(&emit_tasks);
     let database_for_closure = Arc::clone(&state.database);
     let buyer_pubkey_hex_for_closure = buyer_pubkey_hex.clone();
+    let product_event_for_closure = product_event.clone();
 
     // Capture relay manager without holding the AppState nostr lock across awaits.
     let relay_manager = {
@@ -1433,6 +1437,7 @@ async fn fetch_marketplace_stream(
             let listing = AppGameListing::from_listing(product);
             let database = Arc::clone(&database_for_closure);
             let buyer_pubkey_hex = buyer_pubkey_hex_for_closure.clone();
+            let product_event = product_event_for_closure.clone();
             let window = window_for_closure.clone();
             let task = tauri::async_runtime::spawn(async move {
                 let listing = enrich_listing_ownership(
@@ -1443,7 +1448,7 @@ async fn fetch_marketplace_stream(
                 )
                 .await;
 
-                if let Err(e) = window.emit("marketplace-product", &listing) {
+                if let Err(e) = window.emit(&product_event, &listing) {
                     tracing::debug!("Failed to emit marketplace-product: {}", e);
                 }
             });
@@ -1505,7 +1510,7 @@ async fn fetch_marketplace_stream(
     );
 
     // Signal completion
-    let _ = window.emit("marketplace-complete", ());
+    let _ = window.emit(&complete_event, ());
 
     Ok(())
 }
