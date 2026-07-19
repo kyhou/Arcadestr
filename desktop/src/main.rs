@@ -1179,7 +1179,7 @@ async fn install_game_with_fetcher<R: tauri::Runtime>(
     let mut cached_token = None;
     for server_url in &metadata.server_urls {
         if let Some(token) = tokens
-            .valid_token(&coordinate, server_url, now_unix_i64()?)
+            .valid_token(&buyer_pubkey_hex, &coordinate, server_url, now_unix_i64()?)
             .await
             .map_err(|error| error.to_string())?
         {
@@ -2242,6 +2242,7 @@ mod install_game_tests {
         grant_ownership(&state, &buyer, &merchant, listing_id).await;
         DownloadTokensRepository::new(state.database.pool().clone())
             .upsert(&DownloadToken {
+                buyer_pubkey: buyer.public_key().to_hex(),
                 game_coordinate: coordinate.clone(),
                 server_url: server_url.to_string(),
                 token: "token-path-a".to_string(),
@@ -2265,6 +2266,50 @@ mod install_game_tests {
         .expect("token path install should succeed");
 
         assert_eq!(http.call_count(&download_url), 1);
+    }
+
+    #[tokio::test]
+    async fn install_game_rejects_another_accounts_cached_token() {
+        let buyer = Keys::generate();
+        let other_buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let listing_id = "other-account-token";
+        let server_url = "https://dist.example.com";
+        let coordinate = coordinate(&merchant, listing_id);
+        let file_hash = sha256_hex(b"artifact").await;
+        let http = MockHttpClient::new();
+        let state = app_state_with_http(
+            &buyer,
+            test_db("install-game-other-account-token").await,
+            Arc::new(http),
+        )
+        .await;
+        DownloadTokensRepository::new(state.database.pool().clone())
+            .upsert(&DownloadToken {
+                buyer_pubkey: other_buyer.public_key().to_hex(),
+                game_coordinate: coordinate,
+                server_url: server_url.to_string(),
+                token: "other-account-token".to_string(),
+                expires_at: 4_000_000_000,
+            })
+            .await
+            .expect("other account token should persist");
+        let fetcher = StaticFreshListingFetcher {
+            event: listing_event(&merchant, listing_id, server_url, &file_hash, "1.0.0"),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let error = install_game_with_fetcher(
+            app_listing(&merchant, listing_id),
+            &state,
+            None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
+            unique_test_path("install-game-other-account-token-data", "dir"),
+            &fetcher,
+        )
+        .await
+        .expect_err("another account's token must not authorize installation");
+
+        assert_eq!(error, "ownership or explicit current access not found");
     }
 
     #[tokio::test]

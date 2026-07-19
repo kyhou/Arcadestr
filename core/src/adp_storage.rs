@@ -32,6 +32,7 @@ pub struct AdpProvisioning {
 /// Cached ADP download token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadToken {
+    pub buyer_pubkey: String,
     pub game_coordinate: String,
     pub server_url: String,
     pub token: String,
@@ -174,8 +175,9 @@ impl DownloadTokensRepository {
     pub async fn upsert(&self, token: &DownloadToken) -> Result<(), AdpStorageError> {
         sqlx::query(
             r#"INSERT OR REPLACE INTO download_tokens
-            (game_coordinate, server_url, token, expires_at) VALUES (?, ?, ?, ?)"#,
+            (buyer_pubkey, game_coordinate, server_url, token, expires_at) VALUES (?, ?, ?, ?, ?)"#,
         )
+        .bind(&token.buyer_pubkey)
         .bind(&token.game_coordinate)
         .bind(&token.server_url)
         .bind(&token.token)
@@ -187,14 +189,16 @@ impl DownloadTokensRepository {
 
     pub async fn valid_token(
         &self,
+        buyer_pubkey: &str,
         game_coordinate: &str,
         server_url: &str,
         now: i64,
     ) -> Result<Option<DownloadToken>, AdpStorageError> {
         let row = sqlx::query(
-            "SELECT game_coordinate, server_url, token, expires_at FROM download_tokens \
-             WHERE game_coordinate = ? AND server_url = ? AND expires_at > ?",
+            "SELECT buyer_pubkey, game_coordinate, server_url, token, expires_at FROM download_tokens \
+             WHERE buyer_pubkey = ? AND game_coordinate = ? AND server_url = ? AND expires_at > ?",
         )
+        .bind(buyer_pubkey)
         .bind(game_coordinate)
         .bind(server_url)
         .bind(now)
@@ -205,10 +209,14 @@ impl DownloadTokensRepository {
 
     pub async fn delete(
         &self,
+        buyer_pubkey: &str,
         game_coordinate: &str,
         server_url: &str,
     ) -> Result<(), AdpStorageError> {
-        sqlx::query("DELETE FROM download_tokens WHERE game_coordinate = ? AND server_url = ?")
+        sqlx::query(
+            "DELETE FROM download_tokens WHERE buyer_pubkey = ? AND game_coordinate = ? AND server_url = ?",
+        )
+            .bind(buyer_pubkey)
             .bind(game_coordinate)
             .bind(server_url)
             .execute(&self.pool)
@@ -284,6 +292,7 @@ fn adp_provisioning_from_row(row: sqlx::sqlite::SqliteRow) -> AdpProvisioning {
 
 fn download_token_from_row(row: sqlx::sqlite::SqliteRow) -> DownloadToken {
     DownloadToken {
+        buyer_pubkey: row.get("buyer_pubkey"),
         game_coordinate: row.get("game_coordinate"),
         server_url: row.get("server_url"),
         token: row.get("token"),
@@ -464,6 +473,7 @@ mod tests {
         let db = test_db().await;
         let repo = DownloadTokensRepository::new(db.pool().clone());
         let token = DownloadToken {
+            buyer_pubkey: "buyer-1".to_string(),
             game_coordinate: "30402:dev:game".to_string(),
             server_url: "https://dist.example.com".to_string(),
             token: "token-1".to_string(),
@@ -472,7 +482,7 @@ mod tests {
 
         repo.upsert(&token).await.expect("insert should succeed");
         assert_eq!(
-            repo.valid_token("30402:dev:game", "https://dist.example.com", 50)
+            repo.valid_token("buyer-1", "30402:dev:game", "https://dist.example.com", 50,)
                 .await
                 .expect("lookup should succeed")
                 .expect("token should be valid")
@@ -480,16 +490,16 @@ mod tests {
             "token-1"
         );
         assert!(repo
-            .valid_token("30402:dev:game", "https://dist.example.com", 101)
+            .valid_token("buyer-1", "30402:dev:game", "https://dist.example.com", 101,)
             .await
             .expect("lookup should succeed")
             .is_none());
 
-        repo.delete("30402:dev:game", "https://dist.example.com")
+        repo.delete("buyer-1", "30402:dev:game", "https://dist.example.com")
             .await
             .expect("delete should succeed");
         assert!(repo
-            .valid_token("30402:dev:game", "https://dist.example.com", 50)
+            .valid_token("buyer-1", "30402:dev:game", "https://dist.example.com", 50,)
             .await
             .expect("lookup should succeed")
             .is_none());
@@ -500,12 +510,14 @@ mod tests {
         let db = test_db().await;
         let repo = DownloadTokensRepository::new(db.pool().clone());
         let original = DownloadToken {
+            buyer_pubkey: "buyer-1".to_string(),
             game_coordinate: "30402:dev:game".to_string(),
             server_url: "https://dist.example.com".to_string(),
             token: "token-1".to_string(),
             expires_at: 100,
         };
         let replacement = DownloadToken {
+            buyer_pubkey: "buyer-1".to_string(),
             game_coordinate: "30402:dev:game".to_string(),
             server_url: "https://dist.example.com".to_string(),
             token: "token-2".to_string(),
@@ -519,13 +531,42 @@ mod tests {
             .await
             .expect("replacement upsert should succeed");
         let found = repo
-            .valid_token("30402:dev:game", "https://dist.example.com", 150)
+            .valid_token("buyer-1", "30402:dev:game", "https://dist.example.com", 150)
             .await
             .expect("lookup should succeed")
             .expect("replacement token should be valid");
 
         assert_eq!(found.token, "token-2");
         assert_eq!(found.expires_at, 200);
+    }
+
+    #[tokio::test]
+    async fn download_tokens_are_isolated_by_buyer() {
+        let db = test_db().await;
+        let repo = DownloadTokensRepository::new(db.pool().clone());
+        let token = DownloadToken {
+            buyer_pubkey: "buyer-1".to_string(),
+            game_coordinate: "30402:dev:game".to_string(),
+            server_url: "https://dist.example.com".to_string(),
+            token: "buyer-1-token".to_string(),
+            expires_at: 200,
+        };
+
+        repo.upsert(&token).await.expect("insert should succeed");
+
+        assert!(repo
+            .valid_token("buyer-2", "30402:dev:game", "https://dist.example.com", 100,)
+            .await
+            .expect("lookup should succeed")
+            .is_none());
+        assert_eq!(
+            repo.valid_token("buyer-1", "30402:dev:game", "https://dist.example.com", 100,)
+                .await
+                .expect("lookup should succeed")
+                .expect("owner token should remain available")
+                .token,
+            "buyer-1-token"
+        );
     }
 
     #[tokio::test]

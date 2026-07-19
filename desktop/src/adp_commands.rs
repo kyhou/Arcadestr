@@ -899,6 +899,7 @@ pub async fn claim_entitlement(
         .map_err(|error| error.to_string())?;
     DownloadTokensRepository::new(state.database.pool().clone())
         .upsert(&DownloadToken {
+            buyer_pubkey: buyer.to_hex(),
             game_coordinate: game_coordinate,
             server_url: request.server_url,
             token: response.download_token.clone(),
@@ -1066,6 +1067,7 @@ async fn persist_purchase_confirmation(
     let tokens = DownloadTokensRepository::new(state.database.pool().clone());
     tokens
         .upsert(&DownloadToken {
+            buyer_pubkey: buyer_pubkey.to_string(),
             game_coordinate: game_coordinate.to_string(),
             server_url: server_url.to_string(),
             token: response.download_token.clone(),
@@ -2800,6 +2802,7 @@ mod tests {
             DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
         let token = token_repo
             .valid_token(
+                &buyer_pubkey,
                 &coordinate,
                 &server_url,
                 now_unix_i64().expect("clock should work"),
@@ -2877,6 +2880,7 @@ mod tests {
             DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
         let token = token_repo
             .valid_token(
+                &buyer_pubkey,
                 &coordinate,
                 &server_url,
                 now_unix_i64().expect("clock should work"),
@@ -2909,6 +2913,12 @@ mod tests {
         let app = live_test_app(relays).await;
         eprintln!("ADP_GATE5_STAGE=app_init_ok");
         let state = app.state::<AppState>();
+        let buyer_pubkey = {
+            let auth = state.auth.lock().await;
+            auth.public_key()
+                .expect("live buyer should be authenticated")
+                .to_hex()
+        };
         let listing_event = fetch_listing_event_by_coordinate(&state, &coordinate)
             .await
             .expect("live listing event should fetch before install");
@@ -2949,6 +2959,7 @@ mod tests {
             DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
         let cached_token = token_repo
             .valid_token(
+                &buyer_pubkey,
                 &coordinate,
                 &server_url,
                 now_unix_i64().expect("clock should work"),
@@ -2999,11 +3010,12 @@ mod tests {
         );
 
         token_repo
-            .delete(&coordinate, &server_url)
+            .delete(&buyer_pubkey, &coordinate, &server_url)
             .await
             .expect("Path B should delete local token row");
         let token_after_delete = token_repo
             .valid_token(
+                &buyer_pubkey,
                 &coordinate,
                 &server_url,
                 now_unix_i64().expect("clock should work"),
@@ -3048,6 +3060,7 @@ mod tests {
         );
         let token_after_path_b = token_repo
             .valid_token(
+                &buyer_pubkey,
                 &coordinate,
                 &server_url,
                 now_unix_i64().expect("clock should work"),

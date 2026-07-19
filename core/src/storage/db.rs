@@ -213,7 +213,35 @@ impl Database {
         }
 
         Self::ensure_marketplace_cache_schema(pool).await?;
+        Self::ensure_download_tokens_schema(pool).await?;
 
+        Ok(())
+    }
+
+    async fn ensure_download_tokens_schema(pool: &SqlitePool) -> Result<(), DatabaseError> {
+        if !Self::table_needs_reset(pool, "download_tokens", &["buyer_pubkey"]).await? {
+            return Ok(());
+        }
+
+        // Legacy bearer tokens cannot be assigned safely to an account. The cache is disposable.
+        sqlx::query("DROP TABLE download_tokens")
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                DatabaseError::Migration(format!(
+                    "Failed to reset legacy download token cache: {}",
+                    e
+                ))
+            })?;
+        sqlx::query(MIGRATION_8_DOWNLOAD_TOKENS)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                DatabaseError::Migration(format!(
+                    "Failed to recreate account-scoped download token cache: {}",
+                    e
+                ))
+            })?;
         Ok(())
     }
 
@@ -790,6 +818,47 @@ mod tests {
         .expect("table count query should succeed after re-init");
 
         assert_eq!(second_tables.0, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_download_tokens_are_replaced_with_account_scoped_cache() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("legacy-download-tokens.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .expect("legacy database should open");
+        sqlx::query(
+            "CREATE TABLE download_tokens (game_coordinate TEXT NOT NULL, server_url TEXT NOT NULL, token TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY (game_coordinate, server_url))",
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy token table should be created");
+        sqlx::query("INSERT INTO download_tokens VALUES ('game', 'server', 'token', 100)")
+            .execute(&pool)
+            .await
+            .expect("legacy token should be inserted");
+        pool.close().await;
+
+        let db = Database::new(&db_path)
+            .await
+            .expect("legacy database should migrate");
+        let buyer_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('download_tokens') WHERE name = 'buyer_pubkey'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("token schema should be readable");
+        let token_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM download_tokens")
+            .fetch_one(db.pool())
+            .await
+            .expect("token cache should be readable");
+
+        assert_eq!(buyer_column_count, 1);
+        assert_eq!(token_count, 0);
     }
 
     #[tokio::test]
