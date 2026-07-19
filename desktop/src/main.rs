@@ -929,6 +929,29 @@ async fn enrich_listing_ownership(
 }
 
 #[tauri::command]
+async fn get_listing_ownership(
+    buyer_npub: String,
+    publisher_npub: String,
+    listing_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let buyer_pubkey_hex = nostr::PublicKey::from_bech32(&buyer_npub)
+        .map_err(|error| format!("invalid buyer npub: {error}"))?
+        .to_hex();
+    let coordinate = listing_coordinate_from_npub(&publisher_npub, &listing_id)?;
+    let ownership = arcadestr_core::ownership::OwnershipService::new(
+        arcadestr_core::purchases::PurchasesRepository::new(state.database.pool().clone()),
+        arcadestr_core::entitlements_repository::EntitlementsRepository::new(
+            state.database.pool().clone(),
+        ),
+    );
+    ownership
+        .is_owned(&buyer_pubkey_hex, &coordinate)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn get_platform_info() -> arcadestr_app::models::PlatformInfo {
     arcadestr_app::models::PlatformInfo {
         os: std::env::consts::OS.to_string(),
@@ -4779,6 +4802,7 @@ fn main() {
             fetch_listing_by_id,
             fetch_marketplace,
             fetch_marketplace_stream,
+            get_listing_ownership,
             get_platform_info,
             get_installed_games,
             install_game,

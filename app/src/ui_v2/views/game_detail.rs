@@ -13,8 +13,9 @@ use crate::models::{
 use crate::store::try_use_profile_store;
 use crate::tauri_bridge::{
     invoke_claim_entitlement, invoke_confirm_purchase, invoke_connect_nwc_wallet,
-    invoke_discover_campaigns, invoke_get_installed_games, invoke_install_game,
-    invoke_pay_nwc_invoice, invoke_request_lnurl_invoice, listen_download_complete,
+    invoke_discover_campaigns, invoke_get_installed_games, invoke_get_listing_ownership,
+    invoke_install_game, invoke_pay_nwc_invoice, invoke_request_lnurl_invoice,
+    listen_download_complete,
 };
 use crate::tauri_bridge::{
     CampaignPointerInput, ClaimEntitlementRequest, ConfirmPurchaseRequest, ConnectNwcWalletRequest,
@@ -213,6 +214,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let nwc_connected: RwSignal<bool> = RwSignal::new(false);
     let manual_preimage = RwSignal::new(String::new());
     let purchase_confirmed: RwSignal<bool> = RwSignal::new(listing.is_owned);
+    let ownership_loading: RwSignal<bool> = RwSignal::new(false);
     let install_loading: RwSignal<bool> = RwSignal::new(false);
     let install_complete: RwSignal<bool> = RwSignal::new(false);
     let campaigns: RwSignal<Vec<DiscoveredCampaign>> = RwSignal::new(Vec::new());
@@ -223,6 +225,40 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let profile_loading: RwSignal<bool> = RwSignal::new(true);
 
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
+
+    let ownership_publisher = listing.publisher_npub.clone();
+    let ownership_listing_id = listing.id.clone();
+    let ownership_auth = auth.clone();
+    Effect::new(move |_| {
+        let requested_account = ownership_auth.npub.get();
+        purchase_confirmed.set(false);
+        buy_error.set(None);
+
+        let Some(requested_account) = requested_account else {
+            ownership_loading.set(false);
+            return;
+        };
+
+        ownership_loading.set(true);
+        let publisher_npub = ownership_publisher.clone();
+        let listing_id = ownership_listing_id.clone();
+        let auth_for_response = ownership_auth.clone();
+        spawn_local(async move {
+            let result =
+                invoke_get_listing_ownership(requested_account.clone(), publisher_npub, listing_id)
+                    .await;
+            if auth_for_response.npub.get_untracked().as_deref() != Some(requested_account.as_str())
+            {
+                return;
+            }
+
+            match result {
+                Ok(is_owned) => purchase_confirmed.set(is_owned),
+                Err(error) => buy_error.set(Some(format!("Ownership lookup failed: {error}"))),
+            }
+            ownership_loading.set(false);
+        });
+    });
 
     if let Some(coordinate) = game_coordinate(&listing) {
         Effect::new(move |_| {
@@ -646,7 +682,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                                     campaign.classification
                                                 )}
                                             </p>
-                                            {move || if purchase_confirmed.get() {
+                                            {move || if ownership_loading.get() {
+                                                view! { <p class="v2-social-meta">"Checking ownership..."</p> }.into_any()
+                                            } else if purchase_confirmed.get() {
                                                 view! { <p class="v2-social-meta">"Owned"</p> }.into_any()
                                             } else {
                                                 let claim_campaign = claim_campaign.clone();
@@ -670,7 +708,13 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     }}
 
                     {move || {
-                        if purchase_confirmed.get() {
+                        if ownership_loading.get() {
+                            view! {
+                                <button class="v2-btn-primary" disabled=true>
+                                    "Checking ownership..."
+                                </button>
+                            }.into_any()
+                        } else if purchase_confirmed.get() {
                             view! {
                                 <>
                                     {move || if install_complete.get() {

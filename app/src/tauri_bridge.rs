@@ -29,6 +29,34 @@ pub async fn invoke_install_game(_listing: &GameListing) -> Result<(), String> {
     Err("Game installation is only available in desktop builds.".to_string())
 }
 
+/// Return whether the active account owns a listing.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_get_listing_ownership(
+    buyer_npub: String,
+    publisher_npub: String,
+    listing_id: String,
+) -> Result<bool, String> {
+    crate::tauri_invoke::invoke(
+        "get_listing_ownership",
+        serde_json::json!({
+            "buyerNpub": buyer_npub,
+            "publisherNpub": publisher_npub,
+            "listingId": listing_id,
+        }),
+    )
+    .await
+}
+
+/// Web fallback for account ownership lookup.
+#[cfg(feature = "web")]
+pub async fn invoke_get_listing_ownership(
+    _buyer_npub: String,
+    _publisher_npub: String,
+    _listing_id: String,
+) -> Result<bool, String> {
+    Ok(false)
+}
+
 /// Installed ADP game returned by `get_installed_games`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct InstalledGame {
