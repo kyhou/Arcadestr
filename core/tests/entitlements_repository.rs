@@ -1,3 +1,5 @@
+#![cfg(feature = "native")]
+
 use std::path::PathBuf;
 
 use arcadestr_core::adp_protocol::{ADP_CAMPAIGN_KIND, ENTITLEMENT_GRANT_KIND};

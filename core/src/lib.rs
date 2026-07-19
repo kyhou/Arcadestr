@@ -105,7 +105,7 @@ pub mod adp_publish;
 #[cfg(feature = "native")]
 pub mod nwc_client;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod nwc_client_contract_tests {
     use super::nwc_client::{
         build_pay_invoice_request_event, build_pay_invoice_request_json,

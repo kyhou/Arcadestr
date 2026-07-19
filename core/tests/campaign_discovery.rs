@@ -1,3 +1,5 @@
+#![cfg(feature = "native")]
+
 use arcadestr_core::adp_protocol::ADP_CAMPAIGN_KIND;
 use arcadestr_core::campaign_discovery::{
     resolve_campaign_candidates, resolve_campaign_candidates_report, CampaignClassification,
