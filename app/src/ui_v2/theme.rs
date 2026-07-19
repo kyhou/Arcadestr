@@ -57,6 +57,29 @@ pub const UI_V2_STYLES: &str = r#"
   box-sizing: border-box;
 }
 
+select {
+  color-scheme: dark;
+  accent-color: var(--v2-primary);
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: var(--v2-surface-highest) !important;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='%23a8abb3'%3E%3Cpath d='M5.5 7.5 10 12l4.5-4.5z'/%3E%3C/svg%3E");
+  background-position: right 0.75rem center;
+  background-repeat: no-repeat;
+  background-size: 1rem;
+  border: 0;
+  padding-right: 2.5rem !important;
+}
+
+select option {
+  color: var(--v2-on-background);
+  background-color: var(--v2-surface-highest);
+}
+
+select option:disabled {
+  color: var(--v2-on-surface-variant);
+}
+
 .material-symbols-outlined {
   font-family: 'Material Symbols Outlined', sans-serif;
   font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
@@ -1762,6 +1785,16 @@ pub const UI_V2_STYLES: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_dropdown_options_use_readable_dark_colors() {
+        assert!(UI_V2_STYLES.contains("appearance: none;"));
+        assert!(UI_V2_STYLES.contains("background-color: var(--v2-surface-highest) !important;"));
+        assert!(UI_V2_STYLES.contains("fill='%23a8abb3'"));
+        assert!(UI_V2_STYLES.contains(
+            "select option {\n  color: var(--v2-on-background);\n  background-color: var(--v2-surface-highest);"
+        ));
+    }
 
     #[test]
     fn detail_buy_panel_buttons_are_full_width_touch_targets() {
