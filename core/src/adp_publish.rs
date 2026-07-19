@@ -3,6 +3,8 @@
 use nostr::{EventBuilder, Kind, Tag, TagKind};
 use thiserror::Error;
 
+use crate::authorization::FULFILLMENT_AUTHORIZATION_KIND;
+
 /// Input required to construct an ADP NIP-99 listing event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdpListingInput {
@@ -40,21 +42,29 @@ fn is_http_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
-/// Builds the developer-signed `kind:30406` provisioning acceptance event.
-pub fn build_provisioning_acceptance_event_builder(
-    operator_pubkey: &str,
+/// Builds a developer-signed fulfillment authorization root.
+pub fn build_fulfillment_authorization_event_builder(
+    authorization_id: &str,
+    listing_coordinate: &str,
     fulfillment_pubkey: &str,
+    valid_from: u64,
 ) -> EventBuilder {
-    EventBuilder::new(Kind::Custom(30406), "").tags([
+    EventBuilder::new(Kind::Custom(FULFILLMENT_AUTHORIZATION_KIND), "").tags([
+        Tag::custom(TagKind::Custom("d".into()), [authorization_id.to_string()]),
         Tag::custom(
-            TagKind::Custom("d".into()),
-            [format!("{operator_pubkey}:{fulfillment_pubkey}")],
+            TagKind::Custom("authorization_id".into()),
+            [authorization_id.to_string()],
         ),
-        Tag::custom(TagKind::p(), [operator_pubkey.to_string()]),
         Tag::custom(
-            TagKind::Custom("fulfillment_pubkey".into()),
-            [fulfillment_pubkey.to_string()],
+            TagKind::Custom("a".into()),
+            [listing_coordinate.to_string()],
         ),
+        Tag::custom(TagKind::p(), [fulfillment_pubkey.to_string()]),
+        Tag::custom(
+            TagKind::Custom("valid_from".into()),
+            [valid_from.to_string()],
+        ),
+        Tag::custom(TagKind::Custom("status".into()), ["active"]),
     ])
 }
 
@@ -197,6 +207,7 @@ pub fn build_adp_listing_event_builder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authorization::{parse_authorization_event, AuthorizationTransition};
     use nostr::{Keys, Kind};
 
     fn tag_values(event: &nostr::Event, name: &str) -> Vec<Vec<String>> {
@@ -215,35 +226,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builds_kind_30406_acceptance_with_expected_tags() {
-        let keys = Keys::generate();
-        let operator_pubkey = "operator-pubkey";
-        let fulfillment_pubkey = "fulfillment-pubkey";
+    async fn builds_parseable_fulfillment_authorization_root() {
+        let developer = Keys::generate();
+        let fulfillment = Keys::generate();
+        let authorization_id = "authorization-1";
+        let coordinate = format!("30402:{}:game", developer.public_key().to_hex());
+        let valid_from = 1_700_000_000;
 
-        let event =
-            build_provisioning_acceptance_event_builder(operator_pubkey, fulfillment_pubkey)
-                .sign_with_keys(&keys)
-                .expect("event should sign");
+        let event = build_fulfillment_authorization_event_builder(
+            authorization_id,
+            &coordinate,
+            &fulfillment.public_key().to_hex(),
+            valid_from,
+        )
+        .sign_with_keys(&developer)
+        .expect("event should sign");
 
-        assert_eq!(event.kind, Kind::Custom(30406));
-        assert_eq!(
-            tag_values(&event, "d"),
-            vec![vec![
-                "d".to_string(),
-                "operator-pubkey:fulfillment-pubkey".to_string()
-            ]]
-        );
-        assert_eq!(
-            tag_values(&event, "p"),
-            vec![vec!["p".to_string(), "operator-pubkey".to_string()]]
-        );
-        assert_eq!(
-            tag_values(&event, "fulfillment_pubkey"),
-            vec![vec![
-                "fulfillment_pubkey".to_string(),
-                "fulfillment-pubkey".to_string()
-            ]]
-        );
+        assert_eq!(event.kind, Kind::Custom(FULFILLMENT_AUTHORIZATION_KIND));
+        assert_eq!(event.tags.len(), 6);
+
+        let parsed = parse_authorization_event(&event).expect("authorization should parse");
+        let AuthorizationTransition::ActiveRoot(terms) = parsed.transition else {
+            panic!("authorization should be an active root");
+        };
+        assert_eq!(terms.authorization_id, authorization_id);
+        assert_eq!(terms.coordinate, coordinate);
+        assert_eq!(terms.fulfillment_pubkey, fulfillment.public_key());
+        assert_eq!(terms.valid_from, valid_from);
+        assert_eq!(terms.valid_until, None);
     }
 
     #[tokio::test]

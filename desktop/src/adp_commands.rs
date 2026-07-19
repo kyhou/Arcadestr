@@ -12,7 +12,7 @@ use arcadestr_core::adp_discovery::{
     discover_adp_servers as discover_adp_servers_core, AdpServerAnnouncement,
 };
 use arcadestr_core::adp_publish::{
-    build_adp_listing_event_builder, build_provisioning_acceptance_event_builder, AdpListingInput,
+    build_adp_listing_event_builder, build_fulfillment_authorization_event_builder, AdpListingInput,
 };
 use arcadestr_core::adp_storage::{
     AdpProvisioning, AdpProvisioningRepository, DownloadToken, DownloadTokensRepository,
@@ -1243,9 +1243,18 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                 match provisioning {
                     ProvisioningDecision::Reused {
                         fulfillment_pubkey: reused_pubkey,
-                        acceptance_event_id: reused_acceptance_event_id,
+                        authorization_event_id,
                         valid_from,
+                        authorization_event,
+                        row,
                     } => {
+                        provisioning_repo
+                            .upsert(&row)
+                            .await
+                            .map_err(|err| progress_error(&app, "provision", err))?;
+                        publish_event(&state, &authorization_event)
+                            .await
+                            .map_err(|err| progress_error(&app, "provision", err))?;
                         emit_progress(
                             &app,
                             "provision",
@@ -1253,7 +1262,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                             Some("reused existing provisioning".into()),
                         )?;
                         fulfillment_pubkey = Some(reused_pubkey);
-                        acceptance_event_id = Some(reused_acceptance_event_id);
+                        acceptance_event_id = Some(authorization_event_id);
                         fulfillment_valid_from = Some(
                             valid_from
                                 .try_into()
@@ -1262,16 +1271,16 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                     }
                     ProvisioningDecision::Created {
                         fulfillment_pubkey: created_pubkey,
-                        acceptance_event_id: created_acceptance_event_id,
+                        authorization_event_id,
                         valid_from,
-                        acceptance_event,
+                        authorization_event,
                         row,
                     } => {
-                        publish_event(&state, &acceptance_event)
-                            .await
-                            .map_err(|err| progress_error(&app, "provision", err))?;
                         provisioning_repo
                             .upsert(&row)
+                            .await
+                            .map_err(|err| progress_error(&app, "provision", err))?;
+                        publish_event(&state, &authorization_event)
                             .await
                             .map_err(|err| progress_error(&app, "provision", err))?;
                         emit_progress(
@@ -1281,7 +1290,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                             Some("created provisioning".into()),
                         )?;
                         fulfillment_pubkey = Some(created_pubkey);
-                        acceptance_event_id = Some(created_acceptance_event_id);
+                        acceptance_event_id = Some(authorization_event_id);
                         fulfillment_valid_from = Some(
                             valid_from
                                 .try_into()
@@ -1289,6 +1298,40 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                         );
                     }
                 }
+            } else if let Some(existing_pubkey) = existing_authorization_repair_key(
+                should_provision,
+                fulfillment_pubkey.as_deref(),
+                fulfillment_revoked_at,
+            ) {
+                let operator_url = request.operator_url.as_deref().ok_or_else(|| {
+                    "operator URL is required to repair delegated fulfillment authorization"
+                        .to_string()
+                })?;
+                if operator_url.trim().is_empty() {
+                    return Err(
+                        "operator URL is required to repair delegated fulfillment authorization"
+                            .to_string(),
+                    );
+                }
+
+                let provisioning_repo =
+                    AdpProvisioningRepository::new(state.database.pool().clone());
+                let repair = repair_existing_authorization(ExistingAuthorizationRepairInput {
+                    provisioning_repo: &provisioning_repo,
+                    signer: signer.as_ref(),
+                    developer_pubkey,
+                    developer_hex: &developer_npub,
+                    operator_url,
+                    scope: &request.d_tag,
+                    fulfillment_pubkey: existing_pubkey,
+                })
+                .await?;
+                provisioning_repo
+                    .upsert(&repair.row)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                publish_event(&state, &repair.authorization_event).await?;
+                acceptance_event_id = Some(repair.authorization_event_id);
             }
         }
     }
@@ -1412,14 +1455,16 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
 enum ProvisioningDecision {
     Reused {
         fulfillment_pubkey: String,
-        acceptance_event_id: String,
+        authorization_event_id: String,
         valid_from: i64,
+        authorization_event: Box<nostr::Event>,
+        row: Box<AdpProvisioning>,
     },
     Created {
         fulfillment_pubkey: String,
-        acceptance_event_id: String,
+        authorization_event_id: String,
         valid_from: i64,
-        acceptance_event: Box<nostr::Event>,
+        authorization_event: Box<nostr::Event>,
         row: Box<AdpProvisioning>,
     },
 }
@@ -1435,19 +1480,111 @@ struct ResolveProvisioningInput<'a> {
     server_info: &'a AdpServerInfo,
 }
 
+struct ExistingAuthorizationRepairInput<'a> {
+    provisioning_repo: &'a AdpProvisioningRepository,
+    signer: &'a dyn NostrSigner,
+    developer_pubkey: nostr::PublicKey,
+    developer_hex: &'a str,
+    operator_url: &'a str,
+    scope: &'a str,
+    fulfillment_pubkey: &'a str,
+}
+
+struct ExistingAuthorizationRepair {
+    authorization_event_id: String,
+    authorization_event: nostr::Event,
+    row: AdpProvisioning,
+}
+
+fn existing_authorization_repair_key(
+    should_provision: bool,
+    fulfillment_pubkey: Option<&str>,
+    revoked_at: Option<u64>,
+) -> Option<&str> {
+    (!should_provision && revoked_at.is_none())
+        .then_some(fulfillment_pubkey)
+        .flatten()
+}
+
+async fn repair_existing_authorization(
+    input: ExistingAuthorizationRepairInput<'_>,
+) -> Result<ExistingAuthorizationRepair, String> {
+    let matches = input
+        .provisioning_repo
+        .for_fulfillment_scope(input.developer_hex, input.fulfillment_pubkey, input.scope)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .filter(|row| row.revoked_at.is_none() && row.server_url == input.operator_url)
+        .collect::<Vec<_>>();
+    let [mut row] = matches.try_into().map_err(|matches: Vec<AdpProvisioning>| {
+        format!(
+            "expected exactly one active provisioning row for delegated authorization repair, found {}",
+            matches.len()
+        )
+    })?;
+    let valid_from: u64 = row
+        .valid_from
+        .try_into()
+        .map_err(|_| "provisioning valid_from is negative".to_string())?;
+    let coordinate = format!("30402:{}:{}", input.developer_pubkey.to_hex(), input.scope);
+    let builder = build_fulfillment_authorization_event_builder(
+        &row.attestation_event_id,
+        &coordinate,
+        input.fulfillment_pubkey,
+        valid_from,
+    );
+    let authorization_event = input
+        .signer
+        .sign_event(builder.build(input.developer_pubkey))
+        .await
+        .map_err(|err| err.to_string())?;
+    let authorization_event_id = authorization_event.id.to_hex();
+    row.acceptance_event_id = authorization_event_id.clone();
+
+    Ok(ExistingAuthorizationRepair {
+        authorization_event_id,
+        authorization_event,
+        row,
+    })
+}
+
 async fn resolve_provisioning(
     input: ResolveProvisioningInput<'_>,
 ) -> Result<ProvisioningDecision, String> {
+    let listing_coordinate = format!("30402:{}:{}", input.developer_pubkey.to_hex(), input.scope);
+
     if let Some(existing) = input
         .provisioning_repo
         .active_for_scope(input.developer_npub, input.server_url, Some(input.scope))
         .await
         .map_err(|err| err.to_string())?
     {
+        let valid_from: u64 = existing
+            .valid_from
+            .try_into()
+            .map_err(|_| "provisioning valid_from is negative".to_string())?;
+        let authorization_builder = build_fulfillment_authorization_event_builder(
+            &existing.attestation_event_id,
+            &listing_coordinate,
+            &existing.fulfillment_pubkey,
+            valid_from,
+        );
+        let authorization_event = input
+            .signer
+            .sign_event(authorization_builder.build(input.developer_pubkey))
+            .await
+            .map_err(|err| err.to_string())?;
+        let authorization_event_id = authorization_event.id.to_hex();
+        let mut row = existing;
+        row.acceptance_event_id = authorization_event_id.clone();
+
         return Ok(ProvisioningDecision::Reused {
-            fulfillment_pubkey: existing.fulfillment_pubkey,
-            acceptance_event_id: existing.acceptance_event_id,
-            valid_from: existing.valid_from,
+            fulfillment_pubkey: row.fulfillment_pubkey.clone(),
+            authorization_event_id,
+            valid_from: row.valid_from,
+            authorization_event: Box::new(authorization_event),
+            row: Box::new(row),
         });
     }
 
@@ -1456,17 +1593,22 @@ async fn resolve_provisioning(
         .provision(input.signer, Some(input.scope))
         .await
         .map_err(|err| err.to_string())?;
-    let acceptance_builder = build_provisioning_acceptance_event_builder(
-        &input.server_info.pubkey,
+    let now = now_unix_i64()?;
+    let valid_from: u64 = now
+        .try_into()
+        .map_err(|_| "current time is negative".to_string())?;
+    let authorization_builder = build_fulfillment_authorization_event_builder(
+        &provision.attestation_event_id,
+        &listing_coordinate,
         &provision.fulfillment_pubkey,
+        valid_from,
     );
-    let acceptance_event = input
+    let authorization_event = input
         .signer
-        .sign_event(acceptance_builder.build(input.developer_pubkey))
+        .sign_event(authorization_builder.build(input.developer_pubkey))
         .await
         .map_err(|err| err.to_string())?;
-    let acceptance_event_id = acceptance_event.id.to_hex();
-    let now = now_unix_i64()?;
+    let authorization_event_id = authorization_event.id.to_hex();
     let row = AdpProvisioning {
         id: format!(
             "{}:{}:{}",
@@ -1478,7 +1620,7 @@ async fn resolve_provisioning(
         scope: Some(input.scope.to_string()),
         fulfillment_pubkey: provision.fulfillment_pubkey.clone(),
         attestation_event_id: provision.attestation_event_id,
-        acceptance_event_id: acceptance_event_id.clone(),
+        acceptance_event_id: authorization_event_id.clone(),
         valid_from: now,
         revoked_at: None,
         created_at: now,
@@ -1486,9 +1628,9 @@ async fn resolve_provisioning(
 
     Ok(ProvisioningDecision::Created {
         fulfillment_pubkey: provision.fulfillment_pubkey,
-        acceptance_event_id,
+        authorization_event_id,
         valid_from: row.valid_from,
-        acceptance_event: Box::new(acceptance_event),
+        authorization_event: Box::new(authorization_event),
         row: Box::new(row),
     })
 }
@@ -1563,6 +1705,7 @@ mod tests {
     use arcadestr_core::adp_client::{AdpClient, AdpServerInfo};
     use arcadestr_core::adp_storage::AdpProvisioningRepository;
     use arcadestr_core::auth::AuthState;
+    use arcadestr_core::authorization::{parse_authorization_event, AuthorizationTransition};
     use arcadestr_core::http_client::{HttpClient, ReqwestHttpClient};
     use arcadestr_core::marketplace_cache::MarketplaceCache;
     use arcadestr_core::nip05_validator::Nip05Validator;
@@ -2010,7 +2153,7 @@ mod tests {
         let mock = Arc::new(LocalMockHttpClient::default().with_json_post_response(
             provision_url,
             json!({
-                "fulfillment_pubkey": "fulfillment-key",
+                "fulfillment_pubkey": "b0822d6340862b961e88b983b9c3b434e1fc750a36e796ee10825e8778badacf",
                 "attestation_event_id": "attestation-id",
                 "scope": "game"
             }),
@@ -2063,8 +2206,131 @@ mod tests {
         .await
         .expect("second provisioning should succeed");
 
-        assert!(matches!(second, ProvisioningDecision::Reused { .. }));
+        let ProvisioningDecision::Reused {
+            fulfillment_pubkey,
+            valid_from,
+            authorization_event,
+            row,
+            ..
+        } = second
+        else {
+            panic!("second call should reuse provisioning");
+        };
+        let parsed = parse_authorization_event(&authorization_event).unwrap_or_else(|error| {
+            panic!(
+                "reused authorization should parse: {error:?}; tags={:?}",
+                authorization_event.tags
+            )
+        });
+        let AuthorizationTransition::ActiveRoot(terms) = parsed.transition else {
+            panic!("reused authorization should be an active root");
+        };
+        assert_eq!(terms.coordinate, format!("30402:{developer_npub}:game"));
+        assert_eq!(terms.fulfillment_pubkey.to_hex(), fulfillment_pubkey);
+        assert_eq!(
+            terms.valid_from,
+            u64::try_from(valid_from).expect("valid time")
+        );
+        assert_eq!(row.fulfillment_pubkey, fulfillment_pubkey);
+        assert_eq!(row.valid_from, valid_from);
+        assert_eq!(row.acceptance_event_id, authorization_event.id.to_hex());
         assert_eq!(mock.post_call_count(provision_url), 1);
+    }
+
+    #[tokio::test]
+    async fn existing_unrevoked_delegated_edit_repairs_authorization_without_provisioning() {
+        let db = test_db().await;
+        let repo = AdpProvisioningRepository::new(db.pool().clone());
+        let developer = LocalSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("test key should be valid");
+        let developer_pubkey = developer
+            .get_public_key()
+            .await
+            .expect("developer key should load");
+        let developer_hex = developer_pubkey.to_hex();
+        let fulfillment_pubkey = Keys::generate().public_key().to_hex();
+        let original_valid_from = 1_700_000_000;
+        let row = AdpProvisioning {
+            id: "existing-game-provisioning".to_string(),
+            developer_npub: developer_hex.clone(),
+            server_url: "https://operator.example.com".to_string(),
+            operator_pubkey: "operator-key".to_string(),
+            scope: Some("game".to_string()),
+            fulfillment_pubkey: fulfillment_pubkey.clone(),
+            attestation_event_id: "stable-authorization-id".to_string(),
+            acceptance_event_id: "legacy-acceptance-id".to_string(),
+            valid_from: original_valid_from,
+            revoked_at: None,
+            created_at: original_valid_from,
+        };
+        repo.upsert(&row).await.expect("row should persist");
+
+        let repair = repair_existing_authorization(ExistingAuthorizationRepairInput {
+            provisioning_repo: &repo,
+            signer: &developer,
+            developer_pubkey,
+            developer_hex: &developer_hex,
+            operator_url: "https://operator.example.com",
+            scope: "game",
+            fulfillment_pubkey: &fulfillment_pubkey,
+        })
+        .await
+        .expect("existing authorization should repair");
+
+        let parsed = parse_authorization_event(&repair.authorization_event)
+            .expect("repaired authorization should parse");
+        let AuthorizationTransition::ActiveRoot(terms) = parsed.transition else {
+            panic!("repaired authorization should be active");
+        };
+        assert_eq!(terms.authorization_id, "stable-authorization-id");
+        assert_eq!(terms.coordinate, format!("30402:{developer_hex}:game"));
+        assert_eq!(terms.fulfillment_pubkey.to_hex(), fulfillment_pubkey);
+        assert_eq!(terms.valid_from, original_valid_from as u64);
+        assert_eq!(repair.row.valid_from, original_valid_from);
+        assert_eq!(repair.row.fulfillment_pubkey, fulfillment_pubkey);
+        assert_eq!(
+            repair.row.acceptance_event_id,
+            repair.authorization_event.id.to_hex()
+        );
+        repo.upsert(&repair.row)
+            .await
+            .expect("repaired row should persist");
+        let stored = repo
+            .active_for_scope(&developer_hex, "https://operator.example.com", Some("game"))
+            .await
+            .expect("repaired row lookup should succeed")
+            .expect("repaired row should remain active");
+        assert_eq!(stored.valid_from, original_valid_from);
+        assert_eq!(stored.fulfillment_pubkey, fulfillment_pubkey);
+        assert_eq!(stored.acceptance_event_id, repair.authorization_event_id);
+    }
+
+    #[test]
+    fn revoked_delegated_edit_does_not_authorize_or_reactivate() {
+        let metadata = resolve_existing_fulfillment_metadata(
+            &FulfillmentMode::Delegate,
+            "developer-key",
+            Some("revoked-fulfillment-key"),
+            Some(123),
+            Some(456),
+            999,
+        )
+        .expect("revoked delegated metadata should remain editable");
+
+        assert_eq!(
+            metadata.fulfillment_pubkey.as_deref(),
+            Some("revoked-fulfillment-key")
+        );
+        assert_eq!(metadata.valid_from, Some(123));
+        assert_eq!(metadata.revoked_at, Some(456));
+        assert!(existing_authorization_repair_key(
+            metadata.should_provision,
+            metadata.fulfillment_pubkey.as_deref(),
+            metadata.revoked_at,
+        )
+        .is_none());
     }
 
     #[test]

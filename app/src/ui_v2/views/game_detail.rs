@@ -99,8 +99,24 @@ fn adp_server_url_from_download_url(download_url: &str) -> Option<String> {
     let marker = "/game/";
     download_url
         .find(marker)
-        .map(|index| download_url[..index].trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
+        .and_then(|index| normalize_adp_server_url(&download_url[..index]))
+}
+
+fn normalize_adp_server_url(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches('/');
+    let parsed = url::Url::parse(value).ok()?;
+    matches!(parsed.scheme(), "http" | "https")
+        .then(|| parsed.host_str())
+        .flatten()
+        .map(|_| value.to_string())
+}
+
+fn adp_server_url(specs: &[(String, String)], download_url: &str) -> Option<String> {
+    specs
+        .iter()
+        .filter(|(key, _)| key == "server")
+        .find_map(|(_, url)| normalize_adp_server_url(url))
+        .or_else(|| adp_server_url_from_download_url(download_url))
 }
 
 #[component]
@@ -289,11 +305,11 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             };
             let publisher_npub = listing.publisher_npub.clone();
             let listing_id = listing.id.clone();
-            let server_url = match adp_server_url_from_download_url(&listing.download_url) {
+            let server_url = match adp_server_url(&listing.specs, &listing.download_url) {
                 Some(server_url) => server_url,
                 None => {
                     buy_error.set(Some(
-                        "Listing does not include an ADP download URL".to_string(),
+                        "Listing does not include an ADP server URL".to_string(),
                     ));
                     return;
                 }
@@ -498,9 +514,10 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             buy_error.set(Some("Not authenticated".to_string()));
             return;
         }
-        let Some(server_url) = adp_server_url_from_download_url(&claim_listing.download_url) else {
+        let Some(server_url) = adp_server_url(&claim_listing.specs, &claim_listing.download_url)
+        else {
             buy_error.set(Some(
-                "Listing does not include an ADP download URL".to_string(),
+                "Listing does not include an ADP server URL".to_string(),
             ));
             return;
         };
@@ -957,6 +974,47 @@ fn debug_badge_preview() -> EarnedBadgeSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adp_server_url_prefers_listing_server_metadata() {
+        let specs = vec![("server".to_string(), "http://localhost:9099/".to_string())];
+
+        assert_eq!(
+            adp_server_url(&specs, ""),
+            Some("http://localhost:9099".to_string())
+        );
+    }
+
+    #[test]
+    fn adp_server_url_falls_back_to_legacy_download_url() {
+        assert_eq!(
+            adp_server_url(&[], "https://dist.example.com/game/publisher/game-v1"),
+            Some("https://dist.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn adp_server_url_skips_malformed_server_metadata() {
+        let specs = vec![
+            ("server".to_string(), "https://?missing-host".to_string()),
+            (
+                "server".to_string(),
+                "https://dist.example.com/".to_string(),
+            ),
+        ];
+
+        assert_eq!(
+            adp_server_url(&specs, ""),
+            Some("https://dist.example.com".to_string())
+        );
+        assert_eq!(
+            adp_server_url(
+                &[("server".to_string(), "https://?missing-host".to_string(),)],
+                "https://legacy.example.com/game/publisher/game-v1",
+            ),
+            Some("https://legacy.example.com".to_string())
+        );
+    }
 
     #[test]
     fn hero_buy_panel_metadata_excludes_developer_profile() {
