@@ -302,10 +302,7 @@ pub fn AccountSelector(
                                 on:click={
                                     let account_id = account_id.clone();
                                     move |_| {
-                                        // Only switch if not currently active
-                                        if !is_current {
-                                            on_switch.run(account_id.clone());
-                                        }
+                                        on_switch.run(account_id.clone());
                                     }
                                 }
                             >

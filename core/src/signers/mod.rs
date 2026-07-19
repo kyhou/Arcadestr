@@ -20,7 +20,7 @@ pub use local::LocalSigner;
 #[cfg(not(target_arch = "wasm32"))]
 pub use nip46::{
     load_or_create_client_keys, reset_client_keys, set_keys_dir, ActiveSigner, DirectKeySigner,
-    Nip46Signer, NostrSigner, SignerError,
+    Nip46Signer, NostrSigner, SdkSignerAdapter, SignerError,
 };
 
 // LazyNip46Signer is native-only

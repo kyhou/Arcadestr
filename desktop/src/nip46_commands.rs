@@ -19,6 +19,7 @@ use arcadestr_core::nip46::{
     save_profile_to_keyring, set_last_active_profile_id, wait_for_qr_connection, AppSignerState,
     ConnectionState, PendingQrState, ProfileMetadata,
 };
+use arcadestr_core::signers::{ActiveSigner, SdkSignerAdapter};
 
 fn local_account_json(account: &AccountInfo) -> serde_json::Value {
     serde_json::json!({
@@ -60,6 +61,20 @@ async fn activate_local_account(
     auth.connect_with_key(&nsec)
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+async fn activate_remote_account(
+    signer: Arc<dyn nostr::NostrSigner>,
+    app_state: &crate::AppState,
+) -> Result<nostr::PublicKey, String> {
+    let public_key = signer
+        .get_public_key()
+        .await
+        .map_err(|error| format!("failed to get active signer pubkey: {error}"))?;
+    let mut auth = app_state.auth.lock().await;
+    auth.set_signer(ActiveSigner::Sdk(SdkSignerAdapter::new(signer)));
+    auth.set_public_key(public_key);
+    Ok(public_key)
 }
 
 /// Create and activate an encrypted local account from an nsec.
@@ -113,6 +128,7 @@ pub async fn connect_bunker(
     display_name: String,
     state: State<'_, Arc<Mutex<AppSignerState>>>,
     app_handle: AppHandle,
+    app_state: State<'_, crate::AppState>,
 ) -> Result<serde_json::Value, String> {
     info!(
         "connect_bunker called (blocking handshake): identifier={}, display_name={}",
@@ -191,6 +207,11 @@ pub async fn connect_bunker(
         state_guard.active_profile_id = Some(bunker_pubkey.clone());
         state_guard.connection_state = ConnectionState::Connected; // Already connected!
     }
+    let signer = client
+        .signer()
+        .await
+        .map_err(|error| format!("failed to access active signer: {error}"))?;
+    activate_remote_account(signer, &app_state).await?;
 
     // STEP 8: Set as last active profile for auto-restore on next startup
     if let Err(e) = set_last_active_profile_id(&profile.id) {
@@ -720,35 +741,24 @@ pub async fn switch_profile(
     }
 
     // Get the activated profile info
-    let state_guard = state.lock().await;
-    if let Some(ref client) = state_guard.active_client {
-        // Get signer from client, then get public key
-        match client.signer().await {
-            Ok(signer) => {
-                match signer.get_public_key().await {
-                    Ok(pubkey) => {
-                        let user_npub = pubkey.to_bech32().unwrap_or_default();
-                        let _ = app_handle.emit("auth_success", user_npub.clone());
-                        // Return in format frontend expects (wrapped in "account" field)
-                        // Include the profile name from metadata for immediate UI display
-                        Ok(serde_json::json!({
-                            "account": {
-                                "id": profile_id,
-                                "npub": user_npub,
-                                "name": metadata.name,
-                                "signing_mode": "nip46",
-                                "last_used": 0,
-                            }
-                        }))
-                    }
-                    Err(e) => Err(format!("Failed to get public key: {}", e)),
-                }
-            }
-            Err(e) => Err(format!("Failed to get signer: {}", e)),
+    let client = { state.lock().await.active_client.clone() }
+        .ok_or_else(|| "Failed to activate profile - no active client".to_string())?;
+    let signer = client
+        .signer()
+        .await
+        .map_err(|error| format!("failed to access active signer: {error}"))?;
+    let pubkey = activate_remote_account(signer, &app_state).await?;
+    let user_npub = pubkey.to_bech32().unwrap_or_default();
+    let _ = app_handle.emit("auth_success", user_npub.clone());
+    Ok(serde_json::json!({
+        "account": {
+            "id": profile_id,
+            "npub": user_npub,
+            "name": metadata.name,
+            "signing_mode": "nip46",
+            "last_used": 0,
         }
-    } else {
-        Err("Failed to activate profile - no active client".to_string())
-    }
+    }))
 }
 
 /// Attempt to manually reconnect to the bunker.
@@ -1005,67 +1015,40 @@ pub async fn load_active_account(
 ) -> Result<serde_json::Value, String> {
     info!("load_active_account called");
 
-    let state_guard = state.lock().await;
+    let (active_profile_id, active_client) = {
+        let state_guard = state.lock().await;
+        (
+            state_guard.active_profile_id.clone(),
+            state_guard.active_client.clone(),
+        )
+    };
 
     // Check if we have an active profile
-    if let Some(ref profile_id) = state_guard.active_profile_id {
+    if let Some(profile_id) = active_profile_id {
         // Get profile metadata for the name
-        let profile_name = get_profile_metadata_by_id(profile_id)
+        let profile_name = get_profile_metadata_by_id(&profile_id)
             .map(|m| m.name)
             .unwrap_or_default();
 
         // Try to get the client and fetch pubkey
-        if let Some(ref client) = state_guard.active_client {
-            // Get signer from client, then get public key
-            match client.signer().await {
-                Ok(signer) => {
-                    match signer.get_public_key().await {
-                        Ok(pubkey) => {
-                            let user_npub = pubkey.to_bech32().unwrap_or_default();
-                            // Return in format frontend expects (wrapped in "account" field)
-                            return Ok(serde_json::json!({
-                                "account": {
-                                    "id": profile_id,
-                                    "npub": user_npub,
-                                    "name": profile_name,
-                                    "signing_mode": "nip46",
-                                    "last_used": 0,
-                                }
-                            }));
-                        }
-                        Err(e) => {
-                            warn!("Failed to get public key from active client: {}", e);
-                            // Return profile without verifying connection
-                            return Ok(serde_json::json!({
-                                "account": {
-                                    "id": profile_id,
-                                    "npub": null,
-                                    "name": profile_name,
-                                    "signing_mode": "nip46",
-                                    "last_used": 0,
-                                }
-                            }));
-                        }
-                    }
+        if let Some(client) = active_client {
+            let signer = client
+                .signer()
+                .await
+                .map_err(|error| format!("failed to access active signer: {error}"))?;
+            let pubkey = activate_remote_account(signer, &app_state).await?;
+            let user_npub = pubkey.to_bech32().unwrap_or_default();
+            return Ok(serde_json::json!({
+                "account": {
+                    "id": profile_id,
+                    "npub": user_npub,
+                    "name": profile_name,
+                    "signing_mode": "nip46",
+                    "last_used": 0,
                 }
-                Err(e) => {
-                    warn!("Failed to get signer from active client: {}", e);
-                    // Return profile without verifying connection
-                    return Ok(serde_json::json!({
-                        "account": {
-                            "id": profile_id,
-                            "npub": null,
-                            "name": profile_name,
-                            "signing_mode": "nip46",
-                            "last_used": 0,
-                        }
-                    }));
-                }
-            }
+            }));
         }
     }
-
-    drop(state_guard);
 
     if let Some(account) = account_manager
         .load_active_account()

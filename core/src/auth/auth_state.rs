@@ -178,4 +178,28 @@ mod tests {
         assert!(!auth.is_authenticated());
         assert!(auth.public_key().is_none());
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn restored_sdk_signer_authenticates_shared_state() {
+        use std::sync::Arc;
+
+        use crate::signers::SdkSignerAdapter;
+
+        let keys = Keys::generate();
+        let public_key = keys.public_key();
+        let mut auth = AuthState::new();
+        auth.set_signer(ActiveSigner::Sdk(SdkSignerAdapter::new(Arc::new(keys))));
+        auth.set_public_key(public_key);
+
+        assert!(auth.is_authenticated());
+        assert_eq!(
+            auth.signer()
+                .expect("SDK signer should be available")
+                .get_public_key()
+                .await
+                .expect("SDK signer should expose its public key"),
+            public_key
+        );
+    }
 }

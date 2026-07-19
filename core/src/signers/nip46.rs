@@ -3,6 +3,8 @@
 use nostr::{Event, Keys, PublicKey, SecretKey, UnsignedEvent};
 use std::fs;
 use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
@@ -600,6 +602,42 @@ impl NostrSigner for DirectKeySigner {
 }
 
 /// Active signer enum that wraps the different signer implementations.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct SdkSignerAdapter(Arc<dyn nostr::NostrSigner>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SdkSignerAdapter {
+    pub fn new(signer: Arc<dyn nostr::NostrSigner>) -> Self {
+        Self(signer)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for SdkSignerAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SdkSignerAdapter").finish_non_exhaustive()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait::async_trait]
+impl NostrSigner for SdkSignerAdapter {
+    async fn get_public_key(&self) -> Result<PublicKey, SignerError> {
+        self.0
+            .get_public_key()
+            .await
+            .map_err(|error| SignerError::SigningFailed(error.to_string()))
+    }
+
+    async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SignerError> {
+        self.0
+            .sign_event(unsigned)
+            .await
+            .map_err(|error| SignerError::SigningFailed(error.to_string()))
+    }
+}
+
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum ActiveSigner {
@@ -609,6 +647,9 @@ pub enum ActiveSigner {
     /// Direct key signer for testing (desktop).
     #[cfg(not(target_arch = "wasm32"))]
     DirectKey(DirectKeySigner),
+    /// Signer exposed by a restored nostr-sdk client.
+    #[cfg(not(target_arch = "wasm32"))]
+    Sdk(SdkSignerAdapter),
     /// NIP-07 browser extension signer (web/WASM).
     #[cfg(target_arch = "wasm32")]
     Nip07(Nip07Signer),
@@ -621,6 +662,7 @@ impl NostrSigner for ActiveSigner {
         match self {
             ActiveSigner::Nip46(signer) => signer.get_public_key().await,
             ActiveSigner::DirectKey(signer) => signer.get_public_key().await,
+            ActiveSigner::Sdk(signer) => signer.get_public_key().await,
         }
     }
 
@@ -628,6 +670,7 @@ impl NostrSigner for ActiveSigner {
         match self {
             ActiveSigner::Nip46(signer) => signer.sign_event(unsigned).await,
             ActiveSigner::DirectKey(signer) => signer.sign_event(unsigned).await,
+            ActiveSigner::Sdk(signer) => signer.sign_event(unsigned).await,
         }
     }
 }

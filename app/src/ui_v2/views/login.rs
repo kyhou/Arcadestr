@@ -579,13 +579,13 @@ pub fn LoginV2View() -> impl IntoView {
                                                     <div
                                                         class={card_class}
                                                         on:click=move |_| {
-                                                            if !is_current {
-                                                                let auth = auth_for_switch.clone();
-                                                                let account_id = account_id.clone();
-                                                                spawn_local(async move {
-                                                                    let _ = auth.switch_account(account_id).await;
-                                                                });
-                                                            }
+                                                            let auth = auth_for_switch.clone();
+                                                            let account_id = account_id.clone();
+                                                            spawn_local(async move {
+                                                                if let Err(error) = auth.switch_account(account_id).await {
+                                                                    auth.error.set(Some(error));
+                                                                }
+                                                            });
                                                         }
                                                     >
                                                         <button
