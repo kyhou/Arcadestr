@@ -41,10 +41,13 @@ pub fn BadgeEarnedModal(
                     return;
                 }
 
-                let Some(target) = event.target() else {
+                let Some(window) = web_sys::window() else {
                     return;
                 };
-                let Ok(panel) = target.dyn_into::<web_sys::Element>() else {
+                let Some(document) = window.document() else {
+                    return;
+                };
+                let Some(panel) = document.get_element_by_id("badge-earned-modal-panel") else {
                     return;
                 };
                 let Ok(focusables): Result<web_sys::NodeList, _> =
@@ -65,12 +68,6 @@ pub fn BadgeEarnedModal(
                     .item(count - 1)
                     .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
 
-                let Some(window) = web_sys::window() else {
-                    return;
-                };
-                let Some(document) = window.document() else {
-                    return;
-                };
                 let active: Option<web_sys::Element> = document.active_element();
 
                 let active_is_first = active
@@ -134,7 +131,7 @@ pub fn BadgeEarnedModal(
                 on:click=close
                 on:keydown=on_keydown
             >
-                <div class=badge_modal_class_name("panel") on:click=|ev| ev.stop_propagation()>
+                <div id="badge-earned-modal-panel" class=badge_modal_class_name("panel") on:click=|ev| ev.stop_propagation()>
                     <button
                         id="badge-earned-modal-close-button"
                         class=badge_modal_class_name("close")
@@ -162,14 +159,20 @@ fn render_badge_content(badge: EarnedBadgeSummary) -> impl IntoView {
 
     view! {
         <article class=badge_modal_class_name("content")>
-            <h3 id=badge_modal_title_id()>"Achievement unlocked!"</h3>
-            {image.map(|src| view! { <img src=src alt=name.clone() class=badge_modal_class_name("image") /> })}
+            <p class=badge_modal_class_name("eyebrow")>"Verified NIP-58 award"</p>
+            <h3 id=badge_modal_title_id()>"Achievement unlocked"</h3>
+            <div class=badge_modal_class_name("art")>
+                {match image {
+                    Some(src) => view! { <img src=src alt=name.clone() class=badge_modal_class_name("image") /> }.into_any(),
+                    None => view! { <span class="material-symbols-outlined" aria-hidden="true">"workspace_premium"</span> }.into_any(),
+                }}
+            </div>
             <h4>{name}</h4>
             <p>{description}</p>
-            <p>
-                <strong>"Issuer: "</strong>
-                <span>{badge.definition.issuer_pubkey.clone()}</span>
-            </p>
+            <dl class=badge_modal_class_name("meta")>
+                <div><dt>"Issuer"</dt><dd>{badge.definition.issuer_pubkey.clone()}</dd></div>
+                <div><dt>"Award timestamp"</dt><dd>{badge.award.created_at.to_string()}</dd></div>
+            </dl>
         </article>
     }
 }

@@ -163,68 +163,101 @@ pub fn AchievementsView() -> impl IntoView {
     });
 
     view! {
-        <section class="v2-panel p-6 space-y-4">
-                <div>
-                    <h2 class="font-headline text-3xl font-bold tracking-tight">"Achievements"</h2>
-                    <p class="text-on-surface-variant mt-2">
-                        "Verified badges earned by this profile."
-                    </p>
+        <section class="v2-achievements">
+            <header class="v2-achievements-hero v2-panel-glass">
+                <div class="v2-achievements-hero-mark" aria-hidden="true">
+                    <span class="material-symbols-outlined">"military_tech"</span>
                 </div>
+                <div>
+                    <p class="v2-store-kicker">"NIP-58 proof collection"</p>
+                    <h1 class="v2-display">"Achievements"</h1>
+                    <p>"Badges awarded to this profile and verified from signed Nostr events."</p>
+                </div>
+            </header>
 
-                {move || match state.get() {
-                    AchievementsState::Loading => {
-                        view! { <p>"Loading achievements..."</p> }.into_any()
-                    }
-                    AchievementsState::Empty => {
-                        view! { <p>"No verified badges yet."</p> }.into_any()
-                    }
-                    AchievementsState::Error => {
-                        view! { <p>{achievements_error_message()}</p> }.into_any()
-                    }
-                    #[cfg(feature = "web")]
-                    AchievementsState::WebUnavailable => view! {
-                        <p class="badge-showcase-unavailable">
-                            "Badge relay display is not yet available on the web target. Badges will appear here once web relay support is added."
-                        </p>
-                    }
-                    .into_any(),
-                    AchievementsState::Ready(badges) => view! {
-                        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                            {badges
-                                .into_iter()
-                                .map(|badge| {
-                                    let image = badge_image(&badge);
-                                    let name = badge_display_name(&badge);
-                                    let description = badge.definition.description.clone();
-                                    let issuer_pubkey = short_pubkey(&badge.definition.issuer_pubkey);
-                                    let award_date = format_award_date(badge.award.created_at);
+            {move || match state.get() {
+                AchievementsState::Loading => achievement_state_view(
+                    "progress_activity",
+                    "Loading achievements",
+                    "Checking the local cache before refreshing from relays.",
+                    false,
+                ),
+                AchievementsState::Empty => achievement_state_view(
+                    "workspace_premium",
+                    "No verified badges yet",
+                    "NIP-58 awards for this profile will appear here when they are found.",
+                    false,
+                ),
+                AchievementsState::Error => achievement_state_view(
+                    "cloud_off",
+                    "Achievements unavailable",
+                    achievements_error_message(),
+                    true,
+                ),
+                #[cfg(feature = "web")]
+                AchievementsState::WebUnavailable => achievement_state_view(
+                    "desktop_windows",
+                    "Desktop relay support required",
+                    "Badge relay display is not available on the web target. No achievement data is shown.",
+                    false,
+                ),
+                AchievementsState::Ready(badges) => view! {
+                    <div class="v2-achievement-grid">
+                        {badges
+                            .into_iter()
+                            .map(|badge| {
+                                let image = badge_image(&badge);
+                                let name = badge_display_name(&badge);
+                                let description = badge.definition.description.clone();
+                                let issuer_pubkey = short_pubkey(&badge.definition.issuer_pubkey);
+                                let award_date = format_award_date(badge.award.created_at);
 
-                                    view! {
-                                        <article class="bg-surface-container-high rounded-xl p-4 border border-outline-variant/10 space-y-3">
-                                            {image
-                                                .map(|src| {
-                                                    view! {
-                                                        <img src=src alt=name.clone() class="w-16 h-16 rounded-lg object-cover" />
-                                                    }
-                                                })}
-                                            <div class="space-y-1">
-                                                <h3 class="text-lg font-semibold">{name}</h3>
-                                                <p class="text-sm text-on-surface-variant">
-                                                    {description.unwrap_or_else(|| "No description provided.".to_string())}
-                                                </p>
-                                            </div>
-                                            <div class="text-xs text-on-surface-variant space-y-1">
-                                                <p>{format!("Issuer: {issuer_pubkey}")}</p>
-                                                <p>{format!("Awarded: {award_date}")}</p>
-                                            </div>
-                                        </article>
-                                    }
-                                })
-                                .collect::<Vec<_>>()}
-                        </div>
-                    }
-                    .into_any(),
-                }}
+                                view! {
+                                    <article class="v2-achievement-card">
+                                        <div class="v2-achievement-art">
+                                            {match image {
+                                                Some(src) => view! { <img src=src alt=name.clone() /> }.into_any(),
+                                                None => view! {
+                                                    <span class="material-symbols-outlined" aria-hidden="true">"workspace_premium"</span>
+                                                }.into_any(),
+                                            }}
+                                        </div>
+                                        <div class="v2-achievement-copy">
+                                            <p class="v2-store-kicker">"Verified award"</p>
+                                            <h2>{name}</h2>
+                                            <p>{description.unwrap_or_else(|| "No description provided.".to_string())}</p>
+                                        </div>
+                                        <dl class="v2-achievement-meta">
+                                            <div><dt>"Issuer"</dt><dd>{issuer_pubkey}</dd></div>
+                                            <div><dt>"Nostr timestamp"</dt><dd>{award_date}</dd></div>
+                                        </dl>
+                                    </article>
+                                }
+                            })
+                            .collect::<Vec<_>>()}
+                    </div>
+                }
+                .into_any(),
+            }}
         </section>
     }
+}
+
+fn achievement_state_view(
+    icon: &'static str,
+    title: &'static str,
+    message: &'static str,
+    is_error: bool,
+) -> AnyView {
+    view! {
+        <section
+            class="v2-achievement-state v2-panel"
+            class:v2-achievement-state-error=is_error
+            role=if is_error { "alert" } else { "status" }
+        >
+            <span class="material-symbols-outlined" aria-hidden="true">{icon}</span>
+            <div><h2>{title}</h2><p>{message}</p></div>
+        </section>
+    }
+    .into_any()
 }

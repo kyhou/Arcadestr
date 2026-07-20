@@ -15,7 +15,7 @@ const SHOWCASE_FALLBACK_LIMIT: usize = 8;
 enum BadgeShowcaseState {
     Loading,
     Empty,
-    Error(String),
+    Error,
     Ready(Vec<EarnedBadgeSummary>),
     WebUnavailable,
 }
@@ -119,7 +119,8 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                     Err(error) => {
                         if generation == request_generation.get_untracked() {
                             if !matches!(state.get_untracked(), BadgeShowcaseState::Ready(_)) {
-                                state.set(BadgeShowcaseState::Error(error));
+                                warn!("failed to refresh badge showcase: {}", error);
+                                state.set(BadgeShowcaseState::Error);
                             }
                         }
                     }
@@ -130,22 +131,23 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
 
     view! {
         <section class="v2-panel v2-badge-showcase">
-            <div class="v2-profile-listings-header">
-                <h3>"Achievements"</h3>
+            <div class="v2-badge-showcase-header">
+                <span class="material-symbols-outlined" aria-hidden="true">"workspace_premium"</span>
+                <div><p class="v2-store-kicker">"NIP-58"</p><h3>"Achievements"</h3></div>
             </div>
             {move || match state.get() {
                 BadgeShowcaseState::Loading => {
-                    view! { <p>"Loading achievements..."</p> }.into_any()
+                    view! { <p class="v2-badge-showcase-state" role="status">"Loading verified badges..."</p> }.into_any()
                 }
                 BadgeShowcaseState::Empty => {
-                    view! { <p>"No verified badges yet."</p> }.into_any()
+                    view! { <p class="v2-badge-showcase-state">"No verified badges are available for this profile."</p> }.into_any()
                 }
-                BadgeShowcaseState::Error(error) => {
-                    view! { <p>{format!("Failed to load badges: {error}")}</p> }.into_any()
+                BadgeShowcaseState::Error => {
+                    view! { <p class="v2-badge-showcase-state v2-badge-showcase-error" role="alert">"Could not load this badge showcase. Please try again later."</p> }.into_any()
                 }
                 BadgeShowcaseState::WebUnavailable => view! {
-                    <p class="badge-showcase-unavailable">
-                        "Badge relay display is not yet available on the web target. Badges will appear here once web relay support is added."
+                    <p class="v2-badge-showcase-state">
+                        "Badge relay display is not available on the web target. No badge data is shown."
                     </p>
                 }
                 .into_any(),
@@ -196,10 +198,15 @@ fn render_badge_chip(badge: EarnedBadgeSummary) -> impl IntoView {
 
     view! {
         <article class="v2-badge-chip">
-            {image.map(|src| view! { <img src=src alt=name.clone() /> })}
+            <div class="v2-badge-chip-art">
+                {match image {
+                    Some(src) => view! { <img src=src alt=name.clone() /> }.into_any(),
+                    None => view! { <span class="material-symbols-outlined" aria-hidden="true">"military_tech"</span> }.into_any(),
+                }}
+            </div>
             <div>
                 <strong>{name}</strong>
-                <span>{short_pubkey(&badge.definition.issuer_pubkey)}</span>
+                <span>{format!("Issued by {}", short_pubkey(&badge.definition.issuer_pubkey))}</span>
             </div>
         </article>
     }
