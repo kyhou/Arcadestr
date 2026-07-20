@@ -1911,6 +1911,10 @@ select option:disabled {
   font-size: 0.75rem;
 }
 
+.v2-badge-chip .v2-badge-chip-visibility {
+  color: var(--v2-secondary);
+}
+
 .badge-earned-modal-backdrop {
   position: fixed;
   inset: 0;

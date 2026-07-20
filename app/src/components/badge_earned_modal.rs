@@ -172,6 +172,7 @@ fn render_badge_content(badge: EarnedBadgeSummary) -> impl IntoView {
             <dl class=badge_modal_class_name("meta")>
                 <div><dt>"Issuer"</dt><dd>{badge.definition.issuer_pubkey.clone()}</dd></div>
                 <div><dt>"Award timestamp"</dt><dd>{badge.award.created_at.to_string()}</dd></div>
+                <div><dt>"Profile"</dt><dd>{profile_visibility_label(badge.visible_on_profile)}</dd></div>
             </dl>
         </article>
     }
@@ -208,6 +209,14 @@ fn should_close_on_key(_key: &str) -> bool {
 
 fn should_trap_tab(_key: &str) -> bool {
     _key == "Tab"
+}
+
+fn profile_visibility_label(visible_on_profile: bool) -> &'static str {
+    if visible_on_profile {
+        "Visible on profile"
+    } else {
+        "Not selected for profile"
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +262,12 @@ mod tests {
     fn should_trap_only_tab_key() {
         assert!(should_trap_tab("Tab"));
         assert!(!should_trap_tab("Escape"));
+    }
+
+    #[test]
+    fn modal_reports_profile_visibility_truthfully() {
+        assert_eq!(profile_visibility_label(true), "Visible on profile");
+        assert_eq!(profile_visibility_label(false), "Not selected for profile");
     }
 
     fn sample_badge(

@@ -42,9 +42,63 @@ mod tests {
     }
 
     #[test]
+    fn achievement_state_messages_are_truthful() {
+        assert_eq!(achievements_empty_message(), "No verified badges yet.");
+        assert!(!achievements_error_message().contains("relay"));
+    }
+
+    #[test]
+    fn cached_achievements_remain_visible_on_refresh_error() {
+        assert!(should_preserve_ready_state(&AchievementsState::Ready(
+            Vec::new()
+        )));
+        assert!(!should_preserve_ready_state(&AchievementsState::Loading));
+    }
+
+    #[test]
+    fn badge_fallback_and_visibility_are_truthful() {
+        let mut badge = sample_badge();
+        badge.definition.name = Some("  ".to_string());
+        badge.visible_on_profile = false;
+
+        assert_eq!(badge_display_name(&badge), "first-clear");
+        assert_eq!(profile_visibility_label(&badge), "Not selected for profile");
+    }
+
+    #[test]
     fn relay_refresh_yields_only_after_cached_render() {
         assert!(should_yield_before_relay_refresh(true));
         assert!(!should_yield_before_relay_refresh(false));
+    }
+
+    fn sample_badge() -> EarnedBadgeSummary {
+        use crate::models::{BadgeAward, BadgeDefinition};
+
+        EarnedBadgeSummary {
+            definition: BadgeDefinition {
+                coordinate: "30009:issuer:first-clear".to_string(),
+                issuer_pubkey: "issuer".to_string(),
+                badge_id: "first-clear".to_string(),
+                name: None,
+                description: None,
+                image_url: None,
+                image_dimensions: None,
+                thumb_url: None,
+                thumb_dimensions: None,
+                relay_url: None,
+                event_id: "definition".to_string(),
+                created_at: 1,
+            },
+            award: BadgeAward {
+                event_id: "award".to_string(),
+                issuer_pubkey: "issuer".to_string(),
+                recipient_pubkey: "recipient".to_string(),
+                badge_coordinate: "30009:issuer:first-clear".to_string(),
+                relay_url: None,
+                created_at: 2,
+            },
+            visible_on_profile: true,
+        }
     }
 }
 
@@ -64,6 +118,14 @@ fn achievements_error_message() -> &'static str {
     "Could not load achievements. Please try again."
 }
 
+fn achievements_empty_message() -> &'static str {
+    "No verified badges yet."
+}
+
+fn should_preserve_ready_state(state: &AchievementsState) -> bool {
+    matches!(state, AchievementsState::Ready(_))
+}
+
 fn should_yield_before_relay_refresh(cached_rendered: bool) -> bool {
     cached_rendered
 }
@@ -81,7 +143,16 @@ fn badge_display_name(badge: &EarnedBadgeSummary) -> String {
         .definition
         .name
         .clone()
+        .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| badge.definition.badge_id.clone())
+}
+
+fn profile_visibility_label(badge: &EarnedBadgeSummary) -> &'static str {
+    if badge.visible_on_profile {
+        "Visible on profile"
+    } else {
+        "Not selected for profile"
+    }
 }
 
 fn badge_image(badge: &EarnedBadgeSummary) -> Option<String> {
@@ -153,7 +224,7 @@ pub fn AchievementsView() -> impl IntoView {
                 Err(error) => {
                     warn!("failed to fetch achievements: {}", error);
                     if should_apply_generation(generation, request_generation.get_untracked()) {
-                        if !matches!(state.get_untracked(), AchievementsState::Ready(_)) {
+                        if !should_preserve_ready_state(&state.get_untracked()) {
                             state.set(AchievementsState::Error);
                         }
                     }
@@ -184,7 +255,7 @@ pub fn AchievementsView() -> impl IntoView {
                 ),
                 AchievementsState::Empty => achievement_state_view(
                     "workspace_premium",
-                    "No verified badges yet",
+                    achievements_empty_message(),
                     "NIP-58 awards for this profile will appear here when they are found.",
                     false,
                 ),
@@ -211,6 +282,7 @@ pub fn AchievementsView() -> impl IntoView {
                                 let description = badge.definition.description.clone();
                                 let issuer_pubkey = short_pubkey(&badge.definition.issuer_pubkey);
                                 let award_date = format_award_date(badge.award.created_at);
+                                let visibility = profile_visibility_label(&badge);
 
                                 view! {
                                     <article class="v2-achievement-card">
@@ -230,6 +302,7 @@ pub fn AchievementsView() -> impl IntoView {
                                         <dl class="v2-achievement-meta">
                                             <div><dt>"Issuer"</dt><dd>{issuer_pubkey}</dd></div>
                                             <div><dt>"Nostr timestamp"</dt><dd>{award_date}</dd></div>
+                                            <div><dt>"Profile"</dt><dd>{visibility}</dd></div>
                                         </dl>
                                     </article>
                                 }

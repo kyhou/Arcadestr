@@ -50,7 +50,7 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
             match cached_profile_result {
                 Ok(profile_entries) if !profile_entries.is_empty() => {
                     let cached_count = profile_entries.len();
-                    if generation == request_generation.get_untracked() {
+                    if should_apply_generation(generation, request_generation.get_untracked()) {
                         state.set(BadgeShowcaseState::Ready(profile_entries_to_summaries(
                             profile_entries,
                         )));
@@ -66,7 +66,10 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                         Ok(earned) => {
                             let capped = cap_fallback_badges(earned);
                             if !capped.is_empty()
-                                && generation == request_generation.get_untracked()
+                                && should_apply_generation(
+                                    generation,
+                                    request_generation.get_untracked(),
+                                )
                             {
                                 let cached_count = capped.len();
                                 state.set(BadgeShowcaseState::Ready(capped));
@@ -95,7 +98,7 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                         count = profile_entries.len(),
                         "relay refreshed profile badge showcase"
                     );
-                    if generation == request_generation.get_untracked() {
+                    if should_apply_generation(generation, request_generation.get_untracked()) {
                         state.set(BadgeShowcaseState::Ready(profile_entries_to_summaries(
                             profile_entries,
                         )));
@@ -108,7 +111,7 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                             "relay refreshed earned badge showcase fallback"
                         );
                         let capped = cap_fallback_badges(earned);
-                        if generation == request_generation.get_untracked() {
+                        if should_apply_generation(generation, request_generation.get_untracked()) {
                             if capped.is_empty() {
                                 state.set(BadgeShowcaseState::Empty);
                             } else {
@@ -117,7 +120,7 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                         }
                     }
                     Err(error) => {
-                        if generation == request_generation.get_untracked() {
+                        if should_apply_generation(generation, request_generation.get_untracked()) {
                             if !matches!(state.get_untracked(), BadgeShowcaseState::Ready(_)) {
                                 warn!("failed to refresh badge showcase: {}", error);
                                 state.set(BadgeShowcaseState::Error);
@@ -140,10 +143,10 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                     view! { <p class="v2-badge-showcase-state" role="status">"Loading verified badges..."</p> }.into_any()
                 }
                 BadgeShowcaseState::Empty => {
-                    view! { <p class="v2-badge-showcase-state">"No verified badges are available for this profile."</p> }.into_any()
+                    view! { <p class="v2-badge-showcase-state">{badge_showcase_empty_message()}</p> }.into_any()
                 }
                 BadgeShowcaseState::Error => {
-                    view! { <p class="v2-badge-showcase-state v2-badge-showcase-error" role="alert">"Could not load this badge showcase. Please try again later."</p> }.into_any()
+                    view! { <p class="v2-badge-showcase-state v2-badge-showcase-error" role="alert">{badge_showcase_error_message()}</p> }.into_any()
                 }
                 BadgeShowcaseState::WebUnavailable => view! {
                     <p class="v2-badge-showcase-state">
@@ -184,6 +187,26 @@ fn should_yield_before_relay_refresh(cached_rendered: bool) -> bool {
     cached_rendered
 }
 
+fn badge_showcase_empty_message() -> &'static str {
+    "No verified badges are available for this profile."
+}
+
+fn badge_showcase_error_message() -> &'static str {
+    "Could not load this badge showcase. Please try again later."
+}
+
+fn should_apply_generation(request_generation: u64, current_generation: u64) -> bool {
+    request_generation == current_generation
+}
+
+fn profile_visibility_label(visible_on_profile: bool) -> &'static str {
+    if visible_on_profile {
+        "Visible on profile"
+    } else {
+        "Not selected for profile"
+    }
+}
+
 fn render_badge_chip(badge: EarnedBadgeSummary) -> impl IntoView {
     let image = badge
         .definition
@@ -194,7 +217,9 @@ fn render_badge_chip(badge: EarnedBadgeSummary) -> impl IntoView {
         .definition
         .name
         .clone()
+        .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| badge.definition.badge_id.clone());
+    let visibility = profile_visibility_label(badge.visible_on_profile);
 
     view! {
         <article class="v2-badge-chip">
@@ -207,6 +232,7 @@ fn render_badge_chip(badge: EarnedBadgeSummary) -> impl IntoView {
             <div>
                 <strong>{name}</strong>
                 <span>{format!("Issued by {}", short_pubkey(&badge.definition.issuer_pubkey))}</span>
+                <span class="v2-badge-chip-visibility">{visibility}</span>
             </div>
         </article>
     }
@@ -266,5 +292,26 @@ mod tests {
     fn relay_refresh_yields_only_after_cached_showcase_render() {
         assert!(should_yield_before_relay_refresh(true));
         assert!(!should_yield_before_relay_refresh(false));
+    }
+
+    #[test]
+    fn stale_showcase_generation_is_rejected() {
+        assert!(!should_apply_generation(4, 5));
+        assert!(should_apply_generation(5, 5));
+    }
+
+    #[test]
+    fn fallback_visibility_does_not_claim_profile_selection() {
+        assert_eq!(profile_visibility_label(false), "Not selected for profile");
+        assert_eq!(profile_visibility_label(true), "Visible on profile");
+    }
+
+    #[test]
+    fn showcase_empty_and_error_messages_are_safe() {
+        assert_eq!(
+            badge_showcase_empty_message(),
+            "No verified badges are available for this profile."
+        );
+        assert!(!badge_showcase_error_message().contains("relay"));
     }
 }
