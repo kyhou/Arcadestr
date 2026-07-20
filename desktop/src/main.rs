@@ -109,6 +109,17 @@ impl command_contracts::BadgeCommandState for AppState {
     }
 }
 
+impl command_contracts::PurchaseRecordsCommandState for AppState {
+    fn purchase_records_command_handles(
+        &self,
+    ) -> (
+        Arc<Mutex<AuthState>>,
+        Arc<arcadestr_core::storage::Database>,
+    ) {
+        (self.auth.clone(), self.database.clone())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NetworkDiscoverySettings {
     #[serde(default)]
@@ -1313,6 +1324,15 @@ async fn ingest_receipt(
         .upsert_receipt(&receipt)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_purchase_records(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<arcadestr_core::ownership::DurableAcquisitionRecord>, String> {
+    command_contracts::get_purchase_records(state.inner())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Streams NIP-15 products from relays with real-time updates via Tauri events.
@@ -4852,6 +4872,7 @@ fn main() {
             get_installed_games,
             install_game,
             ingest_receipt,
+            get_purchase_records,
             fetch_profile,
             get_cached_earned_badges,
             get_cached_profile_badges,

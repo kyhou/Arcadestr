@@ -28,6 +28,17 @@ pub struct EntitlementsRepository {
     db: SqlitePool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntitlementHistoryRecord {
+    pub grant_id: String,
+    pub game_coordinate: String,
+    pub campaign_id: Option<String>,
+    pub event_id: String,
+    pub acquired_at: u64,
+    pub status: Option<GrantStatus>,
+    pub validation_error: Option<String>,
+}
+
 impl EntitlementsRepository {
     pub fn new(db: SqlitePool) -> Self {
         Self { db }
@@ -113,6 +124,57 @@ impl EntitlementsRepository {
             .any(|grant| grant.status() == Some(GrantStatus::Granted)))
     }
 
+    pub async fn history_for_buyer(
+        &self,
+        buyer_pubkey: &str,
+    ) -> Result<Vec<EntitlementHistoryRecord>, EntitlementsRepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT event_id, grant_id, buyer_pubkey, game_coordinate,
+                   campaign_root_id, status, created_at, raw_event_json
+            FROM entitlement_events
+            WHERE buyer_pubkey = ? AND validated = 1
+            ORDER BY created_at, event_id
+            "#,
+        )
+        .bind(buyer_pubkey)
+        .fetch_all(&self.db)
+        .await?;
+
+        let mut groups: HashMap<
+            (String, String, String),
+            Vec<(String, String, String, String, i64, String)>,
+        > = HashMap::new();
+        for row in rows {
+            let grant_id: String = row.get("grant_id");
+            let coordinate: String = row.get("game_coordinate");
+            let campaign: String = row.get("campaign_root_id");
+            groups
+                .entry((grant_id, coordinate.clone(), campaign.clone()))
+                .or_default()
+                .push((
+                    row.get("event_id"),
+                    row.get("buyer_pubkey"),
+                    coordinate,
+                    campaign,
+                    row.get("created_at"),
+                    row.get("raw_event_json"),
+                ));
+        }
+
+        let mut history = groups
+            .into_iter()
+            .map(|((grant_id, _, _), rows)| map_entitlement_history(grant_id, rows))
+            .collect::<Vec<_>>();
+        history.sort_by(|left, right| {
+            right
+                .acquired_at
+                .cmp(&left.acquired_at)
+                .then_with(|| left.grant_id.cmp(&right.grant_id))
+        });
+        Ok(history)
+    }
+
     async fn parsed_events(
         &self,
         buyer_pubkey: &str,
@@ -156,5 +218,84 @@ impl EntitlementsRepository {
                     .and_then(|event| parse_entitlement_event(&event).ok())
             })
             .collect())
+    }
+}
+
+fn map_entitlement_history(
+    grant_id: String,
+    rows: Vec<(String, String, String, String, i64, String)>,
+) -> EntitlementHistoryRecord {
+    let fallback = rows.last();
+    let fallback_event_id = fallback.map(|row| row.0.clone()).unwrap_or_default();
+    let fallback_coordinate = fallback.map(|row| row.2.clone()).unwrap_or_default();
+    let fallback_campaign = fallback
+        .map(|row| row.3.clone())
+        .filter(|id| !id.is_empty());
+    let fallback_created_at = fallback.map(|row| row.4.max(0) as u64).unwrap_or_default();
+
+    let parsed = rows
+        .iter()
+        .map(|(event_id, buyer, coordinate, campaign, _, raw)| {
+            let event = serde_json::from_str::<Event>(raw).map_err(|_| ())?;
+            let parsed = parse_entitlement_event(&event).map_err(|_| ())?;
+            if event.id.to_hex() != *event_id
+                || parsed.grant_id != grant_id
+                || parsed.recipient.to_hex() != *buyer
+                || parsed.coordinate != *coordinate
+                || parsed.source_event.to_hex() != *campaign
+            {
+                return Err(());
+            }
+            Ok(parsed)
+        })
+        .collect::<Result<Vec<_>, _>>();
+
+    let Ok(parsed) = parsed else {
+        return EntitlementHistoryRecord {
+            grant_id,
+            game_coordinate: fallback_coordinate,
+            campaign_id: fallback_campaign,
+            event_id: fallback_event_id,
+            acquired_at: fallback_created_at,
+            status: None,
+            validation_error: Some("Stored promotion claim could not be verified.".to_string()),
+        };
+    };
+    let Ok(resolved) = resolve_entitlement_grant(&parsed) else {
+        return EntitlementHistoryRecord {
+            grant_id,
+            game_coordinate: fallback_coordinate,
+            campaign_id: fallback_campaign,
+            event_id: fallback_event_id,
+            acquired_at: fallback_created_at,
+            status: None,
+            validation_error: Some("Stored promotion claim could not be verified.".to_string()),
+        };
+    };
+    let Some(root) = resolved.events.first() else {
+        return EntitlementHistoryRecord {
+            grant_id,
+            game_coordinate: fallback_coordinate,
+            campaign_id: fallback_campaign,
+            event_id: fallback_event_id,
+            acquired_at: fallback_created_at,
+            status: None,
+            validation_error: Some("Stored promotion claim is incomplete.".to_string()),
+        };
+    };
+    let event_id = resolved
+        .events
+        .last()
+        .map(|event| event.event.id.to_hex())
+        .unwrap_or_else(|| root.event.id.to_hex());
+
+    EntitlementHistoryRecord {
+        grant_id,
+        game_coordinate: root.coordinate.clone(),
+        campaign_id: Some(root.source_event.to_hex()),
+        event_id,
+        acquired_at: root.event.created_at.as_secs(),
+        status: resolved.status(),
+        validation_error: None,
     }
 }

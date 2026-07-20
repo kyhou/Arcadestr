@@ -1,8 +1,8 @@
 // Typed IPC bridge wrappers for NIP-49 and NIP-05 desktop commands.
 
 use crate::models::{
-    EarnedBadgeSummary, GameListing, Nip05Status, Nip49ExportResult, Nip49ImportRequest,
-    PlatformInfo, ProfileBadgeEntry,
+    DurableAcquisitionRecord, EarnedBadgeSummary, GameListing, Nip05Status, Nip49ExportResult,
+    Nip49ImportRequest, PlatformInfo, ProfileBadgeEntry,
 };
 
 /// Invoke desktop `get_platform_info` command.
@@ -15,6 +15,30 @@ pub async fn invoke_get_platform_info() -> Result<PlatformInfo, String> {
 #[cfg(feature = "web")]
 pub async fn invoke_get_platform_info() -> Result<PlatformInfo, String> {
     Err("Platform detection is only available in desktop builds.".to_string())
+}
+
+/// Reconnect the active desktop NIP-46 signer profile.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_attempt_reconnect() -> Result<serde_json::Value, String> {
+    crate::tauri_invoke::invoke("attempt_reconnect", serde_json::json!({})).await
+}
+
+/// Web fallback for NIP-46 reconnect.
+#[cfg(feature = "web")]
+pub async fn invoke_attempt_reconnect() -> Result<serde_json::Value, String> {
+    Err("Remote signer reconnect is only available in desktop builds.".to_string())
+}
+
+/// Ask the desktop relay pool to reconnect its configured default relays.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_reconnect_relays() -> Result<String, String> {
+    crate::tauri_invoke::invoke("reconnect_relays", serde_json::json!({})).await
+}
+
+/// Web fallback for native relay reconnect.
+#[cfg(feature = "web")]
+pub async fn invoke_reconnect_relays() -> Result<String, String> {
+    Err("Native relay reconnect is only available in desktop builds.".to_string())
 }
 
 /// Invoke desktop `install_game` command.
@@ -104,6 +128,18 @@ pub async fn invoke_ingest_receipt(_raw_event_json: String) -> Result<(), String
     Err("Receipt ingestion is only available in desktop builds.".to_string())
 }
 
+/// Return durable purchase and promotion-claim records for the active account.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_get_purchase_records() -> Result<Vec<DurableAcquisitionRecord>, String> {
+    crate::tauri_invoke::invoke("get_purchase_records", serde_json::json!({})).await
+}
+
+/// Durable acquisition history is unavailable in standalone web builds.
+#[cfg(feature = "web")]
+pub async fn invoke_get_purchase_records() -> Result<Vec<DurableAcquisitionRecord>, String> {
+    Err("Purchase and access records are only available in desktop builds.".to_string())
+}
+
 /// ADP server metadata returned by `check_adp_server`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AdpServerInfo {
@@ -125,6 +161,8 @@ pub enum FulfillmentMode {
 /// Request payload for the ADP publish command.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PublishAdpListingRequest {
+    pub expected_publisher_npub: String,
+    pub existing_event_id: Option<String>,
     pub d_tag: String,
     pub title: String,
     pub description: String,
@@ -143,6 +181,8 @@ pub struct PublishAdpListingRequest {
     pub version: Option<String>,
     pub acquisition: crate::models::AcquisitionPolicy,
     pub platforms: Vec<String>,
+    pub campaigns: Vec<CampaignPointerInput>,
+    pub nip94_event_id: Option<String>,
 }
 
 /// Request payload for resolving an edited listing's delegated operator.
@@ -789,6 +829,8 @@ mod tests {
     #[test]
     fn publish_request_serialization_preserves_existing_fulfillment_metadata() {
         let request = PublishAdpListingRequest {
+            expected_publisher_npub: "npub1expected".to_string(),
+            existing_event_id: Some("existing-listing-event".to_string()),
             d_tag: "game".to_string(),
             title: "Game".to_string(),
             description: "Description".to_string(),
@@ -810,14 +852,23 @@ mod tests {
                 ends_at: 200,
             },
             platforms: vec!["linux-x86_64".to_string()],
+            campaigns: vec![CampaignPointerInput {
+                root_event_id: "campaign-root".to_string(),
+                relay_hint: Some("wss://relay.example.com".to_string()),
+            }],
+            nip94_event_id: Some("nip94-event".to_string()),
         };
 
         let value = serde_json::to_value(request).expect("request should serialize");
 
+        assert_eq!(value["expected_publisher_npub"], "npub1expected");
+        assert_eq!(value["existing_event_id"], "existing-listing-event");
         assert_eq!(value["existing_fulfillment_pubkey"], "delegated-key");
         assert_eq!(value["existing_fulfillment_valid_from"], 123);
         assert_eq!(value["existing_fulfillment_revoked_at"], 456);
         assert_eq!(value["acquisition"]["TimedAccess"]["starts_at"], 100);
         assert_eq!(value["acquisition"]["TimedAccess"]["ends_at"], 200);
+        assert_eq!(value["campaigns"][0]["root_event_id"], "campaign-root");
+        assert_eq!(value["nip94_event_id"], "nip94-event");
     }
 }

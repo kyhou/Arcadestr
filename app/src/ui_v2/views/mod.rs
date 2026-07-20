@@ -8,22 +8,26 @@ pub mod login;
 pub mod marketplace_loader;
 pub mod profile;
 pub mod publish;
+pub mod purchases;
+pub mod settings;
 pub mod social;
 pub mod store_front;
 
 pub use achievements::AchievementsView;
-pub use browse_games::BrowseGamesView;
+pub use browse_games::{BrowseGamesView, BrowseRequest};
 pub use game_detail::GameDetailView;
 pub use library::LibraryView;
 pub use login::LoginV2View;
 pub use profile::ProfileV2View;
 pub use publish::{PublishV2View, PublishViewState};
+pub use purchases::PurchasesView;
+pub use settings::SettingsView;
 pub use social::SocialView;
 pub use store_front::StoreFrontView;
 
 const FALLBACK_COVER: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 10'%3E%3Crect width='16' height='10' fill='%2325232a'/%3E%3Cpath d='M6 4h4v2H6z' fill='%23a9a2b3'/%3E%3C/svg%3E";
 
-fn valid_cover_url(images: &[String]) -> Option<String> {
+pub(crate) fn valid_cover_url(images: &[String]) -> Option<String> {
     images.iter().find_map(|candidate| {
         let trimmed = candidate.trim();
         let parsed = url::Url::parse(trimmed).ok()?;
@@ -42,7 +46,7 @@ fn valid_cover_url(images: &[String]) -> Option<String> {
     })
 }
 
-fn use_fallback_cover(event: web_sys::ErrorEvent) {
+pub(crate) fn use_fallback_cover(event: web_sys::ErrorEvent) {
     use leptos::prelude::event_target;
 
     let image = event_target::<web_sys::HtmlElement>(&event);

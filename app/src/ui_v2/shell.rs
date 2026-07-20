@@ -1,42 +1,140 @@
 use leptos::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
+
+#[cfg(target_arch = "wasm32")]
+const MOBILE_NAV_FOCUSABLE: &str =
+    "button:not([disabled]), [href], [tabindex]:not([tabindex='-1'])";
 
 use crate::models::{npub_fallback_label, GameListing};
 use crate::relay_state::{apply_relay_event, merge_relay_snapshot};
-use crate::ui_v2::components::{NavItem, TopBar};
+use crate::ui_v2::components::{MobileNavItem, NavItem, TopBar};
 use crate::ui_v2::theme::UI_V2_STYLES;
 use crate::ui_v2::views::{
-    AchievementsView, BrowseGamesView, GameDetailView, LibraryView, ProfileV2View, PublishV2View,
-    PublishViewState, SocialView, StoreFrontView,
+    AchievementsView, BrowseGamesView, BrowseRequest, GameDetailView, LibraryView, ProfileV2View,
+    PublishV2View, PublishViewState, PurchasesView, SettingsView, SocialView, StoreFrontView,
 };
-use crate::{
-    invoke_get_allow_insecure_public_ws, invoke_get_connected_relays, invoke_logout_nip46,
-    invoke_set_allow_insecure_public_ws, AuthContext,
-};
+use crate::{invoke_get_allow_insecure_public_ws, invoke_get_connected_relays, AuthContext};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailOrigin {
+    Store,
+    Library,
+}
+
+fn detail_back_destination(origin: DetailOrigin) -> UiV2View {
+    match origin {
+        DetailOrigin::Store => UiV2View::Store,
+        DetailOrigin::Library => UiV2View::Library,
+    }
+}
 
 #[derive(Clone, PartialEq)]
 enum UiV2View {
     Store,
-    BrowseAll,
-    Detail(GameListing),
+    Browse(BrowseRequest),
+    Detail(GameListing, DetailOrigin),
     Library,
     Social,
     Achievements,
+    Purchases,
     Publish(PublishViewState),
     Profile,
     Settings,
 }
 
+impl UiV2View {
+    fn page_title(&self) -> &'static str {
+        match self {
+            Self::Store => "Store",
+            Self::Browse(_) => "Browse",
+            Self::Detail(_, _) => "Game details",
+            Self::Library => "Library",
+            Self::Social => "Community",
+            Self::Achievements => "Achievements",
+            Self::Purchases => "Purchases and access",
+            Self::Publish(_) => "Publish",
+            Self::Profile => "Profile",
+            Self::Settings => "Settings",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{detail_back_destination, BrowseRequest, DetailOrigin, UiV2View};
+
     #[test]
-    fn shell_sidebar_avatar_does_not_use_generated_placeholder() {
+    fn shell_does_not_use_generated_identity_or_fake_controls() {
         let source = include_str!("shell.rs");
 
-        assert!(
-            !source.contains(concat!("aida", "-public")),
-            "shell sidebar avatar should come from user profile/account data, not a generated placeholder URL"
-        );
+        assert!(!source.contains(concat!("aida", "-public")));
+        assert!(!source.contains(concat!("Za", "ps")));
+        assert!(!source.contains(concat!("Notifica", "tions")));
+        assert!(!source.contains(concat!("Sup", "port")));
+    }
+
+    #[test]
+    fn every_shell_destination_has_mobile_navigation() {
+        let source = include_str!("shell.rs");
+        for label in [
+            "Store",
+            "Browse",
+            "Library",
+            "Community",
+            "Publish",
+            "Profile",
+            "Achievements",
+            "Purchases",
+            "Settings",
+        ] {
+            assert!(
+                source.contains(&format!("<MobileNavItem label=\"{label}\"")),
+                "missing mobile navigation for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn store_category_payload_reaches_browse_navigation_state() {
+        let view = UiV2View::Browse(BrowseRequest::for_category("Action RPG"));
+        let UiV2View::Browse(request) = view else {
+            panic!("category navigation must target Browse");
+        };
+        assert_eq!(request.category.as_deref(), Some("action rpg"));
+    }
+
+    #[test]
+    fn detail_back_navigation_preserves_its_origin() {
+        assert!(matches!(
+            detail_back_destination(DetailOrigin::Store),
+            UiV2View::Store
+        ));
+        assert!(matches!(
+            detail_back_destination(DetailOrigin::Library),
+            UiV2View::Library
+        ));
+    }
+
+    #[test]
+    fn profile_achievements_and_settings_navigation_remain_available() {
+        let source = include_str!("shell.rs");
+        for destination in [
+            "ProfileV2View",
+            "AchievementsView",
+            "PurchasesView",
+            "SettingsView",
+        ] {
+            assert!(source.contains(destination));
+        }
+    }
+
+    #[test]
+    fn old_inline_settings_markup_is_removed() {
+        let source = include_str!("shell.rs");
+        assert!(!source.contains(concat!("Allow insecure public ", "ws:// relays")));
+        assert!(source.contains("<SettingsView"));
     }
 }
 
@@ -44,18 +142,21 @@ mod tests {
 pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let current_view = RwSignal::new(UiV2View::Store);
+    let mobile_menu_open = RwSignal::new(false);
     let connected_relays = RwSignal::new(Vec::<String>::new());
+    let relay_snapshot_loaded = RwSignal::new(false);
+    let pending_relay_events = RwSignal::new(Vec::<(String, String)>::new());
     let allow_insecure_public_ws = RwSignal::new(false);
     let settings_error = RwSignal::new(None::<String>);
 
     Effect::new(move |_| {
-        let connected_relays_for_effect = connected_relays.clone();
+        let connected_relays_for_effect = connected_relays;
         let relay_count_for_effect = relay_count;
         spawn_local(async move {
             // Subscribe first so early connection events are not missed.
             #[cfg(not(feature = "web"))]
             {
-                let relays_for_listener = connected_relays_for_effect.clone();
+                let relays_for_listener = connected_relays_for_effect;
                 let relay_count_for_listener = relay_count_for_effect;
 
                 match crate::tauri_invoke::listen("relay-connection", move |payload| {
@@ -71,6 +172,11 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                     relays_for_listener.update(|relays| {
                         let _ = apply_relay_event(relays, event_type, url);
                     });
+                    if !relay_snapshot_loaded.get_untracked() {
+                        pending_relay_events.update(|events| {
+                            events.push((event_type.to_string(), url.to_string()));
+                        });
+                    }
                     relay_count_for_listener.set(relays_for_listener.get_untracked().len());
                 })
                 .await
@@ -81,24 +187,28 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                     }
                     Err(err) => {
                         web_sys::console::error_1(
-                            &format!("[UiV2Root] Failed to subscribe relay listener: {}", err)
-                                .into(),
+                            &format!("[UiV2Root] Failed to subscribe relay listener: {err}").into(),
                         );
                     }
                 }
             }
 
-            // Snapshot after subscribe to recover early relays emitted before listener attach.
+            // Snapshot after subscribe to recover relays emitted before listener attachment.
             match invoke_get_connected_relays().await {
                 Ok(snapshot_relays) => {
-                    connected_relays_for_effect.update(|relays| {
-                        merge_relay_snapshot(relays, snapshot_relays);
-                    });
+                    let mut reconciled = Vec::new();
+                    merge_relay_snapshot(&mut reconciled, snapshot_relays);
+                    for (event_type, url) in pending_relay_events.get_untracked() {
+                        let _ = apply_relay_event(&mut reconciled, &event_type, &url);
+                    }
+                    connected_relays_for_effect.set(reconciled);
+                    relay_snapshot_loaded.set(true);
+                    pending_relay_events.set(Vec::new());
                     relay_count_for_effect.set(connected_relays_for_effect.get_untracked().len());
                 }
                 Err(err) => {
                     web_sys::console::error_1(
-                        &format!("[UiV2Root] Failed to load relay snapshot: {}", err).into(),
+                        &format!("[UiV2Root] Failed to load relay snapshot: {err}").into(),
                     );
                 }
             }
@@ -106,13 +216,10 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     });
 
     Effect::new(move |_| {
-        let allow_flag = allow_insecure_public_ws;
-        let settings_error_signal = settings_error;
-
         spawn_local(async move {
             match invoke_get_allow_insecure_public_ws().await {
-                Ok(value) => allow_flag.set(value),
-                Err(err) => settings_error_signal.set(Some(err)),
+                Ok(value) => allow_insecure_public_ws.set(value),
+                Err(err) => settings_error.set(Some(err)),
             }
         });
     });
@@ -121,26 +228,19 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let connected_relays_signal = Signal::derive(move || connected_relays.get());
     let connection_status = Signal::derive(move || auth.connection_status.get());
     let connection_error = Signal::derive(move || auth.connection_error.get());
-    let search_placeholder = Memo::new(move |_| match current_view.get() {
-        UiV2View::Store => "Search curated games...",
-        UiV2View::BrowseAll => "Search games, developers, notes...",
-        UiV2View::Detail(_) => "Search curated worlds...",
-        UiV2View::Library => "Search your library...",
-        UiV2View::Social => "Search the protocol...",
-        _ => "Search games...",
-    });
-    let browse_active = Memo::new(move |_| {
-        matches!(
-            current_view.get(),
-            UiV2View::BrowseAll | UiV2View::Detail(_)
-        )
-    });
+    let page_title = Signal::derive(move || current_view.get().page_title());
+    let mobile_menu_signal = Signal::derive(move || mobile_menu_open.get());
     let display_name = Signal::derive(move || {
         auth.profile
             .get()
             .map(|profile| profile.display())
+            .or_else(|| {
+                auth.active_account
+                    .get()
+                    .and_then(|account| account.display_name.or(account.name).or(account.username))
+            })
             .or_else(|| auth.npub.get().map(|npub| npub_fallback_label(&npub)))
-            .unwrap_or_else(|| "Neon Curator".to_string())
+            .unwrap_or_else(|| "No active account".to_string())
     });
     let avatar_url = Signal::derive(move || {
         auth.profile
@@ -156,307 +256,337 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
         display_name
             .get()
             .chars()
-            .next()
-            .map(|c| c.to_ascii_uppercase().to_string())
+            .find(|character| character.is_alphanumeric())
+            .map(|character| character.to_uppercase().to_string())
             .unwrap_or_else(|| "?".to_string())
     });
 
-    let set_store = move |_| current_view.set(UiV2View::Store);
-    let set_browse_all = move |_| current_view.set(UiV2View::BrowseAll);
-    let set_library = move |_| current_view.set(UiV2View::Library);
-    let set_social = move |_| current_view.set(UiV2View::Social);
-    let set_achievements = move |_| current_view.set(UiV2View::Achievements);
-    let set_publish = move |_| current_view.set(UiV2View::Publish(PublishViewState::Games));
-    let set_profile = move |_| current_view.set(UiV2View::Profile);
-    let set_settings = move |_| current_view.set(UiV2View::Settings);
-    let on_select_listing = Callback::new(move |listing: GameListing| {
-        current_view.set(UiV2View::Detail(listing));
-    });
-    let on_open_browse_all = Callback::new(move |_| {
-        current_view.set(UiV2View::BrowseAll);
-    });
-    let on_back_to_store = Callback::new(move |_| {
+    let navigate_store = Callback::new(move |_| {
         current_view.set(UiV2View::Store);
+        mobile_menu_open.set(false);
+    });
+    let navigate_browse = Callback::new(move |_| {
+        current_view.set(UiV2View::Browse(BrowseRequest::default()));
+        mobile_menu_open.set(false);
+    });
+    let navigate_store_category = Callback::new(move |request: BrowseRequest| {
+        current_view.set(UiV2View::Browse(request));
+        mobile_menu_open.set(false);
+    });
+    let navigate_library = Callback::new(move |_| {
+        current_view.set(UiV2View::Library);
+        mobile_menu_open.set(false);
+    });
+    let navigate_social = Callback::new(move |_| {
+        current_view.set(UiV2View::Social);
+        mobile_menu_open.set(false);
+    });
+    let navigate_publish = Callback::new(move |_| {
+        current_view.set(UiV2View::Publish(PublishViewState::Games));
+        mobile_menu_open.set(false);
+    });
+    let navigate_profile = Callback::new(move |_| {
+        current_view.set(UiV2View::Profile);
+        mobile_menu_open.set(false);
+    });
+    let navigate_achievements = Callback::new(move |_| {
+        current_view.set(UiV2View::Achievements);
+        mobile_menu_open.set(false);
+    });
+    let navigate_purchases = Callback::new(move |_| {
+        current_view.set(UiV2View::Purchases);
+        mobile_menu_open.set(false);
+    });
+    let navigate_settings = Callback::new(move |_| {
+        current_view.set(UiV2View::Settings);
+        mobile_menu_open.set(false);
+    });
+    let toggle_mobile_menu = Callback::new(move |_| {
+        mobile_menu_open.update(|open| *open = !*open);
+    });
+
+    let on_select_listing = Callback::new(move |listing: GameListing| {
+        current_view.set(UiV2View::Detail(listing, DetailOrigin::Store));
+        mobile_menu_open.set(false);
+    });
+    let on_select_library_listing = Callback::new(move |listing: GameListing| {
+        current_view.set(UiV2View::Detail(listing, DetailOrigin::Library));
+        mobile_menu_open.set(false);
+    });
+    let on_back_from_detail = Callback::new(move |_| {
+        let origin = match current_view.get_untracked() {
+            UiV2View::Detail(_, origin) => origin,
+            _ => DetailOrigin::Store,
+        };
+        current_view.set(detail_back_destination(origin));
     });
     let on_open_publish_from_profile = Callback::new(move |_| {
         current_view.set(UiV2View::Publish(PublishViewState::Games));
     });
     let on_open_listing_from_profile = Callback::new(move |listing: GameListing| {
-        current_view.set(UiV2View::Detail(listing));
+        current_view.set(UiV2View::Detail(listing, DetailOrigin::Store));
     });
     let on_disconnect = Callback::new(move |_| {
         let auth_ctx = auth.clone();
         spawn_local(async move {
-            match invoke_logout_nip46().await {
-                Ok(_) => {
-                    auth_ctx.npub.set(None);
-                    auth_ctx.error.set(None);
-                    auth_ctx.active_account.set(None);
-                    auth_ctx.connection_status.set("disconnected".to_string());
-                    auth_ctx.connection_error.set(None);
-                    let _ = auth_ctx.load_accounts_list().await;
-                }
+            match auth_ctx.logout_nip46().await {
+                Ok(_) => auth_ctx.error.set(None),
                 Err(err) => auth_ctx.error.set(Some(err)),
             }
         });
     });
 
+    let store_active = Signal::derive(move || current_view.get() == UiV2View::Store);
+    let browse_active = Signal::derive(move || {
+        matches!(
+            current_view.get(),
+            UiV2View::Browse(_) | UiV2View::Detail(_, DetailOrigin::Store)
+        )
+    });
+    let library_active = Signal::derive(move || {
+        matches!(
+            current_view.get(),
+            UiV2View::Library | UiV2View::Detail(_, DetailOrigin::Library)
+        )
+    });
+    let social_active = Signal::derive(move || current_view.get() == UiV2View::Social);
+    let publish_active = Signal::derive(move || matches!(current_view.get(), UiV2View::Publish(_)));
+    let profile_active = Signal::derive(move || current_view.get() == UiV2View::Profile);
+    let achievements_active = Signal::derive(move || current_view.get() == UiV2View::Achievements);
+    let purchases_active = Signal::derive(move || current_view.get() == UiV2View::Purchases);
+    let settings_active = Signal::derive(move || current_view.get() == UiV2View::Settings);
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let previous_open = RwSignal::new(false);
+        Effect::new(move |_| {
+            let open = mobile_menu_open.get();
+            let was_open = previous_open.get_untracked();
+            previous_open.set(open);
+            if open && !was_open {
+                spawn_local(async move {
+                    gloo_timers::future::TimeoutFuture::new(0).await;
+                    let Some(document) = web_sys::window().and_then(|window| window.document())
+                    else {
+                        return;
+                    };
+                    let Some(nav) = document.get_element_by_id("mobile-primary-navigation") else {
+                        return;
+                    };
+                    if let Ok(Some(first)) = nav.query_selector(MOBILE_NAV_FOCUSABLE) {
+                        if let Ok(first) = first.dyn_into::<web_sys::HtmlElement>() {
+                            let _ = first.focus();
+                        }
+                    }
+                });
+            } else if !open && was_open {
+                if let Some(trigger) = web_sys::window()
+                    .and_then(|window| window.document())
+                    .and_then(|document| document.get_element_by_id("mobile-navigation-trigger"))
+                    .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+                {
+                    let _ = trigger.focus();
+                }
+            }
+        });
+    }
+
     view! {
         <div class="min-h-screen bg-background text-on-surface selection:bg-primary/30">
             <style>{UI_V2_STYLES}</style>
 
-            <aside
-                class="fixed left-0 top-20 h-[calc(100vh-5rem)] w-64 z-40 bg-[#0f141a]/60 backdrop-blur-2xl border-r shadow-[20px_0px_40px_rgba(0,0,0,0.4)] will-change-transform [transform:translateZ(0)] flex flex-col py-6 gap-2 hidden md:flex"
-                style="border-right-color: rgba(68, 72, 79, 0.15);"
-            >
-                <div class="px-6 mb-8">
-                    <div class="flex items-center gap-3">
-                        {move || match avatar_url.get() {
-                            Some(url) => view! {
-                                <img
-                                    alt="Nostr Avatar"
-                                    class="w-10 h-10 rounded-full bg-surface-container-high object-cover"
-                                    src={url}
-                                />
-                            }
-                                .into_any(),
-                            None => view! {
-                                <div class="w-10 h-10 rounded-full bg-surface-container-highest flex items-center justify-center text-sm font-headline font-bold text-on-surface">
-                                    {move || avatar_fallback.get()}
-                                </div>
-                            }
-                                .into_any(),
-                        }}
-                        <div>
-                            <h3 class="font-bold text-on-surface text-sm">{move || display_name.get()}</h3>
-                            <p class="text-tertiary text-xs">"⚡ 4.2k Zaps"</p>
-                        </div>
-                    </div>
-                </div>
-
-                <nav class="flex-1">
-                    <NavItem
-                        label="Store"
-                        icon="grid_view"
-                        active={Signal::derive(move || {
-                            matches!(current_view.get(), UiV2View::Store)
-                        })}
-                        on_click={Callback::new(set_store)}
-                    />
-                    <NavItem
-                        label="Browse"
-                        icon="explore"
-                        active={Signal::derive(move || {
-                            matches!(current_view.get(), UiV2View::BrowseAll)
-                        })}
-                        on_click={Callback::new(set_browse_all)}
-                    />
-                    <NavItem
-                        label="Library"
-                        icon="sports_esports"
-                        active={Signal::derive(move || current_view.get() == UiV2View::Library)}
-                        on_click={Callback::new(set_library)}
-                    />
-                    <NavItem
-                        label="Social"
-                        icon="forum"
-                        active={Signal::derive(move || current_view.get() == UiV2View::Social)}
-                        on_click={Callback::new(set_social)}
-                    />
-                    <NavItem
-                        label="Publish"
-                        icon="upload"
-                        active={Signal::derive(move || matches!(current_view.get(), UiV2View::Publish(_)))}
-                        on_click={Callback::new(set_publish)}
-                    />
-                    <NavItem
-                        label="Profile"
-                        icon="person"
-                        active={Signal::derive(move || current_view.get() == UiV2View::Profile)}
-                        on_click={Callback::new(set_profile)}
-                    />
-                    <NavItem
-                        label="Achievements"
-                        icon="emoji_events"
-                        active={Signal::derive(move || {
-                            current_view.get() == UiV2View::Achievements
-                        })}
-                        on_click={Callback::new(set_achievements)}
-                    />
-                    <NavItem
-                        label="Settings"
-                        icon="settings"
-                        active={Signal::derive(move || current_view.get() == UiV2View::Settings)}
-                        on_click={Callback::new(set_settings)}
-                    />
-                </nav>
-
-                <div class="px-4 mb-4">
-                    <button class="w-full bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold py-3 rounded-md active:scale-95 transition-all text-sm">
-                        "Connect Nostr"
-                    </button>
-                </div>
-
-                <div class="border-t border-outline-variant/10 pt-4">
-                    <button class="flex items-center gap-4 text-[#f1f3fc]/50 px-4 py-3 mx-2 my-1 hover:bg-[#262c36]/30 cursor-pointer active:opacity-80 transition-transform duration-200 hover:translate-x-1 font-['Inter'] text-sm font-medium w-[calc(100%-1rem)] rounded-lg text-left">
-                        <span class="material-symbols-outlined">"help_outline"</span>
-                        <span>"Support"</span>
-                    </button>
-                    <button
-                        class="flex items-center gap-4 text-[#f1f3fc]/50 px-4 py-3 mx-2 my-1 hover:bg-[#262c36]/30 cursor-pointer active:opacity-80 transition-transform duration-200 hover:translate-x-1 font-['Inter'] text-sm font-medium w-[calc(100%-1rem)] rounded-lg text-left"
-                        on:click=move |_| on_disconnect.run(())
-                    >
-                        <span class="material-symbols-outlined">"logout"</span>
-                        <span>"Sign Out"</span>
-                    </button>
-                </div>
-            </aside>
-
             <TopBar
-                relay_count={relay_count_signal}
-                connected_relays={connected_relays_signal}
-                display_name={display_name}
-                connection_status={connection_status}
-                connection_error={connection_error}
-                on_open_profile={Callback::new(set_profile)}
-                search_placeholder={search_placeholder.into()}
-                browse_active={browse_active.into()}
+                page_title=page_title
+                relay_count=relay_count_signal
+                connected_relays=connected_relays_signal
+                display_name=display_name
+                avatar_url=avatar_url
+                avatar_fallback=avatar_fallback
+                connection_status=connection_status
+                connection_error=connection_error
+                mobile_menu_open=mobile_menu_signal
+                on_open_store=navigate_store
+                on_open_profile=navigate_profile
+                on_toggle_mobile_menu=toggle_mobile_menu
             />
 
-            <main class="md:pl-64 pt-20 min-h-screen pb-24 md:pb-0">
-                {move || {
-                    match current_view.get() {
-                        UiV2View::Store => {
-                            view! {
-                                <StoreFrontView
-                                    on_select={on_select_listing}
-                                    on_view_all={on_open_browse_all}
-                                />
+            <Show when=move || mobile_menu_open.get()>
+                <button
+                    type="button"
+                    class="fixed inset-0 top-20 z-30 bg-black/55 md:hidden"
+                    aria-label="Close navigation"
+                    on:click=move |_| mobile_menu_open.set(false)
+                ></button>
+                <nav
+                    id="mobile-primary-navigation"
+                    class="fixed inset-x-3 top-24 z-40 max-h-[calc(100vh-7rem)] overflow-auto rounded-2xl border border-white/10 bg-surface-container-low/95 p-3 shadow-ambient backdrop-blur-2xl md:hidden"
+                    aria-label="Primary navigation"
+                    role="dialog"
+                    aria-modal="true"
+                    on:keydown=move |event| {
+                        if event.key() == "Escape" {
+                            event.prevent_default();
+                            mobile_menu_open.set(false);
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        if event.key() == "Tab" {
+                            let Some(document) = web_sys::window().and_then(|window| window.document()) else { return };
+                            let Some(nav) = document.get_element_by_id("mobile-primary-navigation") else { return };
+                            let Ok(focusables) = nav.query_selector_all(MOBILE_NAV_FOCUSABLE) else { return };
+                            let count = focusables.length();
+                            if count == 0 { return; }
+                            let first = focusables.item(0).and_then(|item| item.dyn_into::<web_sys::HtmlElement>().ok());
+                            let last = focusables.item(count - 1).and_then(|item| item.dyn_into::<web_sys::HtmlElement>().ok());
+                            let active = document.active_element();
+                            let at_first = active.as_ref().zip(first.as_ref()).is_some_and(|(active, first)| active.is_same_node(Some(first.as_ref())));
+                            let at_last = active.as_ref().zip(last.as_ref()).is_some_and(|(active, last)| active.is_same_node(Some(last.as_ref())));
+                            if event.shift_key() && at_first {
+                                event.prevent_default();
+                                if let Some(last) = last { let _ = last.focus(); }
+                            } else if !event.shift_key() && at_last {
+                                event.prevent_default();
+                                if let Some(first) = first { let _ = first.focus(); }
                             }
-                                .into_any()
                         }
-                        UiV2View::BrowseAll => {
-                            view! { <BrowseGamesView on_select={on_select_listing} /> }
-                                .into_any()
+                    }
+                >
+                    <MobileNavItem label="Store" icon="grid_view" active=store_active on_click=navigate_store />
+                    <MobileNavItem label="Browse" icon="explore" active=browse_active on_click=navigate_browse />
+                    <MobileNavItem label="Library" icon="sports_esports" active=library_active on_click=navigate_library />
+                    <MobileNavItem label="Community" icon="forum" active=social_active on_click=navigate_social />
+                    <MobileNavItem label="Publish" icon="upload" active=publish_active on_click=navigate_publish />
+                    <MobileNavItem label="Profile" icon="person" active=profile_active on_click=navigate_profile />
+                    <MobileNavItem label="Achievements" icon="emoji_events" active=achievements_active on_click=navigate_achievements />
+                    <MobileNavItem label="Purchases" icon="receipt_long" active=purchases_active on_click=navigate_purchases />
+                    <MobileNavItem label="Settings" icon="settings" active=settings_active on_click=navigate_settings />
+                </nav>
+            </Show>
+
+            <div class="mx-auto flex max-w-[1600px] items-start gap-6 px-4 py-6 md:px-8" inert=move || mobile_menu_open.get().then_some("")>
+                <aside class="sticky top-24 hidden max-h-[calc(100vh-7rem)] w-60 shrink-0 flex-col overflow-auto rounded-2xl border border-white/5 bg-surface-container-low/75 p-4 shadow-ambient backdrop-blur-2xl md:flex">
+                    <section class="mb-6 flex items-center gap-3 rounded-xl p-2" aria-label="Active account">
+                        {move || match avatar_url.get() {
+                            Some(url) => view! {
+                                <img src=url alt="" class="h-10 w-10 rounded-full object-cover ring-2 ring-primary/60" />
+                            }
+                            .into_any(),
+                            None => view! {
+                                <span class="flex h-10 w-10 items-center justify-center rounded-full bg-surface-bright text-sm font-bold ring-2 ring-primary/60" aria-hidden="true">
+                                    {move || avatar_fallback.get()}
+                                </span>
+                            }
+                            .into_any(),
+                        }}
+                        <div class="min-w-0">
+                            <h2 class="truncate text-sm font-semibold">{move || display_name.get()}</h2>
+                            <p class=move || match connection_status.get().as_str() {
+                                "connected" => "truncate text-xs text-secondary",
+                                "connecting" => "truncate text-xs text-tertiary",
+                                "failed" => "truncate text-xs text-error",
+                                _ => "truncate text-xs text-on-surface-variant",
+                            }>
+                                {move || match connection_status.get().as_str() {
+                                    "connected" => "Signing app connected",
+                                    "connecting" => "Connecting signing app",
+                                    "failed" => "Signing app connection failed",
+                                    _ => "Signing app disconnected",
+                                }}
+                            </p>
+                        </div>
+                    </section>
+
+                    <nav class="flex flex-1 flex-col gap-1" aria-label="Primary navigation">
+                        <NavItem label="Store" icon="grid_view" active=store_active on_click=navigate_store />
+                        <NavItem label="Browse" icon="explore" active=browse_active on_click=navigate_browse />
+                        <NavItem label="Library" icon="sports_esports" active=library_active on_click=navigate_library />
+                        <NavItem label="Community" icon="forum" active=social_active on_click=navigate_social />
+                        <NavItem label="Publish" icon="upload" active=publish_active on_click=navigate_publish />
+                        <NavItem label="Profile" icon="person" active=profile_active on_click=navigate_profile />
+                        <NavItem label="Achievements" icon="emoji_events" active=achievements_active on_click=navigate_achievements />
+                        <NavItem label="Purchases" icon="receipt_long" active=purchases_active on_click=navigate_purchases />
+                        <NavItem label="Settings" icon="settings" active=settings_active on_click=navigate_settings />
+                    </nav>
+
+                    <div class="mt-6 border-t border-white/5 pt-4">
+                        <button
+                            type="button"
+                            class="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium text-on-surface-variant outline-none ring-primary/60 hover:bg-surface-container-high/60 hover:text-on-surface focus-visible:ring-2"
+                            on:click=move |_| on_disconnect.run(())
+                        >
+                            <span class="material-symbols-outlined text-lg" aria-hidden="true">"logout"</span>
+                            <span>"Sign out"</span>
+                        </button>
+                    </div>
+                </aside>
+
+                <main class="min-w-0 flex-1">
+                    {move || match current_view.get() {
+                        UiV2View::Store => view! {
+                            <StoreFrontView on_select=on_select_listing on_browse=navigate_store_category />
                         }
-                        UiV2View::Detail(listing) => {
+                        .into_any(),
+                        UiV2View::Browse(request) => view! {
+                            <BrowseGamesView on_select=on_select_listing request=request />
+                        }
+                        .into_any(),
+                        UiV2View::Detail(listing, _) => view! {
+                            <div class="p-4 md:p-8">
+                                <GameDetailView listing=listing on_back=on_back_from_detail />
+                            </div>
+                        }
+                        .into_any(),
+                        UiV2View::Library => view! {
+                            <div class="p-4 md:p-8">
+                                <LibraryView on_open_listing=on_select_library_listing />
+                            </div>
+                        }
+                        .into_any(),
+                        UiV2View::Social => view! {
+                            <div class="p-4 md:p-8"><SocialView /></div>
+                        }
+                        .into_any(),
+                        UiV2View::Achievements => view! {
+                            <div class="p-4 md:p-8"><AchievementsView /></div>
+                        }
+                        .into_any(),
+                        UiV2View::Purchases => view! {
+                            <div class="p-4 md:p-8"><PurchasesView /></div>
+                        }
+                        .into_any(),
+                        UiV2View::Publish(state) => {
+                            let on_navigate = Callback::new(move |state| {
+                                current_view.set(UiV2View::Publish(state));
+                            });
                             view! {
-                                <div class="max-w-[1600px] mx-auto p-8">
-                                    <GameDetailView listing={listing} on_back={on_back_to_store} />
+                                <div class="p-4 md:p-8">
+                                    <PublishV2View state=state on_navigate=on_navigate />
                                 </div>
                             }
                             .into_any()
                         }
-                        UiV2View::Library => {
-                            view! { <div class="max-w-[1600px] mx-auto p-8"><LibraryView /></div> }
-                                .into_any()
-                        }
-                        UiV2View::Social => {
-                            view! { <div class="max-w-[1600px] mx-auto p-8"><SocialView /></div> }
-                                .into_any()
-                        }
-                        UiV2View::Achievements => {
-                            view! { <div class="max-w-[1600px] mx-auto p-8"><AchievementsView /></div> }
-                                .into_any()
-                        }
-                        UiV2View::Publish(state) => {
-                            let on_navigate = Callback::new(move |state| current_view.set(UiV2View::Publish(state)));
-                            view! { <div class="max-w-[1600px] mx-auto p-8"><PublishV2View state=state on_navigate=on_navigate /></div> }
-                                .into_any()
-                        }
                         UiV2View::Profile => view! {
-                            <div class="max-w-[1600px] mx-auto p-8">
+                            <div class="p-4 md:p-8">
                                 <ProfileV2View
-                                    on_open_publish={on_open_publish_from_profile}
-                                    on_open_listing={on_open_listing_from_profile}
+                                    on_open_publish=on_open_publish_from_profile
+                                    on_open_listing=on_open_listing_from_profile
                                 />
                             </div>
                         }
                         .into_any(),
-                        UiV2View::Settings => {
-                            view! {
-                                <section class="max-w-[1600px] mx-auto p-8">
-                                    <div class="bg-surface-container-high rounded-xl p-6 space-y-6">
-                                        <div>
-                                            <h2 class="font-headline text-3xl font-bold tracking-tight">"Settings"</h2>
-                                            <p class="text-on-surface-variant mt-2">"Configure client behavior and relay discovery policies."</p>
-                                        </div>
-
-                                        <div class="border border-outline-variant/20 rounded-lg p-4 space-y-4">
-                                            <h3 class="font-semibold text-lg">"Advanced"</h3>
-
-                                            <label class="flex items-start justify-between gap-4 cursor-pointer">
-                                                <div>
-                                                    <p class="font-medium">"Allow insecure public ws:// relays"</p>
-                                                    <p class="text-sm text-on-surface-variant mt-1">
-                                                        "Keep OFF for safety. Local/dev ws:// relays are always allowed."
-                                                    </p>
-                                                </div>
-                                                <input
-                                                    type="checkbox"
-                                                    prop:checked=move || allow_insecure_public_ws.get()
-                                                    on:change=move |ev| {
-                                                        let next = event_target_checked(&ev);
-                                                        allow_insecure_public_ws.set(next);
-                                                        settings_error.set(None);
-
-                                                        spawn_local(async move {
-                                                            if let Err(err) = invoke_set_allow_insecure_public_ws(next).await {
-                                                                settings_error.set(Some(err));
-                                                                allow_insecure_public_ws.set(!next);
-                                                            }
-                                                        });
-                                                    }
-                                                />
-                                            </label>
-
-                                            {move || {
-                                                settings_error
-                                                    .get()
-                                                    .map(|err| {
-                                                        view! {
-                                                            <p class="text-sm text-red-400">{format!("Failed to save setting: {err}")}</p>
-                                                        }
-                                                            .into_any()
-                                                    })
-                                                    .unwrap_or_else(|| view! { <></> }.into_any())
-                                            }}
-                                        </div>
-                                    </div>
-                                </section>
-                            }
-                            .into_any()
+                        UiV2View::Settings => view! {
+                            <section class="p-4 md:p-8">
+                                <SettingsView
+                                    connected_relays=connected_relays_signal
+                                    allow_insecure_public_ws=allow_insecure_public_ws
+                                    settings_error=settings_error
+                                    on_sign_out=on_disconnect
+                                />
+                            </section>
                         }
-                    }
-                }}
-            </main>
-
-            <nav class="md:hidden fixed bottom-0 left-0 right-0 h-16 bg-surface-container-low/90 backdrop-blur-xl border-t border-outline-variant/10 px-6 flex justify-between items-center z-50">
-                <button class="flex flex-col items-center text-primary" on:click=move |_| current_view.set(UiV2View::Store)>
-                    <span class="material-symbols-outlined">"grid_view"</span>
-                    <span class="text-[10px] font-bold">"Store"</span>
-                </button>
-                <button class="flex flex-col items-center text-on-surface-variant" on:click=move |_| set_browse_all(())>
-                    <span class="material-symbols-outlined">"explore"</span>
-                    <span class="text-[10px] font-medium">"Browse"</span>
-                </button>
-                <button class="flex flex-col items-center text-on-surface-variant" on:click=move |_| current_view.set(UiV2View::Library)>
-                    <span class="material-symbols-outlined">"sports_esports"</span>
-                    <span class="text-[10px] font-medium">"Library"</span>
-                </button>
-                <button class="flex flex-col items-center text-on-surface-variant" on:click=move |_| current_view.set(UiV2View::Social)>
-                    <span class="material-symbols-outlined">"forum"</span>
-                    <span class="text-[10px] font-medium">"Social"</span>
-                </button>
-                <button class="flex flex-col items-center text-on-surface-variant" on:click=move |_| set_achievements(())>
-                    <span class="material-symbols-outlined">"emoji_events"</span>
-                    <span class="text-[10px] font-medium">"Achievements"</span>
-                </button>
-                <button class="flex flex-col items-center text-on-surface-variant" on:click=move |_| current_view.set(UiV2View::Settings)>
-                    <span class="material-symbols-outlined">"settings"</span>
-                    <span class="text-[10px] font-medium">"Settings"</span>
-                </button>
-            </nav>
+                        .into_any(),
+                    }}
+                </main>
+            </div>
         </div>
     }
 }

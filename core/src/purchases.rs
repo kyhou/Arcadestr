@@ -129,6 +129,88 @@ impl PurchasesRepository {
 
         Ok(false)
     }
+
+    /// Load persisted receipts for one authenticated buyer.
+    pub async fn list_for_buyer(
+        &self,
+        buyer_pubkey: &str,
+    ) -> Result<Vec<StoredReceipt>, PurchaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT event_id, order_id, listing_coordinate, buyer_pubkey,
+                   merchant_pubkey, payment_hash, status, created_at, raw_event
+            FROM purchases
+            WHERE buyer_pubkey = ?
+            ORDER BY created_at DESC, event_id DESC
+            "#,
+        )
+        .bind(buyer_pubkey)
+        .fetch_all(&self.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| StoredReceipt {
+                event_id: row.get("event_id"),
+                order_id: row.get("order_id"),
+                listing_coordinate: row.get("listing_coordinate"),
+                buyer_pubkey: row.get("buyer_pubkey"),
+                merchant_pubkey: row.get("merchant_pubkey"),
+                payment_hash: row.get("payment_hash"),
+                status: row.get("status"),
+                created_at: row.get::<i64, _>("created_at").max(0) as u64,
+                raw_event: row.get("raw_event"),
+            })
+            .collect())
+    }
+
+    pub(crate) fn database(&self) -> &Pool<Sqlite> {
+        &self.db
+    }
+}
+
+pub(crate) fn stored_receipt_validation_error(receipt: &StoredReceipt) -> Option<&'static str> {
+    if receipt.event_id.trim().is_empty()
+        || receipt.order_id.trim().is_empty()
+        || receipt.listing_coordinate.trim().is_empty()
+        || receipt.buyer_pubkey.trim().is_empty()
+        || receipt.merchant_pubkey.trim().is_empty()
+    {
+        return Some("Stored purchase receipt is incomplete.");
+    }
+
+    let Ok(event) = serde_json::from_str::<Event>(&receipt.raw_event) else {
+        return Some("Stored purchase receipt could not be verified.");
+    };
+    if event.verify().is_err()
+        || event.kind.as_u16() != KIND_PURCHASE_RECEIPT
+        || event.id.to_string() != receipt.event_id
+        || event.pubkey.to_hex() != receipt.merchant_pubkey
+        || tag_value(&event, "p").as_deref() != Some(receipt.buyer_pubkey.as_str())
+        || tag_value(&event, "a").as_deref() != Some(receipt.listing_coordinate.as_str())
+        || tag_value(&event, "order").as_deref() != Some(receipt.order_id.as_str())
+        || tag_value(&event, "status").unwrap_or_else(|| STATUS_PAID.to_string()) != receipt.status
+        || validate_payment_proof(&event).is_err()
+    {
+        return Some("Stored purchase receipt could not be verified.");
+    }
+
+    if tag_value(&event, "e").is_some() && tag_value(&event, "bolt11").is_none() {
+        return Some("Referenced payment proof is not available for local verification.");
+    }
+
+    None
+}
+
+pub(crate) fn stored_receipt_amount(receipt: &StoredReceipt) -> Option<(u64, &'static str)> {
+    let event = serde_json::from_str::<Event>(&receipt.raw_event).ok()?;
+    let invoice = Bolt11Invoice::from_str(&tag_value(&event, "bolt11")?).ok()?;
+    let millisats = invoice.amount_milli_satoshis()?;
+    if millisats % 1_000 == 0 {
+        Some((millisats / 1_000, "SATS"))
+    } else {
+        Some((millisats, "MSATS"))
+    }
 }
 
 /// Parse and validate a NIP-102 receipt event.
@@ -405,8 +487,8 @@ fn status_grants_ownership(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_and_validate_receipt, parse_and_validate_receipt_with_listing, PurchaseError,
-        PurchasesRepository,
+        parse_and_validate_receipt, parse_and_validate_receipt_with_listing, stored_receipt_amount,
+        stored_receipt_validation_error, PurchaseError, PurchasesRepository,
     };
     use crate::storage::Database;
     use bitcoin::hashes::{sha256, Hash as _};
@@ -487,6 +569,7 @@ mod tests {
             .description("Arcadestr purchase receipt test".to_string())
             .payment_hash(payment_hash)
             .payment_secret(PaymentSecret([11_u8; 32]))
+            .amount_milli_satoshis(21_000)
             .duration_since_epoch(Duration::from_secs(1_700_000_000))
             .min_final_cltv_expiry_delta(144)
             .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
@@ -850,6 +933,7 @@ mod tests {
         // Assert
         assert!(receipt.payment_hash.is_some());
         assert_eq!(receipt.order_id, "order-1");
+        assert_eq!(stored_receipt_amount(&receipt), Some((21, "SATS")));
     }
 
     #[test]
@@ -912,6 +996,10 @@ mod tests {
         assert_eq!(receipt.buyer_pubkey, buyer_hex);
         assert_eq!(receipt.merchant_pubkey, merchant.public_key().to_hex());
         assert_eq!(receipt.status, "paid");
+        assert_eq!(
+            stored_receipt_validation_error(&receipt),
+            Some("Referenced payment proof is not available for local verification.")
+        );
     }
 
     #[tokio::test]

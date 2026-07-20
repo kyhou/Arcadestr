@@ -96,6 +96,8 @@ pub enum CommandError {
     InvalidInput(String),
     #[error("Achievement operation failed: {0}")]
     Achievements(String),
+    #[error("Purchase record query failed: {0}")]
+    PurchaseRecords(String),
 }
 
 pub trait BadgeCommandState {
@@ -103,6 +105,15 @@ pub trait BadgeCommandState {
         &self,
     ) -> (
         Arc<Mutex<arcadestr_core::nostr::NostrClient>>,
+        Arc<arcadestr_core::storage::Database>,
+    );
+}
+
+pub trait PurchaseRecordsCommandState {
+    fn purchase_records_command_handles(
+        &self,
+    ) -> (
+        Arc<Mutex<AuthState>>,
         Arc<arcadestr_core::storage::Database>,
     );
 }
@@ -388,6 +399,35 @@ pub fn auth_get_public_key(auth: &AuthState) -> Result<String, String> {
     pubkey.to_bech32().map_err(|e| e.to_string())
 }
 
+pub async fn get_purchase_records<S>(
+    state: &S,
+) -> Result<Vec<arcadestr_core::ownership::DurableAcquisitionRecord>, CommandError>
+where
+    S: PurchaseRecordsCommandState + ?Sized,
+{
+    let (auth, database) = state.purchase_records_command_handles();
+    let buyer_pubkey = {
+        let auth = auth.lock().await;
+        active_purchase_buyer(&auth)?
+    };
+    let ownership = arcadestr_core::ownership::OwnershipService::new(
+        arcadestr_core::purchases::PurchasesRepository::new(database.pool().clone()),
+        arcadestr_core::entitlements_repository::EntitlementsRepository::new(
+            database.pool().clone(),
+        ),
+    );
+    ownership
+        .durable_records_for(&buyer_pubkey)
+        .await
+        .map_err(|error| CommandError::PurchaseRecords(error.to_string()))
+}
+
+fn active_purchase_buyer(auth: &AuthState) -> Result<String, CommandError> {
+    auth.public_key()
+        .map(|public_key| public_key.to_hex())
+        .ok_or(CommandError::NoActiveKey)
+}
+
 pub fn auth_connect_with_key(
     auth: &mut AuthState,
     key: &str,
@@ -580,6 +620,23 @@ mod tests {
     fn normalize_profile_pubkey_identifier_rejects_invalid_identifier() {
         let result = normalize_profile_pubkey_identifier("not-a-pubkey");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn purchase_query_binds_to_active_authenticated_key() {
+        let mut auth = AuthState::new();
+        assert!(matches!(
+            active_purchase_buyer(&auth),
+            Err(CommandError::NoActiveKey)
+        ));
+
+        let keys = Keys::generate();
+        auth.connect_with_key(&keys.secret_key().to_secret_hex())
+            .expect("test key should authenticate");
+        assert_eq!(
+            active_purchase_buyer(&auth).expect("active buyer should resolve"),
+            keys.public_key().to_hex()
+        );
     }
 }
 

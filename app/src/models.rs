@@ -49,6 +49,37 @@ pub enum AcquisitionPolicy {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableAcquisitionKind {
+    Purchase,
+    PromotionClaim,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableCredentialStatus {
+    Active,
+    Disputed,
+    Refunded,
+    Revoked,
+    Unverified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableAcquisitionRecord {
+    pub record_type: DurableAcquisitionKind,
+    pub game_coordinate: String,
+    pub listing_title: Option<String>,
+    pub amount: Option<u64>,
+    pub currency: Option<String>,
+    pub acquired_at: u64,
+    pub status: DurableCredentialStatus,
+    pub record_id: String,
+    pub validation_error: Option<String>,
+    pub campaign_id: Option<String>,
+}
+
 impl AcquisitionPolicy {
     pub fn allows_access_at(&self, now: u64) -> bool {
         match self {
@@ -189,6 +220,11 @@ pub struct GameListing {
 }
 
 impl GameListing {
+    pub fn has_declared_price(&self) -> bool {
+        self.price_sats > 0
+            || (self.price.is_finite() && self.price > 0.0 && !self.currency.trim().is_empty())
+    }
+
     /// Construct a `GameListing` from a NIP-15 product, optionally enriched
     /// with its parent stall.
     ///

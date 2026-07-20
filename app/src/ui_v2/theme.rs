@@ -1915,6 +1915,209 @@ select option:disabled {
   color: var(--v2-secondary);
 }
 
+.v2-purchases {
+  display: grid;
+  gap: var(--v2-space-5);
+}
+
+.v2-purchases-hero {
+  min-height: 240px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: clamp(1.5rem, 5vw, 3rem);
+  background:
+    radial-gradient(circle at 82% 20%, rgba(0, 210, 253, 0.18), transparent 32%),
+    linear-gradient(145deg, rgba(27, 32, 40, 0.9), rgba(29, 43, 52, 0.75));
+}
+
+.v2-purchases-hero h1 {
+  margin: var(--v2-space-1) 0 var(--v2-space-2);
+  font-size: clamp(2.2rem, 5vw, 4rem);
+  line-height: 0.98;
+}
+
+.v2-purchases-hero > p:last-child {
+  max-width: 64ch;
+  margin: 0;
+  color: var(--v2-on-surface-variant);
+  line-height: 1.6;
+}
+
+.v2-purchase-state {
+  min-height: 230px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--v2-space-4);
+  padding: clamp(1.5rem, 5vw, 3rem);
+  border: 1px solid var(--v2-outline-ghost);
+}
+
+.v2-purchase-state > .material-symbols-outlined {
+  color: var(--v2-secondary);
+  font-size: 44px;
+}
+
+.v2-purchase-state-error > .material-symbols-outlined {
+  color: var(--v2-danger);
+}
+
+.v2-purchase-state h2,
+.v2-purchase-state p {
+  margin: 0;
+}
+
+.v2-purchase-state p {
+  margin-top: var(--v2-space-1);
+  color: var(--v2-on-surface-variant);
+}
+
+.v2-purchases-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--v2-space-4);
+  padding: var(--v2-space-3) var(--v2-space-4);
+  border: 1px solid var(--v2-outline-ghost);
+}
+
+.v2-purchases-toolbar .v2-tab-row {
+  min-width: 0;
+  flex-wrap: wrap;
+  margin: 0;
+}
+
+.v2-purchases-toolbar .v2-tab:focus-visible {
+  outline: 2px solid var(--v2-secondary);
+  outline-offset: 2px;
+}
+
+.v2-purchases-partial {
+  margin: 0;
+  color: var(--v2-tertiary);
+  font-size: 0.8rem;
+}
+
+.v2-purchase-list {
+  display: grid;
+  gap: var(--v2-space-3);
+}
+
+.v2-purchase-record {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: var(--v2-space-4);
+  align-items: center;
+  padding: var(--v2-space-4);
+  border: 1px solid var(--v2-outline-ghost);
+}
+
+.v2-purchase-record-mark {
+  width: 56px;
+  height: 56px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--v2-radius-lg);
+  background: rgba(0, 210, 253, 0.1);
+  color: var(--v2-secondary);
+}
+
+.v2-purchase-record-copy {
+  min-width: 0;
+}
+
+.v2-purchase-record-copy h2 {
+  margin: var(--v2-space-1) 0;
+  font-family: var(--v2-font-display);
+  font-size: 1.2rem;
+}
+
+.v2-purchase-coordinate {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--v2-on-surface-variant);
+  font-size: 0.78rem;
+}
+
+.v2-purchase-validation {
+  margin: var(--v2-space-2) 0 0;
+  color: var(--v2-danger);
+  font-size: 0.82rem;
+}
+
+.v2-purchase-record-summary {
+  display: grid;
+  justify-items: end;
+  gap: var(--v2-space-1);
+  color: var(--v2-on-surface-variant);
+  font-size: 0.78rem;
+  text-align: right;
+}
+
+.v2-purchase-status {
+  padding: 0.3rem 0.65rem;
+  border-radius: var(--v2-radius-full);
+  font-weight: 800;
+}
+
+.v2-purchase-status-active {
+  background: rgba(0, 210, 253, 0.1);
+  color: var(--v2-secondary);
+}
+
+.v2-purchase-status-inactive {
+  background: rgba(255, 150, 187, 0.1);
+  color: var(--v2-tertiary);
+}
+
+.v2-purchase-status-error {
+  background: rgba(255, 96, 96, 0.1);
+  color: var(--v2-danger);
+}
+
+.v2-purchase-technical {
+  grid-column: 2 / -1;
+  min-width: 0;
+  color: var(--v2-on-surface-variant);
+  font-size: 0.78rem;
+}
+
+.v2-purchase-technical summary {
+  width: fit-content;
+  cursor: pointer;
+}
+
+.v2-purchase-technical summary:focus-visible {
+  outline: 2px solid var(--v2-secondary);
+  outline-offset: 3px;
+}
+
+.v2-purchase-technical dl {
+  display: grid;
+  gap: var(--v2-space-2);
+  margin: var(--v2-space-3) 0 0;
+}
+
+.v2-purchase-technical dl > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--v2-space-3);
+}
+
+.v2-purchase-technical dt,
+.v2-purchase-technical dd {
+  margin: 0;
+}
+
+.v2-purchase-technical dd {
+  overflow-wrap: anywhere;
+  color: var(--v2-on-background);
+  text-align: right;
+}
+
 .badge-earned-modal-backdrop {
   position: fixed;
   inset: 0;
@@ -3687,6 +3890,25 @@ dialog.v2-confirm-backdrop::backdrop {
   .v2-community-unavailable {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .v2-purchases-toolbar,
+  .v2-purchase-record {
+    align-items: flex-start;
+    grid-template-columns: 1fr;
+  }
+
+  .v2-purchases-toolbar {
+    flex-direction: column;
+  }
+
+  .v2-purchase-record-summary {
+    justify-items: start;
+    text-align: left;
+  }
+
+  .v2-purchase-technical {
+    grid-column: auto;
   }
 
   .v2-user-select-footer {
