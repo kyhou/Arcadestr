@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use arcadestr_core::is_replaceable_event_newer;
+use nostr::nips::nip19::FromBech32;
 
 use crate::models::{CampaignPointer, GameListing, ListingSource};
 use crate::tauri_bridge::{PublishCampaignRequest, PublishCampaignResponse};
@@ -48,6 +49,47 @@ pub enum CampaignPointerUpdatePlan {
     RemoveAfterCampaignPublish,
 }
 
+/// Presentation facts which must stay aligned with campaign protocol behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CampaignPolicyPresentation {
+    pub developer_only: bool,
+    pub end_is_exclusive: bool,
+    pub prior_claims_survive_cancellation: bool,
+    pub provider_can_manage: bool,
+    pub pointer_is_advisory: bool,
+}
+
+pub fn campaign_policy_presentation() -> CampaignPolicyPresentation {
+    CampaignPolicyPresentation {
+        developer_only: true,
+        end_is_exclusive: true,
+        prior_claims_survive_cancellation: true,
+        provider_can_manage: false,
+        pointer_is_advisory: true,
+    }
+}
+
+pub fn campaign_pointer_failure_retryable(response: &PublishCampaignResponse) -> bool {
+    response.pointer_update_error.is_some() && !response.root_event_id.trim().is_empty()
+}
+
+pub fn can_request_campaign_confirmation(
+    operation_in_progress: bool,
+    operation_completed: bool,
+) -> bool {
+    !operation_in_progress && !operation_completed
+}
+
+/// Accept an async result only while both its account and request generation are current.
+pub fn accepts_account_response(
+    current_npub: Option<&str>,
+    initiating_npub: &str,
+    current_generation: u64,
+    request_generation: u64,
+) -> bool {
+    current_npub == Some(initiating_npub) && current_generation == request_generation
+}
+
 impl CampaignForm {
     pub fn new(campaign_id: String) -> Self {
         Self {
@@ -61,7 +103,10 @@ impl CampaignForm {
 }
 
 pub fn listing_coordinate(listing: &GameListing) -> String {
-    format!("30402:{}:{}", listing.publisher_npub, listing.id)
+    let publisher = nostr::PublicKey::from_bech32(&listing.publisher_npub)
+        .map(|key| key.to_hex())
+        .unwrap_or_else(|_| listing.publisher_npub.clone());
+    format!("30402:{publisher}:{}", listing.id)
 }
 
 pub fn current_user_listings(
@@ -114,7 +159,7 @@ pub fn campaign_pointer_update_plan(
 pub fn apply_campaign_pointer_mutation(
     listing: &GameListing,
     root_event_id: &str,
-    listing_event_id: &str,
+    _listing_event_id: &str,
     remove: bool,
 ) -> GameListing {
     let mut updated = listing.clone();
@@ -132,7 +177,8 @@ pub fn apply_campaign_pointer_mutation(
             relay_hint: None,
         });
     }
-    updated.event_id = Some(listing_event_id.to_string());
+    // Keep the source event ID so a later edit must reload instead of treating this
+    // locally synthesized metadata snapshot as the authoritative replacement event.
     updated
 }
 
@@ -224,7 +270,7 @@ pub fn campaign_status(classification: &str) -> &'static str {
         "active" => "Active",
         "ended" => "Ended",
         "cancelled" => "Cancelled",
-        _ => "Invalid",
+        _ => "Invalid/incomplete",
     }
 }
 
@@ -262,13 +308,28 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 #[cfg(target_arch = "wasm32")]
 pub fn datetime_local_to_unix(value: &str) -> Option<u64> {
+    let (year, month, day, hour, minute, second) = datetime_local_parts(value)?;
     let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_str(value));
     let milliseconds = date.get_time();
-    (milliseconds.is_finite() && milliseconds >= 0.0).then_some((milliseconds / 1000.0) as u64)
+    (milliseconds.is_finite()
+        && milliseconds >= 0.0
+        && i64::from(date.get_full_year()) == year
+        && i64::from(date.get_month() + 1) == month
+        && i64::from(date.get_date()) == day
+        && u64::from(date.get_hours()) == hour
+        && u64::from(date.get_minutes()) == minute
+        && u64::from(date.get_seconds()) == second)
+        .then_some((milliseconds / 1000.0) as u64)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn datetime_local_to_unix(value: &str) -> Option<u64> {
+    let (year, month, day, hour, minute, second) = datetime_local_parts(value)?;
+    let days = days_from_civil(year, month, day)?;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn datetime_local_parts(value: &str) -> Option<(i64, i64, i64, u64, u64, u64)> {
     let (date, time) = value.split_once('T')?;
     let mut date_parts = date.split('-').map(|part| part.parse::<i64>().ok());
     let year = date_parts.next()??;
@@ -288,15 +349,28 @@ pub fn datetime_local_to_unix(value: &str) -> Option<u64> {
         || month == 0
         || month > 12
         || day == 0
-        || day > 31
+        || day > days_in_month(year, month)?
         || hour > 23
         || minute > 59
         || second > 59
     {
         return None;
     }
-    let days = days_from_civil(year, month, day)?;
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    Some((year, month, day, hour, minute, second))
+}
+
+fn days_in_month(year: i64, month: i64) -> Option<i64> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 if year.rem_euclid(4) == 0
+            && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0) =>
+        {
+            Some(29)
+        }
+        2 => Some(28),
+        _ => None,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -356,6 +430,22 @@ mod tests {
     }
 
     #[test]
+    fn listing_coordinate_uses_the_publishers_hex_key() {
+        use nostr::nips::nip19::ToBech32;
+
+        let keys = nostr::Keys::generate();
+        let mut value = listing(1, "event");
+        value.publisher_npub = keys
+            .public_key()
+            .to_bech32()
+            .expect("test public key should encode");
+        assert_eq!(
+            listing_coordinate(&value),
+            format!("30402:{}:same-game", keys.public_key().to_hex())
+        );
+    }
+
+    #[test]
     fn current_user_listings_uses_lower_event_id_for_equal_timestamps_in_both_orders() {
         let lower_id = listing(20, "aaa");
         let higher_id = listing(20, "bbb");
@@ -387,6 +477,16 @@ mod tests {
             datetime_local_to_unix("2026-07-18T12:30:45"),
             Some(1_784_377_845)
         );
+    }
+
+    #[test]
+    fn datetime_local_rejects_impossible_calendar_dates() {
+        assert_eq!(datetime_local_to_unix("2026-02-29T12:30"), None);
+        assert_eq!(datetime_local_to_unix("2024-02-30T12:30"), None);
+        assert_eq!(datetime_local_to_unix("2026-04-31T12:30"), None);
+        assert!(datetime_local_to_unix("2024-02-29T12:30").is_some());
+        assert!(datetime_local_to_unix("2000-02-29T12:30").is_some());
+        assert_eq!(datetime_local_to_unix("2100-02-29T12:30"), None);
     }
 
     #[test]
@@ -470,6 +570,76 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_labels_include_invalid_incomplete_state() {
+        assert_eq!(campaign_status("upcoming"), "Upcoming");
+        assert_eq!(campaign_status("active"), "Active");
+        assert_eq!(campaign_status("ended"), "Ended");
+        assert_eq!(campaign_status("cancelled"), "Cancelled");
+        assert_eq!(campaign_status("broken"), "Invalid/incomplete");
+    }
+
+    #[test]
+    fn policy_presentation_assigns_authority_only_to_developer() {
+        let policy = campaign_policy_presentation();
+        assert!(policy.developer_only);
+        assert!(!policy.provider_can_manage);
+        assert!(policy.end_is_exclusive);
+        assert!(policy.pointer_is_advisory);
+    }
+
+    #[test]
+    fn cancellation_presentation_preserves_prior_claims() {
+        assert!(campaign_policy_presentation().prior_claims_survive_cancellation);
+    }
+
+    #[test]
+    fn cancellation_confirmation_only_opens_from_idle_state() {
+        assert!(can_request_campaign_confirmation(false, false));
+        assert!(!can_request_campaign_confirmation(true, false));
+        assert!(!can_request_campaign_confirmation(false, true));
+    }
+
+    #[test]
+    fn pointer_failure_remains_retryable_without_republishing_campaign() {
+        let response = PublishCampaignResponse {
+            event_id: "campaign-event".into(),
+            root_event_id: "campaign-root".into(),
+            listing_event_id: None,
+            pointer_update_error: Some("relay rejected game page".into()),
+        };
+        assert!(campaign_pointer_failure_retryable(&response));
+
+        let no_root = PublishCampaignResponse {
+            root_event_id: String::new(),
+            ..response
+        };
+        assert!(!campaign_pointer_failure_retryable(&no_root));
+    }
+
+    #[test]
+    fn stale_account_or_generation_response_is_rejected() {
+        assert!(accepts_account_response(
+            Some("npub1publisher"),
+            "npub1publisher",
+            7,
+            7,
+        ));
+        assert!(!accepts_account_response(
+            Some("npub1other"),
+            "npub1publisher",
+            7,
+            7,
+        ));
+        assert!(!accepts_account_response(
+            Some("npub1publisher"),
+            "npub1publisher",
+            8,
+            7,
+        ));
+        assert!(!accepts_account_response(None, "npub1publisher", 7, 7));
+    }
+
+    #[test]
     fn pointer_update_plan_covers_initial_and_current_checkbox_states() {
         assert_eq!(
             campaign_pointer_update_plan(false, false),
@@ -490,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn campaign_pointer_add_is_idempotent_and_replaces_listing_event_id() {
+    fn campaign_pointer_add_is_idempotent_and_keeps_authoritative_source_id() {
         let mut original = listing(20, "old-listing-event");
         original.campaigns.push(crate::models::CampaignPointer {
             root_event_id: "root-a".into(),
@@ -505,10 +675,7 @@ mod tests {
         );
 
         assert_eq!(updated.campaigns, original.campaigns);
-        assert_eq!(
-            updated.event_id.as_deref(),
-            Some("replacement-listing-event")
-        );
+        assert_eq!(updated.event_id.as_deref(), Some("old-listing-event"));
     }
 
     #[test]
@@ -542,7 +709,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["root-a", "root-c"]
         );
-        assert_eq!(updated.event_id.as_deref(), Some("replacement"));
+        assert_eq!(updated.event_id.as_deref(), Some("old"));
     }
 
     #[test]
@@ -570,7 +737,7 @@ mod tests {
         let updated = apply_campaign_response_pointer_mutation(&original, &successful, false, true)
             .expect("confirmed pointer update should produce local listing state");
         assert_eq!(updated.campaigns[0].root_event_id, "root");
-        assert_eq!(updated.event_id.as_deref(), Some("replacement"));
+        assert_eq!(updated.event_id.as_deref(), Some("old"));
     }
 
     #[test]

@@ -2,116 +2,169 @@ use leptos::prelude::*;
 
 #[component]
 pub fn TopBar(
+    page_title: Signal<&'static str>,
     relay_count: Signal<usize>,
     connected_relays: Signal<Vec<String>>,
     display_name: Signal<String>,
+    avatar_url: Signal<Option<String>>,
+    avatar_fallback: Signal<String>,
     connection_status: Signal<String>,
     connection_error: Signal<Option<String>>,
+    mobile_menu_open: Signal<bool>,
+    on_open_store: Callback<()>,
     on_open_profile: Callback<()>,
-    #[prop(optional)] search_placeholder: Option<Signal<&'static str>>,
-    #[prop(optional)] browse_active: Option<Signal<bool>>,
+    on_toggle_mobile_menu: Callback<()>,
 ) -> impl IntoView {
-    let placeholder = search_placeholder.unwrap_or_else(|| Signal::derive(|| "Search games..."));
-    let browse_active = browse_active.unwrap_or_else(|| Signal::derive(|| false));
     let relay_menu_open = RwSignal::new(false);
 
     view! {
-        <header class="fixed top-0 w-full z-50 bg-[#0a0e14]/80 backdrop-blur-xl flex justify-between items-center h-20 px-8 bg-gradient-to-b from-[#0a0e14] to-transparent">
-            <div class="flex items-center gap-12">
-                <span class="text-2xl font-bold bg-gradient-to-r from-[#b6a0ff] to-[#7e51ff] bg-clip-text text-transparent font-headline tracking-tight">"Arcadestr"</span>
-                <nav class="hidden md:flex gap-8 items-center">
-                    <a
-                        class={move || if browse_active.get() {
-                            "text-[#f1f3fc]/60 hover:text-[#f1f3fc] transition-colors font-['Space_Grotesk'] tracking-tight"
-                        } else {
-                            "text-[#b6a0ff] font-bold border-b-2 border-[#b6a0ff] pb-1 font-['Space_Grotesk'] tracking-tight"
-                        }}
-                        href="#"
-                    >
-                        "Discover"
-                    </a>
-                    <a
-                        class={move || if browse_active.get() {
-                            "text-[#b6a0ff] font-bold border-b-2 border-[#b6a0ff] pb-1 font-['Space_Grotesk'] tracking-tight"
-                        } else {
-                            "text-[#f1f3fc]/60 hover:text-[#f1f3fc] transition-colors font-['Space_Grotesk'] tracking-tight"
-                        }}
-                        href="#"
-                    >
-                        "Browse"
-                    </a>
-                </nav>
-            </div>
-
-            <div class="flex items-center gap-6 relative">
+        <header class="sticky top-0 z-50 border-b border-white/5 bg-background/75 backdrop-blur-2xl">
+            <div class="mx-auto flex h-20 max-w-[1600px] items-center gap-3 px-4 md:px-8">
                 <button
-                    class="hidden sm:flex items-center gap-2 px-3 py-1.5 bg-surface-container-high/40 rounded-full border border-outline-variant/20"
-                    title={move || {
-                        let status = connection_status.get();
-                        if let Some(err) = connection_error.get() {
-                            format!("{} ({})", status, err)
-                        } else {
-                            status
-                        }
-                    }}
-                    on:click=move |_| relay_menu_open.update(|open| *open = !*open)
+                    type="button"
+                    class="font-display text-2xl font-bold text-transparent outline-none ring-primary/60 [background:var(--noir-gradient-primary)] bg-clip-text focus-visible:ring-2"
+                    aria-label="Go to Store"
+                    on:click=move |_| on_open_store.run(())
                 >
-                    <span class="flex h-2 w-2 relative">
-                        <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                        <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                    </span>
-                    <span class="text-[10px] font-bold tracking-tight text-on-surface/80 font-['Space_Grotesk'] uppercase">{move || relay_count.get().to_string()}</span>
+                    "Arcadestr"
                 </button>
 
-                <Show when=move || crate::debug_storefront_bypass_enabled()>
-                    <span class="hidden md:inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold tracking-widest uppercase bg-warning/25 text-warning border border-warning/30">
-                        "Debug Mock Mode"
-                    </span>
-                </Show>
+                <div class="hidden h-5 w-px bg-white/10 sm:block" aria-hidden="true"></div>
+                <p class="hidden truncate text-sm font-medium text-on-surface-variant sm:block">
+                    {move || page_title.get()}
+                </p>
 
-                <Show when=move || relay_menu_open.get()>
-                    <div class="absolute top-14 right-48 min-w-80 max-h-72 overflow-auto p-3 z-[100] bg-surface-container-high/90 border border-outline-variant/40 rounded-xl backdrop-blur-xl">
-                        <div class="flex items-center justify-between mb-2">
-                            <strong class="text-sm">"Connected relays"</strong>
-                            <button class="text-xs text-on-surface-variant hover:text-on-surface" on:click=move |_| relay_menu_open.set(false)>"Close"</button>
-                        </div>
-                        {move || {
-                            let relays = connected_relays.get();
-                            if relays.is_empty() {
-                                view! { <p class="text-xs text-on-surface-variant">"No relays connected"</p> }.into_any()
+                <div class="ml-auto flex items-center gap-2 sm:gap-3">
+                    <div class="relative">
+                        <button
+                            type="button"
+                            class="flex min-h-10 items-center gap-2 rounded-full bg-surface-container-high px-3 py-2 text-xs font-semibold text-on-surface outline-none ring-primary/60 hover:bg-surface-bright focus-visible:ring-2"
+                            aria-label="Show relay connections"
+                            aria-expanded=move || relay_menu_open.get()
+                            aria-controls="relay-status-menu"
+                            title={move || if relay_count.get() > 0 {
+                                format!("{} connected relays", relay_count.get())
                             } else {
-                                view! {
-                                    <ul class="space-y-1">
-                                        {relays
-                                            .into_iter()
-                                            .map(|relay| view! { <li class="text-xs text-on-surface-variant py-1">{relay}</li> })
-                                            .collect::<Vec<_>>()}
-                                    </ul>
+                                "No connected relays".to_string()
+                            }}
+                            on:click=move |_| relay_menu_open.update(|open| *open = !*open)
+                        >
+                            <span
+                                class={move || if relay_count.get() > 0 {
+                                    "h-2 w-2 rounded-full bg-emerald-400"
+                                } else {
+                                    "h-2 w-2 rounded-full bg-on-surface-variant/50"
+                                }}
+                                aria-hidden="true"
+                            ></span>
+                            <span class="hidden uppercase tracking-widest sm:inline">
+                                {move || match relay_count.get() {
+                                    0 => "No relays".to_string(),
+                                    1 => "1 relay".to_string(),
+                                    count => format!("{count} relays"),
+                                }}
+                            </span>
+                            <span class="sm:hidden">{move || relay_count.get()}</span>
+                        </button>
+
+                        <Show when=move || relay_menu_open.get()>
+                            <section
+                                id="relay-status-menu"
+                                class="absolute right-0 top-12 z-[70] max-h-72 w-[min(20rem,calc(100vw-2rem))] overflow-auto rounded-2xl border border-white/10 bg-surface-container-high/95 p-4 shadow-ambient backdrop-blur-2xl"
+                                aria-label="Relay connections"
+                                on:keydown=move |event| {
+                                    if event.key() == "Escape" {
+                                        relay_menu_open.set(false);
+                                    }
                                 }
-                                    .into_any()
-                            }
-                        }}
+                            >
+                                <div class="mb-3 flex items-center justify-between gap-3">
+                                    <h2 class="font-display text-sm font-semibold">"Relay connections"</h2>
+                                    <button
+                                        type="button"
+                                        class="rounded-lg px-2 py-1 text-xs text-on-surface-variant outline-none ring-primary/60 hover:text-on-surface focus-visible:ring-2"
+                                        on:click=move |_| relay_menu_open.set(false)
+                                    >
+                                        "Close"
+                                    </button>
+                                </div>
+                                {move || {
+                                    let relays = connected_relays.get();
+                                    if relays.is_empty() {
+                                        view! {
+                                            <p class="text-sm text-on-surface-variant">
+                                                "No relays are currently connected."
+                                            </p>
+                                        }
+                                        .into_any()
+                                    } else {
+                                        view! {
+                                            <ul class="space-y-2">
+                                                {relays
+                                                    .into_iter()
+                                                    .map(|relay| view! {
+                                                        <li class="flex items-center gap-2 break-all rounded-xl bg-surface-container-low px-3 py-2 text-xs text-on-surface-variant">
+                                                            <span class="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" aria-hidden="true"></span>
+                                                            {relay}
+                                                        </li>
+                                                    })
+                                                    .collect::<Vec<_>>()}
+                                            </ul>
+                                        }
+                                        .into_any()
+                                    }
+                                }}
+                            </section>
+                        </Show>
                     </div>
-                </Show>
 
-                <div class="relative hidden lg:block">
-                    <input class="w-64 bg-surface-container-highest border-none rounded-md px-4 py-2 text-sm focus:ring-2 focus:ring-secondary/40 placeholder:text-on-surface-variant" placeholder={move || placeholder.get()} type="text" />
-                    <span class="material-symbols-outlined absolute right-3 top-2 text-on-surface-variant text-lg">"search"</span>
-                </div>
+                    <button
+                        id="mobile-navigation-trigger"
+                        type="button"
+                        class="flex min-h-10 items-center gap-2 rounded-full p-1.5 pr-2 text-left outline-none ring-primary/60 hover:bg-surface-container-high focus-visible:ring-2"
+                        aria-label=move || format!("Open profile for {}", display_name.get())
+                        title=move || {
+                            let status = connection_status.get();
+                            if let Some(error) = connection_error.get() {
+                                format!("Signer: {status} ({error})")
+                            } else {
+                                format!("Signer: {status}")
+                            }
+                        }
+                        on:click=move |_| on_open_profile.run(())
+                    >
+                        {move || match avatar_url.get() {
+                            Some(url) => view! {
+                                <img
+                                    src=url
+                                    alt=""
+                                    class="h-8 w-8 rounded-full object-cover ring-1 ring-primary/50"
+                                />
+                            }
+                            .into_any(),
+                            None => view! {
+                                <span class="flex h-8 w-8 items-center justify-center rounded-full bg-surface-bright text-xs font-bold text-on-surface ring-1 ring-primary/50" aria-hidden="true">
+                                    {move || avatar_fallback.get()}
+                                </span>
+                            }
+                            .into_any(),
+                        }}
+                        <span class="hidden max-w-32 truncate text-xs font-semibold text-on-surface lg:block">
+                            {move || display_name.get()}
+                        </span>
+                    </button>
 
-                <div class="flex items-center gap-4">
-                    <button class="p-2 text-[#f1f3fc]/60 hover:text-[#b6a0ff] transition-all duration-300 active:scale-95" title="Notifications">
-                        <span class="material-symbols-outlined">"notifications"</span>
-                    </button>
-                    <button class="p-2 text-[#f1f3fc]/60 hover:text-[#b6a0ff] transition-all duration-300 active:scale-95" title="Cart">
-                        <span class="material-symbols-outlined">"shopping_cart"</span>
-                    </button>
-                    <button class="rounded-full" on:click=move |_| on_open_profile.run(())>
-                        <img
-                            alt={move || display_name.get()}
-                            class="w-10 h-10 rounded-full border-2 border-primary-dim/20"
-                            src="https://lh3.googleusercontent.com/aida-public/AB6AXuBlBb9Z2XKeIyly4E0jzQKQL1WrIRbvYtjoErPatKPOVPljRli_-0vSEhy9ulHT1c80OBEZ9Tbw2Iuk89j1eY0ufF4rVHfnwfzruhtjb0-gduo9w0weQ330SmROvJ5UXj4LH5xobya_kUQS0C5jVapaNkz_kSUDeP6YGOVpn75RKAgLTaUuEUDLLoI2M5r2uULkULPALtpeNGk4c9lS1sPFMF_6pHMZ6393yOUr_WV1jeTn0o1bsnwCjzZxpoJ1oWBsWxZ6jnMhyJA"
-                        />
+                    <button
+                        type="button"
+                        class="flex h-10 w-10 items-center justify-center rounded-xl text-on-surface-variant outline-none ring-primary/60 hover:bg-surface-container-high hover:text-on-surface focus-visible:ring-2 md:hidden"
+                        aria-label={move || if mobile_menu_open.get() { "Close navigation" } else { "Open navigation" }}
+                        aria-expanded=move || mobile_menu_open.get()
+                        aria-controls="mobile-primary-navigation"
+                        on:click=move |_| on_toggle_mobile_menu.run(())
+                    >
+                        <span class="material-symbols-outlined" aria-hidden="true">
+                            {move || if mobile_menu_open.get() { "close" } else { "menu" }}
+                        </span>
                     </button>
                 </div>
             </div>

@@ -19,7 +19,7 @@ pub fn SocialView() -> impl IntoView {
                     <span class="material-symbols-outlined">"forum"</span>
                 </div>
                 <div>
-                    <p class="v2-store-kicker">"Not connected"</p>
+                    <p class="v2-store-kicker">"Feature unavailable"</p>
                     <h2 id="community-unavailable-title">{community_unavailable_message()}</h2>
                     <p>
                         "This client does not currently fetch or publish community notes. No feed, trends, recommendations, or zap activity is shown until those protocol flows are implemented."

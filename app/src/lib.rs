@@ -1118,6 +1118,12 @@ pub struct AuthContext {
     pub connection_status: RwSignal<String>,
     /// Connection error message if status is "failed"
     pub connection_error: RwSignal<Option<String>>,
+    /// Monotonic identity-flow generation used to reject stale async responses.
+    flow_generation: RwSignal<u64>,
+}
+
+pub(crate) fn should_apply_auth_response(request_generation: u64, current_generation: u64) -> bool {
+    request_generation == current_generation
 }
 
 impl AuthContext {
@@ -1132,7 +1138,18 @@ impl AuthContext {
             has_secure_accounts: RwSignal::new(false),
             connection_status: RwSignal::new("disconnected".to_string()),
             connection_error: RwSignal::new(None),
+            flow_generation: RwSignal::new(0),
         }
+    }
+
+    pub fn begin_auth_flow(&self) -> u64 {
+        self.flow_generation
+            .update(|generation| *generation = generation.wrapping_add(1));
+        self.flow_generation.get_untracked()
+    }
+
+    pub fn is_current_auth_flow(&self, generation: u64) -> bool {
+        should_apply_auth_response(generation, self.flow_generation.get_untracked())
     }
 }
 
@@ -1335,66 +1352,32 @@ impl AuthContext {
 
     /// Switch to a different profile (new NIP-46 API)
     pub async fn switch_profile(&self, profile_id: String) -> Result<(), String> {
+        if self.is_loading.get_untracked() {
+            return Err("Another account operation is already in progress.".to_string());
+        }
+        let generation = self.begin_auth_flow();
         self.is_loading.set(true);
+        self.error.set(None);
+        self.profile.set(None);
 
         match invoke_switch_profile(profile_id).await {
             Ok(result) => {
+                if !self.is_current_auth_flow(generation) {
+                    return Ok(());
+                }
                 if let Ok(account) = parse_account_from_result(&result) {
                     self.active_account.set(Some(account.clone()));
                     self.npub.set(Some(account.npub.clone()));
+                    let _ = self.load_accounts_list().await;
+                    if !self.is_current_auth_flow(generation) {
+                        return Ok(());
+                    }
                     self.is_loading.set(false);
 
                     // Start connection status polling for NIP-46 accounts
                     if account.signing_mode == "nip46" {
                         self.start_connection_status_polling().await;
                     }
-
-                    // Explicitly fetch profile immediately to avoid delay
-                    let npub_for_fetch = account.npub.clone();
-                    let auth_for_fetch = self.clone();
-                    spawn_local(async move {
-                        web_sys::console::log_1(
-                            &format!("[SWITCH] Immediate profile fetch for: {}", npub_for_fetch)
-                                .into(),
-                        );
-
-                        // First try to get from backend cache
-                        match invoke_get_cached_profile(npub_for_fetch.clone()).await {
-                            Ok(Some(profile)) => {
-                                web_sys::console::log_1(
-                                    &format!(
-                                        "[SWITCH] Got cached profile immediately: {:?}",
-                                        profile.name
-                                    )
-                                    .into(),
-                                );
-                                auth_for_fetch.profile.set(Some(profile));
-                            }
-                            _ => {
-                                web_sys::console::log_1(
-                                    &"[SWITCH] No cached profile, fetching from relays...".into(),
-                                );
-                                // Fetch from relays
-                                match invoke_fetch_profile(npub_for_fetch.clone(), None).await {
-                                    Ok(profile) => {
-                                        web_sys::console::log_1(
-                                            &format!(
-                                                "[SWITCH] Profile fetched from relays: {:?}",
-                                                profile.name
-                                            )
-                                            .into(),
-                                        );
-                                        auth_for_fetch.profile.set(Some(profile));
-                                    }
-                                    Err(e) => {
-                                        web_sys::console::log_1(
-                                            &format!("[SWITCH] Profile fetch failed: {}", e).into(),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    });
 
                     Ok(())
                 } else {
@@ -1403,6 +1386,9 @@ impl AuthContext {
                 }
             }
             Err(e) => {
+                if !self.is_current_auth_flow(generation) {
+                    return Ok(());
+                }
                 self.error.set(Some(e.clone()));
                 self.is_loading.set(false);
                 Err(e)
@@ -1417,14 +1403,26 @@ impl AuthContext {
 
     /// Login with nsec - creates encrypted local account
     pub async fn login_with_nsec(&self, nsec: String, name: Option<String>) -> Result<(), String> {
+        if self.is_loading.get_untracked() {
+            return Err("Another authentication operation is already in progress.".to_string());
+        }
+        let generation = self.begin_auth_flow();
         self.is_loading.set(true);
+        self.error.set(None);
 
         match invoke_login_with_nsec(nsec, name).await {
             Ok(result) => {
+                if !self.is_current_auth_flow(generation) {
+                    return Ok(());
+                }
                 if let Ok(account) = parse_account_from_result(&result) {
                     self.active_account.set(Some(account.clone()));
                     self.npub.set(Some(account.npub.clone()));
                     self.has_secure_accounts.set(true);
+                    let _ = self.load_accounts_list().await;
+                    if !self.is_current_auth_flow(generation) {
+                        return Ok(());
+                    }
                     self.is_loading.set(false);
                     Ok(())
                 } else {
@@ -1433,6 +1431,9 @@ impl AuthContext {
                 }
             }
             Err(e) => {
+                if !self.is_current_auth_flow(generation) {
+                    return Ok(());
+                }
                 self.error.set(Some(e.clone()));
                 self.is_loading.set(false);
                 Err(e)
@@ -1442,12 +1443,42 @@ impl AuthContext {
 
     /// Delete a profile (new NIP-46 API)
     pub async fn delete_profile(&self, profile_id: String) -> Result<(), String> {
+        if self.is_loading.get_untracked() {
+            return Err("Another account operation is already in progress.".to_string());
+        }
+        let generation = self.begin_auth_flow();
+        self.is_loading.set(true);
         match invoke_delete_profile(profile_id).await {
             Ok(_) => {
-                // Refresh profiles list
-                self.load_profiles_list().await
+                if let Err(error) = self.load_profiles_list().await {
+                    if self.is_current_auth_flow(generation) {
+                        self.is_loading.set(false);
+                    }
+                    return Err(error);
+                }
+                if !self.is_current_auth_flow(generation) {
+                    return Ok(());
+                }
+
+                match invoke_load_active_account().await {
+                    Ok(result) => match parse_account_from_result(&result) {
+                        Ok(account) => {
+                            self.active_account.set(Some(account.clone()));
+                            self.npub.set(Some(account.npub));
+                        }
+                        Err(_) => self.clear_active_identity(),
+                    },
+                    Err(_) => self.clear_active_identity(),
+                }
+                self.is_loading.set(false);
+                Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                if self.is_current_auth_flow(generation) {
+                    self.is_loading.set(false);
+                }
+                Err(e)
+            }
         }
     }
 
@@ -1458,15 +1489,24 @@ impl AuthContext {
 
     /// Logout from NIP-46 session (new NIP-46 API)
     pub async fn logout_nip46(&self) -> Result<(), String> {
+        if self.is_loading.get_untracked() {
+            return Err("Another account operation is already in progress.".to_string());
+        }
+        let generation = self.begin_auth_flow();
+        self.is_loading.set(true);
         match invoke_logout_nip46().await {
             Ok(_) => {
-                self.active_account.set(None);
-                self.npub.set(None);
-                self.connection_status.set("disconnected".to_string());
-                self.connection_error.set(None);
+                if self.is_current_auth_flow(generation) {
+                    self.clear_active_identity();
+                }
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                if self.is_current_auth_flow(generation) {
+                    self.is_loading.set(false);
+                }
+                Err(e)
+            }
         }
     }
 
@@ -1474,8 +1514,15 @@ impl AuthContext {
     /// This runs every 2 seconds until connection is established or fails
     pub async fn start_connection_status_polling(&self) {
         let auth = self.clone();
+        let generation = self.flow_generation.get_untracked();
+        let expected_npub = self.npub.get_untracked();
         spawn_local(async move {
             loop {
+                if !auth.is_current_auth_flow(generation)
+                    || auth.npub.get_untracked() != expected_npub
+                {
+                    break;
+                }
                 match invoke_get_connection_status().await {
                     Ok(status) => {
                         let status_str = status
@@ -1488,6 +1535,11 @@ impl AuthContext {
                             .and_then(|e| e.as_str())
                             .map(|s| s.to_string());
 
+                        if !auth.is_current_auth_flow(generation)
+                            || auth.npub.get_untracked() != expected_npub
+                        {
+                            break;
+                        }
                         auth.connection_status.set(status_str.to_string());
                         auth.connection_error.set(error);
 
@@ -1517,6 +1569,15 @@ impl AuthContext {
                 }
             }
         });
+    }
+
+    fn clear_active_identity(&self) {
+        self.active_account.set(None);
+        self.npub.set(None);
+        self.profile.set(None);
+        self.connection_status.set("disconnected".to_string());
+        self.connection_error.set(None);
+        self.is_loading.set(false);
     }
 }
 
@@ -4927,6 +4988,8 @@ pub fn App() -> impl IntoView {
     // Check authentication status on mount (with small delay for Tauri to initialize)
     Effect::new(move |_| {
         let auth = auth_stored.get_value();
+        let generation = auth.begin_auth_flow();
+        auth.is_loading.set(true);
         spawn_local(async move {
             if debug_storefront_bypass_enabled() {
                 let debug_npub =
@@ -4948,6 +5011,7 @@ pub fn App() -> impl IntoView {
                     nip05: None,
                     about: Some("Debug storefront bypass account".to_string()),
                 }));
+                auth.is_loading.set(false);
                 return;
             }
 
@@ -4966,11 +5030,18 @@ pub fn App() -> impl IntoView {
             }
 
             // Try new secure storage initialization first
-            match invoke_has_accounts().await {
+            let accounts_result = invoke_has_accounts().await;
+            if !auth.is_current_auth_flow(generation) {
+                return;
+            }
+            match accounts_result {
                 Ok(true) => {
                     // We have accounts in secure storage, try fast login
                     match invoke_load_active_account().await {
                         Ok(result) => {
+                            if !auth.is_current_auth_flow(generation) {
+                                return;
+                            }
                             if let Ok(account) = parse_account_from_result(&result) {
                                 auth.active_account.set(Some(account.clone()));
                                 auth.npub.set(Some(account.npub.clone()));
@@ -4980,57 +5051,12 @@ pub fn App() -> impl IntoView {
                                 if account.signing_mode == "nip46" {
                                     auth.start_connection_status_polling().await;
                                 }
-
-                                // IMMEDIATE: Try to get profile from backend cache first
-                                let npub_for_fetch = account.npub.clone();
-                                let auth_for_fetch = auth.clone();
-                                spawn_local(async move {
-                                    web_sys::console::log_1(
-                                        &format!(
-                                            "[INIT] Immediate profile fetch for: {}",
-                                            npub_for_fetch
-                                        )
-                                        .into(),
-                                    );
-
-                                    // First try to get from backend cache
-                                    match invoke_get_cached_profile(npub_for_fetch.clone()).await {
-                                        Ok(Some(profile)) => {
-                                            web_sys::console::log_1(
-                                                &format!(
-                                                    "[INIT] Got cached profile immediately: {:?}",
-                                                    profile.name
-                                                )
-                                                .into(),
-                                            );
-                                            auth_for_fetch.profile.set(Some(profile));
-                                        }
-                                        _ => {
-                                            web_sys::console::log_1(&"[INIT] No cached profile, fetching from relays...".into());
-                                            // Fetch from relays
-                                            match invoke_fetch_profile(npub_for_fetch.clone(), None)
-                                                .await
-                                            {
-                                                Ok(profile) => {
-                                                    web_sys::console::log_1(&format!("[INIT] Profile fetched from relays: {:?}", profile.name).into());
-                                                    auth_for_fetch.profile.set(Some(profile));
-                                                }
-                                                Err(e) => {
-                                                    web_sys::console::log_1(
-                                                        &format!(
-                                                            "[INIT] Profile fetch failed: {}",
-                                                            e
-                                                        )
-                                                        .into(),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
                             }
                         }
                         Err(_) => {
+                            if !auth.is_current_auth_flow(generation) {
+                                return;
+                            }
                             // No active account, but we have accounts
                             // Load list for user to select
                             auth.has_secure_accounts.set(true);
@@ -5081,7 +5107,9 @@ pub fn App() -> impl IntoView {
                     match invoke_is_authenticated().await {
                         Ok(true) => {
                             if let Ok(npub) = invoke_get_public_key().await {
-                                auth.npub.set(Some(npub));
+                                if auth.is_current_auth_flow(generation) {
+                                    auth.npub.set(Some(npub));
+                                }
                             }
                         }
                         _ => {
@@ -5089,6 +5117,9 @@ pub fn App() -> impl IntoView {
                         }
                     }
                 }
+            }
+            if auth.is_current_auth_flow(generation) {
+                auth.is_loading.set(false);
             }
         });
     });
@@ -5150,9 +5181,12 @@ pub fn App() -> impl IntoView {
     // Auto-fetch profile when npub becomes Some
     // Track npub signal and fetch profile when it changes
     let auth_for_effect = auth.clone();
+    let profile_request_generation = RwSignal::new(0_u64);
     Effect::new(move |_| {
         // This read makes the effect track auth.npub
         let npub = auth_for_effect.npub.get();
+        profile_request_generation.update(|generation| *generation = generation.wrapping_add(1));
+        let request_generation = profile_request_generation.get_untracked();
 
         #[cfg(debug_assertions)]
         {
@@ -5161,6 +5195,7 @@ pub fn App() -> impl IntoView {
 
         if let Some(npub) = npub {
             let auth = auth_for_effect.clone();
+            auth.profile.set(None);
             spawn_local(async move {
                 #[cfg(debug_assertions)]
                 {
@@ -5176,6 +5211,12 @@ pub fn App() -> impl IntoView {
                                 &format!("Profile loaded from backend cache: {:?}", profile.name)
                                     .into(),
                             );
+                        }
+                        if profile_request_generation.get_untracked() != request_generation
+                            || auth.npub.get_untracked().as_deref() != Some(npub.as_str())
+                            || profile.npub != npub
+                        {
+                            return;
                         }
                         baseline_profile = Some(profile.clone());
                         auth.profile.set(Some(profile));
@@ -5193,11 +5234,12 @@ pub fn App() -> impl IntoView {
                 // Stale-while-revalidate: always fetch from relays for fresh metadata.
                 match invoke_fetch_profile(npub.clone(), None).await {
                     Ok(profile) => {
-                        let preserves_visible_profile = !profile.has_metadata()
-                            && baseline_profile
-                                .as_ref()
-                                .map(|cached| cached.has_metadata())
-                                .unwrap_or(false);
+                        if profile_request_generation.get_untracked() != request_generation
+                            || auth.npub.get_untracked().as_deref() != Some(npub.as_str())
+                            || profile.npub != npub
+                        {
+                            return;
+                        }
                         let changed = baseline_profile
                             .as_ref()
                             .map(|cached| {
@@ -5213,15 +5255,7 @@ pub fn App() -> impl IntoView {
                             })
                             .unwrap_or(true);
 
-                        if preserves_visible_profile {
-                            #[cfg(debug_assertions)]
-                            {
-                                web_sys::console::log_1(
-                                    &"Relay refresh returned no profile metadata; keeping cached profile"
-                                        .into(),
-                                );
-                            }
-                        } else if changed {
+                        if changed {
                             #[cfg(debug_assertions)]
                             {
                                 web_sys::console::log_1(
@@ -5307,7 +5341,11 @@ pub fn App() -> impl IntoView {
                         web_sys::console::log_1(&"Retrying profile fetch...".into());
                     }
                     if let Ok(profile) = invoke_fetch_profile(npub.clone(), None).await {
-                        if profile.has_metadata() {
+                        if profile.has_metadata()
+                            && profile_request_generation.get_untracked() == request_generation
+                            && auth.npub.get_untracked().as_deref() == Some(npub.as_str())
+                            && profile.npub == npub
+                        {
                             #[cfg(debug_assertions)]
                             {
                                 web_sys::console::log_1(

@@ -5,25 +5,275 @@ use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::components::{BadgeEarnedModal, ProfileRow};
 use crate::models::{
-    AcquisitionPolicy, BadgeAward, BadgeDefinition, EarnedBadgeSummary, GameListing, ListingSource,
-    UserProfile,
+    npub_fallback_label, AcquisitionPolicy, GameListing, ListingSource, PlatformInfo, UserProfile,
 };
 use crate::store::try_use_profile_store;
 use crate::tauri_bridge::{
     invoke_claim_entitlement, invoke_confirm_purchase, invoke_connect_nwc_wallet,
     invoke_discover_campaigns, invoke_get_installed_games, invoke_get_listing_ownership,
-    invoke_install_game, invoke_pay_nwc_invoice, invoke_request_lnurl_invoice,
-    listen_download_complete,
+    invoke_get_platform_info, invoke_install_game, invoke_pay_nwc_invoice,
+    invoke_request_lnurl_invoice, listen_download_complete,
 };
 use crate::tauri_bridge::{
     CampaignPointerInput, ClaimEntitlementRequest, ConfirmPurchaseRequest, ConnectNwcWalletRequest,
     DiscoverCampaignsRequest, DiscoveredCampaign, PayNwcInvoiceRequest, RequestLnurlInvoiceRequest,
 };
+use crate::ui_v2::views::browse_games::listing_categories;
+use crate::ui_v2::views::{use_fallback_cover, FALLBACK_COVER};
 use crate::{invoke_fetch_profile, AuthContext};
 
 type DownloadCompleteCleanup = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DetailOperation {
+    #[default]
+    Idle,
+    RequestingInvoice,
+    ConnectingWallet,
+    PayingWallet,
+    ConfirmingPurchase,
+    Claiming,
+    Installing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimaryAction {
+    CheckingOwnership,
+    Buy,
+    Claim,
+    Install,
+    Installed,
+    Incompatible,
+    UnsupportedWeb,
+    TimedUpcoming,
+    TimedExpired,
+    SignIn,
+    NoPaymentAddress,
+    Unavailable,
+    Busy(DetailOperation),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailCompatibility {
+    Compatible,
+    Incompatible,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrimaryActionDecision {
+    action: PrimaryAction,
+    label: &'static str,
+    explanation: &'static str,
+    enabled: bool,
+}
+
+fn operation_blocks_dispatch(operation: DetailOperation) -> bool {
+    operation != DetailOperation::Idle
+}
+
+fn account_response_is_current(active_account: Option<&str>, initiating_account: &str) -> bool {
+    active_account == Some(initiating_account)
+}
+
+fn active_campaign(campaigns: &[DiscoveredCampaign]) -> Option<DiscoveredCampaign> {
+    campaigns
+        .iter()
+        .find(|campaign| campaign.classification == "active")
+        .cloned()
+}
+
+fn select_primary_action(
+    listing: &GameListing,
+    owned: bool,
+    installed: bool,
+    ownership_loading: bool,
+    campaigns: &[DiscoveredCampaign],
+    campaign_pending: bool,
+    compatibility: DetailCompatibility,
+    operation: DetailOperation,
+    standalone_web: bool,
+    authenticated: bool,
+    now: u64,
+) -> PrimaryActionDecision {
+    if operation_blocks_dispatch(operation) {
+        let label = match operation {
+            DetailOperation::RequestingInvoice => "Requesting invoice...",
+            DetailOperation::ConnectingWallet => "Connecting wallet...",
+            DetailOperation::PayingWallet => "Paying invoice...",
+            DetailOperation::ConfirmingPurchase => "Recording ownership...",
+            DetailOperation::Claiming => "Claiming access...",
+            DetailOperation::Installing => "Installing...",
+            DetailOperation::Idle => "Working...",
+        };
+        return PrimaryActionDecision {
+            action: PrimaryAction::Busy(operation),
+            label,
+            explanation: "Please wait for the current operation to finish.",
+            enabled: false,
+        };
+    }
+    if ownership_loading {
+        return PrimaryActionDecision {
+            action: PrimaryAction::CheckingOwnership,
+            label: "Checking ownership...",
+            explanation: "Checking durable access for the active account.",
+            enabled: false,
+        };
+    }
+    if installed {
+        return PrimaryActionDecision {
+            action: PrimaryAction::Installed,
+            label: "Installed",
+            explanation: "The game is installed on this device.",
+            enabled: false,
+        };
+    }
+    if standalone_web {
+        return PrimaryActionDecision {
+            action: PrimaryAction::UnsupportedWeb,
+            label: "Desktop app required",
+            explanation:
+                "Purchases, claims, and native installation are available in the desktop app.",
+            enabled: false,
+        };
+    }
+    if compatibility == DetailCompatibility::Incompatible {
+        return PrimaryActionDecision {
+            action: PrimaryAction::Incompatible,
+            label: "Not compatible",
+            explanation: "This build does not support the detected platform.",
+            enabled: false,
+        };
+    }
+    if compatibility == DetailCompatibility::Unknown {
+        return PrimaryActionDecision {
+            action: PrimaryAction::Incompatible,
+            label: "Compatibility unknown",
+            explanation: "Platform detection must complete before this build can be installed.",
+            enabled: false,
+        };
+    }
+    if !owned && campaign_pending {
+        return PrimaryActionDecision {
+            action: PrimaryAction::Unavailable,
+            label: "Checking offers...",
+            explanation: "Checking signed campaign events before choosing an access path.",
+            enabled: false,
+        };
+    }
+    if !owned
+        && matches!(listing.acquisition, AcquisitionPolicy::Gated)
+        && listing.has_declared_price()
+        && listing.price_sats == 0
+    {
+        return PrimaryActionDecision {
+            action: PrimaryAction::Unavailable,
+            label: "Purchase unavailable",
+            explanation: "This checkout supports SATS-priced listings only.",
+            enabled: false,
+        };
+    }
+
+    let desired = if owned {
+        PrimaryAction::Install
+    } else if active_campaign(campaigns).is_some() {
+        PrimaryAction::Claim
+    } else {
+        match listing.acquisition {
+            AcquisitionPolicy::Public => PrimaryAction::Install,
+            AcquisitionPolicy::TimedAccess { starts_at, .. } if now < starts_at => {
+                PrimaryAction::TimedUpcoming
+            }
+            AcquisitionPolicy::TimedAccess { ends_at, .. } if now >= ends_at => {
+                PrimaryAction::TimedExpired
+            }
+            AcquisitionPolicy::TimedAccess { .. } => PrimaryAction::Install,
+            AcquisitionPolicy::Gated
+                if listing.price_sats > 0 && listing.lud16.trim().is_empty() =>
+            {
+                PrimaryAction::NoPaymentAddress
+            }
+            AcquisitionPolicy::Gated if listing.price_sats > 0 => PrimaryAction::Buy,
+            AcquisitionPolicy::Gated => PrimaryAction::Unavailable,
+        }
+    };
+
+    if !authenticated
+        && matches!(
+            desired,
+            PrimaryAction::Buy | PrimaryAction::Claim | PrimaryAction::Install
+        )
+    {
+        return PrimaryActionDecision {
+            action: PrimaryAction::SignIn,
+            label: "Sign in required",
+            explanation: "Sign in before purchasing, claiming, or installing this game.",
+            enabled: false,
+        };
+    }
+
+    match desired {
+        PrimaryAction::Buy => PrimaryActionDecision {
+            action: desired,
+            label: "Buy with Lightning",
+            explanation: "Payment is confirmed before durable ownership is recorded.",
+            enabled: true,
+        },
+        PrimaryAction::Claim => PrimaryActionDecision {
+            action: desired,
+            label: "Claim and keep",
+            explanation:
+                "Claim during the active promotion to add permanent access to this account.",
+            enabled: true,
+        },
+        PrimaryAction::Install => PrimaryActionDecision {
+            action: desired,
+            label: if owned {
+                "Install"
+            } else {
+                "Download while available"
+            },
+            explanation: if owned {
+                "Durable ownership is confirmed for the active account."
+            } else {
+                "Access depends on the listing's current public or timed policy."
+            },
+            enabled: true,
+        },
+        PrimaryAction::TimedUpcoming => PrimaryActionDecision {
+            action: desired,
+            label: "Access not started",
+            explanation: "Timed access begins at the publisher's configured start time.",
+            enabled: false,
+        },
+        PrimaryAction::TimedExpired => PrimaryActionDecision {
+            action: desired,
+            label: "Access ended",
+            explanation: "The timed-access interval has expired and did not create ownership.",
+            enabled: false,
+        },
+        PrimaryAction::NoPaymentAddress => PrimaryActionDecision {
+            action: desired,
+            label: "Purchase unavailable",
+            explanation: "The seller has not provided a Lightning payment address.",
+            enabled: false,
+        },
+        PrimaryAction::Unavailable => PrimaryActionDecision {
+            action: desired,
+            label: "Access unavailable",
+            explanation: "This listing has no current purchase or ungated access path.",
+            enabled: false,
+        },
+        action => PrimaryActionDecision {
+            action,
+            label: "Unavailable",
+            explanation: "No action is currently available.",
+            enabled: false,
+        },
+    }
+}
 
 fn current_unix_secs() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -48,37 +298,138 @@ fn game_coordinate(listing: &GameListing) -> Option<String> {
         .map(|publisher| format!("30402:{}:{}", publisher.to_hex(), listing.id))
 }
 
-fn format_timestamp(ts: u64) -> String {
+fn format_date(ts: u64) -> String {
     #[cfg(target_arch = "wasm32")]
     {
         let date = js_sys::Date::new(&(ts as f64 * 1000.0).into());
         let year = date.get_full_year();
         let month = date.get_month() + 1;
         let day = date.get_date();
-        format!("Release Date: {month:02}/{day:02}/{year}")
+        format!("{month:02}/{day:02}/{year}")
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     {
         let years_since_epoch = ts / 31_556_952;
         let year = 1970 + years_since_epoch;
-        format!("Release Date: {year}")
+        year.to_string()
     }
 }
 
-fn safe_css_url(url: &str) -> String {
-    let trimmed = url.trim();
-    let supported_scheme = trimmed.starts_with("https://")
-        || trimmed.starts_with("http://")
-        || trimmed.starts_with("data:image/");
-    let has_css_breakout = trimmed
-        .chars()
-        .any(|ch| matches!(ch, '\'' | '"' | ')' | ';' | '\\'));
+fn format_timestamp(ts: u64) -> String {
+    format!("Release date: {}", format_date(ts))
+}
 
-    if supported_scheme && !has_css_breakout {
-        trimmed.to_string()
+fn valid_image_urls(images: &[String]) -> Vec<String> {
+    let mut valid = Vec::new();
+    for candidate in images {
+        let trimmed = candidate.trim();
+        let Some(parsed) = url::Url::parse(trimmed).ok() else {
+            continue;
+        };
+        if !matches!(parsed.scheme(), "http" | "https") {
+            continue;
+        }
+        let Some(host) = parsed.host_str() else {
+            continue;
+        };
+        if host == "example"
+            || host.ends_with(".example")
+            || host == "example.com"
+            || host.ends_with(".example.com")
+        {
+            continue;
+        }
+        if !valid.iter().any(|url| url == trimmed) {
+            valid.push(trimmed.to_string());
+        }
+    }
+    valid
+}
+
+fn seller_display(profile: Option<&UserProfile>, listing: &GameListing) -> String {
+    profile
+        .map(UserProfile::display)
+        .filter(|display| !display.trim().is_empty())
+        .or_else(|| {
+            listing
+                .stall_name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+        })
+        .unwrap_or_else(|| npub_fallback_label(&listing.publisher_npub))
+}
+
+fn listing_compatibility(
+    listing: &GameListing,
+    platform: Option<&PlatformInfo>,
+) -> DetailCompatibility {
+    if listing.platforms.is_empty() {
+        DetailCompatibility::Compatible
+    } else if let Some(platform) = platform {
+        if listing.platforms.iter().any(|tag| tag == &platform.tag()) {
+            DetailCompatibility::Compatible
+        } else {
+            DetailCompatibility::Incompatible
+        }
     } else {
-        String::new()
+        DetailCompatibility::Unknown
+    }
+}
+
+fn technical_fields(listing: &GameListing) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    if !listing.platforms.is_empty() {
+        fields.push((
+            "Supported platforms".to_string(),
+            listing.platforms.join(", "),
+        ));
+    }
+    for (key, label) in [
+        ("version", "Version"),
+        ("sha256", "File hash"),
+        ("hash", "File hash"),
+        ("server", "Distribution provider"),
+    ] {
+        if let Some((_, value)) = listing.specs.iter().find(|(spec_key, value)| {
+            spec_key.eq_ignore_ascii_case(key) && !value.trim().is_empty()
+        }) {
+            if !fields.iter().any(|(existing, _)| existing == label) {
+                fields.push((label.to_string(), value.clone()));
+            }
+        }
+    }
+    if let Some(event_id) = listing
+        .event_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        fields.push(("Listing event".to_string(), event_id.clone()));
+    }
+    if let Some(event_id) = listing
+        .nip94_event_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        fields.push(("File metadata event".to_string(), event_id.clone()));
+    }
+    fields.push(("Listing identifier".to_string(), listing.id.clone()));
+    fields.push((
+        "Published".to_string(),
+        format_timestamp(listing.created_at),
+    ));
+    fields
+}
+
+fn operation_status(operation: DetailOperation) -> &'static str {
+    match operation {
+        DetailOperation::Idle => "Ready",
+        DetailOperation::RequestingInvoice => "Requesting a Lightning invoice...",
+        DetailOperation::ConnectingWallet => "Connecting to the wallet...",
+        DetailOperation::PayingWallet => "Sending the Lightning payment...",
+        DetailOperation::ConfirmingPurchase => "Confirming payment and recording ownership...",
+        DetailOperation::Claiming => "Claiming permanent access...",
+        DetailOperation::Installing => "Downloading and installing the game...",
     }
 }
 
@@ -90,18 +441,6 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
-}
-
-fn hero_buy_panel_metadata(
-    stall_name: Option<&str>,
-    release_label: &str,
-    protocol_label: &str,
-) -> Vec<String> {
-    vec![
-        format!("Publisher: {}", stall_name.unwrap_or("Independent")),
-        release_label.to_string(),
-        format!("Protocol: {protocol_label}"),
-    ]
 }
 
 fn adp_server_url_from_download_url(download_url: &str) -> Option<String> {
@@ -130,101 +469,75 @@ fn adp_server_url(specs: &[(String, String)], download_url: &str) -> Option<Stri
 
 #[component]
 pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoView {
-    let earned_badge_preview = RwSignal::new(None::<EarnedBadgeSummary>);
-
-    let close_badge_modal = {
-        let earned_badge_preview = earned_badge_preview;
-        Callback::new(move |_| {
-            earned_badge_preview.set(None);
-        })
-    };
-
-    // Follow-up: wire to kind-8 relay subscription when badge issuance lands.
-    let on_invoice_created = {
-        let earned_badge_preview = earned_badge_preview;
-        Callback::new(move |_| {
-            #[cfg(debug_assertions)]
-            {
-                earned_badge_preview.set(Some(debug_badge_preview()));
-            }
-
-            #[cfg(not(debug_assertions))]
-            {
-                let _ = earned_badge_preview;
-            }
-        })
-    };
-
-    let hero_image = listing
-        .images
+    let media = valid_image_urls(&listing.images);
+    let hero_image = media
         .first()
-        .map(|url| safe_css_url(url))
-        .unwrap_or_default();
-    let hero_style = format!(
-        "background-image: linear-gradient(to top, rgba(10,14,20,0.88), rgba(10,14,20,0.45)), url('{hero_image}'); background-size: cover; background-position: center;"
-    );
-    let kicker = listing
-        .tags
+        .cloned()
+        .unwrap_or_else(|| FALLBACK_COVER.to_string());
+    let gallery_images = media.into_iter().skip(1).collect::<Vec<_>>();
+    let categories = listing_categories(&listing)
+        .into_iter()
+        .map(|category| category.label)
+        .collect::<Vec<_>>();
+    let kicker = categories
         .first()
         .cloned()
         .unwrap_or_else(|| "Game".to_string());
-    let direct_access = listing.acquisition.allows_access_at(current_unix_secs());
-    let price_label = match &listing.acquisition {
-        AcquisitionPolicy::Public => "Public access".to_string(),
-        AcquisitionPolicy::TimedAccess { .. } if direct_access => "Timed access".to_string(),
-        _ if listing.price_sats > 0 => format!("{} Sats", listing.price_sats),
-        _ => "Gated".to_string(),
-    };
-    let buy_button_label = match &listing.acquisition {
-        AcquisitionPolicy::Public => "Public install".to_string(),
-        AcquisitionPolicy::TimedAccess { .. } if direct_access => {
-            "Install during access window".to_string()
-        }
-        _ if listing.price_sats > 0 => {
-            format!("Buy with Lightning - {} sats", listing.price_sats)
-        }
-        _ => "Ownership required".to_string(),
-    };
     let release_label = format_timestamp(listing.created_at);
     let protocol_label = match listing.source {
         ListingSource::Nip15Product => "NIP-15",
         ListingSource::Nip99Listing => "NIP-99",
         ListingSource::Legacy => "NIP-01",
     };
-    let gallery_images = listing.images.iter().skip(1).cloned().collect::<Vec<_>>();
-    let tags = listing.tags.clone();
-    let specs = listing.specs.clone();
+    let technical = technical_fields(&listing);
     let publisher_npub = listing.publisher_npub.clone();
     let seller_lud16 = listing.lud16.clone();
     let has_lightning = !seller_lud16.trim().is_empty();
     let title = listing.title.clone();
     let description = listing.description.clone();
-    let hero_metadata = hero_buy_panel_metadata(
-        listing.stall_name.as_deref(),
-        &release_label,
-        protocol_label,
-    );
 
     // Buy flow state.
     let invoice: RwSignal<Option<String>> = RwSignal::new(None);
-    let buy_loading: RwSignal<bool> = RwSignal::new(false);
     let buy_error: RwSignal<Option<String>> = RwSignal::new(None);
+    let success_message: RwSignal<Option<String>> = RwSignal::new(None);
     let show_invoice: RwSignal<bool> = RwSignal::new(false);
     let nwc_connection_input = RwSignal::new(String::new());
     let nwc_connected: RwSignal<bool> = RwSignal::new(false);
     let manual_preimage = RwSignal::new(String::new());
     let purchase_confirmed: RwSignal<bool> = RwSignal::new(listing.is_owned);
     let ownership_loading: RwSignal<bool> = RwSignal::new(false);
-    let install_loading: RwSignal<bool> = RwSignal::new(false);
     let install_complete: RwSignal<bool> = RwSignal::new(false);
+    let operation = RwSignal::new(DetailOperation::Idle);
     let campaigns: RwSignal<Vec<DiscoveredCampaign>> = RwSignal::new(Vec::new());
     let campaign_loading: RwSignal<bool> = RwSignal::new(true);
+    let campaign_error: RwSignal<Option<String>> = RwSignal::new(None);
+    let campaign_refresh = RwSignal::new(0_u64);
+    let pending_claim: RwSignal<Option<DiscoveredCampaign>> = RwSignal::new(None);
+    let platform_info: RwSignal<Option<PlatformInfo>> = RwSignal::new(None);
+    let decision_time = RwSignal::new(current_unix_secs());
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let clock = SendWrapper::new(gloo_timers::callback::Interval::new(30_000, move || {
+            decision_time.set(current_unix_secs());
+        }));
+        on_cleanup(move || drop(clock));
+    }
 
     // Seller profile state.
     let seller_profile: RwSignal<Option<UserProfile>> = RwSignal::new(None);
     let profile_loading: RwSignal<bool> = RwSignal::new(true);
+    let profile_error: RwSignal<bool> = RwSignal::new(false);
 
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
+
+    Effect::new(move |_| {
+        spawn_local(async move {
+            if let Ok(info) = invoke_get_platform_info().await {
+                platform_info.set(Some(info));
+            }
+        });
+    });
 
     let ownership_publisher = listing.publisher_npub.clone();
     let ownership_listing_id = listing.id.clone();
@@ -260,7 +573,8 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         });
     });
 
-    if let Some(coordinate) = game_coordinate(&listing) {
+    let install_game_coordinate = game_coordinate(&listing);
+    if let Some(coordinate) = install_game_coordinate.clone() {
         Effect::new(move |_| {
             let coordinate = coordinate.clone();
             spawn_local(async move {
@@ -279,6 +593,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         let listing = listing.clone();
 
         Callback::new(move |()| {
+            if operation_blocks_dispatch(operation.get_untracked()) {
+                return;
+            }
             if auth.npub.get().is_none() {
                 buy_error.set(Some("Not authenticated".to_string()));
                 return;
@@ -292,8 +609,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 return;
             }
 
-            buy_loading.set(true);
+            operation.set(DetailOperation::RequestingInvoice);
             buy_error.set(None);
+            success_message.set(None);
             show_invoice.set(false);
 
             let lud16 = listing.lud16.clone();
@@ -308,12 +626,11 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     Ok(response) => {
                         invoice.set(Some(response.bolt11));
                         show_invoice.set(true);
-                        buy_loading.set(false);
-                        on_invoice_created.run(());
+                        operation.set(DetailOperation::Idle);
                     }
                     Err(e) => {
                         buy_error.set(Some(e));
-                        buy_loading.set(false);
+                        operation.set(DetailOperation::Idle);
                     }
                 }
             });
@@ -353,9 +670,15 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         }
     });
 
+    let confirm_auth = auth.clone();
     let confirm_with_preimage = {
         let listing = listing.clone();
+        let confirm_auth = confirm_auth.clone();
         move |preimage: String| {
+            let Some(initiating_account) = confirm_auth.npub.get() else {
+                buy_error.set(Some("Not authenticated".to_string()));
+                return;
+            };
             let Some(bolt11) = invoice.get() else {
                 buy_error.set(Some(
                     "Request an invoice before confirming purchase".to_string(),
@@ -374,8 +697,10 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 }
             };
 
-            buy_loading.set(true);
+            operation.set(DetailOperation::ConfirmingPurchase);
             buy_error.set(None);
+            success_message.set(None);
+            let auth_for_response = confirm_auth.clone();
             spawn_local(async move {
                 let request = ConfirmPurchaseRequest {
                     publisher_npub,
@@ -384,10 +709,22 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     bolt11,
                     preimage,
                 };
-                match invoke_confirm_purchase(request).await {
+                let result = invoke_confirm_purchase(request).await;
+                if !account_response_is_current(
+                    auth_for_response.npub.get_untracked().as_deref(),
+                    &initiating_account,
+                ) {
+                    operation.set(DetailOperation::Idle);
+                    return;
+                }
+                match result {
                     Ok(_) => {
                         purchase_confirmed.set(true);
-                        buy_loading.set(false);
+                        success_message.set(Some(
+                            "Payment confirmed. Durable ownership is ready for installation."
+                                .to_string(),
+                        ));
+                        operation.set(DetailOperation::Idle);
                     }
                     Err(err) => {
                         let message = if err.contains("402") {
@@ -403,7 +740,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                             err
                         };
                         buy_error.set(Some(message));
-                        buy_loading.set(false);
+                        operation.set(DetailOperation::Idle);
                     }
                 }
             });
@@ -411,6 +748,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     };
 
     let on_connect_nwc = Callback::new(move |()| {
+        if operation_blocks_dispatch(operation.get_untracked()) {
+            return;
+        }
         let connection_string = nwc_connection_input.get();
         if connection_string.trim().is_empty() {
             buy_error.set(Some(
@@ -418,17 +758,17 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             ));
             return;
         }
-        buy_loading.set(true);
+        operation.set(DetailOperation::ConnectingWallet);
         buy_error.set(None);
         spawn_local(async move {
             match invoke_connect_nwc_wallet(ConnectNwcWalletRequest { connection_string }).await {
                 Ok(_) => {
                     nwc_connected.set(true);
-                    buy_loading.set(false);
+                    operation.set(DetailOperation::Idle);
                 }
                 Err(err) => {
                     buy_error.set(Some(err));
-                    buy_loading.set(false);
+                    operation.set(DetailOperation::Idle);
                 }
             }
         });
@@ -436,24 +776,39 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
 
     let on_pay_nwc = {
         let confirm_with_preimage = confirm_with_preimage.clone();
+        let pay_auth = auth.clone();
         Callback::new(move |()| {
+            if operation_blocks_dispatch(operation.get_untracked()) {
+                return;
+            }
             let Some(bolt11) = invoice.get() else {
                 buy_error.set(Some("Request an invoice before paying".to_string()));
                 return;
             };
-            buy_loading.set(true);
+            let Some(initiating_account) = pay_auth.npub.get() else {
+                buy_error.set(Some("Not authenticated".to_string()));
+                return;
+            };
+            operation.set(DetailOperation::PayingWallet);
             buy_error.set(None);
             let confirm_with_preimage = confirm_with_preimage.clone();
+            let auth_for_response = pay_auth.clone();
             spawn_local(async move {
                 match invoke_pay_nwc_invoice(PayNwcInvoiceRequest { bolt11 }).await {
                     Ok(result) => {
+                        if !account_response_is_current(
+                            auth_for_response.npub.get_untracked().as_deref(),
+                            &initiating_account,
+                        ) {
+                            operation.set(DetailOperation::Idle);
+                            return;
+                        }
                         manual_preimage.set(result.preimage.clone());
-                        buy_loading.set(false);
                         confirm_with_preimage(result.preimage);
                     }
                     Err(err) => {
                         buy_error.set(Some(err));
-                        buy_loading.set(false);
+                        operation.set(DetailOperation::Idle);
                     }
                 }
             });
@@ -463,6 +818,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let on_confirm_manual = {
         let confirm_with_preimage = confirm_with_preimage.clone();
         Callback::new(move |()| {
+            if operation_blocks_dispatch(operation.get_untracked()) {
+                return;
+            }
             let preimage = manual_preimage.get();
             if preimage.trim().is_empty() {
                 buy_error.set(Some("Paste the payment preimage first".to_string()));
@@ -475,26 +833,30 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let on_download = {
         let listing = listing.clone();
         Callback::new(move |()| {
-            install_loading.set(true);
+            if operation_blocks_dispatch(operation.get_untracked()) {
+                return;
+            }
+            operation.set(DetailOperation::Installing);
             buy_error.set(None);
+            success_message.set(None);
             let listing = listing.clone();
             spawn_local(async move {
                 match invoke_install_game(&listing).await {
                     Ok(()) => {
-                        purchase_confirmed.set(true);
                         install_complete.set(true);
-                        install_loading.set(false);
+                        success_message.set(Some("Installation completed.".to_string()));
+                        operation.set(DetailOperation::Idle);
                     }
                     Err(err) => {
                         buy_error.set(Some(format!("Install failed: {err}")));
-                        install_loading.set(false);
+                        operation.set(DetailOperation::Idle);
                     }
                 }
             });
         })
     };
 
-    let install_listing_id = listing.id.clone();
+    let expected_install_coordinate = install_game_coordinate;
     let download_complete_cleanup: DownloadCompleteCleanup = Rc::new(RefCell::new(None));
     let download_complete_disposed = Rc::new(RefCell::new(false));
     let download_complete_registration_started = Rc::new(RefCell::new(false));
@@ -508,15 +870,16 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         }
         *download_complete_registration_started_for_effect.borrow_mut() = true;
 
-        let install_listing_id = install_listing_id.clone();
+        let expected_install_coordinate = expected_install_coordinate.clone();
         let cleanup_handle = Rc::clone(&download_complete_cleanup_for_effect);
         let disposed = Rc::clone(&download_complete_disposed_for_effect);
         spawn_local(async move {
             if let Ok(listener) = listen_download_complete(move |payload| {
-                if payload.listing_id == install_listing_id {
-                    purchase_confirmed.set(true);
+                if expected_install_coordinate.as_deref() == Some(payload.game_coordinate.as_str())
+                {
                     install_complete.set(true);
-                    install_loading.set(false);
+                    success_message.set(Some("Installation completed.".to_string()));
+                    operation.set(DetailOperation::Idle);
                 }
             })
             .await
@@ -552,6 +915,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         })
         .collect::<Vec<_>>();
     Effect::new(move |_| {
+        let _ = campaign_refresh.get();
         let request = DiscoverCampaignsRequest {
             publisher_npub: campaign_publisher.clone(),
             listing_id: campaign_listing_id.clone(),
@@ -559,20 +923,25 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         };
         spawn_local(async move {
             campaign_loading.set(true);
+            campaign_error.set(None);
             match invoke_discover_campaigns(request).await {
                 Ok(discovered) => campaigns.set(discovered),
-                Err(error) => buy_error.set(Some(format!("Campaign discovery failed: {error}"))),
+                Err(error) => campaign_error.set(Some(error)),
             }
             campaign_loading.set(false);
         });
     });
 
     let claim_listing = listing.clone();
+    let claim_auth = auth.clone();
     let on_claim = Callback::new(move |campaign: DiscoveredCampaign| {
-        if auth.npub.get().is_none() {
-            buy_error.set(Some("Not authenticated".to_string()));
+        if operation_blocks_dispatch(operation.get_untracked()) {
             return;
         }
+        let Some(initiating_account) = claim_auth.npub.get() else {
+            buy_error.set(Some("Not authenticated".to_string()));
+            return;
+        };
         let Some(server_url) = adp_server_url(&claim_listing.specs, &claim_listing.download_url)
         else {
             buy_error.set(Some(
@@ -580,20 +949,37 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             ));
             return;
         };
-        buy_loading.set(true);
+        operation.set(DetailOperation::Claiming);
         buy_error.set(None);
+        success_message.set(None);
+        pending_claim.set(None);
         let request = ClaimEntitlementRequest {
             publisher_npub: claim_listing.publisher_npub.clone(),
             listing_id: claim_listing.id.clone(),
             campaign_event_id: campaign.root_event_id,
             server_url,
         };
+        let auth_for_response = claim_auth.clone();
         spawn_local(async move {
-            match invoke_claim_entitlement(request).await {
-                Ok(_) => purchase_confirmed.set(true),
+            let result = invoke_claim_entitlement(request).await;
+            if auth_for_response.npub.get_untracked().as_deref()
+                != Some(initiating_account.as_str())
+            {
+                operation.set(DetailOperation::Idle);
+                return;
+            }
+            match result {
+                Ok(response) => {
+                    purchase_confirmed.set(true);
+                    success_message.set(Some(if response.already_claimed {
+                        "Permanent access was already present for this account.".to_string()
+                    } else {
+                        "Permanent access was added to this account.".to_string()
+                    }));
+                }
                 Err(error) => buy_error.set(Some(error)),
             }
-            buy_loading.set(false);
+            operation.set(DetailOperation::Idle);
         });
     });
 
@@ -605,6 +991,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         let store = profile_store_for_fetch.clone();
         spawn_local(async move {
             profile_loading.set(true);
+            profile_error.set(false);
 
             let cached = store.as_ref().and_then(|s| s.get_untracked(&npub));
             if let Some(profile) = cached {
@@ -620,436 +1007,384 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     }
                     seller_profile.set(Some(profile));
                 }
-                Err(_) => seller_profile.set(None),
+                Err(_) => {
+                    seller_profile.set(None);
+                    profile_error.set(true);
+                }
             }
             profile_loading.set(false);
         });
     });
 
+    let decision_auth = auth.clone();
+    let primary_decision = {
+        let listing = listing.clone();
+        let decision_auth = decision_auth.clone();
+        move || {
+            let discovered = campaigns.get();
+            select_primary_action(
+                &listing,
+                purchase_confirmed.get(),
+                install_complete.get(),
+                ownership_loading.get(),
+                &discovered,
+                campaign_loading.get() || campaign_error.get().is_some(),
+                listing_compatibility(&listing, platform_info.get().as_ref()),
+                operation.get(),
+                cfg!(all(target_arch = "wasm32", feature = "web")),
+                decision_auth.npub.get().is_some(),
+                decision_time.get(),
+            )
+        }
+    };
+    let on_primary = {
+        let decision = primary_decision.clone();
+        let on_buy = on_buy.clone();
+        let on_download = on_download.clone();
+        Callback::new(move |()| match decision().action {
+            PrimaryAction::Buy => on_buy.run(()),
+            PrimaryAction::Install => on_download.run(()),
+            PrimaryAction::Claim => {
+                let discovered = campaigns.get_untracked();
+                pending_claim.set(active_campaign(&discovered));
+            }
+            PrimaryAction::CheckingOwnership
+            | PrimaryAction::Busy(_)
+            | PrimaryAction::Installed
+            | PrimaryAction::Incompatible
+            | PrimaryAction::UnsupportedWeb
+            | PrimaryAction::TimedUpcoming
+            | PrimaryAction::TimedExpired
+            | PrimaryAction::SignIn
+            | PrimaryAction::NoPaymentAddress
+            | PrimaryAction::Unavailable => {}
+        })
+    };
+    let decision_for_label = primary_decision.clone();
+    let decision_for_disabled = primary_decision.clone();
+    let decision_for_explanation = primary_decision.clone();
+    let unowned_access_label = match &listing.acquisition {
+        AcquisitionPolicy::Public => "Public access".to_string(),
+        AcquisitionPolicy::TimedAccess { .. } => "Timed access".to_string(),
+        AcquisitionPolicy::Gated if listing.price_sats > 0 => {
+            format!("{} sats", listing.price_sats)
+        }
+        AcquisitionPolicy::Gated if listing.has_declared_price() => {
+            format!("{} {}", listing.price, listing.currency)
+        }
+        AcquisitionPolicy::Gated => "Restricted".to_string(),
+    };
+    let listing_for_compatibility = listing.clone();
+    let listing_for_seller = listing.clone();
+
     view! {
         <section class="v2-detail-wrap">
-            <header class="v2-panel-glass v2-detail-hero" style=hero_style>
-                <div>
+            <button class="v2-btn-ghost v2-detail-back" on:click=move |_| on_back.run(())>
+                <span class="material-symbols-outlined">"arrow_back"</span>
+                "Back"
+            </button>
+
+            <header class="v2-panel-glass v2-detail-hero">
+                <div class="v2-detail-hero-copy">
                     <p class="v2-store-kicker">{kicker}</p>
                     <h1 class="v2-display v2-detail-title">{title.clone()}</h1>
-                    <div class="v2-detail-rating-row">
-                        <span>"star star star star star_half"</span>
-                        <span>"4.8"</span>
-                        <span>"|"</span>
-                        <span>"bolt 12.4k Zaps"</span>
-                    </div>
                     <p class="v2-hero-description">{description.clone()}</p>
                     <div class="v2-detail-tags">
-                        {tags
-                            .iter()
-                            .take(4)
-                            .map(|tag| view! { <span class="v2-chip">{tag.clone()}</span> })
-                            .collect::<Vec<_>>()}
+                        {categories.iter().map(|category| {
+                            view! { <span class="v2-chip">{category.clone()}</span> }
+                        }).collect::<Vec<_>>()}
                     </div>
                 </div>
+                <div class="v2-detail-cover-frame">
+                    <img src=hero_image alt=format!("{title} cover") on:error=use_fallback_cover />
+                </div>
                 <aside class="v2-detail-buy-panel v2-panel">
-                    <div class="v2-detail-price">{price_label}</div>
-                    <button class="v2-btn-secondary" on:click=move |_| on_back.run(())>
-                        "Back"
+                    <p class="v2-store-kicker">"Access"</p>
+                    <div class="v2-detail-price">
+                        {move || if purchase_confirmed.get() {
+                            "Owned".to_string()
+                        } else {
+                            unowned_access_label.clone()
+                        }}
+                    </div>
+                    <button
+                        class="v2-btn-primary"
+                        on:click=move |_| on_primary.run(())
+                        disabled=move || !decision_for_disabled().enabled
+                    >
+                        {move || decision_for_label().label}
                     </button>
-
-                    {move || {
-                        if campaign_loading.get() {
-                            view! { <p class="v2-social-meta">"Checking claim campaigns..."</p> }
-                                .into_any()
-                        } else {
-                            let cards = campaigns
-                                .get()
-                                .into_iter()
-                                .filter(|campaign| {
-                                    matches!(
-                                        campaign.classification.as_str(),
-                                        "upcoming" | "active" | "ended" | "cancelled"
-                                    )
-                                })
-                                .map(|campaign| {
-                                    let claim_campaign = campaign.clone();
-                                    let on_claim = on_claim.clone();
-                                    let is_active = campaign.classification == "active";
-                                    view! {
-                                        <div class="v2-panel" style:padding="10px">
-                                            <strong>{format!("Claim campaign: {}", campaign.campaign_id)}</strong>
-                                            <p class="v2-social-meta">
-                                                {format!(
-                                                    "{} - {} | {}",
-                                                    campaign.starts_at,
-                                                    campaign.ends_at,
-                                                    campaign.classification
-                                                )}
-                                            </p>
-                                            {move || if ownership_loading.get() {
-                                                view! { <p class="v2-social-meta">"Checking ownership..."</p> }.into_any()
-                                            } else if purchase_confirmed.get() {
-                                                view! { <p class="v2-social-meta">"Owned"</p> }.into_any()
-                                            } else {
-                                                let claim_campaign = claim_campaign.clone();
-                                                let on_claim = on_claim.clone();
-                                                view! {
-                                                    <button
-                                                        class="v2-btn-primary"
-                                                        on:click=move |_| on_claim.run(claim_campaign.clone())
-                                                        disabled=move || !is_active || buy_loading.get()
-                                                    >
-                                                        {if is_active { "Claim" } else { "Unavailable" }}
-                                                    </button>
-                                                }.into_any()
-                                            }}
-                                        </div>
-                                    }
-                                })
-                                .collect::<Vec<_>>();
-                            view! { <>{cards}</> }.into_any()
-                        }
+                    <p class="v2-social-meta">{move || decision_for_explanation().explanation}</p>
+                    {move || if operation.get() != DetailOperation::Idle {
+                        view! { <p class="v2-detail-status">{operation_status(operation.get())}</p> }.into_any()
+                    } else {
+                        view! { <></> }.into_any()
                     }}
+                    {move || buy_error.get().map(|error| view! {
+                        <p class="v2-detail-alert v2-detail-alert-error">{error}</p>
+                    })}
+                    {move || success_message.get().map(|message| view! {
+                        <p class="v2-detail-alert v2-detail-alert-success">{message}</p>
+                    })}
 
-                    {move || {
-                        if ownership_loading.get() {
-                            view! {
-                                <button class="v2-btn-primary" disabled=true>
-                                    "Checking ownership..."
-                                </button>
-                            }.into_any()
-                        } else if purchase_confirmed.get() {
-                            view! {
-                                <>
-                                    {move || if install_complete.get() {
-                                        view! { <p class="v2-social-meta">"Installed"</p> }.into_any()
-                                    } else {
-                                        view! {
-                                            <button
-                                                class="v2-btn-primary"
-                                                on:click=move |_| on_download.run(())
-                                                disabled=move || install_loading.get()
-                                            >
-                                                {move || if install_loading.get() { "Installing..." } else { "Install" }}
-                                            </button>
-                                        }.into_any()
-                                    }}
-                                    <p class="v2-social-meta">
-                                        {move || {
-                                            if install_complete.get() {
-                                                "Installed. Runtime execution and extraction are not available in this gate."
-                                            } else if install_loading.get() {
-                                                "Installing game artifact..."
-                                            } else {
-                                                "Purchase confirmed. Download token stored."
-                                            }
-                                        }}
-                                    </p>
-                                </>
-                            }.into_any()
-                        } else if buy_loading.get() {
-                            view! {
-                                <button class="v2-btn-primary" disabled=true>
-                                    "Processing purchase..."
-                                </button>
-                            }.into_any()
-                        } else if show_invoice.get() {
-                            view! {
-                                <>
-                                    <div class="v2-panel" style:padding="8px" style:font-size="0.8rem">
-                                        <p style:word-break="break-all">
-                                            {move || invoice.get().map(|bolt11| {
-                                                if bolt11.len() > 40 {
-                                                    format!("{}...", &bolt11[..40])
-                                                } else {
-                                                    bolt11
-                                                }
-                                            }).unwrap_or_default()}
-                                        </p>
-                                    </div>
-                                    <button class="v2-btn-primary" on:click=move |_| on_copy_invoice.run(())>
-                                        "Copy Invoice"
-                                    </button>
-                                    <button class="v2-btn-secondary" on:click=move |_| on_open_wallet.run(())>
-                                        "Open in Wallet"
-                                    </button>
-                                    <input
-                                        class="v2-input"
-                                        type="password"
-                                        placeholder="nostr+walletconnect://..."
-                                        prop:value=move || nwc_connection_input.get()
-                                        on:input:target=move |ev| nwc_connection_input.set(ev.target().value())
-                                    />
-                                    <button class="v2-btn-secondary" on:click=move |_| on_connect_nwc.run(())>
-                                        {move || if nwc_connected.get() { "NWC Connected" } else { "Connect NWC Wallet" }}
-                                    </button>
-                                    <button class="v2-btn-primary" on:click=move |_| on_pay_nwc.run(()) disabled=move || !nwc_connected.get()>
-                                        "Pay with Connected Wallet"
-                                    </button>
-                                    <input
-                                        class="v2-input"
-                                        type="text"
-                                        placeholder="Paste payment preimage"
-                                        prop:value=move || manual_preimage.get()
-                                        on:input:target=move |ev| manual_preimage.set(ev.target().value())
-                                    />
-                                    <button class="v2-btn-secondary" on:click=move |_| on_confirm_manual.run(())>
-                                        "Confirm Manual Payment"
-                                    </button>
-                                </>
-                            }.into_any()
-                        } else if direct_access {
-                            let free_button_label = buy_button_label.clone();
-                            view! {
-                                <>
-                                    {move || if install_complete.get() {
-                                        view! { <p class="v2-social-meta">"Installed"</p> }.into_any()
-                                    } else {
-                                        let free_button_label = free_button_label.clone();
-                                        view! {
-                                            <button
-                                                class="v2-btn-primary"
-                                                on:click=move |_| on_download.run(())
-                                                disabled=move || install_loading.get()
-                                            >
-                                                {move || if install_loading.get() {
-                                                    "Installing...".to_string()
-                                                } else {
-                                                    free_button_label.clone()
-                                                }}
-                                            </button>
-                                        }.into_any()
-                                    }}
-                                    <button class="v2-btn-ghost">"Add to Library"</button>
-                                </>
-                            }.into_any()
-                        } else if listing.price_sats == 0 {
-                            view! {
-                                <button class="v2-btn-primary" disabled=true>
-                                    "Ownership required"
-                                </button>
-                            }.into_any()
-                        } else if !has_lightning {
-                            view! {
-                                <>
-                                    <button class="v2-btn-primary" disabled=true>
-                                        "No Lightning address"
-                                    </button>
-                                    <button class="v2-btn-ghost">"Add to Library"</button>
-                                </>
-                            }.into_any()
-                        } else {
-                            view! {
-                                <>
-                                    <button
-                                        class="v2-btn-primary"
-                                        on:click=move |_| on_buy.run(())
-                                    >
-                                        {buy_button_label.clone()}
-                                    </button>
-                                    <button class="v2-btn-ghost">"Add to Library"</button>
-                                </>
-                            }.into_any()
-                        }
-                    }}
-
-                    {move || {
-                        buy_error.get().map(|err| {
-                            view! {
-                                <p class="v2-social-meta" style:color="var(--v2-danger)">{err}</p>
-                            }
-                        })
-                    }}
-
-                    {hero_metadata.iter().map(|item| {
-                        view! { <p class="v2-social-meta">{item.clone()}</p> }
-                    }).collect::<Vec<_>>()}
-
-                    <section class="v2-detail-currently-playing">
-                        <h4>"Currently Playing"</h4>
-                        <div class="v2-playing-row">
-                            <span>"SatoshiGamer"</span>
-                            <span>"Streaming"</span>
-                        </div>
-                        <div class="v2-playing-row">
-                            <span>"PlebsOnly"</span>
-                            <span>"Level 12"</span>
-                        </div>
-                    </section>
-                </aside>
-            </header>
-
-            <div class="v2-detail-grid">
-                <section class="v2-panel-glass v2-detail-feed">
-                    {if !gallery_images.is_empty() {
+                    {move || pending_claim.get().map(|campaign| {
+                        let claim_campaign = campaign.clone();
+                        let on_claim = on_claim.clone();
                         view! {
-                            <div class="v2-detail-gallery-grid">
-                                {gallery_images.iter().take(3).map(|url| {
-                                    view! { <img src={url.clone()} alt="screenshot" /> }
-                                }).collect::<Vec<_>>()}
-                                {if gallery_images.len() > 3 {
-                                    view! {
-                                        <div style:position="relative">
-                                            <img src={gallery_images.get(3).cloned().unwrap_or_default()} alt="more media" />
-                                            <div style:position="absolute" style:inset="0" style:display="flex" style:align-items="center" style:justify-content="center" style:background="rgba(0,0,0,0.4)">
-                                                <span style:color="white" style:font-weight="700">
-                                                    {format!("+{} Media", gallery_images.len() - 3)}
-                                                </span>
-                                            </div>
-                                        </div>
-                                    }.into_any()
-                                } else {
-                                    view! { <></> }.into_any()
-                                }}
+                            <div class="v2-detail-confirm">
+                                <strong>"Confirm permanent access claim"</strong>
+                                <p class="v2-social-meta">
+                                    {format!("Campaign {} is active until {}.", campaign.campaign_id, format_date(campaign.ends_at))}
+                                </p>
+                                <button class="v2-btn-primary" on:click=move |_| on_claim.run(claim_campaign.clone())>
+                                    "Confirm claim"
+                                </button>
+                                <button class="v2-btn-ghost" on:click=move |_| pending_claim.set(None)>
+                                    "Cancel"
+                                </button>
+                            </div>
+                        }
+                    })}
+
+                    {move || if show_invoice.get() && !purchase_confirmed.get() {
+                        view! {
+                            <div class="v2-detail-invoice">
+                                <p class="v2-social-meta">"Lightning invoice"</p>
+                                <code>{move || invoice.get().unwrap_or_default()}</code>
+                                <div class="v2-detail-action-row">
+                                    <button class="v2-btn-secondary" on:click=move |_| on_copy_invoice.run(())>"Copy"</button>
+                                    <button class="v2-btn-secondary" on:click=move |_| on_open_wallet.run(())>"Open wallet"</button>
+                                </div>
+                                <input
+                                    class="v2-input"
+                                    type="password"
+                                    aria-label="Nostr Wallet Connect connection string"
+                                    placeholder="nostr+walletconnect://..."
+                                    prop:value=move || nwc_connection_input.get()
+                                    on:input:target=move |event| nwc_connection_input.set(event.target().value())
+                                />
+                                <button class="v2-btn-secondary" on:click=move |_| on_connect_nwc.run(())>
+                                    {move || if nwc_connected.get() { "Wallet connected" } else { "Connect NWC wallet" }}
+                                </button>
+                                <button
+                                    class="v2-btn-primary"
+                                    on:click=move |_| on_pay_nwc.run(())
+                                    disabled=move || !nwc_connected.get() || operation_blocks_dispatch(operation.get())
+                                >
+                                    "Pay and confirm"
+                                </button>
+                                <input
+                                    class="v2-input"
+                                    type="text"
+                                    aria-label="Payment preimage"
+                                    placeholder="Payment preimage"
+                                    prop:value=move || manual_preimage.get()
+                                    on:input:target=move |event| manual_preimage.set(event.target().value())
+                                />
+                                <button class="v2-btn-secondary" on:click=move |_| on_confirm_manual.run(())>
+                                    "Confirm manual payment"
+                                </button>
                             </div>
                         }.into_any()
                     } else {
                         view! { <></> }.into_any()
                     }}
 
-                    <div class="v2-section-header">
-                        <h3>{title}</h3>
+                    <div class="v2-detail-buy-meta">
+                        <span>{release_label.clone()}</span>
+                        <span>{format!("Protocol: {protocol_label}")}</span>
+                        <span>{move || match listing_compatibility(&listing_for_compatibility, platform_info.get().as_ref()) {
+                            DetailCompatibility::Compatible => "Compatible with this device",
+                            DetailCompatibility::Incompatible => "Not available for this device",
+                            DetailCompatibility::Unknown => "Device compatibility unavailable",
+                        }}</span>
                     </div>
-                    <p class="v2-hero-description">{description}</p>
-                    <div class="v2-detail-tags">
-                        {tags.iter().map(|tag| {
-                            view! { <span class="v2-chip">{tag.clone()}</span> }
+                </aside>
+            </header>
+
+            {if !gallery_images.is_empty() {
+                view! {
+                    <section class="v2-detail-media" aria-label="Game media">
+                        {gallery_images.iter().map(|url| view! {
+                            <img src=url.clone() alt=format!("{title} screenshot") loading="lazy" on:error=use_fallback_cover />
                         }).collect::<Vec<_>>()}
-                    </div>
+                    </section>
+                }.into_any()
+            } else {
+                view! { <></> }.into_any()
+            }}
 
-                    <div class="v2-section-header" style:margin-top="2rem">
-                        <h3>"Nostr Feed"</h3>
-                        <button class="v2-btn-ghost">"Write a Note"</button>
-                    </div>
-                    <div class="v2-live-note v2-detail-note-card">
-                        <p class="v2-social-meta">"npub1...k9q2 - 2h ago"</p>
-                        <p>"Nostr-powered community reviews will appear here once relay subscriptions are implemented."</p>
-                        <div class="v2-social-actions">
-                            <span>"bolt -"</span>
-                            <span>"chat -"</span>
-                            <span>"sync -"</span>
-                        </div>
-                    </div>
-                </section>
-
-                <div>
-                    <section class="v2-panel v2-detail-specs" style:margin-bottom="1rem">
-                        <h3>"Specs"</h3>
-                        <div class="v2-spec-grid">
-                            {if specs.is_empty() {
-                                view! {
-                                    <>
-                                        <span>"OS"</span><span>"Cross-platform"</span>
-                                        <span>"Type"</span><span>"Digital Download"</span>
-                                    </>
-                                }.into_any()
-                            } else {
-                                specs.iter().flat_map(|(key, value)| {
-                                    vec![
-                                        view! { <span>{key.clone()}</span> }.into_any(),
-                                        view! { <span>{value.clone()}</span> }.into_any(),
-                                    ]
-                                }).collect::<Vec<_>>().into_any()
-                            }}
-                        </div>
+            <div class="v2-detail-grid">
+                <main class="v2-detail-main-column">
+                    <section class="v2-panel-glass v2-detail-description-block">
+                        <p class="v2-store-kicker">"About this game"</p>
+                        <h2>{title.clone()}</h2>
+                        <p>{description}</p>
                     </section>
 
-                    <section class="v2-panel v2-detail-specs">
-                        <h3>"Developer"</h3>
-                        {move || {
-                            if profile_loading.get() {
-                                view! { <p class="v2-social-meta">"Loading seller info..."</p> }.into_any()
-                            } else {
-                                let npub = publisher_npub.clone();
-                                let lud16_for_profile = seller_lud16.clone();
-                                view! {
+                    <section class="v2-panel-glass v2-detail-description-block">
+                        <div class="v2-section-header"><h2>"Access campaigns"</h2></div>
+                        {move || if campaign_loading.get() {
+                            view! { <p class="v2-social-meta">"Checking signed campaign events..."</p> }.into_any()
+                        } else if let Some(error) = campaign_error.get() {
+                            view! {
+                                <div class="v2-detail-alert v2-detail-alert-error">
+                                    <p>{format!("Campaign lookup failed: {error}")}</p>
+                                    <button class="v2-btn-secondary" on:click=move |_| campaign_refresh.update(|generation| *generation = generation.wrapping_add(1))>
+                                        "Retry campaign lookup"
+                                    </button>
+                                </div>
+                            }.into_any()
+                        } else if campaigns.get().is_empty() {
+                            view! { <p class="v2-social-meta">"No entitlement campaigns are attached to this listing."</p> }.into_any()
+                        } else {
+                            let cards = campaigns.get().into_iter().map(|campaign| view! {
+                                <article class="v2-detail-campaign-card">
                                     <div>
-                                        <ProfileRow
-                                            npub={npub}
-                                            avatar_size="48px"
-                                            truncate_npub=20
-                                        />
-                                        {move || seller_profile.get().map(|p| {
-                                            view! {
-                                                <div style:margin-top="12px" style:padding-top="12px" style:border-top="1px solid var(--v2-outline-ghost)">
-                                                    {p.about.clone().map(|about| {
-                                                        if !about.is_empty() {
-                                                            let truncated = truncate_chars(&about, 120);
-                                                            view! { <p class="v2-social-meta">{truncated}</p> }.into_any()
-                                                        } else {
-                                                            view! { <></> }.into_any()
-                                                        }
-                                                    })}
-                                                    {p.nip05.clone().map(|nip05| {
-                                                        view! {
-                                                            <p class="v2-social-meta">
-                                                                {if p.nip05_verified { "verified " } else { "" }}{nip05}
-                                                            </p>
-                                                        }.into_any()
-                                                    })}
-                                                    {p.lud16.clone().or(Some(lud16_for_profile.clone())).map(|lud16| {
-                                                        if !lud16.is_empty() {
-                                                            view! {
-                                                                <p class="v2-social-meta" style:color="var(--v2-primary)">
-                                                                    {format!("Lightning: {lud16}")}
-                                                                </p>
-                                                            }.into_any()
-                                                        } else {
-                                                            view! { <></> }.into_any()
-                                                        }
-                                                    })}
-                                                    {p.website.clone().map(|website| {
-                                                        let website_href = website.clone();
-                                                        view! {
-                                                            <a href={website_href} target="_blank" rel="noopener" class="v2-social-meta" style:color="var(--v2-secondary)" style:text-decoration="none">
-                                                                {website}
-                                                            </a>
-                                                        }.into_any()
-                                                    })}
-                                                </div>
-                                            }
-                                        })}
+                                        <strong>{campaign.campaign_id}</strong>
+                                        <p class="v2-social-meta">
+                                            {format!("{} to {}", format_date(campaign.starts_at), format_date(campaign.ends_at))}
+                                        </p>
                                     </div>
-                                }.into_any()
-                            }
+                                    <span class="v2-chip">{campaign.classification}</span>
+                                </article>
+                            }).collect::<Vec<_>>();
+                            view! { <div class="v2-detail-campaign-list">{cards}</div> }.into_any()
                         }}
                     </section>
-                </div>
+
+                    <section class="v2-panel-glass v2-detail-description-block">
+                        <h2>"Technical details"</h2>
+                        <div class="v2-spec-grid">
+                            {technical.iter().flat_map(|(label, value)| vec![
+                                view! { <span>{label.clone()}</span> }.into_any(),
+                                view! { <span class="v2-detail-technical-value">{value.clone()}</span> }.into_any(),
+                            ]).collect::<Vec<_>>()}
+                        </div>
+                    </section>
+                </main>
+
+                <aside class="v2-panel v2-detail-seller-card">
+                    <p class="v2-store-kicker">"Published by"</p>
+                    {move || if profile_loading.get() {
+                        view! { <p class="v2-social-meta">"Loading seller profile..."</p> }.into_any()
+                    } else {
+                        let profile = seller_profile.get();
+                        let display = seller_display(profile.as_ref(), &listing_for_seller);
+                        let avatar = profile
+                            .as_ref()
+                            .and_then(|item| item.picture.as_ref())
+                            .and_then(|url| valid_image_urls(std::slice::from_ref(url)).into_iter().next())
+                            .unwrap_or_default();
+                        let about = profile.as_ref().and_then(|item| item.about.clone());
+                        let nip05 = profile.as_ref().and_then(|item| item.nip05.clone());
+                        let lightning = profile.as_ref().and_then(|item| item.lud16.clone())
+                            .filter(|value| !value.trim().is_empty())
+                            .or_else(|| has_lightning.then(|| seller_lud16.clone()));
+                        view! {
+                            <div>
+                                <div class="v2-detail-seller-identity">
+                                    {if avatar.is_empty() {
+                                        view! { <div class="v2-detail-seller-avatar">{display.chars().next().unwrap_or('?').to_string()}</div> }.into_any()
+                                    } else {
+                                        view! { <img class="v2-detail-seller-avatar" src=avatar alt="Seller avatar" on:error=use_fallback_cover /> }.into_any()
+                                    }}
+                                    <div>
+                                        <h3>{display}</h3>
+                                        <p class="v2-social-meta">{truncate_chars(&publisher_npub, 28)}</p>
+                                    </div>
+                                </div>
+                                {about.filter(|value| !value.trim().is_empty()).map(|value| view! {
+                                    <p class="v2-detail-seller-about">{truncate_chars(&value, 240)}</p>
+                                })}
+                                {nip05.map(|value| view! { <p class="v2-social-meta">{value}</p> })}
+                                {lightning.map(|value| view! { <p class="v2-social-meta">{format!("Lightning: {value}")}</p> })}
+                                {if profile_error.get() {
+                                    view! { <p class="v2-social-meta">"Relay profile unavailable; showing listing identity."</p> }.into_any()
+                                } else {
+                                    view! { <></> }.into_any()
+                                }}
+                            </div>
+                        }.into_any()
+                    }}
+                </aside>
             </div>
-
-            <BadgeEarnedModal badge=earned_badge_preview.into() on_close=close_badge_modal />
         </section>
-    }
-}
-
-#[cfg(debug_assertions)]
-fn debug_badge_preview() -> EarnedBadgeSummary {
-    EarnedBadgeSummary {
-        definition: BadgeDefinition {
-            coordinate: "30009:debug:beta-tester".to_string(),
-            issuer_pubkey: "debug_issuer_pubkey".to_string(),
-            badge_id: "beta-tester".to_string(),
-            name: Some("Beta Tester".to_string()),
-            description: Some("Awarded for testing in debug mode.".to_string()),
-            image_url: Some("https://example.com/badge-beta.png".to_string()),
-            image_dimensions: None,
-            thumb_url: Some("https://example.com/badge-beta-thumb.png".to_string()),
-            thumb_dimensions: None,
-            relay_url: None,
-            event_id: "debug_definition_event".to_string(),
-            created_at: 0,
-        },
-        award: BadgeAward {
-            event_id: "debug_award_event".to_string(),
-            issuer_pubkey: "debug_issuer_pubkey".to_string(),
-            recipient_pubkey: "debug_recipient_pubkey".to_string(),
-            badge_coordinate: "30009:debug:beta-tester".to_string(),
-            relay_url: None,
-            created_at: 0,
-        },
-        visible_on_profile: true,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn listing(acquisition: AcquisitionPolicy) -> GameListing {
+        GameListing {
+            id: "game-id".to_string(),
+            source: ListingSource::Nip99Listing,
+            title: "Game".to_string(),
+            description: "Description".to_string(),
+            images: Vec::new(),
+            download_url: String::new(),
+            price: 1000.0,
+            currency: "SATS".to_string(),
+            price_sats: 1000,
+            quantity: None,
+            tags: Vec::new(),
+            specs: Vec::new(),
+            publisher_npub: "npub1publisher".to_string(),
+            stall_id: String::new(),
+            stall_name: None,
+            lud16: "seller@example.org".to_string(),
+            event_id: None,
+            created_at: 100,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            acquisition,
+            campaigns: Vec::new(),
+            is_owned: false,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
+        }
+    }
+
+    fn campaign(classification: &str) -> DiscoveredCampaign {
+        DiscoveredCampaign {
+            root_event_id: "root".to_string(),
+            campaign_id: "launch".to_string(),
+            starts_at: 50,
+            ends_at: 150,
+            classification: classification.to_string(),
+            event_id: Some("current".to_string()),
+            predecessor_event_id: None,
+            mode: "claim".to_string(),
+        }
+    }
+
+    fn decision(
+        listing: &GameListing,
+        owned: bool,
+        installed: bool,
+        campaigns: &[DiscoveredCampaign],
+        campaign_loading: bool,
+        compatibility: DetailCompatibility,
+        operation: DetailOperation,
+        standalone_web: bool,
+        now: u64,
+    ) -> PrimaryActionDecision {
+        select_primary_action(
+            listing,
+            owned,
+            installed,
+            false,
+            campaigns,
+            campaign_loading,
+            compatibility,
+            operation,
+            standalone_web,
+            true,
+            now,
+        )
+    }
 
     #[test]
     fn adp_server_url_prefers_listing_server_metadata() {
@@ -1093,18 +1428,256 @@ mod tests {
     }
 
     #[test]
-    fn hero_buy_panel_metadata_excludes_developer_profile() {
-        let metadata =
-            hero_buy_panel_metadata(Some("Arcade Vault"), "Release Date: 07/08/2026", "NIP-99");
+    fn durable_ownership_precedes_campaign_and_purchase() {
+        let listing = listing(AcquisitionPolicy::Gated);
+        let campaigns = vec![campaign("active")];
 
         assert_eq!(
-            metadata,
-            vec![
-                "Publisher: Arcade Vault".to_string(),
-                "Release Date: 07/08/2026".to_string(),
-                "Protocol: NIP-99".to_string(),
-            ]
+            decision(
+                &listing,
+                true,
+                false,
+                &campaigns,
+                false,
+                DetailCompatibility::Compatible,
+                DetailOperation::Idle,
+                false,
+                100,
+            )
+            .action,
+            PrimaryAction::Install
         );
-        assert!(!metadata.iter().any(|item| item.starts_with("Developer:")));
+    }
+
+    #[test]
+    fn active_campaign_precedes_paid_purchase() {
+        let listing = listing(AcquisitionPolicy::Gated);
+
+        assert_eq!(
+            decision(
+                &listing,
+                false,
+                false,
+                &[campaign("active")],
+                false,
+                DetailCompatibility::Compatible,
+                DetailOperation::Idle,
+                false,
+                100,
+            )
+            .action,
+            PrimaryAction::Claim
+        );
+    }
+
+    #[test]
+    fn campaign_lookup_blocks_purchase_until_precedence_is_known() {
+        let listing = listing(AcquisitionPolicy::Gated);
+        let result = decision(
+            &listing,
+            false,
+            false,
+            &[],
+            true,
+            DetailCompatibility::Compatible,
+            DetailOperation::Idle,
+            false,
+            100,
+        );
+
+        assert_eq!(result.action, PrimaryAction::Unavailable);
+        assert!(!result.enabled);
+    }
+
+    #[test]
+    fn timed_access_respects_both_boundaries_without_creating_ownership() {
+        let listing = listing(AcquisitionPolicy::TimedAccess {
+            starts_at: 100,
+            ends_at: 200,
+        });
+        let action_at = |now| {
+            decision(
+                &listing,
+                false,
+                false,
+                &[],
+                false,
+                DetailCompatibility::Compatible,
+                DetailOperation::Idle,
+                false,
+                now,
+            )
+            .action
+        };
+
+        assert_eq!(action_at(99), PrimaryAction::TimedUpcoming);
+        assert_eq!(action_at(100), PrimaryAction::Install);
+        assert_eq!(action_at(199), PrimaryAction::Install);
+        assert_eq!(action_at(200), PrimaryAction::TimedExpired);
+    }
+
+    #[test]
+    fn install_and_compatibility_states_block_other_actions() {
+        let listing = listing(AcquisitionPolicy::Public);
+        assert_eq!(
+            decision(
+                &listing,
+                false,
+                true,
+                &[],
+                false,
+                DetailCompatibility::Compatible,
+                DetailOperation::Idle,
+                false,
+                100,
+            )
+            .action,
+            PrimaryAction::Installed
+        );
+        assert_eq!(
+            decision(
+                &listing,
+                false,
+                false,
+                &[],
+                false,
+                DetailCompatibility::Incompatible,
+                DetailOperation::Idle,
+                false,
+                100,
+            )
+            .action,
+            PrimaryAction::Incompatible
+        );
+    }
+
+    #[test]
+    fn gated_listing_requires_price_and_payment_address() {
+        let mut listing = listing(AcquisitionPolicy::Gated);
+        listing.lud16.clear();
+        assert_eq!(
+            decision(
+                &listing,
+                false,
+                false,
+                &[],
+                false,
+                DetailCompatibility::Compatible,
+                DetailOperation::Idle,
+                false,
+                100,
+            )
+            .action,
+            PrimaryAction::NoPaymentAddress
+        );
+
+        listing.price_sats = 0;
+        assert_eq!(
+            decision(
+                &listing,
+                false,
+                false,
+                &[],
+                false,
+                DetailCompatibility::Compatible,
+                DetailOperation::Idle,
+                false,
+                100,
+            )
+            .action,
+            PrimaryAction::Unavailable
+        );
+
+        listing.price = 9.99;
+        listing.currency = "USD".to_string();
+        let unsupported_currency = decision(
+            &listing,
+            false,
+            false,
+            &[],
+            false,
+            DetailCompatibility::Compatible,
+            DetailOperation::Idle,
+            false,
+            100,
+        );
+        assert_eq!(unsupported_currency.action, PrimaryAction::Unavailable);
+        assert_eq!(unsupported_currency.label, "Purchase unavailable");
+    }
+
+    #[test]
+    fn payment_response_must_match_initiating_account() {
+        assert!(account_response_is_current(Some("npub-a"), "npub-a"));
+        assert!(!account_response_is_current(Some("npub-b"), "npub-a"));
+        assert!(!account_response_is_current(None, "npub-a"));
+    }
+
+    #[test]
+    fn standalone_web_and_busy_operations_are_non_interactive() {
+        let listing = listing(AcquisitionPolicy::Public);
+        assert_eq!(
+            decision(
+                &listing,
+                false,
+                false,
+                &[],
+                false,
+                DetailCompatibility::Compatible,
+                DetailOperation::Idle,
+                true,
+                100,
+            )
+            .action,
+            PrimaryAction::UnsupportedWeb
+        );
+        assert_eq!(
+            decision(
+                &listing,
+                false,
+                false,
+                &[],
+                false,
+                DetailCompatibility::Compatible,
+                DetailOperation::Installing,
+                false,
+                100,
+            )
+            .action,
+            PrimaryAction::Busy(DetailOperation::Installing)
+        );
+    }
+
+    #[test]
+    fn native_acquisition_requires_an_authenticated_account() {
+        let listing = listing(AcquisitionPolicy::Public);
+        let result = select_primary_action(
+            &listing,
+            false,
+            false,
+            false,
+            &[],
+            false,
+            DetailCompatibility::Compatible,
+            DetailOperation::Idle,
+            false,
+            false,
+            100,
+        );
+
+        assert_eq!(result.action, PrimaryAction::SignIn);
+        assert!(!result.enabled);
+    }
+
+    #[test]
+    fn media_filter_rejects_placeholders_invalid_schemes_and_duplicates() {
+        let urls = valid_image_urls(&[
+            "https://cdn.arcadestr.test/cover.webp".to_string(),
+            "https://cdn.arcadestr.test/cover.webp".to_string(),
+            "https://example.com/mock.png".to_string(),
+            "javascript:alert(1)".to_string(),
+            "not a url".to_string(),
+        ]);
+
+        assert_eq!(urls, vec!["https://cdn.arcadestr.test/cover.webp"]);
     }
 }

@@ -1,5 +1,7 @@
 //! Pure ADP publish event builders.
 
+use std::collections::HashSet;
+
 use nostr::{EventBuilder, Kind, Tag, TagKind};
 use thiserror::Error;
 
@@ -24,6 +26,9 @@ pub struct AdpListingInput {
     pub fulfillment_revoked_at: Option<u64>,
     pub acquisition: AcquisitionPolicy,
     pub platforms: Vec<String>,
+    pub campaigns: Vec<(String, Option<String>)>,
+    pub nip94_event_id: Option<String>,
+    pub preserved_tags: Vec<Vec<String>>,
 }
 
 /// Errors returned while building ADP publish events.
@@ -41,10 +46,48 @@ pub enum AdpPublishError {
     /// Timed access requires a non-empty interval.
     #[error("timed access end must be after its start")]
     InvalidTimedAccess,
+    /// A tag preserved from the current listing could not be reconstructed.
+    #[error("malformed preserved listing tag")]
+    MalformedPreservedTag,
+    /// Hosted image fields must be absolute HTTP(S) URLs.
+    #[error("malformed image URL: {url}")]
+    MalformedImageUrl { url: String },
+    /// Platform values must be unique `<os>-<arch>` tags.
+    #[error("malformed or duplicate platform tag: {platform}")]
+    InvalidPlatform { platform: String },
+    /// Fulfillment hashes must be SHA-256 hex.
+    #[error("malformed SHA-256 file hash")]
+    InvalidFileHash,
+    /// Campaign pointers must contain a valid event ID and optional relay URL.
+    #[error("malformed campaign pointer")]
+    InvalidCampaignPointer,
+    /// NIP-94 links must contain a valid event ID.
+    #[error("malformed NIP-94 event ID")]
+    InvalidNip94EventId,
 }
 
 fn is_http_url(value: &str) -> bool {
-    value.starts_with("http://") || value.starts_with("https://")
+    url::Url::parse(value).is_ok_and(|parsed| {
+        matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some()
+            && !value
+                .strip_prefix("https://")
+                .or_else(|| value.strip_prefix("http://"))
+                .is_some_and(|remainder| remainder.starts_with('/'))
+    })
+}
+
+fn is_platform_tag(value: &str) -> bool {
+    let Some((os, arch)) = value.split_once('-') else {
+        return false;
+    };
+    !os.is_empty()
+        && !arch.is_empty()
+        && !arch.contains('-')
+        && os
+            .chars()
+            .chain(arch.chars())
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 /// Builds a developer-signed fulfillment authorization root.
@@ -139,6 +182,47 @@ pub fn build_adp_listing_event_builder(
         return Err(AdpPublishError::InvalidTimedAccess);
     }
 
+    for image in &input.images {
+        if !image.is_empty() && !is_http_url(image) {
+            return Err(AdpPublishError::MalformedImageUrl { url: image.clone() });
+        }
+    }
+
+    let mut platforms = HashSet::new();
+    for platform in &input.platforms {
+        if !is_platform_tag(platform) || !platforms.insert(platform) {
+            return Err(AdpPublishError::InvalidPlatform {
+                platform: platform.clone(),
+            });
+        }
+    }
+
+    if input
+        .file_hash
+        .as_deref()
+        .is_some_and(|hash| !crate::is_sha256_hex(hash))
+    {
+        return Err(AdpPublishError::InvalidFileHash);
+    }
+
+    for (root_event_id, relay_hint) in &input.campaigns {
+        if nostr::EventId::from_hex(root_event_id).is_err()
+            || relay_hint
+                .as_deref()
+                .is_some_and(|relay| nostr::RelayUrl::parse(relay).is_err())
+        {
+            return Err(AdpPublishError::InvalidCampaignPointer);
+        }
+    }
+
+    if input
+        .nip94_event_id
+        .as_deref()
+        .is_some_and(|event_id| nostr::EventId::from_hex(event_id).is_err())
+    {
+        return Err(AdpPublishError::InvalidNip94EventId);
+    }
+
     let mut tags = vec![
         Tag::custom(TagKind::Custom("d".into()), [input.d_tag.clone()]),
         Tag::custom(TagKind::Custom("title".into()), [input.title.clone()]),
@@ -148,6 +232,10 @@ pub fn build_adp_listing_event_builder(
         ),
         Tag::custom(TagKind::Custom("t".into()), ["game".to_string()]),
     ];
+
+    for values in &input.preserved_tags {
+        tags.push(Tag::parse(values.clone()).map_err(|_| AdpPublishError::MalformedPreservedTag)?);
+    }
 
     tags.push(match &input.acquisition {
         AcquisitionPolicy::Gated => Tag::custom(TagKind::Custom("acquisition".into()), ["gated"]),
@@ -227,6 +315,28 @@ pub fn build_adp_listing_event_builder(
         ));
     }
 
+    for (root_event_id, relay_hint) in &input.campaigns {
+        if root_event_id.is_empty() {
+            continue;
+        }
+        let mut values = vec![root_event_id.clone()];
+        if let Some(relay_hint) = relay_hint.as_ref().filter(|value| !value.is_empty()) {
+            values.push(relay_hint.clone());
+        }
+        tags.push(Tag::custom(TagKind::Custom("campaign".into()), values));
+    }
+
+    if let Some(nip94_event_id) = input
+        .nip94_event_id
+        .as_ref()
+        .filter(|value| !value.is_empty())
+    {
+        tags.push(Tag::custom(
+            TagKind::Custom("nip94".into()),
+            [nip94_event_id.clone()],
+        ));
+    }
+
     Ok(EventBuilder::new(Kind::Custom(30402), input.description.clone()).tags(tags))
 }
 
@@ -235,6 +345,8 @@ mod tests {
     use super::*;
     use crate::authorization::{parse_authorization_event, AuthorizationTransition};
     use nostr::{Keys, Kind};
+
+    const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn tag_values(event: &nostr::Event, name: &str) -> Vec<Vec<String>> {
         event
@@ -249,6 +361,70 @@ mod tests {
             })
             .filter(|values| values.first().is_some_and(|kind| kind == name))
             .collect()
+    }
+
+    fn minimal_listing_input() -> AdpListingInput {
+        AdpListingInput {
+            d_tag: "game".into(),
+            title: "Game".into(),
+            description: "Description".into(),
+            price_sats: 0,
+            lud16: None,
+            tags: Vec::new(),
+            images: Vec::new(),
+            servers: Vec::new(),
+            file_hash: None,
+            version: None,
+            fulfillment_pubkey: None,
+            fulfillment_valid_from: None,
+            fulfillment_revoked_at: None,
+            acquisition: AcquisitionPolicy::Gated,
+            platforms: Vec::new(),
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+            preserved_tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_phase7_metadata_before_signing() {
+        let mut input = minimal_listing_input();
+        input.images = vec!["file:///tmp/cover.png".into()];
+        assert!(matches!(
+            build_adp_listing_event_builder(&input),
+            Err(AdpPublishError::MalformedImageUrl { .. })
+        ));
+
+        input.images.clear();
+        input.platforms = vec!["linux-x86_64".into(), "linux-x86_64".into()];
+        assert!(matches!(
+            build_adp_listing_event_builder(&input),
+            Err(AdpPublishError::InvalidPlatform { .. })
+        ));
+
+        input.platforms.clear();
+        input.campaigns = vec![("not-an-event-id".into(), None)];
+        assert_eq!(
+            build_adp_listing_event_builder(&input),
+            Err(AdpPublishError::InvalidCampaignPointer)
+        );
+
+        input.campaigns.clear();
+        input.nip94_event_id = Some("not-an-event-id".into());
+        assert_eq!(
+            build_adp_listing_event_builder(&input),
+            Err(AdpPublishError::InvalidNip94EventId)
+        );
+
+        input.nip94_event_id = None;
+        input.servers = vec!["https://dist.example.com".into()];
+        input.file_hash = Some("not-a-sha256".into());
+        input.version = Some("1.0.0".into());
+        input.fulfillment_pubkey = Some("fulfillment-key".into());
+        assert_eq!(
+            build_adp_listing_event_builder(&input),
+            Err(AdpPublishError::InvalidFileHash)
+        );
     }
 
     #[tokio::test]
@@ -297,13 +473,21 @@ mod tests {
                 "https://dist.example.com".to_string(),
                 "https://mirror.example.com".to_string(),
             ],
-            file_hash: Some("abc123".to_string()),
+            file_hash: Some(VALID_SHA256.to_string()),
             version: Some("1.0.0".to_string()),
             fulfillment_pubkey: Some("fulfillment-pubkey".to_string()),
             fulfillment_valid_from: Some(1_725_000_000),
             fulfillment_revoked_at: Some(1_725_000_999),
             acquisition: AcquisitionPolicy::Gated,
             platforms: vec!["linux-x86_64".to_string(), "windows-x86_64".to_string()],
+            campaigns: vec![(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                Some("wss://relay.example.com".to_string()),
+            )],
+            nip94_event_id: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ),
+            preserved_tags: vec![vec!["summary".into(), "Short description".into()]],
         };
 
         let event = build_adp_listing_event_builder(&input)
@@ -318,6 +502,25 @@ mod tests {
         );
         assert_eq!(tag_values(&event, "d")[0], vec!["d", "my-game"]);
         assert_eq!(tag_values(&event, "title")[0], vec!["title", "My Game"]);
+        assert_eq!(
+            tag_values(&event, "summary")[0],
+            vec!["summary", "Short description"]
+        );
+        assert_eq!(
+            tag_values(&event, "campaign")[0],
+            vec![
+                "campaign",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "wss://relay.example.com"
+            ]
+        );
+        assert_eq!(
+            tag_values(&event, "nip94")[0],
+            vec![
+                "nip94",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]
+        );
         assert_eq!(tag_values(&event, "price")[0], vec!["price", "2100", "sat"]);
         assert_eq!(
             tag_values(&event, "image"),
@@ -346,7 +549,7 @@ mod tests {
         );
         assert_eq!(
             tag_values(&event, "file_hash")[0],
-            vec!["file_hash", "abc123"]
+            vec!["file_hash", VALID_SHA256]
         );
         assert_eq!(tag_values(&event, "version")[0], vec!["version", "1.0.0"]);
         assert_eq!(
@@ -384,6 +587,9 @@ mod tests {
             fulfillment_revoked_at: None,
             acquisition: AcquisitionPolicy::Public,
             platforms: vec![],
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+            preserved_tags: Vec::new(),
         };
 
         let public_event = build_adp_listing_event_builder(&input)
@@ -430,6 +636,9 @@ mod tests {
                 ends_at: 100,
             },
             platforms: vec![],
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+            preserved_tags: Vec::new(),
         };
 
         assert_eq!(
@@ -456,6 +665,9 @@ mod tests {
             fulfillment_revoked_at: None,
             acquisition: AcquisitionPolicy::Gated,
             platforms: vec![],
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+            preserved_tags: Vec::new(),
         };
 
         let err = build_adp_listing_event_builder(&input)
@@ -483,6 +695,9 @@ mod tests {
             fulfillment_revoked_at: None,
             acquisition: AcquisitionPolicy::Gated,
             platforms: vec!["linux-x86_64".to_string()],
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+            preserved_tags: Vec::new(),
         };
 
         let event = build_adp_listing_event_builder(&input)
@@ -515,13 +730,16 @@ mod tests {
             tags: vec![],
             images: vec![],
             servers: vec!["https://dist.example.com".to_string()],
-            file_hash: Some("abc123".to_string()),
+            file_hash: Some(VALID_SHA256.to_string()),
             version: None,
             fulfillment_pubkey: None,
             fulfillment_valid_from: None,
             fulfillment_revoked_at: None,
             acquisition: AcquisitionPolicy::Gated,
             platforms: vec![],
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+            preserved_tags: Vec::new(),
         };
 
         let err = build_adp_listing_event_builder(&input)
@@ -547,13 +765,16 @@ mod tests {
             tags: vec![],
             images: vec![],
             servers: vec!["dist.example.com".to_string()],
-            file_hash: Some("abc123".to_string()),
+            file_hash: Some(VALID_SHA256.to_string()),
             version: Some("1.0.0".to_string()),
             fulfillment_pubkey: Some("fulfillment-pubkey".to_string()),
             fulfillment_valid_from: Some(1_725_000_000),
             fulfillment_revoked_at: None,
             acquisition: AcquisitionPolicy::Gated,
             platforms: vec![],
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+            preserved_tags: Vec::new(),
         };
 
         let err =
@@ -576,13 +797,16 @@ mod tests {
             tags: vec![],
             images: vec![],
             servers: vec!["https://dist.example.com".to_string()],
-            file_hash: Some("abc123".to_string()),
+            file_hash: Some(VALID_SHA256.to_string()),
             version: Some("1.0.0".to_string()),
             fulfillment_pubkey: Some(developer_pubkey.clone()),
             fulfillment_valid_from: Some(1_725_000_000),
             fulfillment_revoked_at: None,
             acquisition: AcquisitionPolicy::Gated,
             platforms: vec![],
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+            preserved_tags: Vec::new(),
         };
 
         let event = build_adp_listing_event_builder(&input)
@@ -613,13 +837,16 @@ mod tests {
             tags: vec![],
             images: vec![],
             servers: vec!["https://dist.example.com".to_string()],
-            file_hash: Some("abc123".to_string()),
+            file_hash: Some(VALID_SHA256.to_string()),
             version: Some("1.0.0".to_string()),
             fulfillment_pubkey: Some("fulfillment-pubkey".to_string()),
             fulfillment_valid_from: None,
             fulfillment_revoked_at: None,
             acquisition: AcquisitionPolicy::Gated,
             platforms: vec![],
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+            preserved_tags: Vec::new(),
         };
 
         let event = build_adp_listing_event_builder(&input)

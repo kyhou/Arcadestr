@@ -1,7 +1,7 @@
 //! Shared marketplace listing loader and presentation helpers for UI v2 views.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use arcadestr_core::is_replaceable_event_newer;
@@ -9,8 +9,12 @@ use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::models::{npub_fallback_label, GameListing, ListingSource};
+use crate::models::{GameListing, ListingSource};
 use crate::store::{try_use_marketplace_store, DEFAULT_LISTING_TTL_SECS};
+use crate::tauri_bridge::{
+    invoke_discover_campaign_summaries, invoke_discover_campaigns, CampaignPointerInput,
+    CampaignSummaryListingInput, DiscoverCampaignSummariesRequest, DiscoverCampaignsRequest,
+};
 use crate::{invoke_fetch_marketplace_stream, AuthContext};
 
 // ── Batch flusher for progressive listing updates ────────────────────────────
@@ -33,39 +37,182 @@ pub struct MarketplaceListingsState {
     pub received_count: RwSignal<usize>,
     pub requested_limit: RwSignal<usize>,
     pub has_more: RwSignal<bool>,
+    pub refreshing: RwSignal<bool>,
+    pub using_cached_data: RwSignal<bool>,
 }
 
-pub struct ListingPresentation {
-    pub price_primary: String,
-    pub price_hint: Option<String>,
-    pub cta_label: &'static str,
-    pub is_free: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CampaignAvailability {
+    Active,
+    Upcoming,
+    Ended,
 }
 
-pub fn listing_presentation(listing: &GameListing) -> ListingPresentation {
-    if listing.price_sats == 0 {
-        ListingPresentation {
-            price_primary: "FREE".to_string(),
-            price_hint: None,
-            cta_label: "Play Now",
-            is_free: true,
+#[derive(Clone, Copy)]
+pub struct ListingCampaignStates {
+    pub states: RwSignal<HashMap<String, CampaignAvailability>>,
+    pub loading: RwSignal<bool>,
+    pub error: RwSignal<Option<String>>,
+}
+
+pub fn listing_state_key(listing: &GameListing) -> String {
+    format!("{}:{}", listing.publisher_npub, listing.id)
+}
+
+pub fn use_listing_campaign_states(listings: RwSignal<Vec<GameListing>>) -> ListingCampaignStates {
+    let states = RwSignal::new(HashMap::<String, CampaignAvailability>::new());
+    let loading = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let last_fingerprint = RwSignal::new(String::new());
+    let generation = RwSignal::new(0_u64);
+
+    Effect::new(move |_| {
+        let candidates = listings.get();
+        let fingerprint = candidates
+            .iter()
+            .map(|listing| {
+                let pointers = listing
+                    .campaigns
+                    .iter()
+                    .map(|pointer| pointer.root_event_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{}={pointers}", listing_state_key(listing))
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+
+        if fingerprint == last_fingerprint.get_untracked() {
+            return;
         }
-    } else {
-        ListingPresentation {
-            price_primary: format_sats(listing.price_sats),
-            price_hint: Some(format_usd_hint(listing.price_sats)),
-            cta_label: "Buy Now",
-            is_free: false,
+        last_fingerprint.set(fingerprint);
+        error.set(None);
+        generation.update(|value| *value = value.wrapping_add(1));
+        let request_generation = generation.get_untracked();
+        let candidate_keys = candidates
+            .iter()
+            .map(listing_state_key)
+            .collect::<HashSet<_>>();
+        states.update(|current| current.retain(|key, _| candidate_keys.contains(key)));
+
+        if candidates.is_empty() {
+            loading.set(false);
+            return;
         }
+
+        loading.set(true);
+        spawn_local(async move {
+            let mut by_publisher = HashMap::<String, Vec<GameListing>>::new();
+            for listing in candidates {
+                by_publisher
+                    .entry(listing.publisher_npub.clone())
+                    .or_default()
+                    .push(listing);
+            }
+
+            for (publisher_npub, publisher_listings) in by_publisher {
+                let summary_request = DiscoverCampaignSummariesRequest {
+                    publisher_npub: publisher_npub.clone(),
+                    listings: publisher_listings
+                        .iter()
+                        .map(|listing| CampaignSummaryListingInput {
+                            listing_id: listing.id.clone(),
+                        })
+                        .collect(),
+                };
+                let summaries = match invoke_discover_campaign_summaries(summary_request).await {
+                    Ok(summaries) => summaries,
+                    Err(message) => {
+                        if generation.get_untracked() != request_generation {
+                            return;
+                        }
+                        error.set(Some(message));
+                        Vec::new()
+                    }
+                };
+                if generation.get_untracked() != request_generation {
+                    return;
+                }
+                let summaries = summaries
+                    .into_iter()
+                    .map(|summary| {
+                        let availability = if summary.active > 0 {
+                            Some(CampaignAvailability::Active)
+                        } else if summary.upcoming > 0 {
+                            Some(CampaignAvailability::Upcoming)
+                        } else {
+                            None
+                        };
+                        (summary.listing_id, availability)
+                    })
+                    .collect::<HashMap<_, _>>();
+
+                for listing in publisher_listings {
+                    let key = listing_state_key(&listing);
+                    let mut availability = summaries.get(&listing.id).copied().flatten();
+                    if availability.is_none() && !listing.campaigns.is_empty() {
+                        let request = DiscoverCampaignsRequest {
+                            publisher_npub: publisher_npub.clone(),
+                            listing_id: listing.id.clone(),
+                            pointers: listing
+                                .campaigns
+                                .iter()
+                                .map(|pointer| CampaignPointerInput {
+                                    root_event_id: pointer.root_event_id.clone(),
+                                    relay_hint: pointer.relay_hint.clone(),
+                                })
+                                .collect(),
+                        };
+                        match invoke_discover_campaigns(request).await {
+                            Ok(discovered) => {
+                                availability = if discovered
+                                    .iter()
+                                    .any(|campaign| campaign.classification == "active")
+                                {
+                                    Some(CampaignAvailability::Active)
+                                } else if discovered
+                                    .iter()
+                                    .any(|campaign| campaign.classification == "upcoming")
+                                {
+                                    Some(CampaignAvailability::Upcoming)
+                                } else if discovered.iter().any(|campaign| {
+                                    matches!(
+                                        campaign.classification.as_str(),
+                                        "ended" | "cancelled"
+                                    )
+                                }) {
+                                    Some(CampaignAvailability::Ended)
+                                } else {
+                                    None
+                                };
+                            }
+                            Err(message) => error.set(Some(message)),
+                        }
+                        if generation.get_untracked() != request_generation {
+                            return;
+                        }
+                    }
+                    states.update(|current| match availability {
+                        Some(availability) => {
+                            current.insert(key, availability);
+                        }
+                        None => {
+                            current.remove(&key);
+                        }
+                    });
+                }
+            }
+            if generation.get_untracked() == request_generation {
+                loading.set(false);
+            }
+        });
+    });
+
+    ListingCampaignStates {
+        states,
+        loading,
+        error,
     }
-}
-
-pub fn listing_publisher(listing: &GameListing) -> String {
-    listing
-        .stall_name
-        .clone()
-        .map(|name| format!("by {}", name))
-        .unwrap_or_else(|| format!("by {}", npub_fallback_label(&listing.publisher_npub)))
 }
 
 pub fn use_marketplace_listings() -> MarketplaceListingsState {
@@ -82,8 +229,10 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
     let received_count = RwSignal::new(0);
     let requested_limit = RwSignal::new(limit);
     let has_more = RwSignal::new(true);
+    let refreshing = RwSignal::new(false);
+    let using_cached_data = RwSignal::new(false);
     let last_requested_limit = RwSignal::new(0usize);
-    let loaded_account = RwSignal::new(None::<Option<String>>);
+    let loaded_account = RwSignal::new(Some(auth.npub.get_untracked()));
     let request_generation = RwSignal::new(0u64);
 
     Effect::new(move |_| {
@@ -95,6 +244,8 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
             listings.set(Vec::new());
             received_count.set(0);
             has_more.set(true);
+            refreshing.set(false);
+            using_cached_data.set(false);
             if let Some(store) = &marketplace_store {
                 store.clear();
             }
@@ -119,6 +270,7 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
             let is_initial_load = loaded_count == 0;
             loading.set(is_initial_load);
             loading_more.set(!is_initial_load);
+            refreshing.set(false);
             error.set(None);
             if loaded_count == 0 {
                 received_count.set(0);
@@ -134,6 +286,7 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                 listings.set(mocked);
                 loading.set(false);
                 loading_more.set(false);
+                using_cached_data.set(false);
                 return;
             }
 
@@ -145,8 +298,17 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                         listings.set(recent_listings(cached, target_limit));
                         loading.set(false);
                         loading_more.set(false);
+                        refreshing.set(false);
+                        using_cached_data.set(true);
                         false
                     } else {
+                        if !cached.is_empty() {
+                            listings.set(recent_listings(cached, target_limit));
+                            loading.set(false);
+                            loading_more.set(false);
+                            refreshing.set(true);
+                            using_cached_data.set(true);
+                        }
                         true
                     }
                 }
@@ -208,6 +370,12 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                                 // Wait briefly so bursts of Tauri events coalesce
                                 // into one signal update while the UI remains responsive.
                                 TimeoutFuture::new(50).await;
+
+                                if request_generation.get_untracked() != generation {
+                                    buffer.borrow_mut().clear();
+                                    flush_queued.set(false);
+                                    return;
+                                }
 
                                 let queued: Vec<GameListing> =
                                     std::mem::take(&mut *buffer.borrow_mut());
@@ -273,6 +441,8 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                             ));
                             loading.set(false);
                             loading_more.set(false);
+                            refreshing.set(false);
+                            using_cached_data.set(false);
                         });
                     }
                 };
@@ -298,7 +468,10 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                         }
 
                         // Fallback in case completion event was missed.
-                        if loading.get_untracked() || loading_more.get_untracked() {
+                        if loading.get_untracked()
+                            || loading_more.get_untracked()
+                            || refreshing.get_untracked()
+                        {
                             listings.update(|items| {
                                 items.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at));
                             });
@@ -308,6 +481,8 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                             ));
                             loading.set(false);
                             loading_more.set(false);
+                            refreshing.set(false);
+                            using_cached_data.set(false);
                         }
                     }
                     Err(e) => {
@@ -319,17 +494,22 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                                 let cached = s.get_all();
                                 if !cached.is_empty() {
                                     listings.set(recent_listings(cached, target_limit));
+                                    error.set(Some(e));
                                     loading.set(false);
                                     loading_more.set(false);
+                                    refreshing.set(false);
+                                    using_cached_data.set(true);
                                 } else {
                                     error.set(Some(e));
                                     loading.set(false);
                                     loading_more.set(false);
+                                    refreshing.set(false);
                                 }
                             } else {
                                 error.set(Some(e));
                                 loading.set(false);
                                 loading_more.set(false);
+                                refreshing.set(false);
                             }
                         });
                     }
@@ -346,6 +526,8 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
         received_count,
         requested_limit,
         has_more,
+        refreshing,
+        using_cached_data,
     }
 }
 
@@ -490,21 +672,6 @@ fn debug_mock_listings() -> Vec<GameListing> {
     ]
 }
 
-fn format_sats(value: u64) -> String {
-    let mut chars: Vec<char> = value.to_string().chars().collect();
-    let mut i = chars.len() as isize - 3;
-    while i > 0 {
-        chars.insert(i as usize, ',');
-        i -= 3;
-    }
-    format!("{} SATS", chars.into_iter().collect::<String>())
-}
-
-fn format_usd_hint(price_sats: u64) -> String {
-    let usd = (price_sats as f64) / 2000.0;
-    format!("~${:.2} USD", usd)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,36 +705,6 @@ mod tests {
             #[cfg(debug_assertions)]
             nip99_raw_event_json: None,
         }
-    }
-
-    #[test]
-    fn free_listing_uses_play_now() {
-        let listing = listing_with_sats(0);
-        let presentation = listing_presentation(&listing);
-        assert_eq!(presentation.price_primary, "FREE");
-        assert_eq!(presentation.cta_label, "Play Now");
-        assert!(presentation.is_free);
-        assert!(presentation.price_hint.is_none());
-    }
-
-    #[test]
-    fn paid_listing_uses_buy_now() {
-        let listing = listing_with_sats(8500);
-        let presentation = listing_presentation(&listing);
-        assert_eq!(presentation.price_primary, "8,500 SATS");
-        assert_eq!(presentation.cta_label, "Buy Now");
-        assert!(!presentation.is_free);
-        assert_eq!(presentation.price_hint.as_deref(), Some("~$4.25 USD"));
-    }
-
-    #[test]
-    fn listing_publisher_falls_back_to_abbreviated_npub() {
-        let mut listing = listing_with_sats(21_000);
-        listing.stall_name = None;
-        listing.publisher_npub =
-            "npub1vcq8nv3l2wcjdecvyk0xhqacdwa505fqn6zpqwmwpd6syj3d9l".to_string();
-
-        assert_eq!(listing_publisher(&listing), "by npub1vcq8nv3...6syj3d9l");
     }
 
     #[test]

@@ -45,6 +45,8 @@ pub enum FulfillmentMode {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PublishAdpListingRequest {
+    pub expected_publisher_npub: String,
+    pub existing_event_id: Option<String>,
     pub d_tag: String,
     pub title: String,
     pub description: String,
@@ -63,6 +65,8 @@ pub struct PublishAdpListingRequest {
     pub version: Option<String>,
     pub acquisition: arcadestr_core::marketplace::AcquisitionPolicy,
     pub platforms: Vec<String>,
+    pub campaigns: Vec<CampaignPointerInput>,
+    pub nip94_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -520,7 +524,8 @@ pub async fn publish_campaign(
         return Err("active signer is not the listing publisher".into());
     }
     let coordinate = listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
-    let listing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
+    // Confirm the managed listing exists before publishing a campaign.
+    fetch_listing_event_by_coordinate(&state, &coordinate).await?;
     let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
     let manager = relay_manager.lock().await;
     let report = arcadestr_core::campaign_discovery::CampaignDiscoveryService::new(&manager)
@@ -594,6 +599,9 @@ pub async fn publish_campaign(
 
     let (listing_event_id, pointer_update_error) = if request.update_listing_pointer {
         let pointer_result: Result<String, String> = async {
+            // Campaign publication can involve several relay and signing awaits. Merge the
+            // pointer into the latest listing instead of overwriting a concurrent edit.
+            let listing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
             let mut tags = listing
                 .tags
                 .iter()
@@ -1089,6 +1097,40 @@ fn publisher_hex_from_npub(publisher_npub: &str) -> Result<String, String> {
         .map_err(|err| format!("invalid publisher npub: {err}"))
 }
 
+fn verify_expected_publisher(
+    expected_publisher_npub: &str,
+    signer_pubkey: nostr::PublicKey,
+) -> Result<(), String> {
+    let expected = nostr::PublicKey::from_bech32(expected_publisher_npub)
+        .map_err(|err| format!("invalid expected publisher npub: {err}"))?;
+    if expected != signer_pubkey {
+        return Err(
+            "Active account changed before publication. Nothing was published; review the form and publish again with the intended account. (expected publisher does not match signer pubkey)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn is_publish_form_tag(values: &[String]) -> bool {
+    matches!(
+        values.first().map(String::as_str),
+        Some(
+            "d" | "title"
+                | "price"
+                | "t"
+                | "image"
+                | "acquisition"
+                | "server"
+                | "file_hash"
+                | "version"
+                | "fulfillment_pubkey"
+                | "lud16"
+                | "platform"
+        )
+    )
+}
+
 fn unique_operator_url(matches: &[AdpProvisioning]) -> Option<String> {
     match matches {
         [entry] => Some(entry.server_url.clone()),
@@ -1124,7 +1166,29 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         .get_public_key()
         .await
         .map_err(|err| err.to_string())?;
+    verify_expected_publisher(&request.expected_publisher_npub, developer_pubkey)?;
     let developer_npub = developer_pubkey.to_hex();
+    let preserving_existing_listing = request.existing_event_id.is_some();
+    let preserved_listing_tags = if let Some(expected_event_id) =
+        request.existing_event_id.as_deref()
+    {
+        let coordinate = format!("30402:{developer_npub}:{}", request.d_tag);
+        let existing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
+        if existing.id.to_hex() != expected_event_id {
+            return Err(
+                "This Game page changed since it was opened. Reload it before publishing so newer metadata is not overwritten."
+                    .to_string(),
+            );
+        }
+        existing
+            .tags
+            .iter()
+            .map(|tag| tag.clone().to_vec())
+            .filter(|values| !is_publish_form_tag(values))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let now: u64 = now_unix_i64()?
         .try_into()
         .map_err(|_| "current time is negative".to_string())?;
@@ -1339,6 +1403,17 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         }
     }
 
+    if let Some(expected_event_id) = request.existing_event_id.as_deref() {
+        let coordinate = format!("30402:{developer_npub}:{}", request.d_tag);
+        let current = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
+        if current.id.to_hex() != expected_event_id {
+            return Err(
+                "This Game page changed while publishing authorization was prepared. Reload it before publishing so newer metadata is not overwritten."
+                    .to_string(),
+            );
+        }
+    }
+
     emit_progress(&app, "publish-listing", "pending", None)?;
     let listing_input = AdpListingInput {
         d_tag: request.d_tag.clone(),
@@ -1356,6 +1431,16 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         fulfillment_revoked_at,
         acquisition: request.acquisition.clone(),
         platforms: request.platforms.clone(),
+        campaigns: request
+            .campaigns
+            .iter()
+            .filter(|_| !preserving_existing_listing)
+            .map(|pointer| (pointer.root_event_id.clone(), pointer.relay_hint.clone()))
+            .collect(),
+        nip94_event_id: (!preserving_existing_listing)
+            .then(|| request.nip94_event_id.clone())
+            .flatten(),
+        preserved_tags: preserved_listing_tags,
     };
     let listing_builder =
         build_adp_listing_event_builder(&listing_input).map_err(|err| err.to_string())?;
@@ -1720,10 +1805,45 @@ mod tests {
     use arcadestr_core::relay_hints::RelayHints;
     use arcadestr_core::relay_manager::RelayManagerConfig;
     use arcadestr_core::signers::{LocalSigner, NostrSigner};
+
     use arcadestr_core::storage::Database;
     use arcadestr_core::subscriptions::SubscriptionRegistry;
     use arcadestr_core::user_cache::UserCache;
     use nostr::{nips::nip19::ToBech32, EventBuilder, Keys, Kind, Tag, TagKind, Timestamp};
+
+    #[test]
+    fn expected_publisher_must_match_resolved_signer() {
+        let expected = nostr::Keys::generate();
+        let other = nostr::Keys::generate();
+        let expected_npub = expected
+            .public_key()
+            .to_bech32()
+            .expect("test npub should encode");
+
+        assert_eq!(
+            verify_expected_publisher(&expected_npub, expected.public_key()),
+            Ok(())
+        );
+        let error = verify_expected_publisher(&expected_npub, other.public_key())
+            .expect_err("a changed account must be rejected");
+        assert!(error.contains("Active account changed"));
+        assert!(error.contains("expected publisher does not match signer pubkey"));
+    }
+
+    #[test]
+    fn ordinary_listing_edits_preserve_unmanaged_tags() {
+        assert!(is_publish_form_tag(&["title".into(), "Game".into()]));
+        assert!(is_publish_form_tag(&[
+            "fulfillment_pubkey".into(),
+            "key".into()
+        ]));
+        assert!(!is_publish_form_tag(&["campaign".into(), "root".into()]));
+        assert!(!is_publish_form_tag(&[
+            "summary".into(),
+            "Short description".into()
+        ]));
+        assert!(!is_publish_form_tag(&["status".into(), "active".into()]));
+    }
 
     #[test]
     fn timed_acquisition_wire_format_deserializes_into_core_policy() {
@@ -2539,6 +2659,14 @@ mod tests {
                 .as_nanos()
         );
         let request = PublishAdpListingRequest {
+            expected_publisher_npub: nostr::Keys::parse(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
+            .expect("live test key should parse")
+            .public_key()
+            .to_bech32()
+            .expect("live test npub should encode"),
+            existing_event_id: None,
             d_tag: d_tag.clone(),
             title: "Gate 3 Live Test Binary".to_string(),
             description: "Small live ADP command-level publish test fixture".to_string(),
@@ -2557,6 +2685,8 @@ mod tests {
             version: Some("0.0.1-live".to_string()),
             acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
             platforms: vec!["linux-x86_64".to_string()],
+            campaigns: Vec::new(),
+            nip94_event_id: None,
         };
 
         let result = publish_adp_listing(
