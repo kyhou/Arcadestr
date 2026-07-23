@@ -100,6 +100,8 @@ pub struct AdpServerInfo {
 pub struct ProvisionResponse {
     pub fulfillment_pubkey: String,
     pub attestation_event_id: String,
+    #[serde(default)]
+    pub attestation: Option<Event>,
     pub scope: Option<String>,
 }
 

@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arcadestr_core::adp_client::{
     AdpClient, AdpServerInfo, EntitlementClaimRequest as CoreEntitlementClaimRequest,
-    PurchaseConfirmRequest as CorePurchaseConfirmRequest,
+    ProvisionResponse, PurchaseConfirmRequest as CorePurchaseConfirmRequest,
     PurchaseConfirmResponse as CorePurchaseConfirmResponse, UploadResponse,
 };
 use arcadestr_core::adp_discovery::{
@@ -1308,9 +1308,11 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                         authorization_event_id,
                         valid_from: _,
                         authorization_event,
+                        attestation,
                         row,
                     } => {
-                        validate_current_attestation(&state, &row, now).await?;
+                        validate_current_attestation(&state, &row, attestation.as_deref(), now)
+                            .await?;
                         ensure_publish_account_current(
                             &state,
                             signer_state.inner(),
@@ -1338,9 +1340,11 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                         authorization_event_id,
                         valid_from: _,
                         authorization_event,
+                        attestation,
                         row,
                     } => {
-                        validate_current_attestation(&state, &row, now).await?;
+                        validate_current_attestation(&state, &row, attestation.as_deref(), now)
+                            .await?;
                         ensure_publish_account_current(
                             &state,
                             signer_state.inner(),
@@ -1380,6 +1384,12 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
 
                 let provisioning_repo =
                     AdpProvisioningRepository::new(state.database.pool().clone());
+                let adp_client =
+                    AdpClient::new(operator_url.to_string(), Arc::clone(&state.http_client));
+                let provision = adp_client
+                    .provision(signer.as_ref(), Some(&request.d_tag))
+                    .await
+                    .map_err(|error| progress_error(&app, "provision", error))?;
                 let repair = repair_existing_authorization(ExistingAuthorizationRepairInput {
                     provisioning_repo: &provisioning_repo,
                     signer: signer.as_ref(),
@@ -1388,9 +1398,16 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                     operator_url,
                     scope: &request.d_tag,
                     fulfillment_pubkey: existing_pubkey,
+                    provision: &provision,
                 })
                 .await?;
-                validate_current_attestation(&state, &repair.row, now).await?;
+                validate_current_attestation(
+                    &state,
+                    &repair.row,
+                    repair.attestation.as_deref(),
+                    now,
+                )
+                .await?;
                 ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey)
                     .await?;
                 provisioning_repo
@@ -1558,28 +1575,36 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
 async fn validate_current_attestation(
     state: &State<'_, AppState>,
     row: &AdpProvisioning,
+    provided: Option<&nostr::Event>,
     now: u64,
 ) -> Result<(), String> {
     let operator = nostr::PublicKey::from_hex(&row.operator_pubkey)
         .map_err(|_| "operator pubkey is invalid".to_string())?;
-    let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
-    let relay_manager = relay_manager.lock().await;
     let d = format!("{}:{}", row.developer_npub, row.fulfillment_pubkey);
-    let events = relay_manager
-        .fetch_events_best_effort(
-            nostr::Filter::new()
-                .kind(nostr::Kind::Custom(30404))
-                .author(operator),
-        )
-        .await
-        .map_err(|error| format!("operator attestation evidence unavailable: {error}"))?;
-    let attestation = select_replaceable_event(events.into_iter().filter(|event| {
-        event
-            .tags
-            .iter()
-            .any(|tag| matches!(tag.as_slice(), [name, value] if name == "d" && value == &d))
-    }))
-    .ok_or_else(|| "operator attestation evidence unavailable".to_string())?;
+    let attestation = if let Some(attestation) = provided {
+        if attestation.id.to_hex() != row.attestation_event_id {
+            return Err("operator attestation evidence ID mismatch".into());
+        }
+        attestation.clone()
+    } else {
+        let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+        let relay_manager = relay_manager.lock().await;
+        let events = relay_manager
+            .fetch_events_best_effort(
+                nostr::Filter::new()
+                    .kind(nostr::Kind::Custom(30404))
+                    .author(operator),
+            )
+            .await
+            .map_err(|error| format!("operator attestation evidence unavailable: {error}"))?;
+        select_replaceable_event(events.into_iter().filter(|event| {
+            event
+                .tags
+                .iter()
+                .any(|tag| matches!(tag.as_slice(), [name, value] if name == "d" && value == &d))
+        }))
+        .ok_or_else(|| "operator attestation evidence unavailable".to_string())?
+    };
     let parsed = arcadestr_core::authorization::parse_attestation_event(&attestation)
         .map_err(|error| format!("invalid operator attestation: {error}"))?;
     if attestation.pubkey != operator
@@ -1599,6 +1624,7 @@ enum ProvisioningDecision {
         authorization_event_id: String,
         valid_from: i64,
         authorization_event: Box<nostr::Event>,
+        attestation: Option<Box<nostr::Event>>,
         row: Box<AdpProvisioning>,
     },
     Created {
@@ -1606,6 +1632,7 @@ enum ProvisioningDecision {
         authorization_event_id: String,
         valid_from: i64,
         authorization_event: Box<nostr::Event>,
+        attestation: Option<Box<nostr::Event>>,
         row: Box<AdpProvisioning>,
     },
 }
@@ -1629,11 +1656,13 @@ struct ExistingAuthorizationRepairInput<'a> {
     operator_url: &'a str,
     scope: &'a str,
     fulfillment_pubkey: &'a str,
+    provision: &'a ProvisionResponse,
 }
 
 struct ExistingAuthorizationRepair {
     authorization_event_id: String,
     authorization_event: nostr::Event,
+    attestation: Option<Box<nostr::Event>>,
     row: AdpProvisioning,
 }
 
@@ -1647,6 +1676,12 @@ fn existing_authorization_repair_key(
 async fn repair_existing_authorization(
     input: ExistingAuthorizationRepairInput<'_>,
 ) -> Result<ExistingAuthorizationRepair, String> {
+    if input.provision.fulfillment_pubkey != input.fulfillment_pubkey {
+        return Err(
+            "distribution provider returned a different active fulfillment key; reload the listing before publishing"
+                .into(),
+        );
+    }
     let matches = input
         .provisioning_repo
         .for_fulfillment_scope(input.developer_hex, input.fulfillment_pubkey, input.scope)
@@ -1699,10 +1734,12 @@ async fn repair_existing_authorization(
     row.authorization_root_event_id = Some(authorization_event_id.clone());
     row.authorization_capabilities = terms.capabilities.into_iter().collect();
     row.authorization_profile_version = 2;
+    row.attestation_event_id = input.provision.attestation_event_id.clone();
 
     Ok(ExistingAuthorizationRepair {
         authorization_event_id,
         authorization_event,
+        attestation: input.provision.attestation.clone().map(Box::new),
         row,
     })
 }
@@ -1711,12 +1748,21 @@ async fn resolve_provisioning(
     input: ResolveProvisioningInput<'_>,
 ) -> Result<ProvisioningDecision, String> {
     let listing_coordinate = format!("30402:{}:{}", input.developer_pubkey.to_hex(), input.scope);
+    let provision = input
+        .adp_client
+        .provision(input.signer, Some(input.scope))
+        .await
+        .map_err(|err| err.to_string())?;
 
     if let Some(existing) = input
         .provisioning_repo
         .active_for_scope(input.developer_npub, input.server_url, Some(input.scope))
         .await
         .map_err(|err| err.to_string())?
+        .filter(|existing| {
+            existing.fulfillment_pubkey == provision.fulfillment_pubkey
+                && existing.attestation_event_id == provision.attestation_event_id
+        })
     {
         let valid_from: u64 = now_unix_i64()?
             .try_into()
@@ -1754,15 +1800,10 @@ async fn resolve_provisioning(
             authorization_event_id,
             valid_from: row.valid_from,
             authorization_event: Box::new(authorization_event),
+            attestation: provision.attestation.clone().map(Box::new),
             row: Box::new(row),
         });
     }
-
-    let provision = input
-        .adp_client
-        .provision(input.signer, Some(input.scope))
-        .await
-        .map_err(|err| err.to_string())?;
     let now = now_unix_i64()?;
     let valid_from: u64 = now
         .try_into()
@@ -1799,7 +1840,7 @@ async fn resolve_provisioning(
         operator_pubkey: input.server_info.pubkey.clone(),
         scope: Some(input.scope.to_string()),
         fulfillment_pubkey: provision.fulfillment_pubkey.clone(),
-        attestation_event_id: provision.attestation_event_id,
+        attestation_event_id: provision.attestation_event_id.clone(),
         acceptance_event_id: authorization_event_id.clone(),
         authorization_root_event_id: Some(authorization_event_id.clone()),
         authorization_capabilities: terms.capabilities.into_iter().collect(),
@@ -1814,6 +1855,7 @@ async fn resolve_provisioning(
         authorization_event_id,
         valid_from: row.valid_from,
         authorization_event: Box::new(authorization_event),
+        attestation: provision.attestation.map(Box::new),
         row: Box::new(row),
     })
 }
@@ -2380,7 +2422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_same_scope_reuses_provisioning_without_second_provision_call() {
+    async fn publish_same_scope_reuses_provisioning_after_revalidating_with_operator() {
         let db = test_db().await;
         let repo = AdpProvisioningRepository::new(db.pool().clone());
         let provision_url = "https://dist.example.com/provision";
@@ -2471,11 +2513,11 @@ mod tests {
         assert_eq!(row.fulfillment_pubkey, fulfillment_pubkey);
         assert_eq!(row.valid_from, valid_from);
         assert_eq!(row.acceptance_event_id, authorization_event.id.to_hex());
-        assert_eq!(mock.post_call_count(provision_url), 1);
+        assert_eq!(mock.post_call_count(provision_url), 2);
     }
 
     #[tokio::test]
-    async fn existing_unrevoked_delegated_edit_repairs_authorization_without_provisioning() {
+    async fn existing_unrevoked_delegated_edit_repairs_authorization_with_fresh_evidence() {
         let db = test_db().await;
         let repo = AdpProvisioningRepository::new(db.pool().clone());
         let developer = LocalSigner::from_hex(
@@ -2510,6 +2552,12 @@ mod tests {
             created_at: original_valid_from,
         };
         repo.upsert(&row).await.expect("row should persist");
+        let provision = ProvisionResponse {
+            fulfillment_pubkey: fulfillment_pubkey.clone(),
+            attestation_event_id: "refreshed-attestation-id".to_string(),
+            attestation: None,
+            scope: Some("game".to_string()),
+        };
 
         let repair = repair_existing_authorization(ExistingAuthorizationRepairInput {
             provisioning_repo: &repo,
@@ -2519,6 +2567,7 @@ mod tests {
             operator_url: "https://operator.example.com",
             scope: "game",
             fulfillment_pubkey: &fulfillment_pubkey,
+            provision: &provision,
         })
         .await
         .expect("existing authorization should repair");
@@ -2535,6 +2584,7 @@ mod tests {
         assert_eq!(terms.valid_from, repair.row.valid_from as u64);
         assert!(repair.row.valid_from >= original_valid_from);
         assert_eq!(repair.row.fulfillment_pubkey, fulfillment_pubkey);
+        assert_eq!(repair.row.attestation_event_id, "refreshed-attestation-id");
         assert_eq!(
             repair.row.acceptance_event_id,
             repair.authorization_event.id.to_hex()
