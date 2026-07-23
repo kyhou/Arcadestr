@@ -6,6 +6,7 @@ use std::sync::Arc;
 use nostr::Event;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 
 use crate::http_client::{HttpClient, HttpClientError};
 use crate::nip98_client::{build_nip98_auth_header, Nip98ClientError};
@@ -240,13 +241,29 @@ impl AdpClient {
     /// Uploads a build file for an already-published listing.
     ///
     /// # Errors
-    /// Always returns [`AdpClientError::NotImplemented`] in Gate 1.
+    /// Returns an error if the file cannot be read, authentication fails, or the server rejects
+    /// the upload.
     pub async fn upload(
         &self,
         signer: &dyn NostrSigner,
         listing_event: &Event,
         file_path: &Path,
     ) -> Result<UploadResponse, AdpClientError> {
+        self.upload_with_progress(signer, listing_event, file_path, |_, _| {})
+            .await
+    }
+
+    /// Uploads a build file and reports file bytes as they are streamed into the request body.
+    pub async fn upload_with_progress<F>(
+        &self,
+        signer: &dyn NostrSigner,
+        listing_event: &Event,
+        file_path: &Path,
+        on_progress: F,
+    ) -> Result<UploadResponse, AdpClientError>
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+    {
         let url = self.url("/upload");
         let auth_header = build_nip98_auth_header(signer, &url, "POST").await?;
         let listing_json = serde_json::to_string(listing_event)?;
@@ -255,8 +272,29 @@ impl AdpClient {
             .and_then(|name| name.to_str())
             .unwrap_or("game-build")
             .to_string();
-        let file_bytes = tokio::fs::read(file_path).await?;
-        let file_part = reqwest::multipart::Part::bytes(file_bytes).file_name(file_name);
+        let total_bytes = tokio::fs::metadata(file_path).await?.len();
+        let file = tokio::fs::File::open(file_path).await?;
+        let on_progress = Arc::new(on_progress);
+        on_progress(0, total_bytes);
+        let stream = futures::stream::try_unfold(
+            (file, 0_u64, on_progress),
+            move |(mut file, uploaded, on_progress)| async move {
+                let mut chunk = vec![0_u8; 64 * 1024];
+                let read = file.read(&mut chunk).await?;
+                if read == 0 {
+                    return Ok::<_, std::io::Error>(None);
+                }
+                chunk.truncate(read);
+                let uploaded = uploaded.saturating_add(read as u64);
+                on_progress(uploaded, total_bytes);
+                Ok(Some((chunk, (file, uploaded, on_progress))))
+            },
+        );
+        let file_part = reqwest::multipart::Part::stream_with_length(
+            reqwest::Body::wrap_stream(stream),
+            total_bytes,
+        )
+        .file_name(file_name);
         let form = reqwest::multipart::Form::new()
             .text("listing_event", listing_json)
             .part("file", file_part);

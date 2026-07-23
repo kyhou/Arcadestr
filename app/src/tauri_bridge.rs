@@ -225,6 +225,8 @@ pub struct PublishProgressPayload {
     pub status: String,
     pub server_url: Option<String>,
     pub message: Option<String>,
+    pub bytes_uploaded: Option<u64>,
+    pub total_bytes: Option<u64>,
 }
 
 /// ADP server announcement discovered from relays.

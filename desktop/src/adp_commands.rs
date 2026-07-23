@@ -1,6 +1,7 @@
 //! Tauri commands for ADP publish flow.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -102,6 +103,8 @@ pub struct PublishProgressPayload {
     pub status: String,
     pub server_url: Option<String>,
     pub message: Option<String>,
+    pub bytes_uploaded: Option<u64>,
+    pub total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1515,11 +1518,29 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         for server_url in &request.servers {
             emit_server_progress(&app, "upload", "pending", Some(server_url.clone()), None)?;
             let adp_client = AdpClient::new(server_url.clone(), Arc::clone(&state.http_client));
+            let progress_app = app.clone();
+            let progress_server_url = server_url.clone();
+            let last_reported_percent = Arc::new(AtomicU64::new(u64::MAX));
             match adp_client
-                .upload(
+                .upload_with_progress(
                     signer.as_ref(),
                     &listing_event,
                     std::path::Path::new(file_path),
+                    move |bytes_uploaded, total_bytes| {
+                        let percent = if total_bytes == 0 {
+                            100
+                        } else {
+                            bytes_uploaded.saturating_mul(100) / total_bytes
+                        };
+                        if last_reported_percent.swap(percent, Ordering::Relaxed) != percent {
+                            let _ = emit_upload_progress(
+                                &progress_app,
+                                &progress_server_url,
+                                bytes_uploaded,
+                                total_bytes,
+                            );
+                        }
+                    },
                 )
                 .await
             {
@@ -1896,6 +1917,28 @@ fn emit_server_progress<R: tauri::Runtime>(
             status: status.to_string(),
             server_url,
             message,
+            bytes_uploaded: None,
+            total_bytes: None,
+        },
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn emit_upload_progress<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    server_url: &str,
+    bytes_uploaded: u64,
+    total_bytes: u64,
+) -> Result<(), String> {
+    app.emit(
+        "publish-progress",
+        PublishProgressPayload {
+            step: "upload".to_string(),
+            status: "progress".to_string(),
+            server_url: Some(server_url.to_string()),
+            message: None,
+            bytes_uploaded: Some(bytes_uploaded),
+            total_bytes: Some(total_bytes),
         },
     )
     .map_err(|err| err.to_string())

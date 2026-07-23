@@ -312,6 +312,13 @@ fn progress_label(event: &PublishProgressPayload) -> String {
     )
 }
 
+fn upload_percent(bytes_uploaded: u64, total_bytes: u64) -> u64 {
+    if total_bytes == 0 {
+        return 100;
+    }
+    (bytes_uploaded.saturating_mul(100) / total_bytes).min(100)
+}
+
 fn publication_account_matches(initiating_npub: &str, active_npub: Option<&str>) -> bool {
     active_npub == Some(initiating_npub)
 }
@@ -1063,6 +1070,8 @@ mod tests {
                 status: "ok".into(),
                 server_url: None,
                 message: None,
+                bytes_uploaded: None,
+                total_bytes: None,
             },
         );
         let partial = publication_progress(
@@ -1072,6 +1081,8 @@ mod tests {
                 status: "error".into(),
                 server_url: Some("https://dist.example.com".into()),
                 message: Some("offline".into()),
+                bytes_uploaded: None,
+                total_bytes: None,
             },
         );
         assert_eq!(partial.outcome, PublicationOutcome::Partial);
@@ -1084,6 +1095,13 @@ mod tests {
         let command_failure = publication_completed(partial, Err("upload failed".into()));
         assert_eq!(command_failure.outcome, PublicationOutcome::Partial);
         assert_ne!(command_failure.outcome, PublicationOutcome::Complete);
+    }
+
+    #[test]
+    fn upload_percentage_is_bounded_and_handles_empty_files() {
+        assert_eq!(upload_percent(25, 100), 25);
+        assert_eq!(upload_percent(100, 100), 100);
+        assert_eq!(upload_percent(0, 0), 100);
     }
 
     #[test]
@@ -1249,6 +1267,7 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
     let is_hashing = RwSignal::new(false);
     let error_message = RwSignal::new(None::<String>);
     let progress_events = RwSignal::new(Vec::<PublishProgressPayload>::new());
+    let upload_progress = RwSignal::new(None::<PublishProgressPayload>);
     let publication_state = RwSignal::new(PublicationState::default());
     let initiating_account = RwSignal::new(None::<String>);
     let publication_account_stale = RwSignal::new(false);
@@ -1590,6 +1609,7 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
         publication_account_stale.set(false);
         error_message.set(None);
         progress_events.set(Vec::new());
+        upload_progress.set(None);
         publication_state.set(PublicationState {
             outcome: PublicationOutcome::Publishing,
             ..PublicationState::default()
@@ -1612,9 +1632,12 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
                     return;
                 }
                 if payload.step == "upload" {
+                    if payload.bytes_uploaded.is_some() && payload.total_bytes.is_some() {
+                        upload_progress.set(Some(payload.clone()));
+                    }
                     if let Some(server_url) = payload.server_url.clone() {
                         let status = match payload.status.as_str() {
-                            "pending" => ServerStatus::Pending,
+                            "pending" | "progress" => ServerStatus::Pending,
                             "ok" => ServerStatus::Ok,
                             "error" => ServerStatus::Failed,
                             _ => ServerStatus::Idle,
@@ -1630,7 +1653,9 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
                 }
                 publication_state
                     .update(|state| *state = publication_progress(state.clone(), &payload));
-                progress_events.update(|events| events.push(payload));
+                if payload.status != "progress" {
+                    progress_events.update(|events| events.push(payload));
+                }
             })
             .await;
             let listener_cleanup = match listener_cleanup {
@@ -2006,6 +2031,23 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
                         {move || publication_state.get().message.map(|msg| {
                             let class = match publication_state.get().outcome { PublicationOutcome::Complete => "text-secondary", PublicationOutcome::Partial | PublicationOutcome::Failed => "text-error", _ => "text-on-surface-variant" };
                             view! { <p class={class}>{msg}</p> }
+                        })}
+                        {move || upload_progress.get().and_then(|event| {
+                            let bytes_uploaded = event.bytes_uploaded?;
+                            let total_bytes = event.total_bytes?;
+                            let percent = upload_percent(bytes_uploaded, total_bytes);
+                            let server = event.server_url.unwrap_or_else(|| "distribution server".to_string());
+                            Some(view! {
+                                <div class="mt-4" role="progressbar" aria-label="Build upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>
+                                    <div class="mb-2 flex items-center justify-between gap-3 text-xs font-bold">
+                                        <span class="truncate">{format!("Uploading to {server}")}</span>
+                                        <span>{format!("{percent}%")}</span>
+                                    </div>
+                                    <div class="h-2.5 overflow-hidden rounded-full bg-surface-container-highest">
+                                        <div class="h-full rounded-full bg-primary transition-[width] duration-200" style=format!("width: {percent}%")></div>
+                                    </div>
+                                </div>
+                            })
                         })}
                         <ul class="mt-3 space-y-2 text-xs text-on-surface-variant">
                             {move || progress_events.get().into_iter().map(|event| view! {
