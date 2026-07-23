@@ -8,7 +8,10 @@ use crate::relay_events::{RelayConnectionEvent, RelayStatus};
 use crate::relay_pool::{RelayPool, RelaySource};
 use futures::future;
 use nostr_sdk::{Client, Event, Filter, Url};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout, Duration};
@@ -370,28 +373,30 @@ impl RelayManager {
         let collected: Arc<std::sync::Mutex<Vec<Event>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&collected);
+        let relay_responded = Arc::new(AtomicBool::new(false));
+        let response_seen = Arc::clone(&relay_responded);
 
-        let _ = self
-            .fetch_events_streaming(
-                filter,
-                self.config.query_timeout_secs,
-                3,
-                move |_relay_url, events| {
-                    let mut guard = sink.lock().expect("best_effort_events mutex poisoned");
-                    guard.extend(events);
-                },
-            )
-            .await;
+        self.fetch_events_streaming(
+            filter,
+            self.config.query_timeout_secs,
+            3,
+            move |_relay_url, events| {
+                response_seen.store(true, Ordering::Relaxed);
+                let mut guard = sink.lock().expect("best_effort_events mutex poisoned");
+                guard.extend(events);
+            },
+        )
+        .await?;
 
         let events = collected
             .lock()
             .expect("best_effort_events mutex poisoned")
             .clone();
 
-        if events.is_empty() {
-            Err(RelayManagerError::QueryTimeout)
-        } else {
+        if relay_responded.load(Ordering::Relaxed) {
             Ok(events)
+        } else {
+            Err(RelayManagerError::QueryTimeout)
         }
     }
 
