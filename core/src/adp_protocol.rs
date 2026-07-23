@@ -1,10 +1,12 @@
 use nostr::EventId;
 use thiserror::Error;
 
-/// Provisional development kind used by the current ADP server for grants.
-pub const ENTITLEMENT_GRANT_KIND: u16 = 1030;
-/// Provisional development kind used by the current ADP server for campaigns.
-pub const ADP_CAMPAIGN_KIND: u16 = 1031;
+/// Implementation-local experimental kind. This is not an interoperable allocation.
+pub const EXPERIMENTAL_ENTITLEMENT_GRANT_KIND: u16 = 1030;
+/// Implementation-local experimental kind. This is not an interoperable allocation.
+pub const EXPERIMENTAL_ADP_CAMPAIGN_KIND: u16 = 1031;
+pub const ENTITLEMENT_GRANT_KIND: u16 = EXPERIMENTAL_ENTITLEMENT_GRANT_KIND;
+pub const ADP_CAMPAIGN_KIND: u16 = EXPERIMENTAL_ADP_CAMPAIGN_KIND;
 pub const FULFILLMENT_AUTHORIZATION_KIND: u16 = 30406;
 
 pub const TAG_IDENTIFIER: &str = "d";
@@ -17,7 +19,7 @@ pub const TAG_STARTS: &str = "starts";
 pub const TAG_ENDS: &str = "ends";
 pub const TAG_SOURCE_EVENT: &str = "source_event";
 pub const TAG_REASON: &str = "reason";
-pub const TAG_AUTHORIZATION_EVENT: &str = "authorization_event";
+pub const TAG_AUTHORIZATION_EVENT: &str = "authorization";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProtocolEventError {

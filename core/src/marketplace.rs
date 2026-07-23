@@ -21,6 +21,7 @@
 
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 pub use crate::is_replaceable_event_newer;
 
@@ -260,6 +261,14 @@ pub struct CampaignPointer {
     pub relay_hint: Option<String>,
 }
 
+/// One independently valid listing reference to a fulfillment authorization root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulfillmentAuthorizationReference {
+    pub root_event_id: nostr::EventId,
+    pub fulfillment_pubkey: nostr::PublicKey,
+    pub relay_hint: Option<String>,
+}
+
 /// A NIP-99 listing (kind 30402/30403) enriched with event-level metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Nip99Listing {
@@ -297,15 +306,12 @@ pub struct Nip99Listing {
     /// Published artifact version.
     #[serde(default)]
     pub version: Option<String>,
-    /// Publisher or delegated fulfillment key.
+    /// Independently parsed valid authorization references.
     #[serde(default)]
-    pub fulfillment_pubkey: Option<String>,
-    /// First timestamp at which the fulfillment key is valid.
+    pub fulfillment_authorizations: Vec<FulfillmentAuthorizationReference>,
+    /// Malformed raw references retained for diagnostics without poisoning siblings.
     #[serde(default)]
-    pub fulfillment_valid_from: Option<u64>,
-    /// Optional fulfillment-key revocation timestamp.
-    #[serde(default)]
-    pub fulfillment_revoked_at: Option<u64>,
+    pub malformed_fulfillment_authorization_tags: Vec<Vec<String>>,
     /// Current explicit access policy. Missing or malformed tags fail closed.
     #[serde(default)]
     pub acquisition: AcquisitionPolicy,
@@ -869,9 +875,9 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
     let mut servers = Vec::new();
     let mut file_hash = None;
     let mut version = None;
-    let mut fulfillment_pubkey = None;
-    let mut fulfillment_valid_from = None;
-    let mut fulfillment_revoked_at = None;
+    let mut fulfillment_authorizations = Vec::new();
+    let mut malformed_fulfillment_authorization_tags = Vec::new();
+    let mut seen_fulfillment_authorization_tags = HashSet::new();
     let mut acquisition = AcquisitionPolicy::Gated;
     let mut acquisition_seen = false;
     let mut campaigns = Vec::new();
@@ -960,14 +966,38 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
                     version = v.get(1).filter(|value| !value.is_empty()).cloned();
                 }
             }
-            Some("fulfillment_pubkey") => {
-                if fulfillment_pubkey.is_none() {
-                    fulfillment_pubkey = v.get(1).filter(|key| !key.is_empty()).cloned();
-                    fulfillment_valid_from = v.get(2).and_then(|value| value.parse().ok());
-                    fulfillment_revoked_at = v
-                        .get(3)
-                        .filter(|value| !value.is_empty())
-                        .and_then(|value| value.parse().ok());
+            Some("fulfillment_authorization") => {
+                if !seen_fulfillment_authorization_tags.insert(v.clone()) {
+                    continue;
+                }
+                let parsed = match v.as_slice() {
+                    [_, root, pubkey] => nostr::EventId::from_hex(root)
+                        .ok()
+                        .zip(nostr::PublicKey::from_hex(pubkey).ok())
+                        .map(|(root_event_id, fulfillment_pubkey)| {
+                            FulfillmentAuthorizationReference {
+                                root_event_id,
+                                fulfillment_pubkey,
+                                relay_hint: None,
+                            }
+                        }),
+                    [_, root, pubkey, relay] if !relay.is_empty() => nostr::EventId::from_hex(root)
+                        .ok()
+                        .zip(nostr::PublicKey::from_hex(pubkey).ok())
+                        .zip(nostr::RelayUrl::parse(relay).ok())
+                        .map(|((root_event_id, fulfillment_pubkey), _)| {
+                            FulfillmentAuthorizationReference {
+                                root_event_id,
+                                fulfillment_pubkey,
+                                relay_hint: Some(relay.clone()),
+                            }
+                        }),
+                    _ => None,
+                };
+                if let Some(reference) = parsed {
+                    fulfillment_authorizations.push(reference);
+                } else {
+                    malformed_fulfillment_authorization_tags.push(v);
                 }
             }
             Some("acquisition") if !acquisition_seen => {
@@ -1028,9 +1058,8 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
         servers,
         file_hash,
         version,
-        fulfillment_pubkey,
-        fulfillment_valid_from,
-        fulfillment_revoked_at,
+        fulfillment_authorizations,
+        malformed_fulfillment_authorization_tags,
         acquisition,
         campaigns,
         status,
@@ -1352,9 +1381,8 @@ mod tests {
             servers: Vec::new(),
             file_hash: None,
             version: None,
-            fulfillment_pubkey: None,
-            fulfillment_valid_from: None,
-            fulfillment_revoked_at: None,
+            fulfillment_authorizations: Vec::new(),
+            malformed_fulfillment_authorization_tags: Vec::new(),
             acquisition: AcquisitionPolicy::Gated,
             campaigns: Vec::new(),
             raw_event_json: None,
@@ -1501,9 +1529,50 @@ mod tests {
         assert_eq!(listing.servers, vec!["http://localhost:9099"]);
         assert_eq!(listing.file_hash.as_deref(), Some("abc123"));
         assert_eq!(listing.version.as_deref(), Some("1.4.2"));
-        assert_eq!(listing.fulfillment_pubkey.as_deref(), Some("delegate-key"));
-        assert_eq!(listing.fulfillment_valid_from, Some(1_700_000_000));
-        assert_eq!(listing.fulfillment_revoked_at, None);
+        assert!(listing.fulfillment_authorizations.is_empty());
+        assert!(listing.malformed_fulfillment_authorization_tags.is_empty());
+    }
+
+    #[test]
+    fn valid_authorization_siblings_survive_malformed_entries_and_same_key_roots() {
+        let fulfillment = Keys::generate().public_key().to_hex();
+        let first_root = EventId::from_hex(&"11".repeat(32)).expect("root");
+        let second_root = EventId::from_hex(&"22".repeat(32)).expect("root");
+        let event = make_nip99_event(
+            30402,
+            "ADP listing",
+            vec![
+                vec!["d", "managed-game"],
+                vec!["title", "Managed Game"],
+                vec![
+                    "fulfillment_authorization",
+                    &first_root.to_hex(),
+                    &fulfillment,
+                ],
+                vec!["fulfillment_authorization", "bad", "bad"],
+                vec![
+                    "fulfillment_authorization",
+                    &second_root.to_hex(),
+                    &fulfillment,
+                ],
+                vec![
+                    "fulfillment_authorization",
+                    &first_root.to_hex(),
+                    &fulfillment,
+                ],
+            ],
+        );
+        let listing = parse_listing(event).expect("listing");
+        assert_eq!(listing.fulfillment_authorizations.len(), 2);
+        assert_eq!(listing.malformed_fulfillment_authorization_tags.len(), 1);
+        assert_eq!(
+            listing.fulfillment_authorizations[0].root_event_id,
+            first_root
+        );
+        assert_eq!(
+            listing.fulfillment_authorizations[1].root_event_id,
+            second_root
+        );
     }
 
     #[test]

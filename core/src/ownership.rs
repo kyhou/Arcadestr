@@ -74,18 +74,18 @@ impl OwnershipService {
         game_coordinate: &str,
     ) -> Result<OwnershipSource, OwnershipError> {
         if self
-            .purchases
-            .is_owned(buyer_pubkey, game_coordinate)
-            .await?
-        {
-            return Ok(OwnershipSource::PurchaseReceipt);
-        }
-        if self
             .entitlements
             .is_owned(buyer_pubkey, game_coordinate)
             .await?
         {
             return Ok(OwnershipSource::EntitlementGrant);
+        }
+        if self
+            .purchases
+            .is_owned(buyer_pubkey, game_coordinate)
+            .await?
+        {
+            return Ok(OwnershipSource::PurchaseReceipt);
         }
         Ok(OwnershipSource::None)
     }
@@ -290,7 +290,7 @@ mod tests {
         status: &str,
         created_at: u64,
     ) -> StoredReceipt {
-        let preimage = [7_u8; 32];
+        let preimage = [created_at as u8; 32];
         let payment_hash = sha256::Hash::hash(&preimage);
         let invoice_key = SecretKey::from_slice(&[42_u8; 32]).expect("invoice key should parse");
         let invoice = InvoiceBuilder::new(Currency::Bitcoin)
@@ -307,6 +307,10 @@ mod tests {
                 Tag::custom(TagKind::p(), [buyer.public_key().to_hex()]),
                 Tag::custom(TagKind::a(), [coordinate(merchant, id)]),
                 Tag::custom(TagKind::custom("order"), [order]),
+                Tag::custom(TagKind::custom("payment_hash"), [payment_hash.to_string()]),
+                Tag::custom(TagKind::custom("amount_msat"), ["21000"]),
+                Tag::custom(TagKind::custom("settled_at"), [created_at.to_string()]),
+                Tag::custom(TagKind::custom("proof"), ["bolt11-preimage"]),
                 Tag::custom(TagKind::custom("bolt11"), [invoice.to_string()]),
                 Tag::custom(TagKind::custom("preimage"), [hex::encode(preimage)]),
                 Tag::custom(TagKind::custom("status"), [status]),
@@ -314,8 +318,21 @@ mod tests {
             .custom_created_at(Timestamp::from(created_at))
             .sign_with_keys(merchant)
             .expect("receipt should sign");
-        parse_and_validate_receipt(&event, &buyer.public_key().to_hex())
-            .expect("receipt should validate")
+        if status == "paid" {
+            return parse_and_validate_receipt(&event, &buyer.public_key().to_hex())
+                .expect("receipt should validate");
+        }
+        StoredReceipt {
+            event_id: event.id.to_hex(),
+            order_id: order.to_string(),
+            listing_coordinate: coordinate(merchant, id),
+            buyer_pubkey: buyer.public_key().to_hex(),
+            merchant_pubkey: merchant.public_key().to_hex(),
+            payment_hash: Some(payment_hash.to_string()),
+            status: status.to_string(),
+            created_at,
+            raw_event: serde_json::to_string(&event).expect("receipt should serialize"),
+        }
     }
 
     fn grant_event(

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use arcadestr_core::adp_protocol::{ADP_CAMPAIGN_KIND, ENTITLEMENT_GRANT_KIND};
 use arcadestr_core::campaign::{parse_campaign_event, resolve_campaign};
-use arcadestr_core::entitlements::{GrantStatus, IssuanceDelegation};
+use arcadestr_core::entitlements::GrantStatus;
 use arcadestr_core::entitlements_repository::EntitlementsRepository;
 use arcadestr_core::ownership::{OwnershipService, OwnershipSource};
 use arcadestr_core::purchases::PurchasesRepository;
@@ -110,11 +110,11 @@ async fn valid_grant_is_idempotently_persisted_and_proves_ownership() {
     let repository = EntitlementsRepository::new(db.pool().clone());
 
     repository
-        .ingest_event(&event, &campaign, None, &[])
+        .ingest_event(&event, &campaign, None)
         .await
         .expect("grant ingests");
     repository
-        .ingest_event(&event, &campaign, None, &[])
+        .ingest_event(&event, &campaign, None)
         .await
         .expect("duplicate is idempotent");
 
@@ -164,11 +164,11 @@ async fn publisher_revocation_removes_grant_ownership() {
     );
     let repository = EntitlementsRepository::new(db.pool().clone());
     repository
-        .ingest_event(&root, &campaign, None, &[])
+        .ingest_event(&root, &campaign, None)
         .await
         .expect("root ingests");
     repository
-        .ingest_event(&revoke, &campaign, None, &[])
+        .ingest_event(&revoke, &campaign, None)
         .await
         .expect("revocation ingests");
 
@@ -200,7 +200,7 @@ async fn malformed_unrelated_history_does_not_hide_valid_grant() {
     );
     let repository = EntitlementsRepository::new(db.pool().clone());
     repository
-        .ingest_event(&event, &campaign, None, &[])
+        .ingest_event(&event, &campaign, None)
         .await
         .expect("valid grant ingests");
     sqlx::query(
@@ -250,7 +250,7 @@ async fn shared_ownership_service_reports_entitlement_source() {
     );
     let entitlements = EntitlementsRepository::new(db.pool().clone());
     entitlements
-        .ingest_event(&event, &campaign, None, &[] as &[IssuanceDelegation])
+        .ingest_event(&event, &campaign, None)
         .await
         .expect("grant ingests");
     let ownership =

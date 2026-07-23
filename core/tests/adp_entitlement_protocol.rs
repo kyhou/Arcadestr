@@ -7,7 +7,7 @@ use arcadestr_core::campaign::{
 };
 use arcadestr_core::entitlements::{
     parse_entitlement_event, resolve_entitlement_grant, validate_adp_entitlement, EntitlementError,
-    GrantStatus, IssuanceDelegation,
+    GrantStatus,
 };
 use nostr::{Event, EventBuilder, EventId, Keys, Kind, Tag, Timestamp};
 
@@ -168,7 +168,42 @@ fn campaign_post_start_term_update_is_rejected() {
         parse_campaign_event(&update).expect("update parses"),
     ];
 
-    assert!(resolve_campaign(&nodes, publisher.public_key(), &coordinate).is_err());
+    let resolved = resolve_campaign(&nodes, publisher.public_key(), &coordinate)
+        .expect("invalid successor is excluded from the valid prefix");
+    assert_eq!(resolved.events.len(), 1);
+}
+
+#[test]
+fn successive_pre_start_updates_use_the_previous_valid_start() {
+    let publisher = Keys::generate();
+    let coordinate = coordinate(&publisher, "game");
+    let root = campaign_root(&publisher, &coordinate);
+    let first = campaign_event(
+        &publisher,
+        &coordinate,
+        "campaign-1",
+        "active",
+        Some(root.id),
+        Some((200, 400)),
+        110,
+    );
+    let second = campaign_event(
+        &publisher,
+        &coordinate,
+        "campaign-1",
+        "active",
+        Some(first.id),
+        Some((300, 500)),
+        150,
+    );
+    let nodes = [&root, &first, &second]
+        .into_iter()
+        .map(|event| parse_campaign_event(event).expect("event parses"))
+        .collect::<Vec<_>>();
+    let resolved = resolve_campaign(&nodes, publisher.public_key(), &coordinate)
+        .expect("both updates precede the previous valid start");
+    assert_eq!(resolved.events.len(), 3);
+    assert_eq!(resolved.state_at(250).expect("state").terms.starts, 300);
 }
 
 #[test]
@@ -253,7 +288,7 @@ fn grant_valid_publisher_issuance() {
         resolve_entitlement_grant(&[parse_entitlement_event(&grant).expect("grant parses")])
             .expect("grant resolves");
 
-    validate_adp_entitlement(&grant, &campaign, None, &[]).expect("publisher grant is valid");
+    validate_adp_entitlement(&grant, &campaign, None).expect("publisher grant is valid");
 }
 
 #[test]
@@ -278,14 +313,8 @@ fn grant_listing_delegation_without_authorization_is_rejected() {
     let grant =
         resolve_entitlement_grant(&[parse_entitlement_event(&grant).expect("grant parses")])
             .expect("grant resolves");
-    let delegation = IssuanceDelegation {
-        pubkey: fulfillment.public_key(),
-        valid_from: 100,
-        revoked_at: None,
-    };
-
     assert!(matches!(
-        validate_adp_entitlement(&grant, &campaign, None, &[delegation]),
+        validate_adp_entitlement(&grant, &campaign, None),
         Err(EntitlementError::MissingAuthorization)
     ));
 }
@@ -313,7 +342,7 @@ fn grant_unrelated_signer_is_rejected() {
             .expect("grant resolves");
 
     assert!(matches!(
-        validate_adp_entitlement(&grant, &campaign, None, &[]),
+        validate_adp_entitlement(&grant, &campaign, None),
         Err(EntitlementError::MissingAuthorizationEvent)
     ));
 }
@@ -352,16 +381,9 @@ fn grant_fulfillment_key_revocation_is_rejected() {
         .map(|event| parse_entitlement_event(event).expect("event parses"))
         .collect::<Vec<_>>();
     let grant = resolve_entitlement_grant(&nodes).expect("grant resolves structurally");
-    let delegation = IssuanceDelegation {
-        pubkey: fulfillment.public_key(),
-        valid_from: 100,
-        revoked_at: None,
-    };
-
-    assert!(matches!(
-        validate_adp_entitlement(&grant, &campaign, None, &[delegation]),
-        Err(EntitlementError::UnauthorizedRevoker)
-    ));
+    assert_eq!(grant.events.len(), 1);
+    validate_adp_entitlement(&grant, &campaign, None)
+        .expect("unauthorized revocation is excluded from the valid prefix");
 }
 
 #[test]
@@ -397,7 +419,9 @@ fn grant_invariant_mutation_is_rejected() {
         .map(|event| parse_entitlement_event(event).expect("event parses"))
         .collect::<Vec<_>>();
 
-    assert!(resolve_entitlement_grant(&nodes).is_err());
+    let resolved = resolve_entitlement_grant(&nodes)
+        .expect("invariant-mutating successor is excluded from the valid prefix");
+    assert_eq!(resolved.events.len(), 1);
 }
 
 #[test]
@@ -468,7 +492,7 @@ fn parser_preserves_server_authorization_anchor() {
     assert_eq!(
         parse_entitlement_event(&grant)
             .expect("grant parses")
-            .authorization_event,
+            .authorization,
         Some(campaign.id)
     );
     assert!(matches!(
@@ -569,7 +593,7 @@ fn cancellation_blocks_new_grants_but_preserves_earlier_grant() {
             resolve_entitlement_grant(&[parse_entitlement_event(&event).expect("grant parses")])
                 .expect("grant resolves");
         assert_eq!(
-            validate_adp_entitlement(&grant, &campaign, None, &[]).is_ok(),
+            validate_adp_entitlement(&grant, &campaign, None).is_ok(),
             valid,
             "grant {grant_id}"
         );

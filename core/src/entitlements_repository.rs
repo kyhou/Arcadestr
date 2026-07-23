@@ -8,7 +8,7 @@ use crate::authorization::ResolvedAuthorization;
 use crate::campaign::ResolvedCampaign;
 use crate::entitlements::{
     parse_entitlement_event, resolve_entitlement_grant, validate_adp_entitlement, EntitlementError,
-    GrantStatus, IssuanceDelegation, ParsedEntitlementGrant, ResolvedEntitlementGrant,
+    GrantStatus, ParsedEntitlementGrant, ResolvedEntitlementGrant,
 };
 
 #[derive(Debug, Error)]
@@ -49,7 +49,6 @@ impl EntitlementsRepository {
         event: &Event,
         campaign: &ResolvedCampaign,
         authorization: Option<&ResolvedAuthorization>,
-        delegations: &[IssuanceDelegation],
     ) -> Result<(), EntitlementsRepositoryError> {
         let parsed = parse_entitlement_event(event)
             .map_err(|error| EntitlementsRepositoryError::InvalidEvent(error.to_string()))?;
@@ -62,7 +61,7 @@ impl EntitlementsRepository {
             .await?;
         nodes.push(parsed.clone());
         let resolved = resolve_entitlement_grant(&nodes)?;
-        validate_adp_entitlement(&resolved, campaign, authorization, delegations)?;
+        validate_adp_entitlement(&resolved, campaign, authorization)?;
         let raw_event_json = serde_json::to_string(event)?;
 
         sqlx::query(

@@ -11,6 +11,8 @@ pub enum AdpStorageError {
     /// SQLite operation failed.
     #[error("ADP storage SQL error: {0}")]
     Sql(#[from] sqlx::Error),
+    #[error("ADP storage JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 /// Stored ADP provisioning relationship.
@@ -24,6 +26,9 @@ pub struct AdpProvisioning {
     pub fulfillment_pubkey: String,
     pub attestation_event_id: String,
     pub acceptance_event_id: String,
+    pub authorization_root_event_id: Option<String>,
+    pub authorization_capabilities: Vec<String>,
+    pub authorization_profile_version: i64,
     pub valid_from: i64,
     pub revoked_at: Option<i64>,
     pub created_at: i64,
@@ -69,8 +74,10 @@ impl AdpProvisioningRepository {
         sqlx::query(
             r#"INSERT OR REPLACE INTO adp_provisioning
             (id, developer_npub, server_url, operator_pubkey, scope, fulfillment_pubkey,
-             attestation_event_id, acceptance_event_id, valid_from, revoked_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+             attestation_event_id, acceptance_event_id, authorization_root_event_id,
+             authorization_capabilities_json, authorization_profile_version,
+             valid_from, revoked_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&entry.id)
         .bind(&entry.developer_npub)
@@ -80,6 +87,9 @@ impl AdpProvisioningRepository {
         .bind(&entry.fulfillment_pubkey)
         .bind(&entry.attestation_event_id)
         .bind(&entry.acceptance_event_id)
+        .bind(&entry.authorization_root_event_id)
+        .bind(serde_json::to_string(&entry.authorization_capabilities)?)
+        .bind(entry.authorization_profile_version)
         .bind(entry.valid_from)
         .bind(entry.revoked_at)
         .bind(entry.created_at)
@@ -101,11 +111,14 @@ impl AdpProvisioningRepository {
         let row = sqlx::query(
             r#"SELECT id, developer_npub, server_url, operator_pubkey, scope,
                fulfillment_pubkey, attestation_event_id, acceptance_event_id,
-               valid_from, revoked_at, created_at
+               authorization_root_event_id, authorization_capabilities_json,
+               authorization_profile_version, valid_from, revoked_at, created_at
                FROM adp_provisioning
                WHERE developer_npub = ? AND server_url = ?
-                 AND COALESCE(scope, '') = COALESCE(?, '')
-                 AND revoked_at IS NULL"#,
+                  AND COALESCE(scope, '') = COALESCE(?, '')
+                  AND revoked_at IS NULL
+                  AND authorization_profile_version >= 2
+                  AND authorization_root_event_id IS NOT NULL"#,
         )
         .bind(developer_npub)
         .bind(server_url)
@@ -131,7 +144,8 @@ impl AdpProvisioningRepository {
         let rows = sqlx::query(
             r#"SELECT id, developer_npub, server_url, operator_pubkey, scope,
                fulfillment_pubkey, attestation_event_id, acceptance_event_id,
-               valid_from, revoked_at, created_at
+               authorization_root_event_id, authorization_capabilities_json,
+               authorization_profile_version, valid_from, revoked_at, created_at
                FROM adp_provisioning
                WHERE developer_npub = ? AND fulfillment_pubkey = ? AND scope = ?"#,
         )
@@ -284,6 +298,12 @@ fn adp_provisioning_from_row(row: sqlx::sqlite::SqliteRow) -> AdpProvisioning {
         fulfillment_pubkey: row.get("fulfillment_pubkey"),
         attestation_event_id: row.get("attestation_event_id"),
         acceptance_event_id: row.get("acceptance_event_id"),
+        authorization_root_event_id: row.get("authorization_root_event_id"),
+        authorization_capabilities: row
+            .get::<Option<String>, _>("authorization_capabilities_json")
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
+        authorization_profile_version: row.get("authorization_profile_version"),
         valid_from: row.get("valid_from"),
         revoked_at: row.get("revoked_at"),
         created_at: row.get("created_at"),
@@ -341,6 +361,9 @@ mod tests {
             fulfillment_pubkey: format!("fulfillment-{}", scope.unwrap_or("none")),
             attestation_event_id: "attestation".to_string(),
             acceptance_event_id: "acceptance".to_string(),
+            authorization_root_event_id: Some("authorization-root".to_string()),
+            authorization_capabilities: vec!["upload_build".to_string()],
+            authorization_profile_version: 2,
             valid_from: 10,
             revoked_at: None,
             created_at: 11,
@@ -409,6 +432,30 @@ mod tests {
         assert_eq!(first.id, second.id);
         assert_eq!(first.fulfillment_pubkey, second.fulfillment_pubkey);
         assert_eq!(first.scope, second.scope);
+    }
+
+    #[tokio::test]
+    async fn legacy_provisioning_row_is_audit_only_and_not_reusable() {
+        let db = test_db().await;
+        let repo = AdpProvisioningRepository::new(db.pool().clone());
+        let mut entry = provisioning(Some("game"));
+        entry.authorization_root_event_id = None;
+        entry.authorization_capabilities.clear();
+        entry.authorization_profile_version = 1;
+        repo.upsert(&entry).await.expect("legacy row persists");
+
+        assert!(repo
+            .active_for_scope("developer", "https://dist.example.com", Some("game"))
+            .await
+            .expect("lookup")
+            .is_none());
+        assert_eq!(
+            repo.for_fulfillment_scope("developer", "fulfillment-game", "game")
+                .await
+                .expect("audit lookup")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

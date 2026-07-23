@@ -584,23 +584,27 @@ impl GameListing {
         for (key, value) in [
             ("file_hash", listing.file_hash.clone()),
             ("version", listing.version.clone()),
-            ("fulfillment_pubkey", listing.fulfillment_pubkey.clone()),
-            (
-                "fulfillment_valid_from",
-                listing
-                    .fulfillment_valid_from
-                    .map(|value| value.to_string()),
-            ),
-            (
-                "fulfillment_revoked_at",
-                listing
-                    .fulfillment_revoked_at
-                    .map(|value| value.to_string()),
-            ),
         ] {
             if let Some(value) = value {
                 specs.push((key.to_string(), value));
             }
+        }
+        for authorization in &listing.fulfillment_authorizations {
+            let value = serde_json::json!({
+                "root_event_id": authorization.root_event_id.to_hex(),
+                "fulfillment_pubkey": authorization.fulfillment_pubkey.to_hex(),
+                "relay_hint": authorization.relay_hint,
+            });
+            specs.push(("fulfillment_authorization".into(), value.to_string()));
+        }
+        if !listing.malformed_fulfillment_authorization_tags.is_empty() {
+            specs.push((
+                "malformed_fulfillment_authorizations".into(),
+                listing
+                    .malformed_fulfillment_authorization_tags
+                    .len()
+                    .to_string(),
+            ));
         }
 
         GameListing {

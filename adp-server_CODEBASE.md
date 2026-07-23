@@ -24,7 +24,7 @@
 
 This is a **reference implementation of ADP-01 (Arcadestr Distribution Protocol)** — an open HTTP protocol for serving digital game file downloads using **Nostr identities and event kinds** as the authentication and ownership layer.
 
-A developer publishes a NIP-99 (`kind:30402`) game listing on Nostr relays with ADP extension tags (`server`, `file_hash`, `version`, `fulfillment_pubkey`, `lud16`). For paid listings, a buyer proves they own the game via a NIP-102 `kind:1020` receipt (signed either by the developer's key or a delegated fulfillment key). A listing whose parsed `price` amount is zero bypasses the receipt ownership check, although the caller must still authenticate with NIP-98 or present a valid download token. Servers are interchangeable — no single operator is privileged.
+A developer publishes a NIP-99 (`kind:30402`) game listing on Nostr relays with ADP extension tags (`server`, `file_hash`, `version`, `acquisition`, `fulfillment_pubkey`, `lud16`). Buyers can authorize downloads with local tokens, portable Entitlement Grants (`kind:1030`), anchored NIP-102 receipts (`kind:1020`), or explicit public/timed listing policy. A zero price never grants access. Servers are interchangeable — no single operator is privileged.
 
 ### Who is it for?
 
@@ -37,7 +37,7 @@ A developer publishes a NIP-99 (`kind:30402`) game listing on Nostr relays with 
 - **Provisioning** — developers request a fulfillment key from an operator. The operator generates a keypair, publishes a `kind:30404` attestation to relays, encrypts the private key at rest, and returns the public key.
 - **Upload** — authenticated upload of game archives via multipart POST. The file's SHA-256 must match the listing's `file_hash` tag.
 - **Purchase confirmation** — buyer presents a zap receipt or bolt11+preimage as payment proof; the server signs a `kind:1020` NIP-102 receipt with a held fulfillment key and issues a short-lived download token.
-- **Download** — Path A (fast, local) checks a server-issued download token; Path B (portable, cross-server) queries relays for `kind:1020` receipts for paid listings. NIP-98-authenticated downloads of zero-priced listings skip the receipt query. Every path requires the server to be named in the listing's `server` tags.
+- **Download** — checks a local token, then portable grants and anchored receipts, then explicit `public` or active `timed-access` policy. Every path requires the server to be named in the current listing's `server` tags.
 - **File integrity** — every file read from disk is SHA-256 verified against the listing's `file_hash` before being served. A background task re-verifies all stored files on an interval.
 
 ### Desktop, web, or both?
@@ -118,7 +118,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   │   ├── keystore.rs                 # KeyStore: CRUD for provisioned keys (SQLite + AES-GCM)
 │   │   ├── crypto.rs                   # MasterCipher: AES-256-GCM encrypt/decrypt wrapper
 │   │   ├── storage.rs                  # Storage: SQLite data access (purchases, files, tokens)
-│   │   ├── relay.rs                    # RelayClient: nostr-sdk wrapper (publish, fetch_listing, fetch_receipts)
+│   │   ├── relay.rs                    # RelayClient: multi-relay typed lookups, publishing, and chain completion
 │   │   ├── announcement.rs            # kind:30403 server announcement builder
 │   │   ├── integrity.rs               # spawn_file_hash_reverification (background task)
 │   │   ├── lnurl.rs                    # LNURL resolution: resolve_lud16_lsp_pubkey
@@ -224,7 +224,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 
 External actors:
 - **Developer** — calls `POST /provision`, `POST /upload`, `POST /purchase/confirm` (via NIP-98 auth), manages listing tags on relays.
-- **Buyer** — for paid listings, calls `POST /purchase/confirm` (NIP-98 auth) with payment proof, then `GET /game/:coordinate` via token or NIP-98 receipt proof. For zero-priced listings, calls `GET /game/:coordinate` with NIP-98 auth and no receipt.
+- **Buyer** — calls `POST /purchase/confirm` with payment proof or `POST /entitlement/claim` for an eligible campaign, then downloads via token or NIP-98 portable credential lookup. Explicit public/timed policy can also authorize a download.
 - **LSP (Lightning Service Provider)** — the LNURL-pay endpoint that signs `kind:9735` zap receipts; resolved from the listing's `lud16` tag.
 - **Relays** — Nostr relays store listings, receipts, and attestations. This server reads listing state fresh on every request that needs authorization-sensitive data.
 
@@ -256,7 +256,7 @@ The most instructive flow is a buyer purchasing and downloading a game:
 
 #### Step 2: Buyer downloads the game
 
-The download handler at `game.rs:download_handler` first fetches and parses the current listing, then selects among two ownership paths plus a zero-price exception:
+The download handler at `game.rs:download_handler` first validates the current listing, distribution, and file metadata, then selects the first valid access basis:
 
 **Path A (fast — local token)**:
 ```
@@ -265,22 +265,21 @@ GET /game/30402:developer_pubkey:d-tag?token=uuid-v4
 - Looks up the token in SQLite. The token is scoped to `game_coordinate`, so it only works for the intended game.
 - If valid and not expired, proceeds directly to the distribution check.
 
-**Path B (portable — relay receipts)**:
+**Path B (portable — relay credentials)**:
 ```
 GET /game/30402:developer_pubkey:d-tag
 Authorization: Nostr <base64>
 ```
 - Verifies the NIP-98 token and extracts the buyer's pubkey.
-- Queries relays for all `kind:1020` receipts where `#p` = buyer pubkey and `#a` = game coordinate.
-- Groups receipts by `order` id, resolves each order's status-chain tip via `latest_status_in_chain`.
-- If any tip has status `paid` or `fulfilled` and was signed by an authorized key per the (freshly fetched) listing delegation tags, ownership is proven.
+- Queries relays for Entitlement Grants and NIP-102 receipts addressed to the buyer and game coordinate.
+- Resolves credential status chains and signer authorization-root chains using per-relay EOSE completeness.
+- Accepts a grant or paid/fulfilled receipt signed by the publisher or a fulfillment key anchored to an active publisher-signed kind `30406` lifecycle.
 
-**Zero-priced listing exception**:
-- A request without `?token=` still verifies the NIP-98 token and extracts its pubkey.
-- `listing_is_free` parses the listing's `price` amount as `f64`; when the parsed amount is exactly `0.0`, the handler skips `verify_ownership_via_receipts`.
-- A missing/malformed price or nonnumeric amount is not treated as free and follows Path B. The currency is not inspected by `listing_is_free`.
+**Path C (explicit listing policy)**:
+- Accepts `acquisition: public` or a currently active half-open `timed-access` interval.
+- Price is not an authorization signal; zero price without explicit policy remains gated.
 
-After the ownership check or zero-price bypass:
+After the access check:
 - **Distribution authorization** — checks the already-fetched fresh listing with `listing.distributes_via(server_url)`. Returns HTTP 451 ("Unavailable For Legal Reasons") if this server is not named in the listing's `server` tags. (HTTP 451 is a deliberate choice — it distinguishes "you're not authorized" from "you don't own this.")
 - **File hash verification** — reads the file from disk and SHA-256 hashes it. If the hash doesn't match the listing's `file_hash`, returns 500 (data corruption detected).
 - **Conditional GET** — if the request's `If-None-Match` header matches the file hash's ETag, returns 304 Not Modified.
@@ -326,15 +325,12 @@ Developer's listing (kind:30402) on relays
     │       Action: insert `download_tokens` row (15m TTL)
     │
     └──► game.rs: GET /game/:coordinate
-            Fetch fresh listing and parse its price
+            Fetch fresh listing and validate distribution/file metadata
             Path A (fast): ?token= → resolves via `download_tokens`
-            NIP-98 + zero price: skip receipt ownership check
-            Path B (portable, paid): NIP-98 → queries relays for kind:1020
-                └── verify_ownership_via_receipts
-                    ├── fetch_receipts from relays
-                    ├── group by order_id
-                    ├── latest_status_in_chain per order
-                    └── verify_signer_authorization (listing delegation check)
+            Path B (portable): NIP-98 → queries relays for grants/receipts
+                ├── resolve credential status chain
+                └── resolve signer kind:30406 authorization root
+            Path C: explicit public or active timed-access listing policy
             Check: distributes_via(this server URL) — HTTP 451 if no
             Check: file_hash matches on-disk file (SHA-256)
             Action: serve file (with ETag/If-None-Match support)
@@ -522,23 +518,37 @@ Straightforward SQLite access layer. Key tables:
 
 ### 6.6 Relay Client (`relay.rs`)
 
-Wraps `nostr_sdk::Client` behind the `Relay` trait:
+Wraps `nostr_sdk::Client` behind the `Relay` trait. The trait exposes typed
+lookups for listings, receipts, campaigns, entitlement grants, authorizations,
+authorization successors, and individual events, plus `publish`; the older
+`fetch_listing` and `fetch_receipts` shapes remain as hidden adapters for
+routes that have not migrated.
 
 ```rust
 #[async_trait]
 pub trait Relay: Send + Sync {
     fn server_url(&self) -> &str;
     async fn publish(&self, event: &Event) -> RelayResult<()>;
-    async fn fetch_listing(&self, developer_pubkey: PublicKey, d_tag: &str) -> RelayResult<Option<Event>>;
-    async fn fetch_receipts(&self, buyer_pubkey: PublicKey, game_coordinate: &str) -> RelayResult<Vec<Event>>;
+    async fn lookup_event(&self, event_id: EventId) -> RelayLookup<Event>;
+    async fn lookup_listing(&self, developer: PublicKey, d_tag: &str) -> RelayLookup<Event>;
+    async fn lookup_campaigns(&self, coordinate: &str) -> RelayLookup<Vec<Event>>;
+    async fn lookup_entitlements(&self, buyer: PublicKey, coordinate: &str) -> RelayLookup<Vec<Event>>;
+    async fn lookup_receipts(&self, buyer: PublicKey, coordinate: &str) -> RelayLookup<Vec<Event>>;
+    async fn lookup_authorizations(&self, developer: PublicKey, coordinate: &str) -> RelayLookup<Vec<Event>>;
+    async fn lookup_authorization_successors(&self, developer: PublicKey, event_id: EventId) -> RelayLookup<Vec<Event>>;
 }
 ```
 
-The trait exists specifically to enable the `MockRelay` in `route_integration_tests.rs`. `RelayClient` implements it using `nostr_sdk::Client`.
+The trait exists specifically to enable test doubles such as `MockRelay` in
+`route_integration_tests.rs`. `RelayClient` implements it using
+`nostr_sdk::Client` and returns `RelayLookup<T>` so callers can distinguish a
+confirmed absence from insufficient relay coverage.
 
 Key design decisions:
-- `fetch_listing` calls `self.client.fetch_events(filter, timeout)` on **all** connected relays. `select_latest_listing` picks the highest `created_at` across all responses. Combined with the ≥2 relay startup check, this provides the multi-relay freshness guarantee.
-- `fetch_receipts` builds a filter with `#p` (not `.author()`) — it fetches events that **tag** the buyer pubkey in a `p` tag, not events whose `.pubkey` is the buyer. This is confirmed by the unit test at `relay.rs:134-144` which serializes the filter and checks the JSON has `#p` but not `authors`.
+- Collection lookups query all configured relays concurrently, require at least two successful relay queries for a complete result, and record failures as `RelayLookup::Unavailable` rather than treating partial data as absence. An exact event match can be returned as soon as it is found.
+- Listing lookup selects the newest valid event with `select_latest_listing`. Receipt lookup builds a filter with `#p` (not `.author()`), fetching events that **tag** the buyer pubkey and game coordinate.
+- Individual event lookup uses an `ids` filter, not an `#e` tag filter. This is important for predecessor-chain completion, where the referenced event ID itself must be fetched.
+- Relay queries require matching EOSE, unsubscribe subscriptions during cleanup, and enforce event-count, serialized-byte, and authorization-graph depth/edge limits.
 - `publish` calls `self.client.send_event(event)` which publishes to all connected relays.
 
 ### 6.7 LNURL Resolution (`lnurl.rs`)
@@ -587,18 +597,19 @@ Router::new()
 |---|---|---|---|---|---|
 | `GET` | `/health` | none | — | `{"status": "ok"}` | — |
 | `GET` | `/healthz` | none | — | `{"status": "ok"}` | — |
-| `GET` | `/.well-known/adp` | none | — | `{"adp_version":"0.2.0","pubkey":"...","name":"...","url":"..."}` | — |
+| `GET` | `/.well-known/adp` | none | — | ADP version, operator identity, and provisional kind map | — |
 | `POST` | `/provision` | NIP-98 (developer) | `{"scope": "..."}` | `{"fulfillment_pubkey":"...","attestation_event_id":"...","scope":"..."}` | 401 (bad auth), 500 (internal) |
 | `POST` | `/provision/revoke` | NIP-98 (developer) | `{"fulfillment_pubkey":"..."}` | `{"fulfillment_pubkey":"...","attestation_event_id":"...","revoked_at":...}` | 401, 400 (bad pubkey), 403 (not theirs), 500 |
 | `POST` | `/upload` | NIP-98 (developer or delegated key) | Multipart: `listing_event` + `file` | `{"game_coordinate":"...","file_hash":"...","download_url":"..."}` | 401, 400 (bad listing/signature/hash), 404 (listing not on relays), 500 |
 | `POST` | `/purchase/confirm` | NIP-98 (buyer) | `{"game_coordinate":"...","listing_event":{...},"zap_receipt_event":?... }` | `{"receipt":{...},"download_token":"...","token_expires_at":...}` | 401, 400, 402 (bad payment), 409 (replay), 404 (listing not found), 500 |
+| `POST` | `/entitlement/claim` | NIP-98 (buyer) | `{"game_coordinate":"...","campaign_event_id":"..."}` | grant event and download token | 400, 401, 403, 404, 409, 503 |
 | `GET` | `/game/:game_coordinate` | NIP-98 or `?token=` | — | Binary file (with ETag) | 401, 400, 403 (no ownership), 404 (file/listing not found), 451 (not authorized), 500 (file corruption) |
 
 ### 7.3 Route Details
 
 #### `GET /.well-known/adp` — `well_known.rs`
 
-Unauthenticated endpoint returning server metadata. The `pubkey` field is the operator's identity key (from `ADP_OPERATOR_NSEC`). Clients use this to verify they're talking to the right server. The `adp_version` is hardcoded as `"0.2.0"` in the announcement builder.
+Unauthenticated endpoint returning server metadata. The `pubkey` field is the operator's identity key (from `ADP_OPERATOR_NSEC`). The response uses the centralized ADP version and advertises Entitlement Grant `1030` and ADP campaign `1031` as provisional kinds.
 
 #### `POST /provision` & `/provision/revoke` — `provision.rs`
 
@@ -654,21 +665,15 @@ This means the operator might be running a key for this listing but the listing'
 
 #### `GET /game/:game_coordinate` — `game.rs`
 
-The download handler fetches the fresh listing before authentication, then implements two ownership paths, a zero-price bypass, and one distribution check:
+The download handler fetches the fresh listing before authentication, validates distribution and file metadata, then evaluates token, portable credentials, and explicit listing policy in order:
 
 **Path A — download token** (lines 49-56): If `?token=` is present, look it up in SQLite. The token was issued by the same server during `POST /purchase/confirm`, scoped to the game coordinate. The fresh listing fetch still occurs, but no receipt relay query is needed.
 
-**Path B — portable receipt** (lines 57-88): If no token, require NIP-98 auth and extract the buyer pubkey. For a paid or unparseable-price listing, call `verify_ownership_via_receipts`, which starts at line 185:
-1. Calls `relay.fetch_receipts(buyer_pubkey, game_coordinate)` — gets all `kind:1020` events where `#p` = buyer and `#a` = coordinate.
-2. Groups events by `order_id`.
-3. For each group, calls `latest_status_in_chain` to find the chain tip.
-4. Checks the tip has `status = "paid"` or `"fulfilled"`.
-5. Calls `verify_signer_authorization(tip, listing)` — confirms the receipt's signer was authorized per the (freshly fetched) listing's delegation tags.
-6. If any order passes all checks, ownership is confirmed.
+**Path B — portable credential**: If no token, require NIP-98 auth and extract the buyer pubkey. Query relays for Entitlement Grants and NIP-102 receipts, resolve each credential chain and its signer authorization root, and accept any currently valid durable credential.
 
-**Zero-price bypass** (lines 22-28 and 71-88): `listing_is_free` trims and parses only the amount component of `AdpListing::price` as `f64`. An amount equal to `0.0` skips the receipt query for an already NIP-98-authenticated caller. Missing prices, parse failures, and nonzero amounts do not bypass ownership; the helper does not constrain the currency.
+**Path C — explicit policy**: If no durable credential authorizes access, accept only `acquisition: public` or a currently active half-open `timed-access` interval. Zero price is ignored for authorization.
 
-**Distribution check** (lines 91-95): `listing.distributes_via(state.relay.server_url())`. If the server isn't named in the listing's `server` tags, returns HTTP 451 even for a free listing.
+**Distribution check**: `listing.distributes_via(state.relay.server_url())`. If the server isn't named in the current listing's `server` tags, returns HTTP 451 for every access basis.
 
 **File integrity** (lines 97-113): Looks up the file path by hash, re-verifies SHA-256 on every download, supports `If-None-Match` conditional requests.
 
@@ -678,7 +683,7 @@ The download handler fetches the fresh listing before authentication, then imple
 
 ### 8.1 The `Relay` Trait
 
-`relay.rs:32-46` defines `#[async_trait] pub trait Relay` with four methods. This is the only abstraction boundary in the server crate that exists *solely* for testability. `RelayClient` implements it with real relay connections. `MockRelay` (in `tests/route_integration_tests.rs`) implements it with an in-process `HashMap<String, Event>`.
+`relay.rs` defines `#[async_trait] pub trait Relay` with typed lookup methods for each protocol resource and a `publish` operation. This is the only abstraction boundary in the server crate that exists *solely* for testability. `RelayClient` implements it with real relay connections. `MockRelay` (in `tests/route_integration_tests.rs`) implements it with an in-process `HashMap<String, Event>`.
 
 The trait is used via `Arc<dyn Relay>` in `AppState`, so either implementation can be injected at startup. No other type in the server uses trait objects — this is notable because it's the only test double in the codebase.
 
@@ -854,28 +859,36 @@ Neither crate defines Cargo feature flags. The `nip44` feature of the `nostr` cr
 
 ```
 adp-core/tests/
-├── delegation_tests.rs          # 8 pure logic tests for verify_signer_authorization
-└── protocol_regression_tests.rs # 10 tests for listing parsing, receipts, attestations, zaps
+├── authorization_tests.rs       # authorization graph and credential resolution contracts
+├── campaign_tests.rs            # campaign parsing and state transitions
+├── delegation_tests.rs          # pure logic tests for verify_signer_authorization
+├── entitlement_tests.rs         # entitlement grant parsing and validation
+├── protocol_regression_tests.rs # listing, receipt, attestation, and zap regressions
+├── public_contract_tests.rs     # public protocol API contracts
+└── receipt_authorization_tests.rs # receipt signer and authorization behavior
 
 adp-server/tests/
 ├── announcement_tests.rs          # 1 test: kind:30403 event building
+├── claim_route_tests.rs            # campaign claim, idempotency, cancellation, mismatch
+├── download_authorization_tests.rs # grant, receipt, explicit policy, zero-price denial
 ├── error_mapping_tests.rs         # 3 tests: ApiError → HTTP status code mapping
 ├── health_tests.rs                # 1 test: GET /health endpoint
 ├── keystore_tests.rs              # 5 tests: key round-trip, idempotency, scope isolation, lookup, revoke
 ├── lnurl_tests.rs                 # 2 tests: LNURL resolution and malformed LUD16 (wiremock)
 ├── multi_relay_freshness_tests.rs # 3 live-WebSocket tests: dead relay tolerance and latest listing selection
-└── route_integration_tests.rs     # 1 full lifecycle test: provision→confirm→download→revoke→confirm-fails
+├── public_contract_tests.rs       # public server API contracts
+└── route_integration_tests.rs     # full lifecycle and route integration tests
 ```
 
 Additionally, there are inline `#[cfg(test)] mod tests` in:
 - `adp-server/src/routes/upload.rs` (4 tests: file_hash required, delegated uploader)
-- `adp-server/src/routes/game.rs` (6 tests: receipt matching, ETag, zero-price classification, file hash verification)
+- `adp-server/src/routes/game.rs` (receipt matching, ETag, and file hash verification)
 - `adp-server/src/routes/purchase.rs` (3 tests: SATS/BTC/fiat price resolution)
-- `adp-server/src/relay.rs` (2 tests: select_latest_listing, receipt filter)
+- `adp-server/src/relay.rs` (filter construction, relay completeness, chain limits, cycle detection, and lookup adapters)
 - `adp-server/src/lnurl.rs` (4 tests: exact loopback detection and scheme selection)
 - `adp-server/src/integrity.rs` (2 tests: file hash verification + mismatch rejection)
 
-Total (verified with `cargo test --workspace`): **55 tests across 14 suites**.
+Total (verified with `cargo test --workspace`): **236 tests across 22 suites**.
 
 ### 10.2 What's Tested vs What's Not
 
@@ -886,13 +899,13 @@ Total (verified with `cargo test --workspace`): **55 tests across 14 suites**.
 - Zap verification (buyer P tag, LSP pubkey mismatch)
 - Error-to-HTTP mapping (6 protocol variants + server-level variants)
 - Price resolution (SATS, BTC, fiat)
-- Zero-price listing classification
+- Zero-price denial without explicit acquisition policy
 - File hash verification (matching, mismatched)
 - Upload authorization (file hash required, delegated uploader)
 - LNURL resolution (wiremock-based happy path + malformed address)
 
 **Not tested:**
-- End-to-end download of a zero-priced listing; only `listing_is_free` is unit-tested, not the handler's NIP-98 requirement or receipt bypass
+- Full relay-network behavior beyond the mock and local WebSocket integration suites
 - Multi-relay conflict (no integration test with two relays publishing different listing versions for the same coordinate)
 - LNURL transport errors (LNURL endpoint returning 404 or malformed JSON)
 - The actual relay network interaction (all relay tests use `MockRelay` or in-process `nostr-sdk` constructs)
@@ -1084,7 +1097,7 @@ These can be used in `curl` calls to `POST /purchase/confirm` with the bolt11/pr
 
 1. **The README is partially stale.** It mentions "verify_zap_receipt does not resolve the developer's lud16" and "purchase/confirm hardcodes amount: '0'" — both of these have been fixed but the README wasn't updated. Use `CODEBASE.md` (this document) or read the actual code instead.
 
-2. **Nostr-sdk multi-relay behavior.** `fetch_events` queries all configured relays in parallel and merges results. However, there's no test confirming this — the unit test at `relay.rs:134-144` proves `select_latest_listing` works on a collection, but not that `nostr-sdk` actually queries *all* relays. The startup check guarantees ≥2 relays are configured, but if nostr-sdk short-circuits after the first response, `select_latest_listing` would silently pick the best from a single-relay subset.
+2. **Relay completeness is fail-closed.** Each lookup requires at least two successful relay queries and matching EOSE before it can report absence or return a complete collection. A disconnected or timed-out relay produces `RelayLookup::Unavailable`; callers must surface that as an unavailable dependency rather than treating it as “not found.”
 
 3. **Master key is never logged**, but if a panic occurs in `decode_master_key()` (at startup, not during runtime), the `.expect()` message mentions the env var name `ADP_MASTER_KEY` but not the value. The value is hex-decoded into `[u8; 32]` which has no `Display` impl. Safe, but worth knowing.
 
@@ -1096,7 +1109,7 @@ These can be used in `curl` calls to `POST /purchase/confirm` with the bolt11/pr
 
 7. **sqlx migration path.** The `sqlx::migrate!("../migrations")` call in `storage.rs:29` uses a relative path from `adp-server/src/`. This works during `cargo run -p adp-server` (which runs from the workspace root), but may need adjustment if the working directory is different.
 
-8. **Free downloads still require authentication.** A listing with a `price` amount that parses to exactly zero bypasses receipt ownership verification, but a request without `?token=` must still carry a valid NIP-98 `Authorization` header. The helper parses the amount as `f64` and ignores currency, so any zero amount with a parseable numeric representation is treated as free; there is no end-to-end route test for this path yet.
+8. **Zero price is not access policy.** Public or timed access must be explicit in the listing's `acquisition` tags. A zero-priced listing without such a policy still requires a valid token, grant, or receipt.
 
 ---
 
@@ -1120,8 +1133,9 @@ These can be used in `curl` calls to `POST /purchase/confirm` with the bolt11/pr
 | **Acceptance (provisioning)** | `kind:30406` event published by the developer accepting the operator's attestation. |
 | **Receipt** | `kind:1020` NIP-102 receipt confirming a purchase. Signed by the developer or a delegated fulfillment key. |
 | **Download token** | Short-lived UUID issued by `/purchase/confirm`. Enables fast Path A downloads without relay queries. |
-| **Path A / Path B** | Two ownership verification paths: Path A uses a local download token. Path B uses NIP-98 and, for paid listings, queries relays for `kind:1020` receipts. Zero-priced listings skip Path B's receipt query after NIP-98 authentication. |
-| **Free listing** | A listing whose `price` amount trims and parses as `f64` value `0.0`. Its download still requires NIP-98 or a valid token, but no purchase receipt. Currency is ignored by this classification. |
+| **Access basis** | Ordered authorization basis: local token, portable grant, portable receipt, explicit public policy, or active timed-access policy. |
+| **Entitlement Grant** | Provisional `kind:1030` durable credential addressed to a buyer and game coordinate. |
+| **ADP campaign** | Provisional `kind:1031` publisher-controlled eligibility and cancellation chain used by `/entitlement/claim`. |
 | **Distribution authorization** | The check that a server is named in the listing's `server` tags. Independent of ownership proof. HTTP 451 if this check fails. |
 | **Backdating clamp** | The rule `effective_revoked_at = max(declared revoked_at, listing_event.created_at)`. Prevents stale delegation tags from retroactively invalidating receipts. |
 | **`kind:30403`** | Server announcement event — how clients discover ADP server. |

@@ -299,23 +299,30 @@ impl GameListing {
         for (key, value) in [
             ("file_hash", listing.file_hash.clone()),
             ("version", listing.version.clone()),
-            ("fulfillment_pubkey", listing.fulfillment_pubkey.clone()),
-            (
-                "fulfillment_valid_from",
-                listing
-                    .fulfillment_valid_from
-                    .map(|value| value.to_string()),
-            ),
-            (
-                "fulfillment_revoked_at",
-                listing
-                    .fulfillment_revoked_at
-                    .map(|value| value.to_string()),
-            ),
         ] {
             if let Some(value) = value {
                 specs.push((key.to_string(), value));
             }
+        }
+        for authorization in &listing.fulfillment_authorizations {
+            specs.push((
+                "fulfillment_authorization".into(),
+                serde_json::json!({
+                    "root_event_id": authorization.root_event_id.to_hex(),
+                    "fulfillment_pubkey": authorization.fulfillment_pubkey.to_hex(),
+                    "relay_hint": authorization.relay_hint,
+                })
+                .to_string(),
+            ));
+        }
+        if !listing.malformed_fulfillment_authorization_tags.is_empty() {
+            specs.push((
+                "malformed_fulfillment_authorizations".into(),
+                listing
+                    .malformed_fulfillment_authorization_tags
+                    .len()
+                    .to_string(),
+            ));
         }
 
         let parsed_amount = listing
@@ -678,9 +685,8 @@ mod tests {
                 servers: vec!["https://dist.example.com".to_string()],
                 file_hash: Some("abc123".to_string()),
                 version: Some("1.4.2".to_string()),
-                fulfillment_pubkey: Some("delegate".to_string()),
-                fulfillment_valid_from: Some(1_710_000_000),
-                fulfillment_revoked_at: None,
+                fulfillment_authorizations: Vec::new(),
+                malformed_fulfillment_authorization_tags: Vec::new(),
                 acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
                 campaigns: Vec::new(),
                 status: Some("active".to_string()),

@@ -138,6 +138,10 @@ const MIGRATION_9_INSTALLED_GAMES: &str = include_str!("../../migrations/006_ins
 // Migration 10: NIP-103 entitlement grant history
 const MIGRATION_10_ENTITLEMENTS: &str = include_str!("../../migrations/007_entitlements.sql");
 
+// Migration 11: immutable authorization-root provisioning profile
+const MIGRATION_11_AUTHORIZATION_ROOTS: &str =
+    include_str!("../../migrations/008_authorization_roots.sql");
+
 // List of all migrations in applied order; migration filenames currently lag user_version numbers.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_1_INITIAL,
@@ -150,6 +154,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_8_DOWNLOAD_TOKENS,
     MIGRATION_9_INSTALLED_GAMES,
     MIGRATION_10_ENTITLEMENTS,
+    MIGRATION_11_AUTHORIZATION_ROOTS,
 ];
 
 /// Database connection pool for SQLite
@@ -195,7 +200,11 @@ impl Database {
 
     /// Run database migrations
     async fn run_migrations(pool: &SqlitePool) -> Result<(), DatabaseError> {
-        for (idx, migration) in MIGRATIONS.iter().enumerate() {
+        let (current_version,): (i64,) = sqlx::query_as("PRAGMA user_version")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| DatabaseError::Migration(format!("Reading schema version failed: {e}")))?;
+        for (idx, migration) in MIGRATIONS.iter().enumerate().skip(current_version as usize) {
             let migration_num = idx + 1;
             sqlx::query(*migration).execute(pool).await.map_err(|e| {
                 DatabaseError::Migration(format!("Migration {} failed: {}", migration_num, e))

@@ -49,6 +49,8 @@ pub enum AdpClientError {
     /// The server returned a protocol-level download error.
     #[error("ADP download protocol error: {0}")]
     DownloadProtocol(String),
+    #[error("ADP download verification evidence is unavailable: {0}")]
+    DownloadUnavailable(String),
 
     #[error("campaign has not started: {0}")]
     ClaimCampaignNotStarted(String),
@@ -66,6 +68,18 @@ pub enum AdpClientError {
     ClaimDistributionUnauthorized(String),
     #[error("claim protocol failure: {0}")]
     ClaimProtocol(String),
+    #[error("ADP authorization evidence is unavailable: {0}")]
+    AuthorizationUnavailable(String),
+    #[error("ADP server has no held authorized signer: {0}")]
+    NoHeldAuthorizedSigner(String),
+    #[error("purchase protocol failure: {0}")]
+    PurchaseProtocol(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AdpEventKinds {
+    pub entitlement_grant: u16,
+    pub adp_campaign: u16,
 }
 
 /// Public metadata returned by `GET /.well-known/adp`.
@@ -75,6 +89,10 @@ pub struct AdpServerInfo {
     pub pubkey: String,
     pub name: Option<String>,
     pub url: Option<String>,
+    #[serde(default)]
+    pub event_kinds: Option<AdpEventKinds>,
+    #[serde(default)]
+    pub event_kind_status: Option<String>,
 }
 
 /// Response returned by `POST /provision`.
@@ -105,8 +123,12 @@ pub struct UploadResponse {
 pub struct PurchaseConfirmRequest {
     pub game_coordinate: String,
     pub listing_event: Event,
-    pub bolt11: String,
-    pub preimage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zap_receipt_event: Option<Event>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bolt11: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preimage: Option<String>,
 }
 
 /// Response returned by `POST /purchase/confirm` in a later gate.
@@ -274,7 +296,8 @@ impl AdpClient {
         let value = self
             .http
             .post_json(&url, body, vec![("Authorization".to_string(), auth_header)])
-            .await?;
+            .await
+            .map_err(map_purchase_error)?;
 
         Ok(serde_json::from_value(value)?)
     }
@@ -363,6 +386,12 @@ fn map_download_error(err: HttpClientError) -> AdpClientError {
         HttpClientError::StatusWithBody { status: 451, body } => {
             AdpClientError::DownloadDistribution(body)
         }
+        HttpClientError::Status(503) => {
+            AdpClientError::DownloadUnavailable("relay evidence unavailable".into())
+        }
+        HttpClientError::StatusWithBody { status: 503, body } => {
+            AdpClientError::DownloadUnavailable(body)
+        }
         HttpClientError::Status(status) => {
             AdpClientError::DownloadProtocol(format!("HTTP status {status}"))
         }
@@ -390,7 +419,28 @@ fn map_claim_error(error: HttpClientError) -> AdpClientError {
         403 if normalized.contains("cancel") => AdpClientError::ClaimCampaignCancelled(body),
         403 => AdpClientError::ClaimInvalidCampaign(body),
         451 => AdpClientError::ClaimDistributionUnauthorized(body),
+        500 if normalized.contains("no held key") || normalized.contains("authorized signer") => {
+            AdpClientError::NoHeldAuthorizedSigner(body)
+        }
+        503 => AdpClientError::AuthorizationUnavailable(body),
         _ => AdpClientError::ClaimProtocol(format!("HTTP status {status}: {body}")),
+    }
+}
+
+fn map_purchase_error(error: HttpClientError) -> AdpClientError {
+    let (status, body) = match error {
+        HttpClientError::Status(status) => (status, format!("HTTP status {status}")),
+        HttpClientError::StatusWithBody { status, body } => (status, body),
+        other => return AdpClientError::Http(other),
+    };
+    let normalized = body.to_ascii_lowercase();
+    match status {
+        451 => AdpClientError::DownloadDistribution(body),
+        500 if normalized.contains("no held key") || normalized.contains("authorized signer") => {
+            AdpClientError::NoHeldAuthorizedSigner(body)
+        }
+        503 => AdpClientError::AuthorizationUnavailable(body),
+        _ => AdpClientError::PurchaseProtocol(format!("HTTP status {status}: {body}")),
     }
 }
 
@@ -421,7 +471,9 @@ mod tests {
                 "adp_version": "0.2.0",
                 "pubkey": "operator-pubkey",
                 "name": "Arcadestr Official Distribution",
-                "url": "https://dist.example.com"
+                "url": "https://dist.example.com",
+                "event_kinds": { "entitlement_grant": 1030, "adp_campaign": 1031 },
+                "event_kind_status": "provisional"
             }),
         ));
         let client = AdpClient::new("https://dist.example.com/", http.clone());
@@ -435,6 +487,13 @@ mod tests {
             Some("Arcadestr Official Distribution")
         );
         assert_eq!(info.url.as_deref(), Some("https://dist.example.com"));
+        assert_eq!(info.event_kind_status.as_deref(), Some("provisional"));
+        assert_eq!(
+            info.event_kinds
+                .as_ref()
+                .map(|kinds| kinds.entitlement_grant),
+            Some(1030)
+        );
         assert_eq!(
             http.call_count("https://dist.example.com/.well-known/adp"),
             1
@@ -731,8 +790,9 @@ mod tests {
                 PurchaseConfirmRequest {
                     game_coordinate: "30402:merchant:game-1".to_string(),
                     listing_event: listing_event.clone(),
-                    bolt11: "lnbc1fixedamountinvoice".to_string(),
-                    preimage: "feedface".to_string(),
+                    zap_receipt_event: None,
+                    bolt11: Some("lnbc1fixedamountinvoice".to_string()),
+                    preimage: Some("feedface".to_string()),
                 },
             )
             .await
@@ -904,6 +964,39 @@ mod tests {
         assert!(matches!(
             error,
             AdpClientError::ClaimDistributionUnauthorized(_)
+        ));
+    }
+
+    #[test]
+    fn updated_server_authorization_errors_are_typed() {
+        assert!(matches!(
+            map_claim_error(HttpClientError::StatusWithBody {
+                status: 503,
+                body: r#"{"error":"authorization evidence unavailable"}"#.into(),
+            }),
+            AdpClientError::AuthorizationUnavailable(_)
+        ));
+        assert!(matches!(
+            map_claim_error(HttpClientError::StatusWithBody {
+                status: 500,
+                body: r#"{"error":"no held key has current listing and authorization authority"}"#
+                    .into(),
+            }),
+            AdpClientError::NoHeldAuthorizedSigner(_)
+        ));
+        assert!(matches!(
+            map_purchase_error(HttpClientError::StatusWithBody {
+                status: 451,
+                body: r#"{"error":"this server is not named in the current listing"}"#.into(),
+            }),
+            AdpClientError::DownloadDistribution(_)
+        ));
+        assert!(matches!(
+            map_purchase_error(HttpClientError::StatusWithBody {
+                status: 503,
+                body: r#"{"error":"listing lookup unavailable"}"#.into(),
+            }),
+            AdpClientError::AuthorizationUnavailable(_)
         ));
     }
 }

@@ -1137,6 +1137,9 @@ fn desktop_download_error(error: AdpClientError) -> String {
                 "download failed because the ADP server returned an invalid response: {message}"
             )
         }
+        AdpClientError::DownloadUnavailable(message) => {
+            format!("download authorization could not be verified because relay evidence is incomplete: {message}")
+        }
         AdpClientError::Http(message) => format!("download HTTP request failed: {message}"),
         AdpClientError::Auth(message) => format!("download authentication failed: {message}"),
         AdpClientError::Io(message) => format!("download file I/O failed: {message}"),
@@ -1959,17 +1962,25 @@ mod install_game_tests {
     }
 
     async fn grant_ownership(state: &AppState, buyer: &Keys, merchant: &Keys, listing_id: &str) {
-        let receipt = StoredReceipt {
-            event_id: format!("receipt-{listing_id}"),
-            order_id: format!("order-{listing_id}"),
-            listing_coordinate: coordinate(merchant, listing_id),
-            buyer_pubkey: buyer.public_key().to_hex(),
-            merchant_pubkey: merchant.public_key().to_hex(),
-            payment_hash: None,
-            status: "paid".to_string(),
-            created_at: 1_700_000_200,
-            raw_event: "{}".to_string(),
-        };
+        let event = EventBuilder::new(Kind::Custom(1020), "encrypted")
+            .tags([
+                Tag::custom(TagKind::custom("order"), [format!("order-{listing_id}")]),
+                Tag::custom(TagKind::p(), [buyer.public_key().to_hex()]),
+                Tag::custom(TagKind::a(), [coordinate(merchant, listing_id)]),
+                Tag::custom(TagKind::custom("payment_hash"), ["11".repeat(32)]),
+                Tag::custom(TagKind::custom("amount_msat"), ["1000"]),
+                Tag::custom(TagKind::custom("settled_at"), ["1700000200"]),
+                Tag::custom(TagKind::custom("proof"), ["bolt11-preimage"]),
+                Tag::custom(TagKind::custom("status"), ["paid"]),
+            ])
+            .custom_created_at(Timestamp::from(1_700_000_200))
+            .sign_with_keys(merchant)
+            .expect("receipt signs");
+        let receipt = arcadestr_core::purchases::parse_and_validate_receipt(
+            &event,
+            &buyer.public_key().to_hex(),
+        )
+        .expect("receipt validates");
         state
             .purchases
             .upsert_receipt(&receipt)
@@ -2028,7 +2039,7 @@ mod install_game_tests {
         arcadestr_core::entitlements_repository::EntitlementsRepository::new(
             state.database.pool().clone(),
         )
-        .ingest_event(&grant, &campaign, None, &[])
+        .ingest_event(&grant, &campaign, None)
         .await
         .expect("entitlement persists");
     }
@@ -2486,9 +2497,8 @@ mod task4_tests {
             servers: Vec::new(),
             file_hash: None,
             version: None,
-            fulfillment_pubkey: None,
-            fulfillment_valid_from: None,
-            fulfillment_revoked_at: None,
+            fulfillment_authorizations: Vec::new(),
+            malformed_fulfillment_authorization_tags: Vec::new(),
             acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
             campaigns: Vec::new(),
             status: None,

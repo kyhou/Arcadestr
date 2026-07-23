@@ -1,7 +1,6 @@
 // ADP publish view component.
 
 use leptos::prelude::*;
-use nostr::nips::nip19::FromBech32;
 use wasm_bindgen_futures::spawn_local;
 
 use arcadestr_core::is_sha256_hex;
@@ -489,6 +488,17 @@ fn parse_csv_values(input: &str) -> Vec<String> {
         .collect()
 }
 
+fn editable_listing_tags(tags: &[String]) -> String {
+    let mut seen = std::collections::HashSet::new();
+    tags.iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty() && !tag.eq_ignore_ascii_case("game"))
+        .filter(|tag| seen.insert(tag.to_ascii_lowercase()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn format_sha256(hash: &str) -> String {
     if !is_sha256_hex(hash) {
         return "Invalid SHA-256 metadata".to_string();
@@ -610,25 +620,37 @@ fn listing_servers(listing: &GameListing) -> Vec<String> {
         .collect()
 }
 
+fn listing_authorizations(listing: &GameListing) -> Vec<(nostr::EventId, String)> {
+    let mut authorizations = listing
+        .specs
+        .iter()
+        .filter(|(name, _)| name == "fulfillment_authorization")
+        .filter_map(|(_, value)| {
+            let value: serde_json::Value = serde_json::from_str(value).ok()?;
+            Some((
+                nostr::EventId::from_hex(value.get("root_event_id")?.as_str()?).ok()?,
+                value.get("fulfillment_pubkey")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    authorizations.sort_by_key(|(root, _)| *root);
+    authorizations
+}
+
 fn listing_fulfillment_mode(listing: &GameListing) -> FulfillmentMode {
-    let Some(fulfillment_pubkey) = listing_spec(listing, "fulfillment_pubkey") else {
-        return FulfillmentMode::None;
-    };
-    match nostr::PublicKey::from_bech32(&listing.publisher_npub) {
-        Ok(publisher) if publisher.to_hex() == fulfillment_pubkey => FulfillmentMode::Direct,
-        Ok(_) => FulfillmentMode::Delegate,
-        Err(_) => FulfillmentMode::None,
+    if !listing_authorizations(listing).is_empty() {
+        FulfillmentMode::Delegate
+    } else if !listing_servers(listing).is_empty() && listing_spec(listing, "file_hash").is_some() {
+        FulfillmentMode::Direct
+    } else {
+        FulfillmentMode::None
     }
 }
 
-fn listing_fulfillment_metadata(
-    listing: &GameListing,
-) -> (Option<String>, Option<u64>, Option<u64>) {
-    (
-        listing_spec(listing, "fulfillment_pubkey"),
-        listing_spec(listing, "fulfillment_valid_from").and_then(|value| value.parse().ok()),
-        listing_spec(listing, "fulfillment_revoked_at").and_then(|value| value.parse().ok()),
-    )
+fn listing_fulfillment_pubkey(listing: &GameListing) -> Option<String> {
+    listing_authorizations(listing)
+        .first()
+        .map(|(_, key)| key.clone())
 }
 
 fn initial_operator_url() -> String {
@@ -639,7 +661,7 @@ fn operator_resolution_request(listing: &GameListing) -> Option<ResolveAdpOperat
     if !matches!(listing_fulfillment_mode(listing), FulfillmentMode::Delegate) {
         return None;
     }
-    let fulfillment_pubkey = listing_spec(listing, "fulfillment_pubkey")?;
+    let fulfillment_pubkey = listing_authorizations(listing).first()?.1.clone();
     Some(ResolveAdpOperatorRequest {
         publisher_npub: listing.publisher_npub.clone(),
         fulfillment_pubkey,
@@ -704,9 +726,15 @@ mod tests {
                 ("server".into(), "http://localhost:9099".into()),
                 ("version".into(), "1.4.2".into()),
                 ("file_hash".into(), VALID_SHA256.into()),
-                ("fulfillment_pubkey".into(), fulfillment_pubkey),
-                ("fulfillment_valid_from".into(), "1710000000".into()),
-                ("fulfillment_revoked_at".into(), "1710000999".into()),
+                (
+                    "fulfillment_authorization".into(),
+                    serde_json::json!({
+                        "root_event_id": "11".repeat(32),
+                        "fulfillment_pubkey": fulfillment_pubkey,
+                        "relay_hint": null,
+                    })
+                    .to_string(),
+                ),
             ],
             publisher_npub,
             stall_id: String::new(),
@@ -733,6 +761,18 @@ mod tests {
             platforms,
             vec!["linux-x86_64", "windows-x86_64", "macos-aarch64"]
         );
+    }
+
+    #[test]
+    fn editable_tags_hide_implicit_game_and_remove_duplicates() {
+        let tags = vec![
+            "game".to_string(),
+            " game ".to_string(),
+            "test".to_string(),
+            "TEST".to_string(),
+        ];
+
+        assert_eq!(editable_listing_tags(&tags), "test");
     }
 
     #[test]
@@ -831,12 +871,8 @@ mod tests {
             FulfillmentMode::Delegate
         );
         assert_eq!(
-            listing_fulfillment_metadata(&listing),
-            (
-                Some(delegate.public_key().to_hex()),
-                Some(1_710_000_000),
-                Some(1_710_000_999),
-            )
+            listing_fulfillment_pubkey(&listing),
+            Some(delegate.public_key().to_hex())
         );
         assert_eq!(initial_operator_url(), "");
 
@@ -1097,14 +1133,7 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
     let existing_file_hash = listing
         .as_ref()
         .and_then(|item| listing_spec(item, "file_hash"));
-    let (
-        existing_fulfillment_pubkey,
-        existing_fulfillment_valid_from,
-        existing_fulfillment_revoked_at,
-    ) = listing
-        .as_ref()
-        .map(listing_fulfillment_metadata)
-        .unwrap_or((None, None, None));
+    let existing_fulfillment_pubkey = listing.as_ref().and_then(listing_fulfillment_pubkey);
     let operator_resolution = listing.as_ref().and_then(operator_resolution_request);
     let initial_acquisition = listing
         .as_ref()
@@ -1154,7 +1183,7 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
     let tag_input = RwSignal::new(
         listing
             .as_ref()
-            .map(|item| item.tags.join(", "))
+            .map(|item| editable_listing_tags(&item.tags))
             .unwrap_or_default(),
     );
     let initial_price = listing
@@ -1543,16 +1572,6 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
             existing_fulfillment_pubkey: when_fulfillment_enabled(
                 fulfillment_enabled_val,
                 existing_fulfillment_key_for_submit.clone(),
-            )
-            .flatten(),
-            existing_fulfillment_valid_from: when_fulfillment_enabled(
-                fulfillment_enabled_val,
-                existing_fulfillment_valid_from,
-            )
-            .flatten(),
-            existing_fulfillment_revoked_at: when_fulfillment_enabled(
-                fulfillment_enabled_val,
-                existing_fulfillment_revoked_at,
             )
             .flatten(),
             version: when_fulfillment_enabled(

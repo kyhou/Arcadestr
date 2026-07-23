@@ -113,7 +113,9 @@ fn campaign_query_events(
 ) -> Result<Vec<Event>, CampaignDiscoveryError> {
     match result {
         Ok(events) => Ok(events),
-        Err(RelayManagerError::QueryTimeout) => Ok(Vec::new()),
+        Err(RelayManagerError::QueryTimeout) => Err(CampaignDiscoveryError::Relay(
+            RelayManagerError::QueryTimeout,
+        )),
         Err(error) => Err(error.into()),
     }
 }
@@ -226,9 +228,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_campaign_query_is_not_an_error() {
-        let events = campaign_query_events(Err(RelayManagerError::QueryTimeout))
-            .expect("an empty relay result should mean no campaigns");
-        assert!(events.is_empty());
+    fn campaign_query_timeout_is_reported() {
+        assert!(matches!(
+            campaign_query_events(Err(RelayManagerError::QueryTimeout)),
+            Err(CampaignDiscoveryError::Relay(
+                RelayManagerError::QueryTimeout
+            ))
+        ));
     }
 }

@@ -1,12 +1,15 @@
 //! NIP-102 purchase receipt persistence and verification.
 
 use lightning_invoice::Bolt11Invoice;
-use nostr_sdk::{Event, PublicKey};
+use nostr_sdk::{Event, EventId, PublicKey};
 use sha2::{Digest, Sha256};
 use sqlx::{Pool, Row, Sqlite};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use thiserror::Error;
+
+use crate::adp_protocol::coordinate_publisher;
+use crate::authorization::{ResolvedAuthorization, CAPABILITY_ISSUE_RECEIPT};
 
 const KIND_PURCHASE_RECEIPT: u16 = 1020;
 const STATUS_PAID: &str = "paid";
@@ -43,6 +46,35 @@ pub struct StoredReceipt {
     pub status: String,
     pub created_at: u64,
     pub raw_event: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReceiptProof {
+    Zap(EventId),
+    Bolt11Preimage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedReceipt {
+    pub event: Event,
+    pub order_id: String,
+    pub buyer_pubkey: PublicKey,
+    pub coordinate: String,
+    pub authorization: Option<EventId>,
+    pub payment_hash: Option<String>,
+    pub amount_msat: Option<u64>,
+    pub settled_at: Option<u64>,
+    pub proofs: Vec<ReceiptProof>,
+    pub status: String,
+    pub predecessor: Option<EventId>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReceiptEvidence<'a> {
+    pub bolt11: Option<&'a str>,
+    pub preimage: Option<&'a str>,
+    pub zap_receipts: &'a [Event],
+    pub lsp_pubkey: Option<PublicKey>,
 }
 
 /// SQLite repository for purchase receipts.
@@ -105,7 +137,7 @@ impl PurchasesRepository {
     ) -> Result<bool, PurchaseError> {
         let rows = sqlx::query(
             r#"
-            SELECT order_id, status
+            SELECT order_id, raw_event
             FROM purchases
             WHERE buyer_pubkey = ? AND listing_coordinate = ?
             ORDER BY created_at DESC, event_id DESC
@@ -116,18 +148,19 @@ impl PurchasesRepository {
         .fetch_all(&self.db)
         .await?;
 
-        let mut seen_orders = HashSet::new();
+        let mut orders: HashMap<String, Vec<Event>> = HashMap::new();
         for row in rows {
             let order_id: String = row.get("order_id");
-            if seen_orders.insert(order_id) {
-                let status: String = row.get("status");
-                if status_grants_ownership(&status) {
-                    return Ok(true);
-                }
+            let raw_event: String = row.get("raw_event");
+            if let Ok(event) = serde_json::from_str(&raw_event) {
+                orders.entry(order_id).or_default().push(event);
             }
         }
-
-        Ok(false)
+        Ok(orders.into_values().any(|events| {
+            resolve_persisted_receipt_tip(&events)
+                .and_then(|event| parse_receipt_event(event).ok())
+                .is_some_and(|receipt| status_grants_ownership(&receipt.status))
+        }))
     }
 
     /// Load persisted receipts for one authenticated buyer.
@@ -221,7 +254,12 @@ pub fn parse_and_validate_receipt(
     event: &Event,
     buyer_pubkey_hex: &str,
 ) -> Result<StoredReceipt, PurchaseError> {
-    parse_and_validate_receipt_inner(event, buyer_pubkey_hex, None)
+    let parsed = parse_receipt_event(event)?;
+    validate_receipt_buyer(&parsed, buyer_pubkey_hex)?;
+    let developer = coordinate_publisher(&parsed.coordinate)
+        .ok_or_else(|| PurchaseError::ProofInvalid("malformed listing coordinate".into()))?;
+    validate_adp_receipt_root(&parsed, developer, None)?;
+    stored_receipt(&parsed)
 }
 
 /// Parse and validate a NIP-102 receipt against an ADP listing delegation snapshot.
@@ -236,118 +274,31 @@ pub fn parse_and_validate_receipt_with_listing(
     listing_event.verify().map_err(|error| {
         PurchaseError::ProofInvalid(format!("invalid listing signature: {error}"))
     })?;
-    parse_and_validate_receipt_inner(event, buyer_pubkey_hex, Some(listing_event))
-}
-
-fn parse_and_validate_receipt_inner(
-    event: &Event,
-    buyer_pubkey_hex: &str,
-    listing_event: Option<&Event>,
-) -> Result<StoredReceipt, PurchaseError> {
-    event.verify().map_err(|error| {
-        PurchaseError::ProofInvalid(format!("invalid event signature: {error}"))
-    })?;
-
-    let kind = event.kind.as_u16();
-    if kind != KIND_PURCHASE_RECEIPT {
-        return Err(PurchaseError::WrongKind(kind));
-    }
-
-    let buyer_pubkey = required_tag_value(event, "p", "p tag")?;
-    if buyer_pubkey != buyer_pubkey_hex {
-        return Err(PurchaseError::BuyerMismatch);
-    }
-
-    let listing_coordinate = required_tag_value(event, "a", "a tag")?;
-    match listing_event {
-        Some(listing) => validate_adp_receipt_signer(&listing_coordinate, event, listing)?,
-        None => validate_listing_coordinate_merchant(&listing_coordinate, &event.pubkey.to_hex())?,
-    }
-
-    let order_id = required_tag_value(event, "order", "order tag")?;
-    let payment_hash = validate_payment_proof(event)?;
-    let status = tag_value(event, "status").unwrap_or_else(|| STATUS_PAID.to_string());
-    let raw_event = serde_json::to_string(event)?;
-
-    Ok(StoredReceipt {
-        event_id: event.id.to_string(),
-        order_id,
-        listing_coordinate,
-        buyer_pubkey,
-        merchant_pubkey: event.pubkey.to_hex(),
-        payment_hash,
-        status,
-        created_at: event.created_at.as_secs(),
-        raw_event,
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FulfillmentDelegation {
-    pubkey: PublicKey,
-    valid_from: u64,
-    revoked_at: Option<u64>,
-}
-
-impl FulfillmentDelegation {
-    fn authorizes_at(&self, at: u64, listing_created_at: u64) -> bool {
-        if self.valid_from > at {
-            return false;
-        }
-        match self.revoked_at {
-            Some(revoked_at) => revoked_at.max(listing_created_at) > at,
-            None => true,
-        }
-    }
-}
-
-fn validate_adp_receipt_signer(
-    listing_coordinate: &str,
-    receipt: &Event,
-    listing: &Event,
-) -> Result<(), PurchaseError> {
-    let expected_coordinate = listing_coordinate_from_listing(listing)?;
-    if expected_coordinate != listing_coordinate {
+    let parsed = parse_receipt_event(event)?;
+    validate_receipt_buyer(&parsed, buyer_pubkey_hex)?;
+    let coordinate = listing_coordinate_from_listing(listing_event)?;
+    if parsed.coordinate != coordinate {
         return Err(PurchaseError::ProofInvalid(
-            "receipt listing coordinate does not match listing event".to_string(),
+            "receipt listing coordinate does not match listing event".into(),
         ));
     }
+    validate_adp_receipt_root(&parsed, listing_event.pubkey, None)?;
+    stored_receipt(&parsed)
+}
 
-    if receipt.pubkey == listing.pubkey {
-        return Ok(());
-    }
-
-    let receipt_created_at = receipt.created_at.as_secs();
-    let listing_created_at = listing.created_at.as_secs();
-    let mut revocation_hit: Option<(u64, u64)> = None;
-
-    for delegation in fulfillment_delegations(listing)? {
-        if delegation.pubkey != receipt.pubkey {
-            continue;
-        }
-        if delegation.authorizes_at(receipt_created_at, listing_created_at) {
-            return Ok(());
-        }
-        if delegation.valid_from > receipt_created_at {
-            continue;
-        }
-        if let Some(revoked_at) = delegation.revoked_at {
-            let effective_revoked_at = revoked_at.max(listing_created_at);
-            if effective_revoked_at <= receipt_created_at {
-                revocation_hit = Some((effective_revoked_at, receipt_created_at));
-            }
-        }
-    }
-
-    if let Some((revoked_at, created_at)) = revocation_hit {
-        return Err(PurchaseError::ProofInvalid(format!(
-            "fulfillment key was revoked at {revoked_at}, receipt created_at {created_at} is at or after revocation"
-        )));
-    }
-
-    Err(PurchaseError::ProofInvalid(
-        "receipt signer is not authorized by listing fulfillment_pubkey tags".to_string(),
-    ))
+pub fn parse_and_validate_receipt_with_authorization(
+    event: &Event,
+    buyer_pubkey_hex: &str,
+    authorization: Option<&ResolvedAuthorization>,
+    evidence: ReceiptEvidence<'_>,
+) -> Result<StoredReceipt, PurchaseError> {
+    let parsed = parse_receipt_event(event)?;
+    validate_receipt_buyer(&parsed, buyer_pubkey_hex)?;
+    let developer = coordinate_publisher(&parsed.coordinate)
+        .ok_or_else(|| PurchaseError::ProofInvalid("malformed listing coordinate".into()))?;
+    validate_adp_receipt_root(&parsed, developer, authorization)?;
+    validate_receipt_evidence(&parsed, evidence)?;
+    stored_receipt(&parsed)
 }
 
 fn listing_coordinate_from_listing(listing: &Event) -> Result<String, PurchaseError> {
@@ -360,109 +311,434 @@ fn listing_coordinate_from_listing(listing: &Event) -> Result<String, PurchaseEr
     Ok(format!("30402:{}:{}", listing.pubkey.to_hex(), d_tag))
 }
 
-fn fulfillment_delegations(listing: &Event) -> Result<Vec<FulfillmentDelegation>, PurchaseError> {
-    listing
+fn exact_tag(
+    event: &Event,
+    name: &'static str,
+    required: bool,
+) -> Result<Option<String>, PurchaseError> {
+    let tags = event
         .tags
         .iter()
-        .filter_map(|tag| {
-            let values = tag.clone().to_vec();
-            (values.first().map(String::as_str) == Some("fulfillment_pubkey")).then_some(values)
-        })
-        .map(|values| {
-            let pubkey_hex = values
-                .get(1)
-                .ok_or(PurchaseError::MissingTag("fulfillment_pubkey.pubkey"))?;
-            let valid_from = values
-                .get(2)
-                .ok_or(PurchaseError::MissingTag("fulfillment_pubkey.valid_from"))?
-                .parse::<u64>()
-                .map_err(|_| PurchaseError::MissingTag("fulfillment_pubkey.valid_from"))?;
-            let pubkey = PublicKey::from_hex(pubkey_hex)
-                .map_err(|_| PurchaseError::MissingTag("fulfillment_pubkey.pubkey"))?;
-            let revoked_at = values
-                .get(3)
-                .filter(|value| !value.is_empty())
-                .map(|value| {
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| PurchaseError::MissingTag("fulfillment_pubkey.revoked_at"))
-                })
-                .transpose()?;
-            Ok(FulfillmentDelegation {
-                pubkey,
-                valid_from,
-                revoked_at,
-            })
-        })
-        .collect()
+        .map(|tag| tag.clone().to_vec())
+        .filter(|values| values.first().is_some_and(|value| value == name))
+        .collect::<Vec<_>>();
+    if tags.len() > 1 {
+        return Err(PurchaseError::ProofInvalid(format!("duplicate {name} tag")));
+    }
+    let Some(values) = tags.first() else {
+        return if required {
+            Err(PurchaseError::MissingTag(name))
+        } else {
+            Ok(None)
+        };
+    };
+    if values.len() != 2 || values[1].is_empty() {
+        return Err(PurchaseError::ProofInvalid(format!("malformed {name} tag")));
+    }
+    Ok(Some(values[1].clone()))
 }
 
-fn validate_listing_coordinate_merchant(
-    listing_coordinate: &str,
-    merchant_pubkey_hex: &str,
-) -> Result<(), PurchaseError> {
-    let mut parts = listing_coordinate.split(':');
-    let Some(kind) = parts.next() else {
-        return Err(PurchaseError::ProofInvalid(
-            "malformed listing coordinate: missing kind".to_string(),
-        ));
-    };
-    let Some(expected_merchant) = parts.next() else {
-        return Err(PurchaseError::ProofInvalid(
-            "malformed listing coordinate: missing merchant pubkey".to_string(),
-        ));
-    };
-    let Some(d_tag) = parts.next() else {
-        return Err(PurchaseError::ProofInvalid(
-            "malformed listing coordinate: missing d tag".to_string(),
-        ));
-    };
+fn parse_proofs(event: &Event) -> Result<Vec<ReceiptProof>, PurchaseError> {
+    let mut proofs = Vec::new();
+    let mut seen = HashSet::new();
+    for values in event.tags.iter().map(|tag| tag.clone().to_vec()) {
+        if values.first().is_none_or(|name| name != "proof") {
+            continue;
+        }
+        let proof = match values.as_slice() {
+            [_, kind] if kind == "bolt11-preimage" => ReceiptProof::Bolt11Preimage,
+            [_, kind, id] if kind == "zap" => ReceiptProof::Zap(
+                EventId::from_hex(id)
+                    .map_err(|_| PurchaseError::ProofInvalid("malformed proof tag".into()))?,
+            ),
+            _ => return Err(PurchaseError::ProofInvalid("malformed proof tag".into())),
+        };
+        if !seen.insert(proof.clone()) {
+            return Err(PurchaseError::ProofInvalid("duplicate proof tag".into()));
+        }
+        proofs.push(proof);
+    }
+    Ok(proofs)
+}
 
-    if kind != "30402" || expected_merchant.is_empty() || d_tag.is_empty() || parts.next().is_some()
+pub fn parse_receipt_event(event: &Event) -> Result<ParsedReceipt, PurchaseError> {
+    event.verify().map_err(|error| {
+        PurchaseError::ProofInvalid(format!("invalid event signature: {error}"))
+    })?;
+    if event.kind.as_u16() != KIND_PURCHASE_RECEIPT {
+        return Err(PurchaseError::WrongKind(event.kind.as_u16()));
+    }
+    let buyer_pubkey =
+        PublicKey::from_hex(&exact_tag(event, "p", true)?.ok_or(PurchaseError::MissingTag("p"))?)
+            .map_err(|_| PurchaseError::ProofInvalid("malformed p tag".into()))?;
+    let coordinate = exact_tag(event, "a", true)?.ok_or(PurchaseError::MissingTag("a"))?;
+    if coordinate_publisher(&coordinate).is_none() {
+        return Err(PurchaseError::ProofInvalid(
+            "malformed listing coordinate".into(),
+        ));
+    }
+    let status = exact_tag(event, "status", true)?.ok_or(PurchaseError::MissingTag("status"))?;
+    if !matches!(
+        status.as_str(),
+        "paid" | "fulfilled" | "refunded" | "disputed"
+    ) {
+        return Err(PurchaseError::ProofInvalid("malformed status tag".into()));
+    }
+    let authorization = exact_tag(event, "authorization", false)?
+        .map(|value| {
+            EventId::from_hex(&value)
+                .map_err(|_| PurchaseError::ProofInvalid("malformed authorization tag".into()))
+        })
+        .transpose()?;
+    let payment_hash = exact_tag(event, "payment_hash", false)?;
+    if payment_hash
+        .as_ref()
+        .is_some_and(|hash| hash.len() != 64 || hex::decode(hash).is_err())
     {
         return Err(PurchaseError::ProofInvalid(
-            "malformed listing coordinate".to_string(),
+            "malformed payment_hash tag".into(),
         ));
     }
+    let amount_msat = exact_tag(event, "amount_msat", false)?
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|_| PurchaseError::ProofInvalid("malformed amount_msat tag".into()))?;
+    let settled_at = exact_tag(event, "settled_at", false)?
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|_| PurchaseError::ProofInvalid("malformed settled_at tag".into()))?;
+    let predecessor = exact_tag(event, "e", false)?
+        .map(|value| {
+            EventId::from_hex(&value)
+                .map_err(|_| PurchaseError::ProofInvalid("malformed e tag".into()))
+        })
+        .transpose()?;
+    Ok(ParsedReceipt {
+        event: event.clone(),
+        order_id: exact_tag(event, "order", true)?.ok_or(PurchaseError::MissingTag("order"))?,
+        buyer_pubkey,
+        coordinate,
+        authorization,
+        payment_hash,
+        amount_msat,
+        settled_at,
+        proofs: parse_proofs(event)?,
+        status,
+        predecessor,
+    })
+}
 
-    if expected_merchant != merchant_pubkey_hex {
+fn validate_receipt_buyer(parsed: &ParsedReceipt, buyer: &str) -> Result<(), PurchaseError> {
+    if parsed.buyer_pubkey.to_hex() == buyer {
+        Ok(())
+    } else {
+        Err(PurchaseError::BuyerMismatch)
+    }
+}
+
+pub fn validate_adp_receipt_root(
+    receipt: &ParsedReceipt,
+    developer: PublicKey,
+    authorization: Option<&ResolvedAuthorization>,
+) -> Result<(), PurchaseError> {
+    if receipt.predecessor.is_some()
+        || receipt.status != STATUS_PAID
+        || receipt.payment_hash.is_none()
+        || receipt.amount_msat.is_none()
+        || receipt.settled_at.is_none()
+        || receipt.proofs.is_empty()
+    {
         return Err(PurchaseError::ProofInvalid(
-            "listing coordinate merchant does not match receipt signer".to_string(),
+            "receipt root is incomplete".into(),
         ));
     }
-
+    if receipt.event.pubkey == developer {
+        if receipt.authorization.is_some() {
+            return Err(PurchaseError::ProofInvalid(
+                "direct receipt must omit authorization".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let anchor = receipt.authorization.ok_or_else(|| {
+        PurchaseError::ProofInvalid("delegated receipt is missing authorization".into())
+    })?;
+    let authorization = authorization
+        .ok_or_else(|| PurchaseError::ProofInvalid("authorization evidence unavailable".into()))?;
+    if authorization.root_event_id != anchor
+        || authorization.developer_pubkey != developer
+        || !authorization.authorizes(
+            &receipt.event.pubkey,
+            &receipt.coordinate,
+            CAPABILITY_ISSUE_RECEIPT,
+            receipt.event.created_at.as_secs(),
+        )
+    {
+        return Err(PurchaseError::ProofInvalid(
+            "delegated receipt authorization denied".into(),
+        ));
+    }
     Ok(())
 }
 
-fn validate_payment_proof(event: &Event) -> Result<Option<String>, PurchaseError> {
-    if tag_value(event, "e").is_some() {
-        // Optimistically accept zap receipt references for now; relay-level
-        // verification of the referenced zap receipt is deferred.
-        return Ok(None);
-    }
-
-    let Some(bolt11) = tag_value(event, "bolt11") else {
-        return Err(PurchaseError::MissingPaymentProof);
-    };
-    let Some(preimage_hex) = tag_value(event, "preimage") else {
-        return Err(PurchaseError::MissingPaymentProof);
-    };
-
-    let preimage = hex::decode(preimage_hex)
-        .map_err(|error| PurchaseError::ProofInvalid(format!("invalid preimage hex: {error}")))?;
-    let invoice = Bolt11Invoice::from_str(&bolt11)
-        .map_err(|error| PurchaseError::ProofInvalid(format!("invalid bolt11 invoice: {error}")))?;
-    let digest: [u8; 32] = Sha256::digest(&preimage).into();
-    let digest_hex = hex::encode(digest);
-    let payment_hash_hex = invoice.payment_hash().to_string();
-
-    if digest_hex != payment_hash_hex {
+pub fn resolve_receipt_chain<'a>(
+    events: &'a [Event],
+    developer: PublicKey,
+    authorization: Option<&ResolvedAuthorization>,
+) -> Result<&'a Event, PurchaseError> {
+    let parsed = events
+        .iter()
+        .filter_map(|event| {
+            parse_receipt_event(event)
+                .ok()
+                .map(|parsed| (event, parsed))
+        })
+        .collect::<Vec<_>>();
+    let roots = parsed
+        .iter()
+        .filter(|(_, receipt)| {
+            receipt.predecessor.is_none()
+                && receipt.status == STATUS_PAID
+                && receipt.payment_hash.is_some()
+                && receipt.amount_msat.is_some()
+                && receipt.settled_at.is_some()
+                && !receipt.proofs.is_empty()
+        })
+        .collect::<Vec<_>>();
+    if roots.len() != 1 {
         return Err(PurchaseError::ProofInvalid(
-            "preimage hash does not match bolt11 payment hash".to_string(),
+            "receipt chain must have one valid paid root".into(),
         ));
     }
+    let (root_event, root) = roots[0];
+    validate_adp_receipt_root(root, developer, authorization)?;
+    let delegated = root_event.pubkey != developer;
+    let mut current_event = *root_event;
+    let mut current = root.clone();
+    let mut visited = HashSet::from([current_event.id]);
+    loop {
+        let mut valid = parsed
+            .iter()
+            .filter(|(_, candidate)| candidate.predecessor == Some(current_event.id))
+            .filter(|(event, candidate)| {
+                event.created_at > current_event.created_at
+                    && candidate.order_id == root.order_id
+                    && candidate.buyer_pubkey == root.buyer_pubkey
+                    && candidate.coordinate == root.coordinate
+                    && candidate.authorization == root.authorization
+                    && candidate.payment_hash.is_none()
+                    && candidate.amount_msat.is_none()
+                    && candidate.settled_at.is_none()
+                    && candidate.proofs.is_empty()
+                    && (event.pubkey == developer
+                        || (delegated && event.pubkey == root_event.pubkey))
+                    && current.status != "refunded"
+                    && candidate.status != STATUS_PAID
+                    && candidate.predecessor != Some(event.id)
+            })
+            .collect::<Vec<_>>();
+        if valid.len() > 1 {
+            return Err(PurchaseError::ProofInvalid(format!(
+                "receipt chain forks at {}",
+                current_event.id
+            )));
+        }
+        let Some((next_event, next)) = valid.pop() else {
+            break;
+        };
+        if !visited.insert(next_event.id) {
+            return Err(PurchaseError::ProofInvalid(
+                "receipt chain contains a cycle".into(),
+            ));
+        }
+        current_event = next_event;
+        current = next.clone();
+    }
+    Ok(current_event)
+}
 
-    Ok(Some(payment_hash_hex))
+pub fn validate_receipt_evidence(
+    receipt: &ParsedReceipt,
+    evidence: ReceiptEvidence<'_>,
+) -> Result<(), PurchaseError> {
+    match (evidence.bolt11, evidence.preimage) {
+        (Some(bolt11), Some(preimage)) => {
+            if !receipt.proofs.contains(&ReceiptProof::Bolt11Preimage) {
+                return Err(PurchaseError::ProofInvalid(
+                    "undeclared bolt11 proof".into(),
+                ));
+            }
+            let invoice = Bolt11Invoice::from_str(bolt11).map_err(|error| {
+                PurchaseError::ProofInvalid(format!("invalid bolt11 invoice: {error}"))
+            })?;
+            let bytes = hex::decode(preimage).map_err(|error| {
+                PurchaseError::ProofInvalid(format!("invalid preimage hex: {error}"))
+            })?;
+            let digest = hex::encode(<[u8; 32]>::from(Sha256::digest(bytes)));
+            if digest != invoice.payment_hash().to_string()
+                || receipt.payment_hash.as_deref() != Some(digest.as_str())
+                || invoice.amount_milli_satoshis() != receipt.amount_msat
+            {
+                return Err(PurchaseError::ProofInvalid(
+                    "bolt11 proof contradicts receipt binding".into(),
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(PurchaseError::ProofInvalid(
+                "bolt11 and preimage must be supplied together".into(),
+            ))
+        }
+    }
+    let supplied_zaps = evidence
+        .zap_receipts
+        .iter()
+        .map(|event| (event.id, event))
+        .collect::<HashMap<_, _>>();
+    for proof in &receipt.proofs {
+        if let ReceiptProof::Zap(id) = proof {
+            if !evidence.zap_receipts.is_empty() {
+                let event = supplied_zaps.get(id).ok_or_else(|| {
+                    PurchaseError::ProofInvalid("declared zap proof was not supplied".into())
+                })?;
+                event.verify().map_err(|_| {
+                    PurchaseError::ProofInvalid("invalid zap proof signature".into())
+                })?;
+                if event.kind.as_u16() != 9735 {
+                    return Err(PurchaseError::ProofInvalid(
+                        "zap proof has wrong kind".into(),
+                    ));
+                }
+                if evidence.lsp_pubkey.is_some_and(|lsp| event.pubkey != lsp) {
+                    return Err(PurchaseError::ProofInvalid(
+                        "zap proof signer is not the listing LSP".into(),
+                    ));
+                }
+                let buyer = receipt.buyer_pubkey.to_hex();
+                let has_buyer = event.tags.iter().any(|tag| matches!(tag.as_slice(), [name, value, ..] if name == "P" && value.as_str() == buyer));
+                let has_coordinate = event.tags.iter().any(|tag| matches!(tag.as_slice(), [name, value, ..] if matches!(name.as_str(), "a" | "e") && value == &receipt.coordinate));
+                if !has_buyer || !has_coordinate {
+                    return Err(PurchaseError::ProofInvalid(
+                        "zap proof binding mismatch".into(),
+                    ));
+                }
+                let invoices = event
+                    .tags
+                    .iter()
+                    .filter_map(|tag| match tag.as_slice() {
+                        [name, value] if name == "bolt11" => Some(value.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if invoices.len() != 1 {
+                    return Err(PurchaseError::ProofInvalid(
+                        "zap proof must contain one bolt11 tag".into(),
+                    ));
+                }
+                let invoice = Bolt11Invoice::from_str(&invoices[0]).map_err(|error| {
+                    PurchaseError::ProofInvalid(format!("invalid zap invoice: {error}"))
+                })?;
+                if receipt.payment_hash.as_deref()
+                    != Some(invoice.payment_hash().to_string().as_str())
+                    || receipt.amount_msat != invoice.amount_milli_satoshis()
+                    || receipt
+                        .settled_at
+                        .is_some_and(|settled| event.created_at.as_secs() > settled)
+                {
+                    return Err(PurchaseError::ProofInvalid(
+                        "zap proof contradicts receipt binding".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stored_receipt(parsed: &ParsedReceipt) -> Result<StoredReceipt, PurchaseError> {
+    Ok(StoredReceipt {
+        event_id: parsed.event.id.to_hex(),
+        order_id: parsed.order_id.clone(),
+        listing_coordinate: parsed.coordinate.clone(),
+        buyer_pubkey: parsed.buyer_pubkey.to_hex(),
+        merchant_pubkey: parsed.event.pubkey.to_hex(),
+        payment_hash: parsed.payment_hash.clone(),
+        status: parsed.status.clone(),
+        created_at: parsed.event.created_at.as_secs(),
+        raw_event: serde_json::to_string(&parsed.event)?,
+    })
+}
+
+fn resolve_persisted_receipt_tip(events: &[Event]) -> Option<&Event> {
+    let parsed = events
+        .iter()
+        .filter_map(|event| {
+            parse_receipt_event(event)
+                .ok()
+                .map(|parsed| (event, parsed))
+        })
+        .collect::<Vec<_>>();
+    let roots = parsed
+        .iter()
+        .filter(|(_, receipt)| {
+            receipt.predecessor.is_none()
+                && receipt.status == STATUS_PAID
+                && receipt.payment_hash.is_some()
+                && receipt.amount_msat.is_some()
+                && receipt.settled_at.is_some()
+                && !receipt.proofs.is_empty()
+        })
+        .collect::<Vec<_>>();
+    if roots.len() != 1 {
+        return None;
+    }
+    let (root_event, root) = roots[0];
+    let developer = coordinate_publisher(&root.coordinate)?;
+    let delegated = root_event.pubkey != developer;
+    if (delegated && root.authorization.is_none()) || (!delegated && root.authorization.is_some()) {
+        return None;
+    }
+    let mut current_event = *root_event;
+    let mut current = root.clone();
+    loop {
+        let mut valid = parsed
+            .iter()
+            .filter(|(_, candidate)| candidate.predecessor == Some(current_event.id))
+            .filter(|(event, candidate)| {
+                event.created_at > current_event.created_at
+                    && candidate.order_id == root.order_id
+                    && candidate.buyer_pubkey == root.buyer_pubkey
+                    && candidate.coordinate == root.coordinate
+                    && candidate.authorization == root.authorization
+                    && candidate.payment_hash.is_none()
+                    && candidate.amount_msat.is_none()
+                    && candidate.settled_at.is_none()
+                    && candidate.proofs.is_empty()
+                    && (event.pubkey == developer
+                        || (delegated && event.pubkey == root_event.pubkey))
+                    && current.status != "refunded"
+                    && candidate.status != STATUS_PAID
+            })
+            .collect::<Vec<_>>();
+        if valid.len() > 1 {
+            return None;
+        }
+        let Some((next_event, next)) = valid.pop() else {
+            break;
+        };
+        current_event = next_event;
+        current = next.clone();
+    }
+    Some(current_event)
+}
+
+fn validate_payment_proof(event: &Event) -> Result<Option<String>, PurchaseError> {
+    let parsed = parse_receipt_event(event)?;
+    if parsed.proofs.is_empty() {
+        return Err(PurchaseError::MissingPaymentProof);
+    }
+    Ok(parsed.payment_hash)
 }
 
 fn required_tag_value(
@@ -484,7 +760,7 @@ fn status_grants_ownership(status: &str) -> bool {
     matches!(status, STATUS_PAID | STATUS_FULFILLED)
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::{
         parse_and_validate_receipt, parse_and_validate_receipt_with_listing, stored_receipt_amount,

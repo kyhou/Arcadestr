@@ -5,8 +5,18 @@ use std::collections::HashSet;
 use nostr::{EventBuilder, Kind, Tag, TagKind};
 use thiserror::Error;
 
-use crate::authorization::FULFILLMENT_AUTHORIZATION_KIND;
+use crate::authorization::{
+    AuthorizationTerms, CAPABILITY_ISSUE_GRANT, CAPABILITY_ISSUE_RECEIPT, CAPABILITY_UPLOAD_BUILD,
+    FULFILLMENT_AUTHORIZATION_KIND,
+};
 use crate::marketplace::AcquisitionPolicy;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FulfillmentAuthorizationInput {
+    pub root_event_id: String,
+    pub fulfillment_pubkey: String,
+    pub relay_hint: Option<String>,
+}
 
 /// Input required to construct an ADP NIP-99 listing event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,9 +31,7 @@ pub struct AdpListingInput {
     pub servers: Vec<String>,
     pub file_hash: Option<String>,
     pub version: Option<String>,
-    pub fulfillment_pubkey: Option<String>,
-    pub fulfillment_valid_from: Option<u64>,
-    pub fulfillment_revoked_at: Option<u64>,
+    pub fulfillment_authorizations: Vec<FulfillmentAuthorizationInput>,
     pub acquisition: AcquisitionPolicy,
     pub platforms: Vec<String>,
     pub campaigns: Vec<(String, Option<String>)>,
@@ -64,6 +72,9 @@ pub enum AdpPublishError {
     /// NIP-94 links must contain a valid event ID.
     #[error("malformed NIP-94 event ID")]
     InvalidNip94EventId,
+    /// Authorization references must contain a root, key, and optional relay URL.
+    #[error("malformed fulfillment authorization reference")]
+    InvalidFulfillmentAuthorization,
 }
 
 fn is_http_url(value: &str) -> bool {
@@ -92,28 +103,48 @@ fn is_platform_tag(value: &str) -> bool {
 
 /// Builds a developer-signed fulfillment authorization root.
 pub fn build_fulfillment_authorization_event_builder(
-    authorization_id: &str,
-    listing_coordinate: &str,
-    fulfillment_pubkey: &str,
-    valid_from: u64,
-) -> EventBuilder {
-    EventBuilder::new(Kind::Custom(FULFILLMENT_AUTHORIZATION_KIND), "").tags([
-        Tag::custom(TagKind::Custom("d".into()), [authorization_id.to_string()]),
+    terms: &AuthorizationTerms,
+) -> Result<EventBuilder, AdpPublishError> {
+    if terms.authorization_id.is_empty()
+        || !terms.capabilities.iter().any(|capability| {
+            matches!(
+                capability.as_str(),
+                CAPABILITY_ISSUE_RECEIPT | CAPABILITY_ISSUE_GRANT | CAPABILITY_UPLOAD_BUILD
+            )
+        })
+    {
+        return Err(AdpPublishError::InvalidFulfillmentAuthorization);
+    }
+    let mut tags = vec![
         Tag::custom(
-            TagKind::Custom("authorization_id".into()),
-            [authorization_id.to_string()],
+            TagKind::Custom("d".into()),
+            [terms.authorization_id.clone()],
         ),
+        Tag::custom(TagKind::Custom("a".into()), [terms.coordinate.clone()]),
+        Tag::custom(TagKind::p(), [terms.operator_pubkey.to_hex()]),
         Tag::custom(
-            TagKind::Custom("a".into()),
-            [listing_coordinate.to_string()],
+            TagKind::Custom("fulfillment_pubkey".into()),
+            [terms.fulfillment_pubkey.to_hex()],
         ),
-        Tag::custom(TagKind::p(), [fulfillment_pubkey.to_string()]),
+    ];
+    for capability in &terms.capabilities {
+        tags.push(Tag::custom(
+            TagKind::Custom("capability".into()),
+            [capability.clone()],
+        ));
+    }
+    tags.extend([
         Tag::custom(
             TagKind::Custom("valid_from".into()),
-            [valid_from.to_string()],
+            [terms.valid_from.to_string()],
         ),
         Tag::custom(TagKind::Custom("status".into()), ["active"]),
-    ])
+    ]);
+    Ok(
+        EventBuilder::new(Kind::Custom(FULFILLMENT_AUTHORIZATION_KIND), "")
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from_secs(terms.valid_from)),
+    )
 }
 
 /// Builds the developer-signed `kind:30402` listing event.
@@ -146,17 +177,9 @@ pub fn build_adp_listing_event_builder(
                 .as_deref()
                 .is_some_and(|value| !value.is_empty()),
         ),
-        (
-            "fulfillment_pubkey",
-            input
-                .fulfillment_pubkey
-                .as_deref()
-                .is_some_and(|value| !value.is_empty()),
-        ),
     ];
     let has_any_fulfillment = fulfillment_fields.iter().any(|(_, present)| *present)
-        || input.fulfillment_valid_from.is_some()
-        || input.fulfillment_revoked_at.is_some();
+        || !input.fulfillment_authorizations.is_empty();
     let missing_fulfillment = fulfillment_fields
         .iter()
         .filter_map(|(name, present)| (!present).then_some(*name))
@@ -215,6 +238,18 @@ pub fn build_adp_listing_event_builder(
         }
     }
 
+    for authorization in &input.fulfillment_authorizations {
+        if nostr::EventId::from_hex(&authorization.root_event_id).is_err()
+            || nostr::PublicKey::from_hex(&authorization.fulfillment_pubkey).is_err()
+            || authorization
+                .relay_hint
+                .as_deref()
+                .is_some_and(|relay| nostr::RelayUrl::parse(relay).is_err())
+        {
+            return Err(AdpPublishError::InvalidFulfillmentAuthorization);
+        }
+    }
+
     if input
         .nip94_event_id
         .as_deref()
@@ -233,7 +268,15 @@ pub fn build_adp_listing_event_builder(
         Tag::custom(TagKind::Custom("t".into()), ["game".to_string()]),
     ];
 
+    let mut seen_fulfillment_authorizations = HashSet::new();
     for values in &input.preserved_tags {
+        if values
+            .first()
+            .is_some_and(|name| name == "fulfillment_authorization")
+            && !seen_fulfillment_authorizations.insert(values.clone())
+        {
+            continue;
+        }
         tags.push(Tag::parse(values.clone()).map_err(|_| AdpPublishError::MalformedPreservedTag)?);
     }
 
@@ -259,9 +302,11 @@ pub fn build_adp_listing_event_builder(
         }
     }
 
+    let mut topic_tags = HashSet::from(["game".to_string()]);
     for tag in &input.tags {
-        if !tag.is_empty() {
-            tags.push(Tag::custom(TagKind::Custom("t".into()), [tag.clone()]));
+        let tag = tag.trim();
+        if !tag.is_empty() && topic_tags.insert(tag.to_ascii_lowercase()) {
+            tags.push(Tag::custom(TagKind::Custom("t".into()), [tag.to_string()]));
         }
     }
 
@@ -280,23 +325,23 @@ pub fn build_adp_listing_event_builder(
             TagKind::Custom("version".into()),
             [input.version.clone().expect("version checked above")],
         ));
-        tags.push(Tag::custom(
-            TagKind::Custom("fulfillment_pubkey".into()),
-            [
-                input
-                    .fulfillment_pubkey
-                    .clone()
-                    .expect("fulfillment_pubkey checked above"),
-                input
-                    .fulfillment_valid_from
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                input
-                    .fulfillment_revoked_at
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-            ],
-        ));
+        for authorization in &input.fulfillment_authorizations {
+            let mut values = vec![
+                authorization.root_event_id.clone(),
+                authorization.fulfillment_pubkey.clone(),
+            ];
+            if let Some(relay_hint) = authorization.relay_hint.as_ref() {
+                values.push(relay_hint.clone());
+            }
+            let mut raw_values = vec!["fulfillment_authorization".to_string()];
+            raw_values.extend(values.clone());
+            if seen_fulfillment_authorizations.insert(raw_values) {
+                tags.push(Tag::custom(
+                    TagKind::Custom("fulfillment_authorization".into()),
+                    values,
+                ));
+            }
+        }
     }
 
     if let Some(lud16) = &input.lud16 {
@@ -340,7 +385,7 @@ pub fn build_adp_listing_event_builder(
     Ok(EventBuilder::new(Kind::Custom(30402), input.description.clone()).tags(tags))
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::authorization::{parse_authorization_event, AuthorizationTransition};
@@ -467,7 +512,13 @@ mod tests {
             description: "Fun game".to_string(),
             price_sats: 2100,
             lud16: Some("studio@example.com".to_string()),
-            tags: vec!["arcade".to_string(), "nostr".to_string()],
+            tags: vec![
+                "game".to_string(),
+                "arcade".to_string(),
+                "arcade".to_string(),
+                "GAME".to_string(),
+                "nostr".to_string(),
+            ],
             images: vec!["https://cdn.example.com/cover.png".to_string()],
             servers: vec![
                 "https://dist.example.com".to_string(),

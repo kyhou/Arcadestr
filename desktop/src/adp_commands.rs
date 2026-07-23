@@ -1,5 +1,6 @@
 //! Tauri commands for ADP publish flow.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,12 +13,16 @@ use arcadestr_core::adp_discovery::{
     discover_adp_servers as discover_adp_servers_core, AdpServerAnnouncement,
 };
 use arcadestr_core::adp_publish::{
-    build_adp_listing_event_builder, build_fulfillment_authorization_event_builder, AdpListingInput,
+    build_adp_listing_event_builder, build_fulfillment_authorization_event_builder,
+    AdpListingInput, FulfillmentAuthorizationInput,
 };
 use arcadestr_core::adp_storage::{
     AdpProvisioning, AdpProvisioningRepository, DownloadToken, DownloadTokensRepository,
 };
 use arcadestr_core::auth::AuthState;
+use arcadestr_core::authorization::{
+    AuthorizationTerms, CAPABILITY_ISSUE_GRANT, CAPABILITY_ISSUE_RECEIPT, CAPABILITY_UPLOAD_BUILD,
+};
 use arcadestr_core::file_hash::sha256_file;
 use arcadestr_core::http_client::HttpClient;
 use arcadestr_core::lnurlp::{request_invoice, resolve_lud16};
@@ -60,8 +65,6 @@ pub struct PublishAdpListingRequest {
     pub file_path: Option<String>,
     pub existing_file_hash: Option<String>,
     pub existing_fulfillment_pubkey: Option<String>,
-    pub existing_fulfillment_valid_from: Option<u64>,
-    pub existing_fulfillment_revoked_at: Option<u64>,
     pub version: Option<String>,
     pub acquisition: arcadestr_core::marketplace::AcquisitionPolicy,
     pub platforms: Vec<String>,
@@ -104,8 +107,6 @@ pub struct PublishProgressPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FulfillmentMetadata {
     fulfillment_pubkey: Option<String>,
-    valid_from: Option<u64>,
-    revoked_at: Option<u64>,
     should_provision: bool,
 }
 
@@ -113,16 +114,10 @@ fn resolve_existing_fulfillment_metadata(
     mode: &FulfillmentMode,
     developer_pubkey: &str,
     existing_pubkey: Option<&str>,
-    existing_valid_from: Option<u64>,
-    existing_revoked_at: Option<u64>,
-    now: u64,
 ) -> Result<FulfillmentMetadata, String> {
     match mode {
         FulfillmentMode::None => {
-            if existing_pubkey.is_some()
-                || existing_valid_from.is_some()
-                || existing_revoked_at.is_some()
-            {
+            if existing_pubkey.is_some() {
                 return Err(
                     "existing fulfillment metadata cannot be cleared by an ordinary edit"
                         .to_string(),
@@ -130,46 +125,25 @@ fn resolve_existing_fulfillment_metadata(
             }
             Ok(FulfillmentMetadata {
                 fulfillment_pubkey: None,
-                valid_from: None,
-                revoked_at: None,
                 should_provision: false,
             })
         }
-        FulfillmentMode::Direct => {
-            let key_is_unchanged = existing_pubkey == Some(developer_pubkey);
-            Ok(FulfillmentMetadata {
-                fulfillment_pubkey: Some(developer_pubkey.to_string()),
-                valid_from: if key_is_unchanged {
-                    existing_valid_from.or(Some(now))
-                } else {
-                    Some(now)
-                },
-                revoked_at: if key_is_unchanged {
-                    existing_revoked_at
-                } else {
-                    None
-                },
-                should_provision: false,
-            })
-        }
+        FulfillmentMode::Direct => Ok(FulfillmentMetadata {
+            fulfillment_pubkey: Some(developer_pubkey.to_string()),
+            should_provision: false,
+        }),
         FulfillmentMode::Delegate => match existing_pubkey {
             Some(pubkey) if pubkey == developer_pubkey => Ok(FulfillmentMetadata {
                 fulfillment_pubkey: None,
-                valid_from: None,
-                revoked_at: None,
                 should_provision: true,
             }),
             Some(pubkey) if !pubkey.is_empty() => Ok(FulfillmentMetadata {
                 fulfillment_pubkey: Some(pubkey.to_string()),
-                valid_from: existing_valid_from,
-                revoked_at: existing_revoked_at,
                 should_provision: false,
             }),
             Some(_) => Err("existing fulfillment key cannot be empty".to_string()),
             None => Ok(FulfillmentMetadata {
                 fulfillment_pubkey: None,
-                valid_from: None,
-                revoked_at: None,
                 should_provision: true,
             }),
         },
@@ -215,6 +189,25 @@ async fn resolve_publish_signer(
         .cloned()
         .map(|signer: ActiveSigner| Arc::new(signer) as Arc<dyn NostrSigner>)
         .ok_or_else(|| "not authenticated".to_string())
+}
+
+async fn ensure_publish_account_current(
+    state: &State<'_, AppState>,
+    signer_state: &Arc<tokio::sync::Mutex<AppSignerState>>,
+    expected: nostr::PublicKey,
+) -> Result<(), String> {
+    let auth = { state.auth.lock().await.clone() };
+    let current = resolve_publish_signer(signer_state, &auth)
+        .await?
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    if current != expected {
+        return Err(
+            "active account changed while fulfillment authorization was being prepared".into(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -776,6 +769,8 @@ pub async fn confirm_purchase(
         listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
     let listing_event = fetch_listing_event_by_coordinate(&state, &game_coordinate).await?;
     let listing_for_validation = listing_event.clone();
+    let bolt11 = request.bolt11.clone();
+    let preimage = request.preimage.clone();
     let client = AdpClient::new(request.server_url.clone(), Arc::clone(&state.http_client));
     let response = client
         .purchase_confirm(
@@ -783,8 +778,9 @@ pub async fn confirm_purchase(
             CorePurchaseConfirmRequest {
                 game_coordinate: game_coordinate.clone(),
                 listing_event,
-                bolt11: request.bolt11,
-                preimage: request.preimage,
+                zap_receipt_event: None,
+                bolt11: Some(request.bolt11),
+                preimage: Some(request.preimage),
             },
         )
         .await
@@ -796,6 +792,8 @@ pub async fn confirm_purchase(
         &request.server_url,
         response,
         &listing_for_validation,
+        &bolt11,
+        &preimage,
     )
     .await
 }
@@ -868,8 +866,7 @@ pub async fn claim_entitlement(
     }
     let grant = arcadestr_core::entitlements::resolve_entitlement_grant(&[parsed.clone()])
         .map_err(|error| format!("invalid grant response: {error}"))?;
-    let delegations = grant_issuance_delegations(&listing)?;
-    let authorization = if let Some(root_event_id) = parsed.authorization_event {
+    let authorization = if let Some(root_event_id) = parsed.authorization {
         let relay_manager_guard = relay_manager.lock().await;
         Some(
             arcadestr_core::authorization::discover_authorization(
@@ -889,25 +886,31 @@ pub async fn claim_entitlement(
         &grant,
         &campaign,
         authorization.as_ref(),
-        &delegations,
     )
     .map_err(|error| format!("invalid grant response: {error}"))?;
+    let buyer_hex = buyer.to_hex();
+    if state
+        .auth
+        .lock()
+        .await
+        .public_key()
+        .map(|key| key.to_hex())
+        .as_deref()
+        != Some(buyer_hex.as_str())
+    {
+        return Err("active account changed while grant authorization was being verified".into());
+    }
 
     let entitlements = arcadestr_core::entitlements_repository::EntitlementsRepository::new(
         state.database.pool().clone(),
     );
     entitlements
-        .ingest_event(
-            &response.grant,
-            &campaign,
-            authorization.as_ref(),
-            &delegations,
-        )
+        .ingest_event(&response.grant, &campaign, authorization.as_ref())
         .await
         .map_err(|error| error.to_string())?;
     DownloadTokensRepository::new(state.database.pool().clone())
         .upsert(&DownloadToken {
-            buyer_pubkey: buyer.to_hex(),
+            buyer_pubkey: buyer_hex,
             game_coordinate: game_coordinate,
             server_url: request.server_url,
             token: response.download_token.clone(),
@@ -922,41 +925,6 @@ pub async fn claim_entitlement(
         token_expires_at: response.token_expires_at,
         already_claimed: response.already_claimed,
     })
-}
-
-fn grant_issuance_delegations(
-    listing: &nostr::Event,
-) -> Result<Vec<arcadestr_core::entitlements::IssuanceDelegation>, String> {
-    listing
-        .tags
-        .iter()
-        .filter_map(|tag| {
-            let values = tag.clone().to_vec();
-            (values.first().map(String::as_str) == Some("fulfillment_pubkey")).then_some(values)
-        })
-        .map(|values| {
-            let pubkey = values
-                .get(1)
-                .and_then(|value| nostr::PublicKey::from_hex(value).ok())
-                .ok_or_else(|| "malformed fulfillment_pubkey tag".to_string())?;
-            let valid_from = values
-                .get(2)
-                .and_then(|value| value.parse::<u64>().ok())
-                .ok_or_else(|| "malformed fulfillment_pubkey valid_from".to_string())?;
-            let revoked_at = values
-                .get(3)
-                .filter(|value| !value.is_empty())
-                .map(|value| value.parse::<u64>())
-                .transpose()
-                .map_err(|_| "malformed fulfillment_pubkey revoked_at".to_string())?
-                .map(|declared| declared.max(listing.created_at.as_secs()));
-            Ok(arcadestr_core::entitlements::IssuanceDelegation {
-                pubkey,
-                valid_from,
-                revoked_at,
-            })
-        })
-        .collect()
 }
 
 fn listing_coordinate_from_npub(publisher_npub: &str, listing_id: &str) -> Result<String, String> {
@@ -1060,13 +1028,45 @@ async fn persist_purchase_confirmation(
     server_url: &str,
     response: CorePurchaseConfirmResponse,
     listing_event: &nostr::Event,
+    bolt11: &str,
+    preimage: &str,
 ) -> Result<ConfirmPurchaseResponse, String> {
-    let receipt = arcadestr_core::purchases::parse_and_validate_receipt_with_listing(
+    let parsed = arcadestr_core::purchases::parse_receipt_event(&response.receipt)
+        .map_err(|error| error.to_string())?;
+    let authorization = if response.receipt.pubkey == listing_event.pubkey {
+        None
+    } else {
+        let root = parsed
+            .authorization
+            .ok_or_else(|| "delegated receipt is missing authorization".to_string())?;
+        let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+        let relay_manager = relay_manager.lock().await;
+        Some(
+            arcadestr_core::authorization::discover_authorization(
+                &relay_manager,
+                root,
+                listing_event.pubkey,
+            )
+            .await
+            .map_err(|error| format!("receipt authorization unavailable or invalid: {error}"))?,
+        )
+    };
+    let receipt = arcadestr_core::purchases::parse_and_validate_receipt_with_authorization(
         &response.receipt,
         buyer_pubkey,
-        listing_event,
+        authorization.as_ref(),
+        arcadestr_core::purchases::ReceiptEvidence {
+            bolt11: Some(bolt11),
+            preimage: Some(preimage),
+            zap_receipts: &[],
+            lsp_pubkey: None,
+        },
     )
     .map_err(|err| err.to_string())?;
+    let current_buyer = state.auth.lock().await.public_key().map(|key| key.to_hex());
+    if current_buyer.as_deref() != Some(buyer_pubkey) {
+        return Err("active account changed while receipt authorization was being verified".into());
+    }
     state
         .purchases
         .upsert_receipt(&receipt)
@@ -1194,16 +1194,11 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         .map_err(|_| "current time is negative".to_string())?;
     let FulfillmentMetadata {
         fulfillment_pubkey: mut fulfillment_pubkey,
-        valid_from: mut fulfillment_valid_from,
-        revoked_at: fulfillment_revoked_at,
         should_provision,
     } = resolve_existing_fulfillment_metadata(
         &request.fulfillment_mode,
         &developer_npub,
         request.existing_fulfillment_pubkey.as_deref(),
-        request.existing_fulfillment_valid_from,
-        request.existing_fulfillment_revoked_at,
-        now,
     )?;
 
     let mut file_hash = None;
@@ -1311,10 +1306,17 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                     ProvisioningDecision::Reused {
                         fulfillment_pubkey: reused_pubkey,
                         authorization_event_id,
-                        valid_from,
+                        valid_from: _,
                         authorization_event,
                         row,
                     } => {
+                        validate_current_attestation(&state, &row, now).await?;
+                        ensure_publish_account_current(
+                            &state,
+                            signer_state.inner(),
+                            developer_pubkey,
+                        )
+                        .await?;
                         provisioning_repo
                             .upsert(&row)
                             .await
@@ -1330,19 +1332,21 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                         )?;
                         fulfillment_pubkey = Some(reused_pubkey);
                         acceptance_event_id = Some(authorization_event_id);
-                        fulfillment_valid_from = Some(
-                            valid_from
-                                .try_into()
-                                .map_err(|_| "provisioning valid_from is negative".to_string())?,
-                        );
                     }
                     ProvisioningDecision::Created {
                         fulfillment_pubkey: created_pubkey,
                         authorization_event_id,
-                        valid_from,
+                        valid_from: _,
                         authorization_event,
                         row,
                     } => {
+                        validate_current_attestation(&state, &row, now).await?;
+                        ensure_publish_account_current(
+                            &state,
+                            signer_state.inner(),
+                            developer_pubkey,
+                        )
+                        .await?;
                         provisioning_repo
                             .upsert(&row)
                             .await
@@ -1358,18 +1362,11 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                         )?;
                         fulfillment_pubkey = Some(created_pubkey);
                         acceptance_event_id = Some(authorization_event_id);
-                        fulfillment_valid_from = Some(
-                            valid_from
-                                .try_into()
-                                .map_err(|_| "provisioning valid_from is negative".to_string())?,
-                        );
                     }
                 }
-            } else if let Some(existing_pubkey) = existing_authorization_repair_key(
-                should_provision,
-                fulfillment_pubkey.as_deref(),
-                fulfillment_revoked_at,
-            ) {
+            } else if let Some(existing_pubkey) =
+                existing_authorization_repair_key(should_provision, fulfillment_pubkey.as_deref())
+            {
                 let operator_url = request.operator_url.as_deref().ok_or_else(|| {
                     "operator URL is required to repair delegated fulfillment authorization"
                         .to_string()
@@ -1393,6 +1390,9 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                     fulfillment_pubkey: existing_pubkey,
                 })
                 .await?;
+                validate_current_attestation(&state, &repair.row, now).await?;
+                ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey)
+                    .await?;
                 provisioning_repo
                     .upsert(&repair.row)
                     .await
@@ -1415,6 +1415,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     }
 
     emit_progress(&app, "publish-listing", "pending", None)?;
+    ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey).await?;
     let listing_input = AdpListingInput {
         d_tag: request.d_tag.clone(),
         title: request.title.clone(),
@@ -1426,9 +1427,22 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         servers: request.servers.clone(),
         file_hash: file_hash.clone(),
         version: request.version.clone(),
-        fulfillment_pubkey: fulfillment_pubkey.clone(),
-        fulfillment_valid_from,
-        fulfillment_revoked_at,
+        fulfillment_authorizations: if matches!(request.fulfillment_mode, FulfillmentMode::Delegate)
+        {
+            acceptance_event_id
+                .as_ref()
+                .zip(fulfillment_pubkey.as_ref())
+                .map(|(root_event_id, fulfillment_pubkey)| {
+                    vec![FulfillmentAuthorizationInput {
+                        root_event_id: root_event_id.clone(),
+                        fulfillment_pubkey: fulfillment_pubkey.clone(),
+                        relay_hint: None,
+                    }]
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
         acquisition: request.acquisition.clone(),
         platforms: request.platforms.clone(),
         campaigns: request
@@ -1541,6 +1555,44 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     })
 }
 
+async fn validate_current_attestation(
+    state: &State<'_, AppState>,
+    row: &AdpProvisioning,
+    now: u64,
+) -> Result<(), String> {
+    let operator = nostr::PublicKey::from_hex(&row.operator_pubkey)
+        .map_err(|_| "operator pubkey is invalid".to_string())?;
+    let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+    let relay_manager = relay_manager.lock().await;
+    let d = format!("{}:{}", row.developer_npub, row.fulfillment_pubkey);
+    let events = relay_manager
+        .fetch_events_best_effort(
+            nostr::Filter::new()
+                .kind(nostr::Kind::Custom(30404))
+                .author(operator),
+        )
+        .await
+        .map_err(|error| format!("operator attestation evidence unavailable: {error}"))?;
+    let attestation = select_replaceable_event(events.into_iter().filter(|event| {
+        event
+            .tags
+            .iter()
+            .any(|tag| matches!(tag.as_slice(), [name, value] if name == "d" && value == &d))
+    }))
+    .ok_or_else(|| "operator attestation evidence unavailable".to_string())?;
+    let parsed = arcadestr_core::authorization::parse_attestation_event(&attestation)
+        .map_err(|error| format!("invalid operator attestation: {error}"))?;
+    if attestation.pubkey != operator
+        || parsed.developer_pubkey.to_hex() != row.developer_npub
+        || parsed.fulfillment_pubkey.to_hex() != row.fulfillment_pubkey
+        || parsed.scope.as_deref() != row.scope.as_deref()
+        || !parsed.allows_new_operations_at(now)
+    {
+        return Err("operator no longer attests possession of this fulfillment key".into());
+    }
+    Ok(())
+}
+
 enum ProvisioningDecision {
     Reused {
         fulfillment_pubkey: String,
@@ -1588,11 +1640,8 @@ struct ExistingAuthorizationRepair {
 fn existing_authorization_repair_key(
     should_provision: bool,
     fulfillment_pubkey: Option<&str>,
-    revoked_at: Option<u64>,
 ) -> Option<&str> {
-    (!should_provision && revoked_at.is_none())
-        .then_some(fulfillment_pubkey)
-        .flatten()
+    (!should_provision).then_some(fulfillment_pubkey).flatten()
 }
 
 async fn repair_existing_authorization(
@@ -1604,7 +1653,12 @@ async fn repair_existing_authorization(
         .await
         .map_err(|err| err.to_string())?
         .into_iter()
-        .filter(|row| row.revoked_at.is_none() && row.server_url == input.operator_url)
+        .filter(|row| {
+            row.revoked_at.is_none()
+                && row.server_url == input.operator_url
+                && row.authorization_profile_version >= 2
+                && row.authorization_root_event_id.is_some()
+        })
         .collect::<Vec<_>>();
     let [mut row] = matches.try_into().map_err(|matches: Vec<AdpProvisioning>| {
         format!(
@@ -1612,17 +1666,26 @@ async fn repair_existing_authorization(
             matches.len()
         )
     })?;
-    let valid_from: u64 = row
-        .valid_from
+    let valid_from: u64 = now_unix_i64()?
         .try_into()
-        .map_err(|_| "provisioning valid_from is negative".to_string())?;
+        .map_err(|_| "current time is negative".to_string())?;
     let coordinate = format!("30402:{}:{}", input.developer_pubkey.to_hex(), input.scope);
-    let builder = build_fulfillment_authorization_event_builder(
-        &row.attestation_event_id,
-        &coordinate,
-        input.fulfillment_pubkey,
+    let terms = AuthorizationTerms {
+        authorization_id: uuid::Uuid::new_v4().to_string(),
+        coordinate,
+        operator_pubkey: nostr::PublicKey::from_hex(&row.operator_pubkey)
+            .map_err(|_| "stored operator pubkey is invalid".to_string())?,
+        fulfillment_pubkey: nostr::PublicKey::from_hex(input.fulfillment_pubkey)
+            .map_err(|_| "stored fulfillment pubkey is invalid".to_string())?,
+        capabilities: BTreeSet::from([
+            CAPABILITY_ISSUE_RECEIPT.into(),
+            CAPABILITY_ISSUE_GRANT.into(),
+            CAPABILITY_UPLOAD_BUILD.into(),
+        ]),
         valid_from,
-    );
+    };
+    let builder =
+        build_fulfillment_authorization_event_builder(&terms).map_err(|error| error.to_string())?;
     let authorization_event = input
         .signer
         .sign_event(builder.build(input.developer_pubkey))
@@ -1630,6 +1693,12 @@ async fn repair_existing_authorization(
         .map_err(|err| err.to_string())?;
     let authorization_event_id = authorization_event.id.to_hex();
     row.acceptance_event_id = authorization_event_id.clone();
+    row.valid_from = valid_from
+        .try_into()
+        .map_err(|_| "authorization valid_from exceeds storage range".to_string())?;
+    row.authorization_root_event_id = Some(authorization_event_id.clone());
+    row.authorization_capabilities = terms.capabilities.into_iter().collect();
+    row.authorization_profile_version = 2;
 
     Ok(ExistingAuthorizationRepair {
         authorization_event_id,
@@ -1649,16 +1718,25 @@ async fn resolve_provisioning(
         .await
         .map_err(|err| err.to_string())?
     {
-        let valid_from: u64 = existing
-            .valid_from
+        let valid_from: u64 = now_unix_i64()?
             .try_into()
-            .map_err(|_| "provisioning valid_from is negative".to_string())?;
-        let authorization_builder = build_fulfillment_authorization_event_builder(
-            &existing.attestation_event_id,
-            &listing_coordinate,
-            &existing.fulfillment_pubkey,
+            .map_err(|_| "current time is negative".to_string())?;
+        let terms = AuthorizationTerms {
+            authorization_id: uuid::Uuid::new_v4().to_string(),
+            coordinate: listing_coordinate.clone(),
+            operator_pubkey: nostr::PublicKey::from_hex(&existing.operator_pubkey)
+                .map_err(|_| "stored operator pubkey is invalid".to_string())?,
+            fulfillment_pubkey: nostr::PublicKey::from_hex(&existing.fulfillment_pubkey)
+                .map_err(|_| "stored fulfillment pubkey is invalid".to_string())?,
+            capabilities: BTreeSet::from([
+                CAPABILITY_ISSUE_RECEIPT.into(),
+                CAPABILITY_ISSUE_GRANT.into(),
+                CAPABILITY_UPLOAD_BUILD.into(),
+            ]),
             valid_from,
-        );
+        };
+        let authorization_builder = build_fulfillment_authorization_event_builder(&terms)
+            .map_err(|error| error.to_string())?;
         let authorization_event = input
             .signer
             .sign_event(authorization_builder.build(input.developer_pubkey))
@@ -1667,6 +1745,9 @@ async fn resolve_provisioning(
         let authorization_event_id = authorization_event.id.to_hex();
         let mut row = existing;
         row.acceptance_event_id = authorization_event_id.clone();
+        row.authorization_root_event_id = Some(authorization_event_id.clone());
+        row.authorization_capabilities = terms.capabilities.into_iter().collect();
+        row.authorization_profile_version = 2;
 
         return Ok(ProvisioningDecision::Reused {
             fulfillment_pubkey: row.fulfillment_pubkey.clone(),
@@ -1686,12 +1767,22 @@ async fn resolve_provisioning(
     let valid_from: u64 = now
         .try_into()
         .map_err(|_| "current time is negative".to_string())?;
-    let authorization_builder = build_fulfillment_authorization_event_builder(
-        &provision.attestation_event_id,
-        &listing_coordinate,
-        &provision.fulfillment_pubkey,
+    let terms = AuthorizationTerms {
+        authorization_id: uuid::Uuid::new_v4().to_string(),
+        coordinate: listing_coordinate,
+        operator_pubkey: nostr::PublicKey::from_hex(&input.server_info.pubkey)
+            .map_err(|_| "operator pubkey is invalid".to_string())?,
+        fulfillment_pubkey: nostr::PublicKey::from_hex(&provision.fulfillment_pubkey)
+            .map_err(|_| "provisioned fulfillment pubkey is invalid".to_string())?,
+        capabilities: BTreeSet::from([
+            CAPABILITY_ISSUE_RECEIPT.into(),
+            CAPABILITY_ISSUE_GRANT.into(),
+            CAPABILITY_UPLOAD_BUILD.into(),
+        ]),
         valid_from,
-    );
+    };
+    let authorization_builder =
+        build_fulfillment_authorization_event_builder(&terms).map_err(|error| error.to_string())?;
     let authorization_event = input
         .signer
         .sign_event(authorization_builder.build(input.developer_pubkey))
@@ -1710,6 +1801,9 @@ async fn resolve_provisioning(
         fulfillment_pubkey: provision.fulfillment_pubkey.clone(),
         attestation_event_id: provision.attestation_event_id,
         acceptance_event_id: authorization_event_id.clone(),
+        authorization_root_event_id: Some(authorization_event_id.clone()),
+        authorization_capabilities: terms.capabilities.into_iter().collect(),
+        authorization_profile_version: 2,
         valid_from: now,
         revoked_at: None,
         created_at: now,
@@ -2311,9 +2405,11 @@ mod tests {
         let developer_npub = developer_pubkey.to_hex();
         let server_info = AdpServerInfo {
             adp_version: "0.2.0".to_string(),
-            pubkey: "operator-key".to_string(),
+            pubkey: Keys::generate().public_key().to_hex(),
             name: Some("Test ADP".to_string()),
             url: Some("https://dist.example.com".to_string()),
+            event_kinds: None,
+            event_kind_status: None,
         };
 
         let first = resolve_provisioning(ResolveProvisioningInput {
@@ -2362,9 +2458,10 @@ mod tests {
                 authorization_event.tags
             )
         });
-        let AuthorizationTransition::ActiveRoot(terms) = parsed.transition else {
+        let AuthorizationTransition::ActiveRoot = parsed.transition else {
             panic!("reused authorization should be an active root");
         };
+        let terms = parsed.terms;
         assert_eq!(terms.coordinate, format!("30402:{developer_npub}:game"));
         assert_eq!(terms.fulfillment_pubkey.to_hex(), fulfillment_pubkey);
         assert_eq!(
@@ -2396,11 +2493,18 @@ mod tests {
             id: "existing-game-provisioning".to_string(),
             developer_npub: developer_hex.clone(),
             server_url: "https://operator.example.com".to_string(),
-            operator_pubkey: "operator-key".to_string(),
+            operator_pubkey: Keys::generate().public_key().to_hex(),
             scope: Some("game".to_string()),
             fulfillment_pubkey: fulfillment_pubkey.clone(),
             attestation_event_id: "stable-authorization-id".to_string(),
             acceptance_event_id: "legacy-acceptance-id".to_string(),
+            authorization_root_event_id: Some("11".repeat(32)),
+            authorization_capabilities: vec![
+                CAPABILITY_ISSUE_RECEIPT.into(),
+                CAPABILITY_ISSUE_GRANT.into(),
+                CAPABILITY_UPLOAD_BUILD.into(),
+            ],
+            authorization_profile_version: 2,
             valid_from: original_valid_from,
             revoked_at: None,
             created_at: original_valid_from,
@@ -2421,14 +2525,15 @@ mod tests {
 
         let parsed = parse_authorization_event(&repair.authorization_event)
             .expect("repaired authorization should parse");
-        let AuthorizationTransition::ActiveRoot(terms) = parsed.transition else {
+        let AuthorizationTransition::ActiveRoot = parsed.transition else {
             panic!("repaired authorization should be active");
         };
-        assert_eq!(terms.authorization_id, "stable-authorization-id");
+        let terms = parsed.terms;
+        assert!(!terms.authorization_id.is_empty());
         assert_eq!(terms.coordinate, format!("30402:{developer_hex}:game"));
         assert_eq!(terms.fulfillment_pubkey.to_hex(), fulfillment_pubkey);
-        assert_eq!(terms.valid_from, original_valid_from as u64);
-        assert_eq!(repair.row.valid_from, original_valid_from);
+        assert_eq!(terms.valid_from, repair.row.valid_from as u64);
+        assert!(repair.row.valid_from >= original_valid_from);
         assert_eq!(repair.row.fulfillment_pubkey, fulfillment_pubkey);
         assert_eq!(
             repair.row.acceptance_event_id,
@@ -2442,55 +2547,23 @@ mod tests {
             .await
             .expect("repaired row lookup should succeed")
             .expect("repaired row should remain active");
-        assert_eq!(stored.valid_from, original_valid_from);
+        assert_eq!(stored.valid_from, repair.row.valid_from);
         assert_eq!(stored.fulfillment_pubkey, fulfillment_pubkey);
         assert_eq!(stored.acceptance_event_id, repair.authorization_event_id);
     }
 
     #[test]
-    fn revoked_delegated_edit_does_not_authorize_or_reactivate() {
-        let metadata = resolve_existing_fulfillment_metadata(
-            &FulfillmentMode::Delegate,
-            "developer-key",
-            Some("revoked-fulfillment-key"),
-            Some(123),
-            Some(456),
-            999,
-        )
-        .expect("revoked delegated metadata should remain editable");
-
-        assert_eq!(
-            metadata.fulfillment_pubkey.as_deref(),
-            Some("revoked-fulfillment-key")
-        );
-        assert_eq!(metadata.valid_from, Some(123));
-        assert_eq!(metadata.revoked_at, Some(456));
-        assert!(existing_authorization_repair_key(
-            metadata.should_provision,
-            metadata.fulfillment_pubkey.as_deref(),
-            metadata.revoked_at,
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn delegated_edit_preserves_existing_fulfillment_metadata_without_provisioning() {
+    fn delegated_edit_reuses_the_referenced_key_without_listing_timestamps() {
         let metadata = resolve_existing_fulfillment_metadata(
             &FulfillmentMode::Delegate,
             "developer-key",
             Some("delegated-key"),
-            Some(123),
-            Some(456),
-            999,
         )
-        .expect("existing delegated metadata should be accepted");
-
+        .expect("existing delegated key is accepted");
         assert_eq!(
             metadata.fulfillment_pubkey.as_deref(),
             Some("delegated-key")
         );
-        assert_eq!(metadata.valid_from, Some(123));
-        assert_eq!(metadata.revoked_at, Some(456));
         assert!(!metadata.should_provision);
     }
 
@@ -2500,85 +2573,20 @@ mod tests {
             &FulfillmentMode::Delegate,
             "developer-key",
             Some("developer-key"),
-            Some(123),
-            Some(456),
-            999,
         )
-        .expect("direct to delegated conversion should be accepted");
-
+        .expect("conversion is accepted");
         assert!(metadata.fulfillment_pubkey.is_none());
-        assert!(metadata.valid_from.is_none());
-        assert!(metadata.revoked_at.is_none());
         assert!(metadata.should_provision);
     }
 
     #[test]
-    fn new_delegated_listing_uses_provisioning_flow() {
-        let metadata = resolve_existing_fulfillment_metadata(
-            &FulfillmentMode::Delegate,
-            "developer-key",
-            None,
-            Some(123),
-            Some(456),
-            999,
-        )
-        .expect("new delegated metadata should be accepted");
-
-        assert!(metadata.fulfillment_pubkey.is_none());
-        assert!(metadata.valid_from.is_none());
-        assert!(metadata.revoked_at.is_none());
-        assert!(metadata.should_provision);
-    }
-
-    #[test]
-    fn delegate_to_direct_conversion_resets_metadata_for_the_changed_key() {
-        let metadata = resolve_existing_fulfillment_metadata(
-            &FulfillmentMode::Direct,
-            "developer-key",
-            Some("delegated-key"),
-            Some(123),
-            Some(456),
-            999,
-        )
-        .expect("direct metadata should be accepted");
-
-        assert_eq!(
-            metadata.fulfillment_pubkey.as_deref(),
-            Some("developer-key")
-        );
-        assert_eq!(metadata.valid_from, Some(999));
-        assert_eq!(metadata.revoked_at, None);
-        assert!(!metadata.should_provision);
-    }
-
-    #[test]
-    fn direct_edit_without_validity_uses_current_time_but_keeps_revocation() {
-        let metadata = resolve_existing_fulfillment_metadata(
-            &FulfillmentMode::Direct,
-            "developer-key",
-            Some("developer-key"),
-            None,
-            Some(456),
-            999,
-        )
-        .expect("direct metadata should be accepted");
-
-        assert_eq!(metadata.valid_from, Some(999));
-        assert_eq!(metadata.revoked_at, Some(456));
-    }
-
-    #[test]
-    fn ordinary_edit_cannot_silently_clear_existing_revoked_fulfillment() {
+    fn ordinary_edit_cannot_silently_clear_existing_fulfillment() {
         let error = resolve_existing_fulfillment_metadata(
             &FulfillmentMode::None,
             "developer-key",
-            Some("revoked-key"),
-            Some(123),
-            Some(456),
-            999,
+            Some("delegated-key"),
         )
-        .expect_err("existing fulfillment metadata must not be silently cleared");
-
+        .expect_err("existing fulfillment reference must not be silently cleared");
         assert!(error.contains("cannot be cleared"));
     }
 
@@ -2607,6 +2615,9 @@ mod tests {
             fulfillment_pubkey: "fulfillment".to_string(),
             attestation_event_id: "attestation".to_string(),
             acceptance_event_id: "acceptance".to_string(),
+            authorization_root_event_id: None,
+            authorization_capabilities: Vec::new(),
+            authorization_profile_version: 1,
             valid_from: 123,
             revoked_at: Some(456),
             created_at: 123,
@@ -2680,8 +2691,6 @@ mod tests {
             file_path: Some(file_path.display().to_string()),
             existing_file_hash: None,
             existing_fulfillment_pubkey: None,
-            existing_fulfillment_valid_from: None,
-            existing_fulfillment_revoked_at: None,
             version: Some("0.0.1-live".to_string()),
             acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
             platforms: vec!["linux-x86_64".to_string()],

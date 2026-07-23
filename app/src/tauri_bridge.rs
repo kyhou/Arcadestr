@@ -176,8 +176,6 @@ pub struct PublishAdpListingRequest {
     pub file_path: Option<String>,
     pub existing_file_hash: Option<String>,
     pub existing_fulfillment_pubkey: Option<String>,
-    pub existing_fulfillment_valid_from: Option<u64>,
-    pub existing_fulfillment_revoked_at: Option<u64>,
     pub version: Option<String>,
     pub acquisition: crate::models::AcquisitionPolicy,
     pub platforms: Vec<String>,
@@ -844,8 +842,6 @@ mod tests {
             file_path: None,
             existing_file_hash: Some("hash".to_string()),
             existing_fulfillment_pubkey: Some("delegated-key".to_string()),
-            existing_fulfillment_valid_from: Some(123),
-            existing_fulfillment_revoked_at: Some(456),
             version: Some("1.0.0".to_string()),
             acquisition: crate::models::AcquisitionPolicy::TimedAccess {
                 starts_at: 100,
@@ -864,8 +860,8 @@ mod tests {
         assert_eq!(value["expected_publisher_npub"], "npub1expected");
         assert_eq!(value["existing_event_id"], "existing-listing-event");
         assert_eq!(value["existing_fulfillment_pubkey"], "delegated-key");
-        assert_eq!(value["existing_fulfillment_valid_from"], 123);
-        assert_eq!(value["existing_fulfillment_revoked_at"], 456);
+        assert!(value.get("existing_fulfillment_valid_from").is_none());
+        assert!(value.get("existing_fulfillment_revoked_at").is_none());
         assert_eq!(value["acquisition"]["TimedAccess"]["starts_at"], 100);
         assert_eq!(value["acquisition"]["TimedAccess"]["ends_at"], 200);
         assert_eq!(value["campaigns"][0]["root_event_id"], "campaign-root");

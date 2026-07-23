@@ -1254,17 +1254,19 @@ fn version_label(listing: &GameListing) -> String {
         .unwrap_or_else(|| "Version: Unspecified".into())
 }
 fn fulfillment_label(listing: &GameListing) -> String {
-    let fulfillment_key = listing
+    let authorization_count = listing
         .specs
         .iter()
-        .find(|(key, _)| key == "fulfillment_pubkey")
-        .map(|(_, value)| value);
-    match fulfillment_key {
-        Some(key) if publisher_hex(&listing.publisher_npub).as_deref() == Some(key.as_str()) => {
-            "ADP: Direct fulfillment".into()
-        }
-        Some(_) => "ADP: Delegated fulfillment".into(),
-        None => "ADP: Not configured".into(),
+        .filter(|(key, _)| key == "fulfillment_authorization")
+        .count();
+    if authorization_count > 1 {
+        format!("ADP: {authorization_count} delegated authorizations")
+    } else if authorization_count == 1 {
+        "ADP: Delegated fulfillment".into()
+    } else if listing.specs.iter().any(|(key, _)| key == "server") {
+        "ADP: Direct developer operation".into()
+    } else {
+        "ADP: Not configured".into()
     }
 }
 fn adp_server_label(listing: &GameListing) -> String {

@@ -8,7 +8,7 @@ use crate::adp_protocol::{
     TAG_AUTHORIZATION_EVENT, TAG_COORDINATE, TAG_IDENTIFIER, TAG_PREDECESSOR, TAG_REASON,
     TAG_RECIPIENT, TAG_SOURCE_EVENT, TAG_STATUS,
 };
-use crate::authorization::ResolvedAuthorization;
+use crate::authorization::{ResolvedAuthorization, CAPABILITY_ISSUE_GRANT};
 use crate::campaign::ResolvedCampaign;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +33,7 @@ pub struct ParsedEntitlementGrant {
     pub recipient: PublicKey,
     pub coordinate: String,
     pub source_event: EventId,
-    pub authorization_event: Option<EventId>,
+    pub authorization: Option<EventId>,
     pub reason: Option<String>,
     pub status: GrantStatus,
     pub predecessor: Option<EventId>,
@@ -48,21 +48,6 @@ pub struct ResolvedEntitlementGrant {
 impl ResolvedEntitlementGrant {
     pub fn status(&self) -> Option<GrantStatus> {
         self.events.last().map(|event| event.status)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IssuanceDelegation {
-    pub pubkey: PublicKey,
-    pub valid_from: u64,
-    pub revoked_at: Option<u64>,
-}
-
-impl IssuanceDelegation {
-    fn authorizes(&self, signer: PublicKey, at: u64) -> bool {
-        self.pubkey == signer
-            && self.valid_from <= at
-            && self.revoked_at.map_or(true, |revoked_at| at < revoked_at)
     }
 }
 
@@ -155,7 +140,7 @@ pub fn parse_entitlement_event(
         recipient,
         coordinate,
         source_event,
-        authorization_event,
+        authorization: authorization_event,
         reason,
         status,
         predecessor,
@@ -191,16 +176,9 @@ pub fn resolve_entitlement_grant(
         .iter()
         .map(|node| (node.event.id, node))
         .collect::<HashMap<_, _>>();
-    for node in &nodes {
-        if let Some(predecessor) = node.predecessor {
-            if !by_id.contains_key(&predecessor) {
-                return Err(ChainError::MissingPredecessor(predecessor).into());
-            }
-        }
-    }
     let roots = nodes
         .iter()
-        .filter(|node| node.predecessor.is_none())
+        .filter(|node| node.predecessor.is_none() && node.status == GrantStatus::Granted)
         .collect::<Vec<_>>();
     if roots.is_empty() {
         return Err(ChainError::Cycle.into());
@@ -209,31 +187,6 @@ pub fn resolve_entitlement_grant(
         return Err(ChainError::MultipleRoots.into());
     }
     let root = roots[0];
-    for node in &nodes {
-        if node.grant_id != root.grant_id {
-            return Err(ChainError::InvariantMutation(TAG_IDENTIFIER).into());
-        }
-        if node.recipient != root.recipient {
-            return Err(ChainError::InvariantMutation(TAG_RECIPIENT).into());
-        }
-        if node.coordinate != root.coordinate {
-            return Err(ChainError::InvariantMutation(TAG_COORDINATE).into());
-        }
-        if node.source_event != root.source_event {
-            return Err(ChainError::InvariantMutation(TAG_SOURCE_EVENT).into());
-        }
-        if node.authorization_event != root.authorization_event {
-            return Err(ChainError::InvariantMutation(TAG_AUTHORIZATION_EVENT).into());
-        }
-    }
-    let mut successors = HashMap::new();
-    for node in &nodes {
-        if let Some(predecessor) = node.predecessor {
-            if successors.insert(predecessor, node.event.id).is_some() {
-                return Err(ChainError::Fork(predecessor).into());
-            }
-        }
-    }
     let mut ordered = Vec::with_capacity(nodes.len());
     let mut visited = HashSet::with_capacity(nodes.len());
     let mut current = root.event.id;
@@ -241,25 +194,29 @@ pub fn resolve_entitlement_grant(
         if !visited.insert(current) {
             return Err(ChainError::Cycle.into());
         }
-        ordered.push((*by_id[&current]).clone());
-        match successors.get(&current) {
-            Some(next) => current = *next,
-            None => break,
+        let predecessor = by_id[&current];
+        ordered.push((*predecessor).clone());
+        let mut valid = nodes
+            .iter()
+            .filter(|candidate| candidate.predecessor == Some(current))
+            .filter(|candidate| {
+                candidate.grant_id == root.grant_id
+                    && candidate.recipient == root.recipient
+                    && candidate.coordinate == root.coordinate
+                    && candidate.source_event == root.source_event
+                    && candidate.authorization == root.authorization
+                    && candidate.status == GrantStatus::Revoked
+                    && coordinate_publisher(&root.coordinate) == Some(candidate.event.pubkey)
+                    && predecessor.status != GrantStatus::Revoked
+                    && candidate.event.created_at > predecessor.event.created_at
+                    && candidate.predecessor != Some(candidate.event.id)
+            })
+            .collect::<Vec<_>>();
+        if valid.len() > 1 {
+            return Err(ChainError::Fork(current).into());
         }
-    }
-    if ordered.len() != nodes.len() {
-        return Err(ChainError::Disconnected.into());
-    }
-    if root.status != GrantStatus::Granted {
-        return Err(ChainError::InvalidTransition("root must be granted".into()).into());
-    }
-    for pair in ordered.windows(2) {
-        if pair[1].event.created_at <= pair[0].event.created_at {
-            return Err(ChainError::TimestampRegression.into());
-        }
-        if pair[0].status == GrantStatus::Revoked || pair[1].status != GrantStatus::Revoked {
-            return Err(ChainError::InvalidTransition("revocation is terminal".into()).into());
-        }
+        let Some(next) = valid.pop() else { break };
+        current = next.event.id;
     }
     Ok(ResolvedEntitlementGrant {
         root_event_id: root.event.id,
@@ -271,7 +228,6 @@ pub fn validate_adp_entitlement(
     grant: &ResolvedEntitlementGrant,
     campaign: &ResolvedCampaign,
     authorization: Option<&ResolvedAuthorization>,
-    delegations: &[IssuanceDelegation],
 ) -> Result<(), EntitlementError> {
     let resolved = resolve_entitlement_grant(&grant.events)?;
     if resolved != *grant {
@@ -290,26 +246,24 @@ pub fn validate_adp_entitlement(
     if !campaign.is_claimable_at(issued_at) {
         return Err(EntitlementError::CampaignNotClaimable);
     }
-    match (root.event.pubkey == publisher, root.authorization_event) {
+    match (root.event.pubkey == publisher, root.authorization) {
         (true, None) => {}
-        (_, Some(authorization_event)) => {
+        (true, Some(_)) => return Err(EntitlementError::InvalidAuthorization),
+        (false, Some(authorization_event)) => {
             let authorization = authorization.ok_or(EntitlementError::MissingAuthorization)?;
             if authorization.root_event_id != authorization_event
                 || authorization.developer_pubkey != publisher
-                || !authorization.authorizes(&root.event.pubkey, &root.coordinate, issued_at)
+                || !authorization.authorizes(
+                    &root.event.pubkey,
+                    &root.coordinate,
+                    CAPABILITY_ISSUE_GRANT,
+                    issued_at,
+                )
             {
                 return Err(EntitlementError::InvalidAuthorization);
             }
         }
         (false, None) => return Err(EntitlementError::MissingAuthorizationEvent),
-    }
-    if root.event.pubkey != publisher {
-        if !delegations
-            .iter()
-            .any(|delegation| delegation.authorizes(root.event.pubkey, issued_at))
-        {
-            return Err(EntitlementError::UnauthorizedIssuer);
-        }
     }
     if resolved
         .events
