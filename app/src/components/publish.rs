@@ -177,8 +177,8 @@ fn datetime_local_value(value: u64) -> String {
     )
 }
 
-fn paid_price(paid_enabled: bool, input: &str, lud16: &str) -> Result<u64, String> {
-    if !paid_enabled {
+fn price_for_acquisition(kind: AcquisitionKind, input: &str, lud16: &str) -> Result<u64, String> {
+    if kind != AcquisitionKind::Gated {
         return Ok(0);
     }
     let price = input
@@ -617,7 +617,7 @@ fn readiness_checklist(
     title: &str,
     description: &str,
     image_input: &str,
-    paid_enabled: bool,
+    acquisition_kind: AcquisitionKind,
     price_input: &str,
     lud16: &str,
     acquisition: Result<AcquisitionPolicy, String>,
@@ -646,7 +646,7 @@ fn readiness_checklist(
     .is_ok()
         && validate_http_urls(image_input, "Image URL").is_ok();
     let pricing_and_access =
-        paid_price(paid_enabled, price_input, lud16).is_ok() && acquisition.is_ok();
+        price_for_acquisition(acquisition_kind, price_input, lud16).is_ok() && acquisition.is_ok();
     let platforms_ok = parse_platform_tags(platforms_input).is_ok();
     let distribution = platforms_ok
         && (!fulfillment_enabled
@@ -1140,20 +1140,28 @@ mod tests {
     }
 
     #[test]
-    fn paid_purchase_requires_positive_parseable_sats_and_lud16() {
-        assert!(paid_price(true, "abc", "seller@example.com").is_err());
-        assert!(paid_price(true, "0", "seller@example.com").is_err());
-        assert!(paid_price(true, "25", "").is_err());
-        assert_eq!(paid_price(true, "25", "seller@example.com"), Ok(25));
-        assert_eq!(paid_price(false, "invalid", ""), Ok(0));
+    fn paid_access_requires_positive_parseable_sats_and_lud16() {
+        assert!(
+            price_for_acquisition(AcquisitionKind::Gated, "abc", "seller@example.com").is_err()
+        );
+        assert!(price_for_acquisition(AcquisitionKind::Gated, "0", "seller@example.com").is_err());
+        assert!(price_for_acquisition(AcquisitionKind::Gated, "25", "").is_err());
+        assert_eq!(
+            price_for_acquisition(AcquisitionKind::Gated, "25", "seller@example.com"),
+            Ok(25)
+        );
     }
 
     #[test]
-    fn zero_price_does_not_imply_public_and_public_is_explicit() {
-        let gated = acquisition_policy_from_form(AcquisitionKind::Gated, "", "")
-            .expect("gated access should be explicit");
-        assert_eq!(paid_price(false, "0", ""), Ok(0));
-        assert!(matches!(gated, AcquisitionPolicy::Gated));
+    fn public_and_timed_access_force_zero_price() {
+        assert_eq!(
+            price_for_acquisition(AcquisitionKind::Public, "invalid", ""),
+            Ok(0)
+        );
+        assert_eq!(
+            price_for_acquisition(AcquisitionKind::TimedAccess, "25", "seller@example.com"),
+            Ok(0)
+        );
         assert!(matches!(
             acquisition_policy_from_form(AcquisitionKind::Public, "", ""),
             Ok(AcquisitionPolicy::Public)
@@ -1202,10 +1210,10 @@ mod tests {
             "Game",
             "Description",
             "https://example.com/cover.png",
-            false,
+            AcquisitionKind::Public,
             "0",
             "",
-            Ok(AcquisitionPolicy::Gated),
+            Ok(AcquisitionPolicy::Public),
             "linux-x86_64",
             true,
             &servers,
@@ -1375,12 +1383,13 @@ pub fn PublishView(
             .unwrap_or_default(),
     );
     let tag_choice = RwSignal::new(String::new());
-    let initial_price = listing
-        .as_ref()
-        .map(|item| item.price_sats)
-        .unwrap_or_default();
-    let paid_enabled = RwSignal::new(initial_price > 0);
-    let price_input = RwSignal::new(initial_price.to_string());
+    let initial_price = listing.as_ref().map(|item| item.price_sats);
+    let price_input = RwSignal::new(
+        initial_price
+            .filter(|price| *price > 0)
+            .map(|price| price.to_string())
+            .unwrap_or_default(),
+    );
     let platforms_input = RwSignal::new(
         listing
             .as_ref()
@@ -1610,8 +1619,8 @@ pub fn PublishView(
                     validate_http_urls(&image_input.get_untracked(), "Image URL").map(|_| ())
                 })
             }
-            PublishStage::Pricing => paid_price(
-                paid_enabled.get_untracked(),
+            PublishStage::Pricing => price_for_acquisition(
+                acquisition_kind.get_untracked(),
                 &price_input.get_untracked(),
                 &lud16.get_untracked(),
             )
@@ -1683,13 +1692,15 @@ pub fn PublishView(
         let title_val = title.get().trim().to_string();
         let description_val = description.get().trim().to_string();
         let lud16_val = lud16.get().trim().to_string();
-        let price_val = match paid_price(paid_enabled.get(), &price_input.get(), &lud16_val) {
-            Ok(price) => price,
-            Err(msg) => {
-                error_message.set(Some(msg));
-                return;
-            }
-        };
+        let acquisition_kind_val = acquisition_kind.get();
+        let price_val =
+            match price_for_acquisition(acquisition_kind_val, &price_input.get(), &lud16_val) {
+                Ok(price) => price,
+                Err(msg) => {
+                    error_message.set(Some(msg));
+                    return;
+                }
+            };
         let servers_val = servers.get();
         let file_path_val = file_path.get();
         let file_hash_val = file_hash.get();
@@ -1702,7 +1713,7 @@ pub fn PublishView(
         };
         let operator_url_val = operator_url.get();
         let acquisition = match acquisition_policy_from_form(
-            acquisition_kind.get(),
+            acquisition_kind_val,
             &acquisition_starts_at.get(),
             &acquisition_ends_at.get(),
         ) {
@@ -1753,7 +1764,7 @@ pub fn PublishView(
             title: title_val,
             description: description_val,
             price_sats: price_val,
-            lud16: (!lud16_val.is_empty()).then_some(lud16_val),
+            lud16: (acquisition_kind_val == AcquisitionKind::Gated).then_some(lud16_val),
             tags: parse_csv_values(&tag_input.get()),
             images,
             fulfillment_mode: fulfillment_mode_val,
@@ -1918,7 +1929,7 @@ pub fn PublishView(
             &title.get(),
             &description.get(),
             &image_input.get(),
-            paid_enabled.get(),
+            acquisition_kind.get(),
             &price_input.get(),
             &lud16.get(),
             acquisition_policy_from_form(
@@ -2203,35 +2214,31 @@ pub fn PublishView(
                     <Show when=move || current_stage.get() == PublishStage::Pricing>
                     <section class="v2-publish-stage bg-surface-container-high/60 backdrop-blur-2xl border border-outline-variant/15 rounded-3xl p-6">
                         <h2 class="text-2xl font-bold font-headline mb-2">"Pricing and access"</h2>
-                        <p class="text-sm text-on-surface-variant mb-5">"Paid purchase and current access are independent. A zero price never makes access public."</p>
+                        <p class="text-sm text-on-surface-variant mb-5">"Paid access is the default. Select public or timed access only when the game should be available without an entitlement."</p>
                         <div class="space-y-5">
-                            <label class="flex items-center gap-3 rounded-xl bg-surface-container/50 p-4">
-                                <input type="checkbox" checked={move || paid_enabled.get()} on:change:target=move |ev| paid_enabled.set(ev.target().checked()) disabled=move || is_publishing.get() />
-                                <span><strong>"Enable paid purchase"</strong><span class="block text-xs text-on-surface-variant">"Disabled sends a price of 0 sats."</span></span>
-                            </label>
-                            <Show when=move || paid_enabled.get()>
                             <div>
-                                <label for="publish-price" class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2">"Price in sats (required)"</label>
-                                <input id="publish-price" required=true class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" type="number" min=1 step=1 prop:value={move || price_input.get()} on:input:target=move |ev| price_input.set(ev.target().value()) />
-                            </div>
-                            <div>
-                                <label for="publish-lud16" class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2">"Lightning address (required)"</label>
-                                <input id="publish-lud16" required=true class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="you@example.com" prop:value={move || lud16.get()} on:input:target=move |ev| lud16.set(ev.target().value()) />
-                            </div>
-                            </Show>
-                            <div>
-                                <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2" for="acquisition-policy">"Current access"</label>
+                                <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2" for="acquisition-policy">"Access model"</label>
                                 <select id="acquisition-policy" class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" on:change:target=move |ev| acquisition_kind.set(AcquisitionKind::from_value(&ev.target().value())) disabled=move || is_publishing.get()>
-                                    <option value="gated" selected=move || acquisition_kind.get() == AcquisitionKind::Gated>"Gated"</option>
-                                    <option value="public" selected=move || acquisition_kind.get() == AcquisitionKind::Public>"Public"</option>
-                                    <option value="timed-access" selected=move || acquisition_kind.get() == AcquisitionKind::TimedAccess>"Timed"</option>
+                                    <option value="gated" selected=move || acquisition_kind.get() == AcquisitionKind::Gated>"Paid access (default)"</option>
+                                    <option value="public" selected=move || acquisition_kind.get() == AcquisitionKind::Public>"Public access"</option>
+                                    <option value="timed-access" selected=move || acquisition_kind.get() == AcquisitionKind::TimedAccess>"Timed public access"</option>
                                 </select>
                                 <p class="text-xs text-on-surface-variant mt-2">{move || match acquisition_kind.get() {
-                                    AcquisitionKind::Gated => "Access requires a purchase or entitlement.",
-                                    AcquisitionKind::Public => "Anyone can access the game without an entitlement.",
-                                    AcquisitionKind::TimedAccess => "Anyone can access the game during the selected window.",
+                                    AcquisitionKind::Gated => "A positive price and Lightning address are required.",
+                                    AcquisitionKind::Public => "Anyone can access the game. Its published price is 0 sats.",
+                                    AcquisitionKind::TimedAccess => "Anyone can access the game during the selected window. Its published price is 0 sats.",
                                 }}</p>
                             </div>
+                            <Show when=move || acquisition_kind.get() == AcquisitionKind::Gated>
+                                <div>
+                                    <label for="publish-price" class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2">"Price in sats (required)"</label>
+                                    <input id="publish-price" required=true class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" type="number" min=1 step=1 prop:value={move || price_input.get()} on:input:target=move |ev| price_input.set(ev.target().value()) />
+                                </div>
+                                <div>
+                                    <label for="publish-lud16" class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2">"Lightning address (required)"</label>
+                                    <input id="publish-lud16" required=true class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="you@example.com" prop:value={move || lud16.get()} on:input:target=move |ev| lud16.set(ev.target().value()) />
+                                </div>
+                            </Show>
                             <Show when=move || matches!(acquisition_kind.get(), AcquisitionKind::TimedAccess)>
                                 <div class="grid gap-3">
                                     <div>
@@ -2260,8 +2267,8 @@ pub fn PublishView(
                             <div><dt class="font-bold">"Identifier"</dt><dd class="text-on-surface-variant break-all">{move || id.get()}</dd></div>
                             <div><dt class="font-bold">"Metadata"</dt><dd class="text-on-surface-variant">{move || format!("{}; {} tags; {} images", title.get(), parse_csv_values(&tag_input.get()).len(), parse_csv_values(&image_input.get()).len())}</dd></div>
                             <div><dt class="font-bold">"Description"</dt><dd class="text-on-surface-variant whitespace-pre-wrap">{move || description.get()}</dd></div>
-                            <div><dt class="font-bold">"Paid purchase"</dt><dd class="text-on-surface-variant">{move || if paid_enabled.get() { format!("{} sats via {}", price_input.get(), lud16.get()) } else { "Disabled (0 sats)".to_string() }}</dd></div>
-                            <div><dt class="font-bold">"Current access"</dt><dd class="text-on-surface-variant">{move || match acquisition_kind.get() { AcquisitionKind::Gated => "Gated".to_string(), AcquisitionKind::Public => "Public".to_string(), AcquisitionKind::TimedAccess => format!("Timed from {} to {} (local)", acquisition_starts_at.get(), acquisition_ends_at.get()) }}</dd></div>
+                            <div><dt class="font-bold">"Pricing"</dt><dd class="text-on-surface-variant">{move || match acquisition_kind.get() { AcquisitionKind::Gated => format!("{} sats via {}", price_input.get(), lud16.get()), AcquisitionKind::Public | AcquisitionKind::TimedAccess => "Not for sale (0 sats)".to_string() }}</dd></div>
+                            <div><dt class="font-bold">"Current access"</dt><dd class="text-on-surface-variant">{move || match acquisition_kind.get() { AcquisitionKind::Gated => "Paid".to_string(), AcquisitionKind::Public => "Public".to_string(), AcquisitionKind::TimedAccess => format!("Timed from {} to {} (local)", acquisition_starts_at.get(), acquisition_ends_at.get()) }}</dd></div>
                             <div><dt class="font-bold">"Platforms / version"</dt><dd class="text-on-surface-variant">{move || format!("{} / {}", platform_summary(&platforms_input.get()), version.get())}</dd></div>
                             <div><dt class="font-bold">"Distribution provider/server"</dt><dd class="text-on-surface-variant">{move || if fulfillment_enabled.get() { format!("{} server(s); {}", servers.get().len(), operator_url.get()) } else { "Metadata only".to_string() }}</dd></div>
                             <div><dt class="font-bold">"Build file / hash"</dt><dd class="text-on-surface-variant break-all">{move || format!("{} / {}", file_path.get().unwrap_or_else(|| "existing or none".into()), file_hash.get().map(|hash| format_sha256(&hash)).unwrap_or_else(|| "none".into()))}</dd></div>
