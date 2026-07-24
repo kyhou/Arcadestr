@@ -498,6 +498,47 @@ fn editable_listing_tags(tags: &[String]) -> String {
         .join(", ")
 }
 
+const AVAILABLE_GAME_TAGS: [&str; 18] = [
+    "Action",
+    "Adventure",
+    "Arcade",
+    "Casual",
+    "Fighting",
+    "Horror",
+    "Multiplayer",
+    "Platformer",
+    "Puzzle",
+    "Racing",
+    "RPG",
+    "Shooter",
+    "Simulation",
+    "Sports",
+    "Strategy",
+    "Survival",
+    "Visual Novel",
+    "VR",
+];
+
+fn add_game_tag(input: &str, tag: &str) -> String {
+    let mut tags = parse_csv_values(input);
+    if !tag.is_empty()
+        && !tags
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(tag))
+    {
+        tags.push(tag.to_string());
+    }
+    tags.join(", ")
+}
+
+fn remove_game_tag(input: &str, tag: &str) -> String {
+    parse_csv_values(input)
+        .into_iter()
+        .filter(|existing| !existing.eq_ignore_ascii_case(tag))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn format_sha256(hash: &str) -> String {
     if !is_sha256_hex(hash) {
         return "Invalid SHA-256 metadata".to_string();
@@ -897,6 +938,14 @@ mod tests {
         ];
 
         assert_eq!(editable_listing_tags(&tags), "test");
+    }
+
+    #[test]
+    fn game_tag_selection_adds_unique_tags_and_removes_them_case_insensitively() {
+        let selected = add_game_tag("Action", "Multiplayer");
+        assert_eq!(selected, "Action, Multiplayer");
+        assert_eq!(add_game_tag(&selected, "action"), selected);
+        assert_eq!(remove_game_tag(&selected, "ACTION"), "Multiplayer");
     }
 
     #[test]
@@ -1325,6 +1374,7 @@ pub fn PublishView(
             .map(|item| editable_listing_tags(&item.tags))
             .unwrap_or_default(),
     );
+    let tag_choice = RwSignal::new(String::new());
     let initial_price = listing
         .as_ref()
         .map(|item| item.price_sats)
@@ -1930,8 +1980,31 @@ pub fn PublishView(
                             </div>
                             <div class="grid md:grid-cols-2 gap-5">
                                 <div>
-                                    <label for="publish-tags" class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Tags"</label>
-                                    <input id="publish-tags" class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" placeholder="arcade, multiplayer" prop:value={move || tag_input.get()} on:input:target=move |ev| tag_input.set(ev.target().value()) disabled={move || is_publishing.get()} />
+                                    <label for="publish-tag-choice" class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Tags"</label>
+                                    <select id="publish-tag-choice" aria-describedby="publish-tags-help" class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" prop:value=move || tag_choice.get() on:change:target=move |ev| {
+                                        let selected = ev.target().value();
+                                        tag_input.update(|input| *input = add_game_tag(input, &selected));
+                                        tag_choice.set(String::new());
+                                    } disabled=move || is_publishing.get()>
+                                        <option value="">"Add a tag..."</option>
+                                        {AVAILABLE_GAME_TAGS.into_iter().map(|tag| view! {
+                                            <option value=tag disabled=move || parse_csv_values(&tag_input.get()).iter().any(|selected| selected.eq_ignore_ascii_case(tag))>{tag}</option>
+                                        }).collect_view()}
+                                    </select>
+                                    <div class="mt-3 flex flex-wrap gap-2">
+                                        {move || parse_csv_values(&tag_input.get()).into_iter().map(|tag| {
+                                            let tag_to_remove = tag.clone();
+                                            view! {
+                                                <span class="v2-chip flex items-center gap-2">
+                                                    {tag}
+                                                    <button type="button" class="text-error" aria-label=format!("Remove {tag_to_remove}") on:click=move |_| tag_input.update(|input| *input = remove_game_tag(input, &tag_to_remove)) disabled=move || is_publishing.get()>"Remove"</button>
+                                                </span>
+                                            }
+                                        }).collect_view()}
+                                    </div>
+                                    <label for="publish-tags" class="block text-xs font-bold uppercase tracking-widest text-on-surface-variant mt-4 mb-2">"Custom tags"</label>
+                                    <input id="publish-tags" aria-describedby="publish-tags-help" class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" placeholder="Add comma-separated custom tags" prop:value={move || tag_input.get()} on:input:target=move |ev| tag_input.set(ev.target().value()) disabled={move || is_publishing.get()} />
+                                    <p id="publish-tags-help" class="text-xs text-on-surface-variant mt-2">"Choose common tags above or enter additional comma-separated tags."</p>
                                 </div>
                                 <div>
                                     <label for="publish-images" class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Image URLs"</label>
