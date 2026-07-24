@@ -17,6 +17,11 @@ use crate::tauri_bridge::{
 use crate::ui_v2::views::{use_fallback_cover, valid_cover_url};
 use crate::{AuthContext, GameListing};
 
+const DEFAULT_ADP_SERVER_URL: &str = match option_env!("ARCADESTR_DEFAULT_ADP_SERVER_URL") {
+    Some(url) => url,
+    None => "https://dist.arcadestr.io",
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServerEntry {
     url: String,
@@ -802,8 +807,12 @@ fn published_listing(
     }
 }
 
-fn initial_operator_url() -> String {
-    String::new()
+fn initial_operator_url(editing_delegated_listing: bool) -> String {
+    if editing_delegated_listing {
+        String::new()
+    } else {
+        DEFAULT_ADP_SERVER_URL.to_string()
+    }
 }
 
 fn operator_resolution_request(listing: &GameListing) -> Option<ResolveAdpOperatorRequest> {
@@ -1047,13 +1056,19 @@ mod tests {
             listing_fulfillment_pubkey(&listing),
             Some(delegate.public_key().to_hex())
         );
-        assert_eq!(initial_operator_url(), "");
+        assert_eq!(initial_operator_url(true), "");
 
         let request = operator_resolution_request(&listing)
             .expect("delegated edit should request an exact local operator lookup");
         assert_eq!(request.publisher_npub, listing.publisher_npub);
         assert_eq!(request.fulfillment_pubkey, delegate.public_key().to_hex());
         assert_eq!(request.scope, "managed-game");
+    }
+
+    #[test]
+    fn new_publications_use_the_configured_distribution_provider() {
+        assert_eq!(initial_operator_url(false), DEFAULT_ADP_SERVER_URL);
+        assert!(is_http_url(DEFAULT_ADP_SERVER_URL));
     }
 
     #[test]
@@ -1326,6 +1341,10 @@ pub fn PublishView(
         .as_ref()
         .map(listing_fulfillment_mode)
         .unwrap_or(FulfillmentMode::None);
+    let has_published_fulfillment = !matches!(published_fulfillment_mode, FulfillmentMode::None);
+    let editing_delegated_listing =
+        editing && matches!(published_fulfillment_mode, FulfillmentMode::Delegate);
+    let use_default_provider = !has_published_fulfillment;
     let existing_file_hash = listing
         .as_ref()
         .and_then(|item| listing_spec(item, "file_hash"));
@@ -1412,12 +1431,23 @@ pub fn PublishView(
         AcquisitionPolicy::TimedAccess { ends_at, .. } => datetime_local_value(*ends_at),
         _ => String::new(),
     });
-    let fulfillment_enabled =
-        RwSignal::new(!matches!(published_fulfillment_mode, FulfillmentMode::None));
-    let fulfillment_mode = RwSignal::new(published_fulfillment_mode);
+    let fulfillment_enabled = RwSignal::new(!editing || has_published_fulfillment);
+    let fulfillment_mode = RwSignal::new(if editing {
+        published_fulfillment_mode
+    } else {
+        FulfillmentMode::Delegate
+    });
     let discovered_servers = RwSignal::new(Vec::<AdpServerAnnouncement>::new());
     let discovery_error = RwSignal::new(None::<String>);
-    let servers = RwSignal::new(
+    let initial_servers = if use_default_provider {
+        vec![ServerEntry {
+            url: DEFAULT_ADP_SERVER_URL.to_string(),
+            label: "Arcadestr distribution provider".into(),
+            reachability: ServerStatus::Pending,
+            upload: ServerStatus::Idle,
+            auto_operator: true,
+        }]
+    } else {
         published_servers
             .iter()
             .map(|url| ServerEntry {
@@ -1427,11 +1457,17 @@ pub fn PublishView(
                 upload: ServerStatus::Idle,
                 auto_operator: false,
             })
-            .collect::<Vec<_>>(),
-    );
+            .collect::<Vec<_>>()
+    };
+    let initial_server_urls = initial_servers
+        .iter()
+        .map(|server| server.url.clone())
+        .collect::<Vec<_>>();
+    let servers = RwSignal::new(initial_servers);
     let custom_server = RwSignal::new(String::new());
-    let operator_url = RwSignal::new(initial_operator_url());
-    let operator_auto_added = RwSignal::new(None::<String>);
+    let initial_operator_url = initial_operator_url(editing_delegated_listing);
+    let operator_url = RwSignal::new(initial_operator_url.clone());
+    let operator_auto_added = RwSignal::new(use_default_provider.then_some(initial_operator_url));
     let file_path = RwSignal::new(None::<String>);
     let file_hash = RwSignal::new(existing_file_hash);
     let version = RwSignal::new(
@@ -1495,6 +1531,9 @@ pub fn PublishView(
 
     let remove_server = move |url: String| {
         servers.update(|entries| entries.retain(|entry| entry.url != url));
+        if operator_auto_added.get_untracked().as_deref() == Some(url.as_str()) {
+            operator_auto_added.set(None);
+        }
     };
 
     let sync_operator_server = move |new_url: String| {
@@ -1526,7 +1565,7 @@ pub fn PublishView(
     });
 
     Effect::new(move |_| {
-        for url in published_servers.clone() {
+        for url in initial_server_urls.clone() {
             spawn_local(async move {
                 let status = match invoke_check_adp_server(url.clone()).await {
                     Ok(_) => ServerStatus::Ok,
@@ -2068,64 +2107,106 @@ pub fn PublishView(
                             </div>
                         </div>
                         <label class="flex items-center gap-3 p-4 rounded-xl bg-surface-container/50 mb-6">
-                            <input type="checkbox" checked={move || fulfillment_enabled.get()} disabled=move || is_publishing.get() || existing_fulfillment_locked on:change:target=move |ev| {
-                                let enabled = ev.target().checked();
-                                fulfillment_enabled.set(enabled);
-                                if !enabled { fulfillment_mode.set(FulfillmentMode::None); }
-                            } />
+                             <input type="checkbox" checked={move || fulfillment_enabled.get()} disabled=move || is_publishing.get() || existing_fulfillment_locked on:change:target=move |ev| {
+                                 let enabled = ev.target().checked();
+                                 fulfillment_enabled.set(enabled);
+                                 if enabled && fulfillment_mode.get_untracked() == FulfillmentMode::None {
+                                     fulfillment_mode.set(FulfillmentMode::Delegate);
+                                 } else if !enabled {
+                                     fulfillment_mode.set(FulfillmentMode::None);
+                                 }
+                             } />
                             <span class="font-bold">"Enable automated installation"</span>
                         </label>
                         {existing_fulfillment_locked.then(|| view! { <p class="mb-6 text-xs text-on-surface-variant">"This existing publishing authorization cannot be removed by an ordinary Game page update. Keep the current mode to reuse its key, or deliberately choose another mode to replace the authorization."</p> })}
 
                         <Show when=move || fulfillment_enabled.get()>
                             <div class="space-y-6">
-                                <div class="grid md:grid-cols-2 gap-4">
-                                    <button type="button" aria-pressed=move || fulfillment_mode.get() == FulfillmentMode::Direct class="rounded-xl bg-surface-container-highest p-4 text-left" on:click=move |_| fulfillment_mode.set(FulfillmentMode::Direct)>
-                                        <span class="block font-bold text-secondary">"Use my active account"</span>
-                                        <span class="text-xs text-on-surface-variant">"Publishing authorization is signed directly. Protocol detail: no provisioning event."</span>
-                                    </button>
-                                    <button type="button" aria-pressed=move || fulfillment_mode.get() == FulfillmentMode::Delegate class="rounded-xl bg-surface-container-highest p-4 text-left" on:click=move |_| fulfillment_mode.set(FulfillmentMode::Delegate)>
-                                        <span class="block font-bold text-secondary">"Authorize a distribution provider"</span>
-                                        <span class="text-xs text-on-surface-variant">"Protocol detail: provisions a key and publishes kind 30406 authorization."</span>
-                                    </button>
-                                </div>
+                                <button type="button" aria-pressed=move || fulfillment_mode.get() == FulfillmentMode::Delegate class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate {
+                                    "w-full rounded-2xl border border-secondary/60 bg-secondary-container/20 p-5 text-left"
+                                } else {
+                                    "w-full rounded-2xl border border-outline-variant/20 bg-surface-container-highest/50 p-5 text-left"
+                                } on:click=move |_| {
+                                    if fulfillment_mode.get_untracked() != FulfillmentMode::Delegate {
+                                        fulfillment_mode.set(FulfillmentMode::Delegate);
+                                        if operator_auto_added.get_untracked().is_none() {
+                                            sync_operator_server(operator_url.get_untracked());
+                                        }
+                                    }
+                                }>
+                                    <span class="flex items-center justify-between gap-3">
+                                        <span class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "text-lg font-bold text-secondary" } else { "text-lg font-bold text-on-surface" }>"Authorize a distribution provider"</span>
+                                        <span class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "rounded-full bg-secondary px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-on-secondary" } else { "rounded-full bg-surface-container-highest px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant" }>
+                                            {move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "Selected" } else { "Switch to provider" }}
+                                        </span>
+                                    </span>
+                                    <span class="mt-1 block text-sm text-on-surface-variant">"Recommended. The provider manages fulfillment authorization and build distribution for this game."</span>
+                                    <Show when=move || fulfillment_mode.get() == FulfillmentMode::Delegate>
+                                        <span class="mt-3 block break-all rounded-lg bg-surface-container-highest/70 px-3 py-2 text-xs font-mono text-on-surface">{move || operator_url.get()}</span>
+                                        <Show when=move || operator_auto_added.get().is_some()>
+                                            <span class="mt-2 block text-xs text-on-surface-variant">"This provider is also included as a distribution server."</span>
+                                        </Show>
+                                    </Show>
+                                </button>
 
-                                <Show when=move || matches!(fulfillment_mode.get(), FulfillmentMode::Delegate)>
-                                    <div class="rounded-2xl bg-surface-container/50 p-4 space-y-3">
-                                        <label for="publish-provider-url" class="block text-xs font-bold uppercase tracking-widest text-secondary">"Distribution provider URL"</label>
-                                        <div class="flex gap-2">
-                                            <input id="publish-provider-url" class="flex-1 bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="https://provider.example.com" prop:value={move || operator_url.get()} on:input:target=move |ev| {
-                                                let next = ev.target().value();
-                                                operator_url.set(next.clone());
-                                                if operator_auto_added.get_untracked().is_some() { sync_operator_server(next); }
-                                            } />
-                                            <select aria-label="Copy provider URL from a selected server" class="bg-surface-container-highest border-none rounded-md p-3 text-on-surface" on:change:target=move |ev| {
-                                                let selected = ev.target().value();
-                                                if !selected.is_empty() { operator_url.set(selected); }
-                                            }>
-                                                <option value="">"Copy from server"</option>
-                                                {move || servers.get().into_iter().map(|server| {
-                                                    let url = server.url.clone();
-                                                    let text = url.clone();
-                                                    view! { <option value={url}>{text}</option> }
-                                                }).collect_view()}
-                                            </select>
-                                        </div>
-                                        <label class="flex items-center gap-2 text-sm text-on-surface-variant">
-                                            <input type="checkbox" checked={move || operator_auto_added.get().is_some()} on:change:target=move |ev| {
-                                                if ev.target().checked() {
-                                                    sync_operator_server(operator_url.get());
-                                                } else if let Some(old_url) = operator_auto_added.get_untracked() {
-                                                    servers.update(|entries| entries.retain(|entry| !(entry.auto_operator && entry.url == old_url)));
-                                                    operator_auto_added.set(None);
-                                                }
-                                            } />
-                                             "Also add this as a distribution server"
-                                        </label>
-                                    </div>
-                                </Show>
+                                <details class="rounded-2xl bg-surface-container/50 p-4">
+                                    <summary class="cursor-pointer font-bold text-on-surface">
+                                        {move || if fulfillment_mode.get() == FulfillmentMode::Direct { "Advanced distribution options - direct account signing selected" } else { "Advanced distribution options" }}
+                                    </summary>
+                                    <div class="mt-4 space-y-5">
+                                        <button type="button" aria-pressed=move || fulfillment_mode.get() == FulfillmentMode::Direct class=move || if fulfillment_mode.get() == FulfillmentMode::Direct {
+                                            "w-full rounded-xl border border-secondary/60 bg-secondary-container/20 p-4 text-left"
+                                        } else {
+                                            "w-full rounded-xl border border-transparent bg-surface-container-highest p-4 text-left"
+                                        } on:click=move |_| fulfillment_mode.set(FulfillmentMode::Direct)>
+                                            <span class="flex items-center justify-between gap-3">
+                                                <span class=move || if fulfillment_mode.get() == FulfillmentMode::Direct { "font-bold text-secondary" } else { "font-bold text-on-surface" }>"Use my active account instead"</span>
+                                                <Show when=move || fulfillment_mode.get() == FulfillmentMode::Direct>
+                                                    <span class="rounded-full bg-secondary px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-on-secondary">"Selected"</span>
+                                                </Show>
+                                            </span>
+                                            <span class="text-xs text-on-surface-variant">"Sign fulfillment directly without provisioning a provider key."</span>
+                                        </button>
 
-                                <div class="rounded-2xl bg-surface-container/50 p-4 space-y-4">
+                                        <Show when=move || matches!(fulfillment_mode.get(), FulfillmentMode::Delegate)>
+                                            <div class="rounded-xl bg-surface-container-highest/50 p-4 space-y-3">
+                                                <label for="publish-provider-url" class="block text-xs font-bold uppercase tracking-widest text-secondary">"Use a different distribution provider"</label>
+                                                <div class="flex flex-col gap-2 md:flex-row">
+                                                    <input id="publish-provider-url" class="flex-1 bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="https://provider.example.com" prop:value={move || operator_url.get()} on:input:target=move |ev| {
+                                                        let next = ev.target().value();
+                                                        operator_url.set(next.clone());
+                                                        if operator_auto_added.get_untracked().is_some() { sync_operator_server(next); }
+                                                    } />
+                                                    <select aria-label="Copy provider URL from a selected server" class="bg-surface-container-highest border-none rounded-md p-3 text-on-surface" on:change:target=move |ev| {
+                                                        let selected = ev.target().value();
+                                                        if !selected.is_empty() {
+                                                            operator_url.set(selected.clone());
+                                                            if operator_auto_added.get_untracked().is_some() { sync_operator_server(selected); }
+                                                        }
+                                                    }>
+                                                        <option value="">"Copy from server"</option>
+                                                        {move || servers.get().into_iter().map(|server| {
+                                                            let url = server.url.clone();
+                                                            let text = url.clone();
+                                                            view! { <option value={url}>{text}</option> }
+                                                        }).collect_view()}
+                                                    </select>
+                                                </div>
+                                                <label class="flex items-center gap-2 text-sm text-on-surface-variant">
+                                                    <input type="checkbox" checked={move || operator_auto_added.get().is_some()} on:change:target=move |ev| {
+                                                        if ev.target().checked() {
+                                                            sync_operator_server(operator_url.get());
+                                                        } else if let Some(old_url) = operator_auto_added.get_untracked() {
+                                                            servers.update(|entries| entries.retain(|entry| !(entry.auto_operator && entry.url == old_url)));
+                                                            operator_auto_added.set(None);
+                                                        }
+                                                    } />
+                                                    "Also add this provider as a distribution server"
+                                                </label>
+                                            </div>
+                                        </Show>
+
+                                <div class="rounded-xl bg-surface-container-highest/50 p-4 space-y-4">
                                     <div class="flex items-center justify-between gap-3">
                                          <h3 class="font-bold">"Discovered distribution providers"</h3>
                                         <span class="text-xs text-on-surface-variant">"Live relay query; manual entry still works if discovery fails."</span>
@@ -2176,6 +2257,8 @@ pub fn PublishView(
                                         }).collect_view()}
                                     </div>
                                 </div>
+                                    </div>
+                                </details>
 
                                 <div class="grid md:grid-cols-2 gap-5">
                                     <div>
