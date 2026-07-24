@@ -6,13 +6,13 @@ use wasm_bindgen_futures::spawn_local;
 use arcadestr_core::is_sha256_hex;
 
 use crate::campaign_management::datetime_local_to_unix;
-use crate::models::AcquisitionPolicy;
+use crate::models::{AcquisitionPolicy, CampaignPointer, ListingSource};
 use crate::tauri_bridge::{
     invoke_check_adp_server, invoke_discover_adp_servers, invoke_hash_build_file,
     invoke_publish_adp_listing, invoke_resolve_adp_operator, invoke_select_build_file,
     listen_hash_progress, listen_publish_progress, AdpServerAnnouncement, CampaignPointerInput,
     FulfillmentMode, HashBuildFileRequest, HashProgressPayload, PublishAdpListingRequest,
-    PublishProgressPayload, ResolveAdpOperatorRequest,
+    PublishAdpListingResult, PublishProgressPayload, ResolveAdpOperatorRequest,
 };
 use crate::ui_v2::views::{use_fallback_cover, valid_cover_url};
 use crate::{AuthContext, GameListing};
@@ -652,6 +652,81 @@ fn listing_fulfillment_pubkey(listing: &GameListing) -> Option<String> {
         .map(|(_, key)| key.clone())
 }
 
+fn published_listing(
+    existing: Option<GameListing>,
+    request: &PublishAdpListingRequest,
+    result: &PublishAdpListingResult,
+) -> GameListing {
+    let mut specs = request
+        .servers
+        .iter()
+        .map(|server| ("server".to_string(), server.clone()))
+        .collect::<Vec<_>>();
+    if let Some(file_hash) = result
+        .file_hash
+        .clone()
+        .or_else(|| request.existing_file_hash.clone())
+    {
+        specs.push(("file_hash".into(), file_hash));
+    }
+    if let Some(version) = request.version.clone() {
+        specs.push(("version".into(), version));
+    }
+    if let (Some(root_event_id), Some(fulfillment_pubkey)) = (
+        result.acceptance_event_id.clone(),
+        result.fulfillment_pubkey.clone(),
+    ) {
+        specs.push((
+            "fulfillment_authorization".into(),
+            serde_json::json!({
+                "root_event_id": root_event_id,
+                "fulfillment_pubkey": fulfillment_pubkey,
+                "relay_hint": null,
+            })
+            .to_string(),
+        ));
+    }
+
+    let created_at = existing
+        .as_ref()
+        .map(|listing| listing.created_at)
+        .unwrap_or_else(|| (js_sys::Date::now() / 1000.0) as u64);
+    GameListing {
+        id: request.d_tag.clone(),
+        source: ListingSource::Nip99Listing,
+        title: request.title.clone(),
+        description: request.description.clone(),
+        images: request.images.clone(),
+        download_url: request.images.first().cloned().unwrap_or_default(),
+        price: request.price_sats as f64,
+        currency: "SATS".into(),
+        price_sats: request.price_sats,
+        quantity: None,
+        tags: request.tags.clone(),
+        specs,
+        publisher_npub: request.expected_publisher_npub.clone(),
+        stall_id: String::new(),
+        stall_name: None,
+        lud16: request.lud16.clone().unwrap_or_default(),
+        event_id: Some(result.event_id.clone()),
+        created_at,
+        platforms: request.platforms.clone(),
+        nip94_event_id: request.nip94_event_id.clone(),
+        acquisition: request.acquisition.clone(),
+        campaigns: request
+            .campaigns
+            .iter()
+            .map(|campaign| CampaignPointer {
+                root_event_id: campaign.root_event_id.clone(),
+                relay_hint: campaign.relay_hint.clone(),
+            })
+            .collect(),
+        is_owned: false,
+        #[cfg(debug_assertions)]
+        nip99_raw_event_json: None,
+    }
+}
+
 fn initial_operator_url() -> String {
     String::new()
 }
@@ -1130,11 +1205,15 @@ mod tests {
 
 /// Publish view component - form for creating NIP-99 listings with optional ADP fulfillment.
 #[component]
-pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoView {
+pub fn PublishView(
+    #[prop(optional)] listing: Option<GameListing>,
+    #[prop(optional)] on_published: Option<Callback<GameListing>>,
+) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let editing = listing.is_some();
     let editing_publisher = listing.as_ref().map(|item| item.publisher_npub.clone());
     let existing_event_id = listing.as_ref().and_then(|item| item.event_id.clone());
+    let existing_listing_for_submit = listing.clone();
     let published_servers = listing.as_ref().map(listing_servers).unwrap_or_default();
     let published_fulfillment_mode = listing
         .as_ref()
@@ -1605,6 +1684,8 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
             campaigns: existing_campaigns_for_submit.clone(),
             nip94_event_id: existing_nip94_for_submit.clone(),
         };
+        let published_request = request.clone();
+        let existing_listing = existing_listing_for_submit.clone();
 
         is_publishing.set(true);
         initiating_account.set(Some(initiating_npub.clone()));
@@ -1704,21 +1785,29 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
                 initiating_account.set(None);
                 return;
             }
-            match publish_result {
+            let published = match publish_result {
                 Ok(result) => {
                     let uploads_failed = result.uploads.iter().any(|upload| upload.status != "ok");
                     publication_state.update(|state| {
                         *state = publication_completed(
                             state.clone(),
-                            Ok((result.event_id, uploads_failed)),
+                            Ok((result.event_id.clone(), uploads_failed)),
                         )
                     });
+                    (!uploads_failed)
+                        .then(|| published_listing(existing_listing, &published_request, &result))
                 }
-                Err(err) => publication_state
-                    .update(|state| *state = publication_completed(state.clone(), Err(err))),
-            }
+                Err(err) => {
+                    publication_state
+                        .update(|state| *state = publication_completed(state.clone(), Err(err)));
+                    None
+                }
+            };
             is_publishing.set(false);
             initiating_account.set(None);
+            if let (Some(on_published), Some(listing)) = (on_published, published) {
+                on_published.run(listing);
+            }
         });
     });
 

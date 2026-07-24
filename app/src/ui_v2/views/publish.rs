@@ -61,12 +61,23 @@ pub fn PublishV2View(
             PublishViewState::Games => view! {
                 <PublishedGamesView on_navigate={on_navigate.clone()} />
             }.into_any(),
-            PublishViewState::NewPublication => view! { <PublishView /> }.into_any(),
+            PublishViewState::NewPublication => view! {
+                <PublishView on_published=Callback::new({
+                    let on_navigate = on_navigate.clone();
+                    move |listing| on_navigate.run(PublishViewState::Game(listing))
+                }) />
+            }.into_any(),
             PublishViewState::EditPublication(listing) => {
                 let listing_for_back = listing.clone();
                 view! {
                     <div class="v2-publisher-studio"><button class="v2-btn-secondary" on:click={let on_navigate = on_navigate.clone(); move |_| on_navigate.run(PublishViewState::Game(listing_for_back.clone()))}>"Back to Game page"</button></div>
-                    <PublishView listing=listing />
+                    <PublishView
+                        listing=listing
+                        on_published=Callback::new({
+                            let on_navigate = on_navigate.clone();
+                            move |listing| on_navigate.run(PublishViewState::Game(listing))
+                        })
+                    />
                 }.into_any()
             }
             PublishViewState::Game(listing) => view! {
