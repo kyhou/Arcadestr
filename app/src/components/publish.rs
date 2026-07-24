@@ -536,6 +536,40 @@ fn parse_platform_tags(input: &str) -> Result<Vec<String>, String> {
     Ok(tags)
 }
 
+const AVAILABLE_PLATFORMS: [(&str, &str); 6] = [
+    ("linux-x86_64", "Linux (x86_64)"),
+    ("linux-aarch64", "Linux (ARM64)"),
+    ("windows-x86_64", "Windows (x86_64)"),
+    ("windows-aarch64", "Windows (ARM64)"),
+    ("macos-x86_64", "macOS (Intel)"),
+    ("macos-aarch64", "macOS (Apple silicon)"),
+];
+
+fn add_platform(input: &str, platform: &str) -> String {
+    let mut platforms = parse_csv_values(input);
+    if !platform.is_empty() && !platforms.iter().any(|existing| existing == platform) {
+        platforms.push(platform.to_string());
+    }
+    platforms.join(", ")
+}
+
+fn remove_platform(input: &str, platform: &str) -> String {
+    parse_csv_values(input)
+        .into_iter()
+        .filter(|existing| existing != platform)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn platform_summary(input: &str) -> String {
+    let platforms = parse_csv_values(input);
+    if platforms.is_empty() {
+        "All platforms".to_string()
+    } else {
+        platforms.join(", ")
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn readiness_checklist(
     id: &str,
@@ -835,6 +869,22 @@ mod tests {
             platforms,
             vec!["linux-x86_64", "windows-x86_64", "macos-aarch64"]
         );
+    }
+
+    #[test]
+    fn platform_selection_adds_unique_targets_and_removes_them() {
+        let selected = add_platform("linux-x86_64", "windows-aarch64");
+        assert_eq!(selected, "linux-x86_64, windows-aarch64");
+        assert_eq!(add_platform(&selected, "linux-x86_64"), selected);
+        assert_eq!(
+            remove_platform(&selected, "linux-x86_64"),
+            "windows-aarch64"
+        );
+    }
+
+    #[test]
+    fn empty_platform_selection_means_all_platforms() {
+        assert_eq!(platform_summary(""), "All platforms");
     }
 
     #[test]
@@ -1287,6 +1337,7 @@ pub fn PublishView(
             .map(|item| item.platforms.join(", "))
             .unwrap_or_default(),
     );
+    let platform_choice = RwSignal::new(String::new());
     let lud16 = RwSignal::new(
         listing
             .as_ref()
@@ -1902,8 +1953,35 @@ pub fn PublishView(
                         <p class="text-xs text-on-surface-variant mb-6">{build_capability_message()}</p>
                         <div class="mb-6">
                             <label for="publish-platforms" class="block text-xs font-bold uppercase tracking-widest text-secondary mb-2">"Platforms"</label>
-                            <input id="publish-platforms" aria-describedby="publish-platforms-help" class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="linux-x86_64, windows-x86_64" prop:value={move || platforms_input.get()} on:input:target=move |ev| platforms_input.set(ev.target().value()) />
-                            <p id="publish-platforms-help" class="text-xs text-on-surface-variant mt-2">"Unique tags in <os>-<arch> format."</p>
+                            <select id="publish-platforms" aria-describedby="publish-platforms-help" class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" prop:value=move || platform_choice.get() on:change:target=move |ev| {
+                                let selected = ev.target().value();
+                                platforms_input.update(|input| *input = add_platform(input, &selected));
+                                platform_choice.set(String::new());
+                            } disabled=move || is_publishing.get()>
+                                <option value="">"Add a platform..."</option>
+                                {AVAILABLE_PLATFORMS.into_iter().map(|(tag, label)| view! {
+                                    <option value=tag disabled=move || parse_csv_values(&platforms_input.get()).iter().any(|selected| selected == tag)>{label}</option>
+                                }).collect_view()}
+                            </select>
+                            <p id="publish-platforms-help" class="text-xs text-on-surface-variant mt-2">"Add every supported target. Leave the selection empty to publish for all platforms."</p>
+                            <div class="mt-3 flex flex-wrap gap-2">
+                                {move || {
+                                    let selected = parse_csv_values(&platforms_input.get());
+                                    if selected.is_empty() {
+                                        view! { <span class="v2-chip">"All platforms"</span> }.into_any()
+                                    } else {
+                                        selected.into_iter().map(|platform| {
+                                            let platform_to_remove = platform.clone();
+                                            view! {
+                                                <span class="v2-chip flex items-center gap-2">
+                                                    {platform}
+                                                    <button type="button" class="text-error" aria-label=format!("Remove {platform_to_remove}") on:click=move |_| platforms_input.update(|input| *input = remove_platform(input, &platform_to_remove)) disabled=move || is_publishing.get()>"Remove"</button>
+                                                </span>
+                                            }
+                                        }).collect_view().into_any()
+                                    }
+                                }}
+                            </div>
                         </div>
                         <label class="flex items-center gap-3 p-4 rounded-xl bg-surface-container/50 mb-6">
                             <input type="checkbox" checked={move || fulfillment_enabled.get()} disabled=move || is_publishing.get() || existing_fulfillment_locked on:change:target=move |ev| {
@@ -2111,7 +2189,7 @@ pub fn PublishView(
                             <div><dt class="font-bold">"Description"</dt><dd class="text-on-surface-variant whitespace-pre-wrap">{move || description.get()}</dd></div>
                             <div><dt class="font-bold">"Paid purchase"</dt><dd class="text-on-surface-variant">{move || if paid_enabled.get() { format!("{} sats via {}", price_input.get(), lud16.get()) } else { "Disabled (0 sats)".to_string() }}</dd></div>
                             <div><dt class="font-bold">"Current access"</dt><dd class="text-on-surface-variant">{move || match acquisition_kind.get() { AcquisitionKind::Gated => "Gated".to_string(), AcquisitionKind::Public => "Public".to_string(), AcquisitionKind::TimedAccess => format!("Timed from {} to {} (local)", acquisition_starts_at.get(), acquisition_ends_at.get()) }}</dd></div>
-                            <div><dt class="font-bold">"Platforms / version"</dt><dd class="text-on-surface-variant">{move || format!("{} / {}", platforms_input.get(), version.get())}</dd></div>
+                            <div><dt class="font-bold">"Platforms / version"</dt><dd class="text-on-surface-variant">{move || format!("{} / {}", platform_summary(&platforms_input.get()), version.get())}</dd></div>
                             <div><dt class="font-bold">"Distribution provider/server"</dt><dd class="text-on-surface-variant">{move || if fulfillment_enabled.get() { format!("{} server(s); {}", servers.get().len(), operator_url.get()) } else { "Metadata only".to_string() }}</dd></div>
                             <div><dt class="font-bold">"Build file / hash"</dt><dd class="text-on-surface-variant break-all">{move || format!("{} / {}", file_path.get().unwrap_or_else(|| "existing or none".into()), file_hash.get().map(|hash| format_sha256(&hash)).unwrap_or_else(|| "none".into()))}</dd></div>
                             <div><dt class="font-bold">"Authorization"</dt><dd class="text-on-surface-variant">{move || match fulfillment_mode.get() { FulfillmentMode::None => "Game page only", FulfillmentMode::Direct => "Active account", FulfillmentMode::Delegate => "Distribution provider" }}</dd></div>
