@@ -1330,6 +1330,7 @@ mod tests {
 pub fn PublishView(
     #[prop(optional)] listing: Option<GameListing>,
     #[prop(optional)] on_published: Option<Callback<GameListing>>,
+    #[prop(optional)] on_back: Option<Callback<()>>,
 ) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let editing = listing.is_some();
@@ -1479,6 +1480,7 @@ pub fn PublishView(
 
     let current_stage = RwSignal::new(PublishStage::Details);
     let stage_error = RwSignal::new(None::<String>);
+    let can_exit = on_back.is_some();
 
     let is_publishing = RwSignal::new(false);
     let is_hashing = RwSignal::new(false);
@@ -2406,7 +2408,14 @@ pub fn PublishView(
             </div>
 
             <div class="mt-6 flex flex-wrap items-center justify-between gap-3">
-                <button type="button" class="px-6 py-3 rounded-md bg-surface-container-highest font-bold disabled:opacity-40" disabled=move || current_stage.get() == PublishStage::Details || is_publishing.get() on:click=move |_| { if let Some(previous) = current_stage.get_untracked().previous() { current_stage.set(previous); stage_error.set(None); } }>"Back"</button>
+                <button type="button" class="px-6 py-3 rounded-md bg-surface-container-highest font-bold disabled:opacity-40" disabled=move || (!can_exit && current_stage.get() == PublishStage::Details) || is_publishing.get() on:click=move |_| {
+                    if let Some(previous) = current_stage.get_untracked().previous() {
+                        current_stage.set(previous);
+                        stage_error.set(None);
+                    } else if let Some(on_back) = on_back {
+                        on_back.run(());
+                    }
+                }>"Back"</button>
                 <Show when=move || current_stage.get() != PublishStage::Review>
                     <button type="button" class="px-8 py-3 rounded-md bg-primary text-on-primary font-bold" on:click=on_next disabled=move || is_publishing.get()>"Continue"</button>
                 </Show>
