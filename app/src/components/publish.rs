@@ -10,9 +10,9 @@ use crate::models::AcquisitionPolicy;
 use crate::tauri_bridge::{
     invoke_check_adp_server, invoke_discover_adp_servers, invoke_hash_build_file,
     invoke_publish_adp_listing, invoke_resolve_adp_operator, invoke_select_build_file,
-    listen_publish_progress, AdpServerAnnouncement, CampaignPointerInput, FulfillmentMode,
-    HashBuildFileRequest, PublishAdpListingRequest, PublishProgressPayload,
-    ResolveAdpOperatorRequest,
+    listen_hash_progress, listen_publish_progress, AdpServerAnnouncement, CampaignPointerInput,
+    FulfillmentMode, HashBuildFileRequest, HashProgressPayload, PublishAdpListingRequest,
+    PublishProgressPayload, ResolveAdpOperatorRequest,
 };
 use crate::ui_v2::views::{use_fallback_cover, valid_cover_url};
 use crate::{AuthContext, GameListing};
@@ -312,11 +312,11 @@ fn progress_label(event: &PublishProgressPayload) -> String {
     )
 }
 
-fn upload_percent(bytes_uploaded: u64, total_bytes: u64) -> u64 {
+fn progress_percent(completed_bytes: u64, total_bytes: u64) -> u64 {
     if total_bytes == 0 {
         return 100;
     }
-    (bytes_uploaded.saturating_mul(100) / total_bytes).min(100)
+    (completed_bytes.saturating_mul(100) / total_bytes).min(100)
 }
 
 fn publication_account_matches(initiating_npub: &str, active_npub: Option<&str>) -> bool {
@@ -1098,10 +1098,10 @@ mod tests {
     }
 
     #[test]
-    fn upload_percentage_is_bounded_and_handles_empty_files() {
-        assert_eq!(upload_percent(25, 100), 25);
-        assert_eq!(upload_percent(100, 100), 100);
-        assert_eq!(upload_percent(0, 0), 100);
+    fn progress_percentage_is_bounded_and_handles_empty_files() {
+        assert_eq!(progress_percent(25, 100), 25);
+        assert_eq!(progress_percent(100, 100), 100);
+        assert_eq!(progress_percent(0, 0), 100);
     }
 
     #[test]
@@ -1265,6 +1265,7 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
 
     let is_publishing = RwSignal::new(false);
     let is_hashing = RwSignal::new(false);
+    let hash_progress = RwSignal::new(None::<HashProgressPayload>);
     let error_message = RwSignal::new(None::<String>);
     let progress_events = RwSignal::new(Vec::<PublishProgressPayload>::new());
     let upload_progress = RwSignal::new(None::<PublishProgressPayload>);
@@ -1384,6 +1385,7 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
             return;
         }
         is_hashing.set(true);
+        hash_progress.set(None);
         error_message.set(None);
         spawn_local(async move {
             match invoke_select_build_file().await {
@@ -1391,9 +1393,17 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
                     let (next_path, next_hash) = file_selection_changed(Some(path.clone()));
                     file_path.set(next_path);
                     file_hash.set(next_hash);
-                    match invoke_hash_build_file(HashBuildFileRequest { file_path: path }).await {
-                        Ok(hash) => file_hash.set(Some(hash)),
-                        Err(err) => error_message.set(Some(err)),
+                    match listen_hash_progress(move |payload| hash_progress.set(Some(payload))).await {
+                        Ok(listener_cleanup) => {
+                            match invoke_hash_build_file(HashBuildFileRequest { file_path: path }).await {
+                                Ok(hash) => file_hash.set(Some(hash)),
+                                Err(err) => error_message.set(Some(err)),
+                            }
+                            listener_cleanup();
+                        }
+                        Err(err) => error_message.set(Some(format!(
+                            "Hashing did not start because progress monitoring is unavailable: {err}"
+                        ))),
                     }
                 }
                 Ok(None) => {}
@@ -1930,6 +1940,20 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
                                         <button type="button" aria-labelledby="publish-build-label" aria-describedby="publish-hash-status" class="w-full rounded-md bg-surface-container-highest p-3 text-left" on:click={on_select_file} disabled={move || is_hashing.get() || is_publishing.get()}>
                                             {move || if is_hashing.get() { "Hashing…".to_string() } else { file_path.get().unwrap_or_else(|| if file_hash.get().is_some() { "Using existing build — select replacement".to_string() } else { "Select archive".to_string() }) }}
                                         </button>
+                                        {move || (is_hashing.get()).then(|| hash_progress.get()).flatten().map(|progress| {
+                                            let percent = progress_percent(progress.bytes_hashed, progress.total_bytes);
+                                            view! {
+                                                <div class="mt-3 rounded-xl bg-surface-container-highest/60 p-3" role="progressbar" aria-label="Build hashing progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>
+                                                    <div class="mb-2 flex items-center justify-between gap-3 text-xs font-bold">
+                                                        <span class="text-on-surface">"Computing SHA-256"</span>
+                                                        <span class="text-primary">{format!("{percent}%")}</span>
+                                                    </div>
+                                                    <div class="h-2.5 overflow-hidden rounded-full bg-surface-container-lowest">
+                                                        <div class="h-full rounded-full bg-primary transition-[width] duration-200" style=format!("width: {percent}%")></div>
+                                                    </div>
+                                                </div>
+                                            }
+                                        })}
                                         <p id="publish-hash-status" aria-live="polite" class="text-xs text-on-surface-variant mt-2">{move || if is_hashing.get() { "Computing the read-only SHA-256 hash…".to_string() } else { file_hash.get().map(|hash| format!("Read-only SHA-256: {}", format_sha256(&hash))).unwrap_or_else(|| "Hash appears after file selection.".to_string()) }}</p>
                                     </div>
                                     <div>
@@ -2035,7 +2059,7 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
                         {move || upload_progress.get().and_then(|event| {
                             let bytes_uploaded = event.bytes_uploaded?;
                             let total_bytes = event.total_bytes?;
-                            let percent = upload_percent(bytes_uploaded, total_bytes);
+                            let percent = progress_percent(bytes_uploaded, total_bytes);
                             let server = event.server_url.unwrap_or_else(|| "distribution server".to_string());
                             Some(view! {
                                 <div class="mt-4" role="progressbar" aria-label="Build upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>

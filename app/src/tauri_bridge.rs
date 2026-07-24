@@ -229,6 +229,13 @@ pub struct PublishProgressPayload {
     pub total_bytes: Option<u64>,
 }
 
+/// Progress event payload emitted while hashing a selected build file.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HashProgressPayload {
+    pub bytes_hashed: u64,
+    pub total_bytes: u64,
+}
+
 /// ADP server announcement discovered from relays.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AdpServerAnnouncement {
@@ -434,6 +441,30 @@ pub async fn invoke_hash_build_file(request: HashBuildFileRequest) -> Result<Str
 /// Web fallback for `hash_build_file`.
 #[cfg(feature = "web")]
 pub async fn invoke_hash_build_file(_request: HashBuildFileRequest) -> Result<String, String> {
+    Err("Build file hashing is only available in desktop builds.".to_string())
+}
+
+/// Listen for desktop build hashing progress events.
+#[cfg(not(feature = "web"))]
+pub async fn listen_hash_progress<F>(mut callback: F) -> Result<Box<dyn FnOnce()>, String>
+where
+    F: FnMut(HashProgressPayload) + 'static,
+{
+    let cleanup = crate::tauri_invoke::listen("hash-progress", move |value| {
+        if let Ok(payload) = serde_json::from_value::<HashProgressPayload>(value) {
+            callback(payload);
+        }
+    })
+    .await?;
+    Ok(Box::new(cleanup))
+}
+
+/// Web fallback for build hashing progress events.
+#[cfg(feature = "web")]
+pub async fn listen_hash_progress<F>(_callback: F) -> Result<Box<dyn FnOnce()>, String>
+where
+    F: FnMut(HashProgressPayload) + 'static,
+{
     Err("Build file hashing is only available in desktop builds.".to_string())
 }
 

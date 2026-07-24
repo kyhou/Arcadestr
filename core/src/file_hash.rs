@@ -14,9 +14,27 @@ const HASH_BUFFER_SIZE: usize = 1024 * 1024;
 /// # Errors
 /// Returns any I/O error encountered while opening or reading `path`.
 pub async fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
+    sha256_file_with_progress(path, |_, _| {}).await
+}
+
+/// Computes a lowercase SHA-256 hex digest while reporting bytes read and total bytes.
+///
+/// # Errors
+/// Returns any I/O error encountered while opening, inspecting, or reading `path`.
+pub async fn sha256_file_with_progress<F>(
+    path: &Path,
+    mut on_progress: F,
+) -> Result<String, std::io::Error>
+where
+    F: FnMut(u64, u64),
+{
     let mut file = tokio::fs::File::open(path).await?;
+    let total_bytes = file.metadata().await?.len();
+    let mut bytes_hashed = 0_u64;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; HASH_BUFFER_SIZE];
+
+    on_progress(0, total_bytes);
 
     loop {
         let bytes_read = file.read(&mut buffer).await?;
@@ -24,6 +42,8 @@ pub async fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
             break;
         }
         hasher.update(&buffer[..bytes_read]);
+        bytes_hashed = bytes_hashed.saturating_add(bytes_read as u64);
+        on_progress(bytes_hashed, total_bytes);
     }
 
     Ok(hex::encode(hasher.finalize()))
@@ -64,6 +84,27 @@ mod tests {
             .expect("hash should be computed");
 
         assert_eq!(hash, expected);
+    }
+
+    #[tokio::test]
+    async fn sha256_file_reports_chunked_progress() {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file should be created");
+        let bytes = vec![7_u8; HASH_BUFFER_SIZE + 17];
+        file.write_all(&bytes).expect("fixture should write");
+        let mut updates = Vec::new();
+
+        sha256_file_with_progress(file.path(), |bytes_hashed, total_bytes| {
+            updates.push((bytes_hashed, total_bytes));
+        })
+        .await
+        .expect("hash should be computed");
+
+        assert_eq!(updates.first(), Some(&(0, bytes.len() as u64)));
+        assert_eq!(
+            updates.last(),
+            Some(&(bytes.len() as u64, bytes.len() as u64))
+        );
+        assert!(updates.len() >= 3, "large fixture should report each chunk");
     }
 
     #[tokio::test]

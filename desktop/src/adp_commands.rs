@@ -24,7 +24,7 @@ use arcadestr_core::auth::AuthState;
 use arcadestr_core::authorization::{
     AuthorizationTerms, CAPABILITY_ISSUE_GRANT, CAPABILITY_ISSUE_RECEIPT, CAPABILITY_UPLOAD_BUILD,
 };
-use arcadestr_core::file_hash::sha256_file;
+use arcadestr_core::file_hash::{sha256_file, sha256_file_with_progress};
 use arcadestr_core::http_client::HttpClient;
 use arcadestr_core::lnurlp::{request_invoice, resolve_lud16};
 use arcadestr_core::marketplace::confirm_nip99_listing_propagated;
@@ -105,6 +105,12 @@ pub struct PublishProgressPayload {
     pub message: Option<String>,
     pub bytes_uploaded: Option<u64>,
     pub total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HashProgressPayload {
+    pub bytes_hashed: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -693,10 +699,24 @@ pub async fn update_campaign_pointer(
 }
 
 #[tauri::command]
-pub async fn hash_build_file(request: HashBuildFileRequest) -> Result<String, String> {
-    sha256_file(std::path::Path::new(&request.file_path))
-        .await
-        .map_err(|err| err.to_string())
+pub async fn hash_build_file(
+    app: tauri::AppHandle,
+    request: HashBuildFileRequest,
+) -> Result<String, String> {
+    sha256_file_with_progress(
+        std::path::Path::new(&request.file_path),
+        |bytes_hashed, total_bytes| {
+            let _ = app.emit(
+                "hash-progress",
+                HashProgressPayload {
+                    bytes_hashed,
+                    total_bytes,
+                },
+            );
+        },
+    )
+    .await
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
