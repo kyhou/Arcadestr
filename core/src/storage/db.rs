@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS marketplace_listings (
     images_json TEXT NOT NULL DEFAULT '[]',
     platforms_json TEXT NOT NULL DEFAULT '[]',
     nip94_event_id TEXT,
+    acquisition_json TEXT,
     lud16 TEXT NOT NULL DEFAULT '',
     location TEXT,
     geohash TEXT,
@@ -308,6 +309,7 @@ impl Database {
         Self::ensure_marketplace_cache_platforms_column(pool).await?;
         Self::ensure_marketplace_cache_nip94_event_id_column(pool).await?;
         Self::ensure_marketplace_cache_specs_column(pool).await?;
+        Self::ensure_marketplace_cache_acquisition_column(pool).await?;
 
         Ok(())
     }
@@ -397,6 +399,34 @@ impl Database {
                     "Failed adding marketplace specs_json column: {error}"
                 ))
             })?;
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_marketplace_cache_acquisition_column(
+        pool: &SqlitePool,
+    ) -> Result<(), DatabaseError> {
+        let column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('marketplace_listings') WHERE name = 'acquisition_json'",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|error| {
+            DatabaseError::Migration(format!(
+                "Failed checking marketplace acquisition_json column: {error}"
+            ))
+        })?;
+
+        if column_count == 0 {
+            sqlx::query("ALTER TABLE marketplace_listings ADD COLUMN acquisition_json TEXT")
+                .execute(pool)
+                .await
+                .map_err(|error| {
+                    DatabaseError::Migration(format!(
+                        "Failed adding marketplace acquisition_json column: {error}"
+                    ))
+                })?;
         }
 
         Ok(())
@@ -871,7 +901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_legacy_marketplace_cache_adds_platforms_column_without_dropping_rows() {
+    async fn opening_legacy_marketplace_cache_marks_rows_incomplete_without_dropping_them() {
         let temp_dir = TempDir::new().expect("temp dir should be created");
         let db_path = temp_dir.path().join("legacy-marketplace-cache.db");
 
@@ -956,19 +986,22 @@ mod tests {
         let db = Database::new(&db_path)
             .await
             .expect("database upgrade should not drop legacy cache rows");
+        let row: (String, Option<String>) = sqlx::query_as(
+            "SELECT title, acquisition_json FROM marketplace_listings WHERE product_id = ?",
+        )
+        .bind("legacy-game")
+        .fetch_one(db.pool())
+        .await
+        .expect("legacy cache row should be preserved");
+        assert_eq!(row.0, "Legacy Game");
+        assert_eq!(row.1, None);
+
         let cache = crate::marketplace_cache::MarketplaceCache::new(db.pool().clone());
         let listings = cache
             .load_listings(10, None, None)
             .await
-            .expect("legacy row should load through marketplace cache");
-
-        assert_eq!(listings.len(), 1);
-        let listing = &listings[0];
-        assert_eq!(listing.id, "legacy-game");
-        assert_eq!(listing.title, "Legacy Game");
-        assert_eq!(listing.publisher_npub, "npub1legacy");
-        assert_eq!(listing.platforms, Vec::<String>::new());
-        assert_eq!(listing.nip94_event_id, None);
+            .expect("incomplete legacy cache should remain readable");
+        assert!(listings.is_empty());
     }
 
     #[tokio::test]

@@ -392,8 +392,10 @@ fn listing_signature(listing: &CoreGameListing) -> String {
     let platforms_json =
         serde_json::to_string(&listing.platforms).unwrap_or_else(|_| "[]".to_string());
     let specs_json = serde_json::to_string(&listing.specs).unwrap_or_else(|_| "[]".to_string());
+    let acquisition_json =
+        serde_json::to_string(&listing.acquisition).unwrap_or_else(|_| "\"Gated\"".to_string());
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         listing.publisher_npub,
         listing.id,
         listing.title,
@@ -405,6 +407,7 @@ fn listing_signature(listing: &CoreGameListing) -> String {
         platforms_json,
         listing.nip94_event_id.as_deref().unwrap_or_default(),
         specs_json,
+        acquisition_json,
         listing.event_id.as_deref().unwrap_or_default()
     )
 }
@@ -2583,6 +2586,13 @@ mod task4_tests {
         assert_ne!(
             listing_signature(&linux_listing),
             listing_signature(&nip94_listing)
+        );
+
+        let mut public_listing = linux_listing.clone();
+        public_listing.acquisition = arcadestr_core::marketplace::AcquisitionPolicy::Public;
+        assert_ne!(
+            listing_signature(&linux_listing),
+            listing_signature(&public_listing)
         );
     }
 

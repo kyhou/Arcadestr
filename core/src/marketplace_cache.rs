@@ -36,9 +36,9 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, specs_json, source_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
-                    WHERE created_at >= ? AND created_at <= ?
+                    WHERE acquisition_json IS NOT NULL AND created_at >= ? AND created_at <= ?
                     ORDER BY created_at DESC
                     LIMIT ?
                     "#,
@@ -54,9 +54,9 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, specs_json, source_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
-                    WHERE created_at >= ?
+                    WHERE acquisition_json IS NOT NULL AND created_at >= ?
                     ORDER BY created_at DESC
                     LIMIT ?
                     "#,
@@ -71,9 +71,9 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, specs_json, source_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
-                    WHERE created_at <= ?
+                    WHERE acquisition_json IS NOT NULL AND created_at <= ?
                     ORDER BY created_at DESC
                     LIMIT ?
                     "#,
@@ -88,8 +88,9 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, specs_json, source_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
+                    WHERE acquisition_json IS NOT NULL
                     ORDER BY created_at DESC
                     LIMIT ?
                     "#,
@@ -113,6 +114,8 @@ impl MarketplaceCache {
                 let specs_json: String = row.get("specs_json");
                 let specs: Vec<(String, String)> =
                     serde_json::from_str(&specs_json).unwrap_or_default();
+                let acquisition_json: String = row.get("acquisition_json");
+                let acquisition = serde_json::from_str(&acquisition_json).unwrap_or_default();
 
                 GameListing {
                     id: row.get("product_id"),
@@ -129,7 +132,7 @@ impl MarketplaceCache {
                     lud16: row.get("lud16"),
                     platforms,
                     nip94_event_id: row.get("nip94_event_id"),
-                    acquisition: crate::marketplace::AcquisitionPolicy::Gated,
+                    acquisition,
                     campaigns: Vec::new(),
                     images,
                     summary: row.get("summary"),
@@ -151,6 +154,7 @@ impl MarketplaceCache {
             r#"
             SELECT MAX(created_at) AS latest_created_at
             FROM marketplace_listings
+            WHERE acquisition_json IS NOT NULL
             "#,
         )
         .fetch_one(&self.db)
@@ -185,6 +189,8 @@ impl MarketplaceCache {
             serde_json::to_string(&listing.images).unwrap_or_else(|_| "[]".to_string());
         let platforms_json =
             serde_json::to_string(&listing.platforms).unwrap_or_else(|_| "[]".to_string());
+        let acquisition_json =
+            serde_json::to_string(&listing.acquisition).unwrap_or_else(|_| "\"Gated\"".to_string());
         let now = now_secs();
 
         let result = sqlx::query(
@@ -192,9 +198,9 @@ impl MarketplaceCache {
             INSERT INTO marketplace_listings (
                 publisher_npub, product_id, title, description, price_sats,
                 download_url, tags_json, specs_json, lud16, created_at, updated_at, source_event_id,
-                images_json, platforms_json, nip94_event_id, summary, published_at, location, geohash, status
+                images_json, platforms_json, nip94_event_id, acquisition_json, summary, published_at, location, geohash, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(publisher_npub, product_id) DO UPDATE SET
                 title = excluded.title,
                 description = excluded.description,
@@ -209,6 +215,7 @@ impl MarketplaceCache {
                 images_json = excluded.images_json,
                 platforms_json = excluded.platforms_json,
                 nip94_event_id = excluded.nip94_event_id,
+                acquisition_json = excluded.acquisition_json,
                 summary = excluded.summary,
                 published_at = excluded.published_at,
                 location = excluded.location,
@@ -216,6 +223,7 @@ impl MarketplaceCache {
                 status = excluded.status
             WHERE
                 (
+                    marketplace_listings.acquisition_json IS NULL OR
                     excluded.created_at > marketplace_listings.created_at OR
                     (
                         excluded.created_at = marketplace_listings.created_at AND
@@ -239,6 +247,7 @@ impl MarketplaceCache {
                     marketplace_listings.images_json <> excluded.images_json OR
                     marketplace_listings.platforms_json <> excluded.platforms_json OR
                     IFNULL(marketplace_listings.nip94_event_id, '') <> IFNULL(excluded.nip94_event_id, '') OR
+                    IFNULL(marketplace_listings.acquisition_json, '') <> excluded.acquisition_json OR
                     IFNULL(marketplace_listings.summary, '') <> IFNULL(excluded.summary, '') OR
                     IFNULL(marketplace_listings.published_at, 0) <> IFNULL(excluded.published_at, 0) OR
                     IFNULL(marketplace_listings.location, '') <> IFNULL(excluded.location, '') OR
@@ -262,6 +271,7 @@ impl MarketplaceCache {
         .bind(images_json)
         .bind(platforms_json)
         .bind(&listing.nip94_event_id)
+        .bind(acquisition_json)
         .bind(&listing.summary)
         .bind(listing.published_at.map(|v| v as i64))
         .bind(&listing.location)
@@ -348,6 +358,65 @@ mod tests {
             .expect("load should succeed");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "game-1");
+    }
+
+    #[tokio::test]
+    async fn acquisition_policy_round_trips_and_malformed_cache_data_is_gated() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("marketplace_cache.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("test database should initialize");
+        let cache = MarketplaceCache::new(db.pool().clone());
+        let mut listing = make_listing("public-game", 1_710_000_000, "Public Game");
+        listing.acquisition = crate::marketplace::AcquisitionPolicy::Public;
+
+        cache
+            .upsert_listing(&listing, Some("public-event"))
+            .await
+            .expect("public listing should be cached");
+        let loaded = cache
+            .load_listings(10, None, None)
+            .await
+            .expect("public listing should load");
+        assert_eq!(
+            loaded[0].acquisition,
+            crate::marketplace::AcquisitionPolicy::Public
+        );
+
+        sqlx::query("UPDATE marketplace_listings SET acquisition_json = NULL WHERE product_id = ?")
+            .bind("public-game")
+            .execute(db.pool())
+            .await
+            .expect("cached acquisition should be cleared to simulate a legacy row");
+        assert!(cache
+            .load_listings(10, None, None)
+            .await
+            .expect("incomplete cache should remain readable")
+            .is_empty());
+        assert_eq!(
+            cache
+                .upsert_listing(&listing, Some("public-event"))
+                .await
+                .expect("the signed event should enrich its incomplete cache row"),
+            UpsertOutcome::Updated
+        );
+
+        sqlx::query(
+            "UPDATE marketplace_listings SET acquisition_json = 'invalid' WHERE product_id = ?",
+        )
+        .bind("public-game")
+        .execute(db.pool())
+        .await
+        .expect("cached acquisition should be corrupted for the test");
+        let loaded = cache
+            .load_listings(10, None, None)
+            .await
+            .expect("malformed cached policy should not prevent loading");
+        assert_eq!(
+            loaded[0].acquisition,
+            crate::marketplace::AcquisitionPolicy::Gated
+        );
     }
 
     #[tokio::test]

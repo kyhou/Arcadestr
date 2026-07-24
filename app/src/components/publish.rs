@@ -120,14 +120,6 @@ struct ReadinessChecklist {
 }
 
 impl AcquisitionKind {
-    fn value(self) -> &'static str {
-        match self {
-            Self::Gated => "gated",
-            Self::Public => "public",
-            Self::TimedAccess => "timed-access",
-        }
-    }
-
     fn from_value(value: &str) -> Self {
         match value {
             "public" => Self::Public,
@@ -1989,10 +1981,10 @@ pub fn PublishView(#[prop(optional)] listing: Option<GameListing>) -> impl IntoV
                             </Show>
                             <div>
                                 <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2" for="acquisition-policy">"Current access"</label>
-                                <select id="acquisition-policy" class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" prop:value=move || acquisition_kind.get().value() on:change:target=move |ev| acquisition_kind.set(AcquisitionKind::from_value(&ev.target().value())) disabled=move || is_publishing.get()>
-                                    <option value="gated">"Gated"</option>
-                                    <option value="public">"Public"</option>
-                                    <option value="timed-access">"Timed"</option>
+                                <select id="acquisition-policy" class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" on:change:target=move |ev| acquisition_kind.set(AcquisitionKind::from_value(&ev.target().value())) disabled=move || is_publishing.get()>
+                                    <option value="gated" selected=move || acquisition_kind.get() == AcquisitionKind::Gated>"Gated"</option>
+                                    <option value="public" selected=move || acquisition_kind.get() == AcquisitionKind::Public>"Public"</option>
+                                    <option value="timed-access" selected=move || acquisition_kind.get() == AcquisitionKind::TimedAccess>"Timed"</option>
                                 </select>
                                 <p class="text-xs text-on-surface-variant mt-2">{move || match acquisition_kind.get() {
                                     AcquisitionKind::Gated => "Access requires a purchase or entitlement.",
