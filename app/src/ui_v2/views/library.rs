@@ -9,8 +9,8 @@ use crate::models::{
     npub_fallback_label, AcquisitionPolicy, GameListing, ListingSource, PlatformInfo,
 };
 use crate::tauri_bridge::{
-    invoke_get_installed_games, invoke_get_listing_ownership, invoke_get_platform_info,
-    InstalledGame,
+    invoke_get_installed_games, invoke_get_library_games, invoke_get_listing_ownership,
+    invoke_get_platform_info, InstalledGame, LibraryGame,
 };
 use crate::ui_v2::components::PageHeader;
 use crate::ui_v2::views::marketplace_loader::use_marketplace_listings_with_limit;
@@ -306,6 +306,9 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
     let standalone_web = cfg!(feature = "web");
     let availability = target_library_availability(standalone_web);
     let installed_games = RwSignal::new(Vec::<InstalledGame>::new());
+    let saved_games = RwSignal::new(Vec::<LibraryGame>::new());
+    let saved_loading = RwSignal::new(false);
+    let saved_error = RwSignal::new(None::<String>);
     let registry_loading = RwSignal::new(!standalone_web);
     let registry_error = RwSignal::new(None::<String>);
     let refresh_generation = RwSignal::new(0_u64);
@@ -318,6 +321,37 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
     let ownership_generation = RwSignal::new(0_u64);
     let library_now = RwSignal::new(current_unix_secs());
     let marketplace = use_marketplace_listings_with_limit(LIBRARY_MARKETPLACE_LIMIT);
+
+    let saved_auth = auth.clone();
+    Effect::new(move |_| {
+        let _ = refresh_generation.get();
+        let requested_account = saved_auth.npub.get();
+        saved_games.set(Vec::new());
+        saved_error.set(None);
+        let Some(requested_account) = requested_account else {
+            saved_loading.set(false);
+            return;
+        };
+        if availability == LibraryAvailability::DesktopOnly {
+            saved_loading.set(false);
+            return;
+        }
+
+        saved_loading.set(true);
+        let auth_for_response = saved_auth.clone();
+        spawn_local(async move {
+            let result = invoke_get_library_games().await;
+            if auth_for_response.npub.get_untracked().as_deref() != Some(requested_account.as_str())
+            {
+                return;
+            }
+            match result {
+                Ok(games) => saved_games.set(games),
+                Err(error) => saved_error.set(Some(error)),
+            }
+            saved_loading.set(false);
+        });
+    });
 
     #[cfg(target_arch = "wasm32")]
     {
@@ -358,6 +392,18 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
 
     let entries = Signal::derive(move || {
         reconcile_installed_entries(installed_games.get(), &marketplace.listings.get())
+    });
+    let saved_entries = Signal::derive(move || {
+        saved_games
+            .get()
+            .into_iter()
+            .map(|saved| {
+                let listing = marketplace.listings.get().into_iter().find(|listing| {
+                    listing_coordinate(listing).as_deref() == Some(saved.game_coordinate.as_str())
+                });
+                (saved, listing)
+            })
+            .collect::<Vec<_>>()
     });
 
     Effect::new(move |_| {
@@ -431,9 +477,9 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
         <section class="v2-library-wrap">
             <PageHeader
                 eyebrow="Your collection".to_string()
-                title="Installed Library".to_string()
-                description="Downloaded game artifacts recorded on this device. Installations are device-wide and do not prove ownership for the active account.".to_string()
-                action=view! { <span class="v2-library-collection-label">"Installed registry"</span> }.into_any()
+                title="Game Library".to_string()
+                description="Games saved to your account and downloaded artifacts recorded on this device.".to_string()
+                action=view! { <span class="v2-library-collection-label">"Your games"</span> }.into_any()
             />
 
             {if availability == LibraryAvailability::DesktopOnly {
@@ -448,6 +494,47 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
                 view! {
                     <div class="v2-library-layout">
                         <main class="v2-library-main">
+                            <section class="v2-library-summary-card v2-panel">
+                                <p class="v2-store-kicker">"Account library"</p>
+                                <h2>"Saved games"</h2>
+                                {move || if auth.npub.get().is_none() {
+                                    view! { <p>"Sign in to view games saved to your account."</p> }.into_any()
+                                } else if saved_loading.get() {
+                                    view! { <p role="status">"Loading your saved games..."</p> }.into_any()
+                                } else if let Some(error) = saved_error.get() {
+                                    view! { <p class="v2-detail-alert v2-detail-alert-error">{format!("Library unavailable: {error}")}</p> }.into_any()
+                                } else if saved_entries.get().is_empty() {
+                                    view! { <p>"No games have been added to this account's library yet."</p> }.into_any()
+                                } else {
+                                    let cards = saved_entries.get().into_iter().map(|(saved, listing)| {
+                                        let fallback = parse_game_coordinate(&saved.game_coordinate)
+                                            .map(|(_, listing_id)| listing_id.to_string())
+                                            .unwrap_or_else(|| "Saved game".to_string());
+                                        let title = listing.as_ref().map(|item| item.title.clone()).unwrap_or(fallback);
+                                        let cover = listing.as_ref().and_then(|item| valid_cover_url(&item.images)).unwrap_or_else(|| FALLBACK_COVER.to_string());
+                                        view! {
+                                            <article class="v2-library-card">
+                                                <div class="v2-library-card-media">
+                                                    <img src=cover alt=format!("{title} cover") loading="lazy" on:error=use_fallback_cover />
+                                                    <div class="v2-library-card-badges"><span>"In library"</span></div>
+                                                </div>
+                                                <div class="v2-library-card-body">
+                                                    <div><p class="v2-store-kicker">"Account saved"</p><h2>{title}</h2></div>
+                                                    <dl class="v2-library-card-details">
+                                                        <div><dt>"Listing coordinate"</dt><dd>{saved.game_coordinate}</dd></div>
+                                                    </dl>
+                                                    {listing.map(|listing| {
+                                                        let selected = listing.clone();
+                                                        view! { <button class="v2-btn-primary" on:click=move |_| on_open_listing.run(selected.clone())>"View game"</button> }
+                                                    })}
+                                                </div>
+                                            </article>
+                                        }
+                                    }).collect::<Vec<_>>();
+                                    view! { <section class="v2-library-card-grid" aria-label="Saved games">{cards}</section> }.into_any()
+                                }}
+                            </section>
+
                             <section class="v2-library-controls v2-panel">
                                 <div class="v2-library-search-field">
                                     <label for="library-search">"Search installed games"</label>

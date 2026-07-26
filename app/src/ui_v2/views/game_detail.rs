@@ -10,10 +10,11 @@ use crate::models::{
 };
 use crate::store::try_use_profile_store;
 use crate::tauri_bridge::{
-    invoke_claim_entitlement, invoke_confirm_purchase, invoke_connect_nwc_wallet,
-    invoke_discover_campaigns, invoke_get_installed_games, invoke_get_listing_ownership,
-    invoke_get_platform_info, invoke_install_game, invoke_pay_nwc_invoice,
-    invoke_request_lnurl_invoice, listen_download_complete,
+    invoke_add_game_to_library, invoke_claim_entitlement, invoke_confirm_purchase,
+    invoke_connect_nwc_wallet, invoke_discover_campaigns, invoke_get_installed_games,
+    invoke_get_listing_ownership, invoke_get_platform_info, invoke_install_game,
+    invoke_is_game_in_library, invoke_pay_nwc_invoice, invoke_request_lnurl_invoice,
+    listen_download_complete,
 };
 use crate::tauri_bridge::{
     CampaignPointerInput, ClaimEntitlementRequest, ConfirmPurchaseRequest, ConnectNwcWalletRequest,
@@ -34,6 +35,7 @@ enum DetailOperation {
     PayingWallet,
     ConfirmingPurchase,
     Claiming,
+    AddingToLibrary,
     Installing,
 }
 
@@ -104,6 +106,7 @@ fn select_primary_action(
             DetailOperation::PayingWallet => "Paying invoice...",
             DetailOperation::ConfirmingPurchase => "Recording ownership...",
             DetailOperation::Claiming => "Claiming access...",
+            DetailOperation::AddingToLibrary => "Adding to library...",
             DetailOperation::Installing => "Installing...",
             DetailOperation::Idle => "Working...",
         };
@@ -230,12 +233,16 @@ fn select_primary_action(
         },
         PrimaryAction::Install => PrimaryActionDecision {
             action: desired,
-            label: if owned {
+            label: if matches!(listing.acquisition, AcquisitionPolicy::Public) {
+                "Play Game"
+            } else if owned {
                 "Install"
             } else {
                 "Download while available"
             },
-            explanation: if owned {
+            explanation: if matches!(listing.acquisition, AcquisitionPolicy::Public) {
+                "Adds the game to your library and starts the download."
+            } else if owned {
                 "Durable ownership is confirmed for the active account."
             } else {
                 "Access depends on the listing's current public or timed policy."
@@ -296,6 +303,24 @@ fn game_coordinate(listing: &GameListing) -> Option<String> {
     nostr::PublicKey::from_bech32(&listing.publisher_npub)
         .ok()
         .map(|publisher| format!("30402:{}:{}", publisher.to_hex(), listing.id))
+}
+
+fn show_add_to_library(
+    listing: &GameListing,
+    authenticated: bool,
+    standalone_web: bool,
+    has_coordinate: bool,
+    loading: bool,
+    saved: bool,
+    owned: bool,
+) -> bool {
+    matches!(listing.acquisition, AcquisitionPolicy::Public)
+        && authenticated
+        && !standalone_web
+        && has_coordinate
+        && !loading
+        && !saved
+        && !owned
 }
 
 fn format_date(ts: u64) -> String {
@@ -429,6 +454,7 @@ fn operation_status(operation: DetailOperation) -> &'static str {
         DetailOperation::PayingWallet => "Sending the Lightning payment...",
         DetailOperation::ConfirmingPurchase => "Confirming payment and recording ownership...",
         DetailOperation::Claiming => "Claiming permanent access...",
+        DetailOperation::AddingToLibrary => "Adding the game to your library...",
         DetailOperation::Installing => "Downloading and installing the game...",
     }
 }
@@ -505,7 +531,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let nwc_connected: RwSignal<bool> = RwSignal::new(false);
     let manual_preimage = RwSignal::new(String::new());
     let purchase_confirmed: RwSignal<bool> = RwSignal::new(listing.is_owned);
-    let ownership_loading: RwSignal<bool> = RwSignal::new(false);
+    let ownership_loading: RwSignal<bool> = RwSignal::new(!cfg!(feature = "web"));
+    let library_added: RwSignal<bool> = RwSignal::new(false);
+    let library_loading: RwSignal<bool> = RwSignal::new(!cfg!(feature = "web"));
     let install_complete: RwSignal<bool> = RwSignal::new(false);
     let operation = RwSignal::new(DetailOperation::Idle);
     let campaigns: RwSignal<Vec<DiscoveredCampaign>> = RwSignal::new(Vec::new());
@@ -574,6 +602,35 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     });
 
     let install_game_coordinate = game_coordinate(&listing);
+    let library_coordinate = install_game_coordinate.clone();
+    let library_auth = auth.clone();
+    Effect::new(move |_| {
+        let requested_account = library_auth.npub.get();
+        library_added.set(false);
+
+        let (Some(requested_account), Some(coordinate)) =
+            (requested_account, library_coordinate.clone())
+        else {
+            library_loading.set(false);
+            return;
+        };
+
+        library_loading.set(true);
+        let auth_for_response = library_auth.clone();
+        spawn_local(async move {
+            let result = invoke_is_game_in_library(coordinate).await;
+            if auth_for_response.npub.get_untracked().as_deref() != Some(requested_account.as_str())
+            {
+                return;
+            }
+            match result {
+                Ok(in_library) => library_added.set(in_library),
+                Err(error) => buy_error.set(Some(format!("Library lookup failed: {error}"))),
+            }
+            library_loading.set(false);
+        });
+    });
+
     if let Some(coordinate) = install_game_coordinate.clone() {
         Effect::new(move |_| {
             let coordinate = coordinate.clone();
@@ -832,15 +889,37 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
 
     let on_download = {
         let listing = listing.clone();
+        let coordinate = install_game_coordinate.clone();
+        let play_auth = auth.clone();
         Callback::new(move |()| {
             if operation_blocks_dispatch(operation.get_untracked()) {
                 return;
             }
+            let initiating_account = play_auth.npub.get_untracked();
             operation.set(DetailOperation::Installing);
             buy_error.set(None);
             success_message.set(None);
             let listing = listing.clone();
+            let coordinate = coordinate.clone();
+            let auth_for_response = play_auth.clone();
             spawn_local(async move {
+                if matches!(listing.acquisition, AcquisitionPolicy::Public) {
+                    let Some(coordinate) = coordinate else {
+                        buy_error.set(Some("Game listing coordinate is invalid.".to_string()));
+                        operation.set(DetailOperation::Idle);
+                        return;
+                    };
+                    if let Err(error) = invoke_add_game_to_library(coordinate).await {
+                        buy_error.set(Some(format!("Could not add game to library: {error}")));
+                        operation.set(DetailOperation::Idle);
+                        return;
+                    }
+                    if auth_for_response.npub.get_untracked() != initiating_account {
+                        operation.set(DetailOperation::Idle);
+                        return;
+                    }
+                    library_added.set(true);
+                }
                 match invoke_install_game(&listing).await {
                     Ok(()) => {
                         install_complete.set(true);
@@ -856,7 +935,44 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         })
     };
 
-    let expected_install_coordinate = install_game_coordinate;
+    let on_add_to_library = {
+        let coordinate = install_game_coordinate.clone();
+        let add_auth = auth.clone();
+        Callback::new(move |()| {
+            if operation_blocks_dispatch(operation.get_untracked()) || library_added.get_untracked()
+            {
+                return;
+            }
+            let Some(coordinate) = coordinate.clone() else {
+                buy_error.set(Some("Game listing coordinate is invalid.".to_string()));
+                return;
+            };
+            let initiating_account = add_auth.npub.get_untracked();
+            operation.set(DetailOperation::AddingToLibrary);
+            buy_error.set(None);
+            success_message.set(None);
+            let auth_for_response = add_auth.clone();
+            spawn_local(async move {
+                let result = invoke_add_game_to_library(coordinate).await;
+                if auth_for_response.npub.get_untracked() != initiating_account {
+                    operation.set(DetailOperation::Idle);
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        library_added.set(true);
+                        success_message.set(Some("Game added to your library.".to_string()));
+                    }
+                    Err(error) => {
+                        buy_error.set(Some(format!("Could not add game to library: {error}")));
+                    }
+                }
+                operation.set(DetailOperation::Idle);
+            });
+        })
+    };
+
+    let expected_install_coordinate = install_game_coordinate.clone();
     let download_complete_cleanup: DownloadCompleteCleanup = Rc::new(RefCell::new(None));
     let download_complete_disposed = Rc::new(RefCell::new(false));
     let download_complete_registration_started = Rc::new(RefCell::new(false));
@@ -1114,6 +1230,25 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     >
                         {move || decision_for_label().label}
                     </button>
+                    <Show when=move || {
+                        show_add_to_library(
+                            &listing,
+                            auth.npub.get().is_some(),
+                            cfg!(all(target_arch = "wasm32", feature = "web")),
+                            install_game_coordinate.is_some(),
+                            library_loading.get() || ownership_loading.get(),
+                            library_added.get(),
+                            purchase_confirmed.get(),
+                        )
+                    }>
+                        <button
+                            class="v2-btn-secondary"
+                            on:click=move |_| on_add_to_library.run(())
+                            disabled=move || operation_blocks_dispatch(operation.get())
+                        >
+                            "Add to Library"
+                        </button>
+                    </Show>
                     <p class="v2-social-meta">{move || decision_for_explanation().explanation}</p>
                     {move || if operation.get() != DetailOperation::Idle {
                         view! { <p class="v2-detail-status">{operation_status(operation.get())}</p> }.into_any()
@@ -1666,6 +1801,41 @@ mod tests {
 
         assert_eq!(result.action, PrimaryAction::SignIn);
         assert!(!result.enabled);
+    }
+
+    #[test]
+    fn public_game_actions_add_to_library_or_play() {
+        let public = listing(AcquisitionPolicy::Public);
+        let result = select_primary_action(
+            &public,
+            false,
+            false,
+            false,
+            &[],
+            false,
+            DetailCompatibility::Compatible,
+            DetailOperation::Idle,
+            false,
+            true,
+            100,
+        );
+
+        assert_eq!(result.action, PrimaryAction::Install);
+        assert_eq!(result.label, "Play Game");
+        assert!(show_add_to_library(
+            &public, true, false, true, false, false, false
+        ));
+        assert!(!show_add_to_library(
+            &public, true, false, true, false, true, false
+        ));
+        assert!(!show_add_to_library(
+            &public, true, false, true, false, false, true
+        ));
+
+        let gated = listing(AcquisitionPolicy::Gated);
+        assert!(!show_add_to_library(
+            &gated, true, false, true, false, false, false
+        ));
     }
 
     #[test]

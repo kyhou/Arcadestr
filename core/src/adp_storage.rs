@@ -55,6 +55,14 @@ pub struct InstalledGame {
     pub installed_at: i64,
 }
 
+/// A game explicitly saved to an account's library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryGame {
+    pub buyer_pubkey: String,
+    pub game_coordinate: String,
+    pub added_at: i64,
+}
+
 /// Repository for `adp_provisioning` rows.
 pub struct AdpProvisioningRepository {
     pool: SqlitePool,
@@ -242,6 +250,64 @@ impl DownloadTokensRepository {
 /// Repository for `installed_games` rows.
 pub struct InstalledGamesRepository {
     pool: SqlitePool,
+}
+
+/// Repository for account-scoped `library_games` rows.
+pub struct LibraryGamesRepository {
+    pool: SqlitePool,
+}
+
+impl LibraryGamesRepository {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn add(&self, entry: &LibraryGame) -> Result<(), AdpStorageError> {
+        sqlx::query(
+            r#"INSERT INTO library_games (buyer_pubkey, game_coordinate, added_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT (buyer_pubkey, game_coordinate) DO NOTHING"#,
+        )
+        .bind(&entry.buyer_pubkey)
+        .bind(&entry.game_coordinate)
+        .bind(entry.added_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn contains(
+        &self,
+        buyer_pubkey: &str,
+        game_coordinate: &str,
+    ) -> Result<bool, AdpStorageError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM library_games WHERE buyer_pubkey = ? AND game_coordinate = ?",
+        )
+        .bind(buyer_pubkey)
+        .bind(game_coordinate)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count > 0)
+    }
+
+    pub async fn list(&self, buyer_pubkey: &str) -> Result<Vec<LibraryGame>, AdpStorageError> {
+        let rows = sqlx::query(
+            "SELECT buyer_pubkey, game_coordinate, added_at FROM library_games \
+             WHERE buyer_pubkey = ? ORDER BY added_at DESC, game_coordinate ASC",
+        )
+        .bind(buyer_pubkey)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| LibraryGame {
+                buyer_pubkey: row.get("buyer_pubkey"),
+                game_coordinate: row.get("game_coordinate"),
+                added_at: row.get("added_at"),
+            })
+            .collect())
+    }
 }
 
 impl InstalledGamesRepository {
@@ -637,5 +703,39 @@ mod tests {
             .expect("game should exist");
         assert_eq!(found.file_path, PathBuf::from("/tmp/game.zip"));
         assert_eq!(repo.list().await.expect("list should succeed").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn library_games_are_idempotent_and_account_scoped() {
+        let db = test_db().await;
+        let repo = LibraryGamesRepository::new(db.pool().clone());
+        let entry = LibraryGame {
+            buyer_pubkey: "buyer-1".to_string(),
+            game_coordinate: "30402:dev:game".to_string(),
+            added_at: 123,
+        };
+
+        repo.add(&entry).await.expect("insert should succeed");
+        repo.add(&entry)
+            .await
+            .expect("repeat insert should succeed");
+
+        assert!(repo
+            .contains("buyer-1", "30402:dev:game")
+            .await
+            .expect("lookup should succeed"));
+        assert!(!repo
+            .contains("buyer-2", "30402:dev:game")
+            .await
+            .expect("lookup should succeed"));
+        assert_eq!(
+            repo.list("buyer-1").await.expect("list should succeed"),
+            vec![entry]
+        );
+        assert!(repo
+            .list("buyer-2")
+            .await
+            .expect("list should succeed")
+            .is_empty());
     }
 }

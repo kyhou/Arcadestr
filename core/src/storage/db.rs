@@ -143,6 +143,9 @@ const MIGRATION_10_ENTITLEMENTS: &str = include_str!("../../migrations/007_entit
 const MIGRATION_11_AUTHORIZATION_ROOTS: &str =
     include_str!("../../migrations/008_authorization_roots.sql");
 
+// Migration 12: account-scoped user library
+const MIGRATION_12_LIBRARY_GAMES: &str = include_str!("../../migrations/009_library_games.sql");
+
 // List of all migrations in applied order; migration filenames currently lag user_version numbers.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_1_INITIAL,
@@ -156,6 +159,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_9_INSTALLED_GAMES,
     MIGRATION_10_ENTITLEMENTS,
     MIGRATION_11_AUTHORIZATION_ROOTS,
+    MIGRATION_12_LIBRARY_GAMES,
 ];
 
 /// Database connection pool for SQLite
@@ -1026,7 +1030,12 @@ mod tests {
         let db_path = temp_dir.path().join("test.db");
         let db = Database::new(&db_path).await.unwrap();
 
-        for table in ["adp_provisioning", "download_tokens", "installed_games"] {
+        for table in [
+            "adp_provisioning",
+            "download_tokens",
+            "installed_games",
+            "library_games",
+        ] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
             )

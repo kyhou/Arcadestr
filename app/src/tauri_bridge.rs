@@ -53,6 +53,57 @@ pub async fn invoke_install_game(_listing: &GameListing) -> Result<(), String> {
     Err("Game installation is only available in desktop builds.".to_string())
 }
 
+/// Add a game to the active account's library without downloading it.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_add_game_to_library(game_coordinate: String) -> Result<(), String> {
+    crate::tauri_invoke::invoke(
+        "add_game_to_library",
+        serde_json::json!({ "gameCoordinate": game_coordinate }),
+    )
+    .await
+}
+
+/// Account libraries are unavailable in standalone web builds.
+#[cfg(feature = "web")]
+pub async fn invoke_add_game_to_library(_game_coordinate: String) -> Result<(), String> {
+    Err("Game libraries are only available in desktop builds.".to_string())
+}
+
+/// Return whether a game is already in the active account's library.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_is_game_in_library(game_coordinate: String) -> Result<bool, String> {
+    crate::tauri_invoke::invoke(
+        "is_game_in_library",
+        serde_json::json!({ "gameCoordinate": game_coordinate }),
+    )
+    .await
+}
+
+/// Account libraries are unavailable in standalone web builds.
+#[cfg(feature = "web")]
+pub async fn invoke_is_game_in_library(_game_coordinate: String) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// A game saved to the active account's library.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct LibraryGame {
+    pub game_coordinate: String,
+    pub added_at: i64,
+}
+
+/// Return games saved to the active account's library.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_get_library_games() -> Result<Vec<LibraryGame>, String> {
+    crate::tauri_invoke::invoke("get_library_games", serde_json::json!({})).await
+}
+
+/// Account libraries are unavailable in standalone web builds.
+#[cfg(feature = "web")]
+pub async fn invoke_get_library_games() -> Result<Vec<LibraryGame>, String> {
+    Ok(Vec::new())
+}
+
 /// Return whether the active account owns a listing.
 #[cfg(not(feature = "web"))]
 pub async fn invoke_get_listing_ownership(

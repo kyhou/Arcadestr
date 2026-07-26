@@ -17,7 +17,10 @@ use tracing::{error, info, warn};
 use arcadestr_core::signers::NostrSigner;
 
 use arcadestr_core::adp_client::{AdpClient, AdpClientError, DownloadAuth};
-use arcadestr_core::adp_storage::{DownloadTokensRepository, InstalledGamesRepository};
+use arcadestr_core::adp_storage::{
+    DownloadTokensRepository, InstalledGamesRepository, LibraryGame as CoreLibraryGame,
+    LibraryGamesRepository,
+};
 use arcadestr_core::auth::{AccountManager, AuthState};
 use arcadestr_core::extended_network::ExtendedNetworkRepository;
 use arcadestr_core::http_client::{HttpClient, ReqwestHttpClient};
@@ -981,6 +984,96 @@ struct InstalledGame {
     version: Option<String>,
     server_url: String,
     installed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LibraryGame {
+    game_coordinate: String,
+    added_at: i64,
+}
+
+impl From<CoreLibraryGame> for LibraryGame {
+    fn from(value: CoreLibraryGame) -> Self {
+        Self {
+            game_coordinate: value.game_coordinate,
+            added_at: value.added_at,
+        }
+    }
+}
+
+fn validate_library_coordinate(coordinate: &str) -> Result<(), String> {
+    let mut parts = coordinate.splitn(3, ':');
+    if parts.next() != Some("30402") {
+        return Err("library coordinate must be a kind:30402 listing".to_string());
+    }
+    let publisher = parts
+        .next()
+        .ok_or_else(|| "library coordinate is missing its publisher".to_string())?;
+    nostr::PublicKey::from_hex(publisher)
+        .map_err(|error| format!("library coordinate has an invalid publisher: {error}"))?;
+    if parts
+        .next()
+        .is_none_or(|listing_id| listing_id.trim().is_empty())
+    {
+        return Err("library coordinate is missing its listing id".to_string());
+    }
+    Ok(())
+}
+
+async fn active_library_pubkey(state: &AppState) -> Result<String, String> {
+    state
+        .auth
+        .lock()
+        .await
+        .public_key()
+        .map(|pubkey| pubkey.to_hex())
+        .ok_or_else(|| "Not authenticated".to_string())
+}
+
+#[tauri::command]
+async fn add_game_to_library(
+    game_coordinate: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    validate_library_coordinate(&game_coordinate)?;
+    let buyer_pubkey = active_library_pubkey(&state).await?;
+    let added_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
+        .as_secs()
+        .try_into()
+        .map_err(|_| "current timestamp exceeds SQLite range".to_string())?;
+    LibraryGamesRepository::new(state.database.pool().clone())
+        .add(&CoreLibraryGame {
+            buyer_pubkey,
+            game_coordinate,
+            added_at,
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn is_game_in_library(
+    game_coordinate: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    validate_library_coordinate(&game_coordinate)?;
+    let buyer_pubkey = active_library_pubkey(&state).await?;
+    LibraryGamesRepository::new(state.database.pool().clone())
+        .contains(&buyer_pubkey, &game_coordinate)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_library_games(state: tauri::State<'_, AppState>) -> Result<Vec<LibraryGame>, String> {
+    let buyer_pubkey = active_library_pubkey(&state).await?;
+    LibraryGamesRepository::new(state.database.pool().clone())
+        .list(&buyer_pubkey)
+        .await
+        .map(|games| games.into_iter().map(LibraryGame::from).collect())
+        .map_err(|error| error.to_string())
 }
 
 impl From<arcadestr_core::adp_storage::InstalledGame> for InstalledGame {
@@ -4939,6 +5032,9 @@ fn main() {
             get_listing_ownership,
             get_platform_info,
             get_installed_games,
+            add_game_to_library,
+            is_game_in_library,
+            get_library_games,
             install_game,
             ingest_receipt,
             get_purchase_records,
