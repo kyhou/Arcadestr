@@ -291,12 +291,12 @@ fn PublishedGamesView(on_navigate: Callback<PublishViewState>) -> impl IntoView 
                     <button class="v2-btn-primary" on:click=move |_| on_navigate.run(PublishViewState::NewPublication)>"New Network publication"</button>
                 </div>
             </header>
-            {move || error.get().map(|message| view! { <div class="v2-panel border border-error/40 text-error">{message}</div> })}
+            {move || error.get().map(|message| view! { <div class="v2-panel v2-publisher-panel border border-error/40 text-error">{message}</div> })}
             {move || if loading.get() {
-                view! { <div class="v2-panel text-on-surface-variant">"Loading your published games..."</div> }.into_any()
+                view! { <div class="v2-panel v2-publisher-panel text-on-surface-variant">"Loading your published games..."</div> }.into_any()
             } else if listings.get().is_empty() {
                 view! {
-                    <div class="v2-panel text-center space-y-4">
+                    <div class="v2-panel v2-publisher-panel text-center space-y-4">
                         <h2 class="text-2xl font-headline font-bold">"No published games yet"</h2>
                         <p class="text-on-surface-variant">"Create a Network publication first, then manage Promotions from its Game page."</p>
                         <button class="v2-btn-primary" on:click=move |_| on_navigate.run(PublishViewState::NewPublication)>"Open publishing form"</button>
