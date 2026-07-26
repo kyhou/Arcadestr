@@ -10,6 +10,7 @@ use crate::campaign_management::{
     listing_coordinate, validate_campaign_form, CampaignForm, CampaignPointerUpdatePlan,
     CampaignValidationError,
 };
+use crate::components::DateTimeRangePicker;
 #[cfg(not(feature = "web"))]
 use crate::components::PublishView;
 use crate::invoke_fetch_marketplace_stream;
@@ -1242,7 +1243,13 @@ fn CampaignEditorView(
                 {terms_read_only.then(|| view! { <p class="v2-publisher-readonly" role="status">"Active, Ended, and Cancelled Promotion terms are immutable. This view is read-only."</p> })}
                 <div><label for="campaign-id">"Promotion ID"</label><input id="campaign-id" class="v2-input" readonly=true prop:value=move || form.get().campaign_id /></div>
                 <div><h2>"Claim and keep"</h2><div class="v2-publisher-option"><strong>"Free Claim and keep"</strong><p>"People may claim before the exclusive end time and keep durable access permanently."</p></div><p class="text-sm text-on-surface-variant">"Timed access belongs to the Game page acquisition policy, not this Promotion."</p></div>
-                <div class="v2-publisher-date-grid"><div><label for="campaign-start">"Start date and time (required)"</label><input id="campaign-start" required=true class="v2-input" type="datetime-local" disabled=move || terms_read_only || completed.get() prop:value=move || form.get().starts_at on:input:target=move |event| form.update(|current| current.starts_at = event.target().value()) /></div><div><label for="campaign-end">"Exclusive end date and time (required)"</label><input id="campaign-end" required=true class="v2-input" type="datetime-local" disabled=move || terms_read_only || completed.get() prop:value=move || form.get().ends_at on:input:target=move |event| form.update(|current| current.ends_at = event.target().value()) /></div></div>
+                <DateTimeRangePicker
+                    starts_at=Signal::derive(move || form.get().starts_at)
+                    ends_at=Signal::derive(move || form.get().ends_at)
+                    on_starts_at=Callback::new(move |value| form.update(|current| current.starts_at = value))
+                    on_ends_at=Callback::new(move |value| form.update(|current| current.ends_at = value))
+                    disabled=Signal::derive(move || terms_read_only || completed.get())
+                />
                 <p class="text-xs text-on-surface-variant">"Times use your local timezone. Claims at or after the end are not accepted. Local timezone: "{timezone_label()}</p>
                 {move || live_validation.get().map(|text| view! { <p class="text-sm text-error" role="alert">{text}</p> })}
                 <div class="v2-publisher-link-option"><label><input type="checkbox" disabled=move || terms_read_only || completed.get() prop:checked=move || form.get().update_listing_pointer on:change:target=move |event| form.update(|current| current.update_listing_pointer = event.target().checked()) /><span><strong>"Add a Promotion link to the Game page"</strong><span>"Recommended advisory discovery hint. Promotion validity never depends on this link."</span></span></label></div>
@@ -1350,6 +1357,7 @@ fn datetime_local(value: u64) -> String {
         date.get_minutes()
     )
 }
+
 fn timezone_label() -> String {
     js_sys::Date::new_0().to_string().into()
 }

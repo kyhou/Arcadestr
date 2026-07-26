@@ -17,6 +17,8 @@ use crate::tauri_bridge::{
 use crate::ui_v2::views::{use_fallback_cover, valid_cover_url};
 use crate::{AuthContext, GameListing};
 
+use super::date_time_picker::DateTimeRangePicker;
+
 const DEFAULT_ADP_SERVER_URL: &str = match option_env!("ARCADESTR_DEFAULT_ADP_SERVER_URL") {
     Some(url) => url,
     None => "https://dist.arcadestr.io",
@@ -2326,14 +2328,13 @@ pub fn PublishView(
                             </Show>
                             <Show when=move || matches!(acquisition_kind.get(), AcquisitionKind::TimedAccess)>
                                 <div class="grid gap-3">
-                                    <div>
-                                        <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2" for="acquisition-start">"Access starts (required)"</label>
-                                        <input id="acquisition-start" required=true class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" type="datetime-local" step="1" prop:value=move || acquisition_starts_at.get() on:input:target=move |ev| acquisition_starts_at.set(ev.target().value()) disabled=move || is_publishing.get() />
-                                    </div>
-                                    <div>
-                                        <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2" for="acquisition-end">"Access ends (required)"</label>
-                                        <input id="acquisition-end" required=true class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" type="datetime-local" step="1" prop:value=move || acquisition_ends_at.get() on:input:target=move |ev| acquisition_ends_at.set(ev.target().value()) disabled=move || is_publishing.get() />
-                                    </div>
+                                    <DateTimeRangePicker
+                                        starts_at=Signal::derive(move || acquisition_starts_at.get())
+                                        ends_at=Signal::derive(move || acquisition_ends_at.get())
+                                        on_starts_at=Callback::new(move |value| acquisition_starts_at.set(value))
+                                        on_ends_at=Callback::new(move |value| acquisition_ends_at.set(value))
+                                        disabled=Signal::derive(move || is_publishing.get())
+                                    />
                                     <p class="text-xs text-on-surface-variant">"Times use your local timezone."</p>
                                 </div>
                             </Show>
