@@ -1,10 +1,12 @@
 //! Shared UI v2 components.
 
+pub mod button;
 pub mod game_card;
 pub mod nav_item;
 pub mod page_header;
 pub mod topbar;
 
+pub use button::{Button, ButtonVariant};
 pub use game_card::{
     GameCard, GameCardAccess, GameCardAction, GameCardCampaign, GameCardPresentation,
     PlatformCompatibility,

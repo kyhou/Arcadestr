@@ -2821,9 +2821,14 @@ select option:disabled {
   border: 1px solid rgba(255, 96, 120, 0.32);
   border-radius: var(--v2-radius-md);
   background: rgba(255, 96, 120, 0.1);
-  color: var(--v2-error);
+  color: var(--v2-danger);
   font-weight: 700;
   cursor: pointer;
+}
+
+.v2-btn-danger:hover:not(:disabled) {
+  border-color: var(--v2-danger);
+  background: rgba(255, 96, 120, 0.18);
 }
 
 .v2-auth-add-card,
@@ -3435,39 +3440,80 @@ dialog.v2-confirm-backdrop::backdrop {
   border-radius: var(--v2-radius-xl);
 }
 
-.v2-btn-primary {
-  border: none;
+.v2-btn-primary,
+.v2-btn-secondary,
+.v2-btn-ghost,
+.v2-btn-danger {
+  min-height: 42px;
+  padding: 0.7rem 1rem;
   border-radius: var(--v2-radius-md);
-  background: linear-gradient(120deg, var(--v2-primary) 0%, var(--v2-primary-dim) 100%);
-  color: var(--v2-on-primary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--v2-space-2);
+  font: inherit;
   font-weight: 700;
+  line-height: 1.2;
+  text-align: center;
   cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease, box-shadow 150ms ease,
+    color 150ms ease, opacity 150ms ease, transform 150ms ease;
 }
 
-.v2-btn-primary:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
+.v2-btn-primary,
+.v2-btn-secondary {
+  border: none;
+}
+
+.v2-btn-primary {
+  background: linear-gradient(120deg, var(--v2-primary) 0%, var(--v2-primary-dim) 100%);
+  color: var(--v2-on-primary);
+}
+
+.v2-btn-primary:hover:not(:disabled) {
+  box-shadow: var(--v2-shadow-glow-primary);
 }
 
 .v2-btn-secondary {
-  border: none;
-  border-radius: var(--v2-radius-md);
   background: var(--v2-secondary);
   color: var(--v2-on-secondary);
-  font-weight: 700;
-  cursor: pointer;
+}
+
+.v2-btn-secondary:hover:not(:disabled) {
+  background: var(--v2-secondary-dim);
 }
 
 .v2-btn-ghost {
   border: 1px solid transparent;
-  border-radius: var(--v2-radius-md);
   background: transparent;
   color: var(--v2-on-background);
-  cursor: pointer;
 }
 
-.v2-btn-ghost:hover {
+.v2-btn-ghost:hover:not(:disabled) {
   background: rgba(32, 38, 47, 0.3);
+}
+
+.v2-btn-primary:focus-visible,
+.v2-btn-secondary:focus-visible,
+.v2-btn-ghost:focus-visible,
+.v2-btn-danger:focus-visible {
+  outline: 2px solid var(--v2-primary);
+  outline-offset: 2px;
+}
+
+.v2-btn-primary:active:not(:disabled),
+.v2-btn-secondary:active:not(:disabled),
+.v2-btn-ghost:active:not(:disabled),
+.v2-btn-danger:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.v2-btn-primary:disabled,
+.v2-btn-secondary:disabled,
+.v2-btn-ghost:disabled,
+.v2-btn-danger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .v2-input {

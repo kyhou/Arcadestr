@@ -81,7 +81,8 @@ pub fn Nip05Badge(status: Signal<Nip05Status>, on_verify: Callback<String>) -> i
             {move || if is_unverified() || is_failed() {
                 view! {
                     <button
-                        class="nip05-badge-verify-btn"
+                        type="button"
+                        class="v2-btn-secondary nip05-badge-verify-btn"
                         disabled=move || !can_verify()
                         on:click={
                             let on_verify = on_verify.clone();

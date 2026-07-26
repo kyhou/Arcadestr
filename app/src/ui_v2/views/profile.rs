@@ -4,6 +4,7 @@ use wasm_bindgen_futures::spawn_local;
 use crate::components::BadgeShowcase;
 use crate::models::{npub_fallback_label, GameListing, Nip05Status, UserProfile};
 use crate::tauri_bridge::invoke_verify_nip05;
+use crate::ui_v2::components::Button;
 use crate::ui_v2::views::marketplace_loader::use_marketplace_listings_with_limit;
 use crate::ui_v2::views::{use_fallback_cover, valid_cover_url, FALLBACK_COVER};
 use crate::AuthContext;
@@ -271,7 +272,7 @@ pub fn ProfileV2View(
                     <section class="v2-profile-card v2-panel">
                         <div class="v2-profile-section-header">
                             <div><p class="v2-store-kicker">"Publisher catalog"</p><h2>"Published games"</h2></div>
-                            <button class="v2-btn-secondary" on:click=move |_| on_open_publish.run(())>"Open publishing"</button>
+                            <Button on_click=move |_| on_open_publish.run(())>"Open publishing"</Button>
                         </div>
                         {move || if marketplace_state.loading.get() && my_listings.get().is_empty() {
                             view! { <p class="v2-profile-muted" role="status">"Loading published listings..."</p> }.into_any()
