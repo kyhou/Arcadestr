@@ -1,5 +1,6 @@
 //! HTTP client abstraction for testable network-dependent modules.
 
+use std::error::Error as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -69,6 +70,24 @@ fn temp_sibling_path(dest: &Path) -> PathBuf {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     dest.with_file_name(format!(".{filename}.{}.{nonce}.tmp", std::process::id()))
+}
+
+fn request_error(error: reqwest::Error) -> HttpClientError {
+    let mut details = if error.is_timeout() {
+        format!("request timed out: {error}")
+    } else {
+        error.to_string()
+    };
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !details.contains(&cause_text) {
+            details.push_str(": ");
+            details.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    HttpClientError::Request(details)
 }
 
 /// Production HTTP client backed by `reqwest`.
@@ -147,6 +166,46 @@ mod tests {
             .count();
         assert_eq!(entries, 1, "partial temp file should be removed");
     }
+
+    #[tokio::test]
+    async fn localhost_connects_to_ipv4_without_changing_host_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let port = listener
+            .local_addr()
+            .expect("test server address should be available")
+            .port();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one connection");
+            let mut request = [0_u8; 1024];
+            let bytes = socket
+                .read(&mut request)
+                .await
+                .expect("test server should read request");
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            assert!(request.contains(&format!("host: localhost:{port}")));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}")
+                .await
+                .expect("test server should write response");
+        });
+
+        let client = ReqwestHttpClient::new(Duration::from_secs(5))
+            .expect("reqwest client should be created");
+        let response = client
+            .get_json(&format!("http://localhost:{port}/health"))
+            .await
+            .expect("localhost should connect through IPv4");
+
+        server.await.expect("test server task should finish");
+        assert_eq!(response, serde_json::json!({ "ok": true }));
+    }
 }
 
 impl ReqwestHttpClient {
@@ -155,6 +214,7 @@ impl ReqwestHttpClient {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
             .build()
             .map_err(|e| HttpClientError::Build(e.to_string()))?;
 
@@ -165,12 +225,7 @@ impl ReqwestHttpClient {
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
     async fn get_json(&self, url: &str) -> Result<Value, HttpClientError> {
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| HttpClientError::Request(e.to_string()))?;
+        let response = self.client.get(url).send().await.map_err(request_error)?;
 
         if response.status().is_redirection() {
             return Err(HttpClientError::RedirectBlocked(
@@ -208,10 +263,7 @@ impl HttpClient for ReqwestHttpClient {
             request = request.header(name, value);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| HttpClientError::Request(e.to_string()))?;
+        let response = request.send().await.map_err(request_error)?;
 
         if response.status().is_redirection() {
             return Err(HttpClientError::RedirectBlocked(
@@ -241,15 +293,12 @@ impl HttpClient for ReqwestHttpClient {
         dest: &Path,
         on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
     ) -> Result<HttpDownloadOutcome, HttpClientError> {
-        let mut request = self.client.get(url);
+        let mut request = self.client.get(url).timeout(Duration::from_secs(30 * 60));
         for (name, value) in headers {
             request = request.header(name, value);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| HttpClientError::Request(e.to_string()))?;
+        let response = request.send().await.map_err(request_error)?;
 
         if response.status().is_redirection() {
             return Err(HttpClientError::RedirectBlocked(

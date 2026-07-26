@@ -2,7 +2,6 @@ use leptos::prelude::*;
 
 #[component]
 pub fn TopBar(
-    page_title: Signal<&'static str>,
     relay_count: Signal<usize>,
     connected_relays: Signal<Vec<String>>,
     display_name: Signal<String>,
@@ -12,30 +11,44 @@ pub fn TopBar(
     connection_error: Signal<Option<String>>,
     mobile_menu_open: Signal<bool>,
     on_open_store: Callback<()>,
+    on_open_browse: Callback<()>,
+    on_search: Callback<String>,
     on_open_profile: Callback<()>,
     on_toggle_mobile_menu: Callback<()>,
 ) -> impl IntoView {
     let relay_menu_open = RwSignal::new(false);
+    let search_query = RwSignal::new(String::new());
 
     view! {
-        <header class="sticky top-0 z-50 border-b border-white/5 bg-background/75 backdrop-blur-2xl">
-            <div class="mx-auto flex h-20 max-w-[1600px] items-center gap-3 px-4 md:px-8">
+        <header class="sticky top-0 z-50 border-b border-white/5 bg-background/90 backdrop-blur-2xl">
+            <div class="mx-auto flex h-[72px] max-w-[1600px] items-center gap-3 px-4 md:px-8">
                 <button
                     type="button"
-                    class="font-display text-2xl font-bold text-transparent outline-none ring-primary/60 [background:var(--noir-gradient-primary)] bg-clip-text focus-visible:ring-2"
+                    class="font-display text-[22px] font-bold text-primary outline-none ring-primary/60 focus-visible:ring-2"
                     aria-label="Go to Store"
                     on:click=move |_| on_open_store.run(())
                 >
                     "Arcadestr"
                 </button>
 
-                <div class="hidden h-5 w-px bg-white/10 sm:block" aria-hidden="true"></div>
-                <p class="hidden truncate text-sm font-medium text-on-surface-variant sm:block">
-                    {move || page_title.get()}
-                </p>
+                <nav class="ml-7 hidden items-center gap-6 sm:flex" aria-label="Store navigation">
+                    <button
+                        type="button"
+                        class="text-sm text-on-surface-variant outline-none ring-primary/60 hover:text-on-surface focus-visible:ring-2"
+                        on:click=move |_| on_open_store.run(())
+                    >
+                        "Discover"
+                    </button>
+                    <button
+                        type="button"
+                        class="text-sm text-on-surface-variant outline-none ring-primary/60 hover:text-on-surface focus-visible:ring-2"
+                        on:click=move |_| on_open_browse.run(())
+                    >
+                        "Browse"
+                    </button>
+                </nav>
 
-                <div class="ml-auto flex items-center gap-2 sm:gap-3">
-                    <div class="relative">
+                <div class="relative ml-auto sm:ml-2">
                         <button
                             type="button"
                             class="flex min-h-10 items-center gap-2 rounded-full bg-surface-container-high px-3 py-2 text-xs font-semibold text-on-surface outline-none ring-primary/60 hover:bg-surface-bright focus-visible:ring-2"
@@ -116,12 +129,33 @@ pub fn TopBar(
                                 }}
                             </section>
                         </Show>
-                    </div>
+                </div>
+
+                    <form
+                        class="ml-auto hidden w-[min(34vw,450px)] lg:block"
+                        role="search"
+                        on:submit=move |event| {
+                            event.prevent_default();
+                            on_search.run(search_query.get_untracked());
+                        }
+                    >
+                        <label class="flex h-10 items-center gap-3 rounded-full bg-surface-container-high px-4 text-on-surface-variant ring-primary/60 focus-within:ring-2">
+                            <span class="material-symbols-outlined text-lg" aria-hidden="true">"search"</span>
+                            <span class="sr-only">"Search games"</span>
+                            <input
+                                type="search"
+                                class="min-w-0 flex-1 border-0 bg-transparent p-0 text-sm text-on-surface outline-none placeholder:text-on-surface-variant"
+                                placeholder="Search curated games..."
+                                prop:value=move || search_query.get()
+                                on:input=move |event| search_query.set(event_target_value(&event))
+                            />
+                        </label>
+                    </form>
 
                     <button
                         id="mobile-navigation-trigger"
                         type="button"
-                        class="flex min-h-10 items-center gap-2 rounded-full p-1.5 pr-2 text-left outline-none ring-primary/60 hover:bg-surface-container-high focus-visible:ring-2"
+                        class="ml-auto flex min-h-10 items-center gap-2 rounded-full p-1.5 pr-2 text-left outline-none ring-primary/60 hover:bg-surface-container-high focus-visible:ring-2 lg:ml-0"
                         aria-label=move || format!("Open profile for {}", display_name.get())
                         title=move || {
                             let status = connection_status.get();
@@ -156,7 +190,7 @@ pub fn TopBar(
 
                     <button
                         type="button"
-                        class="flex h-10 w-10 items-center justify-center rounded-xl text-on-surface-variant outline-none ring-primary/60 hover:bg-surface-container-high hover:text-on-surface focus-visible:ring-2 md:hidden"
+                        class="flex h-10 w-10 items-center justify-center rounded-xl text-on-surface-variant outline-none ring-primary/60 hover:bg-surface-container-high hover:text-on-surface focus-visible:ring-2 lg:hidden"
                         aria-label={move || if mobile_menu_open.get() { "Close navigation" } else { "Open navigation" }}
                         aria-expanded=move || mobile_menu_open.get()
                         aria-controls="mobile-primary-navigation"
@@ -166,7 +200,6 @@ pub fn TopBar(
                             {move || if mobile_menu_open.get() { "close" } else { "menu" }}
                         </span>
                     </button>
-                </div>
             </div>
         </header>
     }

@@ -44,23 +44,6 @@ enum UiV2View {
     Settings,
 }
 
-impl UiV2View {
-    fn page_title(&self) -> &'static str {
-        match self {
-            Self::Store => "Store",
-            Self::Browse(_) => "Browse",
-            Self::Detail(_, _) => "Game details",
-            Self::Library => "Library",
-            Self::Social => "Community",
-            Self::Achievements => "Achievements",
-            Self::Purchases => "Purchases and access",
-            Self::Publish(_) => "Publish",
-            Self::Profile => "Profile",
-            Self::Settings => "Settings",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{detail_back_destination, BrowseRequest, DetailOrigin, UiV2View};
@@ -228,7 +211,6 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let connected_relays_signal = Signal::derive(move || connected_relays.get());
     let connection_status = Signal::derive(move || auth.connection_status.get());
     let connection_error = Signal::derive(move || auth.connection_error.get());
-    let page_title = Signal::derive(move || current_view.get().page_title());
     let mobile_menu_signal = Signal::derive(move || mobile_menu_open.get());
     let display_name = Signal::derive(move || {
         auth.profile
@@ -267,6 +249,10 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     });
     let navigate_browse = Callback::new(move |_| {
         current_view.set(UiV2View::Browse(BrowseRequest::default()));
+        mobile_menu_open.set(false);
+    });
+    let search_browse = Callback::new(move |query: String| {
+        current_view.set(UiV2View::Browse(BrowseRequest::for_query(query)));
         mobile_menu_open.set(false);
     });
     let navigate_store_category = Callback::new(move |request: BrowseRequest| {
@@ -396,7 +382,6 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
             <style>{UI_V2_STYLES}</style>
 
             <TopBar
-                page_title=page_title
                 relay_count=relay_count_signal
                 connected_relays=connected_relays_signal
                 display_name=display_name
@@ -406,6 +391,8 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                 connection_error=connection_error
                 mobile_menu_open=mobile_menu_signal
                 on_open_store=navigate_store
+                on_open_browse=navigate_browse
+                on_search=search_browse
                 on_open_profile=navigate_profile
                 on_toggle_mobile_menu=toggle_mobile_menu
             />
@@ -413,13 +400,13 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
             <Show when=move || mobile_menu_open.get()>
                 <button
                     type="button"
-                    class="fixed inset-0 top-20 z-30 bg-black/55 md:hidden"
+                    class="fixed inset-0 top-20 z-30 bg-black/55 lg:hidden"
                     aria-label="Close navigation"
                     on:click=move |_| mobile_menu_open.set(false)
                 ></button>
                 <nav
                     id="mobile-primary-navigation"
-                    class="fixed inset-x-3 top-24 z-40 max-h-[calc(100vh-7rem)] overflow-auto rounded-2xl border border-white/10 bg-surface-container-low/95 p-3 shadow-ambient backdrop-blur-2xl md:hidden"
+                    class="fixed inset-x-3 top-24 z-40 max-h-[calc(100vh-7rem)] overflow-auto rounded-2xl border border-white/10 bg-surface-container-low/95 p-3 shadow-ambient backdrop-blur-2xl lg:hidden"
                     aria-label="Primary navigation"
                     role="dialog"
                     aria-modal="true"
@@ -463,38 +450,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
             </Show>
 
             <div class="mx-auto flex max-w-[1600px] items-start gap-6 px-4 py-6 md:px-8" inert=move || mobile_menu_open.get().then_some("")>
-                <aside class="sticky top-24 hidden max-h-[calc(100vh-7rem)] w-60 shrink-0 flex-col overflow-auto rounded-2xl border border-white/5 bg-surface-container-low/75 p-4 shadow-ambient backdrop-blur-2xl md:flex">
-                    <section class="mb-6 flex items-center gap-3 rounded-xl p-2" aria-label="Active account">
-                        {move || match avatar_url.get() {
-                            Some(url) => view! {
-                                <img src=url alt="" class="h-10 w-10 rounded-full object-cover ring-2 ring-primary/60" />
-                            }
-                            .into_any(),
-                            None => view! {
-                                <span class="flex h-10 w-10 items-center justify-center rounded-full bg-surface-bright text-sm font-bold ring-2 ring-primary/60" aria-hidden="true">
-                                    {move || avatar_fallback.get()}
-                                </span>
-                            }
-                            .into_any(),
-                        }}
-                        <div class="min-w-0">
-                            <h2 class="truncate text-sm font-semibold">{move || display_name.get()}</h2>
-                            <p class=move || match connection_status.get().as_str() {
-                                "connected" => "truncate text-xs text-secondary",
-                                "connecting" => "truncate text-xs text-tertiary",
-                                "failed" => "truncate text-xs text-error",
-                                _ => "truncate text-xs text-on-surface-variant",
-                            }>
-                                {move || match connection_status.get().as_str() {
-                                    "connected" => "Signing app connected",
-                                    "connecting" => "Connecting signing app",
-                                    "failed" => "Signing app connection failed",
-                                    _ => "Signing app disconnected",
-                                }}
-                            </p>
-                        </div>
-                    </section>
-
+                <aside class="sticky top-24 hidden max-h-[calc(100vh-7rem)] w-60 shrink-0 flex-col overflow-auto rounded-2xl border border-white/5 bg-surface-container-low/75 p-4 shadow-ambient backdrop-blur-2xl lg:flex">
                     <nav class="flex flex-1 flex-col gap-1" aria-label="Primary navigation">
                         <NavItem label="Store" icon="grid_view" active=store_active on_click=navigate_store />
                         <NavItem label="Browse" icon="explore" active=browse_active on_click=navigate_browse />

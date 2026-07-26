@@ -404,6 +404,7 @@ pub async fn start_qr_login(
 pub async fn check_qr_connection(
     state: State<'_, Arc<Mutex<AppSignerState>>>,
     app_handle: AppHandle,
+    app_state: State<'_, crate::AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
     info!("check_qr_connection called");
 
@@ -462,7 +463,7 @@ pub async fn check_qr_connection(
     )
     .await
     {
-        Ok(profile) => {
+        Ok((profile, client)) => {
             info!("QR connection established for profile: {}", profile.id);
 
             // Save profile to keyring
@@ -471,17 +472,24 @@ pub async fn check_qr_connection(
                 return Err(format!("Connected but failed to save profile: {}", e));
             }
 
-            // For QR profiles, we don't need to activate via bunker - connection is already established
-            // Just set the active profile directly
-            let mut state_guard = state.lock().await;
-            state_guard.pending_qr = None; // Clear pending state
-            state_guard.active_profile_id = Some(profile.id.clone());
-            // Note: We don't set active_client here because QR connections don't use the NostrConnect client
-            // The signer will send events directly to our relays
-            drop(state_guard);
+            {
+                let mut state_guard = state.lock().await;
+                state_guard.pending_qr = None;
+                state_guard.active_profile_id = Some(profile.id.clone());
+                state_guard.active_client = Some(client.clone());
+                state_guard.connection_state = ConnectionState::Connected;
+            }
+            let signer = client
+                .signer()
+                .await
+                .map_err(|error| format!("failed to access QR signer: {error}"))?;
+            activate_remote_account(signer, &app_state).await?;
+            if let Err(error) = set_last_active_profile_id(&profile.id) {
+                warn!("Failed to persist active QR profile: {error}");
+            }
 
             info!(
-                "QR profile {} activated (without bunker connection)",
+                "QR profile {} activated with its connected signer",
                 profile.id
             );
 
@@ -683,7 +691,7 @@ pub async fn switch_profile(
         }
     }
 
-    let profile = match profile {
+    let _profile = match profile {
         Some(p) => p,
         None => {
             error!(
@@ -694,39 +702,7 @@ pub async fn switch_profile(
         }
     };
 
-    // Check if this is a QR profile (name contains "QR Connected")
-    let is_qr_profile = profile.name.contains("QR Connected");
-
-    if is_qr_profile {
-        // For QR profiles, just set as active without bunker connection
-        info!("QR profile detected, activating without bunker connection");
-        let mut state_guard = state.lock().await;
-        state_guard.active_profile_id = Some(profile_id.clone());
-        state_guard.is_offline_mode = false;
-        // Note: active_client remains None for QR profiles
-        drop(state_guard);
-
-        // Set as last active
-        let _ = set_last_active_profile_id(&profile_id);
-
-        let user_npub = match profile.user_pubkey.to_bech32() {
-            Ok(npub) => npub,
-            Err(e) => return Err(format!("Failed to encode pubkey: {}", e)),
-        };
-        let _ = app_handle.emit("auth_success", user_npub.clone());
-
-        return Ok(serde_json::json!({
-            "account": {
-                "id": profile_id,
-                "npub": user_npub,
-                "name": profile.name,
-                "signing_mode": "nip46",
-                "last_used": 0,
-            }
-        }));
-    }
-
-    // For bunker profiles, use the normal activation flow
+    // All NIP-46 profiles retain enough data to restore a signing client.
     // Use the key_to_use (bunker_pubkey_hex for new profiles, profile_id for old)
     activate_profile(state.inner(), &key_to_use)
         .await
@@ -981,9 +957,14 @@ pub async fn logout_nip46(
     state: State<'_, Arc<Mutex<AppSignerState>>>,
     app_handle: AppHandle,
     app_state: State<'_, crate::AppState>,
+    account_manager: State<'_, Arc<AccountManager>>,
 ) -> Result<(), String> {
     info!("logout_nip46 called");
     logout(state.inner()).await;
+    account_manager
+        .clear_active_account()
+        .await
+        .map_err(|err| err.to_string())?;
     app_state.auth.lock().await.disconnect();
 
     // Emit logout event to notify frontend

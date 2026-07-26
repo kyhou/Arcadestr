@@ -356,6 +356,15 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Clear the active account without deleting any saved accounts.
+    pub async fn clear_active_account(&self) -> Result<(), AccountManagerError> {
+        sqlx::query("UPDATE accounts SET is_active = 0")
+            .execute(self.db.pool())
+            .await?;
+
+        Ok(())
+    }
+
     /// Get account by ID
     pub async fn get_account(
         &self,
@@ -510,5 +519,24 @@ mod tests {
 
         // Should have no accounts initially
         assert!(!manager.has_accounts().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn clear_active_account_keeps_saved_accounts_selectable() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = AccountManager::new(temp_dir.path()).await.unwrap();
+        manager
+            .add_remote_account("abc123", "npub1saved", Some("Saved".to_string()))
+            .await
+            .unwrap();
+
+        assert!(manager.load_active_account().await.unwrap().is_some());
+
+        manager.clear_active_account().await.unwrap();
+
+        assert!(manager.load_active_account().await.unwrap().is_none());
+        let accounts = manager.list_accounts().await.unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert!(!accounts[0].is_active);
     }
 }

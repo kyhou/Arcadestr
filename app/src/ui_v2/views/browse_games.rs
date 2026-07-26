@@ -24,12 +24,22 @@ const MAX_PLATFORM_AUTO_FETCHES: usize = 4;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BrowseRequest {
     pub category: Option<String>,
+    pub query: Option<String>,
 }
 
 impl BrowseRequest {
     pub fn for_category(category: impl Into<String>) -> Self {
         Self {
             category: Some(normalize_filter_value(&category.into())),
+            query: None,
+        }
+    }
+
+    pub fn for_query(query: impl Into<String>) -> Self {
+        let query = query.into().trim().to_string();
+        Self {
+            category: None,
+            query: (!query.is_empty()).then_some(query),
         }
     }
 }
@@ -126,7 +136,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
     let marketplace = use_marketplace_listings();
     let listings = marketplace.listings;
     let campaign_state = use_listing_campaign_states(listings);
-    let query = RwSignal::new(String::new());
+    let query = RwSignal::new(request.query.unwrap_or_default());
     let active_category =
         RwSignal::new(request.category.map(|value| normalize_filter_value(&value)));
     let acquisition_filter = RwSignal::new(AcquisitionFilter::All);

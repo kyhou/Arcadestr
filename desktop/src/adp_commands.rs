@@ -181,7 +181,7 @@ impl NostrSigner for SdkSignerAdapter {
     }
 }
 
-async fn resolve_publish_signer(
+pub(crate) async fn resolve_active_signer(
     signer_state: &Arc<tokio::sync::Mutex<AppSignerState>>,
     auth: &AuthState,
 ) -> Result<Arc<dyn NostrSigner>, String> {
@@ -206,7 +206,7 @@ async fn ensure_publish_account_current(
     expected: nostr::PublicKey,
 ) -> Result<(), String> {
     let auth = { state.auth.lock().await.clone() };
-    let current = resolve_publish_signer(signer_state, &auth)
+    let current = resolve_active_signer(signer_state, &auth)
         .await?
         .get_public_key()
         .await
@@ -515,7 +515,7 @@ pub async fn publish_campaign(
     signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
 ) -> Result<PublishCampaignResponse, String> {
     let auth_snapshot = { state.auth.lock().await.clone() };
-    let signer = resolve_publish_signer(signer_state.inner(), &auth_snapshot).await?;
+    let signer = resolve_active_signer(signer_state.inner(), &auth_snapshot).await?;
     let publisher = signer
         .get_public_key()
         .await
@@ -656,7 +656,7 @@ pub async fn update_campaign_pointer(
     signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
 ) -> Result<String, String> {
     let auth_snapshot = { state.auth.lock().await.clone() };
-    let signer = resolve_publish_signer(signer_state.inner(), &auth_snapshot).await?;
+    let signer = resolve_active_signer(signer_state.inner(), &auth_snapshot).await?;
     let publisher = signer
         .get_public_key()
         .await
@@ -1184,7 +1184,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
 ) -> Result<PublishAdpListingResult, String> {
     let auth_snapshot = { state.auth.lock().await.clone() };
-    let signer = resolve_publish_signer(signer_state.inner(), &auth_snapshot).await?;
+    let signer = resolve_active_signer(signer_state.inner(), &auth_snapshot).await?;
     let developer_pubkey = signer
         .get_public_key()
         .await
@@ -2073,7 +2073,7 @@ mod tests {
             ..AppSignerState::new()
         }));
 
-        let resolved = resolve_publish_signer(&signer_state, &AuthState::new())
+        let resolved = resolve_active_signer(&signer_state, &AuthState::new())
             .await
             .expect("active NIP-46 signer should be resolved");
 

@@ -1157,25 +1157,28 @@ fn now_unix_i64() -> Result<i64, String> {
         .as_secs() as i64)
 }
 
-async fn install_game_with_fetcher<R: tauri::Runtime>(
+async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
     listing: AppGameListing,
     state: &AppState,
+    active_signer: Option<Arc<dyn NostrSigner>>,
     app: Option<&tauri::AppHandle<R>>,
     app_data_dir: PathBuf,
     fresh_listing_fetcher: &dyn FreshListingFetcher,
 ) -> Result<(), String> {
-    let (buyer_pubkey_hex, signer) = {
+    let signer = if let Some(signer) = active_signer {
+        signer
+    } else {
         let auth = state.auth.lock().await;
-        let buyer_pubkey_hex = auth
-            .public_key()
-            .map(|public_key| public_key.to_hex())
-            .ok_or_else(|| "not authenticated".to_string())?;
-        let signer = auth
-            .signer()
+        auth.signer()
             .cloned()
-            .ok_or_else(|| "not authenticated".to_string())?;
-        (buyer_pubkey_hex, signer)
+            .map(|signer| Arc::new(signer) as Arc<dyn NostrSigner>)
+            .ok_or_else(|| "not authenticated".to_string())?
     };
+    let buyer_pubkey_hex = signer
+        .get_public_key()
+        .await
+        .map_err(|error| format!("failed to get active signer pubkey: {error}"))?
+        .to_hex();
 
     let listing_id = listing.id.clone();
     let coordinate = listing_coordinate_from_app_listing(&listing)?;
@@ -1235,7 +1238,9 @@ async fn install_game_with_fetcher<R: tauri::Runtime>(
                 .first()
                 .cloned()
                 .ok_or_else(|| "fresh listing has no authorized server".to_string())?,
-            DownloadAuth::Nip98 { signer: &signer },
+            DownloadAuth::Nip98 {
+                signer: signer.as_ref(),
+            },
         ),
     };
     let dest_path = deterministic_artifact_path(&app_data_dir, &coordinate);
@@ -1291,11 +1296,30 @@ async fn install_game_with_fetcher<R: tauri::Runtime>(
     Ok(())
 }
 
+async fn install_game_with_fetcher<R: tauri::Runtime>(
+    listing: AppGameListing,
+    state: &AppState,
+    app: Option<&tauri::AppHandle<R>>,
+    app_data_dir: PathBuf,
+    fresh_listing_fetcher: &dyn FreshListingFetcher,
+) -> Result<(), String> {
+    install_game_with_fetcher_and_signer(
+        listing,
+        state,
+        None,
+        app,
+        app_data_dir,
+        fresh_listing_fetcher,
+    )
+    .await
+}
+
 #[tauri::command]
 async fn install_game(
     listing: AppGameListing,
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
+    signer_state: tauri::State<'_, Arc<Mutex<AppSignerState>>>,
 ) -> Result<(), String> {
     tracing::info!(
         "install_game called for listing '{}' ({})",
@@ -1310,7 +1334,17 @@ async fn install_game(
     let fetcher = RelayFreshListingFetcher {
         state: state.clone(),
     };
-    install_game_with_fetcher(listing, &state, Some(&app_handle), app_data_dir, &fetcher).await
+    let auth_snapshot = { state.auth.lock().await.clone() };
+    let signer = adp_commands::resolve_active_signer(signer_state.inner(), &auth_snapshot).await?;
+    install_game_with_fetcher_and_signer(
+        listing,
+        &state,
+        Some(signer),
+        Some(&app_handle),
+        app_data_dir,
+        &fetcher,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2134,7 +2168,7 @@ mod install_game_tests {
     }
 
     #[tokio::test]
-    async fn explicit_public_listing_allows_install_without_ownership() {
+    async fn public_listing_uses_active_signer_when_legacy_auth_is_empty() {
         let buyer = Keys::generate();
         let merchant = Keys::generate();
         let listing_id = "public-game";
@@ -2150,6 +2184,15 @@ mod install_game_tests {
             Arc::new(http.clone()),
         )
         .await;
+        let active_signer = {
+            let auth = state.auth.lock().await;
+            Arc::new(
+                auth.signer()
+                    .cloned()
+                    .expect("test buyer should have an active signer"),
+            ) as Arc<dyn NostrSigner>
+        };
+        state.auth.lock().await.disconnect();
         let fetcher = StaticFreshListingFetcher {
             event: listing_event_with_acquisition(
                 &merchant,
@@ -2161,17 +2204,23 @@ mod install_game_tests {
             calls: Arc::new(AtomicUsize::new(0)),
         };
 
-        install_game_with_fetcher(
+        install_game_with_fetcher_and_signer(
             app_listing(&merchant, listing_id),
             &state,
+            Some(active_signer),
             None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
             unique_test_path("install-game-public-data", "dir"),
             &fetcher,
         )
         .await
-        .expect("signed public policy allows install");
+        .expect("signed public policy allows install without ownership");
 
         assert_eq!(http.call_count(&download_url), 1);
+        assert!(http
+            .last_download_headers(&download_url)
+            .expect("download headers should be captured")
+            .iter()
+            .any(|(name, value)| name == "Authorization" && value.starts_with("Nostr ")));
     }
 
     #[tokio::test]

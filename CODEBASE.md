@@ -32,9 +32,9 @@ Arcadestr is a **decentralized game marketplace** built on the NOSTR protocol wi
 ### Main User-Facing Features
 
 1. **Browse Listings**: View published games with metadata (title, description, price, tags, images)
-2. **Publish Games**: Create NIP-99 kind-30402 listings, optionally provision ADP fulfillment, and upload one build to multiple ADP servers
-3. **Buy Games**: Generate Lightning invoices via LNURL-pay, pay through Nostr Wallet Connect or provide a preimage, and confirm purchases with an ADP server
-4. **Ownership & Install**: Track NIP-102 receipts, stream authenticated ADP downloads, verify SHA-256 hashes, quarantine corrupt artifacts, and list successful installs in the local Library
+2. **Publisher Studio**: Create or replacement-edit NIP-99 kind-30402 listings, preserve unmanaged metadata, provision ADP fulfillment, upload builds, and create/update/cancel claim campaigns
+3. **Acquire Games**: Buy paid games over Lightning, claim active claim-and-keep promotions, or use explicitly public/half-open timed access; zero price alone never grants access
+4. **Ownership, History & Install**: Track durable NIP-102 receipts and provisional NIP-103-style grants, show account-scoped purchase/claim history, stream authenticated ADP downloads, verify SHA-256 hashes, quarantine corrupt artifacts, and list device installs separately from ownership
 5. **Authentication**: NIP-07 browser extensions, NIP-46 remote signers, and encrypted local nsec accounts
 6. **Zap Payments**: NIP-57 Lightning zaps for game purchases
 7. **Marketplace Cache**: Persistent SQLite storage for offline browsing
@@ -42,6 +42,8 @@ Arcadestr is a **decentralized game marketplace** built on the NOSTR protocol wi
 9. **Achievements & Badges**: NIP-58 badge display on profiles, earned badge tracking, and achievement showcase
 10. **Platform Filtering**: Browse games filtered by host platform (OS/arch) with automatic platform detection
 11. **Marketplace Empty States**: Graceful UI when no listings are found, with distinct messages for browse vs store front
+12. **Account & Network Settings**: Switch/remove accounts, reconnect signers and relays, export local keys, and inspect non-sensitive diagnostics
+13. **Truthful Capability States**: Unsupported web, community, profile-editing, backup, appearance, and install-lifecycle actions are hidden or presented as unavailable rather than fabricated
 
 ### Desktop vs Web Target
 
@@ -68,7 +70,7 @@ Both targets share UI components from the `app` crate. The desktop target delega
 | **tokio** | 1.40 | Async runtime (native only) | `core/`, `desktop/` |
 | **serde** | 1.0 | Serialization for IPC and events | Throughout codebase |
 | **sqlx** | 0.8 | Async SQLite for persistent storage | `core/src/storage/` |
-| **rusqlite** | 0.32 | Synchronous SQLite (native) | `core/src/storage/db.rs` |
+| **rusqlite** | 0.32 | Synchronous SQLite for relay hints/cache and social graph data | `core/src/relay_cache.rs`, `core/src/relay_hints.rs`, `core/src/social_graph.rs` |
 | **keyring** | 3.6 | Direct OS keychain access for NIP-46/ncryptsec storage | `core/src/nip46/storage.rs` |
 | **tauri-plugin-keyring** | 0.1 | Present in the desktop manifest but not registered as a Tauri plugin | `desktop/Cargo.toml` |
 | **argon2** | 0.5 | Password hashing for encryption | `core/src/storage/encryption.rs` |
@@ -84,12 +86,13 @@ Both targets share UI components from the `app` crate. The desktop target delega
 | **qrcode** | 0.14 | QR code generation for NIP-46 | `app/Cargo.toml` |
 | **gloo-timers** | 0.3 | WASM timer utilities | `app/Cargo.toml` |
 | **send_wrapper** | 0.6 | Safe Leptos cleanup wrapper for async Tauri event listeners | `app/src/ui_v2/views/game_detail.rs` |
+| **url** | 2 | Structural HTTP(S) validation for listing media, ADP servers, and profile links | `app/src/campaign_management.rs`, `app/src/ui_v2/`, `core/src/adp_publish.rs` |
 | **tauri-plugin-dialog** | 2 | Native build archive selection | `desktop/src/adp_commands.rs` |
 | **tauri-plugin-mcp-bridge** | 0.12 | Debug-only desktop/WebView automation and IPC inspection | `desktop/src/main.rs` |
 | **aes-gcm** | 0.10 | AES-256-GCM encryption (WASM) | `app/Cargo.toml` |
 | **bitcoin** | 0.32 | Bitcoin types for payment proofs (dev) | `core/Cargo.toml` |
 | **lightning-types** | 0.1 | Lightning types for invoice validation (dev) | `core/Cargo.toml` |
-| **tailwindcss** | latest | CSS framework | `web/tailwind.config.js` |
+| **tailwindcss** | latest | Noir OKLCH design tokens, semantic utilities, gradients, shadows, and responsive CSS | `web/tailwind.config.js`, `web/style/tailwind.css` |
 | **trunk** | latest | WASM build tool and dev server | `web/Trunk.toml` |
 | **tracing** | 0.1 | Structured logging | Throughout codebase |
 | **thiserror** | 1.0 | Error type derivation | `core/` crate |
@@ -137,6 +140,13 @@ arcadestr/
 ├── AGENTS.md               # Agent-specific build/test commands
 ├── RUST_GUIDELINES.md      # Microsoft Rust Guidelines reference
 ├── NOSTRCONNECT_IMPLEMENTATION.md  # NIP-46 implementation notes
+├── ADP-01.md               # ADP protocol specification
+├── ADP-01-amendment-free-acquisitions.md # Explicit access/campaign amendment
+├── NIP-102.md              # Purchase receipt specification used by ownership
+├── NIP-103.md              # Experimental entitlement/campaign proposal notes
+├── Arcadestr_UI_Screen_Inventory.md # Product screen/capability inventory
+├── Arcadestr_UI_Screen_Inventory_Revised.md # Revised acquisition-aware inventory
+├── opencode.json           # Repository-local OpenCode MCP/watch configuration
 ├── COMMANDS.md             # Available CLI commands
 ├── test_nostrconnect.sh    # Test script for NIP-46
 ├── .vscode/                # VS Code workspace config and debug launcher
@@ -194,11 +204,20 @@ arcadestr/
 │   │   ├── lightning.rs      # NIP-57 zap payments
 │   │   ├── saved_users.rs    # Legacy saved users (JSON file)
 │   │   ├── purchases.rs      # NIP-102 purchase receipt persistence and verification
+│   │   ├── adp_protocol.rs   # Shared provisional campaign/grant kinds and tags
+│   │   ├── ownership.rs      # Unified receipt/grant ownership and durable acquisition history
+│   │   ├── campaign.rs       # Implementation-local provisional campaign chain validation
+│   │   ├── campaign_discovery.rs # Pointer plus authoritative campaign discovery
+│   │   ├── entitlements.rs   # Implementation-local provisional grant parsing and validation
+│   │   ├── entitlements_repository.rs # Validated grant persistence and history
+│   │   ├── authorization.rs  # Kind-30406 fulfillment authorization lifecycles
 │   │   ├── adp_client.rs     # ADP HTTP client: provision, upload, purchase, download
 │   │   ├── adp_discovery.rs  # Kind-30403 ADP server discovery and parsing
-│   │   ├── adp_publish.rs    # Kind-30402 listing and kind-30406 acceptance builders
+│   │   ├── adp_publish.rs    # Validated kind-30402 listing and kind-30406 authorization builders
 │   │   ├── adp_storage.rs    # Provisioning, download-token, and installed-game repositories
 │   │   ├── file_hash.rs      # Streaming SHA-256 file hashing
+│   │   ├── hash_validation.rs # Shared exact SHA-256 hex validation
+│   │   ├── replaceable_event.rs # Central timestamp/event-ID replacement ordering
 │   │   ├── http_client.rs    # Shared HTTP abstraction and atomic streamed downloads
 │   │   ├── nip98_client.rs   # NIP-98 HTTP authorization
 │   │   ├── nwc_client.rs     # Nostr Wallet Connect payment client
@@ -214,16 +233,22 @@ arcadestr/
 │   │   ├── 002_achievements.sql    # NIP-58 badge achievements tables
 │   │   ├── 003_purchases.sql       # NIP-102 purchase receipts
 │   │   ├── 004_adp_provisioning.sql # ADP delegated fulfillment records
-│   │   ├── 005_download_tokens.sql # Cached ADP download credentials
-│   │   └── 006_installed_games.sql # Verified local install registry
+│   │   ├── 005_download_tokens.sql # Buyer-scoped ADP download credentials
+│   │   ├── 006_installed_games.sql # Verified local install registry
+│   │   └── 007_entitlements.sql # Immutable validated entitlement-grant events
 │   └── tests/
 │       ├── integration.rs          # Core integration coverage
-│       └── integration_nip05.rs    # NIP-05 HTTP integration tests
+│       ├── integration_nip05.rs    # NIP-05 HTTP integration tests
+│       ├── adp_entitlement_protocol.rs # Campaign/grant adversarial protocol tests
+│       ├── authorization.rs        # Delegated fulfillment authority tests
+│       ├── campaign_discovery.rs   # Pointer/fallback campaign discovery tests
+│       └── entitlements_repository.rs # Validated grant persistence tests
 │
 ├── app/                    # LIBRARY: Leptos UI components (shared)
 │   ├── Cargo.toml          # Leptos, wasm-bindgen dependencies
 │   └── src/
 │       ├── lib.rs          # Main app component, auth context, styles
+│       ├── campaign_management.rs # Publisher campaign validation, requests, and pointer repair
 │       ├── models.rs       # GameListing, UserProfile, ZapRequest, Badge types + NIP-49/NIP-05 IPC types
 │       ├── tauri_bridge.rs # Tauri command wrappers (invoke_*), badge fetch functions
 │       ├── tauri_invoke.rs # Low-level Tauri IPC (wasm-bindgen)
@@ -237,7 +262,9 @@ arcadestr/
 │       │   ├── theme.rs    # Theme configuration
 │       │   ├── components/ # Reusable UI components
 │       │   │   ├── mod.rs  # Component exports
+│       │   │   ├── game_card.rs # Truthful access/campaign/action card presentation
 │       │   │   ├── nav_item.rs   # Navigation item component
+│       │   │   ├── page_header.rs # Shared page heading component
 │       │   │   └── topbar.rs     # Top navigation bar
 │       │   └── views/      # Page-level views
 │       │       ├── mod.rs  # View exports
@@ -249,7 +276,9 @@ arcadestr/
 │       │       ├── marketplace_loader.rs # Marketplace loading screen
 │       │       ├── profile.rs         # User profile view
 │       │       ├── publish.rs        # Game publishing view
-│       │       ├── social.rs         # Social feed view
+│       │       ├── purchases.rs      # Durable purchase and promotion-claim history
+│       │       ├── settings.rs       # Account, signer, network, export, diagnostics
+│       │       ├── social.rs         # Explicit community-unavailable view
 │       │       └── store_front.rs    # Main store front view
 │       ├── components/     # UI components
 │       │   ├── mod.rs      # Component exports
@@ -366,21 +395,18 @@ arcadestr/
 │  ┌─────────────────────────────────────────────────────────────────────┐     │
 │  │                     Browser (Leptos WASM)                          │     │
 │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │     │
-│  │  │  BrowseView  │  │  DetailView  │  │ ProfileView  │              │     │
-│  │  └──────────────┘  └──────────────┘  └──────────────┘              │     │
+│  │  │ Login/NIP-07 │  │ Store shell  │  │ Local nsec   │              │     │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘              │     │
 │  │         │                 │                 │                     │     │
-│  │         └─────────────────┴─────────────────┘                     │     │
-│  │                         │                                         │     │
-│  │              ┌──────────▼──────────┐                              │     │
-│  │              │   web_auth.rs       │                              │     │
-│  │              │   (NIP-07 bridge)   │                              │     │
-│  │              └──────────┬──────────┘                              │     │
-│  │                         │ window.nostr (browser extension)        │     │
-│  └─────────────────────────┼─────────────────────────────────────────┘     │
-│                           │                                                  │
-│  ┌────────────────────────▼──────────────────────────────────────────┐     │
-│  │              NOSTR Relays (direct WebSocket from browser)         │     │
-│  └───────────────────────────────────────────────────────────────────┘     │
+│  │  web_auth.rs              │          web_secure_store.rs          │     │
+│  │         │                 │                                       │     │
+│  │  window.nostr             │ Native bridge fallbacks return        │     │
+│  │  extension                │ explicit unavailable errors           │     │
+│  └───────────────────────────┼───────────────────────────────────────┘     │
+│                              │                                              │
+│  Marketplace streaming, install registry, purchase history, publishing,    │
+│  campaigns, badge relay fetches, and native network controls are not        │
+│  implemented directly in the standalone web target.                         │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -392,6 +418,8 @@ Let's trace through the current ADP-aware flow when a user clicks "Publish":
 ```rust
 // app/src/components/publish.rs
 let request = PublishAdpListingRequest {
+    expected_publisher_npub,
+    existing_event_id,
     d_tag,
     title,
     description,
@@ -403,8 +431,13 @@ let request = PublishAdpListingRequest {
     operator_url,
     servers,
     file_path,
+    existing_file_hash,
+    existing fulfillment authorization references,
     version,
+    acquisition, // Gated, Public, or half-open TimedAccess
     platforms,
+    campaigns,
+    nip94_event_id,
 };
 spawn_local(async move {
     let result = invoke_publish_adp_listing(request).await;
@@ -451,9 +484,9 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     state: tauri::State<'_, AppState>,
     signer_state: tauri::State<'_, Arc<Mutex<AppSignerState>>>,
 ) -> Result<PublishAdpListingResult, String> {
-    // Resolve the active local or NIP-46 signer, provision delegated
-    // fulfillment if requested, publish, confirm propagation, then upload.
-    // Each stage emits a publish-progress event.
+    // Verify the expected publisher and optimistic edit event ID, preserve
+    // unmanaged tags, prepare or reuse fulfillment authorization, recheck the
+    // event ID, publish, confirm propagation, then upload only a new file.
     /* ... */
 }
 ```
@@ -464,17 +497,18 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
 pub fn build_adp_listing_event_builder(
     input: &AdpListingInput,
 ) -> Result<EventBuilder, AdpPublishError> {
-    // Always emits kind 30402 identity/title/price/game tags.
-    // Fulfilled listings also carry server, file_hash, version,
-    // fulfillment_pubkey, and fulfillment_valid_from tags.
+    // Emits validated identity/title/price/game, acquisition, campaign,
+    // platform, NIP-94, and all-or-none fulfillment metadata while retaining
+    // caller-filtered preserved tags during replacement edits.
     /* ... */
 }
 ```
 
 **Step 6: NOSTR Network**
-- A delegated publisher first signs and broadcasts a kind-30406 provisioning acceptance event.
+- A delegated publisher validates the operator attestation, then signs and broadcasts a coordinate-scoped kind-30406 root or reuses a suitable immutable active root. Listings carry repeatable root-ID/key references without lifecycle timestamps.
 - The kind-30402 listing is broadcast and must become visible on at least two relays.
-- Buy-only mode stops after publication. Direct/delegated fulfillment uploads the selected archive sequentially to every selected ADP server using NIP-98 authentication.
+- New fulfilled listings upload the selected archive sequentially to every selected ADP server using NIP-98 authentication. An edit may reuse a validated existing hash and skip upload when no replacement file is selected.
+- Replacement edits use `expected_publisher_npub` plus two `existing_event_id` checks as optimistic concurrency control and preserve tags not managed by the form.
 - Publication and uploads are not transactional: a later upload failure does not roll back the relay event or earlier successful uploads.
 
 ### 4.3 Data Flow Diagram
@@ -573,17 +607,17 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 
 | Command | File | Parameters | Return Type | What it does |
 |---------|------|------------|-------------|--------------|
-| `connect_bunker` | `nip46_commands.rs` | `identifier: String`, `display_name: String` | `serde_json::Value` | Connects to NIP-46 bunker URI or NIP-05 identifier |
+| `connect_bunker` | `nip46_commands.rs` | `identifier: String`, `display_name: String` | `serde_json::Value` | Connects to NIP-46 and synchronizes the SDK signer into shared `AppState.auth` |
 | `login_with_nsec` | `nip46_commands.rs` | `nsec: String`, `name: Option<String>` | `serde_json::Value` | Encrypts, stores, and activates a local direct-signing account |
 | `start_qr_login` | `nip46_commands.rs` | None | `String` | Generates nostrconnect:// URI for QR login |
 | `check_qr_connection` | `nip46_commands.rs` | None | `Option<serde_json::Value>` | Polls for QR connection completion |
 | `list_saved_profiles` | `nip46_commands.rs` | None | `serde_json::Value` | Returns deduplicated NIP-46 profiles and encrypted local accounts |
 | `switch_profile` | `nip46_commands.rs` | `profile_id: String` | `serde_json::Value` | Activates a NIP-46 profile or local account |
 | `delete_profile` | `nip46_commands.rs` | `profile_id: String` | `()` | Removes a NIP-46 profile or local account |
-| `logout_nip46` | `nip46_commands.rs` | None | `()` | Clears NIP-46 state and shared local/remote authentication state |
+| `logout_nip46` | `nip46_commands.rs` | None | `()` | Clears NIP-46 state, persisted active-account flags, and shared authentication while retaining saved accounts |
 | `get_connection_status` | `nip46_commands.rs` | None | `serde_json::Value` | Returns connection state |
 | `has_accounts` | `nip46_commands.rs` | None | `bool` | Checks for either NIP-46 profiles or local accounts |
-| `load_active_account` | `nip46_commands.rs` | None | `serde_json::Value` | Restores the active NIP-46 or encrypted local account |
+| `load_active_account` | `nip46_commands.rs` | None | `serde_json::Value` | Restores local or NIP-46 state and synchronizes the signer/pubkey into shared auth |
 | `generate_nostrconnect_uri` | `main.rs` | `relay: String` | `String` | Creates nostrconnect:// URI |
 | `connect_nip46` | `main.rs` | `uri: String`, `relay: String` | `String` | Connects via NIP-46 URI |
 | `connect_with_key` | `main.rs` | `key: String` | `String` | Activates a direct-key signer without account persistence |
@@ -620,13 +654,21 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `get_cached_earned_badges` | `main.rs` | `profile_pubkey: String` | `Vec<EarnedBadgeSummary>` | Loads cached badge awards and definitions |
 | `get_cached_profile_badges` | `main.rs` | `profile_pubkey: String` | `Vec<ProfileBadgeEntry>` | Loads the cached profile badge display list |
 | `get_version_info` | `main.rs` | None | `VersionInfo` | Get app version info |
-| `fetch_marketplace_stream` | `main.rs` | `limit: usize`, `since_days: Option<u64>`, `until_secs: Option<u64>` | `()` | Stream marketplace listings via events with incremental cache refresh |
+| `fetch_marketplace_stream` | `main.rs` | `limit: usize`, `since_days: Option<u64>`, `until_secs: Option<u64>`, `request_id: String` | `()` | Streams cached and relay listings on request-scoped events |
 | `get_platform_info` | `main.rs` | None | `PlatformInfo` | Returns host OS/arch for platform-aware filtering |
-| `install_game` | `main.rs` | `listing: GameListing` | `()` | Uses the request's `price_sats` for the ownership gate, then refetches delivery metadata, authenticates, verifies/quarantines, and records the artifact |
+| `get_listing_ownership` | `main.rs` | `buyer_npub: String`, `publisher_npub: String`, `listing_id: String` | `bool` | Checks receipt-or-grant ownership for an explicit buyer and full listing coordinate |
+| `get_purchase_records` | `main.rs` | None | `Vec<DurableAcquisitionRecord>` | Returns account-scoped purchase and promotion-claim history for the active key |
+| `install_game` | `main.rs` | `listing: GameListing` | `()` | Refetches signed policy/delivery metadata, checks active-account ownership or current explicit access, then verifies/quarantines and records the artifact |
 | `get_installed_games` | `main.rs` | None | `Vec<InstalledGame>` | Lists verified device installs newest-first |
 | `ingest_receipt` | `main.rs` | `raw_event_json: String` | `()` | Parses and persists a NIP-102 kind-1020 purchase receipt |
 | `check_adp_server` | `adp_commands.rs` | `server_url: String` | `AdpServerInfo` | Fetches and decodes `/.well-known/adp` |
 | `discover_adp_servers` | `adp_commands.rs` | None | `Vec<AdpServerAnnouncement>` | Discovers and deduplicates kind-30403 server announcements from connected relays |
+| `resolve_adp_operator` | `adp_commands.rs` | `request: ResolveAdpOperatorRequest` | `Option<String>` | Resolves exactly one locally known operator for a publisher/key/scope |
+| `discover_campaigns` | `adp_commands.rs` | `request: DiscoverCampaignsRequest` | `Vec<DiscoveredCampaign>` | Resolves campaign chains, including tip/predecessor IDs and lifecycle state |
+| `discover_campaign_summaries` | `adp_commands.rs` | `request: DiscoverCampaignSummariesRequest` | `Vec<CampaignSummary>` | Batch-counts active/upcoming campaigns for a publisher's listings |
+| `publish_campaign` | `adp_commands.rs` | `request: PublishCampaignRequest` | `PublishCampaignResponse` | Publishes create/update/cancel events; listing-pointer failure is typed partial success |
+| `update_campaign_pointer` | `adp_commands.rs` | `request: UpdateCampaignPointerRequest` | `String` | Adds/removes one campaign pointer on the current replacement listing |
+| `claim_entitlement` | `adp_commands.rs` | `request: ClaimEntitlementRequest` | `ClaimEntitlementResponse` | Claims a campaign grant, validates/persists it, and caches a buyer-scoped token |
 | `select_build_file` | `adp_commands.rs` | None | `Option<String>` | Opens the native archive picker; cancellation is not an error |
 | `hash_build_file` | `adp_commands.rs` | `request: HashBuildFileRequest` | `String` | Computes the selected build's SHA-256 digest |
 | `publish_adp_listing` | `adp_commands.rs` | `request: PublishAdpListingRequest` | `PublishAdpListingResult` | Publishes buy-only/direct/delegated kind-30402 listings and uploads fulfilled builds |
@@ -673,7 +715,7 @@ pub fn setup_profile_event_handlers(profile_store: ProfileStore) {
 
 | Event | Emitted By | Payload | Purpose |
 |-------|-----------|---------|---------|
-| `auth_success` | `switch_profile` | `String` (npub) | Saved NIP-46 or local profile switch completed |
+| `auth_success` | `switch_profile`, `connect_with_key` contract | `String` (npub) | Saved-profile or direct-key activation completed |
 | `auth_logout` | `logout_nip46` | `()` | User logged out |
 | `profile_fetched` | `initialize_relay_gossip` | `UserProfile` | New profile available |
 | `profile_fetch_progress` | `initialize_relay_gossip` | `ProfileFetchProgress` | Batch fetch progress |
@@ -684,8 +726,8 @@ pub fn setup_profile_event_handlers(profile_store: ProfileStore) {
 | `bunker-heartbeat` | `ping_bunker` | `serde_json::Value` | Connection health check |
 | `qr-login-complete` | `check_qr_connection` | `String` (npub) | QR login finished |
 | `relay-connection` | `RelayManager` bridge | JSON `{ type, url, reason? }` | Unified connected/disconnected relay state update |
-| `marketplace-product` | `fetch_marketplace_stream` | `GameListing` | New listing from stream |
-| `marketplace-complete` | `fetch_marketplace_stream` | `()` | Streaming fetch complete |
+| `marketplace-product-{request_id}` | `fetch_marketplace_stream` | `GameListing` | Cached or relay listing isolated to one concurrent request |
+| `marketplace-complete-{request_id}` | `fetch_marketplace_stream` | `()` | Completion isolated to the matching request |
 | `publish-progress` | `publish_adp_listing` | `PublishProgressPayload` | Stage and per-server status for provisioning, propagation, and upload |
 | `download-progress` | `install_game` | `DownloadProgressPayload` | Cumulative downloaded bytes and optional content length |
 | `download-complete` | `install_game` | `DownloadCompletePayload` | Verified install path keyed by coordinate and listing ID |
@@ -793,67 +835,56 @@ App (app/src/lib.rs) - Chooses LoginV2View or UiV2Root from AuthContext
 │
 └── DebugOverlay (app/src/lib.rs) - Debug information overlay
 
-UiV2Root (app/src/ui_v2/shell.rs) - Active authenticated Stitch-based interface
-│   └── Keeps relay listener cleanup alive via `std::mem::forget`
+UiV2Root (app/src/ui_v2/shell.rs) - Active authenticated Noir interface
+│   ├── In-memory `RwSignal<UiV2View>` navigation; there is no URL router
+│   ├── DetailOrigin preserves Store/Library back navigation
+│   └── Desktop/mobile navigation covers Store, Browse, Library, Community,
+│       Achievements, Purchases, Publish, Profile, and Settings
 │
-├── TopBar (app/src/ui_v2/components/topbar.rs)
-│   └── NavItem components
+├── TopBar / NavItem / MobileNavItem (app/src/ui_v2/components/)
+│   └── Responsive navigation with focus-trapped mobile menu and Escape restoration
 │
-├── StoreFront (app/src/ui_v2/views/store_front.rs)
-│   ├── Featured game showcase
-│   ├── Category browsing
-│   └── Empty state when no listings found (after load completes)
+├── PageHeader / GameCard (app/src/ui_v2/components/)
+│   └── Shared heading and truthful access/campaign/compatibility/action presentation
 │
-├── BrowseGames (app/src/ui_v2/views/browse_games.rs)
-│   ├── Platform filter dropdown (defaults to All Platforms; detects host for opt-in filtering)
-│   ├── Platform-aware auto-fetch (loads more if active filter has < 50 results)
-│   ├── Install button with ownership check via purchase receipts
-│   ├── Error banner for install failures
-│   └── Empty state when no products match filters
+├── StoreFrontView (app/src/ui_v2/views/store_front.rs)
+│   └── Valid-cover hero, categories, promotion-aware cards, and truthful empty/error states
 │
-├── GameDetail (app/src/ui_v2/views/game_detail.rs)
-│   ├── Hero section with gradient overlay background and metadata
-│   ├── Buy panel with LNURL invoice, NWC payment, and manual-preimage confirmation
-│   ├── Token/NIP-98-backed Install action for purchased or free ADP listings
-│   ├── `download-complete` listener with async-registration-safe cleanup
-│   ├── Seller profile with ProfileRow (about, NIP-05, lud16, website)
-│   ├── Specs and gallery sections
-│   ├── BadgeEarnedModal integration (debug-only preview)
-│   └── First 4 tag chips displayed
+├── BrowseGamesView (app/src/ui_v2/views/browse_games.rs)
+│   ├── Search plus category, access, platform, and sort filters
+│   ├── Campaign/install enrichment, 50-item pagination, and bounded sparse auto-fetch
+│   └── Uses full-coordinate `GameCard` state rather than inferring access from price
 │
-├── Library (app/src/ui_v2/views/library.rs)
-│   ├── Loads the local verified install registry via `get_installed_games`
-│   └── Shows coordinate, version, server, hash, and artifact path
+├── GameDetailView (app/src/ui_v2/views/game_detail.rs)
+│   ├── Rechecks active-account durable ownership and campaign availability
+│   ├── Selects buy, claim, install, timed-state, incompatible, sign-in, or unavailable action
+│   ├── LNURL/NWC/manual-preimage purchase and campaign-claim flows
+│   └── Scoped download listener, seller profile, specs, gallery, and debug raw event data
 │
-├── Login (app/src/ui_v2/views/login.rs)
-│   ├── NIP-46 bunker and QR flows
-│   ├── Encrypted local nsec import
-│   └── NIP-07 on the web target
+├── LibraryView (app/src/ui_v2/views/library.rs)
+│   └── Reconciles device installs by stable coordinate without presenting install as ownership
 │
-├── Profile (app/src/ui_v2/views/profile.rs)
-│   ├── User profile management
-│   ├── BadgeShowcase (profile badges)
-│   └── Listings sourced from marketplace_loader (shared reactive state)
+├── PurchasesView (app/src/ui_v2/views/purchases.rs)
+│   └── Account-scoped purchase/claim history with active/refunded/revoked/unverified states
 │
-├── MarketplaceLoader (app/src/ui_v2/views/marketplace_loader.rs)
-│   ├── Batch-flusher debounce pattern (50ms) for progressive listing updates
-│   ├── Shared via `use_marketplace_listings` / `use_marketplace_listings_with_limit`
-│   └── Caches and deduplicates listings across views
+├── LoginV2View (app/src/ui_v2/views/login.rs)
+│   ├── Desktop bunker/QR/local-nsec and web NIP-07/local-nsec capabilities
+│   └── NIP-49 validates/decrypts only; active selection follows current identity, not stale flags
 │
-├── Publish (app/src/ui_v2/views/publish.rs)
-│   └── Routes to the full ADP-aware `components::PublishView`
-
-├── PublishView (app/src/components/publish.rs)
-│   ├── Buy-only, direct, and delegated fulfillment modes
-│   ├── Kind-30403 discovery plus manual/multi-server selection
-│   ├── Native build selection, SHA-256 hashing, and platform validation
-│   └── Reactive `publish-progress` stages and per-server upload status
+├── ProfileV2View / AchievementsView
+│   └── Read-only profile, truthful badge visibility, cached-first badge refresh, shared listings
 │
-├── Social (app/src/ui_v2/views/social.rs)
-│   └── Social feed integration
+├── PublishV2View (app/src/ui_v2/views/publish.rs)
+│   └── `PublishViewState` studio for games, new/edit publication, game management, and campaigns
 │
-└── Achievements (app/src/ui_v2/views/achievements.rs)
-    └── User's earned badges with definitions
+├── SettingsView (app/src/ui_v2/views/settings.rs)
+│   └── Account switching/removal, reconnect, NIP-49 export, relay policy, and diagnostics
+│
+├── SocialView (app/src/ui_v2/views/social.rs)
+│   └── Explicit unavailable state; no feed, composer, trends, recommendations, or zap activity
+│
+└── MarketplaceLoader (app/src/ui_v2/views/marketplace_loader.rs)
+    └── Cached-first request generations, pagination cursors, 50ms batches, and account isolation
 
 Badge Components:
 ├── BadgeShowcase (app/src/components/badge_showcase.rs)
@@ -876,6 +907,8 @@ Arcadestr uses Leptos's **fine-grained reactive signals**:
 | `Memo<T>` | Computed/cached derived value | `display_name: Memo<String>` |
 | `Resource<T>` | Async data loading | `listings: Resource<Vec<GameListing>>` |
 | `Action<T>` | Async mutations (form submissions) | `publish_action: Action<GameListing, Result<String, String>>` |
+| `StoredValue<T>` | Non-reactive retained state/handles | Account snapshots and event cleanup |
+| `Effect` | React to identity/request changes | Clear or refetch account-scoped data |
 
 #### Global State: AuthContext
 
@@ -892,6 +925,7 @@ pub struct AuthContext {
     pub has_secure_accounts: RwSignal<bool>,    // Has encrypted storage
     pub connection_status: RwSignal<String>,      // NIP-46 connection state
     pub connection_error: RwSignal<Option<String>>, // Connection error
+    flow_generation: RwSignal<u64>,                // Reject stale identity-flow responses
 }
 ```
 
@@ -927,22 +961,22 @@ let is_logged_in = Signal::derive(move || auth.npub.get().is_some());
 // app/src/store/profiles.rs
 #[derive(Clone)]
 pub struct ProfileStore {
-    inner: RwSignal<HashMap<String, UserProfile>>,
+    profiles: RwSignal<HashMap<String, UserProfile>>,
 }
 
 impl ProfileStore {
     pub fn put(&self, profile: UserProfile) {
-        self.inner.update(|map| {
+        self.profiles.update(|map| {
             map.insert(profile.npub.clone(), profile);
         });
     }
     
     pub fn get(&self, npub: &str) -> Option<UserProfile> {
-        self.inner.get().get(npub).cloned()
+        self.profiles.get().get(npub).cloned()
     }
     
     pub fn has(&self, npub: &str) -> bool {
-        self.inner.get().contains_key(npub)
+        self.profiles.get().contains_key(npub)
     }
 }
 
@@ -952,9 +986,9 @@ pub fn provide_profile_store() {
 }
 ```
 
-`MarketplaceStore` in `app/src/store/marketplace.rs` is the second context-provided cache. It stores listings by `listing.id` in an `RwSignal<HashMap<_, _>>` and tracks the last fetch as epoch milliseconds so the same state works in native and WASM builds. Its default refresh TTL is 300 seconds. Because the key is only the d-tag, two publishers using the same listing ID can collide; streaming insertion also keeps the first version received.
+`MarketplaceStore` in `app/src/store/marketplace.rs` is the second context-provided cache. It keys kind-30402 listings by full coordinate (`30402:<publisher>:<d>`) and tracks the last fetch as epoch milliseconds. `put_streaming()` applies centralized replaceable ordering: a newer timestamp wins, while equal timestamps choose the lexicographically lower event ID. The default refresh TTL is 300 seconds, and marketplace view state is cleared/reseeded when the active npub changes.
 
-ADP-heavy views keep operation state local rather than adding another global store. `PublishView` owns selected servers, build/hash, fulfillment mode, stage log, and upload statuses. `GameDetailView` owns invoice, NWC, confirmation, and install signals; its `download-complete` listener is unregistered on component cleanup, including the race where registration finishes after unmount.
+ADP-heavy views keep operation state local rather than adding another global store. Current flows primarily combine `RwSignal`, `Signal::derive`, `Effect::new`, `StoredValue`, `spawn_local`, explicit operation enums, and monotonic request generations. `AuthContext::begin_auth_flow()` and per-view expected-npub/generation checks discard late responses after account changes. `GameDetailView` still unregisters its `download-complete` listener safely even when registration finishes after unmount.
 
 ### 6.4 Async Operations in the UI
 
@@ -1037,16 +1071,14 @@ view! {
 
 ### 7.1 Entry Point
 
-`desktop/src/main.rs` is the Tauri application entry point:
+`desktop/src/main.rs` is the Tauri application entry point. The following is a condensed architecture sketch; the source contains explicit fallbacks and early returns for initialization failures:
 
 ```rust
 fn main() {
     // 1. Initialize logging and the application data directory.
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    tracing_subscriber::fmt::init();
     let keys_dir = dirs::data_local_dir()
-        .expect("local data directory unavailable")
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("arcadestr");
 
     // 2. Open the shared SQLite database and encrypted account store.
@@ -1123,10 +1155,19 @@ fn main() {
 | `core::social_graph` | Extended network | `SocialGraphDb` | `discover_network()` |
 | `core::achievements` | NIP-58 badges | `BadgeDefinition`, `BadgeAward`, `ProfileBadgeEntry` | `parse_badge_definition()`, `fetch_profile_badges()` |
 | `core::purchases` | NIP-102 purchase receipts | `PurchasesRepository`, `StoredReceipt` | `parse_and_validate_receipt()`, `upsert_receipt()`, `is_owned()` |
+| `core::ownership` | Unified durable ownership/history | `OwnershipService`, `DurableAcquisitionRecord` | `source_for()`, `durable_records_for()` |
+| `core::campaign` | Implementation-local provisional campaign chains | `CampaignEvent`, `CampaignChain` | Parse, resolve, and classify campaign lifecycles |
+| `core::campaign_discovery` | Pointer plus authoritative campaign lookup | `CampaignDiscoveryService` | Resolve hinted roots and publisher `#a` fallback |
+| `core::entitlements` | Implementation-local provisional grant chains | Grant event/chain types | Validate immutable buyer/game/source chains |
+| `core::entitlements_repository` | Validated grant persistence | `EntitlementsRepository`, `EntitlementHistoryRecord` | `ingest_event()`, `history_for_buyer()` |
+| `core::authorization` | Kind-30406 fulfillment authority | Authorization lifecycle types | Resolve active/revoked delegated authority |
+| `core::adp_protocol` | Shared experimental protocol constants | Kinds 1030/1031 and tag names | Central vocabulary for campaigns and grants |
 | `core::adp_client` | ADP HTTP protocol | `AdpClient`, `DownloadAuth`, `AdpClientError` | `well_known()`, `provision()`, `upload()`, `purchase_confirm()`, `download()` |
 | `core::adp_discovery` | ADP server discovery | `AdpServerAnnouncement` | `discover_adp_servers()`, `parse_adp_server_announcements()` |
-| `core::adp_publish` | ADP NOSTR event construction | `AdpListingInput`, `AdpPublishError` | `build_adp_listing_event_builder()`, `build_provisioning_acceptance_event_builder()` |
-| `core::adp_storage` | ADP persistence | `AdpProvisioningRepository`, `DownloadTokensRepository`, `InstalledGamesRepository` | `active_for_scope()`, `valid_token()`, `record()`, `list()` |
+| `core::adp_publish` | Validated ADP listing/authorization construction | `AdpListingInput`, `AdpPublishError` | `build_adp_listing_event_builder()`, `build_fulfillment_authorization_event_builder()` |
+| `core::adp_storage` | ADP persistence | `AdpProvisioningRepository`, `DownloadTokensRepository`, `InstalledGamesRepository` | `for_fulfillment_scope()`, buyer-scoped `valid_token()`, `record()`, `list()` |
+| `core::hash_validation` | Exact delivery-hash checks | — | `is_sha256_hex()` |
+| `core::replaceable_event` | Shared replacement ordering | — | `is_replaceable_event_newer()` |
 | `core::http_client` | Testable HTTP and atomic downloads | `HttpClient`, `ReqwestHttpClient`, `HttpDownloadOutcome` | `get()`, `post_json()`, `download_to_path()` |
 | `core::nip98_client` | Signed HTTP requests | NIP-98 event/header helpers | `build_nip98_auth_header()` |
 | `core::nwc_client` | Nostr Wallet Connect | Wallet connection/payment types | Connect and pay invoice operations |
@@ -1202,7 +1243,9 @@ pub struct GameListing {
     // Platform and delivery metadata
     pub platforms: Vec<String>,        // Platform compatibility tags (e.g. "linux-x86_64")
     pub nip94_event_id: Option<String>, // NIP-94 file metadata event id for delivery
-    pub is_owned: bool,                // True if user holds a valid purchase receipt
+    pub acquisition: AcquisitionPolicy, // Gated, Public, or TimedAccess
+    pub campaigns: Vec<CampaignPointer>, // Advisory provisional campaign root pointers
+    pub is_owned: bool,                // Valid receipt or active entitlement grant
     
     // Debug (debug builds only)
     #[cfg(debug_assertions)]
@@ -1218,6 +1261,8 @@ pub enum ListingSource {
     Legacy,         // Kind 30078 - Legacy Arcadestr format
 }
 ```
+
+`AcquisitionPolicy::{Gated, Public, TimedAccess { starts_at, ends_at }}` describes current signed-listing access; timed windows are half-open. It is separate from `DurableAcquisitionRecord`, which normalizes account history across `Purchase` and `PromotionClaim` records with `Active`, `Disputed`, `Refunded`, `Revoked`, or `Unverified` status. Public/timed access never creates one of these durable records.
 
 #### UserProfile
 ```rust
@@ -1390,11 +1435,11 @@ pub enum DownloadAuth<'a> {
 }
 
 // core/src/adp_storage.rs
-pub struct DownloadToken { /* coordinate, server, token, expiry */ }
-pub struct AdpProvisioning { /* developer/operator/scope and acceptance IDs */ }
+pub struct DownloadToken { /* buyer, coordinate, server, token, expiry */ }
+pub struct AdpProvisioning { /* developer/operator/scope and authorization IDs */ }
 ```
 
-`InstalledGamesRepository` replaces records by game coordinate and lists them newest-first. `DownloadTokensRepository::valid_token()` accepts only `expires_at > now`; expired records are not automatically removed.
+`InstalledGamesRepository` replaces records by game coordinate and lists them newest-first. `DownloadTokensRepository::valid_token()` requires buyer pubkey, coordinate, and server and accepts only `expires_at > now`; expired records are not automatically removed. Runtime migration deliberately drops legacy unscoped bearer tokens rather than assigning them to an account.
 
 ### 7.4 State Management in Tauri
 
@@ -1480,7 +1525,7 @@ pub trait NostrSigner: Send + Sync {
 // - Nip07Signer: Browser extension (web target)
 ```
 
-This allows the same `AuthState` to work with local and remote signers. `login_with_nsec` persists the encrypted account through `AccountManager`, clears active NIP-46 retry/client state, decrypts the key into a zeroizing value, and activates the local signer. ADP commands resolve whichever signer is active: the SDK-backed NIP-46 client is preferred, with `AuthState` as the local/legacy fallback.
+This allows the same `AuthState` to work with local and remote signers. `SdkSignerAdapter` and `ActiveSigner::Sdk` synchronize restored NIP-46 clients into shared command state. `login_with_nsec` persists the encrypted account through `AccountManager`, clears active NIP-46 retry/client state, decrypts the key into a zeroizing value, and activates the local signer. Logout clears the active database flag without deleting saved accounts, then disconnects shared auth.
 
 ### 8.2 Feature-Gated Compilation
 
@@ -1527,27 +1572,37 @@ To avoid overwhelming relays, profile fetching is batched:
 ```rust
 // core/src/profile_fetcher.rs
 pub struct ProfileFetcher {
-    queue: Arc<Mutex<VecDeque<String>>>,
-    cache: Arc<LruProfileCache>,
+    pending: Arc<Mutex<VecDeque<String>>>,
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    failed_attempts: Arc<Mutex<HashMap<String, u32>>>,
+    cache: Arc<dyn ProfileCache>,
+    persistent_cache: Option<Arc<UserCache>>,
+    max_attempts: u32,
+    batch_size: usize,
+    nip05_validator: Option<Arc<Mutex<Nip05Validator>>>,
 }
 
 impl ProfileFetcher {
     pub fn enqueue_many(&self, pubkeys: Vec<String>) {
-        let mut queue = self.queue.lock().unwrap();
+        let mut pending = self.pending.lock().unwrap();
         for pubkey in pubkeys {
-            if !self.cache.has(&pubkey) && !queue.contains(&pubkey) {
-                queue.push_back(pubkey);
+            if !self.cache.contains(&pubkey) && !pending.contains(&pubkey) {
+                pending.push_back(pubkey);
             }
         }
     }
     
     pub async fn fetch_batch(&self, nostr: &NostrClient) -> (Vec<UserProfile>, usize) {
-        const BATCH_SIZE: usize = 10;
         let batch: Vec<String> = {
-            let mut queue = self.queue.lock().unwrap();
-            queue.drain(..BATCH_SIZE.min(queue.len())).collect()
+            let mut pending = self.pending.lock().unwrap();
+            let mut in_flight = self.in_flight.lock().unwrap();
+            let count = pending.len().min(self.batch_size);
+            let batch: Vec<_> = pending.drain(..count).collect();
+            in_flight.extend(batch.iter().cloned());
+            batch
         };
-        // Fetch batch...
+        // Fetches indexers/relays, updates memory + optional SQLite cache,
+        // tracks failures, and removes the batch from in_flight.
     }
 }
 ```
@@ -1587,29 +1642,22 @@ pub fn select_relays(
 
 ### 8.5 NIP-46 Fast Connection Flow
 
-The NIP-46 implementation uses **deferred connection** for speed:
+Despite this section's historical heading, the active bunker-login path is now a **blocking handshake**. `connect_bunker` keeps the UI in "Connecting..." until signer approval, then persists the profile, updates `AppSignerState`, and synchronizes the SDK signer/pubkey into `AppState.auth`:
 
 ```rust
-// core/src/nip46/mod.rs
-pub async fn init_signer_session_fast(
-    bunker_uri: NostrConnectURI,
-    user_pubkey: PublicKey,
-) -> Result<(ProfileMetadata, NostrConnect), Nip46Error> {
-    // 1. Create client immediately (no blocking handshake)
-    let client = NostrConnect::new(client_keys, bunker_uri, None, None)?;
-    
-    // 2. Return immediately with "connecting" state
-    // 3. Background task completes handshake
-    tokio::spawn(async move {
-        match client.signer().await {
-            Ok(signer) => { /* transition to connected */ }
-            Err(e) => { /* transition to failed */ }
-        }
-    });
-    
-    Ok((profile, client))
+// desktop/src/nip46_commands.rs
+pub async fn connect_bunker(/* identifier, state, app handles */) -> Result<Value, String> {
+    let (mut profile, client) = init_signer_session(&bunker_uri.to_string(), auth_handler)
+        .await?; // waits for signer approval
+    save_profile_to_keyring(&profile)?;
+    // Store the connected client without retaining the mutex across signer awaits.
+    let signer = client.signer().await?;
+    activate_remote_account(signer, &app_state).await?;
+    Ok(/* connected profile JSON */)
 }
 ```
+
+`init_signer_session_fast` and `LazyNip46Signer` still exist as library surface, but the desktop `connect_bunker` command does not use that deferred path. QR polling remains a separate flow.
 
 ### 8.6 Relay Events (Real-time Connection Status)
 
@@ -1646,7 +1694,7 @@ where
 
 ### 8.7 Marketplace Cache with Upsert
 
-Listings are cached in SQLite with change detection. Schema includes `platforms_json` (JSON array of platform tags) and `nip94_event_id` (NIP-94 file metadata reference):
+Listings are cached in SQLite with change detection. Schema includes `platforms_json`, `nip94_event_id`, `specs_json`, and source event IDs. Upsert uses the same replaceable-event invariant as relay streaming: newer timestamp first, then lexicographically lower event ID at equal timestamps:
 
 ```rust
 // core/src/marketplace_cache.rs
@@ -1671,12 +1719,13 @@ impl MarketplaceCache {
         listing: &GameListing,
         source_event_id: Option<&str>,
     ) -> Result<UpsertOutcome, sqlx::Error> {
-        // Uses INSERT ... ON CONFLICT with field-by-field comparison
-        // Only updates if something actually changed
-        // Compares platforms_json and nip94_event_id for change detection
+        // Uses INSERT ... ON CONFLICT with replacement ordering.
+        // Stale candidates leave both listing data and updated_at unchanged.
     }
 }
 ```
+
+Current cache reconstruction is intentionally fail-closed but incomplete: `load_listings()` restores `AcquisitionPolicy::Gated` and an empty campaign-pointer list. Public/timed access and campaign pointers therefore do not survive an offline cache round trip, although delivery specs and source event identity do.
 
 ### 8.8 Streaming Marketplace Fetch
 
@@ -1695,8 +1744,8 @@ where
     F: FnMut(Nip99Listing) + Send + 'static,
 {
     // Fetches from multiple relays concurrently
-    // Calls callback for each unique product
-    // Deduplicates by event ID
+    // Calls callback for the current event at each full listing coordinate
+    // Applies centralized timestamp/event-ID replacement ordering
     // Filters relay queries to only ['game'] t-tags
 }
 ```
@@ -1712,21 +1761,23 @@ async fn fetch_marketplace_stream(
     limit: usize,
     since_days: Option<u64>,
     until_secs: Option<u64>,
+    request_id: String,
 ) -> Result<(), String> {
     // 1. Load cached listings first (fast initial render)
     // 2. Compute refresh cursor from latest_cached_created_at with 24h overlap
     // 3. Stream from relays using fetch_nip99_listings_streaming_since
     // 4. Enrich each listing with ownership data via async emit tasks
     // 5. Wait for all ownership lookups before marking complete
-    // 6. Emit "marketplace-complete" when done
+    // 6. Emit "marketplace-complete-{request_id}" when done
 }
 ```
 
 **Key improvements over batch fetch:**
 
 - **Cursor-based refresh**: Uses `marketplace_cache.latest_created_at()` to compute `since_secs`, fetching only events newer than the latest cached item with a 24-hour overlap (`MARKETPLACE_REFRESH_OVERLAP_SECS = 86400`) to catch updates to existing listings.
-- **Ownership enrichment**: Each listing is checked against the `PurchasesRepository` before being emitted, setting `is_owned=true` for listings the authenticated user has purchased.
+- **Ownership enrichment**: Each listing is checked through `OwnershipService`, setting `is_owned=true` for a valid receipt or active grant belonging to the current account.
 - **Async emit tasks**: Ownership lookups are spawned as background tasks so they don't block the streaming pipeline. All tasks are awaited before completion.
+- **Request isolation**: Product and completion channels include the frontend-generated request ID, preventing overlapping account refreshes from consuming each other's events.
 - **Platform tag filtering**: Relay queries filter to `['game']` t-tags, reducing noise from non-game NIP-99 listings.
 
 ### 8.9 NIP-58 Badge System
@@ -1837,6 +1888,9 @@ cargo test -p arcadestr-core --features native --lib -- --test-threads=1
 
 # Desktop command, ADP install, and local-account tests
 cargo test -p arcadestr-desktop
+
+# Leptos state, presentation, and navigation tests
+cargo test -p arcadestr-app
 ```
 
 **Linting & Formatting**:
@@ -1895,7 +1949,7 @@ dist = "dist"
 public_url = "/"
 ```
 
-The desktop manifest additionally carries `tauri-plugin-dialog = "2"` for build selection, `tauri-plugin-mcp-bridge = "0.12"` for debug automation, and `sha2 = "0.10"` for deterministic artifact directories. The app manifest uses `send_wrapper = "0.6"` to safely retain the non-`Send` event cleanup state expected by Leptos. `desktop/capabilities/default.json` grants the corresponding dialog and MCP bridge capabilities; only the MCP plugin registration is compile-time debug-gated.
+The desktop manifest additionally carries `tauri-plugin-dialog = "2"` for build selection, `tauri-plugin-mcp-bridge = "0.12"` for debug automation, and `sha2 = "0.10"` for deterministic artifact directories. The app manifest uses unconditional `nostr = "0.44"`, `url = "2"`, `HtmlDialogElement`, and `send_wrapper = "0.6"`; its `web` feature is now an empty target marker rather than a dependency-enabling feature. `desktop/capabilities/default.json` grants the corresponding dialog and MCP bridge capabilities; only the MCP plugin registration is compile-time debug-gated. `web/tailwind.config.js` scans `../app/src/**/*.rs` and maps semantic classes to the Noir OKLCH variables defined in `web/style/tailwind.css`, including reduced-motion rules, glass/text-gradient utilities, ambient/glow shadows, and primary/hero gradients. Root `opencode.json` enables Serena and excludes generated/build/database artifacts from watching.
 
 ### 9.3 Feature Flags
 
@@ -1905,7 +1959,7 @@ The desktop manifest additionally carries `tauri-plugin-dialog = "2"` for build 
 | `wasm` | `core` | Enables WASM stubs |
 | `csr` | `app` | Client-side rendering mode |
 | `hydrate` | `app` | Hydration mode (available but unused) |
-| `web` | `app` | Web target with NIP-07 support |
+| `web` | `app` | Empty target marker selecting standalone-browser code paths; NIP-07 support is conditionally compiled in the app |
 
 ---
 
@@ -1974,7 +2028,7 @@ impl FavoritesRepository {
 
 Add migration:
 ```sql
--- core/migrations/007_favorites.sql
+-- core/migrations/008_favorites.sql
 CREATE TABLE favorites (
     id TEXT PRIMARY KEY,
     user_npub TEXT NOT NULL,
@@ -1996,11 +2050,13 @@ async fn add_favorite(
     publisher_npub: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    let auth = state.auth.lock().await;
-    let user_npub = auth.public_key()
-        .ok_or("Not authenticated")?
-        .to_bech32()
-        .map_err(|e| e.to_string())?;
+    let user_npub = {
+        let auth = state.auth.lock().await;
+        auth.public_key()
+            .ok_or("Not authenticated")?
+            .to_bech32()
+            .map_err(|e| e.to_string())?
+    }; // Never retain the guard across repository awaits.
     
     let favorite = Favorite {
         id: ulid::Ulid::new().to_string(),
@@ -2020,11 +2076,13 @@ async fn add_favorite(
 async fn list_favorites(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<Favorite>, String> {
-    let auth = state.auth.lock().await;
-    let user_npub = auth.public_key()
-        .ok_or("Not authenticated")?
-        .to_bech32()
-        .map_err(|e| e.to_string())?;
+    let user_npub = {
+        let auth = state.auth.lock().await;
+        auth.public_key()
+            .ok_or("Not authenticated")?
+            .to_bech32()
+            .map_err(|e| e.to_string())?
+    };
     
     let repo = FavoritesRepository::new(state.user_cache.pool().clone());
     repo.list_for_user(&user_npub).await.map_err(|e| e.to_string())
@@ -2042,7 +2100,7 @@ tauri::Builder::default()
 ### Step 3: Add Frontend Bridge (app)
 
 ```rust
-// app/src/lib.rs
+// app/src/tauri_bridge.rs
 #[derive(Serialize)]
 struct AddFavoriteArgs {
     listing_id: String,
@@ -2067,14 +2125,16 @@ pub async fn invoke_add_favorite(
 #[cfg(any(target_arch = "wasm32", not(feature = "web")))]
 pub async fn invoke_list_favorites() -> Result<Vec<Favorite>, String> {
     use crate::tauri_invoke::invoke;
-    invoke("list_favorites", serde_json::json!({})).await
+invoke("list_favorites", serde_json::json!({})).await
 }
 ```
+
+Keep typed request/response models and target-specific fallbacks in `tauri_bridge.rs`. For account-scoped operations, derive identity in the backend where possible; in the UI, capture the expected npub and request generation and ignore stale responses after account switches.
 
 ### Step 4: Create UI Component (app)
 
 ```rust
-// app/src/components/favorites.rs
+// app/src/ui_v2/views/favorites.rs
 use leptos::prelude::*;
 use crate::{invoke_list_favorites, invoke_add_favorite, GameListing, invoke_fetch_listing_by_id};
 
@@ -2128,26 +2188,19 @@ fn FavoriteCard(favorite: Favorite) -> impl IntoView {
 }
 ```
 
+Export the view from `app/src/ui_v2/views/mod.rs`. If favorites are rendered as marketplace cards, construct `GameCardPresentation` rather than inventing a second set of access, campaign, ownership, and compatibility rules.
+
 ### Step 5: Add to Main App
 
 ```rust
-// app/src/lib.rs
-pub mod components;
-// ...
-pub use components::{FavoritesView, /* ... */};
-
-// In App component view
+// app/src/ui_v2/shell.rs
+// Add UiV2View::Favorites, its title, desktop/mobile NavItems, and render arm.
 view! {
-    <div class="arcadestr-app">
-        <nav>/* ... */</nav>
-        <main>
-            {move || match current_view.get() {
-                View::Browse => view! { <BrowseView /> },
-                View::Favorites => view! { <FavoritesView /> },  // NEW
-                // ...
-            }}
-        </main>
-    </div>
+    {move || match current_view.get() {
+        UiV2View::Browse(request) => view! { <BrowseGamesView request /> }.into_any(),
+        UiV2View::Favorites => view! { <FavoritesView /> }.into_any(),
+        // ...
+    }}
 }
 ```
 
@@ -2156,6 +2209,10 @@ view! {
 ```bash
 # Run core tests
 cargo test -p arcadestr-core --features native favorites
+
+# Run app and desktop contract tests
+cargo test -p arcadestr-app favorites
+cargo test -p arcadestr-desktop favorites
 
 # Run desktop
 cargo tauri dev
@@ -2250,10 +2307,12 @@ tauri::Builder::default()
 let signal = RwSignal::new(0);
 
 // Log when signal changes
-create_effect(move |_| {
+Effect::new(move |_| {
     web_sys::console::log_1(&format!("Signal value: {}", signal.get()).into());
 });
 ```
+
+Account-sensitive effects should capture the expected npub and a flow/request generation before spawning work, then discard a response when either no longer matches. Use `.get_untracked()` when reading `ProfileStore` or `MarketplaceStore` specifically to avoid creating a reactive dependency. Debug standalone-web WASM can bypass authentication for storefront inspection with local-storage key `arcadestr.debug.storefront=1`; native-only operations remain unavailable.
 
 **Common Leptos Pitfalls**:
 
@@ -2294,6 +2353,8 @@ console.log(window.__TAURI__.core);  // Should show invoke function
 console.log(window.__TAURI__.event);  // Should show listen/emit functions
 ```
 
+Marketplace streams no longer use static event names. Inspect the `requestId` argument and matching `marketplace-product-{request_id}` / `marketplace-complete-{request_id}` listeners when concurrent refreshes appear stalled.
+
 ### 11.4 Known Gotchas
 
 1. **Mutex across await points**: Never hold a MutexGuard across an await
@@ -2327,17 +2388,25 @@ console.log(window.__TAURI__.event);  // Should show listen/emit functions
    cargo check -p arcadestr-app --target wasm32-unknown-unknown --features web
    ```
 
-7. **ADP download authentication**: Installation uses a non-expired cached token first and otherwise signs a NIP-98 GET. A rejected cached token is not deleted and retried automatically. NIP-98 signs the decoded coordinate URL while the actual request percent-encodes the coordinate.
+7. **ADP download authentication**: Installation uses a non-expired token scoped by buyer, coordinate, and server, then otherwise signs a NIP-98 GET. A rejected cached token is not deleted and retried automatically. NIP-98 signs the decoded coordinate URL while the actual request percent-encodes the coordinate.
 
-8. **Install trust boundary and failover**: `install_game` decides whether ownership is required from caller-supplied `listing.price_sats` before refetching. The fresh kind-30402 event supplies only server/hash/version metadata, so a caller that submits `price_sats = 0` bypasses the local receipt check even if the relay listing is paid. It also uses only the first `server` tag; downloads do not resume or fail over. All installs still require an authenticated signer.
+8. **Install trust boundary and failover**: `install_game` refetches the signed kind-30402 policy and delivery metadata, then requires active-account durable ownership or currently allowed public/timed access. It still uses only the first `server` tag; downloads do not resume or fail over, and all installs require an authenticated signer.
 
 9. **Artifact scope**: A successful install stores a verified `artifact.bin` and an `installed_games` row. Extraction, launch, uninstall, repair, and reveal-in-file-manager are not implemented. A hash mismatch preserves the artifact under a unique `.corrupt*` name and does not create an install row.
 
-10. **Publish partial success**: Relay publication and multi-server uploads are not transactional. The listing can already be visible, and earlier servers can already contain the build, when a later upload causes the command to return an error. Upload currently reads the selected file into memory.
+10. **Publish/edit partial success**: Relay publication and multi-server uploads are not transactional. The listing can already be visible, and earlier servers can already contain the build, when a later upload fails. Campaign publication can also succeed while `pointer_update_error` reports a failed listing-pointer update. Existing-listing edits may intentionally reuse a valid hash and emit no upload progress.
 
 11. **Local-key threat model**: Desktop local nsecs are AES-256-GCM encrypted, but the encryption master key is a mode-`0600` file in the same app data area rather than an OS-keyring secret. Web encrypted nsecs keep ciphertext and encryption key in browser storage, which does not protect against malicious JavaScript or full profile compromise.
 
 12. **Debug MCP capability**: `tauri-plugin-mcp-bridge` registration is debug-only, but `mcp-bridge:default` remains in the default capability file. Keep release configuration under review because that permission set includes WebView script execution and backend command access.
+
+13. **Offline policy cache is fail-closed**: `MarketplaceCache::load_listings()` currently reconstructs cached listings as gated with no campaign pointers. Public/timed access and campaign links return only after relay refresh.
+
+14. **Provisional campaign/grant kinds**: Kinds `1030` and `1031` are experimental allocations, not finalized interoperable NIP numbers. Grant parsing validates signed tags and context but does not inspect encrypted event content.
+
+15. **Preserved edit tags are caller-filtered**: The core builder appends `preserved_tags` verbatim. Callers must remove form-managed tags or they can produce duplicates.
+
+16. **Remote-auth synchronization**: Connect, switch, and restore paths must update both NIP-46 client state and `AppState.auth`. Logout can fail while clearing the persisted active flag before shared auth is disconnected or `auth_logout` is emitted.
 
 ---
 
@@ -2409,13 +2478,24 @@ console.log(window.__TAURI__.event);  // Should show listen/emit functions
 | **NIP-94** | File metadata events (kind 1063) referenced via `["nip94", "<event-id>"]` tag for verifiable delivery metadata |
 | **ADP** | Arcadestr Distribution Protocol: HTTP APIs plus NOSTR metadata for provisioning, upload, purchase confirmation, and authenticated game delivery |
 | **ADP server announcement** | Kind-30403 event advertising an HTTP(S) ADP endpoint, optional name/contact, and supported protocol version |
-| **Provisioning acceptance** | Kind-30406 event by which a developer accepts a delegated ADP fulfillment key |
+| **Fulfillment authorization** | Coordinate-scoped kind-30406 lifecycle by which a developer authorizes a delegated fulfillment key to issue delivery credentials |
 | **Fulfillment mode** | Publishing choice: `none` (buy-only), `direct` (developer signer), or `delegate` (provisioned operator signer) |
-| **Download token** | Expiring ADP credential cached by game coordinate and server after purchase confirmation |
+| **Download token** | Expiring ADP credential scoped by buyer pubkey, game coordinate, and server after purchase confirmation or campaign claim |
 | **NWC** | Nostr Wallet Connect, used to connect a wallet and pay a Bolt11 invoice without exposing its connection secret to the UI response |
 | **Install registry** | SQLite `installed_games` records for artifacts that passed SHA-256 verification |
 | **Artifact quarantine** | Preservation of a hash-mismatched download as `.corrupt`, `.corrupt.1`, and so on, without recording an install |
 | **Local account** | Direct-signing account whose nsec is encrypted by Arcadestr rather than held by a NIP-46 signer |
+| **Acquisition policy** | Signed kind-30402 current-access policy: `Gated`, `Public`, or half-open `TimedAccess`; zero price has no authorization meaning |
+| **Campaign** | Publisher-controlled append-only provisional claim policy; cancellation blocks later claims but preserves prior grants |
+| **Campaign pointer** | Advisory listing tag referencing an immutable campaign root; authoritative discovery still falls back to publisher/coordinate queries |
+| **Entitlement grant** | Buyer-specific append-only provisional durable credential issued by a publisher or properly authorized fulfillment key |
+| **Durable acquisition record** | Account-scoped normalized purchase or promotion-claim history with active, disputed, refunded, revoked, or unverified status |
+| **Device registry** | Local `installed_games` artifact inventory shared on a device; an install row is not proof of durable ownership |
+| **Replaceable ordering** | Central invariant: later `created_at` wins; equal timestamps choose the lexicographically lower event ID |
+| **Request generation** | Monotonic UI token paired with expected identity to reject stale asynchronous responses |
+| **Request-scoped event** | Marketplace Tauri event named `marketplace-product-{id}` or `marketplace-complete-{id}` to isolate concurrent streams |
+| **Publisher studio** | `PublishViewState` workflow for listing creation/editing, game management, and campaign lifecycle operations |
+| **Noir theme** | OKLCH token-based visual system implemented by Tailwind configuration, global CSS, and `UI_V2_STYLES` |
 
 ### Platform tag examples
 
@@ -2438,7 +2518,7 @@ Before diving into the codebase, ensure you deeply understand these concepts:
 The same Leptos UI runs in both Tauri (desktop) and browser (web), but native ADP file selection, downloads, and install persistence are desktop-only. Authentication can be remote (NIP-46 desktop, NIP-07 web) or a locally encrypted nsec. The `app` crate uses conditional compilation (`#[cfg(target_arch = "wasm32")]`) for the bridge fallbacks.
 
 ### 2. **NIP-46 Fast Connection Flow**
-Authentication is asynchronous and deferred. The `connect_bunker` command returns immediately with a "connecting" state, while a background task completes the WebSocket handshake. The UI must poll `get_connection_status` to track progress.
+The active `connect_bunker` command waits for signer approval and returns only after the profile is saved and both NIP-46 and shared `AuthState` are synchronized. The deferred `init_signer_session_fast` helper remains available but is not used by this command; QR login still uses polling.
 
 ### 3. **Relay Gossip (NIP-65)**
 The app doesn't just connect to hardcoded relays. It fetches each user's relay list, builds a coverage map, and uses greedy set cover to select optimal relays. This is the key to efficient decentralized communication.
@@ -2447,7 +2527,7 @@ The app doesn't just connect to hardcoded relays. It fetches each user's relay l
 The `core` crate compiles differently for native (desktop) and WASM (web) targets. Native gets tokio, sqlx, and full NOSTR functionality. WASM gets stubs and relies on browser APIs. Understanding `#[cfg(feature = "native")]` guards is essential.
 
 ### 5. **Tauri IPC Pattern**
-Frontend wrappers in `tauri_bridge.rs` call the low-level `tauri_invoke.rs` bridge, which invokes `window.__TAURI__.core.invoke()`. Commands are registered in `main.rs`; ADP command implementations live primarily in `desktop/src/adp_commands.rs`, while download orchestration remains in `main.rs`. Backend progress and completion return through Tauri events.
+Frontend wrappers in `tauri_bridge.rs` call the low-level `tauri_invoke.rs` bridge, which invokes `window.__TAURI__.core.invoke()`. Commands are registered in `main.rs`; ADP command implementations live primarily in `desktop/src/adp_commands.rs`, while download orchestration remains in `main.rs`. Overlapping marketplace streams use request-scoped event names; other backend progress and completion return through fixed Tauri events.
 
 ---
 
@@ -2456,7 +2536,7 @@ Frontend wrappers in `tauri_bridge.rs` call the low-level `tauri_invoke.rs` brid
 **ADP marketplace completion and Gate 5 delivery:**
 - `core/src/adp_discovery.rs` discovers kind-30403 server announcements; the publish UI supports buy-only, direct, and delegated fulfillment with native file selection, SHA-256 hashing, provisioning, two-relay propagation confirmation, and sequential multi-server upload.
 - `core/src/adp_client.rs` now streams token- or NIP-98-authenticated downloads through `HttpClient::download_to_path()` using an atomic temporary-file rename.
-- `desktop/src/main.rs` refetches authoritative server/hash/version tags, downloads to a deterministic app-data path, and emits `download-progress`/`download-complete`. The paid/free ownership decision still trusts the request's `price_sats` and is documented as a known security gap.
+- `desktop/src/main.rs` refetches authoritative policy/server/hash/version tags, requires durable active-account ownership or explicit current public/timed access, downloads to a deterministic app-data path, and emits `download-progress`/`download-complete`.
 - `desktop/src/install.rs` verifies the listing hash, preserves mismatches under unique `.corrupt*` paths, and records only successful installs. `LibraryView` renders those `installed_games` rows; extraction and execution remain out of scope.
 
 **Encrypted local nsec accounts:**
@@ -2511,7 +2591,7 @@ Cache-aware streaming reduces relay load and startup time:
 - **24h overlap**: `MARKETPLACE_REFRESH_OVERLAP_SECS = 86400` ensures updates to existing listings aren't missed
 - **`fetch_nip99_listings_streaming_since`**: New streaming function accepting raw `since_secs` instead of `since_days`
 - **`marketplace_refresh_since_secs`**: Helper that computes the effective since value, preferring cache cursor over user-specified window
-- **Cache signature**: `listing_signature()` now includes `platforms_json` and `nip94_event_id` for accurate change detection
+- **Cache signature**: `listing_signature()` includes platforms, NIP-94, specs, and source event identity; SQL upsert rejects stale replaceable events with deterministic tie-breaking
 
 ### Marketplace Empty States
 Graceful UI when no listings are found:
@@ -2544,16 +2624,14 @@ New debug-only UI component in `detail.rs` for inspecting NIP-99 events:
 
 ### NIP-103 Entitlements And ADP Campaigns
 - **Provisional kinds**: `core/src/adp_protocol.rs` centralizes Entitlement Grant kind `1030`, campaign kind `1031`, and shared tags. These are development allocations; kind `1021` is never used.
-- **Protocol validation**: `campaign.rs`, `authorization.rs`, and `entitlements.rs` verify signatures, publisher/fulfillment authority, invariant append-only chains, half-open windows, terminal cancellation/revocation, and fail-closed forks/cycles. Delegated grants reference the root developer-signed kind `30406` event with `authorization_event`; Arcadestr resolves that complete lifecycle from the shared relay manager.
+- **Protocol validation**: `campaign.rs`, `authorization.rs`, and `entitlements.rs` verify signatures, transition-specific authority, valid-prefix chains, half-open windows, prospective cancellation, and fail-closed valid forks. Delegated grants reference the exact developer-signed kind `30406` root with `authorization`; historical verification does not depend on current listing membership or operator attestation state.
 - **Listing policy**: NIP-99 parsing supports explicit `acquisition: public`, `acquisition: timed-access <starts> <ends>`, and repeatable advisory `campaign` pointers. Missing or malformed policy is gated; zero price has no authorization meaning.
 - **Discovery**: `CampaignDiscoveryService` tries immutable pointer IDs and relay hints, always performs the `#a` fallback, fetches complete publisher `#d` chains, and reports invalid chains separately.
-- **Migration 10**: `core/migrations/007_entitlements.sql` adds append-only `entitlement_events` history indexed by buyer/game, grant ID, and predecessor.
+- **Migration 7**: `core/migrations/007_entitlements.sql` adds append-only `entitlement_events` history indexed by buyer/game, grant ID, and predecessor.
 - **Ownership**: `OwnershipService` resolves `PurchaseReceipt | EntitlementGrant | None`. Public and timed access are current access modes, not stored ownership.
 - **ADP route**: `AdpClient::entitlement_claim` calls exact `POST /entitlement/claim` with NIP-98 and typed campaign, coordinate, grant, distribution, and protocol errors.
-- **Commands/bridges**: `discover_campaigns` / `invoke_discover_campaigns`, `claim_entitlement` / `invoke_claim_entitlement`, and `publish_campaign` / `invoke_publish_campaign` cover buyer and publisher flows.
+- **Commands/bridges**: Discovery, summary, publish, pointer-repair, claim, ownership, and purchase-history commands cover buyer and publisher flows; campaign publication reports pointer-update partial success explicitly.
 - **Publisher authority**: Campaign create/update/cancel requires the active publisher identity signer. A fulfillment key may issue grants only when both the historical listing delegation and referenced kind `30406` authorization lifecycle were active at issuance; either source alone fails closed. Direct publisher grants require neither proof. Fulfillment keys cannot control campaigns or revoke grants.
-- **Install trust boundary**: The current signed listing controls server, hash, version, and current access policy. Historical validated grants/receipts remain durable after price, policy, version, or campaign cancellation changes.
+- **Install trust boundary**: The current signed listing controls server, hash, version, and current access policy. Historical validated grants/receipts remain durable after price, policy, version, or campaign cancellation changes, and cached tokens are buyer-scoped.
 
 ---
-
-*Documentation generated for Arcadestr codebase. Last updated: 2026-07-18*

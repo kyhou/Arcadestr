@@ -374,7 +374,7 @@ pub async fn generate_login_qr(
 /// 3. Waits for a "connect" request from the signer
 /// 4. Validates the secret nonce
 /// 5. Sends back "ack" response
-/// 6. Returns SavedProfile on successful connection
+/// 6. Returns the saved profile and connected signer client
 ///
 /// # Arguments
 /// * `qr_uri_string` - The nostrconnect:// URI that was displayed as QR
@@ -386,7 +386,7 @@ pub async fn wait_for_qr_connection(
     app_keys: Keys,
     expected_secret: String,
     timeout_secs: u64,
-) -> anyhow::Result<SavedProfile> {
+) -> anyhow::Result<(SavedProfile, nostr_sdk::Client)> {
     use nostr::{Filter, Kind, Timestamp};
     use nostr_sdk::Client;
     use std::time::Duration;
@@ -526,9 +526,11 @@ pub async fn wait_for_qr_connection(
                                     bunker_uri,
                                     app_keys,
                                 };
+                                let signer_client =
+                                    Client::new(Arc::new(signer) as Arc<dyn nostr::NostrSigner>);
 
                                 client.disconnect().await;
-                                return Ok(profile);
+                                return Ok((profile, signer_client));
                             }
                             Err(e) => {
                                 warn!("Failed to handle connect event: {}", e);

@@ -18,6 +18,14 @@ enum LoginPanel {
     Nip49,
 }
 
+fn show_back_button(panel: LoginPanel, has_saved_accounts: bool) -> bool {
+    match panel {
+        LoginPanel::Accounts => false,
+        LoginPanel::Methods => has_saved_accounts,
+        LoginPanel::Qr | LoginPanel::Nip49 => true,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RemovalConfirmation {
     Idle,
@@ -101,7 +109,7 @@ fn account_connection_label(
 }
 
 fn is_active_account(account: &StoredAccount, active_npub: Option<&str>) -> bool {
-    active_npub == Some(account.npub.as_str()) || account.is_current
+    active_npub == Some(account.npub.as_str())
 }
 
 fn abbreviated_npub(npub: &str) -> String {
@@ -451,7 +459,10 @@ pub fn LoginV2View() -> impl IntoView {
                     <span class="v2-auth-brand-mark" aria-hidden="true"></span>
                     <span>"Arcadestr Noir"</span>
                 </div>
-                <Show when=move || panel.get() != LoginPanel::Accounts || !auth_stored.get_value().accounts.get().is_empty()>
+                <Show when=move || show_back_button(
+                    panel.get(),
+                    !auth_stored.get_value().accounts.get().is_empty(),
+                )>
                     <button class="v2-btn-ghost" disabled=move || auth_stored.get_value().is_loading.get() on:click=move |_| cancel_flow()>
                         <span class="material-symbols-outlined" aria-hidden="true">"arrow_back"</span>
                         "Back"
@@ -753,12 +764,12 @@ mod tests {
     }
 
     #[test]
-    fn active_account_selection_uses_current_identity_or_backend_flag() {
+    fn active_account_selection_requires_current_identity() {
         let mut account = account();
         assert!(!is_active_account(&account, None));
         assert!(is_active_account(&account, Some(&account.npub)));
         account.is_current = true;
-        assert!(is_active_account(&account, None));
+        assert!(!is_active_account(&account, None));
     }
 
     #[test]
@@ -788,6 +799,15 @@ mod tests {
         let desktop = target_auth_capabilities(false);
         assert!(desktop.bunker && desktop.qr && desktop.nip49);
         assert!(!desktop.nip07);
+    }
+
+    #[test]
+    fn back_button_only_appears_when_navigation_has_a_destination() {
+        assert!(!show_back_button(LoginPanel::Accounts, true));
+        assert!(!show_back_button(LoginPanel::Methods, false));
+        assert!(show_back_button(LoginPanel::Methods, true));
+        assert!(show_back_button(LoginPanel::Qr, false));
+        assert!(show_back_button(LoginPanel::Nip49, false));
     }
 
     #[test]
