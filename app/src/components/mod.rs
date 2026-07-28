@@ -18,7 +18,7 @@ pub use backup_manager::BackupManager;
 pub use badge_earned_modal::BadgeEarnedModal;
 pub use badge_showcase::BadgeShowcase;
 pub use browse::{BrowseView, ListingCard};
-pub use date_time_picker::DateTimeRangePicker;
+pub use date_time_picker::{DatePicker, DateTimeRangePicker};
 pub use detail::DetailView;
 pub use profile::ProfileView;
 pub use profile_avatar::ProfileAvatar;

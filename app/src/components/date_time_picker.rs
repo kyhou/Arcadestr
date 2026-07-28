@@ -139,6 +139,90 @@ pub fn DateTimeRangePicker(
     }
 }
 
+#[component]
+pub fn DatePicker(
+    #[prop(into)] value: Signal<String>,
+    on_value: Callback<String>,
+    #[prop(into)] disabled: Signal<bool>,
+) -> impl IntoView {
+    let initial_date = date_from_datetime(&value.get_untracked())
+        .or_else(current_local_date)
+        .unwrap_or(Date::MIN);
+    let display_date = RwSignal::new(initial_date);
+    let open = RwSignal::new(false);
+
+    view! {
+        <div class="relative">
+            <button
+                type="button"
+                class="v2-input flex min-h-12 items-center justify-between gap-3 text-left"
+                aria-label="Choose release date"
+                aria-expanded=move || open.get()
+                disabled=move || disabled.get()
+                on:click=move |_| {
+                    if let Some(date) = date_from_datetime(&value.get_untracked()) {
+                        display_date.set(date);
+                    }
+                    open.update(|open| *open = !*open);
+                }
+            >
+                <span>{move || {
+                    let current = value.get();
+                    if current.trim().is_empty() { "Select a date".to_string() } else { current }
+                }}</span>
+                <span class="material-symbols-outlined text-lg text-on-surface-variant" aria-hidden="true">"calendar_month"</span>
+            </button>
+            <Show when=move || open.get()>
+                <section class="absolute left-0 top-[calc(100%+0.5rem)] z-50 w-[min(22rem,calc(100vw-3rem))] rounded-xl border border-outline-variant/40 bg-surface-container-highest p-3 shadow-ambient" aria-label="Release date calendar">
+                    <header class="mb-2 grid grid-cols-[2rem_1fr_2rem] items-center">
+                        <button type="button" class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-on-surface-variant hover:bg-surface-bright hover:text-on-surface" aria-label="Previous month" on:click=move |_| display_date.update(|date| *date = adjacent_month(*date, false))>
+                            <span class="material-symbols-outlined text-lg">"chevron_left"</span>
+                        </button>
+                        <strong class="text-center text-sm font-bold">{move || format!("{} {}", display_date.get().month(), display_date.get().year())}</strong>
+                        <button type="button" class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-on-surface-variant hover:bg-surface-bright hover:text-on-surface" aria-label="Next month" on:click=move |_| display_date.update(|date| *date = adjacent_month(*date, true))>
+                            <span class="material-symbols-outlined text-lg">"chevron_right"</span>
+                        </button>
+                    </header>
+                    <div class="grid grid-cols-7 text-center text-[11px] font-semibold text-on-surface-variant" aria-hidden="true">
+                        <span>"Mo"</span><span>"Tu"</span><span>"We"</span><span>"Th"</span><span>"Fr"</span><span>"Sa"</span><span>"Su"</span>
+                    </div>
+                    <div class="mt-1 grid grid-cols-7 justify-items-center gap-1" role="grid" aria-label="Choose release date">
+                        {move || {
+                            let year = display_date.get().year();
+                            let month = display_date.get().month();
+                            calendar_days(year, month)
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, day)| {
+                                    let date = day.and_then(|day| Date::from_calendar_date(year, month, day).ok());
+                                    match date {
+                                        Some(date) => view! {
+                                            <button
+                                                type="button"
+                                                role="gridcell"
+                                                class=move || calendar_day_class(date, date_from_datetime(&value.get()), None)
+                                                aria-label=format!("Set release date to {date}")
+                                                on:click=move |_| {
+                                                    on_value.run(format_date(date));
+                                                    open.set(false);
+                                                }
+                                            >{date.day()}</button>
+                                        }.into_any(),
+                                        None => view! { <span role="gridcell" aria-hidden="true" data-index=index></span> }.into_any(),
+                                    }
+                                })
+                                .collect_view()
+                        }}
+                    </div>
+                    <div class="mt-3 flex justify-end border-t border-outline-variant/20 pt-3">
+                        <button type="button" class="v2-btn-secondary" on:click=move |_| { on_value.run(String::new()); open.set(false); }>"Clear date"</button>
+                    </div>
+                </section>
+            </Show>
+        </div>
+    }
+}
+
 fn selection_button_class(selected: bool) -> &'static str {
     if selected {
         "grid min-w-0 gap-0.5 bg-surface-container-high px-3 py-2.5 text-left ring-1 ring-inset ring-primary disabled:opacity-50"
