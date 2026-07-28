@@ -146,6 +146,13 @@ const MIGRATION_11_AUTHORIZATION_ROOTS: &str =
 // Migration 12: account-scoped user library
 const MIGRATION_12_LIBRARY_GAMES: &str = include_str!("../../migrations/009_library_games.sql");
 
+// Migration 13: validated Store Page presentation cache
+const MIGRATION_13_STORE_PAGES: &str = include_str!("../../migrations/010_store_pages.sql");
+
+// Migration 14: signed listings required for offline Store Page reciprocity checks
+const MIGRATION_14_STORE_PAGE_LISTINGS: &str =
+    include_str!("../../migrations/011_store_page_listing_events.sql");
+
 // List of all migrations in applied order; migration filenames currently lag user_version numbers.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_1_INITIAL,
@@ -160,6 +167,8 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_10_ENTITLEMENTS,
     MIGRATION_11_AUTHORIZATION_ROOTS,
     MIGRATION_12_LIBRARY_GAMES,
+    MIGRATION_13_STORE_PAGES,
+    MIGRATION_14_STORE_PAGE_LISTINGS,
 ];
 
 /// Database connection pool for SQLite
@@ -1025,7 +1034,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adp_gate2_tables_exist_after_migrations() {
+    async fn adp_gate2_and_store_page_tables_exist_after_migrations() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let db = Database::new(&db_path).await.unwrap();
@@ -1035,6 +1044,8 @@ mod tests {
             "download_tokens",
             "installed_games",
             "library_games",
+            "store_pages",
+            "store_page_listing_events",
         ] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",

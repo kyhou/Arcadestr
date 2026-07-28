@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use crate::models::{AcquisitionPolicy, GameListing, PlatformInfo};
+use crate::models::{AcquisitionPolicy, GameListing, PlatformInfo, StorePageCardPresentation};
 use crate::tauri_bridge::{invoke_get_installed_games, invoke_get_platform_info};
 #[cfg(feature = "web")]
 use crate::ui_v2::components::GameCardAction;
@@ -14,7 +14,8 @@ use crate::ui_v2::components::{
     GameCard, GameCardCampaign, GameCardPresentation, PageHeader, PlatformCompatibility,
 };
 use crate::ui_v2::views::marketplace_loader::{
-    listing_state_key, use_listing_campaign_states, use_marketplace_listings, CampaignAvailability,
+    canonical_listing_coordinate, listing_state_key, use_listing_campaign_states,
+    use_listing_store_page_presentations, use_marketplace_listings, CampaignAvailability,
 };
 
 const BROWSE_INITIAL_VISIBLE_COUNT: usize = 50;
@@ -136,6 +137,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
     let marketplace = use_marketplace_listings();
     let listings = marketplace.listings;
     let campaign_state = use_listing_campaign_states(listings);
+    let store_pages = use_listing_store_page_presentations(listings);
     let query = RwSignal::new(request.query.unwrap_or_default());
     let active_category =
         RwSignal::new(request.category.map(|value| normalize_filter_value(&value)));
@@ -427,11 +429,15 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                     let active_platform = active_platform_filter.get();
                     let campaign_states = campaign_state.states.get();
                     let installed = installed_coordinates.get();
+                    let presentations = store_pages.presentations.get();
                     view! {
                         <div class="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
                             {filtered.into_iter().take(visible_count.get()).map(|listing| {
+                                let store_page = canonical_listing_coordinate(&listing)
+                                    .and_then(|coordinate| presentations.get(&coordinate).cloned());
                                 render_game_card(
                                     listing,
+                                    store_page,
                                     on_select,
                                     &campaign_states,
                                     &installed,
@@ -505,6 +511,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
 
 fn render_game_card(
     listing: GameListing,
+    store_page: Option<StorePageCardPresentation>,
     on_select: Callback<GameListing>,
     campaign_states: &std::collections::HashMap<String, CampaignAvailability>,
     installed_coordinates: &HashSet<String>,
@@ -530,6 +537,7 @@ fn render_game_card(
             listing=listing
             presentation=presentation
             categories=categories
+            store_page=store_page
             on_open=Callback::new(move |_| on_select.run(listing_for_open.clone()))
             on_action=action_callback
         />

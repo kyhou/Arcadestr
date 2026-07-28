@@ -1,5 +1,6 @@
 #![cfg(feature = "native")]
 
+use arcadestr_core::adp_protocol::EXPERIMENTAL_STORE_PAGE_KIND;
 use arcadestr_core::adp_publish::{
     build_adp_listing_event_builder, AdpListingInput, FulfillmentAuthorizationInput,
 };
@@ -79,4 +80,47 @@ fn replacement_preserves_unknown_and_authorization_siblings_with_byte_deduplicat
             .count(),
         3
     );
+}
+
+#[test]
+fn replacement_preserves_store_page_tags_without_managing_them() {
+    let developer = Keys::generate();
+    let valid = vec![
+        "store_page".into(),
+        format!(
+            "{}:{}:page",
+            EXPERIMENTAL_STORE_PAGE_KIND,
+            developer.public_key().to_hex()
+        ),
+        "wss://relay.example.com".into(),
+    ];
+    let malformed = vec!["store_page".into(), "malformed".into()];
+    let event = build_adp_listing_event_builder(&AdpListingInput {
+        d_tag: "game".into(),
+        title: "Game".into(),
+        description: "Description".into(),
+        price_sats: 0,
+        lud16: None,
+        tags: Vec::new(),
+        images: Vec::new(),
+        servers: Vec::new(),
+        file_hash: None,
+        version: None,
+        fulfillment_authorizations: Vec::new(),
+        acquisition: AcquisitionPolicy::Gated,
+        platforms: Vec::new(),
+        campaigns: Vec::new(),
+        nip94_event_id: None,
+        preserved_tags: vec![valid.clone(), malformed.clone()],
+    })
+    .expect("listing builder")
+    .sign_with_keys(&developer)
+    .expect("signed listing");
+    let tags = event
+        .tags
+        .iter()
+        .map(|tag| tag.clone().to_vec())
+        .collect::<Vec<_>>();
+    assert!(tags.contains(&valid));
+    assert!(tags.contains(&malformed));
 }

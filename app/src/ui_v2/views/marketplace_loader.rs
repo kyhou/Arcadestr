@@ -7,13 +7,18 @@ use std::rc::Rc;
 use arcadestr_core::is_replaceable_event_newer;
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
+use nostr::nips::nip19::FromBech32;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::models::{GameListing, ListingSource};
+use crate::models::{
+    GameListing, ListingSource, StorePageCardPresentation, StorePageEnrichmentRequest,
+    StorePageEnrichmentState, StorePageListingRef,
+};
 use crate::store::{try_use_marketplace_store, DEFAULT_LISTING_TTL_SECS};
 use crate::tauri_bridge::{
-    invoke_discover_campaign_summaries, invoke_discover_campaigns, CampaignPointerInput,
-    CampaignSummaryListingInput, DiscoverCampaignSummariesRequest, DiscoverCampaignsRequest,
+    invoke_discover_campaign_summaries, invoke_discover_campaigns, invoke_enrich_store_pages,
+    CampaignPointerInput, CampaignSummaryListingInput, DiscoverCampaignSummariesRequest,
+    DiscoverCampaignsRequest,
 };
 use crate::{invoke_fetch_marketplace_stream, AuthContext};
 
@@ -53,6 +58,134 @@ pub struct ListingCampaignStates {
     pub states: RwSignal<HashMap<String, CampaignAvailability>>,
     pub loading: RwSignal<bool>,
     pub error: RwSignal<Option<String>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ListingStorePagePresentations {
+    pub presentations: RwSignal<HashMap<String, StorePageCardPresentation>>,
+    pub loading: RwSignal<bool>,
+    pub unavailable: RwSignal<bool>,
+}
+
+pub fn canonical_listing_coordinate(listing: &GameListing) -> Option<String> {
+    let publisher = nostr::PublicKey::from_bech32(&listing.publisher_npub).ok()?;
+    Some(format!("30402:{}:{}", publisher.to_hex(), listing.id))
+}
+
+pub fn use_listing_store_page_presentations(
+    listings: RwSignal<Vec<GameListing>>,
+) -> ListingStorePagePresentations {
+    let presentations = RwSignal::new(HashMap::<String, StorePageCardPresentation>::new());
+    let loading = RwSignal::new(false);
+    let unavailable = RwSignal::new(false);
+    let generation = RwSignal::new(0_u64);
+    let known_events = RwSignal::new(HashMap::<String, Option<String>>::new());
+
+    Effect::new(move |_| {
+        let ordered = listings
+            .get()
+            .into_iter()
+            .filter_map(|listing| {
+                canonical_listing_coordinate(&listing)
+                    .map(|coordinate| (coordinate, listing.event_id))
+            })
+            .collect::<Vec<_>>();
+        let current = ordered.iter().cloned().collect::<HashMap<_, _>>();
+        let previous = known_events.get_untracked();
+        if current == previous {
+            return;
+        }
+        generation.update(|value| *value = value.wrapping_add(1));
+        let request_generation = generation.get_untracked();
+        presentations.update(|values| {
+            values.retain(|coordinate, _| current.get(coordinate) == previous.get(coordinate))
+        });
+        known_events.set(current.clone());
+        if current.is_empty() {
+            loading.set(false);
+            return;
+        }
+        loading.set(true);
+        unavailable.set(false);
+        let request = StorePageEnrichmentRequest {
+            generation: request_generation,
+            listings: ordered
+                .iter()
+                .filter_map(|(coordinate, event_id)| {
+                    event_id
+                        .clone()
+                        .map(|listing_event_id| StorePageListingRef {
+                            listing_coordinate: coordinate.clone(),
+                            listing_event_id,
+                        })
+                })
+                .take(64)
+                .collect(),
+        };
+        spawn_local(async move {
+            let response = match invoke_enrich_store_pages(request).await {
+                Ok(response) => response,
+                Err(_) => {
+                    if generation.get_untracked() == request_generation {
+                        unavailable.set(true);
+                        loading.set(false);
+                    }
+                    return;
+                }
+            };
+            if !store_page_generation_matches(
+                generation.get_untracked(),
+                request_generation,
+                response.generation,
+            ) {
+                return;
+            }
+            let expected_events = known_events.get_untracked();
+            apply_store_page_updates(&presentations, &expected_events, response.cached);
+            apply_store_page_updates(&presentations, &expected_events, response.refreshed);
+            loading.set(false);
+        });
+    });
+
+    ListingStorePagePresentations {
+        presentations,
+        loading,
+        unavailable,
+    }
+}
+
+fn store_page_generation_matches(current: u64, requested: u64, response: u64) -> bool {
+    current == requested && response == requested
+}
+
+fn apply_store_page_updates(
+    presentations: &RwSignal<HashMap<String, StorePageCardPresentation>>,
+    expected_events: &HashMap<String, Option<String>>,
+    updates: Vec<crate::models::StorePageEnrichmentResult>,
+) {
+    presentations.update(|current| {
+        for update in updates {
+            if expected_events
+                .get(&update.listing_coordinate)
+                .and_then(Clone::clone)
+                .as_deref()
+                != Some(update.listing_event_id.as_str())
+            {
+                continue;
+            }
+            match update.state {
+                StorePageEnrichmentState::Enriched(presentation) => {
+                    current.insert(update.listing_coordinate, presentation);
+                }
+                StorePageEnrichmentState::Unavailable => {}
+                StorePageEnrichmentState::NotAssociated
+                | StorePageEnrichmentState::NotFound
+                | StorePageEnrichmentState::Invalid => {
+                    current.remove(&update.listing_coordinate);
+                }
+            }
+        }
+    });
 }
 
 pub fn listing_state_key(listing: &GameListing) -> String {
@@ -790,5 +923,12 @@ mod tests {
             .count();
 
         assert_eq!(unique_count, 2);
+    }
+
+    #[test]
+    fn game_card_store_page_stale_request_generation_is_ignored() {
+        assert!(store_page_generation_matches(4, 4, 4));
+        assert!(!store_page_generation_matches(5, 4, 4));
+        assert!(!store_page_generation_matches(4, 4, 3));
     }
 }

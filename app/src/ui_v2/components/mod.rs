@@ -4,6 +4,7 @@ pub mod button;
 pub mod game_card;
 pub mod nav_item;
 pub mod page_header;
+pub mod store_page_detail;
 pub mod topbar;
 
 pub use button::{Button, ButtonVariant};
@@ -13,4 +14,5 @@ pub use game_card::{
 };
 pub use nav_item::{MobileNavItem, NavItem};
 pub use page_header::PageHeader;
+pub use store_page_detail::StorePageRichDetail;
 pub use topbar::TopBar;

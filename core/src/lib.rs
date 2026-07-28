@@ -89,6 +89,12 @@ pub mod campaign_discovery;
 pub mod entitlements;
 #[cfg(feature = "native")]
 pub mod entitlements_repository;
+pub mod store_page;
+pub mod store_page_content_policy;
+#[cfg(feature = "native")]
+pub mod store_page_discovery;
+#[cfg(feature = "native")]
+pub mod store_page_repository;
 
 #[cfg(feature = "native")]
 pub mod lnurlp;

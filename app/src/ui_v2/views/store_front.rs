@@ -2,14 +2,15 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 
-use crate::models::{AcquisitionPolicy, GameListing};
+use crate::models::{AcquisitionPolicy, GameListing, StorePageCardPresentation};
 use crate::ui_v2::components::{
     GameCard, GameCardAction, GameCardCampaign, GameCardPresentation, PageHeader,
     PlatformCompatibility,
 };
 use crate::ui_v2::views::browse_games::{extract_categories, listing_categories, BrowseRequest};
 use crate::ui_v2::views::marketplace_loader::{
-    listing_state_key, use_listing_campaign_states, use_marketplace_listings_with_limit,
+    canonical_listing_coordinate, listing_state_key, use_listing_campaign_states,
+    use_listing_store_page_presentations, use_marketplace_listings_with_limit,
     CampaignAvailability,
 };
 use crate::ui_v2::views::{use_fallback_cover, valid_cover_url, FALLBACK_COVER};
@@ -26,6 +27,7 @@ pub fn StoreFrontView(
     let marketplace = use_marketplace_listings_with_limit(STORE_FRONT_LISTING_LIMIT);
     let listings = marketplace.listings;
     let campaign_state = use_listing_campaign_states(listings);
+    let store_pages = use_listing_store_page_presentations(listings);
     let featured_listing = Signal::derive(move || select_featured_listing(&listings.get()));
     let categories = Signal::derive(move || {
         extract_categories(&listings.get())
@@ -65,8 +67,16 @@ pub fn StoreFrontView(
 
             {move || match featured_listing.get() {
                 Some(listing) => {
-                    let image_url = valid_cover_url(&listing.images)
+                    let store_page = canonical_listing_coordinate(&listing)
+                        .and_then(|coordinate| store_pages.presentations.get().get(&coordinate).cloned());
+                    let image_url = store_page.as_ref()
+                        .and_then(|page| page.hero_url.clone().or(page.capsule_url.clone()))
+                        .or_else(|| valid_cover_url(&listing.images))
                         .unwrap_or_else(|| FALLBACK_COVER.to_string());
+                    let title = store_page.as_ref().and_then(|page| page.title.clone())
+                        .unwrap_or_else(|| listing.title.clone());
+                    let summary = store_page.as_ref().and_then(|page| page.summary.clone())
+                        .unwrap_or_else(|| listing.description.clone());
                     let selected = listing.clone();
                     let access_label = featured_access_label(
                         &listing,
@@ -77,7 +87,7 @@ pub fn StoreFrontView(
                         <article class="relative min-h-[28rem] overflow-hidden rounded-3xl bg-surface-container-high md:min-h-[32rem]">
                             <img
                                 src=image_url
-                                alt={format!("{} cover art", listing.title)}
+                                alt={format!("{} cover art", title)}
                                 class="absolute inset-0 h-full w-full object-cover"
                                 on:error=use_fallback_cover
                             />
@@ -87,10 +97,10 @@ pub fn StoreFrontView(
                                     {format!("Featured · {access_label}")}
                                 </span>
                                 <h2 class="max-w-4xl font-display text-4xl font-bold leading-[0.95] text-on-surface md:text-6xl">
-                                    {listing.title.clone()}
+                                    {title}
                                 </h2>
                                 <p class="mt-4 max-w-2xl text-sm leading-relaxed text-on-surface-variant md:text-lg">
-                                    {listing.description.clone()}
+                                    {summary}
                                 </p>
                                 <button
                                     type="button"
@@ -198,10 +208,15 @@ pub fn StoreFrontView(
                         {move || {
                             let featured_key = featured_listing.get().map(|listing| listing_state_key(&listing));
                             let campaign_states = campaign_state.states.get();
+                            let presentations = store_pages.presentations.get();
                             listings.get().into_iter()
                                 .filter(|listing| Some(listing_state_key(listing)) != featured_key)
                                 .take(STORE_CARD_LIMIT)
-                                .map(|listing| render_store_card(listing, on_select, &campaign_states))
+                                .map(|listing| {
+                                    let store_page = canonical_listing_coordinate(&listing)
+                                        .and_then(|coordinate| presentations.get(&coordinate).cloned());
+                                    render_store_card(listing, store_page, on_select, &campaign_states)
+                                })
                                 .collect::<Vec<_>>()
                         }}
                     </div>
@@ -213,6 +228,7 @@ pub fn StoreFrontView(
 
 fn render_store_card(
     listing: GameListing,
+    store_page: Option<StorePageCardPresentation>,
     on_select: Callback<GameListing>,
     campaign_states: &HashMap<String, CampaignAvailability>,
 ) -> AnyView {
@@ -246,6 +262,7 @@ fn render_store_card(
             listing=listing
             presentation=presentation
             categories=categories
+            store_page=store_page
             on_open=Callback::new(move |_| on_select.run(selected.clone()))
             on_action=Callback::new(move |_| on_select.run(selected_for_action.clone()))
         />

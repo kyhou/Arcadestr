@@ -1,9 +1,486 @@
 // Typed IPC bridge wrappers for NIP-49 and NIP-05 desktop commands.
 
 use crate::models::{
-    DurableAcquisitionRecord, EarnedBadgeSummary, GameListing, Nip05Status, Nip49ExportResult,
-    Nip49ImportRequest, PlatformInfo, ProfileBadgeEntry,
+    DurableAcquisitionRecord, EarnedBadgeSummary, GameDetailPresentation, GameListing, Nip05Status,
+    Nip49ExportResult, Nip49ImportRequest, PlatformInfo, ProfileBadgeEntry, SafeStorePageHtml,
+    StorePageAccessibility, StorePageBatchEnrichment, StorePageDetailEnrichment,
+    StorePageDetailSection, StorePageDetailState, StorePageEnrichmentRequest, StorePageLanguage,
+    StorePageLinks, StorePageListingRef, StorePageMedia, StorePagePlatformRequirements,
+    StorePageRequirementTier,
 };
+use arcadestr_core::store_page::{StorePageDraft, StorePageValidationDiagnostic};
+use serde::{Deserialize, Serialize};
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_enrich_store_pages(
+    request: StorePageEnrichmentRequest,
+) -> Result<StorePageBatchEnrichment, String> {
+    crate::tauri_invoke::invoke(
+        "enrich_store_pages",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawStorePageMedia {
+    id: String,
+    media_type: String,
+    role: String,
+    url: String,
+    thumbnail_url: Option<String>,
+    alt: Option<String>,
+    caption: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawStorePageSection {
+    id: String,
+    heading: String,
+    body_html: String,
+    media_id: Option<String>,
+    layout: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawStorePageLanguage {
+    code: String,
+    interface: bool,
+    audio: bool,
+    subtitles: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawRequirementTier {
+    os: Option<String>,
+    processor: Option<String>,
+    memory: Option<String>,
+    graphics: Option<String>,
+    storage: Option<String>,
+    additional: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawPlatformRequirements {
+    platform: String,
+    minimum: Option<RawRequirementTier>,
+    recommended: Option<RawRequirementTier>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawAccessibility {
+    feature: String,
+    supported: bool,
+    notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RawLinks {
+    website: Option<String>,
+    support: Option<String>,
+    documentation: Option<String>,
+    source: Option<String>,
+    community: Option<String>,
+    privacy_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawDetailPresentation {
+    listing_coordinate: String,
+    listing_event_id: String,
+    store_page_coordinate: String,
+    event_id: String,
+    title: Option<String>,
+    summary: Option<String>,
+    description_html: Option<String>,
+    media: Vec<RawStorePageMedia>,
+    sections: Vec<RawStorePageSection>,
+    genres: Vec<String>,
+    features: Vec<String>,
+    languages: Vec<RawStorePageLanguage>,
+    requirements: Vec<RawPlatformRequirements>,
+    accessibility: Vec<RawAccessibility>,
+    links: RawLinks,
+    developer: Option<String>,
+    publisher: Option<String>,
+    release_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "state", content = "presentation", rename_all = "snake_case")]
+enum RawDetailState {
+    Enriched(RawDetailPresentation),
+    NotAssociated,
+    NotFound,
+    Invalid,
+    Unsupported,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawDetailEnrichment {
+    generation: u64,
+    listing_event_current: bool,
+    cached: Option<RawDetailPresentation>,
+    refreshed: RawDetailState,
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_enrich_store_page_detail(
+    generation: u64,
+    listing: StorePageListingRef,
+) -> Result<StorePageDetailEnrichment, String> {
+    let raw: RawDetailEnrichment = crate::tauri_invoke::invoke(
+        "enrich_store_page_detail",
+        serde_json::json!({ "request": { "generation": generation, "listing": listing } }),
+    )
+    .await?;
+    Ok(map_detail_enrichment(raw))
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_enrich_store_page_detail(
+    _generation: u64,
+    _listing: StorePageListingRef,
+) -> Result<StorePageDetailEnrichment, String> {
+    Err("Store Page detail enrichment is unavailable in standalone web builds.".to_string())
+}
+
+fn map_detail_enrichment(raw: RawDetailEnrichment) -> StorePageDetailEnrichment {
+    StorePageDetailEnrichment {
+        generation: raw.generation,
+        listing_event_current: raw.listing_event_current,
+        cached: raw.cached.map(map_detail_presentation),
+        refreshed: match raw.refreshed {
+            RawDetailState::Enriched(value) => {
+                StorePageDetailState::Enriched(map_detail_presentation(value))
+            }
+            RawDetailState::NotAssociated => StorePageDetailState::NotAssociated,
+            RawDetailState::NotFound => StorePageDetailState::NotFound,
+            RawDetailState::Invalid => StorePageDetailState::Invalid,
+            RawDetailState::Unsupported => StorePageDetailState::Unsupported,
+            RawDetailState::Unavailable => StorePageDetailState::Unavailable,
+        },
+    }
+}
+
+fn map_detail_presentation(raw: RawDetailPresentation) -> GameDetailPresentation {
+    GameDetailPresentation {
+        listing_coordinate: raw.listing_coordinate,
+        listing_event_id: raw.listing_event_id,
+        store_page_coordinate: raw.store_page_coordinate,
+        event_id: raw.event_id,
+        title: raw.title,
+        summary: raw.summary,
+        description_html: raw.description_html.map(SafeStorePageHtml::from_backend),
+        media: raw
+            .media
+            .into_iter()
+            .map(|item| StorePageMedia {
+                id: item.id,
+                media_type: item.media_type,
+                role: item.role,
+                url: item.url,
+                thumbnail_url: item.thumbnail_url,
+                alt: item.alt,
+                caption: item.caption,
+            })
+            .collect(),
+        sections: raw
+            .sections
+            .into_iter()
+            .map(|section| StorePageDetailSection {
+                id: section.id,
+                heading: section.heading,
+                body_html: SafeStorePageHtml::from_backend(section.body_html),
+                media_id: section.media_id,
+                layout: section.layout,
+            })
+            .collect(),
+        genres: raw.genres,
+        features: raw.features,
+        languages: raw
+            .languages
+            .into_iter()
+            .map(|language| StorePageLanguage {
+                code: language.code,
+                interface: language.interface,
+                audio: language.audio,
+                subtitles: language.subtitles,
+            })
+            .collect(),
+        requirements: raw
+            .requirements
+            .into_iter()
+            .map(|requirement| StorePagePlatformRequirements {
+                platform: requirement.platform,
+                minimum: requirement.minimum.map(map_requirement_tier),
+                recommended: requirement.recommended.map(map_requirement_tier),
+            })
+            .collect(),
+        accessibility: raw
+            .accessibility
+            .into_iter()
+            .map(|entry| StorePageAccessibility {
+                feature: entry.feature,
+                supported: entry.supported,
+                notes: entry.notes,
+            })
+            .collect(),
+        links: StorePageLinks {
+            website: raw.links.website,
+            support: raw.links.support,
+            documentation: raw.links.documentation,
+            source: raw.links.source,
+            community: raw.links.community,
+            privacy_policy: raw.links.privacy_policy,
+        },
+        developer: raw.developer,
+        publisher: raw.publisher,
+        release_date: raw.release_date,
+    }
+}
+
+fn map_requirement_tier(raw: RawRequirementTier) -> StorePageRequirementTier {
+    StorePageRequirementTier {
+        os: raw.os,
+        processor: raw.processor,
+        memory: raw.memory,
+        graphics: raw.graphics,
+        storage: raw.storage,
+        additional: raw.additional,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublisherStorePageListingRevision {
+    pub listing_coordinate: String,
+    pub event_id: String,
+    pub reciprocal: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublisherStorePageEditorState {
+    pub draft: StorePageDraft,
+    pub baseline_draft: StorePageDraft,
+    pub listings: Vec<PublisherStorePageListingRevision>,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawValidateStorePageDraftResponse {
+    valid: bool,
+    diagnostics: Vec<StorePageValidationDiagnostic>,
+    preview: Option<RawDetailPresentation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidateStorePageDraftResponse {
+    pub valid: bool,
+    pub diagnostics: Vec<StorePageValidationDiagnostic>,
+    pub preview: Option<GameDetailPresentation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListingPointerMutation {
+    Link,
+    Unlink,
+    Review,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorePageListingMutation {
+    pub listing_coordinate: String,
+    pub expected_event_id: String,
+    pub action: ListingPointerMutation,
+    pub relay_hint: Option<String>,
+    #[serde(default)]
+    pub published_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventPublishOutcome {
+    pub event_id: String,
+    pub success_count: usize,
+    pub failure_count: usize,
+    pub propagation_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListingPointerPublishOutcome {
+    pub listing_coordinate: String,
+    pub action: ListingPointerMutation,
+    pub replacement_event_id: Option<String>,
+    pub published: bool,
+    pub propagation_confirmed: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublishStorePageResponse {
+    pub store_page_coordinate: String,
+    pub store_page: Option<EventPublishOutcome>,
+    pub listing_updates: Vec<ListingPointerPublishOutcome>,
+    pub complete: bool,
+    pub retryable: bool,
+    pub cache_error: Option<String>,
+    pub retry_scope_complete: bool,
+}
+
+fn store_page_publishing_unsupported_error() -> String {
+    "Store Page publishing is unavailable in standalone web builds.".to_string()
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_load_publisher_store_page_editor(
+    expected_publisher_npub: String,
+    listing: StorePageListingRef,
+    presentation_id: Option<String>,
+) -> Result<PublisherStorePageEditorState, String> {
+    crate::tauri_invoke::invoke(
+        "load_publisher_store_page_editor",
+        serde_json::json!({
+            "request": {
+                "expected_publisher_npub": expected_publisher_npub,
+                "listing": listing,
+                "presentation_id": presentation_id
+            }
+        }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_load_publisher_store_page_editor(
+    _expected_publisher_npub: String,
+    _listing: StorePageListingRef,
+    _presentation_id: Option<String>,
+) -> Result<PublisherStorePageEditorState, String> {
+    Err(store_page_publishing_unsupported_error())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_validate_store_page_draft(
+    expected_publisher_npub: String,
+    draft: StorePageDraft,
+    preview_listing: PublisherStorePageListingRevision,
+    listing_mutations: Vec<StorePageListingMutation>,
+) -> Result<ValidateStorePageDraftResponse, String> {
+    let raw: RawValidateStorePageDraftResponse = crate::tauri_invoke::invoke(
+        "validate_store_page_draft_command",
+        serde_json::json!({
+            "request": {
+                "expected_publisher_npub": expected_publisher_npub,
+                "draft": draft,
+                "preview_listing": preview_listing
+                ,"listing_mutations": listing_mutations
+            }
+        }),
+    )
+    .await?;
+    Ok(ValidateStorePageDraftResponse {
+        valid: raw.valid,
+        diagnostics: raw.diagnostics,
+        preview: raw.preview.map(map_detail_presentation),
+    })
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_validate_store_page_draft(
+    _expected_publisher_npub: String,
+    _draft: StorePageDraft,
+    _preview_listing: PublisherStorePageListingRevision,
+    _listing_mutations: Vec<StorePageListingMutation>,
+) -> Result<ValidateStorePageDraftResponse, String> {
+    Err(store_page_publishing_unsupported_error())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_clone_store_page(
+    source: StorePageDraft,
+    presentation_id: String,
+) -> Result<StorePageDraft, String> {
+    crate::tauri_invoke::invoke(
+        "clone_store_page",
+        serde_json::json!({ "request": { "source": source, "presentation_id": presentation_id } }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_clone_store_page(
+    _source: StorePageDraft,
+    _presentation_id: String,
+) -> Result<StorePageDraft, String> {
+    Err(store_page_publishing_unsupported_error())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_publish_store_page(
+    expected_publisher_npub: String,
+    draft: StorePageDraft,
+    listing_mutations: Vec<StorePageListingMutation>,
+) -> Result<PublishStorePageResponse, String> {
+    crate::tauri_invoke::invoke(
+        "publish_store_page",
+        serde_json::json!({
+            "request": {
+                "expected_publisher_npub": expected_publisher_npub,
+                "draft": draft,
+                "listing_mutations": listing_mutations
+            }
+        }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_publish_store_page(
+    _expected_publisher_npub: String,
+    _draft: StorePageDraft,
+    _listing_mutations: Vec<StorePageListingMutation>,
+) -> Result<PublishStorePageResponse, String> {
+    Err(store_page_publishing_unsupported_error())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_retry_store_page_pointer_sync(
+    expected_publisher_npub: String,
+    store_page_coordinate: String,
+    store_page_event_id: String,
+    listing_mutations: Vec<StorePageListingMutation>,
+) -> Result<PublishStorePageResponse, String> {
+    crate::tauri_invoke::invoke(
+        "retry_store_page_pointer_sync",
+        serde_json::json!({
+            "request": {
+                "expected_publisher_npub": expected_publisher_npub,
+                "store_page_coordinate": store_page_coordinate,
+                "store_page_event_id": store_page_event_id,
+                "listing_mutations": listing_mutations
+            }
+        }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_retry_store_page_pointer_sync(
+    _expected_publisher_npub: String,
+    _store_page_coordinate: String,
+    _store_page_event_id: String,
+    _listing_mutations: Vec<StorePageListingMutation>,
+) -> Result<PublishStorePageResponse, String> {
+    Err(store_page_publishing_unsupported_error())
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_enrich_store_pages(
+    _request: StorePageEnrichmentRequest,
+) -> Result<StorePageBatchEnrichment, String> {
+    Err("Store Page relay enrichment is unavailable in standalone web builds.".to_string())
+}
 
 /// Invoke desktop `get_platform_info` command.
 #[cfg(not(feature = "web"))]
@@ -950,5 +1427,13 @@ mod tests {
         assert_eq!(value["acquisition"]["TimedAccess"]["ends_at"], 200);
         assert_eq!(value["campaigns"][0]["root_event_id"], "campaign-root");
         assert_eq!(value["nip94_event_id"], "nip94-event");
+    }
+
+    #[test]
+    fn store_page_publish_web_error_is_explicit() {
+        assert_eq!(
+            store_page_publishing_unsupported_error(),
+            "Store Page publishing is unavailable in standalone web builds."
+        );
     }
 }

@@ -6,20 +6,23 @@ use send_wrapper::SendWrapper;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::models::{
-    npub_fallback_label, AcquisitionPolicy, GameListing, ListingSource, PlatformInfo, UserProfile,
+    npub_fallback_label, AcquisitionPolicy, GameDetailCommerce, GameDetailPresentation,
+    GameListing, ListingSource, PlatformInfo, StorePageDetailState, StorePageListingRef,
+    UserProfile,
 };
 use crate::store::try_use_profile_store;
 use crate::tauri_bridge::{
     invoke_add_game_to_library, invoke_claim_entitlement, invoke_confirm_purchase,
-    invoke_connect_nwc_wallet, invoke_discover_campaigns, invoke_get_installed_games,
-    invoke_get_listing_ownership, invoke_get_platform_info, invoke_install_game,
-    invoke_is_game_in_library, invoke_pay_nwc_invoice, invoke_request_lnurl_invoice,
-    listen_download_complete,
+    invoke_connect_nwc_wallet, invoke_discover_campaigns, invoke_enrich_store_page_detail,
+    invoke_get_installed_games, invoke_get_listing_ownership, invoke_get_platform_info,
+    invoke_install_game, invoke_is_game_in_library, invoke_pay_nwc_invoice,
+    invoke_request_lnurl_invoice, listen_download_complete,
 };
 use crate::tauri_bridge::{
     CampaignPointerInput, ClaimEntitlementRequest, ConfirmPurchaseRequest, ConnectNwcWalletRequest,
     DiscoverCampaignsRequest, DiscoveredCampaign, PayNwcInvoiceRequest, RequestLnurlInvoiceRequest,
 };
+use crate::ui_v2::components::StorePageRichDetail;
 use crate::ui_v2::views::browse_games::listing_categories;
 use crate::ui_v2::views::{use_fallback_cover, FALLBACK_COVER};
 use crate::{invoke_fetch_profile, AuthContext};
@@ -493,6 +496,41 @@ fn adp_server_url(specs: &[(String, String)], download_url: &str) -> Option<Stri
         .or_else(|| adp_server_url_from_download_url(download_url))
 }
 
+fn detail_commerce(listing: &GameListing) -> Option<GameDetailCommerce> {
+    Some(GameDetailCommerce {
+        listing_coordinate: game_coordinate(listing)?,
+        price_sats: listing.price_sats,
+        acquisition: listing.acquisition.clone(),
+        owned: listing.is_owned,
+        platforms: listing.platforms.clone(),
+        version: listing
+            .specs
+            .iter()
+            .find(|(key, _)| key == "version")
+            .map(|(_, value)| value.clone()),
+        distribution_available: listing.specs.iter().any(|(key, _)| key == "server"),
+        file_hash: listing
+            .specs
+            .iter()
+            .find(|(key, _)| matches!(key.as_str(), "sha256" | "hash"))
+            .map(|(_, value)| value.clone()),
+    })
+}
+
+fn detail_response_is_current(
+    current_generation: u64,
+    requested_generation: u64,
+    response_generation: u64,
+    coordinate: &str,
+    event_id: &str,
+    presentation: &GameDetailPresentation,
+) -> bool {
+    current_generation == requested_generation
+        && response_generation == requested_generation
+        && presentation.listing_coordinate == coordinate
+        && presentation.listing_event_id == event_id
+}
+
 #[component]
 pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoView {
     let media = valid_image_urls(&listing.images);
@@ -558,6 +596,77 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let profile_error: RwSignal<bool> = RwSignal::new(false);
 
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
+    let detail_presentation = RwSignal::new(None::<GameDetailPresentation>);
+    let detail_generation = RwSignal::new(0_u64);
+    let listing_event_current = RwSignal::new(cfg!(feature = "web"));
+    let detail_coordinate = game_coordinate(&listing);
+    let detail_event_id = listing.event_id.clone();
+    let _commerce = detail_commerce(&listing);
+
+    Effect::new(move |_| {
+        let _account = auth.npub.get();
+        detail_generation.update(|value| *value = value.wrapping_add(1));
+        listing_event_current.set(cfg!(feature = "web"));
+        let requested_generation = detail_generation.get_untracked();
+        let (Some(coordinate), Some(event_id)) =
+            (detail_coordinate.clone(), detail_event_id.clone())
+        else {
+            detail_presentation.set(None);
+            return;
+        };
+        spawn_local(async move {
+            let response = invoke_enrich_store_page_detail(
+                requested_generation,
+                StorePageListingRef {
+                    listing_coordinate: coordinate.clone(),
+                    listing_event_id: event_id.clone(),
+                },
+            )
+            .await;
+            let Ok(response) = response else {
+                return;
+            };
+            if detail_generation.get_untracked() != requested_generation
+                || response.generation != requested_generation
+            {
+                return;
+            }
+            listing_event_current.set(response.listing_event_current);
+            if let Some(cached) = response.cached {
+                if detail_response_is_current(
+                    detail_generation.get_untracked(),
+                    requested_generation,
+                    response.generation,
+                    &coordinate,
+                    &event_id,
+                    &cached,
+                ) {
+                    detail_presentation.set(Some(cached));
+                }
+            }
+            match response.refreshed {
+                StorePageDetailState::Enriched(presentation)
+                    if detail_response_is_current(
+                        detail_generation.get_untracked(),
+                        requested_generation,
+                        response.generation,
+                        &coordinate,
+                        &event_id,
+                        &presentation,
+                    ) =>
+                {
+                    detail_presentation.set(Some(presentation));
+                }
+                StorePageDetailState::Unavailable => {}
+                StorePageDetailState::Enriched(_) => {}
+                StorePageDetailState::NotAssociated
+                | StorePageDetailState::NotFound
+                | StorePageDetailState::Invalid
+                | StorePageDetailState::Unsupported => detail_presentation.set(None),
+            }
+        });
+    });
+    on_cleanup(move || detail_generation.update(|value| *value = value.wrapping_add(1)));
 
     Effect::new(move |_| {
         spawn_local(async move {
@@ -1142,7 +1251,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 &listing,
                 purchase_confirmed.get(),
                 install_complete.get(),
-                ownership_loading.get(),
+                ownership_loading.get() || !listing_event_current.get(),
                 &discovered,
                 campaign_loading.get() || campaign_error.get().is_some(),
                 listing_compatibility(&listing, platform_info.get().as_ref()),
@@ -1192,6 +1301,10 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     };
     let listing_for_compatibility = listing.clone();
     let listing_for_seller = listing.clone();
+    let listing_title_for_header = title.clone();
+    let listing_description_for_header = description.clone();
+    let listing_hero_for_header = hero_image.clone();
+    let listing_categories_for_header = categories.clone();
 
     view! {
         <section class="v2-detail-wrap">
@@ -1202,17 +1315,18 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
 
             <header class="v2-panel-glass v2-detail-hero">
                 <div class="v2-detail-hero-copy">
-                    <p class="v2-store-kicker">{kicker}</p>
-                    <h1 class="v2-display v2-detail-title">{title.clone()}</h1>
-                    <p class="v2-hero-description">{description.clone()}</p>
+                    <p class="v2-store-kicker">{move || detail_presentation.get().and_then(|page| page.genres.first().cloned()).unwrap_or_else(|| kicker.clone())}</p>
+                    <h1 class="v2-display v2-detail-title">{move || detail_presentation.get().and_then(|page| page.title).unwrap_or_else(|| listing_title_for_header.clone())}</h1>
+                    <p class="v2-hero-description">{move || detail_presentation.get().and_then(|page| page.summary).unwrap_or_else(|| truncate_chars(&listing_description_for_header, 300))}</p>
                     <div class="v2-detail-tags">
-                        {categories.iter().map(|category| {
-                            view! { <span class="v2-chip">{category.clone()}</span> }
-                        }).collect::<Vec<_>>()}
+                        {move || {
+                            let values = detail_presentation.get().map(|page| page.genres.into_iter().chain(page.features).take(8).collect::<Vec<_>>()).filter(|values| !values.is_empty()).unwrap_or_else(|| listing_categories_for_header.clone());
+                            values.into_iter().map(|category| view! { <span class="v2-chip">{category}</span> }).collect_view()
+                        }}
                     </div>
                 </div>
                 <div class="v2-detail-cover-frame">
-                    <img src=hero_image alt=format!("{title} cover") on:error=use_fallback_cover />
+                    <img src=move || detail_presentation.get().and_then(|page| page.media.iter().find(|item| item.role == "hero").or_else(|| page.media.iter().find(|item| item.role == "capsule")).map(|item| item.url.clone())).unwrap_or_else(|| listing_hero_for_header.clone()) alt=format!("{title} cover") on:error=use_fallback_cover />
                 </div>
                 <aside class="v2-detail-buy-panel v2-panel">
                     <p class="v2-store-kicker">"Access"</p>
@@ -1351,11 +1465,11 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
 
             <div class="v2-detail-grid">
                 <main class="v2-detail-main-column">
-                    <section class="v2-panel-glass v2-detail-description-block">
-                        <p class="v2-store-kicker">"About this game"</p>
-                        <h2>{title.clone()}</h2>
-                        <p>{description}</p>
-                    </section>
+                    {move || if detail_presentation.get().and_then(|page| page.description_html).is_none() {
+                        view! { <section class="v2-panel-glass v2-detail-description-block"><p class="v2-store-kicker">"About this game"</p><h2>{title.clone()}</h2><p>{description.clone()}</p></section> }.into_any()
+                    } else { view! { <></> }.into_any() }}
+
+                    {move || detail_presentation.get().map(|presentation| view! { <StorePageRichDetail presentation=presentation /> })}
 
                     <section class="v2-panel-glass v2-detail-description-block">
                         <div class="v2-section-header"><h2>"Access campaigns"</h2></div>
@@ -1849,5 +1963,80 @@ mod tests {
         ]);
 
         assert_eq!(urls, vec!["https://cdn.arcadestr.test/cover.webp"]);
+    }
+
+    #[test]
+    fn game_detail_store_page_response_requires_current_navigation_and_listing_event() {
+        let presentation = GameDetailPresentation {
+            listing_coordinate: "30402:publisher:game".into(),
+            listing_event_id: "event-2".into(),
+            store_page_coordinate: "30407:publisher:page".into(),
+            event_id: "page-event".into(),
+            title: None,
+            summary: None,
+            description_html: None,
+            media: Vec::new(),
+            sections: Vec::new(),
+            genres: Vec::new(),
+            features: Vec::new(),
+            languages: Vec::new(),
+            requirements: Vec::new(),
+            accessibility: Vec::new(),
+            links: Default::default(),
+            developer: None,
+            publisher: None,
+            release_date: None,
+        };
+        assert!(detail_response_is_current(
+            4,
+            4,
+            4,
+            "30402:publisher:game",
+            "event-2",
+            &presentation,
+        ));
+        assert!(!detail_response_is_current(
+            5,
+            4,
+            4,
+            "30402:publisher:game",
+            "event-2",
+            &presentation,
+        ));
+        assert!(!detail_response_is_current(
+            4,
+            4,
+            4,
+            "30402:publisher:game",
+            "event-1",
+            &presentation,
+        ));
+    }
+
+    #[test]
+    fn game_detail_commerce_remains_listing_derived() {
+        use nostr::nips::nip19::ToBech32;
+
+        let mut listing = listing(AcquisitionPolicy::Gated);
+        listing.publisher_npub = nostr::Keys::generate()
+            .public_key()
+            .to_bech32()
+            .expect("npub");
+        listing.price_sats = 42_000;
+        listing.platforms = vec!["linux-x86_64".into()];
+        listing.specs = vec![
+            ("version".into(), "2.0.0".into()),
+            ("server".into(), "https://dist.example.org".into()),
+            ("sha256".into(), "aa".repeat(32)),
+        ];
+        let commerce = detail_commerce(&listing).expect("canonical listing");
+        assert_eq!(commerce.price_sats, 42_000);
+        assert_eq!(commerce.platforms, vec!["linux-x86_64"]);
+        assert_eq!(commerce.version.as_deref(), Some("2.0.0"));
+        assert!(commerce.distribution_available);
+        assert_eq!(
+            commerce.file_hash.as_deref(),
+            Some("aa".repeat(32).as_str())
+        );
     }
 }

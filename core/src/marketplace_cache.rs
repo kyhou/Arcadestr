@@ -34,7 +34,7 @@ impl MarketplaceCache {
             (Some(since), Some(until)) => {
                 sqlx::query(
                     r#"
-                    SELECT product_id, title, description, price_sats, download_url,
+                    SELECT product_id, title, description, price_sats, price_amount, price_currency, download_url,
                            publisher_npub, created_at, tags_json, lud16,
                            images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
@@ -52,7 +52,7 @@ impl MarketplaceCache {
             (Some(since), None) => {
                 sqlx::query(
                     r#"
-                    SELECT product_id, title, description, price_sats, download_url,
+                    SELECT product_id, title, description, price_sats, price_amount, price_currency, download_url,
                            publisher_npub, created_at, tags_json, lud16,
                            images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
@@ -69,7 +69,7 @@ impl MarketplaceCache {
             (None, Some(until)) => {
                 sqlx::query(
                     r#"
-                    SELECT product_id, title, description, price_sats, download_url,
+                    SELECT product_id, title, description, price_sats, price_amount, price_currency, download_url,
                            publisher_npub, created_at, tags_json, lud16,
                            images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
@@ -86,7 +86,7 @@ impl MarketplaceCache {
             (None, None) => {
                 sqlx::query(
                     r#"
-                    SELECT product_id, title, description, price_sats, download_url,
+                    SELECT product_id, title, description, price_sats, price_amount, price_currency, download_url,
                            publisher_npub, created_at, tags_json, lud16,
                            images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
                     FROM marketplace_listings
@@ -124,6 +124,8 @@ impl MarketplaceCache {
                     title: row.get("title"),
                     description: row.get("description"),
                     price_sats: row.get::<i64, _>("price_sats").max(0) as u64,
+                    price_amount: row.get("price_amount"),
+                    price_currency: row.get("price_currency"),
                     download_url: row.get("download_url"),
                     publisher_npub: row.get("publisher_npub"),
                     created_at: row.get::<i64, _>("created_at").max(0) as u64,
@@ -196,15 +198,17 @@ impl MarketplaceCache {
         let result = sqlx::query(
             r#"
             INSERT INTO marketplace_listings (
-                publisher_npub, product_id, title, description, price_sats,
+                publisher_npub, product_id, title, description, price_sats, price_amount, price_currency,
                 download_url, tags_json, specs_json, lud16, created_at, updated_at, source_event_id,
                 images_json, platforms_json, nip94_event_id, acquisition_json, summary, published_at, location, geohash, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(publisher_npub, product_id) DO UPDATE SET
                 title = excluded.title,
                 description = excluded.description,
                 price_sats = excluded.price_sats,
+                price_amount = excluded.price_amount,
+                price_currency = excluded.price_currency,
                 download_url = excluded.download_url,
                 tags_json = excluded.tags_json,
                 specs_json = excluded.specs_json,
@@ -238,6 +242,8 @@ impl MarketplaceCache {
                     marketplace_listings.title <> excluded.title OR
                     marketplace_listings.description <> excluded.description OR
                     marketplace_listings.price_sats <> excluded.price_sats OR
+                    IFNULL(marketplace_listings.price_amount, '') <> IFNULL(excluded.price_amount, '') OR
+                    IFNULL(marketplace_listings.price_currency, '') <> IFNULL(excluded.price_currency, '') OR
                     marketplace_listings.download_url <> excluded.download_url OR
                     marketplace_listings.tags_json <> excluded.tags_json OR
                     marketplace_listings.specs_json <> excluded.specs_json OR
@@ -261,6 +267,8 @@ impl MarketplaceCache {
         .bind(&listing.title)
         .bind(&listing.description)
         .bind(listing.price_sats as i64)
+        .bind(&listing.price_amount)
+        .bind(&listing.price_currency)
         .bind(&listing.download_url)
         .bind(tags_json)
         .bind(specs_json)
@@ -314,6 +322,8 @@ mod tests {
             title: title.to_string(),
             description: "desc".to_string(),
             price_sats: 100,
+            price_amount: Some("100".to_string()),
+            price_currency: Some("SATS".to_string()),
             download_url: "https://example.com".to_string(),
             publisher_npub: "npub1merchant".to_string(),
             created_at,
@@ -870,7 +880,9 @@ mod tests {
             source: ListingSource::Nip99Listing,
             title: "Complete NIP-99 Game".to_string(),
             description: "A fully featured game with all NIP-99 fields".to_string(),
-            price_sats: 5000,
+            price_sats: 0,
+            price_amount: Some("19.99".to_string()),
+            price_currency: Some("USD".to_string()),
             download_url: "https://example.com/download".to_string(),
             publisher_npub: "npub1completepublisher".to_string(),
             created_at: 1_710_000_000,
@@ -920,6 +932,8 @@ mod tests {
         assert_eq!(loaded_listing.title, listing.title);
         assert_eq!(loaded_listing.description, listing.description);
         assert_eq!(loaded_listing.price_sats, listing.price_sats);
+        assert_eq!(loaded_listing.price_amount, listing.price_amount);
+        assert_eq!(loaded_listing.price_currency, listing.price_currency);
         assert_eq!(loaded_listing.download_url, listing.download_url);
         assert_eq!(loaded_listing.publisher_npub, listing.publisher_npub);
         assert_eq!(loaded_listing.created_at, listing.created_at);
@@ -955,6 +969,8 @@ mod tests {
             title: "Minimal Game".to_string(),
             description: "A game with minimal fields".to_string(),
             price_sats: 1000,
+            price_amount: Some("1000".to_string()),
+            price_currency: Some("SATS".to_string()),
             download_url: "https://example.com/minimal".to_string(),
             publisher_npub: "npub1minimalpublisher".to_string(),
             created_at: 1_710_000_001,

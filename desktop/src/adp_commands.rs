@@ -200,7 +200,7 @@ pub(crate) async fn resolve_active_signer(
         .ok_or_else(|| "not authenticated".to_string())
 }
 
-async fn ensure_publish_account_current(
+pub(crate) async fn ensure_publish_account_current(
     state: &State<'_, AppState>,
     signer_state: &Arc<tokio::sync::Mutex<AppSignerState>>,
     expected: nostr::PublicKey,
@@ -212,9 +212,7 @@ async fn ensure_publish_account_current(
         .await
         .map_err(|error| error.to_string())?;
     if current != expected {
-        return Err(
-            "active account changed while fulfillment authorization was being prepared".into(),
-        );
+        return Err("active account changed while publication was being prepared".into());
     }
     Ok(())
 }
@@ -1120,7 +1118,7 @@ fn publisher_hex_from_npub(publisher_npub: &str) -> Result<String, String> {
         .map_err(|err| format!("invalid publisher npub: {err}"))
 }
 
-fn verify_expected_publisher(
+pub(crate) fn verify_expected_publisher(
     expected_publisher_npub: &str,
     signer_pubkey: nostr::PublicKey,
 ) -> Result<(), String> {

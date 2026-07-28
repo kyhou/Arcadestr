@@ -144,6 +144,8 @@ fn sample_listing() -> GameListing {
         title: "Test Game".to_string(),
         description: "Section 6 test listing".to_string(),
         price_sats: 1000,
+        price_amount: Some("1000".to_string()),
+        price_currency: Some("SATS".to_string()),
         download_url: "https://example.com/game.zip".to_string(),
         publisher_npub: "npub1testpublisher".to_string(),
         created_at: 1_710_000_000,

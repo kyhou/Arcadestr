@@ -21,6 +21,8 @@ use crate::tauri_bridge::{
     DiscoverCampaignSummariesRequest, DiscoverCampaignsRequest, DiscoveredCampaign,
     UpdateCampaignPointerRequest,
 };
+#[cfg(not(feature = "web"))]
+use crate::ui_v2::views::StorePageEditorView;
 use crate::ui_v2::views::{use_fallback_cover, valid_cover_url};
 
 #[derive(Clone, PartialEq)]
@@ -29,6 +31,7 @@ pub enum PublishViewState {
     NewPublication,
     EditPublication(GameListing),
     Game(GameListing),
+    StorePage(GameListing),
     Campaign {
         listing: GameListing,
         campaign: Option<DiscoveredCampaign>,
@@ -95,6 +98,13 @@ pub fn PublishV2View(
                     listing=listing
                     on_back=Callback::new({ let on_navigate = on_navigate.clone(); move |_| on_navigate.run(PublishViewState::Games) })
                     on_navigate={on_navigate.clone()}
+                />
+            }.into_any(),
+            PublishViewState::StorePage(listing) => view! {
+                <StorePageEditorView
+                    listing=listing.clone()
+                    on_back=Callback::new({ let on_navigate = on_navigate.clone(); let listing = listing.clone(); move |_| on_navigate.run(PublishViewState::Game(listing.clone())) })
+                    on_saved=Callback::new({ let on_navigate = on_navigate.clone(); move |listing| on_navigate.run(PublishViewState::Game(listing)) })
                 />
             }.into_any(),
             PublishViewState::Campaign { listing, campaign } => view! {
@@ -368,7 +378,9 @@ fn GameManagementView(
     let listing_for_effect = listing.clone();
     let listing_for_button = listing_for_effect.clone();
     let listing_for_edit = listing.clone();
+    let listing_for_store_page = listing.clone();
     let on_navigate_for_edit = on_navigate.clone();
+    let on_navigate_for_store_page = on_navigate.clone();
     let discovery_generation = RwSignal::new(0_u64);
     let discovery_account = RwSignal::new(None::<String>);
     Effect::new(move |_| {
@@ -444,6 +456,12 @@ fn GameManagementView(
             </header>
             <div class="v2-publisher-management-layout">
             <main class="v2-publisher-main">
+            <section class="v2-publisher-panel">
+                <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                    <div><h2>"Store Page"</h2><p class="text-sm text-on-surface-variant">"Edit buyer-facing presentation separately from authoritative price, access, builds, and fulfillment."</p></div>
+                    <button class="v2-btn-primary" on:click=move |_| on_navigate_for_store_page.run(PublishViewState::StorePage(listing_for_store_page.clone()))>"Manage Store Page"</button>
+                </div>
+            </section>
             <section class="v2-publisher-panel">
                 <h2>"Network publication"</h2>
                 <dl class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 text-sm">

@@ -12,6 +12,7 @@ pub mod purchases;
 pub mod settings;
 pub mod social;
 pub mod store_front;
+pub mod store_page_publish;
 
 pub use achievements::AchievementsView;
 pub use browse_games::{BrowseGamesView, BrowseRequest};
@@ -24,6 +25,7 @@ pub use purchases::PurchasesView;
 pub use settings::SettingsView;
 pub use social::SocialView;
 pub use store_front::StoreFrontView;
+pub use store_page_publish::StorePageEditorView;
 
 const FALLBACK_COVER: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 10'%3E%3Crect width='16' height='10' fill='%2325232a'/%3E%3Cpath d='M6 4h4v2H6z' fill='%23a9a2b3'/%3E%3C/svg%3E";
 

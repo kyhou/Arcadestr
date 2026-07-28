@@ -58,6 +58,7 @@ mod adp_commands;
 mod command_contracts;
 mod install;
 mod nip46_commands;
+mod store_page_commands;
 
 use arcadestr_app::models::GameListing as AppGameListing;
 use command_contracts::{
@@ -867,8 +868,12 @@ fn app_listing_from_cached_listing(listing: CoreGameListing) -> AppGameListing {
         description: listing.description,
         images: listing.images,
         download_url: listing.download_url,
-        price: listing.price_sats as f64,
-        currency: "SATS".to_string(),
+        price: listing
+            .price_amount
+            .as_deref()
+            .and_then(|amount| amount.parse::<f64>().ok())
+            .unwrap_or(listing.price_sats as f64),
+        currency: listing.price_currency.unwrap_or_else(|| "SATS".to_string()),
         price_sats: listing.price_sats,
         quantity: None,
         tags: listing.tags,
@@ -2696,6 +2701,8 @@ mod task4_tests {
             title: "Game".to_string(),
             description: "Description".to_string(),
             price_sats: 100,
+            price_amount: Some("100".to_string()),
+            price_currency: Some("SATS".to_string()),
             download_url: "https://example.com/game.zip".to_string(),
             publisher_npub: "npub1publisher".to_string(),
             created_at: 1,
@@ -2789,14 +2796,16 @@ mod task4_tests {
     }
 
     #[test]
-    fn cached_core_listing_maps_to_app_listing_with_defaults() {
+    fn cached_core_listing_preserves_exact_non_sats_price() {
         let cached = CoreGameListing {
             id: "game-v1".to_string(),
             event_id: None,
             source: ListingSource::Nip99Listing,
             title: "Game".to_string(),
             description: "Description".to_string(),
-            price_sats: 21,
+            price_sats: 0,
+            price_amount: Some("19.99".to_string()),
+            price_currency: Some("USD".to_string()),
             download_url: "https://example.com/game.zip".to_string(),
             publisher_npub: "npub1publisher".to_string(),
             created_at: 7,
@@ -2821,8 +2830,9 @@ mod task4_tests {
 
         assert_eq!(listing.platforms, vec!["linux-x86_64"]);
         assert_eq!(listing.nip94_event_id, Some("nip94-event-1".to_string()));
-        assert_eq!(listing.price_sats, 21);
-        assert_eq!(listing.currency, "SATS");
+        assert_eq!(listing.price, 19.99);
+        assert_eq!(listing.price_sats, 0);
+        assert_eq!(listing.currency, "USD");
         assert!(!listing.is_owned);
     }
 }
@@ -5029,6 +5039,13 @@ fn main() {
             fetch_listing_by_id,
             fetch_marketplace,
             fetch_marketplace_stream,
+            store_page_commands::enrich_store_pages,
+            store_page_commands::enrich_store_page_detail,
+            store_page_commands::load_publisher_store_page_editor,
+            store_page_commands::validate_store_page_draft_command,
+            store_page_commands::publish_store_page,
+            store_page_commands::clone_store_page,
+            store_page_commands::retry_store_page_pointer_sync,
             get_listing_ownership,
             get_platform_info,
             get_installed_games,

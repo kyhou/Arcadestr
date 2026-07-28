@@ -121,6 +121,7 @@ pub struct SendEventResult {
 }
 
 /// Background relay manager that maintains persistent connections
+#[derive(Clone)]
 pub struct RelayManager {
     client: Client,
     pool: Arc<RelayPool>,

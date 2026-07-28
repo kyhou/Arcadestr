@@ -96,6 +96,183 @@ pub struct CampaignPointer {
     pub relay_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorePageListingRef {
+    pub listing_coordinate: String,
+    pub listing_event_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorePageEnrichmentRequest {
+    pub generation: u64,
+    pub listings: Vec<StorePageListingRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorePageCardPresentation {
+    pub listing_coordinate: String,
+    pub store_page_coordinate: String,
+    pub event_id: String,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub capsule_url: Option<String>,
+    pub hero_url: Option<String>,
+    pub genres: Vec<String>,
+    pub features: Vec<String>,
+    pub release_date: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "presentation", rename_all = "snake_case")]
+pub enum StorePageEnrichmentState {
+    Enriched(StorePageCardPresentation),
+    NotAssociated,
+    NotFound,
+    Invalid,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorePageEnrichmentResult {
+    pub listing_coordinate: String,
+    pub listing_event_id: String,
+    pub state: StorePageEnrichmentState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorePageBatchEnrichment {
+    pub generation: u64,
+    pub cached: Vec<StorePageEnrichmentResult>,
+    pub refreshed: Vec<StorePageEnrichmentResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeStorePageHtml(String);
+
+impl SafeStorePageHtml {
+    pub(crate) fn from_backend(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePageMedia {
+    pub id: String,
+    pub media_type: String,
+    pub role: String,
+    pub url: String,
+    pub thumbnail_url: Option<String>,
+    pub alt: Option<String>,
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePageDetailSection {
+    pub id: String,
+    pub heading: String,
+    pub body_html: SafeStorePageHtml,
+    pub media_id: Option<String>,
+    pub layout: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePageLanguage {
+    pub code: String,
+    pub interface: bool,
+    pub audio: bool,
+    pub subtitles: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePageRequirementTier {
+    pub os: Option<String>,
+    pub processor: Option<String>,
+    pub memory: Option<String>,
+    pub graphics: Option<String>,
+    pub storage: Option<String>,
+    pub additional: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePagePlatformRequirements {
+    pub platform: String,
+    pub minimum: Option<StorePageRequirementTier>,
+    pub recommended: Option<StorePageRequirementTier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePageAccessibility {
+    pub feature: String,
+    pub supported: bool,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StorePageLinks {
+    pub website: Option<String>,
+    pub support: Option<String>,
+    pub documentation: Option<String>,
+    pub source: Option<String>,
+    pub community: Option<String>,
+    pub privacy_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameDetailPresentation {
+    pub listing_coordinate: String,
+    pub listing_event_id: String,
+    pub store_page_coordinate: String,
+    pub event_id: String,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub description_html: Option<SafeStorePageHtml>,
+    pub media: Vec<StorePageMedia>,
+    pub sections: Vec<StorePageDetailSection>,
+    pub genres: Vec<String>,
+    pub features: Vec<String>,
+    pub languages: Vec<StorePageLanguage>,
+    pub requirements: Vec<StorePagePlatformRequirements>,
+    pub accessibility: Vec<StorePageAccessibility>,
+    pub links: StorePageLinks,
+    pub developer: Option<String>,
+    pub publisher: Option<String>,
+    pub release_date: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorePageDetailState {
+    Enriched(GameDetailPresentation),
+    NotAssociated,
+    NotFound,
+    Invalid,
+    Unsupported,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePageDetailEnrichment {
+    pub generation: u64,
+    pub listing_event_current: bool,
+    pub cached: Option<GameDetailPresentation>,
+    pub refreshed: StorePageDetailState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameDetailCommerce {
+    pub listing_coordinate: String,
+    pub price_sats: u64,
+    pub acquisition: AcquisitionPolicy,
+    pub owned: bool,
+    pub platforms: Vec<String>,
+    pub version: Option<String>,
+    pub distribution_available: bool,
+    pub file_hash: Option<String>,
+}
+
 /// A game (or any digital product) available in the marketplace.
 ///
 /// This type is the shared currency between the Tauri backend and the Leptos

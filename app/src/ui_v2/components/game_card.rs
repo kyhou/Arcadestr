@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::models::{AcquisitionPolicy, GameListing};
+use crate::models::{AcquisitionPolicy, GameListing, StorePageCardPresentation};
 
 const FALLBACK_COVER: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 10'%3E%3Crect width='16' height='10' fill='%23191a22'/%3E%3Cpath d='M6 4h4v2H6z' fill='%23aaa4b5'/%3E%3C/svg%3E";
 
@@ -146,20 +146,20 @@ pub fn GameCard(
     presentation: GameCardPresentation,
     on_open: Callback<GameListing>,
     #[prop(optional)] categories: Option<Vec<String>>,
+    store_page: Option<StorePageCardPresentation>,
     #[prop(optional)] on_action: Option<Callback<GameCardAction>>,
 ) -> impl IntoView {
-    let image_url = valid_cover_url(&listing.images).unwrap_or_else(|| FALLBACK_COVER.to_string());
-    let title = listing.title.clone();
+    let display = resolve_card_content(&listing, store_page.as_ref(), categories);
+    let image_url = display.image_url;
+    let title = display.title;
+    let summary = display.summary;
     let title_for_open = listing.clone();
     let publisher = listing
         .stall_name
         .clone()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| crate::models::npub_fallback_label(&listing.publisher_npub));
-    let tags = match categories {
-        Some(categories) => categories.into_iter().take(2).collect::<Vec<_>>(),
-        None => listing.tags.iter().take(2).cloned().collect::<Vec<_>>(),
-    };
+    let tags = display.badges;
     let badge = access_badge(presentation.access);
     let price = price_label(&listing, presentation);
     let action = presentation.action;
@@ -205,6 +205,7 @@ pub fn GameCard(
                     </div>
                     <p class="shrink-0 text-right text-sm font-semibold text-primary">{price}</p>
                 </div>
+                <p class="line-clamp-2 min-h-10 text-sm text-on-surface-variant">{summary}</p>
                 <div class="mt-auto flex items-center justify-between gap-3">
                     <span class="min-w-0 truncate text-xs text-on-surface-variant">{format!("by {publisher}")}</span>
                     {move || match (action, on_action) {
@@ -222,6 +223,56 @@ pub fn GameCard(
                 </div>
             </div>
         </article>
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CardDisplayContent {
+    title: String,
+    summary: String,
+    image_url: String,
+    badges: Vec<String>,
+}
+
+fn resolve_card_content(
+    listing: &GameListing,
+    store_page: Option<&StorePageCardPresentation>,
+    categories: Option<Vec<String>>,
+) -> CardDisplayContent {
+    let title = store_page
+        .and_then(|page| page.title.clone())
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| listing.title.clone());
+    let summary = store_page
+        .and_then(|page| page.summary.clone())
+        .filter(|summary| !summary.trim().is_empty())
+        .unwrap_or_else(|| listing.description.chars().take(180).collect());
+    let store_image = store_page
+        .and_then(|page| page.capsule_url.as_ref().or(page.hero_url.as_ref()))
+        .cloned();
+    let image_url = store_image
+        .and_then(|url| valid_cover_url(&[url]))
+        .or_else(|| valid_cover_url(&listing.images))
+        .unwrap_or_else(|| FALLBACK_COVER.to_string());
+    let badges = store_page
+        .map(|page| {
+            page.genres
+                .iter()
+                .chain(&page.features)
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .filter(|badges| !badges.is_empty())
+        .unwrap_or_else(|| match categories {
+            Some(categories) => categories.into_iter().take(2).collect(),
+            None => listing.tags.iter().take(2).cloned().collect(),
+        });
+    CardDisplayContent {
+        title,
+        summary,
+        image_url,
+        badges,
     }
 }
 
@@ -469,5 +520,46 @@ mod tests {
             false,
         );
         assert_eq!(gated.access, GameCardAccess::Gated);
+    }
+
+    #[test]
+    fn store_page_content_enriches_only_card_display_with_listing_fallbacks() {
+        let mut listing = listing();
+        listing.images = vec!["https://cdn.example.org/listing.webp".into()];
+        listing.tags = vec!["listing-genre".into()];
+        let page = StorePageCardPresentation {
+            listing_coordinate: "30402:publisher:game-id".into(),
+            store_page_coordinate: "30407:publisher:page".into(),
+            event_id: "event".into(),
+            title: Some("Store title".into()),
+            summary: Some("Store summary".into()),
+            capsule_url: Some("https://cdn.example.org/capsule.webp".into()),
+            hero_url: Some("https://cdn.example.org/hero.webp".into()),
+            genres: vec!["action".into(), "adventure".into()],
+            features: vec!["windows-x86_64".into()],
+            release_date: Some("2026-10-12".into()),
+        };
+        let display = resolve_card_content(&listing, Some(&page), None);
+        assert_eq!(display.title, "Store title");
+        assert_eq!(display.summary, "Store summary");
+        assert_eq!(display.image_url, "https://cdn.example.org/capsule.webp");
+        assert_eq!(display.badges, vec!["action", "adventure"]);
+
+        let fallback = resolve_card_content(&listing, None, None);
+        assert_eq!(fallback.title, listing.title);
+        assert_eq!(fallback.image_url, listing.images[0]);
+        assert_eq!(fallback.badges, listing.tags);
+
+        let authoritative = GameCardPresentation::from_listing(
+            &listing,
+            1,
+            PlatformCompatibility::Incompatible,
+            false,
+        );
+        assert_eq!(
+            authoritative.compatibility,
+            PlatformCompatibility::Incompatible
+        );
+        assert_eq!(authoritative.action, Some(GameCardAction::ViewDetails));
     }
 }

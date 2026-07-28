@@ -465,11 +465,15 @@ pub struct GameListing {
     pub source: ListingSource,
     pub title: String,
     pub description: String,
-    pub price_sats: u64,        // price in satoshis, 0 = free
-    pub download_url: String,   // direct download link (may be encrypted in future)
+    pub price_sats: u64, // price in satoshis, 0 = free
+    #[serde(default)]
+    pub price_amount: Option<String>,
+    #[serde(default)]
+    pub price_currency: Option<String>,
+    pub download_url: String, // direct download link (may be encrypted in future)
     pub publisher_npub: String, // bech32 npub of the publisher
-    pub created_at: u64,        // unix timestamp
-    pub tags: Vec<String>,      // freeform tags e.g. ["rpg", "pixel-art"]
+    pub created_at: u64,      // unix timestamp
+    pub tags: Vec<String>,    // freeform tags e.g. ["rpg", "pixel-art"]
     #[serde(default)]
     pub specs: Vec<(String, String)>,
     pub lud16: String, // Lightning address for payments (e.g., "seller@walletofsatoshi.com")
@@ -538,6 +542,8 @@ impl GameListing {
             title: product.name,
             description: product.description.unwrap_or_default(),
             price_sats,
+            price_amount: Some(product.price.to_string()),
+            price_currency: Some(product.currency),
             download_url,
             publisher_npub: product.merchant_npub,
             created_at: product.created_at,
@@ -614,6 +620,8 @@ impl GameListing {
             title: listing.title,
             description: listing.content,
             price_sats,
+            price_amount: listing.price_amount,
+            price_currency: listing.price_currency,
             download_url: listing.images.first().cloned().unwrap_or_default(),
             publisher_npub: listing.merchant_npub,
             created_at: listing.created_at,
@@ -1792,6 +1800,8 @@ pub fn event_to_game_listing(event: &Event) -> Result<GameListing, NostrError> {
         title,
         description: content.description,
         price_sats,
+        price_amount: Some(price_str),
+        price_currency: Some("SATS".to_string()),
         download_url: content.download_url,
         publisher_npub,
         created_at: event.created_at.as_secs(),
@@ -1826,6 +1836,8 @@ mod listing_event_tests {
             title: "Sample Game".to_string(),
             description: "A sample game".to_string(),
             price_sats: 21,
+            price_amount: Some("21".to_string()),
+            price_currency: Some("SATS".to_string()),
             download_url: "https://example.com/sample.zip".to_string(),
             publisher_npub: "".to_string(),
             created_at: 0,

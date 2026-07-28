@@ -1075,6 +1075,8 @@ fn test_game_listing(publisher_npub: String, id: &str) -> GameListing {
         title: "Test Game".to_string(),
         description: "Integration scenario listing".to_string(),
         price_sats: 1_000,
+        price_amount: Some("1000".to_string()),
+        price_currency: Some("SATS".to_string()),
         download_url: "https://example.com/game.zip".to_string(),
         publisher_npub,
         created_at: 1_710_000_000,
