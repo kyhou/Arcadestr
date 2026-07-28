@@ -99,6 +99,25 @@ fn clear_recovery(key: &str) {
     });
 }
 
+fn seed_new_draft_association(
+    draft: &mut StorePageDraft,
+    raw: &mut RawDraftFields,
+    coordinate: &str,
+    event_id: Option<&str>,
+) {
+    let Some(event_id) = event_id else {
+        return;
+    };
+    let association = format!("{coordinate}\t{event_id}\tlink");
+    if raw.associations.trim().is_empty()
+        && draft.listing_coordinates.is_empty()
+        && draft.loaded_event_id.is_none()
+    {
+        raw.associations = association;
+        draft.listing_coordinates = vec![coordinate.to_string()];
+    }
+}
+
 fn csv(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -514,35 +533,44 @@ pub fn StorePageEditorView(
     let cached = cached_draft(&key);
     let recovered = recovery(&key);
     let fallback = StorePageDraft::new(listing.id.clone(), vec![coordinate.clone()]);
-    let draft = RwSignal::new(
-        cached
-            .as_ref()
-            .map_or_else(|| fallback.clone(), |entry| entry.draft.clone()),
-    );
+    let mut initial_draft = cached
+        .as_ref()
+        .map_or_else(|| fallback.clone(), |entry| entry.draft.clone());
     let baseline = RwSignal::new(
         cached
             .as_ref()
             .map_or_else(|| fallback, |entry| entry.baseline.clone()),
     );
     let listings = RwSignal::new(Vec::<PublisherStorePageListingRevision>::new());
+    let selected_association = listing
+        .event_id
+        .as_ref()
+        .map(|event_id| format!("{coordinate}\t{event_id}\tlink"))
+        .unwrap_or_default();
     let default_raw = RawDraftFields {
-        associations: String::new(),
-        media: format_media(&draft.get_untracked().content.media),
-        sections: format_sections(&draft.get_untracked().content.sections),
+        associations: selected_association.clone(),
+        media: format_media(&initial_draft.content.media),
+        sections: format_sections(&initial_draft.content.sections),
         languages: format_languages(
-            draft
-                .get_untracked()
+            initial_draft
                 .content
                 .languages
                 .as_deref()
                 .unwrap_or_default(),
         ),
-        requirements: format_requirements(&draft.get_untracked().content.requirements),
-        accessibility: format_accessibility(&draft.get_untracked().content.accessibility),
+        requirements: format_requirements(&initial_draft.content.requirements),
+        accessibility: format_accessibility(&initial_draft.content.accessibility),
     };
-    let raw = cached
+    let mut raw = cached
         .as_ref()
         .map_or(default_raw, |entry| entry.raw.clone());
+    seed_new_draft_association(
+        &mut initial_draft,
+        &mut raw,
+        &coordinate,
+        listing.event_id.as_deref(),
+    );
+    let draft = RwSignal::new(initial_draft);
     let associations_text = RwSignal::new(raw.associations);
     let media_text = RwSignal::new(raw.media);
     let sections_text = RwSignal::new(raw.sections);
@@ -1377,6 +1405,28 @@ mod tests {
         retain_account_drafts("npub-b");
         assert!(cached_draft("npub-a|listing").is_none());
         assert!(cached_draft("npub-b|listing").is_none());
+    }
+
+    #[test]
+    fn new_draft_keeps_selected_listing_association_before_load() {
+        let coordinate = "30402:publisher:game";
+        let mut draft = StorePageDraft::new("game".into(), Vec::new());
+        let mut raw = RawDraftFields {
+            associations: String::new(),
+            media: String::new(),
+            sections: String::new(),
+            languages: String::new(),
+            requirements: String::new(),
+            accessibility: String::new(),
+        };
+
+        seed_new_draft_association(&mut draft, &mut raw, coordinate, Some("listing-event"));
+
+        assert_eq!(draft.listing_coordinates, vec![coordinate.to_string()]);
+        assert_eq!(
+            raw.associations,
+            format!("{coordinate}\tlisting-event\tlink")
+        );
     }
 
     #[test]
