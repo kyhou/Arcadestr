@@ -3810,6 +3810,266 @@ dialog.v2-confirm-backdrop::backdrop {
   line-height: 1.65;
 }
 
+/* Typed Store Page editor */
+.v2-store-page-editor {
+  min-width: 0;
+  padding-bottom: 6.5rem;
+  overflow-x: clip;
+}
+
+.v2-store-editor-tabs {
+  position: sticky;
+  top: 68px;
+  z-index: 30;
+  display: flex;
+  gap: 0.35rem;
+  max-width: 100%;
+  padding: 0.55rem;
+  overflow-x: auto;
+  border: 1px solid var(--v2-outline-ghost);
+  border-radius: var(--v2-radius-lg);
+  background: oklch(0.19 0.02 270 / 94%);
+  scrollbar-width: thin;
+}
+
+.v2-store-editor-tabs button {
+  flex: 0 0 auto;
+  min-height: 42px;
+  padding: 0.65rem 0.9rem;
+  border: 1px solid transparent;
+  border-radius: var(--v2-radius-md);
+  color: var(--v2-on-surface-variant);
+  background: transparent;
+  cursor: pointer;
+}
+
+.v2-store-editor-tabs button:hover,
+.v2-store-editor-tab-active {
+  color: var(--v2-on-background) !important;
+  border-color: var(--v2-outline-ghost) !important;
+  background: var(--v2-surface-highest) !important;
+}
+
+.v2-store-editor-tabs button:focus-visible,
+.v2-store-page-editor button:focus-visible,
+.v2-store-page-editor summary:focus-visible,
+.v2-store-page-editor a:focus-visible {
+  outline: 2px solid var(--v2-secondary);
+  outline-offset: 2px;
+}
+
+.v2-store-field-label {
+  display: block;
+  margin-bottom: 0.45rem;
+  font-weight: 750;
+}
+
+.v2-store-chip-row,
+.v2-store-add-row,
+.v2-store-section-heading,
+.v2-store-card-actions,
+.v2-store-preview-banner,
+.v2-store-language-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.v2-store-section-heading {
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.v2-store-section-heading h2 {
+  margin-bottom: 0;
+}
+
+.v2-store-add-row .v2-input {
+  min-width: min(18rem, 100%);
+}
+
+.v2-store-card {
+  min-width: 0;
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--v2-outline-ghost);
+  border-radius: var(--v2-radius-lg);
+  background: var(--v2-surface-high);
+}
+
+.v2-store-card .v2-input,
+.v2-store-tier .v2-input {
+  border-color: color-mix(in oklch, var(--v2-outline) 58%, transparent);
+  background-color: var(--v2-surface-lowest) !important;
+}
+
+.v2-store-card-actions {
+  justify-content: flex-end;
+  margin-bottom: 0.8rem;
+}
+
+.v2-store-card-actions button,
+.v2-store-toolbar button,
+.v2-store-preview-banner button,
+.v2-store-language-row button,
+.v2-store-overflow button {
+  min-height: 36px;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--v2-outline);
+  border-radius: var(--v2-radius-sm);
+  color: var(--v2-on-background);
+  background: var(--v2-surface-high);
+  cursor: pointer;
+}
+
+.v2-store-form-grid,
+.v2-store-tier {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.v2-store-tier {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--v2-outline-ghost);
+  border-radius: var(--v2-radius-md);
+  background: var(--v2-surface-highest);
+}
+
+.v2-store-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.7rem;
+}
+
+/* Markdown destinations belong to the typed Links fields, never the prose toolbar. */
+.v2-store-toolbar button:nth-child(3) {
+  display: none;
+}
+
+.v2-store-diagnostic-list button {
+  padding: 0;
+  border: 0;
+  color: var(--v2-secondary);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.v2-store-canonical-placeholder {
+  padding: 2rem;
+  border: 1px dashed var(--v2-outline);
+  border-radius: var(--v2-radius-lg);
+  text-align: center;
+}
+
+.v2-store-media-preview {
+  display: block;
+  width: min(100%, 34rem);
+  max-height: 20rem;
+  margin-top: 1rem;
+  border-radius: var(--v2-radius-md);
+  object-fit: contain;
+  background: #000;
+}
+
+#store-editor-media .v2-store-card::after {
+  content: 'Draft media is not loaded here. Validate to use the canonical preview.';
+  display: block;
+  margin-top: 1rem;
+  padding: 0.8rem;
+  border: 1px dashed var(--v2-outline);
+  border-radius: var(--v2-radius-md);
+  color: var(--v2-on-surface-variant);
+  font-size: 0.82rem;
+}
+
+.v2-store-mono {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+}
+
+.v2-store-accessibility-row {
+  display: grid;
+  grid-template-columns: minmax(10rem, 0.6fr) minmax(8rem, 0.35fr) minmax(14rem, 1fr);
+  align-items: center;
+  gap: 1rem;
+  padding: 0.8rem 0;
+  border-bottom: 1px solid var(--v2-outline-ghost);
+}
+
+.v2-store-accessibility-row small,
+.v2-store-accessibility-row strong {
+  display: block;
+}
+
+.v2-store-preview {
+  width: 100%;
+  margin-inline: auto;
+  padding: 1rem;
+  border: 2px solid var(--v2-primary);
+  border-radius: var(--v2-radius-xl);
+  transition: max-width 180ms ease;
+}
+
+.v2-store-preview-narrow {
+  max-width: 430px;
+}
+
+.v2-store-preview-banner {
+  margin: -1rem -1rem 1rem;
+  padding: 0.85rem 1rem;
+  background: oklch(0.6 0.24 295 / 20%);
+}
+
+.v2-store-readiness-toggle {
+  display: none;
+  width: fit-content;
+}
+
+.v2-store-editor-footer {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 45;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  max-width: calc(100vw - 2rem);
+  padding: 0.7rem;
+  border: 1px solid var(--v2-outline);
+  border-radius: var(--v2-radius-xl);
+  background: oklch(0.19 0.02 270 / 96%);
+  box-shadow: var(--v2-shadow-ambient);
+}
+
+.v2-store-overflow {
+  position: relative;
+}
+
+.v2-store-overflow > summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.v2-store-overflow > div {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 0.8rem);
+  display: grid;
+  gap: 0.7rem;
+  width: min(22rem, calc(100vw - 2rem));
+  padding: 1rem;
+  border: 1px solid var(--v2-outline);
+  border-radius: var(--v2-radius-lg);
+  background: var(--v2-surface-high);
+  box-shadow: var(--v2-shadow-ambient);
+}
+
 @media (max-width: 1240px) and (min-width: 961px) {
   .v2-detail-hero {
     grid-template-columns: minmax(0, 1fr) 240px;
@@ -3902,6 +4162,36 @@ dialog.v2-confirm-backdrop::backdrop {
 
   .v2-publisher-sidebar {
     position: static;
+  }
+
+  .v2-store-editor-tabs {
+    top: 80px;
+  }
+
+  .v2-store-readiness-toggle {
+    display: inline-flex;
+  }
+
+  .v2-store-readiness {
+    display: none;
+  }
+
+  .v2-store-readiness-open {
+    display: grid;
+  }
+
+  .v2-store-form-grid,
+  .v2-store-tier,
+  .v2-store-accessibility-row {
+    grid-template-columns: 1fr;
+  }
+
+  .v2-store-editor-footer {
+    right: 0.5rem;
+    bottom: calc(76px + 0.5rem);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) repeat(3, auto);
+    max-width: calc(100vw - 1rem);
   }
 
   .v2-settings-account-card,

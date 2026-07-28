@@ -1,14 +1,15 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use arcadestr_core::store_page::{
-    AccessibilityFeature, LanguageSupport, PlatformRequirement, RequirementTier, StorePageDraft,
-    StorePageMediaItem, StorePageSection,
+    AccessibilityFeature, LanguageSupport, StorePageDraft, StorePageMediaItem, StorePageSection,
 };
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::campaign_management::{accepts_account_response, listing_coordinate};
+use crate::components::DatePicker;
 use crate::models::{GameDetailPresentation, GameListing, StorePageListingRef};
 use crate::tauri_bridge::{
     invoke_clone_store_page, invoke_load_publisher_store_page_editor, invoke_publish_store_page,
@@ -21,18 +22,17 @@ use crate::ui_v2::components::StorePageRichDetail;
 struct CachedDraft {
     draft: StorePageDraft,
     baseline: StorePageDraft,
-    raw: RawDraftFields,
+    associations: Vec<AssociationRow>,
     input_dirty: bool,
 }
 
-#[derive(Clone)]
-struct RawDraftFields {
-    associations: String,
-    media: String,
-    sections: String,
-    languages: String,
-    requirements: String,
-    accessibility: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AssociationRow {
+    listing_coordinate: String,
+    event_id: String,
+    reciprocal: bool,
+    action: ListingPointerMutation,
+    relay_hint: Option<String>,
 }
 
 #[derive(Clone)]
@@ -40,11 +40,106 @@ struct PublisherRecovery {
     response: PublishStorePageResponse,
     mutations: Vec<StorePageListingMutation>,
     draft: StorePageDraft,
+    selected_listing_event_id: Option<String>,
 }
 
 thread_local! {
     static PUBLISHER_STORE_PAGE_DRAFTS: RefCell<HashMap<String, CachedDraft>> = RefCell::new(HashMap::new());
     static PUBLISHER_STORE_PAGE_RECOVERY: RefCell<HashMap<String, PublisherRecovery>> = RefCell::new(HashMap::new());
+}
+
+const EDITOR_TABS: [(&str, &str); 8] = [
+    ("basic", "Basic Info"),
+    ("description", "Description"),
+    ("media", "Media"),
+    ("sections", "Feature Sections"),
+    ("requirements", "Requirements"),
+    ("languages", "Languages"),
+    ("accessibility", "Accessibility"),
+    ("links", "Links"),
+];
+const CANONICAL_PREVIEW_SOURCE: &str = "canonical-validation";
+
+fn diagnostic_tab(message: &str) -> &'static str {
+    let normalized = message.to_ascii_lowercase();
+    EDITOR_TABS
+        .iter()
+        .find_map(|(id, _)| normalized.contains(id).then_some(*id))
+        .unwrap_or("basic")
+}
+
+fn adjacent_tab(current: &str, direction: isize) -> &'static str {
+    let index = EDITOR_TABS
+        .iter()
+        .position(|(id, _)| *id == current)
+        .unwrap_or_default() as isize;
+    let len = EDITOR_TABS.len() as isize;
+    EDITOR_TABS[((index + direction).rem_euclid(len)) as usize].0
+}
+
+fn focus_editor_tab(id: &str) {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return;
+    };
+    let Some(element) = document.get_element_by_id(&format!("store-editor-tab-{id}")) else {
+        return;
+    };
+    if let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() {
+        let _ = element.focus();
+    }
+}
+
+fn unique_editor_id<'a>(prefix: &str, existing_ids: impl IntoIterator<Item = &'a str>) -> String {
+    let existing = existing_ids
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    (1usize..)
+        .map(|sequence| format!("{prefix}-{sequence}"))
+        .find(|candidate| !existing.contains(candidate.as_str()))
+        .unwrap_or_else(|| format!("{prefix}-new"))
+}
+
+fn validate_editor_ids(draft: &StorePageDraft) -> Result<(), String> {
+    let mut media_ids = std::collections::HashSet::new();
+    if draft
+        .content
+        .media
+        .iter()
+        .any(|item| item.id.trim().is_empty() || !media_ids.insert(item.id.as_str()))
+    {
+        return Err("Media IDs must be non-empty and unique.".into());
+    }
+    let mut section_ids = std::collections::HashSet::new();
+    if draft
+        .content
+        .sections
+        .iter()
+        .any(|section| section.id.trim().is_empty() || !section_ids.insert(section.id.as_str()))
+    {
+        return Err("Feature section IDs must be non-empty and unique.".into());
+    }
+    Ok(())
+}
+
+fn description_contains_link(markdown: &str) -> bool {
+    let bytes = markdown.as_bytes();
+    bytes.windows(2).any(|window| window == b"](")
+        || bytes.windows(3).any(|window| window == b"![")
+        || markdown.contains("]:")
+        || markdown.contains("http://")
+        || markdown.contains("https://")
+        || markdown.to_ascii_lowercase().contains("<img")
+}
+
+fn selected_replacement_event_id(
+    response: &PublishStorePageResponse,
+    selected_coordinate: &str,
+) -> Option<String> {
+    response
+        .listing_updates
+        .iter()
+        .find(|outcome| outcome.published && outcome.listing_coordinate == selected_coordinate)
+        .and_then(|outcome| outcome.replacement_event_id.clone())
 }
 
 fn draft_key(publisher: &str, listing_coordinate: &str) -> String {
@@ -67,7 +162,7 @@ fn save_cached_draft(
     key: &str,
     draft: StorePageDraft,
     baseline: StorePageDraft,
-    raw: RawDraftFields,
+    associations: Vec<AssociationRow>,
     input_dirty: bool,
 ) {
     PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| {
@@ -76,7 +171,7 @@ fn save_cached_draft(
             CachedDraft {
                 draft,
                 baseline,
-                raw,
+                associations,
                 input_dirty,
             },
         );
@@ -101,34 +196,37 @@ fn clear_recovery(key: &str) {
 
 fn seed_new_draft_association(
     draft: &mut StorePageDraft,
-    raw: &mut RawDraftFields,
+    associations: &mut Vec<AssociationRow>,
     coordinate: &str,
     event_id: Option<&str>,
 ) {
     let Some(event_id) = event_id else {
         return;
     };
-    let association = format!("{coordinate}\t{event_id}\tlink");
-    if raw.associations.trim().is_empty()
-        && draft.listing_coordinates.is_empty()
-        && draft.loaded_event_id.is_none()
-    {
-        raw.associations = association;
-        draft.listing_coordinates = vec![coordinate.to_string()];
+    if associations.is_empty() && draft.loaded_event_id.is_none() {
+        associations.push(AssociationRow {
+            listing_coordinate: coordinate.to_string(),
+            event_id: event_id.to_string(),
+            reciprocal: false,
+            action: ListingPointerMutation::Link,
+            relay_hint: None,
+        });
+        if !draft
+            .listing_coordinates
+            .iter()
+            .any(|value| value == coordinate)
+        {
+            draft.listing_coordinates.push(coordinate.to_string());
+        }
     }
-}
-
-fn csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 fn optional(value: String) -> Option<String> {
     let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn optional_editor_text(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
@@ -145,343 +243,276 @@ fn sync_compact_tags(draft: &mut StorePageDraft) {
     draft.compact_tags.support = draft.content.links.support.clone();
 }
 
-fn parse_bool(value: &str) -> Result<bool, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(format!("expected true or false, found `{value}`")),
-    }
-}
-
-fn parse_dimension(value: &str, line: usize, name: &str) -> Result<Option<u32>, String> {
-    if value.is_empty() {
-        return Ok(None);
-    }
-    value
-        .parse::<u32>()
-        .map(Some)
-        .map_err(|_| format!("Media line {line} has an invalid {name}"))
-}
-
-fn escape_cell(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '\t' => escaped.push_str("\\t"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            character => escaped.push(character),
-        }
-    }
-    escaped
-}
-
-fn unescape_cell(value: &str) -> Result<String, String> {
-    let mut decoded = String::with_capacity(value.len());
-    let mut characters = value.chars();
-    while let Some(character) = characters.next() {
-        if character != '\\' {
-            decoded.push(character);
-            continue;
-        }
-        match characters.next() {
-            Some('\\') => decoded.push('\\'),
-            Some('t') => decoded.push('\t'),
-            Some('n') => decoded.push('\n'),
-            Some('r') => decoded.push('\r'),
-            Some(other) => return Err(format!("unsupported escape sequence: \\{other}")),
-            None => return Err("unfinished escape sequence".to_string()),
-        }
-    }
-    Ok(decoded)
-}
-
-fn parse_media(value: &str) -> Result<Vec<StorePageMediaItem>, String> {
-    value
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-        .map(|(index, line)| {
-            let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
-            if fields.len() != 9 {
-                return Err(format!(
-                    "Media line {} needs 9 tab-separated fields",
-                    index + 1
-                ));
-            }
-            Ok(StorePageMediaItem {
-                id: fields[0].to_string(),
-                media_type: fields[1].to_string(),
-                role: fields[2].to_string(),
-                url: fields[3].to_string(),
-                thumbnail_url: fields
-                    .get(4)
-                    .and_then(|value| optional((*value).to_string())),
-                alt: fields
-                    .get(5)
-                    .and_then(|value| optional((*value).to_string())),
-                caption: fields
-                    .get(6)
-                    .and_then(|value| optional((*value).to_string())),
-                width: parse_dimension(fields[7], index + 1, "width")?,
-                height: parse_dimension(fields[8], index + 1, "height")?,
-            })
-        })
-        .collect()
-}
-
-fn format_media(media: &[StorePageMediaItem]) -> String {
-    media
-        .iter()
-        .map(|item| {
-            format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                item.id,
-                item.media_type,
-                item.role,
-                item.url,
-                item.thumbnail_url.clone().unwrap_or_default(),
-                item.alt.clone().unwrap_or_default(),
-                item.caption.clone().unwrap_or_default(),
-                item.width
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                item.height
-                    .map(|value| value.to_string())
-                    .unwrap_or_default()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn parse_sections(value: &str) -> Result<Vec<StorePageSection>, String> {
-    value
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-        .map(|(index, line)| {
-            let fields = line.splitn(5, '\t').collect::<Vec<_>>();
-            if fields.len() != 5 {
-                return Err(format!(
-                    "Section line {} needs id|heading|layout|media_id|Markdown",
-                    index + 1
-                ));
-            }
-            Ok(StorePageSection {
-                id: fields[0].trim().to_string(),
-                heading: unescape_cell(fields[1])?,
-                layout: fields[2].trim().to_string(),
-                media_id: optional(fields[3].trim().to_string()),
-                body_markdown: unescape_cell(fields[4])?,
-            })
-        })
-        .collect()
-}
-
-fn format_sections(sections: &[StorePageSection]) -> String {
-    sections
-        .iter()
-        .map(|section| {
-            format!(
-                "{}\t{}\t{}\t{}\t{}",
-                section.id,
-                escape_cell(&section.heading),
-                section.layout,
-                section.media_id.clone().unwrap_or_default(),
-                escape_cell(&section.body_markdown)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn parse_languages(value: &str) -> Result<Vec<LanguageSupport>, String> {
-    value
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-        .map(|(index, line)| {
-            let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
-            if fields.len() != 4 {
-                return Err(format!(
-                    "Language line {} needs code|interface|audio|subtitles",
-                    index + 1
-                ));
-            }
-            Ok(LanguageSupport {
-                code: fields[0].to_string(),
-                interface: parse_bool(fields[1])
-                    .map_err(|error| format!("Language line {}: {error}", index + 1))?,
-                audio: parse_bool(fields[2])
-                    .map_err(|error| format!("Language line {}: {error}", index + 1))?,
-                subtitles: parse_bool(fields[3])
-                    .map_err(|error| format!("Language line {}: {error}", index + 1))?,
-            })
-        })
-        .collect()
-}
-
-fn format_languages(languages: &[LanguageSupport]) -> String {
-    languages
-        .iter()
-        .map(|entry| {
-            format!(
-                "{}\t{}\t{}\t{}",
-                entry.code, entry.interface, entry.audio, entry.subtitles
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn parse_accessibility(value: &str) -> Result<Vec<AccessibilityFeature>, String> {
-    value
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-        .map(|(index, line)| {
-            let fields = line.splitn(3, '\t').map(str::trim).collect::<Vec<_>>();
-            if fields.len() < 2 {
-                return Err(format!(
-                    "Accessibility line {} needs feature|supported|notes",
-                    index + 1
-                ));
-            }
-            Ok(AccessibilityFeature {
-                feature: fields[0].to_string(),
-                supported: parse_bool(fields[1])
-                    .map_err(|error| format!("Accessibility line {}: {error}", index + 1))?,
-                notes: fields
-                    .get(2)
-                    .and_then(|value| optional((*value).to_string())),
-            })
-        })
-        .collect()
-}
-
-fn format_accessibility(entries: &[AccessibilityFeature]) -> String {
-    entries
-        .iter()
-        .map(|entry| {
-            format!(
-                "{}\t{}\t{}",
-                entry.feature,
-                entry.supported,
-                entry.notes.clone().unwrap_or_default()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn parse_requirements(value: &str) -> Result<BTreeMap<String, PlatformRequirement>, String> {
-    let mut requirements = BTreeMap::new();
-    for (index, line) in value
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-    {
-        let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
-        if fields.len() != 8 || !matches!(fields[1], "minimum" | "recommended") {
-            return Err(format!("Requirement line {} needs platform|minimum-or-recommended|os|processor|memory|graphics|storage|additional", index + 1));
-        }
-        let tier = RequirementTier {
-            os: optional(fields[2].to_string()),
-            processor: optional(fields[3].to_string()),
-            memory: optional(fields[4].to_string()),
-            graphics: optional(fields[5].to_string()),
-            storage: optional(fields[6].to_string()),
-            additional: optional(fields[7].to_string()),
-        };
-        let entry = requirements
-            .entry(fields[0].to_string())
-            .or_insert_with(PlatformRequirement::default);
-        if fields[1] == "minimum" {
-            entry.minimum = Some(tier);
-        } else {
-            entry.recommended = Some(tier);
-        }
-    }
-    Ok(requirements)
-}
-
-fn format_requirements(requirements: &BTreeMap<String, PlatformRequirement>) -> String {
-    let mut lines = Vec::new();
-    for (platform, requirement) in requirements {
-        for (name, tier) in [
-            ("minimum", requirement.minimum.as_ref()),
-            ("recommended", requirement.recommended.as_ref()),
-        ] {
-            if let Some(tier) = tier {
-                lines.push(format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    platform,
-                    name,
-                    tier.os.clone().unwrap_or_default(),
-                    tier.processor.clone().unwrap_or_default(),
-                    tier.memory.clone().unwrap_or_default(),
-                    tier.graphics.clone().unwrap_or_default(),
-                    tier.storage.clone().unwrap_or_default(),
-                    tier.additional.clone().unwrap_or_default()
-                ));
-            }
-        }
-    }
-    lines.join("\n")
-}
-
-fn parse_associations(value: &str) -> Result<Vec<StorePageListingMutation>, String> {
-    value
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-        .map(|(index, line)| {
-            let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
-            if fields.len() < 3 {
-                return Err(format!(
-                    "Association line {} needs coordinate, event ID, and link, unlink, or review",
-                    index + 1
-                ));
-            }
-            let action = match fields[2] {
-                "link" => ListingPointerMutation::Link,
-                "unlink" => ListingPointerMutation::Unlink,
-                "review" => ListingPointerMutation::Review,
-                _ => {
-                    return Err(format!(
-                        "Association line {} has an invalid action",
-                        index + 1
-                    ))
-                }
-            };
-            Ok(StorePageListingMutation {
-                listing_coordinate: fields[0].to_string(),
-                expected_event_id: fields[1].to_string(),
-                action,
-                relay_hint: fields
-                    .get(3)
-                    .and_then(|value| optional((*value).to_string())),
-                published_event_id: None,
-            })
-        })
-        .collect()
-}
-
-fn format_associations(listings: &[PublisherStorePageListingRevision]) -> String {
+fn associations_from_revisions(
+    listings: &[PublisherStorePageListingRevision],
+) -> Vec<AssociationRow> {
     listings
         .iter()
-        .map(|listing| {
-            format!(
-                "{}\t{}\t{}",
-                listing.listing_coordinate,
-                listing.event_id,
-                if listing.reciprocal { "link" } else { "review" }
+        .map(|listing| AssociationRow {
+            listing_coordinate: listing.listing_coordinate.clone(),
+            event_id: listing.event_id.clone(),
+            reciprocal: listing.reciprocal,
+            action: if listing.reciprocal {
+                ListingPointerMutation::Link
+            } else {
+                ListingPointerMutation::Review
+            },
+            relay_hint: None,
+        })
+        .collect()
+}
+
+fn adapter_requests(
+    mut draft: StorePageDraft,
+    associations: &[AssociationRow],
+) -> Result<(StorePageDraft, Vec<StorePageListingMutation>), String> {
+    validate_editor_ids(&draft)?;
+    if description_contains_link(&draft.content.description_markdown)
+        || draft
+            .content
+            .sections
+            .iter()
+            .any(|section| description_contains_link(&section.body_markdown))
+    {
+        return Err(
+            "Markdown links and images are not allowed. Add destinations in the Links fields."
+                .to_string(),
+        );
+    }
+    for singular in ["hero", "capsule"] {
+        if draft
+            .content
+            .media
+            .iter()
+            .filter(|item| item.role == singular)
+            .count()
+            > 1
+        {
+            return Err(format!("Only one {singular} media item is allowed."));
+        }
+    }
+    let media_ids = draft
+        .content
+        .media
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if let Some(section) = draft.content.sections.iter().find(|section| {
+        section
+            .media_id
+            .as_deref()
+            .is_some_and(|id| !media_ids.contains(id))
+    }) {
+        return Err(format!(
+            "Section ‘{}’ refers to media that no longer exists.",
+            section.heading
+        ));
+    }
+    let mutations = associations
+        .iter()
+        .map(|row| StorePageListingMutation {
+            listing_coordinate: row.listing_coordinate.clone(),
+            expected_event_id: row.event_id.clone(),
+            action: row.action,
+            relay_hint: row.relay_hint.clone(),
+            published_event_id: None,
+        })
+        .collect::<Vec<_>>();
+    draft.listing_coordinates = associations
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.action,
+                ListingPointerMutation::Link | ListingPointerMutation::Review
             )
         })
+        .map(|row| row.listing_coordinate.clone())
+        .collect();
+    sync_compact_tags(&mut draft);
+    Ok((draft, mutations))
+}
+
+fn move_item<T>(items: &mut [T], index: usize, direction: isize) {
+    let target = index as isize + direction;
+    if target >= 0 && (target as usize) < items.len() {
+        items.swap(index, target as usize);
+    }
+}
+
+fn media_url_has_inline_format_guidance(url: &str, media_type: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    let allowed = if media_type == "video" {
+        [".mp4", ".webm"].as_slice()
+    } else {
+        [".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"].as_slice()
+    };
+    lower.starts_with("https://")
+        && allowed.iter().any(|extension| {
+            lower
+                .split(['?', '#'])
+                .next()
+                .is_some_and(|path| path.ends_with(extension))
+        })
+}
+
+#[cfg(test)]
+fn safe_media_preview(url: &str, media_type: &str) -> bool {
+    media_url_has_inline_format_guidance(url, media_type)
+}
+
+#[cfg(not(test))]
+fn safe_media_preview(_url: &str, _media_type: &str) -> bool {
+    // Draft URLs are never loaded by the editor. Only the canonical validated preview may load media.
+    false
+}
+
+fn safe_https_link(url: &str) -> bool {
+    let value = url.trim();
+    value.starts_with("https://")
+        && value.len() > "https://".len()
+        && !value.chars().any(char::is_whitespace)
+        && value["https://".len()..]
+            .split('/')
+            .next()
+            .is_some_and(|host| {
+                host.contains('.') && !host.starts_with('.') && !host.ends_with('.')
+            })
+}
+
+fn platform_label(platform: &str) -> String {
+    platform
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
+        })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join(" ")
+}
+
+fn linked_platforms(
+    listing_platforms: &[String],
+    associations: &[AssociationRow],
+    selected_coordinate: &str,
+) -> Vec<String> {
+    if associations.iter().any(|row| {
+        row.listing_coordinate == selected_coordinate && row.action == ListingPointerMutation::Link
+    }) {
+        listing_platforms.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Readiness {
+    blockers: Vec<String>,
+    recommendations: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn readiness(
+    draft: &StorePageDraft,
+    associations: &[AssociationRow],
+    platforms: &[String],
+    diagnostics: &[String],
+) -> Readiness {
+    let mut value = Readiness::default();
+    if draft.presentation_id.trim().is_empty() {
+        value.blockers.push("Presentation ID is required.".into());
+    }
+    if draft
+        .content
+        .basic
+        .title
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        value.blockers.push("Title is required.".into());
+    }
+    if associations.is_empty() {
+        value
+            .blockers
+            .push("At least one listing association is required.".into());
+    }
+    if associations
+        .iter()
+        .any(|row| row.action == ListingPointerMutation::Review)
+    {
+        value
+            .warnings
+            .push("A listing association needs review.".into());
+    }
+    for diagnostic in diagnostics {
+        if diagnostic.starts_with("Warning:") || diagnostic.starts_with("Association:") {
+            value.warnings.push(diagnostic.clone());
+        } else {
+            value.blockers.push(diagnostic.clone());
+        }
+    }
+    if description_contains_link(&draft.content.description_markdown)
+        || draft
+            .content
+            .sections
+            .iter()
+            .any(|section| description_contains_link(&section.body_markdown))
+    {
+        value
+            .blockers
+            .push("Move Markdown links and images to the Links fields.".into());
+    }
+    for (missing, label) in [
+        ("hero", "Add hero media."),
+        ("capsule", "Add capsule media."),
+    ] {
+        if !draft.content.media.iter().any(|item| item.role == missing) {
+            value.recommendations.push(label.into());
+        }
+    }
+    if draft
+        .content
+        .media
+        .iter()
+        .filter(|item| item.role == "screenshot")
+        .count()
+        < 3
+    {
+        value
+            .recommendations
+            .push("Add at least three screenshots.".into());
+    }
+    if !draft
+        .content
+        .media
+        .iter()
+        .any(|item| item.role == "trailer")
+    {
+        value.recommendations.push("Add a trailer.".into());
+    }
+    if draft.content.description_markdown.trim().is_empty() {
+        value.recommendations.push("Add a description.".into());
+    }
+    if platforms
+        .iter()
+        .any(|platform| !draft.content.requirements.contains_key(platform))
+    {
+        value
+            .recommendations
+            .push("Add requirements for linked platforms.".into());
+    }
+    if draft.content.languages.as_ref().is_none_or(Vec::is_empty) {
+        value.recommendations.push("Add language support.".into());
+    }
+    if draft.content.accessibility.is_empty() {
+        value
+            .recommendations
+            .push("Add accessibility information.".into());
+    }
+    value
 }
 
 fn retryable_mutations(
@@ -542,41 +573,17 @@ pub fn StorePageEditorView(
             .map_or_else(|| fallback, |entry| entry.baseline.clone()),
     );
     let listings = RwSignal::new(Vec::<PublisherStorePageListingRevision>::new());
-    let selected_association = listing
-        .event_id
+    let mut initial_associations = cached
         .as_ref()
-        .map(|event_id| format!("{coordinate}\t{event_id}\tlink"))
-        .unwrap_or_default();
-    let default_raw = RawDraftFields {
-        associations: selected_association.clone(),
-        media: format_media(&initial_draft.content.media),
-        sections: format_sections(&initial_draft.content.sections),
-        languages: format_languages(
-            initial_draft
-                .content
-                .languages
-                .as_deref()
-                .unwrap_or_default(),
-        ),
-        requirements: format_requirements(&initial_draft.content.requirements),
-        accessibility: format_accessibility(&initial_draft.content.accessibility),
-    };
-    let mut raw = cached
-        .as_ref()
-        .map_or(default_raw, |entry| entry.raw.clone());
+        .map_or_else(Vec::new, |entry| entry.associations.clone());
     seed_new_draft_association(
         &mut initial_draft,
-        &mut raw,
+        &mut initial_associations,
         &coordinate,
         listing.event_id.as_deref(),
     );
     let draft = RwSignal::new(initial_draft);
-    let associations_text = RwSignal::new(raw.associations);
-    let media_text = RwSignal::new(raw.media);
-    let sections_text = RwSignal::new(raw.sections);
-    let languages_text = RwSignal::new(raw.languages);
-    let requirements_text = RwSignal::new(raw.requirements);
-    let accessibility_text = RwSignal::new(raw.accessibility);
+    let associations = RwSignal::new(initial_associations);
     let input_dirty = RwSignal::new(cached.as_ref().is_some_and(|entry| entry.input_dirty));
     let association_review_required = RwSignal::new(false);
     let preview = RwSignal::new(None::<GameDetailPresentation>);
@@ -584,7 +591,7 @@ pub fn StorePageEditorView(
     let loading = RwSignal::new(true);
     let validating = RwSignal::new(false);
     let publishing = RwSignal::new(false);
-    let parser_error = RwSignal::new(None::<String>);
+    let form_error = RwSignal::new(None::<String>);
     let message = RwSignal::new(None::<String>);
     let partial = RwSignal::new(recovered.as_ref().map(|state| state.response.clone()));
     let transaction_mutations = RwSignal::new(
@@ -593,71 +600,61 @@ pub fn StorePageEditorView(
             .map_or_else(Vec::new, |state| state.mutations.clone()),
     );
     let transaction_draft = RwSignal::new(recovered.as_ref().map(|state| state.draft.clone()));
+    let transaction_selected_listing_event_id = RwSignal::new(
+        recovered
+            .as_ref()
+            .and_then(|state| state.selected_listing_event_id.clone()),
+    );
     let show_discard = RwSignal::new(false);
     let clone_id = RwSignal::new(String::new());
     let link_existing_id = RwSignal::new(String::new());
     let operation_generation = RwSignal::new(0_u64);
     let operation_account = RwSignal::new(auth.npub.get_untracked());
+    let active_tab = RwSignal::new("basic");
+    let description_preview = RwSignal::new(false);
+    let preview_narrow = RwSignal::new(false);
+    let readiness_open = RwSignal::new(false);
+    let genre_input = RwSignal::new(String::new());
+    let feature_input = RwSignal::new(String::new());
+    let locale_input = RwSignal::new("en".to_string());
+    let custom_accessibility = RwSignal::new(String::new());
+    let pending_removal = RwSignal::new(None::<(&'static str, usize)>);
+    let validation_valid = RwSignal::new(None::<bool>);
+    let discard_dialog_ref = NodeRef::<leptos::html::Dialog>::new();
+
+    Effect::new(move |_| {
+        draft.track();
+        associations.track();
+        preview.set(None);
+        validation_valid.set(None);
+    });
+
+    Effect::new(move |_| {
+        let Some(dialog) = discard_dialog_ref.get() else {
+            return;
+        };
+        if show_discard.get() {
+            if !dialog.open() {
+                let _ = dialog.show_modal();
+            }
+        } else if dialog.open() {
+            dialog.close();
+        }
+    });
 
     Effect::new({
         let key = key.clone();
+        let publisher = publisher.clone();
         move |_| {
-            save_cached_draft(
-                &key,
-                draft.get(),
-                baseline.get_untracked(),
-                RawDraftFields {
-                    associations: associations_text.get(),
-                    media: media_text.get(),
-                    sections: sections_text.get(),
-                    languages: languages_text.get(),
-                    requirements: requirements_text.get(),
-                    accessibility: accessibility_text.get(),
-                },
-                input_dirty.get(),
-            )
-        }
-    });
-
-    Effect::new(move |_| {
-        if let Ok(value) = parse_media(&media_text.get()) {
-            draft.update(|draft| draft.content.media = value);
-        }
-    });
-    Effect::new(move |_| {
-        if let Ok(value) = parse_sections(&sections_text.get()) {
-            draft.update(|draft| draft.content.sections = value);
-        }
-    });
-    Effect::new(move |_| {
-        if let Ok(value) = parse_languages(&languages_text.get()) {
-            draft.update(|draft| draft.content.languages = (!value.is_empty()).then_some(value));
-        }
-    });
-    Effect::new(move |_| {
-        if let Ok(value) = parse_requirements(&requirements_text.get()) {
-            draft.update(|draft| draft.content.requirements = value);
-        }
-    });
-    Effect::new(move |_| {
-        if let Ok(value) = parse_accessibility(&accessibility_text.get()) {
-            draft.update(|draft| draft.content.accessibility = value);
-        }
-    });
-    Effect::new(move |_| {
-        if let Ok(value) = parse_associations(&associations_text.get()) {
-            draft.update(|draft| {
-                draft.listing_coordinates = value
-                    .iter()
-                    .filter(|mutation| {
-                        matches!(
-                            mutation.action,
-                            ListingPointerMutation::Link | ListingPointerMutation::Review
-                        )
-                    })
-                    .map(|mutation| mutation.listing_coordinate.clone())
-                    .collect();
-            });
+            if auth.npub.get().as_deref() == Some(publisher.as_str()) {
+                save_cached_draft(
+                    &key,
+                    draft.get(),
+                    baseline.get_untracked(),
+                    associations.get(),
+                    input_dirty.get(),
+                )
+            }
         }
     });
 
@@ -680,6 +677,69 @@ pub fn StorePageEditorView(
                     retain_account_drafts(&current);
                 } else {
                     PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| drafts.borrow_mut().clear());
+                }
+            }
+        }
+    });
+
+    Effect::new({
+        let publisher = publisher.clone();
+        move |_| {
+            let selected = active_tab.get();
+            let account_matches = auth.npub.get().as_deref() == Some(publisher.as_str());
+            let busy =
+                loading.get() || validating.get() || publishing.get() || partial.get().is_some();
+            let Some(window) = web_sys::window() else {
+                return;
+            };
+            let Some(document) = window.document() else {
+                return;
+            };
+            if let Ok(tabs) = document.query_selector_all(".v2-store-editor-tabs [role='tab']") {
+                for (index, (id, _)) in EDITOR_TABS.iter().enumerate() {
+                    let Some(element) = tabs.item(index as u32) else {
+                        continue;
+                    };
+                    let Ok(element) = element.dyn_into::<web_sys::Element>() else {
+                        continue;
+                    };
+                    let tab_id = format!("store-editor-tab-{id}");
+                    let panel_id = format!("store-editor-{id}");
+                    let _ = element.set_attribute("id", &tab_id);
+                    let _ = element.set_attribute("aria-controls", &panel_id);
+                    let _ =
+                        element.set_attribute("tabindex", if *id == selected { "0" } else { "-1" });
+                }
+            }
+            if let Ok(Some(panel)) =
+                document.query_selector(".v2-store-page-editor [role='tabpanel']")
+            {
+                let _ = panel.set_attribute("id", &format!("store-editor-{selected}"));
+                let _ =
+                    panel.set_attribute("aria-labelledby", &format!("store-editor-tab-{selected}"));
+            }
+            if let Ok(Some(fieldset)) = document.query_selector(".v2-store-page-editor fieldset") {
+                if account_matches && !busy {
+                    let _ = fieldset.remove_attribute("disabled");
+                } else {
+                    let _ = fieldset.set_attribute("disabled", "");
+                }
+            }
+            if let Ok(actions) = document
+                .query_selector_all(".v2-store-editor-footer button, .v2-store-editor-footer input")
+            {
+                for index in 0..actions.length() {
+                    let Some(element) = actions.item(index) else {
+                        continue;
+                    };
+                    let Ok(element) = element.dyn_into::<web_sys::Element>() else {
+                        continue;
+                    };
+                    if account_matches && !busy {
+                        let _ = element.remove_attribute("disabled");
+                    } else {
+                        let _ = element.set_attribute("disabled", "");
+                    }
                 }
             }
         }
@@ -722,29 +782,29 @@ pub fn StorePageEditorView(
                         operation_generation.get_untracked(),
                         generation,
                     ) {
+                        loading.set(false);
                         return;
                     }
                     match result {
                         Ok(state) => {
-                            let requires_association_review = !state.diagnostics.is_empty();
+                            let requires_association_review = !state.diagnostics.is_empty()
+                                || state.listings.iter().any(|listing| !listing.reciprocal);
                             listings.set(state.listings.clone());
-                            diagnostics.set(state.diagnostics);
+                            diagnostics.set(
+                                state
+                                    .diagnostics
+                                    .into_iter()
+                                    .map(|message| format!("Association: {message}"))
+                                    .collect(),
+                            );
+                            validation_valid.set(None);
                             association_review_required.set(requires_association_review);
                             if draft.get_untracked() == baseline.get_untracked()
                                 && !input_dirty.get_untracked()
                             {
-                                associations_text.set(format_associations(&state.listings));
+                                associations.set(associations_from_revisions(&state.listings));
                                 draft.set(state.draft.clone());
                                 baseline.set(state.baseline_draft);
-                                media_text.set(format_media(&state.draft.content.media));
-                                sections_text.set(format_sections(&state.draft.content.sections));
-                                languages_text.set(format_languages(
-                                    state.draft.content.languages.as_deref().unwrap_or_default(),
-                                ));
-                                requirements_text
-                                    .set(format_requirements(&state.draft.content.requirements));
-                                accessibility_text
-                                    .set(format_accessibility(&state.draft.content.accessibility));
                             }
                         }
                         Err(error) => message.set(Some(error)),
@@ -755,45 +815,37 @@ pub fn StorePageEditorView(
         }
     });
 
-    let update_complex = move || -> Result<(), String> {
-        let media = parse_media(&media_text.get_untracked())?;
-        let sections = parse_sections(&sections_text.get_untracked())?;
-        let languages = parse_languages(&languages_text.get_untracked())?;
-        let requirements = parse_requirements(&requirements_text.get_untracked())?;
-        let accessibility = parse_accessibility(&accessibility_text.get_untracked())?;
-        let mutations = parse_associations(&associations_text.get_untracked())?;
-        draft.update(|draft| {
-            draft.content.media = media;
-            draft.content.sections = sections;
-            draft.content.languages = (!languages.is_empty()).then_some(languages);
-            draft.content.requirements = requirements;
-            draft.content.accessibility = accessibility;
-            draft.listing_coordinates = mutations
-                .iter()
-                .filter(|mutation| {
-                    matches!(
-                        mutation.action,
-                        ListingPointerMutation::Link | ListingPointerMutation::Review
-                    )
-                })
-                .map(|mutation| mutation.listing_coordinate.clone())
-                .collect();
-            sync_compact_tags(draft);
-        });
-        parser_error.set(None);
-        Ok(())
+    let update_complex = move || -> Result<Vec<StorePageListingMutation>, String> {
+        let (adapted, mutations) =
+            adapter_requests(draft.get_untracked(), &associations.get_untracked())?;
+        draft.set(adapted);
+        form_error.set(None);
+        Ok(mutations)
     };
 
     let run_validation = Callback::new({
         let publisher = publisher.clone();
         let selected_coordinate = coordinate.clone();
         move |_: ()| {
-            if let Err(error) = update_complex() {
-                parser_error.set(Some(error));
+            if loading.get_untracked()
+                || validating.get_untracked()
+                || publishing.get_untracked()
+                || partial.get_untracked().is_some()
+            {
                 return;
             }
-            let Ok(mutations) = parse_associations(&associations_text.get_untracked()) else {
+            if auth.npub.get_untracked().as_deref() != Some(publisher.as_str()) {
+                message.set(Some(
+                    "Switch back to the publisher account before previewing.".to_string(),
+                ));
                 return;
+            }
+            let mutations = match update_complex() {
+                Ok(mutations) => mutations,
+                Err(error) => {
+                    form_error.set(Some(error));
+                    return;
+                }
             };
             let Some(preview_listing) = mutations
                 .iter()
@@ -814,6 +866,7 @@ pub fn StorePageEditorView(
                 return;
             };
             validating.set(true);
+            validation_valid.set(None);
             diagnostics.set(Vec::new());
             let request_draft = draft.get_untracked();
             let publisher = publisher.clone();
@@ -842,11 +895,18 @@ pub fn StorePageEditorView(
                 }
                 match result {
                     Ok(result) => {
+                        validation_valid.set(Some(result.valid));
                         diagnostics.set(
                             result
                                 .diagnostics
                                 .into_iter()
-                                .map(|diagnostic| diagnostic.message)
+                                .map(|diagnostic| {
+                                    if result.valid {
+                                        format!("Warning: {}", diagnostic.message)
+                                    } else {
+                                        diagnostic.message
+                                    }
+                                })
                                 .collect(),
                         );
                         preview.set(result.preview);
@@ -864,10 +924,20 @@ pub fn StorePageEditorView(
         let selected_coordinate = coordinate.clone();
         let recovery_key = key.clone();
         move |_: ()| {
-            if let Err(error) = update_complex() {
-                parser_error.set(Some(error));
+            if loading.get_untracked()
+                || validating.get_untracked()
+                || publishing.get_untracked()
+                || partial.get_untracked().is_some()
+            {
                 return;
             }
+            let mutations = match update_complex() {
+                Ok(mutations) => mutations,
+                Err(error) => {
+                    form_error.set(Some(error));
+                    return;
+                }
+            };
             if auth.npub.get_untracked().as_deref() != Some(publisher.as_str()) {
                 message.set(Some(
                     "Switch back to the publisher account before publishing.".to_string(),
@@ -881,9 +951,6 @@ pub fn StorePageEditorView(
                 ));
                 return;
             }
-            let Ok(mutations) = parse_associations(&associations_text.get_untracked()) else {
-                return;
-            };
             let request_draft = draft.get_untracked();
             let Some(initiating_account) = auth.npub.get_untracked() else {
                 return;
@@ -892,6 +959,7 @@ pub fn StorePageEditorView(
             let generation = operation_generation.get_untracked();
             publishing.set(true);
             partial.set(None);
+            transaction_selected_listing_event_id.set(listing_for_saved.event_id.clone());
             transaction_mutations.set(mutations.clone());
             transaction_draft.set(Some(request_draft.clone()));
             let publisher = publisher.clone();
@@ -910,12 +978,19 @@ pub fn StorePageEditorView(
                     if let Ok(mut response) = result {
                         response.complete = false;
                         response.retryable = true;
+                        if let Some(event_id) =
+                            selected_replacement_event_id(&response, &selected_coordinate)
+                        {
+                            transaction_selected_listing_event_id.set(Some(event_id));
+                        }
                         save_recovery(
                             &recovery_key,
                             PublisherRecovery {
                                 response: response.clone(),
                                 mutations: transaction_mutations.get_untracked(),
                                 draft: request_draft,
+                                selected_listing_event_id: transaction_selected_listing_event_id
+                                    .get_untracked(),
                             },
                         );
                         partial.set(Some(response));
@@ -926,14 +1001,13 @@ pub fn StorePageEditorView(
                 match result {
                     Ok(result) => {
                         let mut updated_listing = listing_for_saved;
-                        if let Some(event_id) = result
-                            .listing_updates
-                            .iter()
-                            .find(|outcome| {
-                                outcome.published
-                                    && outcome.listing_coordinate == selected_coordinate
-                            })
-                            .and_then(|outcome| outcome.replacement_event_id.clone())
+                        if let Some(event_id) =
+                            selected_replacement_event_id(&result, &selected_coordinate)
+                        {
+                            transaction_selected_listing_event_id.set(Some(event_id));
+                        }
+                        if let Some(event_id) =
+                            transaction_selected_listing_event_id.get_untracked()
                         {
                             updated_listing.event_id = Some(event_id);
                         }
@@ -954,6 +1028,8 @@ pub fn StorePageEditorView(
                                     response: result.clone(),
                                     mutations: transaction_mutations.get_untracked(),
                                     draft: request_draft,
+                                    selected_listing_event_id:
+                                        transaction_selected_listing_event_id.get_untracked(),
                                 },
                             );
                             partial.set(Some(result));
@@ -972,6 +1048,15 @@ pub fn StorePageEditorView(
         let selected_coordinate = coordinate.clone();
         let recovery_key = key.clone();
         move |_: ()| {
+            if loading.get_untracked() || validating.get_untracked() || publishing.get_untracked() {
+                return;
+            }
+            if auth.npub.get_untracked().as_deref() != Some(publisher.as_str()) {
+                message.set(Some(
+                    "Switch back to the publisher account before retrying.".to_string(),
+                ));
+                return;
+            }
             let Some(result) = partial.get_untracked() else {
                 return;
             };
@@ -986,13 +1071,9 @@ pub fn StorePageEditorView(
                 return;
             }
             let retry_mutations = retryable_mutations(&result, &all_mutations);
-            let selected_existing_event_id = result
-                .listing_updates
-                .iter()
-                .find(|outcome| {
-                    outcome.published && outcome.listing_coordinate == selected_coordinate
-                })
-                .and_then(|outcome| outcome.replacement_event_id.clone());
+            if let Some(event_id) = selected_replacement_event_id(&result, &selected_coordinate) {
+                transaction_selected_listing_event_id.set(Some(event_id));
+            }
             let store_page_coordinate = result.store_page_coordinate.clone();
             let store_page_event_id = page.event_id.clone();
             let Some(initiating_account) = auth.npub.get_untracked() else {
@@ -1020,6 +1101,11 @@ pub fn StorePageEditorView(
                     generation,
                 ) {
                     if let Ok(response) = result {
+                        if let Some(event_id) =
+                            selected_replacement_event_id(&response, &selected_coordinate)
+                        {
+                            transaction_selected_listing_event_id.set(Some(event_id));
+                        }
                         save_recovery(
                             &recovery_key,
                             PublisherRecovery {
@@ -1028,6 +1114,8 @@ pub fn StorePageEditorView(
                                 draft: transaction_draft
                                     .get_untracked()
                                     .unwrap_or_else(|| draft.get_untracked()),
+                                selected_listing_event_id: transaction_selected_listing_event_id
+                                    .get_untracked(),
                             },
                         );
                         partial.set(Some(response));
@@ -1039,15 +1127,13 @@ pub fn StorePageEditorView(
                     Ok(retried) if retried.retry_scope_complete => {
                         clear_recovery(&recovery_key);
                         let mut updated_listing = listing_for_saved;
-                        if let Some(event_id) = retried
-                            .listing_updates
-                            .iter()
-                            .find(|outcome| {
-                                outcome.published
-                                    && outcome.listing_coordinate == selected_coordinate
-                            })
-                            .and_then(|outcome| outcome.replacement_event_id.clone())
-                            .or(selected_existing_event_id)
+                        if let Some(event_id) =
+                            selected_replacement_event_id(&retried, &selected_coordinate)
+                        {
+                            transaction_selected_listing_event_id.set(Some(event_id));
+                        }
+                        if let Some(event_id) =
+                            transaction_selected_listing_event_id.get_untracked()
                         {
                             updated_listing.event_id = Some(event_id);
                         }
@@ -1063,6 +1149,11 @@ pub fn StorePageEditorView(
                         on_saved.run(updated_listing);
                     }
                     Ok(retried) => {
+                        if let Some(event_id) =
+                            selected_replacement_event_id(&retried, &selected_coordinate)
+                        {
+                            transaction_selected_listing_event_id.set(Some(event_id));
+                        }
                         save_recovery(
                             &recovery_key,
                             PublisherRecovery {
@@ -1071,6 +1162,8 @@ pub fn StorePageEditorView(
                                 draft: transaction_draft
                                     .get_untracked()
                                     .unwrap_or_else(|| draft.get_untracked()),
+                                selected_listing_event_id: transaction_selected_listing_event_id
+                                    .get_untracked(),
                             },
                         );
                         partial.set(Some(retried));
@@ -1083,7 +1176,21 @@ pub fn StorePageEditorView(
     });
 
     let clone_page = Callback::new({
+        let publisher = publisher.clone();
         move |_: ()| {
+            if loading.get_untracked()
+                || validating.get_untracked()
+                || publishing.get_untracked()
+                || partial.get_untracked().is_some()
+            {
+                return;
+            }
+            if auth.npub.get_untracked().as_deref() != Some(publisher.as_str()) {
+                message.set(Some(
+                    "Switch back to the publisher account before cloning.".to_string(),
+                ));
+                return;
+            }
             let presentation_id = clone_id.get_untracked();
             if presentation_id.trim().is_empty() {
                 message.set(Some(
@@ -1097,6 +1204,7 @@ pub fn StorePageEditorView(
             };
             operation_generation.update(|value| *value = value.wrapping_add(1));
             let generation = operation_generation.get_untracked();
+            loading.set(true);
             spawn_local(async move {
                 let result = invoke_clone_store_page(source, presentation_id).await;
                 if !accepts_account_response(
@@ -1105,17 +1213,19 @@ pub fn StorePageEditorView(
                     operation_generation.get_untracked(),
                     generation,
                 ) {
+                    loading.set(false);
                     return;
                 }
                 match result {
                     Ok(cloned) => {
-                        associations_text.set(String::new());
+                        associations.set(Vec::new());
                         draft.set(cloned);
                         preview.set(None);
                         message.set(Some("Clone created locally. Add explicit listing associations before publishing.".to_string()));
                     }
                     Err(error) => message.set(Some(error)),
                 }
+                loading.set(false);
             });
         }
     });
@@ -1125,6 +1235,13 @@ pub fn StorePageEditorView(
         let coordinate = coordinate.clone();
         let event_id = listing.event_id.clone();
         move |_: ()| {
+            if loading.get_untracked()
+                || validating.get_untracked()
+                || publishing.get_untracked()
+                || partial.get_untracked().is_some()
+            {
+                return;
+            }
             if draft.get_untracked() != baseline.get_untracked() || input_dirty.get_untracked() {
                 message.set(Some(
                     "Discard or publish the current draft before loading another Store Page."
@@ -1173,27 +1290,27 @@ pub fn StorePageEditorView(
                     operation_generation.get_untracked(),
                     generation,
                 ) {
+                    loading.set(false);
                     return;
                 }
                 match result {
                     Ok(state) => {
-                        let requires_association_review = !state.diagnostics.is_empty();
-                        associations_text.set(format_associations(&state.listings));
+                        let requires_association_review = !state.diagnostics.is_empty()
+                            || state.listings.iter().any(|listing| !listing.reciprocal);
+                        associations.set(associations_from_revisions(&state.listings));
                         listings.set(state.listings);
-                        diagnostics.set(state.diagnostics);
+                        diagnostics.set(
+                            state
+                                .diagnostics
+                                .into_iter()
+                                .map(|message| format!("Association: {message}"))
+                                .collect(),
+                        );
+                        validation_valid.set(None);
                         association_review_required.set(requires_association_review);
                         draft.set(state.draft.clone());
                         baseline.set(state.baseline_draft);
                         input_dirty.set(false);
-                        media_text.set(format_media(&state.draft.content.media));
-                        sections_text.set(format_sections(&state.draft.content.sections));
-                        languages_text.set(format_languages(
-                            state.draft.content.languages.as_deref().unwrap_or_default(),
-                        ));
-                        requirements_text
-                            .set(format_requirements(&state.draft.content.requirements));
-                        accessibility_text
-                            .set(format_accessibility(&state.draft.content.accessibility));
                         message.set(Some(
                             "Existing Store Page loaded locally. Publishing will add the selected listing reciprocally."
                                 .to_string(),
@@ -1207,9 +1324,9 @@ pub fn StorePageEditorView(
     });
 
     let on_back_click = move |_| {
-        if publishing.get_untracked() {
+        if loading.get_untracked() || validating.get_untracked() || publishing.get_untracked() {
             message.set(Some(
-                "Wait for the active publication request to finish before leaving.".to_string(),
+                "Wait for the active Store Page request to finish before leaving.".to_string(),
             ));
             return;
         }
@@ -1227,16 +1344,23 @@ pub fn StorePageEditorView(
         }
     };
 
+    let selected_platforms = StoredValue::new(listing.platforms.clone());
+    let listing_for_preview = listing.clone();
+    let coordinate_for_readiness = StoredValue::new(coordinate.clone());
+    let coordinate_for_requirements = StoredValue::new(coordinate.clone());
+    let coordinate_for_preview = StoredValue::new(coordinate.clone());
+    let publisher_for_retry_disabled = StoredValue::new(publisher.clone());
+    let publisher_for_discard = StoredValue::new(publisher.clone());
+
     view! {
-        <section class="v2-publisher-studio">
+        <section class="v2-publisher-studio v2-store-page-editor">
             <button class="v2-btn-secondary v2-publisher-back" on:click=on_back_click>"Back to game management"</button>
             <header class="v2-publisher-game-hero">
                 <div><p class="v2-publisher-kicker">"Store Page editor"</p><h1>{listing.title.clone()}</h1><p class="text-sm text-on-surface-variant">"Drafts stay local until Publish is selected."</p></div>
             </header>
             {move || loading.get().then(|| view! { <p>"Loading current Store Page and signed listings..."</p> })}
             {move || message.get().map(|value| view! { <p class="rounded-xl bg-surface-container-high p-3" role="status">{value}</p> })}
-            {move || parser_error.get().map(|value| view! { <p class="text-error" role="alert">{value}</p> })}
-            {move || (!diagnostics.get().is_empty()).then(|| view! { <div class="rounded-xl border border-error p-3" role="alert"><h2>"Validation"</h2><ul>{diagnostics.get().into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul></div> })}
+            {move || form_error.get().map(|value| view! { <p class="text-error" role="alert">{value}</p> })}
             {move || partial.get().map(|result| {
                 let page_status = result.store_page.as_ref().map(|page| {
                     format!(
@@ -1251,58 +1375,71 @@ pub fn StorePageEditorView(
                     <p>{page_status}</p>
                     {result.cache_error.map(|error| view! { <p class="text-error">{format!("Local cache update failed: {error}")}</p> })}
                     <ul class="mt-3 space-y-2">{result.listing_updates.into_iter().map(|outcome| view! { <li class="rounded-xl bg-surface-container-low p-3"><strong>{outcome.listing_coordinate}</strong><p>{format!("{:?}: published={}, propagation={}", outcome.action, outcome.published, outcome.propagation_confirmed)}</p>{outcome.error.map(|error| view! { <p class="text-error">{error}</p> })}</li> }).collect_view()}</ul>
-                    <button class="v2-btn-secondary mt-3" type="button" disabled=move || publishing.get() on:click=move |_| retry.run(())>"Retry incomplete synchronization"</button>
+                    <button class="v2-btn-secondary mt-3" type="button" disabled=move || validating.get() || publishing.get() || auth.npub.get().as_deref() != Some(publisher_for_retry_disabled.get_value().as_str()) on:click=move |_| retry.run(())>"Retry incomplete synchronization"</button>
                 </section> }
             })}
 
-            <div class="v2-publisher-management-layout">
+            <Show when=move || !diagnostics.get().is_empty()>
+                <section class="v2-publisher-panel" aria-labelledby="store-editor-diagnostics-title">
+                    <h2 id="store-editor-diagnostics-title">{move || match validation_valid.get() { Some(true) => "Validation warnings", Some(false) => "Blocking validation issues", None => "Association warnings" }}</h2>
+                    <ul class="v2-store-diagnostic-list">
+                        {move || diagnostics.get().into_iter().map(|item| {
+                            let tab = diagnostic_tab(&item);
+                            view! { <li><button type="button" on:click=move |_| active_tab.set(tab)>{item}</button></li> }
+                        }).collect_view()}
+                    </ul>
+                </section>
+            </Show>
+
+            <nav class="v2-store-editor-tabs" role="tablist" aria-label="Store Page fields">
+                {EDITOR_TABS.into_iter().map(|(id, label)| view! { <button id=format!("store-editor-tab-{id}") aria-controls=format!("store-editor-{id}") tabindex=move || if active_tab.get() == id { 0 } else { -1 } type="button" role="tab" aria-selected=move || active_tab.get() == id class:v2-store-editor-tab-active=move || active_tab.get() == id on:keydown=move |event| { let next = match event.key().as_str() { "ArrowRight" => Some(adjacent_tab(id, 1)), "ArrowLeft" => Some(adjacent_tab(id, -1)), "Home" => Some(EDITOR_TABS[0].0), "End" => Some(EDITOR_TABS[EDITOR_TABS.len() - 1].0), _ => None }; if let Some(next) = next { event.prevent_default(); active_tab.set(next); focus_editor_tab(next); } } on:click=move |_| active_tab.set(id)>{label}</button> }).collect_view()}
+            </nav>
+            <button type="button" class="v2-btn-secondary v2-store-readiness-toggle" aria-expanded=move || readiness_open.get() on:click=move |_| readiness_open.update(|open| *open = !*open)>"Readiness"</button>
+            <div class="v2-publisher-management-layout v2-store-editor-layout">
             <main class="v2-publisher-main space-y-5">
                 <fieldset class="contents" disabled=move || publishing.get() || partial.get().is_some()>
-                <section class="v2-publisher-panel grid gap-4 sm:grid-cols-2">
-                    <h2 class="sm:col-span-2">"Identity and discovery"</h2>
-                    <label>"Presentation ID"<input class="v2-input" disabled=move || draft.get().loaded_event_id.is_some() prop:value=move || draft.get().presentation_id on:input=move |event| draft.update(|draft| draft.presentation_id = event_target_value(&event)) /></label>
-                    <label>"Release date"<input class="v2-input" prop:value=move || draft.get().content.basic.release_date.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.basic.release_date = optional(event_target_value(&event))) /></label>
-                    <label>"Title"<input class="v2-input" prop:value=move || draft.get().content.basic.title.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.basic.title = optional(event_target_value(&event))) /></label>
-                    <label>"Summary"<input class="v2-input" prop:value=move || draft.get().content.basic.summary.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.basic.summary = optional(event_target_value(&event))) /></label>
-                    <label>"Developer display name"<input class="v2-input" prop:value=move || draft.get().content.basic.developer.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.basic.developer = optional(event_target_value(&event))) /></label>
-                    <label>"Publisher display name"<input class="v2-input" prop:value=move || draft.get().content.basic.publisher.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.basic.publisher = optional(event_target_value(&event))) /></label>
-                    <label>"Genres (comma separated)"<input class="v2-input" prop:value=move || draft.get().content.discovery.genres.unwrap_or_default().join(", ") on:input=move |event| draft.update(|draft| { let values = csv(&event_target_value(&event)); draft.content.discovery.genres = (!values.is_empty()).then_some(values); }) /></label>
-                    <label>"Features (comma separated)"<input class="v2-input" prop:value=move || draft.get().content.discovery.features.unwrap_or_default().join(", ") on:input=move |event| draft.update(|draft| { let values = csv(&event_target_value(&event)); draft.content.discovery.features = (!values.is_empty()).then_some(values); }) /></label>
-                </section>
+                <Show when=move || active_tab.get() == "basic"><section id="store-editor-basic" role="tabpanel" class="v2-publisher-panel grid gap-4 sm:grid-cols-2">
+                    <h2 class="sm:col-span-2">"Basic Info"</h2>
+                    <label>"Presentation ID"<input class="v2-input" disabled=move || draft.get().loaded_event_id.is_some() prop:value=move || draft.get().presentation_id on:input=move |event| draft.update(|value| value.presentation_id = event_target_value(&event)) /></label>
+                    <div><span class="v2-store-field-label">"Release date"</span><DatePicker value=Signal::derive(move || draft.get().content.basic.release_date.unwrap_or_default()) on_value=Callback::new(move |date| draft.update(|value| value.content.basic.release_date = optional(date))) disabled=Signal::derive(move || publishing.get() || partial.get().is_some()) /></div>
+                    <label>"Title"<input class="v2-input" prop:value=move || draft.get().content.basic.title.unwrap_or_default() on:input:target=move |event| draft.update(|value| value.content.basic.title = optional_editor_text(event.target().value())) /></label>
+                    <label>"Summary"<textarea class="v2-input" prop:value=move || draft.get().content.basic.summary.unwrap_or_default() on:input:target=move |event| draft.update(|value| value.content.basic.summary = optional_editor_text(event.target().value())) /><small>{move || format!("{} characters", draft.get().content.basic.summary.as_deref().unwrap_or_default().chars().count())}</small></label>
+                    <label>"Developer display name"<input class="v2-input" prop:value=move || draft.get().content.basic.developer.unwrap_or_default() on:input:target=move |event| draft.update(|value| value.content.basic.developer = optional_editor_text(event.target().value())) /></label>
+                    <label>"Publisher display name"<input class="v2-input" prop:value=move || draft.get().content.basic.publisher.unwrap_or_default() on:input:target=move |event| draft.update(|value| value.content.basic.publisher = optional_editor_text(event.target().value())) /></label>
+                    <div class="sm:col-span-2"><span class="v2-store-field-label">"Genres"</span><div class="v2-store-chip-row">{move || draft.get().content.discovery.genres.unwrap_or_default().into_iter().enumerate().map(|(index, value)| view! { <button type="button" class="v2-chip" aria-label=format!("Remove genre {value}") on:click=move |_| draft.update(|item| { if let Some(values) = &mut item.content.discovery.genres { values.remove(index); } })>{value.clone()}" ×"</button> }).collect_view()}</div><div class="v2-store-add-row"><input class="v2-input" list="store-genre-suggestions" placeholder="Add genre" prop:value=move || genre_input.get() on:input=move |event| genre_input.set(event_target_value(&event)) /><datalist id="store-genre-suggestions"><option value="Action"/><option value="Adventure"/><option value="Puzzle"/><option value="Role-playing"/><option value="Strategy"/></datalist><button type="button" class="v2-btn-secondary" on:click=move |_| { let value = genre_input.get_untracked().trim().to_string(); if !value.is_empty() { draft.update(|item| item.content.discovery.genres.get_or_insert_default().push(value)); genre_input.set(String::new()); } }>"Add"</button></div></div>
+                    <div class="sm:col-span-2"><span class="v2-store-field-label">"Features"</span><div class="v2-store-chip-row">{move || draft.get().content.discovery.features.unwrap_or_default().into_iter().enumerate().map(|(index, value)| view! { <button type="button" class="v2-chip" aria-label=format!("Remove feature {value}") on:click=move |_| draft.update(|item| { if let Some(values) = &mut item.content.discovery.features { values.remove(index); } })>{value.clone()}" ×"</button> }).collect_view()}</div><div class="v2-store-add-row"><input class="v2-input" list="store-feature-suggestions" placeholder="Add feature" prop:value=move || feature_input.get() on:input=move |event| feature_input.set(event_target_value(&event)) /><datalist id="store-feature-suggestions"><option value="Single-player"/><option value="Multiplayer"/><option value="Controller support"/><option value="Achievements"/></datalist><button type="button" class="v2-btn-secondary" on:click=move |_| { let value = feature_input.get_untracked().trim().to_string(); if !value.is_empty() { draft.update(|item| item.content.discovery.features.get_or_insert_default().push(value)); feature_input.set(String::new()); } }>"Add"</button></div></div>
+                    <section class="sm:col-span-2"><h3>"Associated listings"</h3><p class="text-sm text-on-surface-variant">"Signed current-user-owned revisions. Changes publish as explicit pointer mutations."</p>{move || associations.get().into_iter().enumerate().map(|(index, row)| { let status = if row.reciprocal { "Reciprocal pointer current" } else { "Reciprocal pointer missing or incomplete" }; view! { <article class="v2-store-card"><strong>{row.listing_coordinate}</strong><p class="v2-store-mono">{row.event_id}</p><p>{status}</p><label>"Association action"<select class="v2-input" prop:value=format!("{:?}", row.action).to_ascii_lowercase() on:change=move |event| { let action = match event_target_value(&event).as_str() { "link" => ListingPointerMutation::Link, "unlink" => ListingPointerMutation::Unlink, _ => ListingPointerMutation::Review }; associations.update(|rows| if let Some(row) = rows.get_mut(index) { row.action = action; }); association_review_required.set(associations.get_untracked().iter().any(|row| row.action == ListingPointerMutation::Review)); input_dirty.set(true); }><option value="link">"Link"</option><option value="unlink">"Unlink"</option><option value="review">"Review"</option></select></label></article> } }).collect_view()}</section>
+                </section></Show>
 
-                <section class="v2-publisher-panel"><h2>"Description"</h2><label>"Markdown"<textarea class="v2-input min-h-48" prop:value=move || draft.get().content.description_markdown on:input=move |event| draft.update(|draft| draft.content.description_markdown = event_target_value(&event)) /></label></section>
+                <Show when=move || active_tab.get() == "description"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Description"</h2><div role="group" aria-label="Description mode"><button type="button" class="v2-btn-secondary" aria-pressed=move || !description_preview.get() on:click=move |_| description_preview.set(false)>"Write"</button><button type="button" class="v2-btn-secondary" aria-pressed=move || description_preview.get() on:click=move |_| description_preview.set(true)>"Preview"</button></div></div><Show when=move || !description_preview.get()><div class="v2-store-toolbar" role="toolbar" aria-label="Markdown formatting"><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("**bold**"))>"Bold"</button><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("\n## Heading\n"))>"Heading"</button><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("\n- item"))>"List"</button></div><label>"Markdown description"<textarea class="v2-input min-h-64" prop:value=move || draft.get().content.description_markdown on:input=move |event| draft.update(|value| value.content.description_markdown = event_target_value(&event)) /></label><small>{move || format!("{} characters", draft.get().content.description_markdown.chars().count())}</small></Show><Show when=move || description_preview.get()><div class="v2-store-canonical-placeholder"><strong>"Canonical preview only"</strong><p>"Validate the draft to render sanitized content with the buyer Store Page renderer below."</p><button type="button" class="v2-btn-secondary" on:click=move |_| run_validation.run(())>"Validate canonical preview"</button></div></Show><details class="v2-publisher-diagnostics"><summary>"Description diagnostics"</summary>{move || diagnostics.get().into_iter().map(|item| view! { <p>{item}</p> }).collect_view()}</details></section></Show>
 
-                <section class="v2-publisher-panel"><h2>"Associated listings"</h2><p class="text-sm text-on-surface-variant">"One tab-separated row per listing: coordinate, current event ID, link, unlink, or review, and an optional public wss relay. Every review row must be changed explicitly before publishing."</p><textarea class="v2-input min-h-32" prop:value=move || associations_text.get() on:input=move |event| { let value = event_target_value(&event); input_dirty.set(true); association_review_required.set(match parse_associations(&value) { Ok(rows) => rows.iter().any(|row| row.action == ListingPointerMutation::Review), Err(_) => true }); associations_text.set(value); } /></section>
+                <Show when=move || active_tab.get() == "media"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Media"</h2><button type="button" class="v2-btn-secondary" on:click=move |_| draft.update(|value| { let id = unique_editor_id("media", value.content.media.iter().map(|item| item.id.as_str())); value.content.media.push(StorePageMediaItem { id, media_type: "image".into(), role: "screenshot".into(), url: String::new(), thumbnail_url: None, alt: None, caption: None, width: None, height: None }); })>"Add media"</button></div>{move || draft.get().content.media.into_iter().enumerate().map(|(index, item)| view! { <article class="v2-store-card"><div class="v2-store-card-actions"><button type="button" aria-label="Move media up" disabled=index == 0 on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.media, index, -1)); }>"↑"</button><button type="button" aria-label="Move media down" on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.media, index, 1)); }>"↓"</button><button type="button" aria-label="Delete media" on:click=move |_| { if pending_removal.get_untracked() == Some(("media", index)) { pending_removal.set(None); draft.update(|value| { let removed_id = value.content.media.get(index).map(|item| item.id.clone()); if index < value.content.media.len() { value.content.media.remove(index); } if let Some(removed_id) = removed_id { for section in &mut value.content.sections { if section.media_id.as_deref() == Some(removed_id.as_str()) { section.media_id = None; } } } }); } else { pending_removal.set(Some(("media", index))); } }>{move || if pending_removal.get() == Some(("media", index)) { "Confirm delete" } else { "Delete" }}</button></div><div class="v2-store-form-grid"><label>"Type"<select class="v2-input" prop:value=item.media_type.clone() on:change=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.media_type = event_target_value(&event); })><option value="image">"Image"</option><option value="video">"Video"</option></select></label><label>"Role"<select class="v2-input" prop:value=item.role.clone() on:change=move |event| { let role = event_target_value(&event); if matches!(role.as_str(), "hero" | "capsule") && draft.get_untracked().content.media.iter().enumerate().any(|(other, item)| other != index && item.role == role) { form_error.set(Some(format!("Only one {role} is allowed."))); } else { draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.role = role; }); } }><option value="hero">"Hero"</option><option value="capsule">"Capsule"</option><option value="screenshot">"Screenshot"</option><option value="trailer">"Trailer"</option><option value="feature">"Feature"</option></select></label><label class="sm:col-span-2">"HTTPS URL"<input type="url" class="v2-input" prop:value=item.url.clone() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.url = event_target_value(&event); }) /></label><label>"Thumbnail URL"<input type="url" class="v2-input" prop:value=item.thumbnail_url.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.thumbnail_url = optional(event_target_value(&event)); }) /></label><label>"Alternative text"<input class="v2-input" prop:value=item.alt.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.alt = optional(event_target_value(&event)); }) /></label><label>"Caption"<input class="v2-input" prop:value=item.caption.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.caption = optional(event_target_value(&event)); }) /></label><label>"Width"<input type="number" min="1" class="v2-input" prop:value=item.width.map(|value| value.to_string()).unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.width = event_target_value(&event).parse().ok(); }) /></label><label>"Height"<input type="number" min="1" class="v2-input" prop:value=item.height.map(|value| value.to_string()).unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.height = event_target_value(&event).parse().ok(); }) /></label></div><div class="v2-store-canonical-placeholder"><strong>{if safe_media_preview(&item.url, &item.media_type) { "Ready for core validation" } else { "Enter a supported HTTPS media URL" }}</strong><p>"Media is rendered only after canonical validation in Preview."</p></div></article> }).collect_view()}</section></Show>
 
-                <section class="v2-publisher-panel"><h2>"Media"</h2><p class="text-sm text-on-surface-variant">"Tab-separated rows: id, image or video, role, HTTPS URL, thumbnail URL, alt text, caption, width, height. Direct trailers must be MP4 or WebM."</p><textarea class="v2-input min-h-40" prop:value=move || media_text.get() on:input=move |event| { input_dirty.set(true); media_text.set(event_target_value(&event)); } /></section>
+                <Show when=move || active_tab.get() == "sections"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Feature Sections"</h2><button type="button" class="v2-btn-secondary" on:click=move |_| draft.update(|value| { let id = unique_editor_id("section", value.content.sections.iter().map(|section| section.id.as_str())); value.content.sections.push(StorePageSection { id, heading: String::new(), body_markdown: String::new(), media_id: None, layout: "text".into() }); })>"Add section"</button></div>{move || { let media = draft.get().content.media; draft.get().content.sections.into_iter().enumerate().map(|(index, section)| { let options = media.clone(); view! { <article class="v2-store-card"><div class="v2-store-card-actions"><button type="button" aria-label="Move section up" disabled=index == 0 on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.sections, index, -1)); }>"↑"</button><button type="button" aria-label="Move section down" on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.sections, index, 1)); }>"↓"</button><button type="button" aria-label="Remove section" on:click=move |_| { if pending_removal.get_untracked() == Some(("section", index)) { pending_removal.set(None); draft.update(|value| { if index < value.content.sections.len() { value.content.sections.remove(index); } }); } else { pending_removal.set(Some(("section", index))); } }>{move || if pending_removal.get() == Some(("section", index)) { "Confirm remove" } else { "Remove" }}</button></div><label>"Layout"<select class="v2-input" prop:value=section.layout on:change=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.layout = event_target_value(&event); })><option value="text">"Text"</option><option value="media-left">"Media left"</option><option value="media-right">"Media right"</option><option value="media-wide">"Media wide"</option></select></label><label>"Heading"<input class="v2-input" prop:value=section.heading on:input=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.heading = event_target_value(&event); }) /></label><label>"Media"<select class="v2-input" prop:value=section.media_id.unwrap_or_default() on:change=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.media_id = optional(event_target_value(&event)); })><option value="">"No media"</option>{options.into_iter().map(|item| view! { <option value=item.id.clone()>{format!("{} · {}", item.role, item.id)}</option> }).collect_view()}</select></label><label>"Section Markdown"<textarea class="v2-input min-h-32" prop:value=section.body_markdown on:input=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.body_markdown = event_target_value(&event); }) /></label><button type="button" class="v2-btn-secondary" on:click=move |_| run_validation.run(())>"Preview canonical section"</button></article> } }).collect_view() }}</section></Show>
 
-                <section class="v2-publisher-panel"><h2>"Feature sections"</h2><p class="text-sm text-on-surface-variant">"Tab-separated rows: id, heading, layout, media ID, Markdown. Use \\n for a line break."</p><textarea class="v2-input min-h-40" prop:value=move || sections_text.get() on:input=move |event| { input_dirty.set(true); sections_text.set(event_target_value(&event)); } /></section>
+                <Show when=move || active_tab.get() == "requirements"><section role="tabpanel" class="v2-publisher-panel"><h2>"Requirements"</h2><p class="text-sm text-on-surface-variant">"Platforms come from the selected linked authoritative listing; no compatibility is inferred."</p>{move || { let platforms = linked_platforms(&selected_platforms.get_value(), &associations.get(), &coordinate_for_requirements.get_value()); if platforms.is_empty() { view! { <p>"Link the selected listing to edit its declared platform requirements."</p> }.into_any() } else { platforms.into_iter().map(|platform| { let label = platform_label(&platform); let platform_min = platform.clone(); let platform_rec = platform.clone(); view! { <article class="v2-store-card"><h3>{label}</h3>{[("Minimum", true), ("Recommended", false)].into_iter().map(|(name, minimum)| { let key = if minimum { platform_min.clone() } else { platform_rec.clone() }; view! { <fieldset class="v2-store-tier"><legend>{name}</legend>{[("Operating system", "os"), ("Processor", "processor"), ("Memory", "memory"), ("Graphics", "graphics"), ("Storage", "storage"), ("Additional", "additional")].into_iter().map(|(label, field)| { let key = key.clone(); let value_key = key.clone(); view! { <label>{label}<input class="v2-input" prop:value=move || { let requirement = draft.get().content.requirements.get(&value_key).cloned().unwrap_or_default(); let tier = if minimum { requirement.minimum } else { requirement.recommended }; tier.and_then(|tier| match field { "os" => tier.os, "processor" => tier.processor, "memory" => tier.memory, "graphics" => tier.graphics, "storage" => tier.storage, _ => tier.additional }).unwrap_or_default() } on:input=move |event| { let input = optional(event_target_value(&event)); draft.update(|value| { let requirement = value.content.requirements.entry(key.clone()).or_default(); let tier = if minimum { requirement.minimum.get_or_insert_default() } else { requirement.recommended.get_or_insert_default() }; match field { "os" => tier.os = input, "processor" => tier.processor = input, "memory" => tier.memory = input, "graphics" => tier.graphics = input, "storage" => tier.storage = input, _ => tier.additional = input } }); } /></label> } }).collect_view()}</fieldset> } }).collect_view()}</article> } }).collect_view().into_any() } }}</section></Show>
 
-                <section class="v2-publisher-panel"><h2>"Platform requirements"</h2><p class="text-sm text-on-surface-variant">"Tab-separated: platform, minimum or recommended, os, processor, memory, graphics, storage, additional."</p><textarea class="v2-input min-h-32" prop:value=move || requirements_text.get() on:input=move |event| { input_dirty.set(true); requirements_text.set(event_target_value(&event)); } /></section>
+                <Show when=move || active_tab.get() == "languages"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Languages"</h2><div class="v2-store-add-row"><label>"Language"<select class="v2-input" prop:value=move || locale_input.get() on:change=move |event| locale_input.set(event_target_value(&event))><option value="en">"English (en)"</option><option value="es">"Spanish (es)"</option><option value="pt-BR">"Portuguese — Brazil (pt-BR)"</option><option value="fr">"French (fr)"</option><option value="de">"German (de)"</option><option value="ja">"Japanese (ja)"</option><option value="zh-CN">"Chinese — Simplified (zh-CN)"</option></select></label><button type="button" class="v2-btn-secondary" on:click=move |_| { let code = locale_input.get_untracked(); draft.update(|value| { let values = value.content.languages.get_or_insert_default(); if !values.iter().any(|entry| entry.code == code) { values.push(LanguageSupport { code, interface: true, audio: false, subtitles: false }); } }); }>"Add language"</button></div></div>{move || draft.get().content.languages.unwrap_or_default().into_iter().enumerate().map(|(index, language)| view! { <article class="v2-store-card v2-store-language-row"><strong>{language.code}</strong><label><input type="checkbox" prop:checked=language.interface on:change=move |event| draft.update(|value| if let Some(entry) = value.content.languages.as_mut().and_then(|values| values.get_mut(index)) { entry.interface = event_target_checked(&event); }) />" Interface"</label><label><input type="checkbox" prop:checked=language.audio on:change=move |event| draft.update(|value| if let Some(entry) = value.content.languages.as_mut().and_then(|values| values.get_mut(index)) { entry.audio = event_target_checked(&event); }) />" Audio"</label><label><input type="checkbox" prop:checked=language.subtitles on:change=move |event| draft.update(|value| if let Some(entry) = value.content.languages.as_mut().and_then(|values| values.get_mut(index)) { entry.subtitles = event_target_checked(&event); }) />" Subtitles"</label><button type="button" on:click=move |_| draft.update(|value| if let Some(values) = &mut value.content.languages { values.remove(index); if values.is_empty() { value.content.languages = None; } })>"Remove"</button></article> }).collect_view()}</section></Show>
 
-                <section class="v2-publisher-panel"><h2>"Languages"</h2><p class="text-sm text-on-surface-variant">"Tab-separated: code, interface, audio, subtitles using true or false."</p><textarea class="v2-input min-h-32" prop:value=move || languages_text.get() on:input=move |event| { input_dirty.set(true); languages_text.set(event_target_value(&event)); } /></section>
+                <Show when=move || active_tab.get() == "accessibility"><section role="tabpanel" class="v2-publisher-panel"><h2>"Accessibility"</h2><p class="text-sm text-on-surface-variant">"Publisher-provided accessibility information. Verify every claim."</p>{[("Visual", "colorblind-modes"), ("Visual", "scalable-text"), ("Hearing", "subtitles"), ("Hearing", "closed-captions"), ("Input", "remappable-controls"), ("Input", "single-stick")].into_iter().map(|(group, feature)| view! { <article class="v2-store-accessibility-row"><div><small>{group}</small><strong>{platform_label(feature)}</strong></div><label><input type="checkbox" prop:checked=move || draft.get().content.accessibility.iter().find(|entry| entry.feature == feature).is_some_and(|entry| entry.supported) on:change=move |event| { let supported = event_target_checked(&event); draft.update(|value| { if let Some(entry) = value.content.accessibility.iter_mut().find(|entry| entry.feature == feature) { entry.supported = supported; } else { value.content.accessibility.push(AccessibilityFeature { feature: feature.into(), supported, notes: None }); } }); } />" Supported"</label><label>"Optional notes"<input class="v2-input" prop:value=move || draft.get().content.accessibility.iter().find(|entry| entry.feature == feature).and_then(|entry| entry.notes.clone()).unwrap_or_default() on:input=move |event| { let notes = optional(event_target_value(&event)); draft.update(|value| { if let Some(entry) = value.content.accessibility.iter_mut().find(|entry| entry.feature == feature) { entry.notes = notes; } else { value.content.accessibility.push(AccessibilityFeature { feature: feature.into(), supported: false, notes }); } }); } /></label></article> }).collect_view()}<details class="v2-publisher-diagnostics"><summary>"Advanced custom identifier"</summary><div class="v2-store-add-row"><input class="v2-input" placeholder="publisher-defined-feature" prop:value=move || custom_accessibility.get() on:input=move |event| custom_accessibility.set(event_target_value(&event)) /><button type="button" class="v2-btn-secondary" on:click=move |_| { let feature = custom_accessibility.get_untracked().trim().to_string(); if !feature.is_empty() { draft.update(|value| value.content.accessibility.push(AccessibilityFeature { feature, supported: true, notes: None })); custom_accessibility.set(String::new()); } }>"Add"</button></div></details></section></Show>
 
-                <section class="v2-publisher-panel"><h2>"Accessibility claims"</h2><p class="text-sm text-on-surface-variant">"Tab-separated: feature, supported, notes."</p><textarea class="v2-input min-h-32" prop:value=move || accessibility_text.get() on:input=move |event| { input_dirty.set(true); accessibility_text.set(event_target_value(&event)); } /></section>
-
-                <section class="v2-publisher-panel grid gap-4 sm:grid-cols-2"><h2 class="sm:col-span-2">"External links"</h2>
+                <Show when=move || active_tab.get() == "links"><section role="tabpanel" class="v2-publisher-panel grid gap-4 sm:grid-cols-2"><h2 class="sm:col-span-2">"Links"</h2>
                     <label>"Website"<input class="v2-input" prop:value=move || draft.get().content.links.website.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.website = optional(event_target_value(&event))) /></label>
                     <label>"Support"<input class="v2-input" prop:value=move || draft.get().content.links.support.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.support = optional(event_target_value(&event))) /></label>
                     <label>"Documentation"<input class="v2-input" prop:value=move || draft.get().content.links.documentation.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.documentation = optional(event_target_value(&event))) /></label>
                     <label>"Source"<input class="v2-input" prop:value=move || draft.get().content.links.source.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.source = optional(event_target_value(&event))) /></label>
                     <label>"Community"<input class="v2-input" prop:value=move || draft.get().content.links.community.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.community = optional(event_target_value(&event))) /></label>
                     <label>"Privacy policy"<input class="v2-input" prop:value=move || draft.get().content.links.privacy_policy.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.privacy_policy = optional(event_target_value(&event))) /></label>
-                </section>
-
-                <section class="v2-publisher-panel"><h2>"Clone presentation"</h2><p class="text-sm text-on-surface-variant">"Cloning copies presentation fields, clears associations, and starts a new optimistic-concurrency identity."</p><div class="flex gap-2"><input class="v2-input" placeholder="new-presentation-id" prop:value=move || clone_id.get() on:input=move |event| clone_id.set(event_target_value(&event)) /><button class="v2-btn-secondary" type="button" on:click=move |_| clone_page.run(())>"Clone locally"</button></div></section>
-
-                <section class="v2-publisher-panel"><h2>"Link existing Store Page"</h2><p class="text-sm text-on-surface-variant">"Load a Store Page owned by this publisher and add the selected listing as an explicit reciprocal association."</p><div class="flex gap-2"><input class="v2-input" placeholder="existing-presentation-id" prop:value=move || link_existing_id.get() on:input=move |event| link_existing_id.set(event_target_value(&event)) /><button class="v2-btn-secondary" type="button" on:click=move |_| link_existing.run(())>"Load existing"</button></div></section>
-
-                <section class="v2-publisher-panel"><div class="flex flex-wrap gap-3"><button class="v2-btn-secondary" type="button" disabled=move || validating.get() on:click=move |_| run_validation.run(())>{move || if validating.get() { "Validating..." } else { "Validate and preview" }}</button><button class="v2-btn-primary" type="button" disabled=move || publishing.get() on:click=move |_| publish.run(())>{move || if publishing.get() { "Publishing..." } else { "Publish Store Page" }}</button></div></section>
+                    <div class="sm:col-span-2"><p class="text-sm text-on-surface-variant">"Only validated HTTPS links are opened. Backend validation remains authoritative."</p>{move || [draft.get().content.links.website, draft.get().content.links.support, draft.get().content.links.documentation, draft.get().content.links.source, draft.get().content.links.community, draft.get().content.links.privacy_policy].into_iter().flatten().map(|url| if safe_https_link(&url) { view! { <a class="v2-btn-secondary" href=url target="_blank" rel="noopener noreferrer">"Test safe link"</a> }.into_any() } else { view! { <span class="text-error">"Enter a complete HTTPS URL"</span> }.into_any() }).collect_view()}</div>
+                </section></Show>
+                <Show when=move || active_tab.get() == "sections">
+                    <button type="button" class="v2-btn-secondary" on:click=move |_| run_validation.run(())>"Preview sections with canonical validation"</button>
+                </Show>
                 </fieldset>
 
                 {move || preview.get().map(|presentation| view! {
-                    <section class="rounded-2xl border-2 border-primary p-4" aria-label="Store Page preview">
-                        <p class="v2-publisher-kicker">"Preview mode · links and commerce actions disabled"</p>
+                    <section class="v2-store-preview" class:v2-store-preview-narrow=move || preview_narrow.get() aria-label="Store Page preview" data-preview-source=CANONICAL_PREVIEW_SOURCE>
+                        <div class="v2-store-preview-banner"><strong>"Canonical validated preview"</strong><span>"Commerce and external navigation are disabled"</span><label>"Associated listing"<select disabled><option>{coordinate_for_preview.get_value()}</option></select></label><div role="group" aria-label="Preview width"><button type="button" aria-pressed=move || !preview_narrow.get() on:click=move |_| preview_narrow.set(false)>"Desktop"</button><button type="button" aria-pressed=move || preview_narrow.get() on:click=move |_| preview_narrow.set(true)>"Narrow"</button></div></div>
                         <h2>{presentation.title.clone().unwrap_or_else(|| listing.title.clone())}</h2>
                         <p>{presentation.summary.clone().unwrap_or_else(|| listing.description.clone())}</p>
                         <div class="my-4 rounded-xl bg-surface-container-high p-3"><strong>"Authoritative listing commerce"</strong><p>{preview_commerce_label(listing.price, &listing.currency, &listing.acquisition)}</p></div>
@@ -1310,12 +1447,12 @@ pub fn StorePageEditorView(
                     </section>
                 })}
             </main>
-            <aside class="v2-publisher-panel v2-publisher-sidebar"><h2>"Draft status"</h2><p>{move || if draft.get() == baseline.get() { "No unsaved changes" } else { "Unsaved local changes" }}</p><p class="text-sm text-on-surface-variant">"Validation and preview use the same core sanitizer and buyer renderer as published Store Pages."</p></aside>
+            <aside class="v2-publisher-panel v2-publisher-sidebar v2-store-readiness" class:v2-store-readiness-open=move || readiness_open.get()><h2>"Readiness"</h2>{move || { let platforms = linked_platforms(&listing_for_preview.platforms, &associations.get(), &coordinate_for_readiness.get_value()); let state = readiness(&draft.get(), &associations.get(), &platforms, &diagnostics.get()); view! { <div><p>{if draft.get() == baseline.get() && !input_dirty.get() { "Saved revision" } else { "Unsaved local changes" }}</p><p class="text-sm">{draft.get().loaded_event_id.map(|id| format!("Current revision: {id}")).unwrap_or_else(|| "New unpublished Store Page".into())}</p><h3>"Blocking issues"</h3>{if state.blockers.is_empty() { view! { <p class="text-secondary">"No known blockers"</p> }.into_any() } else { view! { <ul>{state.blockers.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul> }.into_any() }}<h3>"Association warnings"</h3><ul>{state.warnings.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul><h3>"Recommendations"</h3><ul>{state.recommendations.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul></div> } }}<p class="text-sm text-on-surface-variant">"Preview uses the core sanitizer and buyer renderer."</p></aside>
             </div>
 
-            <Show when=move || show_discard.get()>
-                <dialog open class="m-auto rounded-2xl bg-surface-container-high p-6 text-on-surface backdrop:bg-black/70"><h2>"Discard Store Page draft?"</h2><p>"Unsaved changes will be removed for this game."</p><div class="mt-4 flex gap-3"><button class="v2-btn-secondary" autofocus on:click=move |_| show_discard.set(false)>"Keep editing"</button><button class="v2-btn-primary" on:click={let key = key.clone(); move |_| { PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| { drafts.borrow_mut().remove(&key); }); on_back.run(()); }}>"Discard changes"</button></div></dialog>
-            </Show>
+            <footer class="v2-store-editor-footer"><span role="status">{move || if validating.get() { "Validating…" } else if publishing.get() { "Publishing…" } else if draft.get() == baseline.get() && !input_dirty.get() { "Saved" } else { "Unsaved" }}</span><button class="v2-btn-secondary" type="button" disabled=move || validating.get() on:click=move |_| run_validation.run(())>{move || if validating.get() { "Validating..." } else { "Preview" }}</button><button class="v2-btn-primary" type="button" disabled=move || publishing.get() on:click=move |_| publish.run(())>{move || if publishing.get() { "Publishing..." } else { "Publish" }}</button><details class="v2-store-overflow"><summary class="v2-btn-secondary">"More"</summary><div><label>"New presentation ID"<input class="v2-input" prop:value=move || clone_id.get() on:input=move |event| clone_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| clone_page.run(())>"Clone"</button><label>"Existing presentation ID"<input class="v2-input" prop:value=move || link_existing_id.get() on:input=move |event| link_existing_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| link_existing.run(())>"Link existing"</button><button type="button" on:click=move |_| show_discard.set(true)>"Reset / discard draft"</button><details><summary>"Protocol diagnostics"</summary>{move || diagnostics.get().into_iter().map(|item| view! { <p>{item}</p> }).collect_view()}</details></div></details></footer>
+
+            <dialog node_ref=discard_dialog_ref class="m-auto rounded-2xl bg-surface-container-high p-6 text-on-surface backdrop:bg-black/70" on:cancel=move |event: web_sys::Event| { event.prevent_default(); show_discard.set(false); }><h2>"Discard Store Page draft?"</h2><p>"Unsaved changes will be removed for this game."</p><div class="mt-4 flex gap-3"><button class="v2-btn-secondary" autofocus on:click=move |_| show_discard.set(false)>"Keep editing"</button><button class="v2-btn-primary" on:click={let key = key.clone(); move |_| { if loading.get_untracked() || validating.get_untracked() || publishing.get_untracked() || partial.get_untracked().is_some() || auth.npub.get_untracked().as_deref() != Some(publisher_for_discard.get_value().as_str()) { show_discard.set(false); message.set(Some("The draft cannot be discarded while an operation is active or the publisher account is unavailable.".into())); return; } PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| { drafts.borrow_mut().remove(&key); }); on_back.run(()); }}>"Discard changes"</button></div></dialog>
         </section>
     }
 }
@@ -1326,61 +1463,129 @@ mod tests {
     use crate::tauri_bridge::{EventPublishOutcome, ListingPointerPublishOutcome};
 
     #[test]
-    fn structured_editor_parsers_preserve_supported_v1_fields() {
-        let media = parse_media("hero\timage\thero\thttps://cdn.example/hero.png\t\talt | text\tcaption | text\t1920\t1080").expect("media");
-        assert_eq!(media[0].width, Some(1920));
-        assert_eq!(media[0].alt.as_deref(), Some("alt | text"));
+    fn typed_adapter_preserves_supported_v1_fields() {
+        let mut draft = StorePageDraft::new("page".into(), Vec::new());
+        draft.content.media.push(StorePageMediaItem {
+            id: "hero".into(),
+            media_type: "image".into(),
+            role: "hero".into(),
+            url: "https://cdn.example/hero.png".into(),
+            thumbnail_url: None,
+            alt: Some("alt | text".into()),
+            caption: None,
+            width: Some(1920),
+            height: Some(1080),
+        });
+        draft.content.sections.push(StorePageSection {
+            id: "section-1".into(),
+            heading: "Intro".into(),
+            body_markdown: "Hello **world**".into(),
+            media_id: Some("hero".into()),
+            layout: "media-wide".into(),
+        });
+        draft.content.languages = Some(vec![LanguageSupport {
+            code: "en".into(),
+            interface: true,
+            audio: false,
+            subtitles: true,
+        }]);
+        draft.content.accessibility.push(AccessibilityFeature {
+            feature: "subtitles".into(),
+            supported: true,
+            notes: Some("Configurable".into()),
+        });
+        let associations = vec![AssociationRow {
+            listing_coordinate: "listing".into(),
+            event_id: "event".into(),
+            reciprocal: true,
+            action: ListingPointerMutation::Link,
+            relay_hint: None,
+        }];
+        let (adapted, mutations) = adapter_requests(draft, &associations).expect("typed adapter");
+        assert_eq!(adapted.content.media[0].width, Some(1920));
         assert_eq!(
-            parse_sections("intro\tIntro\ttext-only\t\tHello **world**")
-                .expect("section")
-                .len(),
-            1
+            adapted.content.sections[0].media_id.as_deref(),
+            Some("hero")
+        );
+        assert_eq!(adapted.content.languages.as_ref().map(Vec::len), Some(1));
+        assert!(adapted.content.accessibility[0].supported);
+        assert_eq!(mutations[0].action, ListingPointerMutation::Link);
+    }
+
+    #[test]
+    fn editor_text_preserves_spaces_while_typing() {
+        assert_eq!(
+            optional_editor_text("Arcade ".into()).as_deref(),
+            Some("Arcade ")
         );
         assert_eq!(
-            parse_languages("en\ttrue\tfalse\ttrue").expect("language")[0].code,
-            "en"
+            optional_editor_text("Arcade Studio".into()).as_deref(),
+            Some("Arcade Studio")
         );
-        assert!(
-            parse_requirements("linux-x86_64\tminimum\tLinux\tCPU\t8 GB\tGPU\t2 GB\t")
-                .expect("requirements")
-                .contains_key("linux-x86_64")
-        );
-        assert!(
-            parse_accessibility("subtitles\ttrue\tConfigurable").expect("accessibility")[0]
-                .supported
-        );
+        assert_eq!(optional_editor_text(String::new()), None);
     }
 
     #[test]
     fn association_editor_distinguishes_link_unlink_and_review() {
-        let values = parse_associations(
-            "30402:pub:a\tevent-a\tlink\n30402:pub:b\tevent-b\tunlink\n30402:pub:c\tevent-c\treview",
-        )
-        .expect("associations");
-        assert_eq!(values[0].action, ListingPointerMutation::Link);
-        assert_eq!(values[1].action, ListingPointerMutation::Unlink);
-        assert_eq!(values[2].action, ListingPointerMutation::Review);
-    }
-
-    #[test]
-    fn editor_rejects_ambiguous_boolean_claims() {
-        assert!(parse_languages("en\tflase\tfalse\ttrue").is_err());
-        assert!(parse_accessibility("subtitles\tyes\tConfigurable").is_err());
-    }
-
-    #[test]
-    fn section_rows_round_trip_markdown_losslessly() {
-        let section = StorePageSection {
-            id: "details".into(),
-            heading: "Heading\twith tab".into(),
-            body_markdown: "literal \\n and real\nnewline\tindent".into(),
-            media_id: None,
-            layout: "text-only".into(),
-        };
+        let rows = [
+            ListingPointerMutation::Link,
+            ListingPointerMutation::Unlink,
+            ListingPointerMutation::Review,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, action)| AssociationRow {
+            listing_coordinate: format!("listing-{index}"),
+            event_id: format!("event-{index}"),
+            reciprocal: false,
+            action,
+            relay_hint: None,
+        })
+        .collect::<Vec<_>>();
+        let (_, values) = adapter_requests(StorePageDraft::new("page".into(), Vec::new()), &rows)
+            .expect("adapter");
         assert_eq!(
-            parse_sections(&format_sections(std::slice::from_ref(&section))).expect("round trip"),
-            vec![section]
+            values.iter().map(|value| value.action).collect::<Vec<_>>(),
+            vec![
+                ListingPointerMutation::Link,
+                ListingPointerMutation::Unlink,
+                ListingPointerMutation::Review
+            ]
         );
+    }
+
+    #[test]
+    fn media_reorder_and_singular_roles_are_enforced() {
+        let item = |id: &str, role: &str| StorePageMediaItem {
+            id: id.into(),
+            media_type: "image".into(),
+            role: role.into(),
+            url: format!("https://cdn.example/{id}.png"),
+            thumbnail_url: None,
+            alt: None,
+            caption: None,
+            width: None,
+            height: None,
+        };
+        let mut media = vec![item("a", "screenshot"), item("b", "screenshot")];
+        move_item(&mut media, 1, -1);
+        assert_eq!(media[0].id, "b");
+        let mut draft = StorePageDraft::new("page".into(), Vec::new());
+        draft.content.media = vec![item("hero-a", "hero"), item("hero-b", "hero")];
+        assert!(adapter_requests(draft, &[]).is_err());
+    }
+
+    #[test]
+    fn section_media_selection_must_reference_typed_media() {
+        let mut draft = StorePageDraft::new("page".into(), Vec::new());
+        draft.content.sections.push(StorePageSection {
+            id: "section-1".into(),
+            heading: "Details".into(),
+            body_markdown: String::new(),
+            media_id: Some("missing".into()),
+            layout: "media-left".into(),
+        });
+        assert!(adapter_requests(draft, &[]).is_err());
     }
 
     #[test]
@@ -1388,20 +1593,7 @@ mod tests {
         let mut draft = StorePageDraft::new("page".into(), vec!["listing".into()]);
         let baseline = draft.clone();
         draft.content.description_markdown = "unsaved".into();
-        save_cached_draft(
-            "npub-a|listing",
-            draft.clone(),
-            baseline,
-            RawDraftFields {
-                associations: "invalid raw input".into(),
-                media: String::new(),
-                sections: String::new(),
-                languages: String::new(),
-                requirements: String::new(),
-                accessibility: String::new(),
-            },
-            true,
-        );
+        save_cached_draft("npub-a|listing", draft.clone(), baseline, Vec::new(), true);
         retain_account_drafts("npub-b");
         assert!(cached_draft("npub-a|listing").is_none());
         assert!(cached_draft("npub-b|listing").is_none());
@@ -1411,22 +1603,163 @@ mod tests {
     fn new_draft_keeps_selected_listing_association_before_load() {
         let coordinate = "30402:publisher:game";
         let mut draft = StorePageDraft::new("game".into(), Vec::new());
-        let mut raw = RawDraftFields {
-            associations: String::new(),
-            media: String::new(),
-            sections: String::new(),
-            languages: String::new(),
-            requirements: String::new(),
-            accessibility: String::new(),
-        };
+        let mut associations = Vec::new();
 
-        seed_new_draft_association(&mut draft, &mut raw, coordinate, Some("listing-event"));
+        seed_new_draft_association(
+            &mut draft,
+            &mut associations,
+            coordinate,
+            Some("listing-event"),
+        );
 
         assert_eq!(draft.listing_coordinates, vec![coordinate.to_string()]);
+        assert_eq!(associations[0].listing_coordinate, coordinate);
+    }
+
+    #[test]
+    fn linked_platforms_use_only_selected_authoritative_listing_values() {
+        let platforms = vec!["linux-x86_64".to_string(), "windows-x86_64".to_string()];
+        let mut associations = vec![AssociationRow {
+            listing_coordinate: "selected".into(),
+            event_id: "event".into(),
+            reciprocal: true,
+            action: ListingPointerMutation::Unlink,
+            relay_hint: None,
+        }];
+        assert!(linked_platforms(&platforms, &associations, "selected").is_empty());
+        associations[0].action = ListingPointerMutation::Link;
         assert_eq!(
-            raw.associations,
-            format!("{coordinate}\tlisting-event\tlink")
+            linked_platforms(&platforms, &associations, "selected"),
+            platforms
         );
+        assert_eq!(platform_label("linux-x86_64"), "Linux X86 64");
+    }
+
+    #[test]
+    fn typed_languages_accessibility_and_readiness_remain_recommendations() {
+        let mut draft = StorePageDraft::new("page".into(), Vec::new());
+        draft.content.basic.title = Some("Game".into());
+        draft.content.languages = Some(vec![LanguageSupport {
+            code: "pt-BR".into(),
+            interface: true,
+            audio: false,
+            subtitles: true,
+        }]);
+        draft.content.accessibility.push(AccessibilityFeature {
+            feature: "subtitles".into(),
+            supported: true,
+            notes: Some("Publisher provided".into()),
+        });
+        let associations = vec![AssociationRow {
+            listing_coordinate: "listing".into(),
+            event_id: "event".into(),
+            reciprocal: true,
+            action: ListingPointerMutation::Link,
+            relay_hint: None,
+        }];
+        let status = readiness(&draft, &associations, &["linux-x86_64".into()], &[]);
+        assert!(status.blockers.is_empty());
+        assert!(!status
+            .recommendations
+            .iter()
+            .any(|item| item.contains("language")));
+        assert!(!status
+            .recommendations
+            .iter()
+            .any(|item| item.contains("accessibility")));
+        assert!(status
+            .recommendations
+            .iter()
+            .any(|item| item.contains("requirements")));
+    }
+
+    #[test]
+    fn diagnostic_mapping_preview_source_and_responsive_tab_state_are_stable() {
+        assert_eq!(diagnostic_tab("media URL is invalid"), "media");
+        assert_eq!(diagnostic_tab("unknown protocol issue"), "basic");
+        assert_eq!(CANONICAL_PREVIEW_SOURCE, "canonical-validation");
+        assert_eq!(adjacent_tab("basic", -1), "links");
+        assert_eq!(adjacent_tab("links", 1), "basic");
+    }
+
+    #[test]
+    fn conservative_media_preview_requires_https_and_known_extensions() {
+        assert!(safe_media_preview(
+            "https://cdn.example/shot.webp?x=1",
+            "image"
+        ));
+        assert!(safe_media_preview(
+            "https://cdn.example/trailer.webm",
+            "video"
+        ));
+        assert!(!safe_media_preview("http://cdn.example/shot.png", "image"));
+        assert!(!safe_media_preview("https://cdn.example/file", "image"));
+        assert!(safe_https_link("https://arcadestr.example/support"));
+        assert!(!safe_https_link("https://"));
+        assert!(!safe_https_link("javascript:alert(1)"));
+    }
+
+    #[test]
+    fn editor_ids_fill_first_available_gap_and_reject_duplicates() {
+        assert_eq!(unique_editor_id("media", ["media-1", "media-3"]), "media-2");
+        assert_eq!(
+            unique_editor_id("section", std::iter::empty::<&str>()),
+            "section-1"
+        );
+
+        let mut draft = StorePageDraft::new("page".into(), Vec::new());
+        let media = |id: &str| StorePageMediaItem {
+            id: id.into(),
+            media_type: "image".into(),
+            role: "screenshot".into(),
+            url: "https://cdn.example/image.png".into(),
+            thumbnail_url: None,
+            alt: None,
+            caption: None,
+            width: None,
+            height: None,
+        };
+        draft.content.media = vec![media("media-1"), media("media-1")];
+        assert!(validate_editor_ids(&draft).is_err());
+    }
+
+    #[test]
+    fn markdown_destinations_are_rejected_by_typed_adapter() {
+        assert!(description_contains_link(
+            "Read [the guide](https://example.org)"
+        ));
+        assert!(description_contains_link(
+            "![cover](https://example.org/a.png)"
+        ));
+        assert!(!description_contains_link("Use **bold** and headings."));
+
+        let mut draft = StorePageDraft::new("page".into(), Vec::new());
+        draft.content.description_markdown = "[link](https://example.org)".into();
+        assert!(adapter_requests(draft, &[]).is_err());
+    }
+
+    #[test]
+    fn valid_validation_diagnostics_and_relationship_diagnostics_are_warnings() {
+        let mut draft = StorePageDraft::new("page".into(), Vec::new());
+        draft.content.basic.title = Some("Game".into());
+        let associations = vec![AssociationRow {
+            listing_coordinate: "listing".into(),
+            event_id: "event".into(),
+            reciprocal: true,
+            action: ListingPointerMutation::Link,
+            relay_hint: None,
+        }];
+        let status = readiness(
+            &draft,
+            &associations,
+            &[],
+            &[
+                "Warning: sanitized Markdown".into(),
+                "Association: incomplete".into(),
+            ],
+        );
+        assert!(status.blockers.is_empty());
+        assert_eq!(status.warnings.len(), 2);
     }
 
     #[test]
@@ -1481,6 +1814,11 @@ mod tests {
 
         let retry = retryable_mutations(&result, &mutations);
         assert_eq!(retry, vec![mutations[1].clone()]);
+        assert_eq!(
+            selected_replacement_event_id(&result, "listing-a").as_deref(),
+            Some("new-a")
+        );
+        assert!(selected_replacement_event_id(&result, "listing-b").is_none());
     }
 
     #[test]
