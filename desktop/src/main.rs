@@ -55,6 +55,9 @@ use nostr::prelude::ToBech32;
 use tauri::Emitter;
 
 mod adp_commands;
+pub mod blossom_commands;
+pub mod blossom_settings;
+pub mod blossom_upload;
 mod command_contracts;
 mod install;
 mod nip46_commands;
@@ -4641,6 +4644,32 @@ fn main() {
     /// Version info structure for frontend
     type VersionInfo = command_contracts::VersionInfo;
 
+    let database = Arc::new(database);
+    let auth = Arc::new(Mutex::new(AuthState::new()));
+    let signer_state = Arc::new(Mutex::new(AppSignerState::new()));
+    let blossom_provider: Arc<dyn blossom_upload::BlossomAccountProvider> = Arc::new(
+        blossom_commands::DesktopBlossomAccountProvider::new(auth.clone(), signer_state.clone()),
+    );
+    let blossom_upload = Arc::new(blossom_upload::BlossomUploadService::new(
+        blossom_provider.clone(),
+        blossom_upload::BlossomUploadConfig {
+            allow_loopback: cfg!(debug_assertions),
+            ..blossom_upload::BlossomUploadConfig::default()
+        },
+    ));
+    #[cfg(debug_assertions)]
+    let blossom_settings = blossom_settings::BlossomServerSettingsRepository::development_loopback(
+        database.clone(),
+        blossom_provider,
+    );
+    #[cfg(not(debug_assertions))]
+    let blossom_settings = blossom_settings::BlossomServerSettingsRepository::production(
+        database.clone(),
+        blossom_provider,
+    );
+    let blossom_state =
+        blossom_commands::BlossomManagedState::new(blossom_upload, Arc::new(blossom_settings));
+
     let mut builder = tauri::Builder::default();
 
     #[cfg(debug_assertions)]
@@ -4651,9 +4680,9 @@ fn main() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            auth: Arc::new(Mutex::new(AuthState::new())),
+            auth,
             nostr: nostr_client.clone(),
-            database: Arc::new(database),
+            database,
             relay_cache: relay_cache.clone(),
             deduplicator: Arc::new(Mutex::new(deduplicator)),
             subscription_registry: subscription_registry.clone(),
@@ -4667,7 +4696,8 @@ fn main() {
             extended_network_follows: Arc::new(RwLock::new(Vec::new())),
             relay_hints: Some(relay_hints.clone()),
         })
-        .manage(Arc::new(Mutex::new(AppSignerState::new())))
+        .manage(signer_state)
+        .manage(blossom_state)
         .manage(Arc::new(account_manager))
         .setup(move |app| {
             // Ensure window is visible and focused
@@ -5020,6 +5050,19 @@ fn main() {
             get_public_key,
             is_authenticated,
             disconnect,
+            blossom_commands::select_blossom_media_file,
+            blossom_commands::start_blossom_upload,
+            blossom_commands::retry_blossom_upload,
+            blossom_commands::cancel_blossom_upload,
+            blossom_commands::discard_blossom_media_selection,
+            blossom_commands::get_blossom_server_settings,
+            blossom_commands::replace_blossom_server_settings,
+            blossom_commands::add_blossom_server,
+            blossom_commands::update_blossom_server,
+            blossom_commands::remove_blossom_server,
+            blossom_commands::reorder_blossom_servers,
+            blossom_commands::set_preferred_blossom_server,
+            blossom_commands::resolve_blossom_server_candidates,
             adp_commands::check_adp_server,
             adp_commands::discover_adp_servers,
             adp_commands::discover_campaigns,

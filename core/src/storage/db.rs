@@ -153,6 +153,10 @@ const MIGRATION_13_STORE_PAGES: &str = include_str!("../../migrations/010_store_
 const MIGRATION_14_STORE_PAGE_LISTINGS: &str =
     include_str!("../../migrations/011_store_page_listing_events.sql");
 
+// Migration 15: account-scoped Blossom server settings
+const MIGRATION_15_BLOSSOM_SERVER_SETTINGS: &str =
+    include_str!("../../migrations/012_blossom_server_settings.sql");
+
 // List of all migrations in applied order; migration filenames currently lag user_version numbers.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_1_INITIAL,
@@ -169,6 +173,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_12_LIBRARY_GAMES,
     MIGRATION_13_STORE_PAGES,
     MIGRATION_14_STORE_PAGE_LISTINGS,
+    MIGRATION_15_BLOSSOM_SERVER_SETTINGS,
 ];
 
 /// Database connection pool for SQLite

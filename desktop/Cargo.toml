@@ -26,13 +26,23 @@ url = "2"
 dirs = "5"
 tauri-plugin-keyring = "0.1"
 uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 thiserror = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 async-trait = "0.1"
+futures-util = "0.3"
+infer = { version = "0.22", default-features = false }
+imagesize = { version = "0.15", default-features = false, features = ["jpeg", "png", "webp"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
 nostr-sdk = { workspace = true }
 tauri = { workspace = true, features = ["test"] }
+tempfile = "3"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

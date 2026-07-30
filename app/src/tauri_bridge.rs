@@ -1381,9 +1381,351 @@ pub async fn fetch_profile_badges(
     Err("Badge relay display is not yet available on the web target.".to_string())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomCommandErrorDto {
+    pub code: String,
+    pub message: String,
+}
+
+impl From<String> for BlossomCommandErrorDto {
+    fn from(_message: String) -> Self {
+        Self {
+            code: "storage_failure".to_string(),
+            message: "The desktop command could not be completed.".to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "web")]
+fn blossom_desktop_only() -> BlossomCommandErrorDto {
+    BlossomCommandErrorDto {
+        code: "desktop_only".to_string(),
+        message: "Blossom uploads and settings are only available in desktop builds.".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExpectedBlossomPublisherRequest {
+    pub expected_publisher_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomMediaSelectionDto {
+    pub selection_id: String,
+    pub filename: String,
+    pub detected_mime: String,
+    pub size: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartBlossomUploadRequest {
+    pub selection_id: String,
+    pub expected_publisher_hex: String,
+    pub selected_server: Option<String>,
+    pub preflight: bool,
+    pub request_id: String,
+}
+
+pub type RetryBlossomUploadRequest = StartBlossomUploadRequest;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomUploadResponse {
+    pub upload_id: String,
+    pub url: String,
+    pub sha256: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub uploaded: u64,
+    pub was_existing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomUploadProgressDto {
+    pub upload_id: String,
+    pub selection_id: String,
+    pub request_id: String,
+    pub publisher_pubkey: String,
+    pub phase: String,
+    pub bytes_completed: u64,
+    pub total_bytes: u64,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelBlossomUploadRequest {
+    pub upload_id: String,
+    pub expected_publisher_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelBlossomUploadResponse {
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscardBlossomMediaRequest {
+    pub selection_id: String,
+    pub expected_publisher_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscardBlossomMediaResponse {
+    pub cancelled_uploads: usize,
+    pub selection_removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomServerDto {
+    pub origin: String,
+    pub label: Option<String>,
+    pub enabled: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomServerSettingsDto {
+    pub publisher_pubkey: String,
+    pub servers: Vec<BlossomServerDto>,
+    pub preferred_server: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomServerInputDto {
+    pub origin: String,
+    pub label: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplaceBlossomServerSettingsRequest {
+    pub expected_publisher_hex: String,
+    pub servers: Vec<BlossomServerInputDto>,
+    pub preferred_server: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AddBlossomServerRequest {
+    pub expected_publisher_hex: String,
+    pub origin: String,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateBlossomServerRequest {
+    pub expected_publisher_hex: String,
+    pub origin: String,
+    pub label: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomServerOriginRequest {
+    pub expected_publisher_hex: String,
+    pub origin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReorderBlossomServersRequest {
+    pub expected_publisher_hex: String,
+    pub ordered_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetPreferredBlossomServerRequest {
+    pub expected_publisher_hex: String,
+    pub origin: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolveBlossomServerCandidatesRequest {
+    pub expected_publisher_hex: String,
+    pub explicit_server: Option<String>,
+}
+
+#[cfg(not(feature = "web"))]
+async fn invoke_blossom<T, R>(command: &str, request: R) -> Result<T, BlossomCommandErrorDto>
+where
+    T: serde::de::DeserializeOwned + 'static,
+    R: Serialize,
+{
+    crate::tauri_invoke::invoke_typed(command, serde_json::json!({ "request": request })).await
+}
+
+macro_rules! blossom_native_wrapper {
+    ($name:ident, $command:literal, $request:ty, $response:ty) => {
+        #[cfg(not(feature = "web"))]
+        pub async fn $name(request: $request) -> Result<$response, BlossomCommandErrorDto> {
+            invoke_blossom($command, request).await
+        }
+        #[cfg(feature = "web")]
+        pub async fn $name(_request: $request) -> Result<$response, BlossomCommandErrorDto> {
+            Err(blossom_desktop_only())
+        }
+    };
+}
+
+blossom_native_wrapper!(
+    invoke_select_blossom_media_file,
+    "select_blossom_media_file",
+    ExpectedBlossomPublisherRequest,
+    Option<BlossomMediaSelectionDto>
+);
+blossom_native_wrapper!(
+    invoke_start_blossom_upload,
+    "start_blossom_upload",
+    StartBlossomUploadRequest,
+    BlossomUploadResponse
+);
+blossom_native_wrapper!(
+    invoke_retry_blossom_upload,
+    "retry_blossom_upload",
+    RetryBlossomUploadRequest,
+    BlossomUploadResponse
+);
+blossom_native_wrapper!(
+    invoke_cancel_blossom_upload,
+    "cancel_blossom_upload",
+    CancelBlossomUploadRequest,
+    CancelBlossomUploadResponse
+);
+blossom_native_wrapper!(
+    invoke_discard_blossom_media_selection,
+    "discard_blossom_media_selection",
+    DiscardBlossomMediaRequest,
+    DiscardBlossomMediaResponse
+);
+blossom_native_wrapper!(
+    invoke_get_blossom_server_settings,
+    "get_blossom_server_settings",
+    ExpectedBlossomPublisherRequest,
+    BlossomServerSettingsDto
+);
+blossom_native_wrapper!(
+    invoke_replace_blossom_server_settings,
+    "replace_blossom_server_settings",
+    ReplaceBlossomServerSettingsRequest,
+    BlossomServerSettingsDto
+);
+blossom_native_wrapper!(
+    invoke_add_blossom_server,
+    "add_blossom_server",
+    AddBlossomServerRequest,
+    BlossomServerSettingsDto
+);
+blossom_native_wrapper!(
+    invoke_update_blossom_server,
+    "update_blossom_server",
+    UpdateBlossomServerRequest,
+    BlossomServerSettingsDto
+);
+blossom_native_wrapper!(
+    invoke_remove_blossom_server,
+    "remove_blossom_server",
+    BlossomServerOriginRequest,
+    BlossomServerSettingsDto
+);
+blossom_native_wrapper!(
+    invoke_reorder_blossom_servers,
+    "reorder_blossom_servers",
+    ReorderBlossomServersRequest,
+    BlossomServerSettingsDto
+);
+blossom_native_wrapper!(
+    invoke_set_preferred_blossom_server,
+    "set_preferred_blossom_server",
+    SetPreferredBlossomServerRequest,
+    BlossomServerSettingsDto
+);
+blossom_native_wrapper!(
+    invoke_resolve_blossom_server_candidates,
+    "resolve_blossom_server_candidates",
+    ResolveBlossomServerCandidatesRequest,
+    Vec<String>
+);
+
+#[cfg(not(feature = "web"))]
+pub async fn listen_blossom_upload_progress<F>(
+    mut callback: F,
+) -> Result<Box<dyn FnOnce()>, BlossomCommandErrorDto>
+where
+    F: FnMut(BlossomUploadProgressDto) + 'static,
+{
+    let cleanup = crate::tauri_invoke::listen("blossom-upload-progress", move |value| {
+        if let Ok(payload) = serde_json::from_value::<BlossomUploadProgressDto>(value) {
+            callback(payload);
+        }
+    })
+    .await
+    .map_err(BlossomCommandErrorDto::from)?;
+    Ok(Box::new(cleanup))
+}
+
+#[cfg(feature = "web")]
+pub async fn listen_blossom_upload_progress<F>(
+    _callback: F,
+) -> Result<Box<dyn FnOnce()>, BlossomCommandErrorDto>
+where
+    F: FnMut(BlossomUploadProgressDto) + 'static,
+{
+    Err(blossom_desktop_only())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blossom_tauri_bridge_request_response_and_progress_are_safe() {
+        let request = StartBlossomUploadRequest {
+            selection_id: "selection".into(),
+            expected_publisher_hex: "ab".repeat(32),
+            selected_server: Some("https://cdn.example/".into()),
+            preflight: true,
+            request_id: "ui-1".into(),
+        };
+        let request_json = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(request_json["request_id"], "ui-1");
+        let response = BlossomUploadResponse {
+            upload_id: "upload".into(),
+            url: "https://cdn.example/blob".into(),
+            sha256: "cd".repeat(32),
+            mime_type: "image/png".into(),
+            size: 12,
+            uploaded: 10,
+            was_existing: true,
+        };
+        let progress = BlossomUploadProgressDto {
+            upload_id: response.upload_id.clone(),
+            selection_id: request.selection_id,
+            request_id: request.request_id,
+            publisher_pubkey: request.expected_publisher_hex,
+            phase: "upload".into(),
+            bytes_completed: 6,
+            total_bytes: 12,
+            message: None,
+        };
+        let json = format!(
+            "{}{}{}",
+            serde_json::to_string(&request_json).expect("request JSON"),
+            serde_json::to_string(&response).expect("response JSON"),
+            serde_json::to_string(&progress).expect("progress JSON")
+        );
+        for forbidden in ["file_path", "authorization", "raw_bytes", "secret"] {
+            assert!(!json.to_ascii_lowercase().contains(forbidden));
+        }
+        assert!(response.was_existing);
+        assert_eq!(progress.phase, "upload");
+    }
+
+    #[cfg(feature = "web")]
+    #[test]
+    fn blossom_tauri_bridge_web_error_is_typed_desktop_only() {
+        let error = blossom_desktop_only();
+        assert_eq!(error.code, "desktop_only");
+    }
 
     #[test]
     fn publish_request_serialization_preserves_existing_fulfillment_metadata() {

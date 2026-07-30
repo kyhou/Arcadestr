@@ -83,6 +83,7 @@ pub mod adp_client;
 pub mod adp_discovery;
 pub mod adp_protocol;
 pub mod authorization;
+pub mod blossom;
 pub mod campaign;
 #[cfg(feature = "native")]
 pub mod campaign_discovery;

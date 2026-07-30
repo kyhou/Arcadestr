@@ -206,6 +206,51 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
     }
 }
 
+/// Invoke a Tauri command while preserving structured rejection payloads.
+pub async fn invoke_typed<T, E>(command: &str, args: serde_json::Value) -> Result<T, E>
+where
+    T: serde::de::DeserializeOwned + 'static,
+    E: serde::de::DeserializeOwned + From<String>,
+{
+    if !is_tauri_available() {
+        return Err(E::from("Tauri API not available.".to_string()));
+    }
+    let promise = tauri_invoke(command, args).map_err(E::from)?;
+    let value = match JsFuture::from(promise).await {
+        Ok(value) => value,
+        Err(rejection) => {
+            if let Some(raw) = rejection.as_string() {
+                return match serde_json::from_str::<E>(&raw) {
+                    Ok(error) => Err(error),
+                    Err(_) => Err(E::from(raw)),
+                };
+            }
+            let serialized = js_value_json(&rejection);
+            return match serde_json::from_str::<E>(&serialized) {
+                Ok(error) => Err(error),
+                Err(_) => Err(E::from(serialized)),
+            };
+        }
+    };
+    let serialized = js_value_json(&value);
+    serde_json::from_str(&serialized).map_err(|error| {
+        E::from(format!(
+            "Failed to parse response from command '{command}': {error}"
+        ))
+    })
+}
+
+fn js_value_json(value: &JsValue) -> String {
+    if let Some(value) = value.as_string() {
+        serde_json::to_string(&value).unwrap_or_else(|_| "\"IPC failure\"".to_string())
+    } else {
+        js_sys::JSON::stringify(value)
+            .ok()
+            .and_then(|value| value.as_string())
+            .unwrap_or_else(|| "{}".to_string())
+    }
+}
+
 /// Invoke a Tauri command that returns no value
 #[allow(dead_code)]
 pub async fn invoke_void(command: &str, args: serde_json::Value) -> Result<(), String> {

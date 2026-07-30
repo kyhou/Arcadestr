@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::adp_protocol::{EXPERIMENTAL_STORE_PAGE_KIND, NIP99_LISTING_KIND};
+use crate::blossom::{
+    blossom_blob_url_matches_sha256, is_lowercase_sha256_hex, validate_blossom_media,
+};
 use crate::is_replaceable_event_newer;
 use crate::store_page_content_policy::{
     is_allowed_direct_video_url, sanitize_markdown, validate_store_page_url, ContentPolicyError,
@@ -42,6 +45,12 @@ pub struct StorePageMediaItem {
     pub media_type: String,
     pub role: String,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
     #[serde(default)]
     pub thumbnail_url: Option<String>,
     #[serde(default)]
@@ -1005,6 +1014,35 @@ fn validate_content(content: &StorePageContentV1) -> Result<(), StorePageError> 
         ensure_char_limit("media role", &media.role, MAX_IDENTIFIER_CHARS)?;
         ensure_optional_char_limit("media alt text", &media.alt, MAX_TEXT_FIELD_CHARS)?;
         ensure_optional_char_limit("media caption", &media.caption, MAX_TEXT_FIELD_CHARS)?;
+        match (&media.sha256, &media.mime_type, media.size) {
+            (None, None, None) => {}
+            (Some(sha256), Some(mime_type), Some(size)) => {
+                if !is_lowercase_sha256_hex(sha256) {
+                    return Err(StorePageError::InvalidContent(format!(
+                        "media[{}] SHA-256 must contain exactly 64 lowercase hexadecimal characters",
+                        media.id
+                    )));
+                }
+                let policy = validate_blossom_media(mime_type, size).map_err(|error| {
+                    StorePageError::InvalidContent(format!(
+                        "media[{}] integrity metadata is invalid: {error}",
+                        media.id
+                    ))
+                })?;
+                if policy.media_type != media.media_type {
+                    return Err(StorePageError::InvalidContent(format!(
+                        "media[{}] MIME type is incompatible with media type {}",
+                        media.id, media.media_type
+                    )));
+                }
+            }
+            _ => {
+                return Err(StorePageError::InvalidContent(format!(
+                    "media[{}] integrity metadata requires sha256, mime_type, and size",
+                    media.id
+                )))
+            }
+        }
         if media.id.is_empty() || !media_ids.insert(media.id.as_str()) {
             return Err(StorePageError::InvalidContent(
                 "media IDs must be non-empty and unique".into(),
@@ -1095,7 +1133,7 @@ fn sanitize_content(
         if (item.role == "trailer" && item.media_type != "video")
             || (matches!(
                 item.role.as_str(),
-                "hero" | "capsule" | "thumbnail" | "screenshot"
+                "hero" | "capsule" | "thumbnail" | "screenshot" | "feature"
             ) && item.media_type != "image")
         {
             omit_optional(
@@ -1113,7 +1151,12 @@ fn sanitize_content(
             );
             continue;
         };
-        if item.media_type == "video" && !is_allowed_direct_video_url(&url) {
+        let integrity_video = matches!(item.mime_type.as_deref(), Some("video/mp4" | "video/webm"))
+            && item
+                .sha256
+                .as_deref()
+                .is_some_and(|sha256| blossom_blob_url_matches_sha256(&url, sha256));
+        if item.media_type == "video" && !is_allowed_direct_video_url(&url) && !integrity_video {
             omit_optional(
                 &mut diagnostics,
                 format!("{field}.url"),
@@ -1867,6 +1910,9 @@ mod tests {
             media_type: "image".into(),
             role: "hero".into(),
             url: "https://example.com/hero.webp".into(),
+            sha256: None,
+            mime_type: None,
+            size: None,
             thumbnail_url: None,
             alt: None,
             caption: None,
@@ -1926,7 +1972,7 @@ mod tests {
             media_item(
                 "unknown-video",
                 "video",
-                "feature",
+                "trailer",
                 "https://cdn.example.com/trailer.mov",
             ),
         ];
@@ -1958,6 +2004,161 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn media_integrity_metadata_is_backward_compatible_and_preserved_when_complete() {
+        let keys = Keys::generate();
+        let mut without_integrity = content("Manual URL");
+        without_integrity.media.push(media_item(
+            "manual",
+            "image",
+            "hero",
+            "https://cdn.example/manual.webp",
+        ));
+        let json = serde_json::to_value(&without_integrity).expect("content JSON");
+        let serialized_media = &json["media"][0];
+        assert!(serialized_media.get("sha256").is_none());
+        assert!(serialized_media.get("mime_type").is_none());
+        assert!(serialized_media.get("size").is_none());
+        let event = signed_event(
+            &keys,
+            "manual",
+            vec![coordinate(&keys, "manual")],
+            without_integrity,
+            1,
+        );
+        assert!(parse_store_page_event(&event).is_ok());
+
+        let mut with_integrity = content("Blossom URL");
+        let mut media = media_item(
+            "uploaded",
+            "image",
+            "hero",
+            "https://cdn.example/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.webp",
+        );
+        media.sha256 =
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into());
+        media.mime_type = Some("image/webp".into());
+        media.size = Some(42);
+        with_integrity.media.push(media);
+        let event = signed_event(
+            &keys,
+            "blossom",
+            vec![coordinate(&keys, "blossom")],
+            with_integrity,
+            2,
+        );
+        let parsed = parse_store_page_event(&event).expect("complete integrity metadata");
+        assert_eq!(
+            parsed.content.media[0].mime_type.as_deref(),
+            Some("image/webp")
+        );
+        assert_eq!(parsed.sanitized_content.media[0].size, Some(42));
+    }
+
+    #[test]
+    fn blossom_integrity_allows_hash_addressed_video_without_file_extension() {
+        let keys = Keys::generate();
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut page = content("Blossom video");
+        let mut video = media_item(
+            "trailer",
+            "video",
+            "trailer",
+            &format!("https://cdn.example/{hash}"),
+        );
+        video.sha256 = Some(hash.into());
+        video.mime_type = Some("video/webm".into());
+        video.size = Some(42);
+        page.media.push(video);
+        let event = signed_event(
+            &keys,
+            "blossom-video",
+            vec![coordinate(&keys, "blossom-video")],
+            page,
+            3,
+        );
+        let parsed = parse_store_page_event(&event).expect("hash-addressed Blossom video");
+        assert_eq!(parsed.sanitized_content.media.len(), 1);
+
+        let mut manual = content("Manual extensionless video");
+        manual.media.push(media_item(
+            "manual",
+            "video",
+            "trailer",
+            &format!("https://cdn.example/{hash}"),
+        ));
+        let event = signed_event(
+            &keys,
+            "manual-video",
+            vec![coordinate(&keys, "manual-video")],
+            manual,
+            4,
+        );
+        let parsed = parse_store_page_event(&event).expect("manual Store Page remains valid");
+        assert!(parsed.sanitized_content.media.is_empty());
+    }
+
+    #[test]
+    fn parser_rejects_partial_malformed_and_incompatible_media_integrity() {
+        let keys = Keys::generate();
+        let parse = |media: StorePageMediaItem, timestamp| {
+            let mut page = content("Integrity");
+            page.media.push(media);
+            let event = raw_event(
+                &keys,
+                vec![
+                    parse_tag(["d", "integrity"]).expect("d tag"),
+                    parse_tag(["a", coordinate(&keys, "integrity").as_str()]).expect("a tag"),
+                ],
+                serde_json::to_string(&page).expect("content JSON"),
+                timestamp,
+            );
+            parse_store_page_event(&event)
+        };
+
+        let mut partial = media_item(
+            "partial",
+            "image",
+            "hero",
+            "https://cdn.example/partial.webp",
+        );
+        partial.sha256 = Some("a".repeat(64));
+        assert!(matches!(
+            parse(partial, 1),
+            Err(StorePageError::InvalidContent(_))
+        ));
+
+        for invalid_hash in ["A".repeat(64), "abc".to_string()] {
+            let mut malformed = media_item(
+                "malformed",
+                "image",
+                "hero",
+                "https://cdn.example/malformed.webp",
+            );
+            malformed.sha256 = Some(invalid_hash);
+            malformed.mime_type = Some("image/webp".into());
+            malformed.size = Some(42);
+            assert!(matches!(
+                parse(malformed, 2),
+                Err(StorePageError::InvalidContent(_))
+            ));
+        }
+
+        let mut mismatch = media_item(
+            "mismatch",
+            "video",
+            "trailer",
+            "https://cdn.example/mismatch.mp4",
+        );
+        mismatch.sha256 = Some("a".repeat(64));
+        mismatch.mime_type = Some("image/webp".into());
+        mismatch.size = Some(42);
+        assert!(matches!(
+            parse(mismatch, 3),
+            Err(StorePageError::InvalidContent(_))
+        ));
     }
 
     #[test]
@@ -2439,6 +2640,9 @@ mod tests {
             media_type: media_type.into(),
             role: role.into(),
             url: url.into(),
+            sha256: None,
+            mime_type: None,
+            size: None,
             thumbnail_url: None,
             alt: None,
             caption: None,
