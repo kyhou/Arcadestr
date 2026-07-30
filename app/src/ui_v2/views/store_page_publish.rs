@@ -16,7 +16,8 @@ use crate::tauri_bridge::{
     invoke_retry_store_page_pointer_sync, invoke_validate_store_page_draft, ListingPointerMutation,
     PublishStorePageResponse, PublisherStorePageListingRevision, StorePageListingMutation,
 };
-use crate::ui_v2::components::StorePageRichDetail;
+use crate::ui_v2::components::blossom_media_upload::publisher_hex as blossom_publisher_hex;
+use crate::ui_v2::components::{BlossomMediaUpload, StorePageRichDetail};
 
 #[derive(Clone)]
 struct CachedDraft {
@@ -228,6 +229,36 @@ fn optional(value: String) -> Option<String> {
 
 fn optional_editor_text(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
+}
+
+fn media_url_snapshot(draft: &StorePageDraft) -> HashMap<String, String> {
+    draft
+        .content
+        .media
+        .iter()
+        .map(|media| (media.id.clone(), media.url.clone()))
+        .collect()
+}
+
+fn clear_changed_media_integrity(
+    draft: &mut StorePageDraft,
+    previous_urls: &HashMap<String, String>,
+) -> bool {
+    let mut changed = false;
+    for media in &mut draft.content.media {
+        let url_changed = previous_urls
+            .get(&media.id)
+            .is_some_and(|previous| previous != &media.url);
+        if url_changed
+            && (media.sha256.is_some() || media.mime_type.is_some() || media.size.is_some())
+        {
+            media.sha256 = None;
+            media.mime_type = None;
+            media.size = None;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn sync_compact_tags(draft: &mut StorePageDraft) {
@@ -559,6 +590,7 @@ pub fn StorePageEditorView(
 ) -> impl IntoView {
     let auth = use_context::<crate::AuthContext>().expect("AuthContext not provided");
     let publisher = listing.publisher_npub.clone();
+    let canonical_publisher_hex = blossom_publisher_hex(&publisher).unwrap_or_default();
     let coordinate = listing_coordinate(&listing);
     let key = draft_key(&publisher, &coordinate);
     let cached = cached_draft(&key);
@@ -609,7 +641,11 @@ pub fn StorePageEditorView(
     let clone_id = RwSignal::new(String::new());
     let link_existing_id = RwSignal::new(String::new());
     let operation_generation = RwSignal::new(0_u64);
+    let upload_context_generation = RwSignal::new(0_u64);
+    let media_url_generation = RwSignal::new(0_u64);
+    let media_urls = RwSignal::new(media_url_snapshot(&draft.get_untracked()));
     let operation_account = RwSignal::new(auth.npub.get_untracked());
+    let blossom_dialog_role = RwSignal::new(None::<String>);
     let active_tab = RwSignal::new("basic");
     let description_preview = RwSignal::new(false);
     let preview_narrow = RwSignal::new(false);
@@ -623,7 +659,27 @@ pub fn StorePageEditorView(
     let discard_dialog_ref = NodeRef::<leptos::html::Dialog>::new();
 
     Effect::new(move |_| {
-        draft.track();
+        let current = draft.get();
+        let current_urls = media_url_snapshot(&current);
+        let generation = upload_context_generation.get();
+        if media_url_generation.get_untracked() != generation {
+            media_url_generation.set(generation);
+            media_urls.set(current_urls);
+        } else {
+            let previous_urls = media_urls.get_untracked();
+            let changed = current.content.media.iter().any(|media| {
+                previous_urls
+                    .get(&media.id)
+                    .is_some_and(|previous| previous != &media.url)
+                    && (media.sha256.is_some() || media.mime_type.is_some() || media.size.is_some())
+            });
+            media_urls.set(current_urls);
+            if changed {
+                draft.update(|value| {
+                    clear_changed_media_integrity(value, &previous_urls);
+                });
+            }
+        }
         associations.track();
         preview.set(None);
         validation_valid.set(None);
@@ -664,6 +720,7 @@ pub fn StorePageEditorView(
             let current = auth.npub.get();
             if current.as_deref() != Some(publisher.as_str()) {
                 operation_generation.update(|value| *value = value.wrapping_add(1));
+                upload_context_generation.update(|value| *value = value.wrapping_add(1));
                 operation_account.set(current.clone());
                 preview.set(None);
                 loading.set(false);
@@ -803,6 +860,8 @@ pub fn StorePageEditorView(
                                 && !input_dirty.get_untracked()
                             {
                                 associations.set(associations_from_revisions(&state.listings));
+                                upload_context_generation
+                                    .update(|value| *value = value.wrapping_add(1));
                                 draft.set(state.draft.clone());
                                 baseline.set(state.baseline_draft);
                             }
@@ -1219,6 +1278,7 @@ pub fn StorePageEditorView(
                 match result {
                     Ok(cloned) => {
                         associations.set(Vec::new());
+                        upload_context_generation.update(|value| *value = value.wrapping_add(1));
                         draft.set(cloned);
                         preview.set(None);
                         message.set(Some("Clone created locally. Add explicit listing associations before publishing.".to_string()));
@@ -1308,6 +1368,7 @@ pub fn StorePageEditorView(
                         );
                         validation_valid.set(None);
                         association_review_required.set(requires_association_review);
+                        upload_context_generation.update(|value| *value = value.wrapping_add(1));
                         draft.set(state.draft.clone());
                         baseline.set(state.baseline_draft);
                         input_dirty.set(false);
@@ -1358,6 +1419,14 @@ pub fn StorePageEditorView(
             <header class="v2-publisher-game-hero">
                 <div><p class="v2-publisher-kicker">"Store Page editor"</p><h1>{listing.title.clone()}</h1><p class="text-sm text-on-surface-variant">"Drafts stay local until Publish is selected."</p></div>
             </header>
+            <BlossomMediaUpload
+                dialog_role=blossom_dialog_role
+                listing_publisher_npub=publisher.clone()
+                publisher_hex=canonical_publisher_hex.clone()
+                context_generation=upload_context_generation
+                draft=draft
+                input_dirty=input_dirty
+            />
             {move || loading.get().then(|| view! { <p>"Loading current Store Page and signed listings..."</p> })}
             {move || message.get().map(|value| view! { <p class="rounded-xl bg-surface-container-high p-3" role="status">{value}</p> })}
             {move || form_error.get().map(|value| view! { <p class="text-error" role="alert">{value}</p> })}
@@ -1413,7 +1482,7 @@ pub fn StorePageEditorView(
 
                 <Show when=move || active_tab.get() == "description"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Description"</h2><div role="group" aria-label="Description mode"><button type="button" class="v2-btn-secondary" aria-pressed=move || !description_preview.get() on:click=move |_| description_preview.set(false)>"Write"</button><button type="button" class="v2-btn-secondary" aria-pressed=move || description_preview.get() on:click=move |_| description_preview.set(true)>"Preview"</button></div></div><Show when=move || !description_preview.get()><div class="v2-store-toolbar" role="toolbar" aria-label="Markdown formatting"><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("**bold**"))>"Bold"</button><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("\n## Heading\n"))>"Heading"</button><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("\n- item"))>"List"</button></div><label>"Markdown description"<textarea class="v2-input min-h-64" prop:value=move || draft.get().content.description_markdown on:input=move |event| draft.update(|value| value.content.description_markdown = event_target_value(&event)) /></label><small>{move || format!("{} characters", draft.get().content.description_markdown.chars().count())}</small></Show><Show when=move || description_preview.get()><div class="v2-store-canonical-placeholder"><strong>"Canonical preview only"</strong><p>"Validate the draft to render sanitized content with the buyer Store Page renderer below."</p><button type="button" class="v2-btn-secondary" on:click=move |_| run_validation.run(())>"Validate canonical preview"</button></div></Show><details class="v2-publisher-diagnostics"><summary>"Description diagnostics"</summary>{move || diagnostics.get().into_iter().map(|item| view! { <p>{item}</p> }).collect_view()}</details></section></Show>
 
-                <Show when=move || active_tab.get() == "media"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Media"</h2><button type="button" class="v2-btn-secondary" on:click=move |_| draft.update(|value| { let id = unique_editor_id("media", value.content.media.iter().map(|item| item.id.as_str())); value.content.media.push(StorePageMediaItem { id, media_type: "image".into(), role: "screenshot".into(), url: String::new(), thumbnail_url: None, alt: None, caption: None, width: None, height: None }); })>"Add media"</button></div>{move || draft.get().content.media.into_iter().enumerate().map(|(index, item)| view! { <article class="v2-store-card"><div class="v2-store-card-actions"><button type="button" aria-label="Move media up" disabled=index == 0 on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.media, index, -1)); }>"↑"</button><button type="button" aria-label="Move media down" on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.media, index, 1)); }>"↓"</button><button type="button" aria-label="Delete media" on:click=move |_| { if pending_removal.get_untracked() == Some(("media", index)) { pending_removal.set(None); draft.update(|value| { let removed_id = value.content.media.get(index).map(|item| item.id.clone()); if index < value.content.media.len() { value.content.media.remove(index); } if let Some(removed_id) = removed_id { for section in &mut value.content.sections { if section.media_id.as_deref() == Some(removed_id.as_str()) { section.media_id = None; } } } }); } else { pending_removal.set(Some(("media", index))); } }>{move || if pending_removal.get() == Some(("media", index)) { "Confirm delete" } else { "Delete" }}</button></div><div class="v2-store-form-grid"><label>"Type"<select class="v2-input" prop:value=item.media_type.clone() on:change=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.media_type = event_target_value(&event); })><option value="image">"Image"</option><option value="video">"Video"</option></select></label><label>"Role"<select class="v2-input" prop:value=item.role.clone() on:change=move |event| { let role = event_target_value(&event); if matches!(role.as_str(), "hero" | "capsule") && draft.get_untracked().content.media.iter().enumerate().any(|(other, item)| other != index && item.role == role) { form_error.set(Some(format!("Only one {role} is allowed."))); } else { draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.role = role; }); } }><option value="hero">"Hero"</option><option value="capsule">"Capsule"</option><option value="screenshot">"Screenshot"</option><option value="trailer">"Trailer"</option><option value="feature">"Feature"</option></select></label><label class="sm:col-span-2">"HTTPS URL"<input type="url" class="v2-input" prop:value=item.url.clone() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.url = event_target_value(&event); }) /></label><label>"Thumbnail URL"<input type="url" class="v2-input" prop:value=item.thumbnail_url.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.thumbnail_url = optional(event_target_value(&event)); }) /></label><label>"Alternative text"<input class="v2-input" prop:value=item.alt.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.alt = optional(event_target_value(&event)); }) /></label><label>"Caption"<input class="v2-input" prop:value=item.caption.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.caption = optional(event_target_value(&event)); }) /></label><label>"Width"<input type="number" min="1" class="v2-input" prop:value=item.width.map(|value| value.to_string()).unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.width = event_target_value(&event).parse().ok(); }) /></label><label>"Height"<input type="number" min="1" class="v2-input" prop:value=item.height.map(|value| value.to_string()).unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.height = event_target_value(&event).parse().ok(); }) /></label></div><div class="v2-store-canonical-placeholder"><strong>{if safe_media_preview(&item.url, &item.media_type) { "Ready for core validation" } else { "Enter a supported HTTPS media URL" }}</strong><p>"Media is rendered only after canonical validation in Preview."</p></div></article> }).collect_view()}</section></Show>
+                <Show when=move || active_tab.get() == "media"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Media"</h2><div class="flex flex-wrap gap-2" role="group" aria-label="Add Store Page media"><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("hero".into()))>"Upload hero"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("capsule".into()))>"Upload capsule"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("screenshot".into()))>"Add screenshot"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("trailer".into()))>"Add trailer"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("feature".into()))>"Add feature image"</button><button type="button" class="v2-btn-secondary" on:click=move |_| draft.update(|value| { let id = unique_editor_id("media", value.content.media.iter().map(|item| item.id.as_str())); value.content.media.push(StorePageMediaItem { id, media_type: "image".into(), role: "screenshot".into(), url: String::new(), sha256: None, mime_type: None, size: None, thumbnail_url: None, alt: None, caption: None, width: None, height: None }); })>"Use existing URL"</button></div></div><p class="text-sm text-on-surface-variant">"Removing media only removes its draft reference; it does not delete the hosted blob."</p>{move || draft.get().content.media.into_iter().enumerate().map(|(index, item)| view! { <article class="v2-store-card"><div class="v2-store-card-actions"><button type="button" aria-label="Move media up" disabled=index == 0 on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.media, index, -1)); }>"↑"</button><button type="button" aria-label="Move media down" on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.media, index, 1)); }>"↓"</button><button type="button" aria-label="Delete media" on:click=move |_| { if pending_removal.get_untracked() == Some(("media", index)) { pending_removal.set(None); draft.update(|value| { let removed_id = value.content.media.get(index).map(|item| item.id.clone()); if index < value.content.media.len() { value.content.media.remove(index); } if let Some(removed_id) = removed_id { for section in &mut value.content.sections { if section.media_id.as_deref() == Some(removed_id.as_str()) { section.media_id = None; } } } }); } else { pending_removal.set(Some(("media", index))); } }>{move || if pending_removal.get() == Some(("media", index)) { "Confirm remove draft reference" } else { "Remove reference" }}</button></div><div class="v2-store-form-grid"><label>"Type"<select class="v2-input" prop:value=item.media_type.clone() on:change=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.media_type = event_target_value(&event); })><option value="image">"Image"</option><option value="video">"Video"</option></select></label><label>"Role"<select class="v2-input" prop:value=item.role.clone() on:change=move |event| { let role = event_target_value(&event); if matches!(role.as_str(), "hero" | "capsule") && draft.get_untracked().content.media.iter().enumerate().any(|(other, item)| other != index && item.role == role) { form_error.set(Some(format!("Only one {role} is allowed."))); } else { draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.role = role; }); } }><option value="hero">"Hero"</option><option value="capsule">"Capsule"</option><option value="screenshot">"Screenshot"</option><option value="trailer">"Trailer"</option><option value="feature">"Feature"</option></select></label><label class="sm:col-span-2">"HTTPS URL"<input type="url" class="v2-input" prop:value=item.url.clone() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.url = event_target_value(&event); }) /></label><label>"Thumbnail URL"<input type="url" class="v2-input" prop:value=item.thumbnail_url.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.thumbnail_url = optional(event_target_value(&event)); }) /></label><label>"Alternative text"<input class="v2-input" prop:value=item.alt.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.alt = optional(event_target_value(&event)); }) /></label><label>"Caption"<input class="v2-input" prop:value=item.caption.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.caption = optional(event_target_value(&event)); }) /></label><label>"Width"<input type="number" min="1" class="v2-input" prop:value=item.width.map(|value| value.to_string()).unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.width = event_target_value(&event).parse().ok(); }) /></label><label>"Height"<input type="number" min="1" class="v2-input" prop:value=item.height.map(|value| value.to_string()).unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.height = event_target_value(&event).parse().ok(); }) /></label></div><div class="v2-store-canonical-placeholder"><strong>{if safe_media_preview(&item.url, &item.media_type) { "Ready for core validation" } else { "Enter a supported HTTPS media URL" }}</strong><p>"Media is rendered only after canonical validation in Preview."</p></div></article> }).collect_view()}</section></Show>
 
                 <Show when=move || active_tab.get() == "sections"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Feature Sections"</h2><button type="button" class="v2-btn-secondary" on:click=move |_| draft.update(|value| { let id = unique_editor_id("section", value.content.sections.iter().map(|section| section.id.as_str())); value.content.sections.push(StorePageSection { id, heading: String::new(), body_markdown: String::new(), media_id: None, layout: "text".into() }); })>"Add section"</button></div>{move || { let media = draft.get().content.media; draft.get().content.sections.into_iter().enumerate().map(|(index, section)| { let options = media.clone(); view! { <article class="v2-store-card"><div class="v2-store-card-actions"><button type="button" aria-label="Move section up" disabled=index == 0 on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.sections, index, -1)); }>"↑"</button><button type="button" aria-label="Move section down" on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.sections, index, 1)); }>"↓"</button><button type="button" aria-label="Remove section" on:click=move |_| { if pending_removal.get_untracked() == Some(("section", index)) { pending_removal.set(None); draft.update(|value| { if index < value.content.sections.len() { value.content.sections.remove(index); } }); } else { pending_removal.set(Some(("section", index))); } }>{move || if pending_removal.get() == Some(("section", index)) { "Confirm remove" } else { "Remove" }}</button></div><label>"Layout"<select class="v2-input" prop:value=section.layout on:change=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.layout = event_target_value(&event); })><option value="text">"Text"</option><option value="media-left">"Media left"</option><option value="media-right">"Media right"</option><option value="media-wide">"Media wide"</option></select></label><label>"Heading"<input class="v2-input" prop:value=section.heading on:input=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.heading = event_target_value(&event); }) /></label><label>"Media"<select class="v2-input" prop:value=section.media_id.unwrap_or_default() on:change=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.media_id = optional(event_target_value(&event)); })><option value="">"No media"</option>{options.into_iter().map(|item| view! { <option value=item.id.clone()>{format!("{} · {}", item.role, item.id)}</option> }).collect_view()}</select></label><label>"Section Markdown"<textarea class="v2-input min-h-32" prop:value=section.body_markdown on:input=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.body_markdown = event_target_value(&event); }) /></label><button type="button" class="v2-btn-secondary" on:click=move |_| run_validation.run(())>"Preview canonical section"</button></article> } }).collect_view() }}</section></Show>
 
@@ -1470,6 +1539,9 @@ mod tests {
             media_type: "image".into(),
             role: "hero".into(),
             url: "https://cdn.example/hero.png".into(),
+            sha256: None,
+            mime_type: None,
+            size: None,
             thumbnail_url: None,
             alt: Some("alt | text".into()),
             caption: None,
@@ -1526,6 +1598,35 @@ mod tests {
     }
 
     #[test]
+    fn manual_url_change_clears_stale_integrity_assertions() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut draft = StorePageDraft::new("page".into(), Vec::new());
+        draft.content.media.push(StorePageMediaItem {
+            id: "uploaded".into(),
+            media_type: "image".into(),
+            role: "screenshot".into(),
+            url: format!("https://cdn.example/{hash}.png"),
+            sha256: Some(hash.into()),
+            mime_type: Some("image/png".into()),
+            size: Some(42),
+            thumbnail_url: None,
+            alt: None,
+            caption: None,
+            width: None,
+            height: None,
+        });
+        let previous_urls = media_url_snapshot(&draft);
+
+        draft.content.media[0].url = format!("https://other.example/{hash}.png");
+        assert!(clear_changed_media_integrity(&mut draft, &previous_urls));
+        let media = &draft.content.media[0];
+        assert_eq!(
+            (media.sha256.as_ref(), media.mime_type.as_ref(), media.size),
+            (None, None, None)
+        );
+    }
+
+    #[test]
     fn association_editor_distinguishes_link_unlink_and_review() {
         let rows = [
             ListingPointerMutation::Link,
@@ -1561,6 +1662,9 @@ mod tests {
             media_type: "image".into(),
             role: role.into(),
             url: format!("https://cdn.example/{id}.png"),
+            sha256: None,
+            mime_type: None,
+            size: None,
             thumbnail_url: None,
             alt: None,
             caption: None,
@@ -1713,6 +1817,9 @@ mod tests {
             media_type: "image".into(),
             role: "screenshot".into(),
             url: "https://cdn.example/image.png".into(),
+            sha256: None,
+            mime_type: None,
+            size: None,
             thumbnail_url: None,
             alt: None,
             caption: None,
