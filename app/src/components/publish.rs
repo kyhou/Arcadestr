@@ -8,20 +8,27 @@ use arcadestr_core::is_sha256_hex;
 use crate::campaign_management::datetime_local_to_unix;
 use crate::models::{AcquisitionPolicy, CampaignPointer, ListingSource};
 use crate::tauri_bridge::{
-    invoke_check_adp_server, invoke_discover_adp_servers, invoke_hash_build_file,
-    invoke_publish_adp_listing, invoke_resolve_adp_operator, invoke_select_build_file,
-    listen_hash_progress, listen_publish_progress, AdpServerAnnouncement, CampaignPointerInput,
-    FulfillmentMode, HashBuildFileRequest, HashProgressPayload, PublishAdpListingRequest,
-    PublishAdpListingResult, PublishProgressPayload, ResolveAdpOperatorRequest,
+    invoke_add_blossom_server, invoke_check_adp_server, invoke_discard_blossom_media_selection,
+    invoke_discover_adp_servers, invoke_get_blossom_server_settings, invoke_hash_build_file,
+    invoke_publish_adp_listing, invoke_resolve_adp_operator, invoke_select_blossom_media_file,
+    invoke_select_build_file, invoke_start_blossom_upload, listen_hash_progress,
+    listen_publish_progress, AddBlossomServerRequest, AdpServerAnnouncement,
+    BlossomMediaSelectionDto, CampaignPointerInput, DiscardBlossomMediaRequest,
+    ExpectedBlossomPublisherRequest, FulfillmentMode, HashBuildFileRequest, HashProgressPayload,
+    PublishAdpListingRequest, PublishAdpListingResult, PublishProgressPayload,
+    ResolveAdpOperatorRequest, StartBlossomUploadRequest,
 };
-use crate::ui_v2::views::{use_fallback_cover, valid_cover_url};
+use crate::ui_v2::components::blossom_media_upload::{
+    fresh_request_id, preferred_candidate, publisher_hex, stable_error_message,
+};
+use crate::ui_v2::views::use_fallback_cover;
 use crate::{AuthContext, GameListing};
 
 use super::date_time_picker::DateTimeRangePicker;
 
 const DEFAULT_ADP_SERVER_URL: &str = match option_env!("ARCADESTR_DEFAULT_ADP_SERVER_URL") {
     Some(url) => url,
-    None => "https://dist.arcadestr.io",
+    None => "http://localhost:9099",
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +233,52 @@ fn validate_http_urls(input: &str, label: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(values)
+}
+
+fn listing_image_mime(mime: &str) -> bool {
+    matches!(mime, "image/jpeg" | "image/png" | "image/webp")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListingImageDraft {
+    Hosted(String),
+    Pending(BlossomMediaSelectionDto),
+}
+
+fn hosted_image_urls(images: &[ListingImageDraft]) -> Result<Vec<String>, String> {
+    let hosted = images
+        .iter()
+        .filter_map(|image| match image {
+            ListingImageDraft::Hosted(url) => Some(url.clone()),
+            ListingImageDraft::Pending(_) => None,
+        })
+        .collect::<Vec<_>>();
+    validate_http_urls(&hosted.join(","), "Image URL")
+}
+
+fn screenshot_slot_count(image_count: usize) -> usize {
+    let screenshot_count = image_count.saturating_sub(1);
+    4.max(screenshot_count.saturating_add(1))
+}
+
+fn has_pending_images(images: &[ListingImageDraft]) -> bool {
+    images
+        .iter()
+        .any(|image| matches!(image, ListingImageDraft::Pending(_)))
+}
+
+fn image_server_ready(images: &[ListingImageDraft], server: Option<&str>) -> bool {
+    !has_pending_images(images) || server.is_some()
+}
+
+fn human_image_size(size: u64) -> String {
+    if size >= 1_048_576 {
+        format!("{:.1} MiB", size as f64 / 1_048_576.0)
+    } else if size >= 1_024 {
+        format!("{:.1} KiB", size as f64 / 1_024.0)
+    } else {
+        format!("{size} bytes")
+    }
 }
 
 fn publication_progress(
@@ -1207,6 +1260,63 @@ mod tests {
     }
 
     #[test]
+    fn deferred_listing_images_accept_only_supported_image_types() {
+        assert!(listing_image_mime("image/jpeg"));
+        assert!(listing_image_mime("image/png"));
+        assert!(listing_image_mime("image/webp"));
+        assert!(!listing_image_mime("image/gif"));
+        assert!(!listing_image_mime("video/mp4"));
+    }
+
+    #[test]
+    fn hosted_listing_image_urls_preserve_visual_order() {
+        let images = vec![
+            ListingImageDraft::Hosted("https://cdn.example/cover.png".into()),
+            ListingImageDraft::Pending(BlossomMediaSelectionDto {
+                selection_id: "pending".into(),
+                filename: "shot.png".into(),
+                detected_mime: "image/png".into(),
+                size: 42,
+                width: Some(1),
+                height: Some(1),
+                preview_data_url: Some("data:image/png;base64,AA==".into()),
+            }),
+            ListingImageDraft::Hosted("https://cdn.example/shot-2.png".into()),
+        ];
+        assert_eq!(
+            hosted_image_urls(&images),
+            Ok(vec![
+                "https://cdn.example/cover.png".into(),
+                "https://cdn.example/shot-2.png".into()
+            ])
+        );
+        assert!(has_pending_images(&images));
+        assert!(!image_server_ready(&images, None));
+        assert!(image_server_ready(&images, Some("https://blossom.example")));
+        let mut completed = images;
+        completed[1] = ListingImageDraft::Hosted("https://cdn.example/shot-1.png".into());
+        assert!(!has_pending_images(&completed));
+        assert!(image_server_ready(&completed, None));
+        assert_eq!(
+            hosted_image_urls(&completed),
+            Ok(vec![
+                "https://cdn.example/cover.png".into(),
+                "https://cdn.example/shot-1.png".into(),
+                "https://cdn.example/shot-2.png".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn screenshot_slots_start_at_four_and_keep_one_empty_slot() {
+        assert_eq!(screenshot_slot_count(0), 4);
+        assert_eq!(screenshot_slot_count(1), 4);
+        assert_eq!(screenshot_slot_count(4), 4);
+        assert_eq!(screenshot_slot_count(5), 5);
+        assert_eq!(screenshot_slot_count(8), 8);
+    }
+
+    #[test]
     fn selecting_a_different_file_invalidates_the_hash() {
         let (path, hash) = file_selection_changed(Some("/tmp/new.zip".into()));
         assert_eq!(path.as_deref(), Some("/tmp/new.zip"));
@@ -1392,12 +1502,25 @@ pub fn PublishView(
             .map(|item| item.description.clone())
             .unwrap_or_default(),
     );
-    let image_input = RwSignal::new(
+    let image_drafts = RwSignal::new(
         listing
             .as_ref()
-            .map(|item| item.images.join(", "))
+            .map(|item| {
+                item.images
+                    .iter()
+                    .cloned()
+                    .map(ListingImageDraft::Hosted)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default(),
     );
+    let selected_image_publisher = RwSignal::new(None::<String>);
+    let is_selecting_image = RwSignal::new(false);
+    let image_upload_status = RwSignal::new(None::<String>);
+    let image_upload_server = RwSignal::new(None::<String>);
+    let image_server_origin = RwSignal::new(String::new());
+    let image_server_error = RwSignal::new(None::<String>);
+    let is_saving_image_server = RwSignal::new(false);
     let tag_input = RwSignal::new(
         listing
             .as_ref()
@@ -1637,6 +1760,192 @@ pub fn PublishView(
         });
     };
 
+    let editing_publisher_for_images = editing_publisher.clone();
+    let on_select_image = Callback::new(move |target_index: usize| {
+        if !can_dispatch(
+            is_selecting_image.get_untracked(),
+            is_publishing.get_untracked(),
+        ) {
+            return;
+        }
+        let Some(account) = auth.npub.get_untracked() else {
+            error_message.set(Some("Sign in before selecting an image.".into()));
+            return;
+        };
+        if !publication_account_allowed(editing_publisher_for_images.as_deref(), &account) {
+            error_message.set(Some(
+                "Switch to the developer account that published this Game page before adding images."
+                    .into(),
+            ));
+            return;
+        }
+        let Some(account_hex) = publisher_hex(&account) else {
+            error_message.set(Some("The active publisher key is invalid.".into()));
+            return;
+        };
+        if has_pending_images(&image_drafts.get_untracked())
+            && selected_image_publisher.get_untracked().as_deref() != Some(account_hex.as_str())
+        {
+            error_message.set(Some(
+                "Remove images selected by the previous account before adding more.".into(),
+            ));
+            return;
+        }
+        is_selecting_image.set(true);
+        error_message.set(None);
+        spawn_local(async move {
+            match invoke_get_blossom_server_settings(ExpectedBlossomPublisherRequest {
+                expected_publisher_hex: account_hex.clone(),
+            })
+            .await
+            {
+                Ok(settings) if settings.publisher_pubkey == account_hex => {
+                    image_upload_server.set(preferred_candidate(&settings));
+                    image_server_error.set(None);
+                }
+                Ok(_) => {
+                    image_upload_server.set(None);
+                    image_server_error.set(Some(
+                        "The Blossom settings belong to a different account.".into(),
+                    ));
+                }
+                Err(command_error) => {
+                    image_upload_server.set(None);
+                    image_server_error.set(Some(stable_error_message(&command_error.code).into()));
+                }
+            }
+            let picked = invoke_select_blossom_media_file(ExpectedBlossomPublisherRequest {
+                expected_publisher_hex: account_hex.clone(),
+            })
+            .await;
+            if auth.npub.get_untracked().as_deref() != Some(account.as_str()) {
+                if let Ok(Some(stale)) = picked {
+                    let _ = invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
+                        selection_id: stale.selection_id,
+                        expected_publisher_hex: account_hex,
+                    })
+                    .await;
+                }
+                error_message.set(Some(
+                    "The active account changed while selecting the image.".into(),
+                ));
+                is_selecting_image.set(false);
+                return;
+            }
+            match picked {
+                Ok(Some(selection)) if listing_image_mime(&selection.detected_mime) => {
+                    selected_image_publisher.set(Some(account_hex.clone()));
+                    let replaced = image_drafts
+                        .try_update(|images| {
+                            let selected = ListingImageDraft::Pending(selection);
+                            if target_index < images.len() {
+                                Some(std::mem::replace(&mut images[target_index], selected))
+                            } else {
+                                images.push(selected);
+                                None
+                            }
+                        })
+                        .flatten();
+                    if let Some(ListingImageDraft::Pending(replaced)) = replaced {
+                        let _ =
+                            invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
+                                selection_id: replaced.selection_id,
+                                expected_publisher_hex: account_hex,
+                            })
+                            .await;
+                    }
+                }
+                Ok(Some(selection)) => {
+                    let _ = invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
+                        selection_id: selection.selection_id,
+                        expected_publisher_hex: account_hex,
+                    })
+                    .await;
+                    error_message.set(Some("Choose a JPEG, PNG, or WebP image.".into()));
+                }
+                Ok(None) => {}
+                Err(command_error) => {
+                    error_message.set(Some(stable_error_message(&command_error.code).to_string()))
+                }
+            }
+            is_selecting_image.set(false);
+        });
+    });
+
+    let remove_image = Callback::new(move |index: usize| {
+        if is_publishing.get_untracked() {
+            return;
+        }
+        let removed = image_drafts
+            .try_update(|images| (index < images.len()).then(|| images.remove(index)))
+            .flatten();
+        if let (Some(ListingImageDraft::Pending(selection)), Some(expected_publisher_hex)) =
+            (removed, selected_image_publisher.get_untracked())
+        {
+            spawn_local(async move {
+                let _ = invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
+                    selection_id: selection.selection_id,
+                    expected_publisher_hex,
+                })
+                .await;
+            });
+        }
+    });
+
+    let save_image_server = Callback::new(move |_: ()| {
+        if is_saving_image_server.get_untracked() || is_publishing.get_untracked() {
+            return;
+        }
+        let origin = image_server_origin.get_untracked().trim().to_string();
+        if origin.is_empty() {
+            image_server_error.set(Some("Enter a Blossom server URL.".into()));
+            return;
+        }
+        let Some(account) = auth.npub.get_untracked() else {
+            image_server_error.set(Some("Sign in before adding a Blossom server.".into()));
+            return;
+        };
+        let Some(account_hex) = publisher_hex(&account) else {
+            image_server_error.set(Some("The active publisher key is invalid.".into()));
+            return;
+        };
+        if selected_image_publisher.get_untracked().as_deref() != Some(account_hex.as_str()) {
+            image_server_error.set(Some(
+                "Switch back to the account that selected these images.".into(),
+            ));
+            return;
+        }
+        is_saving_image_server.set(true);
+        image_server_error.set(None);
+        spawn_local(async move {
+            match invoke_add_blossom_server(AddBlossomServerRequest {
+                expected_publisher_hex: account_hex.clone(),
+                origin,
+                label: Some("Game publishing".into()),
+            })
+            .await
+            {
+                Ok(settings) if settings.publisher_pubkey == account_hex => {
+                    if let Some(server) = preferred_candidate(&settings) {
+                        image_upload_server.set(Some(server));
+                        image_server_origin.set(String::new());
+                    } else {
+                        image_server_error.set(Some(
+                            "The Blossom server was added but is not enabled.".into(),
+                        ));
+                    }
+                }
+                Ok(_) => image_server_error.set(Some(
+                    "The Blossom settings belong to a different account.".into(),
+                )),
+                Err(command_error) => {
+                    image_server_error.set(Some(stable_error_message(&command_error.code).into()))
+                }
+            }
+            is_saving_image_server.set(false);
+        });
+    });
+
     let on_next = move |_| {
         let stage = current_stage.get_untracked();
         let validation = match stage {
@@ -1658,8 +1967,19 @@ pub fn PublishView(
                     &FulfillmentMode::None,
                     "",
                 )
+                .and_then(|_| hosted_image_urls(&image_drafts.get_untracked()).map(|_| ()))
                 .and_then(|_| {
-                    validate_http_urls(&image_input.get_untracked(), "Image URL").map(|_| ())
+                    if !image_server_ready(
+                        &image_drafts.get_untracked(),
+                        image_upload_server.get_untracked().as_deref(),
+                    ) {
+                        image_server_error.set(Some(
+                            "Add an enabled Blossom server before continuing.".into(),
+                        ));
+                        Err("Add a Blossom upload server below before continuing.".into())
+                    } else {
+                        Ok(())
+                    }
                 })
             }
             PublishStage::Pricing => price_for_acquisition(
@@ -1714,6 +2034,10 @@ pub fn PublishView(
     let editing_publisher_for_submit = editing_publisher.clone();
     let existing_event_id_for_submit = existing_event_id.clone();
     let on_submit = Callback::new(move |()| {
+        if is_selecting_image.get_untracked() {
+            error_message.set(Some("Finish selecting the image before publishing.".into()));
+            return;
+        }
         if !can_dispatch(is_hashing.get_untracked(), is_publishing.get_untracked()) {
             return;
         }
@@ -1792,15 +2116,40 @@ pub fn PublishView(
                 return;
             }
         };
-        let images = match validate_http_urls(&image_input.get(), "Image URL") {
+        let draft_images = image_drafts.get();
+        let images = match hosted_image_urls(&draft_images) {
             Ok(images) => images,
             Err(msg) => {
                 error_message.set(Some(msg));
                 return;
             }
         };
+        let pending_images = draft_images
+            .iter()
+            .filter_map(|image| match image {
+                ListingImageDraft::Pending(selection) => Some(selection.clone()),
+                ListingImageDraft::Hosted(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let image_publisher_hex = match publisher_hex(&initiating_npub) {
+            Some(value) => value,
+            None => {
+                error_message.set(Some("The active publisher key is invalid.".into()));
+                return;
+            }
+        };
+        if !pending_images.is_empty()
+            && selected_image_publisher.get_untracked().as_deref()
+                != Some(image_publisher_hex.as_str())
+        {
+            error_message.set(Some(
+                "The selected images belong to a different publisher account. Remove and select them again."
+                    .into(),
+            ));
+            return;
+        }
 
-        let request = PublishAdpListingRequest {
+        let mut request = PublishAdpListingRequest {
             expected_publisher_npub: initiating_npub.clone(),
             existing_event_id: existing_event_id_for_submit.clone(),
             d_tag: id_val,
@@ -1839,7 +2188,6 @@ pub fn PublishView(
             campaigns: existing_campaigns_for_submit.clone(),
             nip94_event_id: existing_nip94_for_submit.clone(),
         };
-        let published_request = request.clone();
         let existing_listing = existing_listing_for_submit.clone();
 
         is_publishing.set(true);
@@ -1859,6 +2207,173 @@ pub fn PublishView(
         });
 
         spawn_local(async move {
+            if !pending_images.is_empty() {
+                image_upload_status.set(Some(format!(
+                    "Preparing {} image upload(s)",
+                    pending_images.len()
+                )));
+                let settings = match invoke_get_blossom_server_settings(
+                    ExpectedBlossomPublisherRequest {
+                        expected_publisher_hex: image_publisher_hex.clone(),
+                    },
+                )
+                .await
+                {
+                    Ok(settings) if settings.publisher_pubkey == image_publisher_hex => settings,
+                    Ok(_) => {
+                        publication_state.set(PublicationState {
+                            outcome: PublicationOutcome::Failed,
+                            listing_published: false,
+                            message: Some(
+                                "Image upload stopped because the publisher account changed. No game event was published."
+                                    .into(),
+                            ),
+                        });
+                        image_upload_status.set(None);
+                        is_publishing.set(false);
+                        initiating_account.set(None);
+                        return;
+                    }
+                    Err(command_error) => {
+                        publication_state.set(PublicationState {
+                            outcome: PublicationOutcome::Failed,
+                            listing_published: false,
+                            message: Some(format!(
+                                "Image upload failed: {} No game event was published.",
+                                stable_error_message(&command_error.code)
+                            )),
+                        });
+                        image_upload_status.set(None);
+                        is_publishing.set(false);
+                        initiating_account.set(None);
+                        return;
+                    }
+                };
+                let Some(server) = preferred_candidate(&settings) else {
+                    image_upload_server.set(None);
+                    image_server_error.set(Some(
+                        "Add an enabled Blossom server before publishing.".into(),
+                    ));
+                    current_stage.set(PublishStage::Details);
+                    publication_state.set(PublicationState {
+                        outcome: PublicationOutcome::Failed,
+                        listing_published: false,
+                        message: Some(
+                            "Image upload paused: add a Blossom server in Cover & screenshots. No game event was published."
+                                .into(),
+                        ),
+                    });
+                    image_upload_status.set(None);
+                    is_publishing.set(false);
+                    initiating_account.set(None);
+                    return;
+                };
+                let upload_started = js_sys::Date::now().max(0.0) as u64;
+                for (index, selection) in pending_images.iter().enumerate() {
+                    if auth.npub.get_untracked().as_deref() != Some(initiating_npub.as_str()) {
+                        publication_state.set(PublicationState {
+                            outcome: PublicationOutcome::Failed,
+                            listing_published: false,
+                            message: Some(
+                                "The active account changed during image upload. No game event was published."
+                                    .into(),
+                            ),
+                        });
+                        image_upload_status.set(None);
+                        is_publishing.set(false);
+                        initiating_account.set(None);
+                        return;
+                    }
+                    image_upload_status.set(Some(format!(
+                        "Uploading image {} of {}: {}",
+                        index + 1,
+                        pending_images.len(),
+                        selection.filename
+                    )));
+                    let response = invoke_start_blossom_upload(StartBlossomUploadRequest {
+                        selection_id: selection.selection_id.clone(),
+                        expected_publisher_hex: image_publisher_hex.clone(),
+                        selected_server: Some(server.clone()),
+                        preflight: true,
+                        request_id: fresh_request_id(upload_started, index as u64 + 1),
+                    })
+                    .await;
+                    let response = match response {
+                        Ok(response)
+                            if response.mime_type == selection.detected_mime
+                                && listing_image_mime(&response.mime_type)
+                                && is_http_url(&response.url) =>
+                        {
+                            response
+                        }
+                        Ok(_) => {
+                            publication_state.set(PublicationState {
+                                outcome: PublicationOutcome::Failed,
+                                listing_published: false,
+                                message: Some(
+                                    "Image upload returned invalid media metadata. No game event was published."
+                                        .into(),
+                                ),
+                            });
+                            image_upload_status.set(None);
+                            is_publishing.set(false);
+                            initiating_account.set(None);
+                            return;
+                        }
+                        Err(command_error) => {
+                            publication_state.set(PublicationState {
+                                outcome: PublicationOutcome::Failed,
+                                listing_published: false,
+                                message: Some(format!(
+                                    "Image upload failed: {} No game event was published.",
+                                    stable_error_message(&command_error.code)
+                                )),
+                            });
+                            image_upload_status.set(None);
+                            is_publishing.set(false);
+                            initiating_account.set(None);
+                            return;
+                        }
+                    };
+                    image_drafts.update(|images| {
+                        if let Some(image) = images.iter_mut().find(|image| {
+                            matches!(image, ListingImageDraft::Pending(pending) if pending.selection_id == selection.selection_id)
+                        }) {
+                            *image = ListingImageDraft::Hosted(response.url.clone());
+                        }
+                    });
+                }
+                image_upload_status.set(None);
+            }
+            request.images = match hosted_image_urls(&image_drafts.get_untracked()) {
+                Ok(images) => images,
+                Err(error) => {
+                    publication_state.set(PublicationState {
+                        outcome: PublicationOutcome::Failed,
+                        listing_published: false,
+                        message: Some(format!(
+                            "Image upload returned an invalid URL: {error}. No game event was published."
+                        )),
+                    });
+                    is_publishing.set(false);
+                    initiating_account.set(None);
+                    return;
+                }
+            };
+            if has_pending_images(&image_drafts.get_untracked()) {
+                publication_state.set(PublicationState {
+                    outcome: PublicationOutcome::Failed,
+                    listing_published: false,
+                    message: Some(
+                        "An image selection changed during publication. No game event was published."
+                            .into(),
+                    ),
+                });
+                is_publishing.set(false);
+                initiating_account.set(None);
+                return;
+            }
+            let published_request = request.clone();
             let progress_account = initiating_npub.clone();
             let listener_cleanup = listen_publish_progress(move |payload| {
                 if publication_account_stale.get_untracked()
@@ -1966,12 +2481,37 @@ pub fn PublishView(
         });
     });
 
+    on_cleanup(move || {
+        let selections = image_drafts
+            .get_untracked()
+            .into_iter()
+            .filter_map(|image| match image {
+                ListingImageDraft::Pending(selection) => Some(selection),
+                ListingImageDraft::Hosted(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let publisher = selected_image_publisher.get_untracked();
+        if let Some(expected_publisher_hex) = publisher {
+            spawn_local(async move {
+                for selection in selections {
+                    let _ = invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
+                        selection_id: selection.selection_id,
+                        expected_publisher_hex: expected_publisher_hex.clone(),
+                    })
+                    .await;
+                }
+            });
+        }
+    });
+
     let checklist = move || {
         readiness_checklist(
             &id.get(),
             &title.get(),
             &description.get(),
-            &image_input.get(),
+            &hosted_image_urls(&image_drafts.get())
+                .unwrap_or_default()
+                .join(","),
             acquisition_kind.get(),
             &price_input.get(),
             &lud16.get(),
@@ -2032,8 +2572,7 @@ pub fn PublishView(
                                 <label for="publish-description" class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Description (required)"</label>
                                 <textarea id="publish-description" required=true class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" rows=5 placeholder="Tell players about your game..." prop:value={move || description.get()} on:input:target=move |ev| description.set(ev.target().value()) disabled={move || is_publishing.get()} />
                             </div>
-                            <div class="grid md:grid-cols-2 gap-5">
-                                <div>
+                            <div>
                                     <label for="publish-tag-choice" class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Tags"</label>
                                     <select id="publish-tag-choice" aria-describedby="publish-tags-help" class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" prop:value=move || tag_choice.get() on:change:target=move |ev| {
                                         let selected = ev.target().value();
@@ -2059,17 +2598,98 @@ pub fn PublishView(
                                     <label for="publish-tags" class="block text-xs font-bold uppercase tracking-widest text-on-surface-variant mt-4 mb-2">"Custom tags"</label>
                                     <input id="publish-tags" aria-describedby="publish-tags-help" class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" placeholder="Add comma-separated custom tags" prop:value={move || tag_input.get()} on:input:target=move |ev| tag_input.set(ev.target().value()) disabled={move || is_publishing.get()} />
                                     <p id="publish-tags-help" class="text-xs text-on-surface-variant mt-2">"Choose common tags above or enter additional comma-separated tags."</p>
-                                </div>
-                                <div>
-                                    <label for="publish-images" class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Image URLs"</label>
-                                    <input id="publish-images" aria-describedby="publish-images-help" class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" placeholder="https://..." prop:value={move || image_input.get()} on:input:target=move |ev| image_input.set(ev.target().value()) disabled={move || is_publishing.get()} />
-                                    <p id="publish-images-help" class="text-xs text-on-surface-variant mt-2">"Hosted HTTP(S) URLs only. The first image is the cover; additional URLs are screenshots."</p>
-                                    {move || valid_cover_url(&parse_csv_values(&image_input.get())).map(|url| view! {
-                                        <img class="mt-4 h-40 w-28 rounded-xl object-cover" src=url alt="Game cover preview" on:error=use_fallback_cover />
-                                    })}
-                                </div>
                             </div>
                         </div>
+                    </section>
+
+                    <section class="v2-publish-stage bg-surface-container-high/60 backdrop-blur-2xl border border-outline-variant/15 rounded-3xl p-6" aria-labelledby="publish-images-title">
+                        <div class="mb-4 flex items-center gap-3">
+                            <span class="material-symbols-outlined flex h-9 w-9 items-center justify-center rounded-lg bg-secondary/10 text-xl text-secondary" aria-hidden="true">"image"</span>
+                            <h2 id="publish-images-title" class="text-2xl font-bold font-headline">"Cover & screenshots"</h2>
+                        </div>
+                        {move || {
+                            match image_drafts.get().first().cloned() {
+                                Some(image) => {
+                                    let (src, title, detail) = match image {
+                                        ListingImageDraft::Hosted(url) => (url, "Hosted cover".to_string(), "Published image".to_string()),
+                                        ListingImageDraft::Pending(selection) => (
+                                            selection.preview_data_url.unwrap_or_default(),
+                                            selection.filename,
+                                            format!("{} · Local preview", human_image_size(selection.size)),
+                                        ),
+                                    };
+                                    view! {
+                                        <article class="group relative h-48 overflow-hidden rounded-2xl border-2 border-dashed border-secondary/50 bg-surface-container-low">
+                                            <img class="h-full w-full object-cover" src=src alt="Game cover preview" on:error=use_fallback_cover />
+                                            <div class="absolute inset-x-0 bottom-0 flex items-end justify-between gap-3 bg-gradient-to-t from-black/85 to-transparent p-4 pt-10">
+                                                <div class="min-w-0"><p class="truncate text-sm font-bold text-white">{title}</p><p class="truncate text-xs text-white/70">{detail}</p></div>
+                                                <div class="flex shrink-0 gap-2">
+                                                    <button type="button" class="rounded-lg bg-black/60 px-3 py-2 text-xs font-bold text-white hover:bg-black/80" on:click=move |_| on_select_image.run(0) disabled=move || is_selecting_image.get() || is_publishing.get()>"Replace"</button>
+                                                    <button type="button" class="rounded-lg bg-error/90 px-3 py-2 text-xs font-bold text-white hover:bg-error" on:click=move |_| remove_image.run(0) disabled=move || is_publishing.get()>"Remove"</button>
+                                                </div>
+                                            </div>
+                                        </article>
+                                    }.into_any()
+                                }
+                                None => view! {
+                                    <button type="button" class="flex h-48 w-full items-center justify-center rounded-2xl border-2 border-dashed border-secondary/50 bg-surface-container-low text-center transition-colors hover:border-secondary hover:bg-surface-container" on:click=move |_| on_select_image.run(0) disabled=move || is_selecting_image.get() || is_publishing.get()>
+                                        <span><span class="material-symbols-outlined mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-surface-container-high text-on-surface-variant" aria-hidden="true">"arrow_upward"</span><span class="mt-2 block font-bold">{move || if is_selecting_image.get() { "Selecting image..." } else { "Hero banner upload" }}</span><span class="block text-xs text-on-surface-variant">"Recommended: 1920×1080px"</span></span>
+                                    </button>
+                                }.into_any(),
+                            }
+                        }}
+                        <div class="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                            {move || {
+                                let images = image_drafts.get();
+                                let screenshots_disabled = images.is_empty();
+                                (0..screenshot_slot_count(images.len())).map(|slot| {
+                                    let image_index = slot + 1;
+                                    match images.get(image_index).cloned() {
+                                        Some(image) => {
+                                            let (src, title) = match image {
+                                                ListingImageDraft::Hosted(url) => (url, "Hosted screenshot".to_string()),
+                                                ListingImageDraft::Pending(selection) => (selection.preview_data_url.unwrap_or_default(), selection.filename),
+                                            };
+                                            view! {
+                                                <article class="group relative aspect-square overflow-hidden rounded-xl border-2 border-dashed border-secondary/50 bg-surface-container-low">
+                                                    <img class="h-full w-full object-cover" src=src alt=format!("Game screenshot {}", image_index) on:error=use_fallback_cover />
+                                                    <div class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 to-transparent p-2 pt-8">
+                                                        <p class="truncate text-[11px] font-bold text-white">{title}</p>
+                                                        <div class="mt-1 flex gap-2"><button type="button" class="text-[10px] font-bold text-white hover:text-secondary" on:click=move |_| on_select_image.run(image_index) disabled=move || is_selecting_image.get() || is_publishing.get()>"Replace"</button><button type="button" class="text-[10px] font-bold text-error hover:text-white" on:click=move |_| remove_image.run(image_index) disabled=move || is_publishing.get()>"Remove"</button></div>
+                                                    </div>
+                                                </article>
+                                            }.into_any()
+                                        }
+                                        None => view! {
+                                            <button type="button" class="flex aspect-square items-center justify-center rounded-xl border-2 border-dashed border-secondary/50 bg-surface-container-low text-on-surface-variant transition-colors hover:border-secondary hover:text-secondary disabled:cursor-not-allowed disabled:opacity-40" aria-label="Add screenshot" on:click=move |_| on_select_image.run(image_index) disabled=move || screenshots_disabled || is_selecting_image.get() || is_publishing.get()>
+                                                <span class="material-symbols-outlined" aria-hidden="true">"add"</span>
+                                            </button>
+                                        }.into_any(),
+                                    }
+                                }).collect_view()
+                            }}
+                        </div>
+                        <Show when=move || has_pending_images(&image_drafts.get()) && image_upload_server.get().is_none()>
+                            <section class="mt-4 rounded-2xl border border-secondary/30 bg-surface-container-low p-4" aria-labelledby="publish-blossom-server-title">
+                                <div class="flex items-start gap-3">
+                                    <span class="material-symbols-outlined mt-0.5 text-secondary" aria-hidden="true">"cloud_upload"</span>
+                                    <div class="min-w-0 flex-1">
+                                        <h3 id="publish-blossom-server-title" class="font-bold">"Add a Blossom upload server"</h3>
+                                        <p class="mt-1 text-xs text-on-surface-variant">"Your images need a Blossom server. Add one here; it will also be saved to your Store Page media settings."</p>
+                                        <div class="mt-3 flex flex-col gap-2 sm:flex-row">
+                                            <label for="publish-blossom-server" class="sr-only">"Blossom server URL"</label>
+                                            <input id="publish-blossom-server" type="url" class="min-w-0 flex-1 rounded-md border-none bg-surface-container-highest p-3 text-sm text-on-surface" placeholder="https://blossom.example" prop:value=move || image_server_origin.get() on:input:target=move |event| { image_server_origin.set(event.target().value()); image_server_error.set(None); } disabled=move || is_saving_image_server.get() || is_publishing.get() />
+                                            <button type="button" class="rounded-md bg-secondary px-4 py-3 text-sm font-bold text-on-secondary disabled:opacity-40" on:click=move |_| save_image_server.run(()) disabled=move || image_server_origin.get().trim().is_empty() || is_saving_image_server.get() || is_publishing.get()>{move || if is_saving_image_server.get() { "Saving…" } else { "Save server" }}</button>
+                                        </div>
+                                        {move || image_server_error.get().map(|error| view! { <p class="mt-2 text-xs font-bold text-error" role="alert">{error}</p> })}
+                                    </div>
+                                </div>
+                            </section>
+                        </Show>
+                        {move || image_upload_server.get().filter(|_| has_pending_images(&image_drafts.get())).map(|server| view! {
+                            <p class="mt-3 flex items-center gap-2 text-xs text-secondary"><span class="material-symbols-outlined text-base" aria-hidden="true">"cloud_done"</span><span>"Images will upload to "<span class="font-mono">{server}</span>" when you publish."</span></p>
+                        })}
+                        <p class="mt-3 text-xs text-on-surface-variant">"JPEG, PNG, or WebP. Images stay local until you publish."</p>
                     </section>
                     </Show>
 
@@ -2351,7 +2971,7 @@ pub fn PublishView(
                         <p class="text-xs text-on-surface-variant mt-3">"Read-only active account. Protocol detail: the signer publishes the Nostr events."</p>
                         <dl class="mt-5 space-y-3 text-sm">
                             <div><dt class="font-bold">"Identifier"</dt><dd class="text-on-surface-variant break-all">{move || id.get()}</dd></div>
-                            <div><dt class="font-bold">"Metadata"</dt><dd class="text-on-surface-variant">{move || format!("{}; {} tags; {} images", title.get(), parse_csv_values(&tag_input.get()).len(), parse_csv_values(&image_input.get()).len())}</dd></div>
+                            <div><dt class="font-bold">"Metadata"</dt><dd class="text-on-surface-variant">{move || format!("{}; {} tags; {} images", title.get(), parse_csv_values(&tag_input.get()).len(), image_drafts.get().len())}</dd></div>
                             <div><dt class="font-bold">"Description"</dt><dd class="text-on-surface-variant whitespace-pre-wrap">{move || description.get()}</dd></div>
                             <div><dt class="font-bold">"Pricing"</dt><dd class="text-on-surface-variant">{move || match acquisition_kind.get() { AcquisitionKind::Gated => format!("{} sats via {}", price_input.get(), lud16.get()), AcquisitionKind::Public | AcquisitionKind::TimedAccess => "Not for sale (0 sats)".to_string() }}</dd></div>
                             <div><dt class="font-bold">"Current access"</dt><dd class="text-on-surface-variant">{move || match acquisition_kind.get() { AcquisitionKind::Gated => "Paid".to_string(), AcquisitionKind::Public => "Public".to_string(), AcquisitionKind::TimedAccess => format!("Timed from {} to {} (local)", acquisition_starts_at.get(), acquisition_ends_at.get()) }}</dd></div>
@@ -2381,6 +3001,7 @@ pub fn PublishView(
                             let class = match publication_state.get().outcome { PublicationOutcome::Complete => "text-secondary", PublicationOutcome::Partial | PublicationOutcome::Failed => "text-error", _ => "text-on-surface-variant" };
                             view! { <p class={class}>{msg}</p> }
                         })}
+                        {move || image_upload_status.get().map(|status| view! { <p class="mt-3 text-sm font-bold text-primary" role="status">{status}</p> })}
                         {move || upload_progress.get().and_then(|event| {
                             let bytes_uploaded = event.bytes_uploaded?;
                             let total_bytes = event.total_bytes?;
@@ -2421,7 +3042,7 @@ pub fn PublishView(
                     <button type="button" class="px-8 py-3 rounded-md bg-primary text-on-primary font-bold" on:click=on_next disabled=move || is_publishing.get()>"Continue"</button>
                 </Show>
                 <Show when=move || current_stage.get() == PublishStage::Review>
-                    <button type="button" class="px-8 py-3 rounded-md bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold" on:click=move |_| on_submit.run(()) disabled=move || is_hashing.get() || is_publishing.get()>
+                    <button type="button" class="px-8 py-3 rounded-md bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold" on:click=move |_| on_submit.run(()) disabled=move || is_hashing.get() || is_selecting_image.get() || is_publishing.get()>
                         {move || if is_publishing.get() { "Publishing to network…".to_string() } else { match (editing, fulfillment_enabled.get()) { (true, true) => "Update game page and distribution", (true, false) => "Update game page", (false, true) => "Publish game page and build", (false, false) => "Publish game page" }.to_string() }}
                     </button>
                 </Show>
