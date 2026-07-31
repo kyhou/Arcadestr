@@ -51,3 +51,4 @@ tsx-1000/
 *.cdtor.c
 *.bak
 tmp.*
+/docs
