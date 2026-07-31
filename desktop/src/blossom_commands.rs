@@ -15,6 +15,8 @@ use arcadestr_core::blossom::{validate_blossom_server_origin, BlossomServerOrigi
 use arcadestr_core::nip46::AppSignerState;
 use arcadestr_core::signers::NostrSigner;
 use async_trait::async_trait;
+use base64::Engine;
+use futures_util::future::join_all;
 use nostr::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -146,6 +148,7 @@ pub struct BlossomMediaSelectionDto {
     pub size: u64,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub preview_data_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,6 +222,19 @@ pub struct BlossomServerSettingsDto {
     pub publisher_pubkey: String,
     pub servers: Vec<BlossomServerDto>,
     pub preferred_server: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomServerHealthDto {
+    pub origin: String,
+    pub status: String,
+    pub latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomServerHealthResponse {
+    pub publisher_pubkey: String,
+    pub servers: Vec<BlossomServerHealthDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -597,6 +613,7 @@ pub async fn select_blossom_media_file(
         return Ok(None);
     };
     verify_publisher(&state.upload_service, publisher).await?;
+    let preview_path = path.clone();
     let selected = state
         .upload_service
         .register_file(path, publisher)
@@ -606,14 +623,38 @@ pub async fn select_blossom_media_file(
         .inspect_selection(selected.selection_id)
         .await
     {
-        Ok(inspected) => Ok(Some(BlossomMediaSelectionDto {
-            selection_id: inspected.selection_id.to_string(),
-            filename: inspected.filename,
-            detected_mime: inspected.mime_type,
-            size: inspected.size,
-            width: inspected.width,
-            height: inspected.height,
-        })),
+        Ok(inspected) => {
+            let preview_data_url = if inspected.mime_type.starts_with("image/") {
+                let bytes = match tokio::fs::read(preview_path).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        let _ = state
+                            .upload_service
+                            .cleanup_selection(inspected.selection_id);
+                        return Err(BlossomCommandError::new(
+                            "storage_failure",
+                            "The local media preview failed.",
+                        ));
+                    }
+                };
+                Some(format!(
+                    "data:{};base64,{}",
+                    inspected.mime_type,
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                ))
+            } else {
+                None
+            };
+            Ok(Some(BlossomMediaSelectionDto {
+                selection_id: inspected.selection_id.to_string(),
+                filename: inspected.filename,
+                detected_mime: inspected.mime_type,
+                size: inspected.size,
+                width: inspected.width,
+                height: inspected.height,
+                preview_data_url,
+            }))
+        }
         Err(error) => {
             let _ = state
                 .upload_service
@@ -856,6 +897,47 @@ pub async fn get_blossom_server_settings(
         parse_publisher(&request.expected_publisher_hex)?,
     )
     .await
+}
+
+#[tauri::command]
+pub async fn probe_blossom_server_health(
+    state: tauri::State<'_, BlossomManagedState>,
+    request: ExpectedBlossomPublisherRequest,
+) -> Result<BlossomServerHealthResponse, BlossomCommandError> {
+    let publisher = parse_publisher(&request.expected_publisher_hex)?;
+    verify_publisher(&state.upload_service, publisher).await?;
+    let settings = state
+        .settings
+        .list(publisher)
+        .await
+        .map_err(map_settings_error)?;
+    let probes = settings.servers.into_iter().map(|server| {
+        let service = Arc::clone(&state.upload_service);
+        async move {
+            let result = service.probe_server(&server.origin).await;
+            match result {
+                Ok(elapsed) => {
+                    let latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                    BlossomServerHealthDto {
+                        origin: server.origin,
+                        status: if latency_ms > 1_000 { "slow" } else { "online" }.into(),
+                        latency_ms: Some(latency_ms),
+                    }
+                }
+                Err(_) => BlossomServerHealthDto {
+                    origin: server.origin,
+                    status: "offline".into(),
+                    latency_ms: None,
+                },
+            }
+        }
+    });
+    let servers = join_all(probes).await;
+    verify_publisher(&state.upload_service, publisher).await?;
+    Ok(BlossomServerHealthResponse {
+        publisher_pubkey: publisher.to_hex(),
+        servers,
+    })
 }
 
 #[tauri::command]
@@ -1103,6 +1185,7 @@ mod tests {
             size: 42,
             width: Some(1),
             height: Some(1),
+            preview_data_url: Some("data:image/png;base64,AA==".into()),
         };
         let json = serde_json::to_string(&dto).expect("serialize safe selection");
         for forbidden in ["path", "authorization", "secret", "bytes"] {

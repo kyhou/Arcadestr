@@ -226,6 +226,38 @@ impl BlossomUploadService {
         self.provider.current_publisher().await
     }
 
+    /// Probe the upload endpoint through the same origin validation, DNS pinning, and
+    /// redirect policy used for uploads. Any HTTP response proves reachability.
+    pub async fn probe_server(&self, server: &str) -> Result<Duration, BlossomUploadError> {
+        let policy = if self.config.allow_loopback {
+            BlossomServerOriginPolicy::AllowHttpLoopback
+        } else {
+            BlossomServerOriginPolicy::HttpsOnly
+        };
+        let origin = validate_blossom_server_origin(server, policy)
+            .map_err(|error| BlossomUploadError::Destination(error.to_string()))?;
+        let timeout = Duration::from_secs(5);
+        let token = CancellationToken::new();
+        let pinned = resolve_destination(
+            &origin,
+            self.config.allow_loopback,
+            &token,
+            self.config.connect_timeout.min(timeout),
+        )
+        .await?;
+        let mut config = self.config.clone();
+        config.connect_timeout = config.connect_timeout.min(timeout);
+        config.request_timeout = timeout;
+        let client = pinned_client(&origin, &pinned, &config)?;
+        let started = Instant::now();
+        client
+            .head(format!("{}upload", origin.as_str()))
+            .send()
+            .await
+            .map_err(http_error)?;
+        Ok(started.elapsed())
+    }
+
     pub fn register_file(
         &self,
         path: impl AsRef<Path>,
@@ -1528,6 +1560,20 @@ mod tests {
 
     fn no_progress() -> BlossomProgressCallback {
         Arc::new(|_| {})
+    }
+
+    #[tokio::test]
+    async fn blossom_health_probe_uses_upload_endpoint_and_accepts_any_http_status() {
+        let (provider, _) = provider();
+        let service = development_service(provider);
+        let (server, requests) = blossom_fixture(vec![(405, FixtureBody::Empty)]).await;
+        let elapsed = service
+            .probe_server(&server)
+            .await
+            .expect("reachable server");
+        assert!(elapsed < Duration::from_secs(5));
+        let requests = requests.await.expect("captured request");
+        assert!(requests[0].starts_with("HEAD /upload HTTP/1.1"));
     }
 
     #[test]

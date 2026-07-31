@@ -927,6 +927,7 @@ mod tests {
             size: 42,
             width: Some(1200),
             height: Some(600),
+            preview_data_url: Some("data:image/png;base64,AA==".into()),
         }
     }
 

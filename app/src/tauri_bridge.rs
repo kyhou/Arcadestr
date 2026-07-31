@@ -1417,6 +1417,7 @@ pub struct BlossomMediaSelectionDto {
     pub size: u64,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub preview_data_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1490,6 +1491,19 @@ pub struct BlossomServerSettingsDto {
     pub publisher_pubkey: String,
     pub servers: Vec<BlossomServerDto>,
     pub preferred_server: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomServerHealthDto {
+    pub origin: String,
+    pub status: String,
+    pub latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomServerHealthResponse {
+    pub publisher_pubkey: String,
+    pub servers: Vec<BlossomServerHealthDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1602,6 +1616,12 @@ blossom_native_wrapper!(
     "get_blossom_server_settings",
     ExpectedBlossomPublisherRequest,
     BlossomServerSettingsDto
+);
+blossom_native_wrapper!(
+    invoke_probe_blossom_server_health,
+    "probe_blossom_server_health",
+    ExpectedBlossomPublisherRequest,
+    BlossomServerHealthResponse
 );
 blossom_native_wrapper!(
     invoke_replace_blossom_server_settings,

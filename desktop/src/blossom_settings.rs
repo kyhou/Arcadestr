@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const MAX_LABEL_CHARS: usize = 100;
+const DEVELOPMENT_DEFAULT_SERVER: &str = "http://localhost:9099/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredBlossomServer {
@@ -65,11 +66,17 @@ pub struct BlossomServerSettingsRepository {
     database: Arc<Database>,
     provider: Arc<dyn BlossomAccountProvider>,
     origin_policy: BlossomServerOriginPolicy,
+    default_server: Option<&'static str>,
 }
 
 impl BlossomServerSettingsRepository {
     pub fn production(database: Arc<Database>, provider: Arc<dyn BlossomAccountProvider>) -> Self {
-        Self::new(database, provider, BlossomServerOriginPolicy::HttpsOnly)
+        Self::new(
+            database,
+            provider,
+            BlossomServerOriginPolicy::HttpsOnly,
+            None,
+        )
     }
 
     pub fn development_loopback(
@@ -80,6 +87,7 @@ impl BlossomServerSettingsRepository {
             database,
             provider,
             BlossomServerOriginPolicy::AllowHttpLoopback,
+            Some(DEVELOPMENT_DEFAULT_SERVER),
         )
     }
 
@@ -87,11 +95,13 @@ impl BlossomServerSettingsRepository {
         database: Arc<Database>,
         provider: Arc<dyn BlossomAccountProvider>,
         origin_policy: BlossomServerOriginPolicy,
+        default_server: Option<&'static str>,
     ) -> Self {
         Self {
             database,
             provider,
             origin_policy,
+            default_server,
         }
     }
 
@@ -100,9 +110,51 @@ impl BlossomServerSettingsRepository {
         expected_publisher: PublicKey,
     ) -> Result<BlossomServerSettings, BlossomSettingsError> {
         self.verify_account(expected_publisher).await?;
-        let settings = self
+        let mut settings = self
             .list_for_publisher(&expected_publisher.to_hex())
             .await?;
+        settings
+            .servers
+            .retain(|server| self.normalize_origin(&server.origin).is_ok());
+        if settings.preferred_server.as_ref().is_some_and(|preferred| {
+            !settings
+                .servers
+                .iter()
+                .any(|server| &server.origin == preferred && server.enabled)
+        }) {
+            settings.preferred_server = None;
+        }
+        if settings.servers.is_empty() {
+            if let Some(default_server) = self.default_server {
+                match self
+                    .add_server(
+                        expected_publisher,
+                        default_server,
+                        Some("Local development"),
+                    )
+                    .await
+                {
+                    Ok(()) | Err(BlossomSettingsError::DuplicateServer) => {}
+                    Err(error) => return Err(error),
+                }
+                settings = self
+                    .list_for_publisher(&expected_publisher.to_hex())
+                    .await?;
+            }
+        }
+        if let Some(default_server) = self.default_server {
+            let default_is_enabled = settings
+                .servers
+                .iter()
+                .any(|server| server.origin == default_server && server.enabled);
+            if settings.preferred_server.is_none() && default_is_enabled {
+                self.set_preferred(expected_publisher, Some(default_server))
+                    .await?;
+                settings = self
+                    .list_for_publisher(&expected_publisher.to_hex())
+                    .await?;
+            }
+        }
         self.verify_account(expected_publisher).await?;
         Ok(settings)
     }
@@ -767,7 +819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blossom_settings_explicit_loopback_development_policy_only() {
+    async fn blossom_settings_development_seeds_preferred_local_server() {
         let (_directory, database, provider, production, publisher) = fixture().await;
         assert!(matches!(
             production
@@ -775,11 +827,46 @@ mod tests {
                 .await,
             Err(BlossomSettingsError::InvalidOrigin(_))
         ));
-        let development = BlossomServerSettingsRepository::development_loopback(database, provider);
+        let development = BlossomServerSettingsRepository::development_loopback(
+            database.clone(),
+            provider.clone(),
+        );
+        let settings = development
+            .list(publisher)
+            .await
+            .expect("development defaults");
+        assert_eq!(settings.servers.len(), 1);
+        assert_eq!(settings.servers[0].origin, DEVELOPMENT_DEFAULT_SERVER);
+        assert!(settings.servers[0].enabled);
+        assert_eq!(
+            settings.preferred_server.as_deref(),
+            Some(DEVELOPMENT_DEFAULT_SERVER)
+        );
         development
             .add_server(publisher, "http://127.0.0.1:3000", None)
             .await
             .expect("development loopback add");
+        development
+            .set_preferred(publisher, None)
+            .await
+            .expect("clear preferred");
+        assert_eq!(
+            development
+                .list(publisher)
+                .await
+                .expect("repair development preference")
+                .preferred_server
+                .as_deref(),
+            Some(DEVELOPMENT_DEFAULT_SERVER)
+        );
+        drop(development);
+        let production = BlossomServerSettingsRepository::production(database, provider);
+        assert!(production
+            .list(publisher)
+            .await
+            .expect("production filters development origins")
+            .servers
+            .is_empty());
     }
 
     #[tokio::test]

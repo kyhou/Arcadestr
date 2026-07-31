@@ -5056,6 +5056,7 @@ fn main() {
             blossom_commands::cancel_blossom_upload,
             blossom_commands::discard_blossom_media_selection,
             blossom_commands::get_blossom_server_settings,
+            blossom_commands::probe_blossom_server_health,
             blossom_commands::replace_blossom_server_settings,
             blossom_commands::add_blossom_server,
             blossom_commands::update_blossom_server,

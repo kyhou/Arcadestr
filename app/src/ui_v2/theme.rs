@@ -32,6 +32,7 @@ pub const UI_V2_STYLES: &str = r#"
 
   --v2-danger: oklch(0.66 0.22 20);
   --v2-success: oklch(0.75 0.15 160);
+  --v2-warning: oklch(0.84 0.16 95);
 
   --v2-radius-sm: 0.25rem;
   --v2-radius-md: 0.75rem;
@@ -3178,6 +3179,25 @@ dialog.v2-confirm-backdrop::backdrop {
   color: var(--v2-on-surface-variant);
   font-size: 0.82rem;
   overflow-wrap: anywhere;
+}
+
+.v2-settings-account-row .v2-blossom-health-online,
+.v2-settings-account-row .v2-blossom-health-online .v2-blossom-health-dot {
+  color: var(--v2-success);
+}
+
+.v2-settings-account-row .v2-blossom-health-slow,
+.v2-settings-account-row .v2-blossom-health-slow .v2-blossom-health-dot {
+  color: var(--v2-warning);
+}
+
+.v2-settings-account-row .v2-blossom-health-offline,
+.v2-settings-account-row .v2-blossom-health-offline .v2-blossom-health-dot {
+  color: var(--v2-danger);
+}
+
+.v2-blossom-health-dot {
+  background: currentColor;
 }
 
 .v2-settings-relay-list {

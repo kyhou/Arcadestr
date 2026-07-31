@@ -1,10 +1,17 @@
 use leptos::prelude::*;
+use std::collections::HashMap;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::models::{npub_fallback_label, Nip49ExportResult, PlatformInfo};
 use crate::tauri_bridge::{
-    invoke_attempt_reconnect, invoke_get_platform_info, invoke_reconnect_relays,
+    invoke_add_blossom_server, invoke_attempt_reconnect, invoke_get_blossom_server_settings,
+    invoke_get_platform_info, invoke_probe_blossom_server_health, invoke_reconnect_relays,
+    invoke_remove_blossom_server, invoke_set_preferred_blossom_server,
+    invoke_update_blossom_server, AddBlossomServerRequest, BlossomServerHealthDto,
+    BlossomServerOriginRequest, BlossomServerSettingsDto, ExpectedBlossomPublisherRequest,
+    SetPreferredBlossomServerRequest, UpdateBlossomServerRequest,
 };
+use crate::ui_v2::components::blossom_media_upload::{publisher_hex, stable_error_message};
 use crate::ui_v2::components::PageHeader;
 use crate::{
     invoke_get_allow_insecure_public_ws, invoke_set_allow_insecure_public_ws, AuthContext,
@@ -103,6 +110,37 @@ fn diagnostics_summary(
     )
 }
 
+fn verified_blossom_settings(
+    expected_publisher: &str,
+    settings: BlossomServerSettingsDto,
+) -> Result<BlossomServerSettingsDto, String> {
+    if settings.publisher_pubkey == expected_publisher {
+        Ok(settings)
+    } else {
+        Err("The Blossom settings belong to a different account.".into())
+    }
+}
+
+fn blossom_settings_error_message(code: &str) -> &'static str {
+    match code {
+        "invalid_request" => "That server is already configured or the settings are invalid.",
+        _ => stable_error_message(code),
+    }
+}
+
+fn is_development_default_blossom_server(origin: &str) -> bool {
+    cfg!(debug_assertions) && origin.trim_end_matches('/') == "http://localhost:9099"
+}
+
+fn blossom_health_presentation(status: &str) -> (&'static str, &'static str) {
+    match status {
+        "online" => ("Online", "v2-blossom-health-online"),
+        "slow" => ("Slow", "v2-blossom-health-slow"),
+        "offline" => ("Offline", "v2-blossom-health-offline"),
+        _ => ("Unknown", ""),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SettingsRemoval {
     Idle,
@@ -134,6 +172,19 @@ pub fn SettingsView(
     let export_account = RwSignal::new(String::new());
     let export_status = RwSignal::new(None::<String>);
     let diagnostic_copy_status = RwSignal::new(None::<String>);
+    let blossom_settings = RwSignal::new(None::<BlossomServerSettingsDto>);
+    let blossom_origin = RwSignal::new(String::new());
+    let blossom_label = RwSignal::new(String::new());
+    let blossom_error = RwSignal::new(None::<String>);
+    let blossom_status = RwSignal::new(None::<String>);
+    let blossom_loading = RwSignal::new(false);
+    let blossom_busy = RwSignal::new(false);
+    let blossom_generation = RwSignal::new(0_u64);
+    let blossom_health = RwSignal::new(HashMap::<String, BlossomServerHealthDto>::new());
+    let blossom_health_loading = RwSignal::new(false);
+    let blossom_health_error = RwSignal::new(None::<String>);
+    let blossom_health_generation = RwSignal::new(0_u64);
+    let blossom_health_refresh = RwSignal::new(0_u64);
 
     Effect::new(move |_| {
         let auth = auth_stored.get_value();
@@ -147,6 +198,108 @@ pub fn SettingsView(
                     Err(error) => platform_error.set(Some(error)),
                 }
             }
+        });
+    });
+
+    Effect::new(move |_| {
+        let account = auth.npub.get();
+        blossom_generation.update(|value| *value = value.wrapping_add(1));
+        let generation = blossom_generation.get_untracked();
+        blossom_busy.set(false);
+        blossom_settings.set(None);
+        blossom_error.set(None);
+        blossom_status.set(None);
+        if !availability.native_network {
+            return;
+        }
+        let Some(account) = account else {
+            blossom_loading.set(false);
+            return;
+        };
+        let Some(expected_publisher_hex) = publisher_hex(&account) else {
+            blossom_error.set(Some("The active publisher key is invalid.".into()));
+            blossom_loading.set(false);
+            return;
+        };
+        blossom_loading.set(true);
+        spawn_local(async move {
+            let result = invoke_get_blossom_server_settings(ExpectedBlossomPublisherRequest {
+                expected_publisher_hex: expected_publisher_hex.clone(),
+            })
+            .await;
+            if blossom_generation.get_untracked() != generation
+                || auth.npub.get_untracked().as_deref() != Some(account.as_str())
+            {
+                return;
+            }
+            match result {
+                Ok(settings) => {
+                    match verified_blossom_settings(&expected_publisher_hex, settings) {
+                        Ok(settings) => blossom_settings.set(Some(settings)),
+                        Err(error) => blossom_error.set(Some(error)),
+                    }
+                }
+                Err(error) => {
+                    blossom_error.set(Some(blossom_settings_error_message(&error.code).into()));
+                }
+            }
+            blossom_loading.set(false);
+        });
+    });
+
+    Effect::new(move |_| {
+        let _refresh = blossom_health_refresh.get();
+        let settings = blossom_settings.get();
+        blossom_health_generation.update(|value| *value = value.wrapping_add(1));
+        let health_generation = blossom_health_generation.get_untracked();
+        blossom_health.set(HashMap::new());
+        blossom_health_error.set(None);
+        let Some(settings) = settings else {
+            blossom_health_loading.set(false);
+            return;
+        };
+        let Some(account) = auth.npub.get_untracked() else {
+            blossom_health_loading.set(false);
+            return;
+        };
+        let Some(expected_publisher_hex) = publisher_hex(&account) else {
+            blossom_health_loading.set(false);
+            return;
+        };
+        if expected_publisher_hex != settings.publisher_pubkey || settings.servers.is_empty() {
+            blossom_health_loading.set(false);
+            return;
+        }
+        let account_generation = blossom_generation.get_untracked();
+        blossom_health_loading.set(true);
+        spawn_local(async move {
+            let result = invoke_probe_blossom_server_health(ExpectedBlossomPublisherRequest {
+                expected_publisher_hex: expected_publisher_hex.clone(),
+            })
+            .await;
+            if blossom_health_generation.get_untracked() != health_generation
+                || blossom_generation.get_untracked() != account_generation
+                || auth.npub.get_untracked().as_deref() != Some(account.as_str())
+            {
+                return;
+            }
+            match result {
+                Ok(response) if response.publisher_pubkey == expected_publisher_hex => {
+                    blossom_health.set(
+                        response
+                            .servers
+                            .into_iter()
+                            .map(|server| (server.origin.clone(), server))
+                            .collect(),
+                    );
+                }
+                Ok(_) => blossom_health_error.set(Some(
+                    "The Blossom health response belongs to a different account.".into(),
+                )),
+                Err(error) => blossom_health_error
+                    .set(Some(blossom_settings_error_message(&error.code).into())),
+            }
+            blossom_health_loading.set(false);
         });
     });
 
@@ -268,6 +421,195 @@ pub fn SettingsView(
             relay_reconnecting.set(false);
         });
     };
+
+    let on_add_blossom_server = move |_| {
+        if blossom_loading.get_untracked() || blossom_busy.get_untracked() {
+            return;
+        }
+        let origin = blossom_origin.get_untracked().trim().to_string();
+        if origin.is_empty() {
+            blossom_error.set(Some("Enter a Blossom server URL.".into()));
+            return;
+        }
+        let label = blossom_label.get_untracked().trim().to_string();
+        let Some(account) = auth.npub.get_untracked() else {
+            blossom_error.set(Some("Sign in before changing Blossom settings.".into()));
+            return;
+        };
+        let Some(expected_publisher_hex) = publisher_hex(&account) else {
+            blossom_error.set(Some("The active publisher key is invalid.".into()));
+            return;
+        };
+        let generation = blossom_generation.get_untracked();
+        blossom_busy.set(true);
+        blossom_error.set(None);
+        blossom_status.set(None);
+        spawn_local(async move {
+            let result = invoke_add_blossom_server(AddBlossomServerRequest {
+                expected_publisher_hex: expected_publisher_hex.clone(),
+                origin,
+                label: (!label.is_empty()).then_some(label),
+            })
+            .await;
+            if blossom_generation.get_untracked() != generation
+                || auth.npub.get_untracked().as_deref() != Some(account.as_str())
+            {
+                return;
+            }
+            match result {
+                Ok(settings) => {
+                    match verified_blossom_settings(&expected_publisher_hex, settings) {
+                        Ok(settings) => {
+                            blossom_settings.set(Some(settings));
+                            blossom_origin.set(String::new());
+                            blossom_label.set(String::new());
+                            blossom_status.set(Some("Blossom server added.".into()));
+                        }
+                        Err(error) => blossom_error.set(Some(error)),
+                    }
+                }
+                Err(error) => {
+                    blossom_error.set(Some(blossom_settings_error_message(&error.code).into()))
+                }
+            }
+            if blossom_generation.get_untracked() == generation {
+                blossom_busy.set(false);
+            }
+        });
+    };
+
+    let on_toggle_blossom_server = Callback::new(
+        move |(origin, label, enabled): (String, Option<String>, bool)| {
+            if blossom_loading.get_untracked() || blossom_busy.get_untracked() {
+                return;
+            }
+            let Some(account) = auth.npub.get_untracked() else {
+                return;
+            };
+            let Some(expected_publisher_hex) = publisher_hex(&account) else {
+                return;
+            };
+            let generation = blossom_generation.get_untracked();
+            blossom_busy.set(true);
+            blossom_error.set(None);
+            blossom_status.set(None);
+            spawn_local(async move {
+                let result = invoke_update_blossom_server(UpdateBlossomServerRequest {
+                    expected_publisher_hex: expected_publisher_hex.clone(),
+                    origin,
+                    label,
+                    enabled,
+                })
+                .await;
+                if blossom_generation.get_untracked() == generation
+                    && auth.npub.get_untracked().as_deref() == Some(account.as_str())
+                {
+                    match result {
+                        Ok(settings) => {
+                            match verified_blossom_settings(&expected_publisher_hex, settings) {
+                                Ok(settings) => blossom_settings.set(Some(settings)),
+                                Err(error) => blossom_error.set(Some(error)),
+                            }
+                        }
+                        Err(error) => blossom_error
+                            .set(Some(blossom_settings_error_message(&error.code).into())),
+                    }
+                }
+                if blossom_generation.get_untracked() == generation {
+                    blossom_busy.set(false);
+                }
+            });
+        },
+    );
+
+    let on_remove_blossom_server = Callback::new(move |origin: String| {
+        if blossom_loading.get_untracked() || blossom_busy.get_untracked() {
+            return;
+        }
+        let Some(account) = auth.npub.get_untracked() else {
+            return;
+        };
+        let Some(expected_publisher_hex) = publisher_hex(&account) else {
+            return;
+        };
+        let generation = blossom_generation.get_untracked();
+        blossom_busy.set(true);
+        blossom_error.set(None);
+        blossom_status.set(None);
+        spawn_local(async move {
+            let result = invoke_remove_blossom_server(BlossomServerOriginRequest {
+                expected_publisher_hex: expected_publisher_hex.clone(),
+                origin,
+            })
+            .await;
+            if blossom_generation.get_untracked() == generation
+                && auth.npub.get_untracked().as_deref() == Some(account.as_str())
+            {
+                match result {
+                    Ok(settings) => {
+                        match verified_blossom_settings(&expected_publisher_hex, settings) {
+                            Ok(settings) => {
+                                blossom_settings.set(Some(settings));
+                                blossom_status.set(Some("Blossom server removed.".into()));
+                            }
+                            Err(error) => blossom_error.set(Some(error)),
+                        }
+                    }
+                    Err(error) => {
+                        blossom_error.set(Some(blossom_settings_error_message(&error.code).into()))
+                    }
+                }
+            }
+            if blossom_generation.get_untracked() == generation {
+                blossom_busy.set(false);
+            }
+        });
+    });
+
+    let on_prefer_blossom_server = Callback::new(move |origin: String| {
+        if blossom_loading.get_untracked() || blossom_busy.get_untracked() {
+            return;
+        }
+        let Some(account) = auth.npub.get_untracked() else {
+            return;
+        };
+        let Some(expected_publisher_hex) = publisher_hex(&account) else {
+            return;
+        };
+        let generation = blossom_generation.get_untracked();
+        blossom_busy.set(true);
+        blossom_error.set(None);
+        blossom_status.set(None);
+        spawn_local(async move {
+            let result = invoke_set_preferred_blossom_server(SetPreferredBlossomServerRequest {
+                expected_publisher_hex: expected_publisher_hex.clone(),
+                origin: Some(origin),
+            })
+            .await;
+            if blossom_generation.get_untracked() == generation
+                && auth.npub.get_untracked().as_deref() == Some(account.as_str())
+            {
+                match result {
+                    Ok(settings) => {
+                        match verified_blossom_settings(&expected_publisher_hex, settings) {
+                            Ok(settings) => {
+                                blossom_settings.set(Some(settings));
+                                blossom_status
+                                    .set(Some("Preferred Blossom server updated.".into()));
+                            }
+                            Err(error) => blossom_error.set(Some(error)),
+                        }
+                    }
+                    Err(error) => {
+                        blossom_error.set(Some(blossom_settings_error_message(&error.code).into()))
+                    }
+                }
+            }
+            if blossom_generation.get_untracked() == generation {
+                blossom_busy.set(false);
+            }
+        });
+    });
 
     let on_export = Callback::new(move |result: Nip49ExportResult| {
         export_status.set(Some(if result.deferred {
@@ -430,6 +772,73 @@ pub fn SettingsView(
                     </section>
                 </Show>
 
+                <Show when=move || availability.native_network>
+                    <section class="v2-settings-card" aria-labelledby="settings-blossom-title">
+                        <header class="v2-settings-card-header">
+                            <span class="v2-settings-icon material-symbols-outlined" aria-hidden="true">"cloud_upload"</span>
+                            <div><p class="v2-store-kicker">"Media hosting"</p><h2 id="settings-blossom-title">"Blossom servers"</h2></div>
+                        </header>
+                        <div class="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
+                            <p>"Blossom servers host game covers, screenshots, trailers, and Store Page media. Settings are scoped to the active account."</p>
+                            <button type="button" class="v2-btn-ghost shrink-0" disabled=move || blossom_loading.get() || blossom_health_loading.get() || blossom_settings.get().is_none() on:click=move |_| blossom_health_refresh.update(|value| *value = value.wrapping_add(1))>{move || if blossom_health_loading.get() { "Checking…" } else { "Refresh status" }}</button>
+                        </div>
+                        <Show when=move || blossom_loading.get()>
+                            <p class="v2-settings-muted" role="status">"Loading Blossom servers…"</p>
+                        </Show>
+                        {move || blossom_settings.get().map(|settings| {
+                            let preferred = settings.preferred_server;
+                            if settings.servers.is_empty() {
+                                view! { <p class="v2-settings-muted">"No Blossom servers are configured."</p> }.into_any()
+                            } else {
+                                view! {
+                                    <div class="v2-settings-account-list" aria-label="Configured Blossom servers">
+                                        {settings.servers.into_iter().map(|server| {
+                                            let origin_toggle = server.origin.clone();
+                                            let origin_preferred = server.origin.clone();
+                                            let origin_remove = server.origin.clone();
+                                            let origin_health = server.origin.clone();
+                                            let label_toggle = server.label.clone();
+                                            let is_preferred = preferred.as_deref() == Some(server.origin.as_str());
+                                            let is_development_default = is_development_default_blossom_server(&server.origin);
+                                            let display = server.label.clone().unwrap_or_else(|| server.origin.clone());
+                                            view! {
+                                                <article class="v2-settings-account-row">
+                                                    <div class="min-w-0"><strong>{display}</strong><span class="break-all font-mono">{server.origin}</span><span>{if is_preferred { "Preferred upload destination" } else if server.enabled { "Enabled" } else { "Disabled" }}</span></div>
+                                                    <div class="v2-settings-row-actions">
+                                                        {move || {
+                                                            let health = blossom_health.get().get(&origin_health).cloned();
+                                                            match health {
+                                                                Some(health) => {
+                                                                    let (label, color) = blossom_health_presentation(&health.status);
+                                                                    let title = health.latency_ms.map(|latency| format!("{label} · {latency} ms")).unwrap_or_else(|| label.to_string());
+                                                                    view! { <span class=format!("inline-flex items-center gap-1.5 text-xs font-bold {color}") title=title><span class="v2-blossom-health-dot h-2.5 w-2.5 rounded-full" aria-hidden="true"></span>{label}</span> }.into_any()
+                                                                }
+                                                                None if blossom_health_loading.get() => view! { <span class="inline-flex items-center gap-1.5 text-xs font-bold text-on-surface-variant" role="status"><span class="h-2.5 w-2.5 animate-pulse rounded-full bg-current" aria-hidden="true"></span>"Checking"</span> }.into_any(),
+                                                                None => view! { <span class="inline-flex items-center gap-1.5 text-xs font-bold text-on-surface-variant"><span class="h-2.5 w-2.5 rounded-full bg-current" aria-hidden="true"></span>"Unknown"</span> }.into_any(),
+                                                            }
+                                                        }}
+                                                        <label class="flex items-center gap-2 text-xs font-bold"><input type="checkbox" prop:checked=server.enabled disabled=move || blossom_busy.get() on:change=move |event| on_toggle_blossom_server.run((origin_toggle.clone(), label_toggle.clone(), event_target_checked(&event))) />"Enabled"</label>
+                                                        <button type="button" class="v2-btn-ghost" disabled=move || is_preferred || !server.enabled || blossom_busy.get() on:click=move |_| on_prefer_blossom_server.run(origin_preferred.clone())>{if is_preferred { "Preferred" } else { "Make preferred" }}</button>
+                                                        <button type="button" class="v2-btn-ghost v2-btn-danger" disabled=move || is_development_default || blossom_busy.get() on:click=move |_| on_remove_blossom_server.run(origin_remove.clone())>{if is_development_default { "Development default" } else { "Remove" }}</button>
+                                                    </div>
+                                                </article>
+                                            }
+                                        }).collect::<Vec<_>>()}
+                                    </div>
+                                }.into_any()
+                            }
+                        })}
+                        <div class="grid gap-3 md:grid-cols-2">
+                            <label class="text-sm font-bold">"Server URL"<input type="url" class="v2-input mt-2" placeholder="https://blossom.example" prop:value=move || blossom_origin.get() on:input=move |event| { blossom_origin.set(event_target_value(&event)); blossom_error.set(None); } disabled=move || blossom_loading.get() || blossom_busy.get() /></label>
+                            <label class="text-sm font-bold">"Label (optional)"<input class="v2-input mt-2" placeholder="Primary media server" prop:value=move || blossom_label.get() on:input=move |event| blossom_label.set(event_target_value(&event)) disabled=move || blossom_loading.get() || blossom_busy.get() /></label>
+                        </div>
+                        <button type="button" class="v2-btn-primary" on:click=on_add_blossom_server disabled=move || blossom_loading.get() || blossom_busy.get() || blossom_origin.get().trim().is_empty()>{move || if blossom_busy.get() { "Saving…" } else { "Add server" }}</button>
+                        {move || blossom_error.get().map(|error| view! { <p class="v2-settings-alert v2-settings-alert-error" role="alert">{error}</p> })}
+                        {move || blossom_health_error.get().map(|error| view! { <p class="v2-settings-alert v2-settings-alert-error" role="alert">{format!("Server status check failed: {error}")}</p> })}
+                        {move || blossom_status.get().map(|status| view! { <p class="v2-settings-alert" role="status">{status}</p> })}
+                    </section>
+                </Show>
+
                 <section class="v2-settings-card">
                     <header class="v2-settings-card-header">
                         <span class="v2-settings-icon material-symbols-outlined" aria-hidden="true">"backup"</span>
@@ -554,6 +963,25 @@ mod tests {
         let summary = diagnostics_summary("desktop", None, 0, "disconnected", Some("local"));
         assert!(summary.contains("No") || !summary.contains("npub"));
         assert!(!summary.contains("nsec"));
+    }
+
+    #[test]
+    fn blossom_settings_reject_cross_account_responses() {
+        let settings = BlossomServerSettingsDto {
+            publisher_pubkey: "publisher-a".into(),
+            servers: vec![],
+            preferred_server: None,
+        };
+        assert!(verified_blossom_settings("publisher-a", settings.clone()).is_ok());
+        assert!(verified_blossom_settings("publisher-b", settings).is_err());
+        assert!(blossom_settings_error_message("invalid_request").contains("already configured"));
+        assert_eq!(
+            is_development_default_blossom_server("http://localhost:9099/"),
+            cfg!(debug_assertions)
+        );
+        assert_eq!(blossom_health_presentation("online").0, "Online");
+        assert_eq!(blossom_health_presentation("slow").0, "Slow");
+        assert_eq!(blossom_health_presentation("offline").0, "Offline");
     }
 
     #[test]
