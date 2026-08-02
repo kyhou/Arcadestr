@@ -8,10 +8,10 @@ use leptos::task::spawn_local;
 
 use crate::models::{AcquisitionPolicy, GameListing, PlatformInfo, StorePageCardPresentation};
 use crate::tauri_bridge::{invoke_get_installed_games, invoke_get_platform_info};
-#[cfg(feature = "web")]
-use crate::ui_v2::components::GameCardAction;
 use crate::ui_v2::components::{
-    GameCard, GameCardCampaign, GameCardPresentation, PageHeader, PlatformCompatibility,
+    EmptyState, ErrorSeverity, ErrorState, GameCard, GameCardAction, GameCardCampaign,
+    GameCardDensity, GameCardPresentation, GameCardSkeleton, InlineLoading, PartialRelayKind,
+    PartialRelayState, PlatformCompatibility,
 };
 use crate::ui_v2::views::marketplace_loader::{
     canonical_listing_coordinate, listing_state_key, use_listing_campaign_states,
@@ -78,6 +78,17 @@ impl AcquisitionFilter {
             _ => Self::All,
         }
     }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All access",
+            Self::Paid => "Paid",
+            Self::Claim => "Claim and keep",
+            Self::Public => "Public access",
+            Self::Timed => "Timed access",
+            Self::Owned => "Owned",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -110,6 +121,16 @@ impl SortOption {
             _ => Self::Recommended,
         }
     }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recommended => "Marketplace order",
+            Self::Newest => "Newest",
+            Self::PriceLow => "Price: low to high",
+            Self::PriceHigh => "Price: high to low",
+            Self::Title => "Title",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +151,100 @@ enum PlatformAutoFetchDecision {
     Wait,
     Fetch,
     Stop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClearedBrowseFilters {
+    query: String,
+    category: Option<String>,
+    acquisition: AcquisitionFilter,
+    platform: Option<String>,
+    sort: SortOption,
+}
+
+fn cleared_browse_filters() -> ClearedBrowseFilters {
+    ClearedBrowseFilters {
+        query: String::new(),
+        category: None,
+        acquisition: AcquisitionFilter::All,
+        platform: None,
+        sort: SortOption::Recommended,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowseContentState {
+    Loading,
+    Error,
+    MarketplaceEmpty,
+    FilterPending,
+    NoMatches,
+    Ready,
+}
+
+fn browse_content_state(
+    loaded_count: usize,
+    filtered_count: usize,
+    loading: bool,
+    has_error: bool,
+    filter_pending: bool,
+) -> BrowseContentState {
+    if loaded_count == 0 && loading {
+        BrowseContentState::Loading
+    } else if loaded_count == 0 && has_error {
+        BrowseContentState::Error
+    } else if loaded_count == 0 {
+        BrowseContentState::MarketplaceEmpty
+    } else if filtered_count == 0 && filter_pending {
+        BrowseContentState::FilterPending
+    } else if filtered_count == 0 {
+        BrowseContentState::NoMatches
+    } else {
+        BrowseContentState::Ready
+    }
+}
+
+fn category_label_for_key(categories: &[CategoryOption], key: &str) -> String {
+    categories
+        .iter()
+        .find(|category| category.key == key)
+        .map(|category| category.label.clone())
+        .unwrap_or_else(|| key.to_string())
+}
+
+fn browse_partial_result_kind(
+    listing_count: usize,
+    refreshing: bool,
+    has_error: bool,
+) -> Option<PartialRelayKind> {
+    if listing_count == 0 {
+        None
+    } else if has_error {
+        Some(PartialRelayKind::Failed)
+    } else if refreshing {
+        Some(PartialRelayKind::Loading)
+    } else {
+        None
+    }
+}
+
+fn no_results_copy(has_query: bool, has_filters: bool) -> (&'static str, &'static str) {
+    if has_query {
+        (
+            "No games match this search",
+            "Clear or adjust the search to see currently loaded marketplace results.",
+        )
+    } else if has_filters {
+        (
+            "No games match these filters",
+            "Clear or adjust filters to see currently loaded marketplace results.",
+        )
+    } else {
+        (
+            "No marketplace listings",
+            "No valid game listings were returned by the connected relays.",
+        )
+    }
 }
 
 #[component]
@@ -238,34 +353,39 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
             || active_platform_filter.get().is_some()
             || sort.get() != SortOption::Recommended
     });
+    let clear_all_filters = Callback::new(move |()| {
+        let cleared = cleared_browse_filters();
+        query.set(cleared.query);
+        active_category.set(cleared.category);
+        acquisition_filter.set(cleared.acquisition);
+        active_platform_filter.set(cleared.platform);
+        sort.set(cleared.sort);
+        platform_auto_fetch.set(None);
+        visible_count.set(BROWSE_INITIAL_VISIBLE_COUNT);
+    });
 
     view! {
-        <section class="p-4 md:p-8">
-            <PageHeader
-                eyebrow="Catalog".to_string()
-                title="Browse games".to_string()
-                description="Search and filter listings currently loaded from your connected Nostr relays.".to_string()
-            />
+        <section class="arc-browse">
+            <header class="arc-browse-header">
+                <h1>"Browse games"</h1>
+            </header>
 
-            <div class="mb-6 grid gap-4 rounded-2xl bg-surface-container-low p-4 lg:grid-cols-[minmax(0,1fr)_repeat(3,minmax(10rem,auto))]">
-                <label class="block min-w-0">
-                    <span class="mb-1.5 block text-xs font-semibold uppercase tracking-widest text-on-surface-variant">"Search"</span>
-                    <span class="relative block">
-                        <span class="material-symbols-outlined pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-lg text-on-surface-variant" aria-hidden="true">"search"</span>
-                        <input
-                            type="search"
-                            class="w-full rounded-xl border border-white/10 bg-surface-container-high py-3 pl-10 pr-4 text-sm text-on-surface outline-none ring-primary/60 placeholder:text-on-surface-variant focus-visible:ring-2"
-                            placeholder="Title, description, publisher, or category"
-                            prop:value=move || query.get()
-                            on:input=move |event| query.set(event_target_value(&event))
-                        />
-                    </span>
+            <div class="arc-browse-toolbar" aria-label="Browse controls">
+                <label class="arc-browse-search">
+                    <span class="sr-only">"Search loaded marketplace listings"</span>
+                    <span class="material-symbols-outlined" aria-hidden="true">"search"</span>
+                    <input
+                        type="search"
+                        placeholder="Search games, publishers, or tags"
+                        prop:value=move || query.get()
+                        on:input=move |event| query.set(event_target_value(&event))
+                    />
                 </label>
 
-                <label class="block">
-                    <span class="mb-1.5 block text-xs font-semibold uppercase tracking-widest text-on-surface-variant">"Access"</span>
+                <label class="arc-browse-filter">
+                    <span class="sr-only">"Filter by access method"</span>
                     <select
-                        class="w-full rounded-xl border border-white/10 bg-surface-container-high px-3 py-3 text-sm text-on-surface outline-none ring-primary/60 focus-visible:ring-2"
+                        aria-label="Access method"
                         prop:value=move || acquisition_filter.get().value()
                         on:change=move |event| acquisition_filter.set(AcquisitionFilter::from_value(&event_target_value(&event)))
                     >
@@ -278,10 +398,10 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                     </select>
                 </label>
 
-                <label class="block">
-                    <span class="mb-1.5 block text-xs font-semibold uppercase tracking-widest text-on-surface-variant">"Platform"</span>
+                <label class="arc-browse-filter">
+                    <span class="sr-only">"Filter by platform"</span>
                     <select
-                        class="w-full rounded-xl border border-white/10 bg-surface-container-high px-3 py-3 text-sm text-on-surface outline-none ring-primary/60 focus-visible:ring-2"
+                        aria-label="Platform"
                         prop:value=move || active_platform_filter.get().unwrap_or_default()
                         on:change=move |event| {
                             let value = event_target_value(&event);
@@ -314,24 +434,28 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                     </select>
                 </label>
 
-                <label class="block">
-                    <span class="mb-1.5 block text-xs font-semibold uppercase tracking-widest text-on-surface-variant">"Sort"</span>
+                <label class="arc-browse-filter">
+                    <span class="sr-only">"Sort marketplace listings"</span>
                     <select
-                        class="w-full rounded-xl border border-white/10 bg-surface-container-high px-3 py-3 text-sm text-on-surface outline-none ring-primary/60 focus-visible:ring-2"
+                        aria-label="Sort listings"
                         prop:value=move || sort.get().value()
                         on:change=move |event| sort.set(SortOption::from_value(&event_target_value(&event)))
                     >
-                        <option value="recommended">"Recommended"</option>
+                        <option value="recommended">"Marketplace order"</option>
                         <option value="newest">"Newest"</option>
                         <option value="price-low">"Price: low to high"</option>
                         <option value="price-high">"Price: high to low"</option>
                         <option value="title">"Title"</option>
                     </select>
                 </label>
+
+                <p class="arc-browse-result-count" aria-live="polite">
+                    {move || format!("{} result{}", filtered_listings.get().len(), if filtered_listings.get().len() == 1 { "" } else { "s" })}
+                </p>
             </div>
 
-            <div class="mb-6 flex flex-wrap items-center gap-2">
-                <span class="mr-1 text-xs font-semibold uppercase tracking-widest text-on-surface-variant">"Category"</span>
+            <div class="arc-browse-categories" role="group" aria-label="Filter by category">
+                <span>"Category"</span>
                 <button
                     type="button"
                     class=move || filter_chip_class(active_category.get().is_none())
@@ -353,100 +477,136 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                 }).collect_view()}
             </div>
 
-            <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
-                <p class="text-sm text-on-surface-variant" aria-live="polite">
-                    {move || format!("{} loaded result{}", filtered_listings.get().len(), if filtered_listings.get().len() == 1 { "" } else { "s" })}
-                </p>
-                <Show when=move || filters_active.get()>
-                    <button
-                        type="button"
-                        class="rounded-xl px-3 py-2 text-sm font-semibold text-primary outline-none ring-primary/60 hover:bg-primary/10 focus-visible:ring-2"
-                        on:click=move |_| {
-                            query.set(String::new());
-                            active_category.set(None);
-                            acquisition_filter.set(AcquisitionFilter::All);
+            <Show when=move || filters_active.get()>
+                <div class="arc-browse-active-filters" role="group" aria-label="Active filters">
+                    <span>"Active"</span>
+                    <Show when=move || !normalize_search(&query.get()).is_empty()>
+                        <button type="button" aria-label="Clear search filter" on:click=move |_| query.set(String::new())>
+                            {move || format!("Search: {}", query.get())}<span aria-hidden="true">"×"</span>
+                        </button>
+                    </Show>
+                    {move || active_category.get().map(|category| view! {
+                        <button type="button" aria-label="Clear category filter" on:click=move |_| active_category.set(None)>
+                            {format!("Category: {}", category_label_for_key(&categories.get(), &category))}<span aria-hidden="true">"×"</span>
+                        </button>
+                    })}
+                    <Show when=move || acquisition_filter.get() != AcquisitionFilter::All>
+                        <button type="button" aria-label="Clear access filter" on:click=move |_| acquisition_filter.set(AcquisitionFilter::All)>
+                            {move || format!("Access: {}", acquisition_filter.get().label())}<span aria-hidden="true">"×"</span>
+                        </button>
+                    </Show>
+                    {move || active_platform_filter.get().map(|platform| view! {
+                        <button type="button" aria-label="Clear platform filter" on:click=move |_| {
                             active_platform_filter.set(None);
-                            sort.set(SortOption::Recommended);
                             platform_auto_fetch.set(None);
                             visible_count.set(BROWSE_INITIAL_VISIBLE_COUNT);
-                        }
-                    >"Clear filters"</button>
-                </Show>
-            </div>
+                        }>
+                            {format!("Platform: {platform}")}<span aria-hidden="true">"×"</span>
+                        </button>
+                    })}
+                    <Show when=move || sort.get() != SortOption::Recommended>
+                        <button type="button" aria-label="Reset sort order" on:click=move |_| sort.set(SortOption::Recommended)>
+                            {move || format!("Sort: {}", sort.get().label())}<span aria-hidden="true">"×"</span>
+                        </button>
+                    </Show>
+                    <button type="button" class="arc-browse-clear-all" on:click=move |_| clear_all_filters.run(())>"Clear all"</button>
+                </div>
+            </Show>
 
-            <Show when=move || marketplace.refreshing.get() && !listings.get().is_empty()>
-                <p class="mb-5 rounded-xl border border-secondary/20 bg-secondary/10 px-4 py-3 text-sm text-secondary" role="status">
-                    "Showing cached listings while refreshing from relays."
-                </p>
-            </Show>
-            <Show when=move || marketplace.error.get().is_some() && !listings.get().is_empty()>
-                <p class="mb-5 rounded-xl border border-tertiary/25 bg-tertiary/10 px-4 py-3 text-sm text-tertiary" role="status">
-                    {move || format!("Relay refresh failed; cached listings remain available. {}", marketplace.error.get().unwrap_or_default())}
-                </p>
-            </Show>
+            {move || browse_partial_result_kind(
+                listings.get().len(),
+                marketplace.refreshing.get(),
+                marketplace.error.get().is_some(),
+            ).map(|kind| view! {
+                <PartialRelayState kind=kind result_count=listings.get().len() />
+            })}
             <Show when=move || campaign_state.loading.get() && !listings.get().is_empty()>
-                <p class="mb-5 text-xs text-on-surface-variant" role="status">"Checking claim-and-keep campaigns..."</p>
+                <p class="arc-browse-enrichment-status" role="status">"Checking claim-and-keep campaigns..."</p>
             </Show>
             <Show when=move || campaign_state.error.get().is_some() && !listings.get().is_empty()>
-                <p class="mb-5 text-xs text-tertiary" role="status">"Some claim campaign statuses are currently unavailable."</p>
+                <p class="arc-browse-enrichment-status arc-browse-enrichment-warning" role="status">"Some claim campaign statuses are currently unavailable."</p>
             </Show>
+
             {move || {
                 let loaded = listings.get();
                 let filtered = filtered_listings.get();
-                if loaded.is_empty() && marketplace.loading.get() {
-                    view! {
-                        <div class="rounded-2xl bg-surface-container-high p-10 text-center text-on-surface-variant" role="status">
-                            {if marketplace.received_count.get() > 0 {
-                                format!("Loading marketplace... {} listings received", marketplace.received_count.get())
-                            } else {
-                                "Loading marketplace from connected relays...".to_string()
-                            }}
+                match browse_content_state(
+                    loaded.len(),
+                    filtered.len(),
+                    marketplace.loading.get(),
+                    marketplace.error.get().is_some(),
+                    filters_active.get()
+                        && (marketplace.loading.get()
+                            || marketplace.loading_more.get()
+                            || platform_auto_fetch.get().is_some()
+                            || campaign_state.loading.get()),
+                ) {
+                    BrowseContentState::Loading => view! {
+                        <div class="arc-browse-grid" role="status" aria-label="Loading games">
+                            <GameCardSkeleton browse=true />
+                            <GameCardSkeleton browse=true />
+                            <GameCardSkeleton browse=true />
+                            <GameCardSkeleton browse=true />
                         </div>
-                    }.into_any()
-                } else if loaded.is_empty() && marketplace.error.get().is_some() {
-                    view! {
-                        <div class="rounded-2xl border border-error/30 bg-error/10 p-10 text-center">
-                            <h2 class="font-display text-xl font-semibold text-on-surface">"Marketplace unavailable"</h2>
-                            <p class="mt-2 text-sm text-error">{marketplace.error.get().unwrap_or_default()}</p>
+                    }.into_any(),
+                    BrowseContentState::Error => view! {
+                        <div class="arc-browse-state">
+                            <ErrorState
+                                title="Marketplace unavailable"
+                                message="Connected relays could not provide marketplace listings."
+                                severity=ErrorSeverity::Recoverable
+                            />
                         </div>
-                    }.into_any()
-                } else if loaded.is_empty() {
-                    view! {
-                        <div class="rounded-2xl bg-surface-container-high p-10 text-center">
-                            <h2 class="font-display text-xl font-semibold">"No marketplace listings"</h2>
-                            <p class="mt-2 text-sm text-on-surface-variant">"No valid game listings were returned by the connected relays."</p>
+                    }.into_any(),
+                    BrowseContentState::MarketplaceEmpty => view! {
+                        <div class="arc-browse-state">
+                            <EmptyState
+                                title="No marketplace listings"
+                                description="No valid game listings were returned by the connected relays."
+                                icon="sports_esports"
+                            />
                         </div>
-                    }.into_any()
-                } else if filtered.is_empty() {
-                    view! {
-                        <div class="rounded-2xl bg-surface-container-high p-10 text-center">
-                            <h2 class="font-display text-xl font-semibold">"No games match these filters"</h2>
-                            <p class="mt-2 text-sm text-on-surface-variant">"Clear or adjust filters to see the currently loaded marketplace results."</p>
+                    }.into_any(),
+                    BrowseContentState::FilterPending => view! {
+                        <div class="arc-browse-filter-pending" role="status">
+                            <InlineLoading label="Checking more relay results for active filters" />
                         </div>
-                    }.into_any()
-                } else {
-                    let host_tag = host_platform_tag.get();
-                    let active_platform = active_platform_filter.get();
-                    let campaign_states = campaign_state.states.get();
-                    let installed = installed_coordinates.get();
-                    let presentations = store_pages.presentations.get();
-                    view! {
-                        <div class="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
-                            {filtered.into_iter().take(visible_count.get()).map(|listing| {
-                                let store_page = canonical_listing_coordinate(&listing)
-                                    .and_then(|coordinate| presentations.get(&coordinate).cloned());
-                                render_game_card(
-                                    listing,
-                                    store_page,
-                                    on_select,
-                                    &campaign_states,
-                                    &installed,
-                                    host_tag.as_deref(),
-                                    active_platform.as_deref(),
-                                )
-                            }).collect::<Vec<_>>()}
-                        </div>
-                    }.into_any()
+                    }.into_any(),
+                    BrowseContentState::NoMatches => {
+                        let (title, description) = no_results_copy(
+                            !normalize_search(&query.get()).is_empty(),
+                            filters_active.get(),
+                        );
+                        view! {
+                            <div class="arc-browse-state">
+                                <EmptyState title=title description=description icon="filter_alt_off" />
+                            </div>
+                        }.into_any()
+                    }
+                    BrowseContentState::Ready => {
+                        let host_tag = host_platform_tag.get();
+                        let active_platform = active_platform_filter.get();
+                        let campaign_states = campaign_state.states.get();
+                        let installed = installed_coordinates.get();
+                        let presentations = store_pages.presentations.get();
+                        view! {
+                            <div class="arc-browse-grid">
+                                {filtered.into_iter().take(visible_count.get()).map(|listing| {
+                                    let store_page = canonical_listing_coordinate(&listing)
+                                        .and_then(|coordinate| presentations.get(&coordinate).cloned());
+                                    render_game_card(
+                                        listing,
+                                        store_page,
+                                        on_select,
+                                        &campaign_states,
+                                        &installed,
+                                        host_tag.as_deref(),
+                                        active_platform.as_deref(),
+                                    )
+                                }).collect::<Vec<_>>()}
+                            </div>
+                        }.into_any()
+                    }
                 }
             }}
 
@@ -454,16 +614,16 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                 let filtered_count = filtered_listings.get().len();
                 if marketplace.loading_more.get() {
                     view! {
-                        <div class="mt-10 flex justify-center" role="status">
-                            <span class="rounded-full bg-surface-container-low px-6 py-3 text-sm font-semibold text-on-surface-variant">"Loading more listings..."</span>
+                        <div class="arc-browse-pagination">
+                            <InlineLoading label="Loading more listings" />
                         </div>
                     }.into_any()
                 } else if can_load_more_browse_cards(visible_count.get(), filtered_count, marketplace.has_more.get()) {
                     view! {
-                        <div class="mt-10 flex justify-center">
+                        <div class="arc-browse-pagination">
                             <button
                                 type="button"
-                                class="rounded-full border border-white/10 bg-surface-container-low px-8 py-3 text-sm font-semibold text-on-surface outline-none ring-primary/60 hover:bg-surface-container-high focus-visible:ring-2"
+                                class="v2-btn-secondary"
                                 on:click=move |_| {
                                     let displayed_count = filtered_listings.get_untracked().len();
                                     let loaded_count = listings.get_untracked().len();
@@ -499,7 +659,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                     marketplace.loading_more.get(),
                 ) {
                     view! {
-                        <p class="mt-10 text-center text-sm text-on-surface-variant">"No more games are available for this platform in the loaded marketplace."</p>
+                        <p class="arc-browse-exhausted">"No more games are available for this platform in the loaded marketplace."</p>
                     }.into_any()
                 } else {
                     view! { <></> }.into_any()
@@ -538,6 +698,7 @@ fn render_game_card(
             presentation=presentation
             categories=categories
             store_page=store_page
+            density=GameCardDensity::Browse
             on_open=Callback::new(move |_| on_select.run(listing_for_open.clone()))
             on_action=action_callback
         />
@@ -561,10 +722,9 @@ fn card_presentation(
                 CampaignAvailability::Ended => GameCardCampaign::Ended,
             },
         ));
-    #[cfg(feature = "web")]
-    if presentation.action == Some(GameCardAction::Install) {
-        presentation.action = Some(GameCardAction::ViewDetails);
-    }
+    // Browse card actions currently navigate to details; their label must match
+    // that behavior until acquisition actions are deliberately wired here.
+    presentation.action = Some(GameCardAction::ViewDetails);
     presentation
 }
 
@@ -591,9 +751,9 @@ fn current_unix_secs() -> u64 {
 
 fn filter_chip_class(active: bool) -> &'static str {
     if active {
-        "rounded-full bg-primary/20 px-3 py-1.5 text-xs font-semibold text-primary outline-none ring-primary/60 focus-visible:ring-2"
+        "arc-browse-category active"
     } else {
-        "rounded-full bg-surface-container-high px-3 py-1.5 text-xs font-medium text-on-surface-variant outline-none ring-primary/60 hover:text-on-surface focus-visible:ring-2"
+        "arc-browse-category"
     }
 }
 
@@ -1271,5 +1431,102 @@ mod tests {
             listing_compatibility(&["windows-x86_64".into()], None, None),
             PlatformCompatibility::Unknown
         );
+    }
+
+    #[test]
+    fn clearing_all_filters_restores_existing_defaults() {
+        let cleared = cleared_browse_filters();
+        assert!(cleared.query.is_empty());
+        assert_eq!(cleared.category, None);
+        assert_eq!(cleared.acquisition, AcquisitionFilter::All);
+        assert_eq!(cleared.platform, None);
+        assert_eq!(cleared.sort, SortOption::Recommended);
+    }
+
+    #[test]
+    fn supported_sort_values_round_trip_without_invented_rankings() {
+        for option in [
+            SortOption::Recommended,
+            SortOption::Newest,
+            SortOption::PriceLow,
+            SortOption::PriceHigh,
+            SortOption::Title,
+        ] {
+            assert_eq!(SortOption::from_value(option.value()), option);
+            assert!(!option.label().is_empty());
+        }
+        assert_eq!(
+            SortOption::from_value("popularity"),
+            SortOption::Recommended
+        );
+    }
+
+    #[test]
+    fn loading_empty_error_filtered_and_ready_states_are_distinct() {
+        assert_eq!(
+            browse_content_state(0, 0, true, false, false),
+            BrowseContentState::Loading
+        );
+        assert_eq!(
+            browse_content_state(0, 0, false, true, false),
+            BrowseContentState::Error
+        );
+        assert_eq!(
+            browse_content_state(0, 0, false, false, false),
+            BrowseContentState::MarketplaceEmpty
+        );
+        assert_eq!(
+            browse_content_state(4, 0, false, false, false),
+            BrowseContentState::NoMatches
+        );
+        assert_eq!(
+            browse_content_state(4, 2, false, false, false),
+            BrowseContentState::Ready
+        );
+        assert_eq!(
+            browse_content_state(4, 0, false, false, true),
+            BrowseContentState::FilterPending
+        );
+    }
+
+    #[test]
+    fn no_results_copy_distinguishes_search_from_other_filters() {
+        assert_eq!(no_results_copy(true, true).0, "No games match this search");
+        assert_eq!(
+            no_results_copy(false, true).0,
+            "No games match these filters"
+        );
+        assert_eq!(no_results_copy(false, false).0, "No marketplace listings");
+        assert_eq!(
+            category_label_for_key(
+                &[CategoryOption {
+                    key: "action rpg".into(),
+                    label: "Action RPG".into(),
+                }],
+                "action rpg",
+            ),
+            "Action RPG"
+        );
+    }
+
+    #[test]
+    fn partial_results_keep_loaded_cards_visible() {
+        assert_eq!(
+            browse_partial_result_kind(4, true, false),
+            Some(PartialRelayKind::Loading)
+        );
+        assert_eq!(
+            browse_partial_result_kind(4, false, true),
+            Some(PartialRelayKind::Failed)
+        );
+        assert_eq!(browse_partial_result_kind(0, true, true), None);
+    }
+
+    #[test]
+    fn browse_card_actions_remain_details_navigation() {
+        let listing = listing("game", "Game");
+        let presentation =
+            card_presentation(&listing, None, PlatformCompatibility::Compatible, false);
+        assert_eq!(presentation.action, Some(GameCardAction::ViewDetails));
     }
 }

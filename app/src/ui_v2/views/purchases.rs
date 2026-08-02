@@ -3,6 +3,10 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::models::{DurableAcquisitionKind, DurableAcquisitionRecord, DurableCredentialStatus};
 use crate::tauri_bridge::invoke_get_purchase_records;
+use crate::ui_v2::components::{
+    EmptyState, ErrorSeverity, ErrorState, FeedbackLayout, LoadingState, PageTabItem,
+    PageTabSemantics, PageTabs, StatusChip, StatusChipSize, StatusChipVariant,
+};
 use crate::AuthContext;
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,37 @@ fn filter_matches(filter: PurchaseFilter, record: &DurableAcquisitionRecord) -> 
     }
 }
 
+fn purchase_filter_id(filter: PurchaseFilter) -> &'static str {
+    match filter {
+        PurchaseFilter::All => "all",
+        PurchaseFilter::Purchases => "purchases",
+        PurchaseFilter::PromotionClaims => "promotion-claims",
+        PurchaseFilter::Inactive => "inactive",
+    }
+}
+
+fn purchase_filter_from_id(id: &str) -> Option<PurchaseFilter> {
+    match id {
+        "all" => Some(PurchaseFilter::All),
+        "purchases" => Some(PurchaseFilter::Purchases),
+        "promotion-claims" => Some(PurchaseFilter::PromotionClaims),
+        "inactive" => Some(PurchaseFilter::Inactive),
+        _ => None,
+    }
+}
+
+fn purchase_filter_tabs() -> Vec<PageTabItem> {
+    [
+        (PurchaseFilter::All, "All"),
+        (PurchaseFilter::Purchases, "Purchases"),
+        (PurchaseFilter::PromotionClaims, "Promotion claims"),
+        (PurchaseFilter::Inactive, "Refunded or revoked"),
+    ]
+    .into_iter()
+    .map(|(filter, label)| PageTabItem::local(purchase_filter_id(filter), label))
+    .collect()
+}
+
 fn record_type_label(record_type: DurableAcquisitionKind) -> &'static str {
     match record_type {
         DurableAcquisitionKind::Purchase => "Purchase",
@@ -72,6 +107,16 @@ fn status_label(status: DurableCredentialStatus) -> &'static str {
         DurableCredentialStatus::Refunded => "Purchase refunded",
         DurableCredentialStatus::Revoked => "Access revoked",
         DurableCredentialStatus::Unverified => "Record could not be verified",
+    }
+}
+
+fn status_variant(status: DurableCredentialStatus) -> StatusChipVariant {
+    match status {
+        DurableCredentialStatus::Active => StatusChipVariant::Success,
+        DurableCredentialStatus::Disputed => StatusChipVariant::Warning,
+        DurableCredentialStatus::Refunded => StatusChipVariant::Cancelled,
+        DurableCredentialStatus::Revoked => StatusChipVariant::Error,
+        DurableCredentialStatus::Unverified => StatusChipVariant::Unverified,
     }
 }
 
@@ -95,6 +140,12 @@ pub fn PurchasesView() -> impl IntoView {
     let state = RwSignal::new(PurchasesState::Loading);
     let filter = RwSignal::new(PurchaseFilter::All);
     let request_generation = RwSignal::new(0_u64);
+    let selected_filter = Signal::derive(move || purchase_filter_id(filter.get()).to_string());
+    let select_filter = Callback::new(move |id: String| {
+        if let Some(next) = purchase_filter_from_id(&id) {
+            filter.set(next);
+        }
+    });
 
     #[cfg(feature = "web")]
     state.set(PurchasesState::WebUnavailable);
@@ -136,30 +187,32 @@ pub fn PurchasesView() -> impl IntoView {
             </header>
 
             {move || match state.get() {
-                PurchasesState::Loading => purchase_state_view(
-                    "progress_activity",
-                    "Loading records",
-                    "Reading validated records for the active account.",
-                    false,
-                ),
+                PurchasesState::Loading => view! {
+                    <LoadingState
+                        title="Loading records"
+                        description="Reading validated records for the active account."
+                    />
+                }.into_any(),
                 PurchasesState::AccountRequired => purchase_state_view(
                     "person",
                     "Account required",
                     "Connect an account to view its durable purchases and promotion claims.",
                     false,
                 ),
-                PurchasesState::Empty => purchase_state_view(
-                    "receipt_long",
-                    "No durable records yet",
-                    "Paid purchases and claimed keep-forever promotions will appear here.",
-                    false,
-                ),
-                PurchasesState::Error => purchase_state_view(
-                    "cloud_off",
-                    "Records unavailable",
-                    "Purchase and access records could not be loaded.",
-                    true,
-                ),
+                PurchasesState::Empty => view! {
+                    <EmptyState
+                        title="No durable records yet"
+                        description="Paid purchases and claimed keep-forever promotions will appear here."
+                        icon="receipt_long"
+                    />
+                }.into_any(),
+                PurchasesState::Error => view! {
+                    <ErrorState
+                        title="Records unavailable"
+                        message="Purchase and access records could not be loaded."
+                        severity=ErrorSeverity::Recoverable
+                    />
+                }.into_any(),
                 PurchasesState::WebUnavailable => purchase_state_view(
                     "desktop_windows",
                     "Desktop records unavailable on web",
@@ -177,12 +230,13 @@ pub fn PurchasesView() -> impl IntoView {
                         .collect::<Vec<_>>();
                     view! {
                         <div class="v2-purchases-toolbar v2-panel">
-                            <div class="v2-tab-row" role="group" aria-label="Filter purchase records">
-                                <button class="v2-tab" class:active=move || filter.get() == PurchaseFilter::All aria-pressed=move || filter.get() == PurchaseFilter::All on:click=move |_| filter.set(PurchaseFilter::All)>"All"</button>
-                                <button class="v2-tab" class:active=move || filter.get() == PurchaseFilter::Purchases aria-pressed=move || filter.get() == PurchaseFilter::Purchases on:click=move |_| filter.set(PurchaseFilter::Purchases)>"Purchases"</button>
-                                <button class="v2-tab" class:active=move || filter.get() == PurchaseFilter::PromotionClaims aria-pressed=move || filter.get() == PurchaseFilter::PromotionClaims on:click=move |_| filter.set(PurchaseFilter::PromotionClaims)>"Promotion claims"</button>
-                                <button class="v2-tab" class:active=move || filter.get() == PurchaseFilter::Inactive aria-pressed=move || filter.get() == PurchaseFilter::Inactive on:click=move |_| filter.set(PurchaseFilter::Inactive)>"Refunded or revoked"</button>
-                            </div>
+                            <PageTabs
+                                items=purchase_filter_tabs()
+                                selected=selected_filter
+                                on_select=select_filter
+                                aria_label="Filter purchase records"
+                                semantics=PageTabSemantics::Filter
+                            />
                             {(partial_count > 0).then(|| view! {
                                 <p class="v2-purchases-partial" role="status">
                                     {format!("{partial_count} record(s) have incomplete local details.")}
@@ -191,12 +245,14 @@ pub fn PurchasesView() -> impl IntoView {
                         </div>
 
                         {if visible_records.is_empty() {
-                            purchase_state_view(
-                                "filter_alt_off",
-                                "No matching records",
-                                "No durable records match this filter.",
-                                false,
-                            )
+                            view! {
+                                <EmptyState
+                                    title="No matching records"
+                                    description="No durable records match this filter."
+                                    icon="filter_alt_off"
+                                    layout=FeedbackLayout::Compact
+                                />
+                            }.into_any()
                         } else {
                             view! {
                                 <div class="v2-purchase-list">
@@ -235,13 +291,7 @@ fn purchase_record_view(record: DurableAcquisitionRecord) -> impl IntoView {
         .unwrap_or_else(|| "Game title unavailable".to_string());
     let record_type = record_type_label(record.record_type);
     let status = status_label(record.status);
-    let status_class = match record.status {
-        DurableCredentialStatus::Active => "v2-purchase-status-active",
-        DurableCredentialStatus::Disputed
-        | DurableCredentialStatus::Refunded
-        | DurableCredentialStatus::Revoked => "v2-purchase-status-inactive",
-        DurableCredentialStatus::Unverified => "v2-purchase-status-error",
-    };
+    let status_variant = status_variant(record.status);
 
     view! {
         <article class="v2-purchase-record v2-panel">
@@ -257,7 +307,12 @@ fn purchase_record_view(record: DurableAcquisitionRecord) -> impl IntoView {
                 })}
             </div>
             <div class="v2-purchase-record-summary">
-                <span class=format!("v2-purchase-status {status_class}")>{status}</span>
+                <StatusChip
+                    label=status
+                    variant=status_variant
+                    icon=None
+                    size=StatusChipSize::Compact
+                />
                 {amount_label(&record).map(|amount| view! { <strong>{amount}</strong> })}
                 <span>{format!("Acquired: {}", record.acquired_at)}</span>
             </div>
@@ -340,6 +395,26 @@ mod tests {
             status_label(DurableCredentialStatus::Unverified),
             "Record could not be verified"
         );
+        assert_eq!(
+            status_variant(DurableCredentialStatus::Unverified),
+            StatusChipVariant::Unverified
+        );
+    }
+
+    #[test]
+    fn purchase_tab_ids_resolve_to_local_filter_state() {
+        for filter in [
+            PurchaseFilter::All,
+            PurchaseFilter::Purchases,
+            PurchaseFilter::PromotionClaims,
+            PurchaseFilter::Inactive,
+        ] {
+            assert_eq!(
+                purchase_filter_from_id(purchase_filter_id(filter)),
+                Some(filter)
+            );
+        }
+        assert_eq!(purchase_filter_from_id("unknown"), None);
     }
 
     #[test]

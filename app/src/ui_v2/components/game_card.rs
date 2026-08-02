@@ -1,8 +1,10 @@
 use leptos::prelude::*;
 
 use crate::models::{AcquisitionPolicy, GameListing, StorePageCardPresentation};
-
-const FALLBACK_COVER: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 10'%3E%3Crect width='16' height='10' fill='%23191a22'/%3E%3Cpath d='M6 4h4v2H6z' fill='%23aaa4b5'/%3E%3C/svg%3E";
+use crate::ui_v2::components::{
+    artwork_state_from_url, GameArtwork, GameCardSkeleton, StatusChip, StatusChipSize,
+    StatusChipVariant,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameCardAccess {
@@ -38,13 +40,54 @@ pub enum GameCardAction {
     Install,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GameCardDensity {
+    #[default]
+    Home,
+    Browse,
+}
+
+impl GameCardDensity {
+    const fn class(self) -> &'static str {
+        match self {
+            Self::Home => "arc-game-card-home",
+            Self::Browse => "arc-game-card-browse",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GameCardPresentation {
     pub access: GameCardAccess,
+    pub owned: bool,
     pub campaign: Option<GameCardCampaign>,
     pub compatibility: PlatformCompatibility,
     pub installed: bool,
     pub action: Option<GameCardAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameCardStatus {
+    pub label: String,
+    pub variant: StatusChipVariant,
+    pub icon: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameCardActionPresentation {
+    pub label: String,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameCardVisualContent {
+    pub title: String,
+    pub publisher: String,
+    pub artwork_url: Option<String>,
+    pub summary: Option<String>,
+    pub secondary_metadata: Vec<String>,
+    pub price_or_acquisition: Option<String>,
+    pub statuses: Vec<GameCardStatus>,
 }
 
 impl GameCardPresentation {
@@ -54,27 +97,25 @@ impl GameCardPresentation {
         compatibility: PlatformCompatibility,
         installed: bool,
     ) -> Self {
-        let access = if listing.is_owned {
-            GameCardAccess::Owned
-        } else {
-            match listing.acquisition {
-                AcquisitionPolicy::Public => GameCardAccess::Public,
-                AcquisitionPolicy::TimedAccess { starts_at, .. } if now < starts_at => {
-                    GameCardAccess::TimedUpcoming
-                }
-                AcquisitionPolicy::TimedAccess { ends_at, .. } if now >= ends_at => {
-                    GameCardAccess::TimedExpired
-                }
-                AcquisitionPolicy::TimedAccess { .. } => GameCardAccess::TimedActive,
-                AcquisitionPolicy::Gated if listing.has_declared_price() => GameCardAccess::Paid,
-                AcquisitionPolicy::Gated => GameCardAccess::Gated,
+        let access = match listing.acquisition {
+            AcquisitionPolicy::Public => GameCardAccess::Public,
+            AcquisitionPolicy::TimedAccess { starts_at, .. } if now < starts_at => {
+                GameCardAccess::TimedUpcoming
             }
+            AcquisitionPolicy::TimedAccess { ends_at, .. } if now >= ends_at => {
+                GameCardAccess::TimedExpired
+            }
+            AcquisitionPolicy::TimedAccess { .. } => GameCardAccess::TimedActive,
+            AcquisitionPolicy::Gated if listing.has_declared_price() => GameCardAccess::Paid,
+            AcquisitionPolicy::Gated => GameCardAccess::Gated,
         };
 
         let action = if compatibility == PlatformCompatibility::Incompatible {
             Some(GameCardAction::ViewDetails)
         } else if installed {
             Some(GameCardAction::ViewDetails)
+        } else if listing.is_owned {
+            Some(GameCardAction::Install)
         } else {
             match access {
                 GameCardAccess::Paid => Some(GameCardAction::Purchase),
@@ -89,6 +130,7 @@ impl GameCardPresentation {
 
         Self {
             access,
+            owned: listing.is_owned,
             campaign: None,
             compatibility,
             installed,
@@ -101,11 +143,7 @@ impl GameCardPresentation {
         compatibility: PlatformCompatibility,
         installed: bool,
     ) -> Self {
-        let access = if claimed {
-            GameCardAccess::Owned
-        } else {
-            GameCardAccess::Gated
-        };
+        let access = GameCardAccess::Gated;
         let action = if compatibility == PlatformCompatibility::Incompatible || installed {
             Some(GameCardAction::ViewDetails)
         } else if claimed {
@@ -116,6 +154,7 @@ impl GameCardPresentation {
 
         Self {
             access,
+            owned: claimed,
             campaign: Some(if claimed {
                 GameCardCampaign::Claimed
             } else {
@@ -130,7 +169,7 @@ impl GameCardPresentation {
     pub fn with_campaign(mut self, campaign: Option<GameCardCampaign>) -> Self {
         self.campaign = campaign;
         if campaign == Some(GameCardCampaign::Active)
-            && self.access != GameCardAccess::Owned
+            && !self.owned
             && self.compatibility != PlatformCompatibility::Incompatible
             && !self.installed
         {
@@ -148,6 +187,7 @@ pub fn GameCard(
     #[prop(optional)] categories: Option<Vec<String>>,
     store_page: Option<StorePageCardPresentation>,
     #[prop(optional)] on_action: Option<Callback<GameCardAction>>,
+    #[prop(optional)] density: GameCardDensity,
 ) -> impl IntoView {
     let display = resolve_card_content(&listing, store_page.as_ref(), categories);
     let image_url = display.image_url;
@@ -160,77 +200,145 @@ pub fn GameCard(
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| crate::models::npub_fallback_label(&listing.publisher_npub));
     let tags = display.badges;
-    let badge = access_badge(presentation.access);
     let price = price_label(&listing, presentation);
     let action = presentation.action;
+    let statuses = card_statuses(presentation);
+    let action_presentation = action.map(|action| GameCardActionPresentation {
+        label: action_label(action, presentation).to_string(),
+        disabled: false,
+    });
+    let action_callback = on_action.map(|callback| {
+        Callback::new(move |_| {
+            if let Some(action) = action {
+                callback.run(action);
+            }
+        })
+    });
+    let content = GameCardVisualContent {
+        title,
+        publisher,
+        artwork_url: image_url,
+        summary: (!summary.trim().is_empty()).then_some(summary),
+        secondary_metadata: tags,
+        price_or_acquisition: Some(price),
+        statuses,
+    };
 
     view! {
-        <article class="group relative flex h-full flex-col overflow-hidden rounded-2xl bg-surface-container-high transition-colors hover:bg-surface-bright">
-            <div class="relative aspect-[4/3] w-full overflow-hidden bg-surface-container-low">
-                <img
-                    src=image_url
-                    alt={format!("{} cover art", title)}
-                    loading="lazy"
-                    class="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
-                    on:error=move |event| {
-                        let image = event_target::<web_sys::HtmlElement>(&event);
-                        let _ = image.set_attribute("src", FALLBACK_COVER);
+        <GameCardVisual
+            content=content
+            on_open=Callback::new(move |_| on_open.run(title_for_open.clone()))
+            action=action_presentation
+            on_action=action_callback
+            favorite=None
+            on_favorite=None
+            density=density
+        />
+    }
+}
+
+#[component]
+pub fn GameCardVisual(
+    content: GameCardVisualContent,
+    on_open: Callback<()>,
+    action: Option<GameCardActionPresentation>,
+    on_action: Option<Callback<()>>,
+    favorite: Option<bool>,
+    on_favorite: Option<Callback<bool>>,
+    #[prop(optional)] density: GameCardDensity,
+    #[prop(optional)] disabled: bool,
+    #[prop(optional)] loading: bool,
+) -> impl IntoView {
+    if loading {
+        return view! {
+            <GameCardSkeleton announce=true browse=density == GameCardDensity::Browse />
+        }
+        .into_any();
+    }
+
+    let title = content.title.clone();
+    let title_for_art = title.clone();
+    let metadata = content.secondary_metadata.join(" · ");
+    let has_metadata = !metadata.is_empty();
+    let artwork = artwork_state_from_url(content.artwork_url.clone());
+
+    view! {
+        <article class=format!("arc-game-card {}", density.class()) class:arc-game-card-disabled=disabled>
+            <button
+                type="button"
+                class="arc-game-card-main"
+                disabled=disabled
+                aria-label={format!("Open details for {title}")}
+                on:click=move |_| {
+                    if !disabled {
+                        on_open.run(());
                     }
-                />
-                <div class="absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-black/80 to-transparent" aria-hidden="true"></div>
-                <div class="absolute left-3 top-3 flex flex-wrap items-center gap-1.5">
-                    <span class={access_badge_class(presentation.access)}>{badge}</span>
-                    {campaign_badge(presentation.campaign)}
-                    {compatibility_badge(presentation.compatibility)}
+                }
+            >
+                <div class="arc-game-card-art">
+                    <GameArtwork title=title_for_art state=artwork />
+                    <span class="arc-game-card-art-shade" aria-hidden="true"></span>
+                    <strong class="arc-game-card-title">{content.title}</strong>
                 </div>
-                <Show when=move || presentation.installed>
-                    <span class="absolute right-3 top-3 rounded-full bg-secondary/90 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-on-secondary">
-                        "Installed"
-                    </span>
-                </Show>
-            </div>
-            <div class="flex flex-1 flex-col gap-3 p-4">
-                <div class="flex items-start justify-between gap-3">
-                    <div class="min-w-0">
-                        <button
-                            type="button"
-                            class="block max-w-full truncate text-left font-display text-lg font-semibold text-on-surface outline-none ring-primary/60 hover:text-primary focus-visible:ring-2"
-                            on:click=move |_| on_open.run(title_for_open.clone())
-                        >
-                            {title}
-                        </button>
-                        <p class="truncate text-xs text-on-surface-variant">
-                            {if tags.is_empty() { "Game".to_string() } else { tags.join(" · ") }}
-                        </p>
+                <div class="arc-game-card-body">
+                    <div class="arc-game-card-meta-row">
+                        <span class="arc-game-card-publisher">{content.publisher}</span>
+                        {content.price_or_acquisition.map(|label| view! {
+                            <span class="arc-game-card-price">{label}</span>
+                        })}
                     </div>
-                    <p class="shrink-0 text-right text-sm font-semibold text-primary">{price}</p>
+                    {has_metadata.then(|| view! { <span class="arc-game-card-metadata">{metadata}</span> })}
+                    {content.summary.map(|summary| view! { <span class="arc-game-card-summary">{summary}</span> })}
+                    <div class="arc-game-card-statuses">
+                        {content.statuses
+                            .into_iter()
+                            .map(|status| view! {
+                                <StatusChip
+                                    label=status.label
+                                    variant=status.variant
+                                    icon=status.icon
+                                    size=StatusChipSize::Compact
+                                />
+                            })
+                            .collect_view()}
+                    </div>
                 </div>
-                <p class="line-clamp-2 min-h-10 text-sm text-on-surface-variant">{summary}</p>
-                <div class="mt-auto flex items-center justify-between gap-3">
-                    <span class="min-w-0 truncate text-xs text-on-surface-variant">{format!("by {publisher}")}</span>
-                    {move || match (action, on_action) {
-                        (Some(action), Some(callback)) => view! {
-                            <button
-                                type="button"
-                                class="shrink-0 rounded-full bg-primary px-3 py-1.5 text-xs font-semibold text-on-primary outline-none ring-primary/60 hover:brightness-110 focus-visible:ring-2"
-                                on:click=move |_| callback.run(action)
-                            >
-                                {action_label(action, presentation)}
-                            </button>
-                        }.into_any(),
-                        _ => view! { <></> }.into_any(),
-                    }}
-                </div>
-            </div>
+            </button>
+
+            {favorite.zip(on_favorite).map(|(selected, callback)| view! {
+                <button
+                    type="button"
+                    class="arc-game-card-favorite"
+                    class:arc-game-card-favorite-active=selected
+                    aria-label=if selected { "Remove from favorites" } else { "Add to favorites" }
+                    aria-pressed=selected
+                    disabled=disabled
+                    on:click=move |_| callback.run(!selected)
+                >
+                    <span class="material-symbols-outlined" aria-hidden="true">"favorite"</span>
+                </button>
+            })}
+
+            {action.zip(on_action).map(|(action, callback)| view! {
+                <button
+                    type="button"
+                    class="arc-game-card-action"
+                    disabled=disabled || action.disabled
+                    on:click=move |_| callback.run(())
+                >
+                    {action.label}
+                </button>
+            })}
         </article>
     }
+    .into_any()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CardDisplayContent {
     title: String,
     summary: String,
-    image_url: String,
+    image_url: Option<String>,
     badges: Vec<String>,
 }
 
@@ -252,8 +360,7 @@ fn resolve_card_content(
         .cloned();
     let image_url = store_image
         .and_then(|url| valid_cover_url(&[url]))
-        .or_else(|| valid_cover_url(&listing.images))
-        .unwrap_or_else(|| FALLBACK_COVER.to_string());
+        .or_else(|| valid_cover_url(&listing.images));
     let badges = store_page
         .map(|page| {
             page.genres
@@ -306,55 +413,64 @@ fn access_badge(access: GameCardAccess) -> &'static str {
     }
 }
 
-fn access_badge_class(access: GameCardAccess) -> &'static str {
-    match access {
-        GameCardAccess::Public | GameCardAccess::TimedActive => {
-            "rounded-full bg-black/70 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-secondary backdrop-blur"
-        }
-        _ => "rounded-full bg-black/70 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-on-surface backdrop-blur",
-    }
-}
+fn card_statuses(presentation: GameCardPresentation) -> Vec<GameCardStatus> {
+    let mut statuses = vec![GameCardStatus {
+        label: access_badge(presentation.access).to_string(),
+        variant: match presentation.access {
+            GameCardAccess::Paid => StatusChipVariant::Active,
+            GameCardAccess::Owned => StatusChipVariant::Owned,
+            GameCardAccess::Public => StatusChipVariant::Public,
+            GameCardAccess::TimedActive
+            | GameCardAccess::TimedUpcoming
+            | GameCardAccess::TimedExpired => StatusChipVariant::TimedAccess,
+            GameCardAccess::Gated => StatusChipVariant::Gated,
+        },
+        icon: None,
+    }];
 
-fn campaign_badge(campaign: Option<GameCardCampaign>) -> AnyView {
-    let Some(campaign) = campaign else {
-        return view! { <></> }.into_any();
-    };
-    let label = match campaign {
-        GameCardCampaign::Active => "Claim and keep",
-        GameCardCampaign::Upcoming => "Claim upcoming",
-        GameCardCampaign::Ended => "Claim ended",
-        GameCardCampaign::Claimed => "Entitlement claimed",
-    };
-    view! {
-        <span class="rounded-full bg-black/70 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-tertiary backdrop-blur">
-            {label}
-        </span>
+    if let Some(campaign) = presentation.campaign {
+        statuses.push(GameCardStatus {
+            label: match campaign {
+                GameCardCampaign::Active => "Claim and keep",
+                GameCardCampaign::Upcoming => "Claim upcoming",
+                GameCardCampaign::Ended => "Claim ended",
+                GameCardCampaign::Claimed => "Entitlement claimed",
+            }
+            .to_string(),
+            variant: match campaign {
+                GameCardCampaign::Active | GameCardCampaign::Claimed => StatusChipVariant::Success,
+                GameCardCampaign::Upcoming => StatusChipVariant::Pending,
+                GameCardCampaign::Ended => StatusChipVariant::Expired,
+            },
+            icon: None,
+        });
     }
-    .into_any()
-}
 
-fn compatibility_badge(compatibility: PlatformCompatibility) -> AnyView {
-    match compatibility {
-        PlatformCompatibility::Incompatible => view! {
-            <span class="rounded-full bg-error/90 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-on-surface">
-                "Incompatible"
-            </span>
-        }
-        .into_any(),
-        PlatformCompatibility::Compatible => view! {
-            <span class="rounded-full bg-black/60 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-secondary">
-                "Compatible"
-            </span>
-        }
-        .into_any(),
-        PlatformCompatibility::Unknown => view! { <></> }.into_any(),
+    if presentation.compatibility == PlatformCompatibility::Incompatible {
+        statuses.push(GameCardStatus {
+            label: "Incompatible".to_string(),
+            variant: StatusChipVariant::Error,
+            icon: None,
+        });
     }
+    if presentation.installed {
+        statuses.push(GameCardStatus {
+            label: "Installed".to_string(),
+            variant: StatusChipVariant::Installed,
+            icon: None,
+        });
+    }
+    if presentation.owned && presentation.access != GameCardAccess::Owned {
+        statuses.push(GameCardStatus {
+            label: "Owned".to_string(),
+            variant: StatusChipVariant::Owned,
+            icon: None,
+        });
+    }
+    statuses
 }
 
 fn price_label(listing: &GameListing, presentation: GameCardPresentation) -> String {
-    if presentation.access == GameCardAccess::Owned {
-        return "Owned".to_string();
-    }
     if presentation.campaign == Some(GameCardCampaign::Active) {
         return "Free claim".to_string();
     }
@@ -423,7 +539,8 @@ mod tests {
             PlatformCompatibility::Compatible,
             false,
         );
-        assert_eq!(owned.access, GameCardAccess::Owned);
+        assert_eq!(owned.access, GameCardAccess::Paid);
+        assert!(owned.owned);
         assert_eq!(owned.action, Some(GameCardAction::Install));
 
         value.is_owned = false;
@@ -485,7 +602,8 @@ mod tests {
 
         let claimed =
             GameCardPresentation::claim_and_keep(true, PlatformCompatibility::Compatible, false);
-        assert_eq!(claimed.access, GameCardAccess::Owned);
+        assert_eq!(claimed.access, GameCardAccess::Gated);
+        assert!(claimed.owned);
         assert_eq!(claimed.campaign, Some(GameCardCampaign::Claimed));
         assert_eq!(claimed.action, Some(GameCardAction::Install));
 
@@ -542,12 +660,18 @@ mod tests {
         let display = resolve_card_content(&listing, Some(&page), None);
         assert_eq!(display.title, "Store title");
         assert_eq!(display.summary, "Store summary");
-        assert_eq!(display.image_url, "https://cdn.example.org/capsule.webp");
+        assert_eq!(
+            display.image_url.as_deref(),
+            Some("https://cdn.example.org/capsule.webp")
+        );
         assert_eq!(display.badges, vec!["action", "adventure"]);
 
         let fallback = resolve_card_content(&listing, None, None);
         assert_eq!(fallback.title, listing.title);
-        assert_eq!(fallback.image_url, listing.images[0]);
+        assert_eq!(
+            fallback.image_url.as_deref(),
+            Some(listing.images[0].as_str())
+        );
         assert_eq!(fallback.badges, listing.tags);
 
         let authoritative = GameCardPresentation::from_listing(
@@ -561,5 +685,43 @@ mod tests {
             PlatformCompatibility::Incompatible
         );
         assert_eq!(authoritative.action, Some(GameCardAction::ViewDetails));
+    }
+
+    #[test]
+    fn visual_statuses_keep_access_install_and_compatibility_separate() {
+        let presentation = GameCardPresentation {
+            access: GameCardAccess::Public,
+            owned: false,
+            campaign: None,
+            compatibility: PlatformCompatibility::Incompatible,
+            installed: true,
+            action: Some(GameCardAction::ViewDetails),
+        };
+        let statuses = card_statuses(presentation);
+
+        assert!(statuses
+            .iter()
+            .any(|status| status.variant == StatusChipVariant::Public));
+        assert!(statuses
+            .iter()
+            .any(|status| status.variant == StatusChipVariant::Installed));
+        assert!(statuses
+            .iter()
+            .any(|status| status.variant == StatusChipVariant::Error));
+    }
+
+    #[test]
+    fn card_primary_favorite_and_action_controls_remain_separate() {
+        let source = include_str!("game_card.rs");
+        assert!(source.contains("class=\"arc-game-card-main\""));
+        assert!(source.contains("class=\"arc-game-card-favorite\""));
+        assert!(source.contains("class=\"arc-game-card-action\""));
+        assert!(source.contains("aria-label={format!(\"Open details for {title}\")}"));
+    }
+
+    #[test]
+    fn home_and_browse_cards_have_distinct_artwork_density() {
+        assert_eq!(GameCardDensity::Home.class(), "arc-game-card-home");
+        assert_eq!(GameCardDensity::Browse.class(), "arc-game-card-browse");
     }
 }

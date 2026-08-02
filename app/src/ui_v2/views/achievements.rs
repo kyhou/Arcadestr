@@ -2,6 +2,7 @@
 
 use crate::models::EarnedBadgeSummary;
 use crate::tauri_bridge::{fetch_earned_badges, get_cached_earned_badges};
+use crate::ui_v2::components::{artwork_state_from_url, ArtworkRole, GameArtwork};
 use crate::AuthContext;
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
@@ -11,6 +12,7 @@ use wasm_bindgen_futures::spawn_local;
 #[derive(Debug, Clone)]
 enum AchievementsState {
     Loading,
+    SignedOut,
     Empty,
     Error,
     Ready(Vec<EarnedBadgeSummary>),
@@ -63,6 +65,23 @@ mod tests {
 
         assert_eq!(badge_display_name(&badge), "first-clear");
         assert_eq!(profile_visibility_label(&badge), "Not selected for profile");
+    }
+
+    #[test]
+    fn badge_media_rejects_non_public_schemes() {
+        assert_eq!(
+            valid_badge_image_url("https://cdn.example.org/badge.png".into()),
+            Some("https://cdn.example.org/badge.png".into())
+        );
+        assert_eq!(valid_badge_image_url("javascript:alert(1)".into()), None);
+        assert_eq!(
+            valid_badge_image_url("https://[fe80::1]/badge.png".into()),
+            None
+        );
+        assert_eq!(
+            valid_badge_image_url("file:///tmp/private.png".into()),
+            None
+        );
     }
 
     #[test]
@@ -131,10 +150,15 @@ fn should_yield_before_relay_refresh(cached_rendered: bool) -> bool {
 }
 
 fn short_pubkey(pubkey: &str) -> String {
-    if pubkey.len() <= 12 {
+    let chars = pubkey.chars().collect::<Vec<_>>();
+    if chars.len() <= 12 {
         pubkey.to_string()
     } else {
-        format!("{}…{}", &pubkey[..6], &pubkey[pubkey.len() - 6..])
+        format!(
+            "{}…{}",
+            chars[..6].iter().collect::<String>(),
+            chars[chars.len() - 6..].iter().collect::<String>()
+        )
     }
 }
 
@@ -161,6 +185,42 @@ fn badge_image(badge: &EarnedBadgeSummary) -> Option<String> {
         .thumb_url
         .clone()
         .or_else(|| badge.definition.image_url.clone())
+        .and_then(valid_badge_image_url)
+}
+
+fn valid_badge_image_url(value: String) -> Option<String> {
+    let parsed = url::Url::parse(value.trim()).ok()?;
+    if parsed.scheme() != "https" || !is_public_url_host(&parsed) {
+        return None;
+    }
+    Some(value.trim().to_string())
+}
+
+fn is_public_url_host(url: &url::Url) -> bool {
+    let Some(host) = url.host() else {
+        return false;
+    };
+    match host {
+        url::Host::Domain(domain) => !domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(address) => {
+            let octets = address.octets();
+            !(address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_broadcast()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1])))
+        }
+        url::Host::Ipv6(address) => {
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.is_multicast())
+        }
+    }
 }
 
 #[component]
@@ -168,7 +228,14 @@ pub fn AchievementsView() -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let state = RwSignal::new(AchievementsState::Loading);
     let request_generation = RwSignal::new(0_u64);
-    let profile_pubkey = Signal::derive(move || auth.npub.get().unwrap_or_default());
+    let refresh_generation = RwSignal::new(0_u64);
+    let refresh_warning = RwSignal::new(false);
+    let state_profile = RwSignal::new(String::new());
+    let profile_auth = auth.clone();
+    let profile_pubkey = Signal::derive(move || profile_auth.npub.get().unwrap_or_default());
+    let loading_auth = auth.clone();
+    let auth_loading = Signal::derive(move || loading_auth.is_loading.get());
+    let auth_error = Signal::derive(move || auth.error.get().is_some());
 
     #[cfg(feature = "web")]
     {
@@ -177,16 +244,33 @@ pub fn AchievementsView() -> impl IntoView {
 
     #[cfg(not(feature = "web"))]
     Effect::new(move |_| {
+        let _ = refresh_generation.get();
         let generation = next_generation(request_generation.get_untracked());
         request_generation.set(generation);
 
-        let requested_profile_pubkey = profile_pubkey.get();
-        if requested_profile_pubkey.is_empty() {
-            state.set(AchievementsState::Empty);
+        if auth_loading.get() {
+            state.set(AchievementsState::Loading);
             return;
         }
 
-        state.set(AchievementsState::Loading);
+        let requested_profile_pubkey = profile_pubkey.get();
+        if requested_profile_pubkey.is_empty() {
+            state.set(if auth_error.get() {
+                AchievementsState::Error
+            } else {
+                AchievementsState::SignedOut
+            });
+            state_profile.set(String::new());
+            refresh_warning.set(false);
+            return;
+        }
+
+        let account_changed = state_profile.get_untracked() != requested_profile_pubkey;
+        state_profile.set(requested_profile_pubkey.clone());
+        if account_changed || !should_preserve_ready_state(&state.get_untracked()) {
+            state.set(AchievementsState::Loading);
+        }
+        refresh_warning.set(false);
 
         spawn_local(async move {
             let mut cached_rendered = false;
@@ -215,9 +299,14 @@ pub fn AchievementsView() -> impl IntoView {
                     info!(count = badges.len(), "relay refreshed earned achievements");
                     if should_apply_generation(generation, request_generation.get_untracked()) {
                         if badges.is_empty() {
-                            state.set(AchievementsState::Empty);
+                            if should_preserve_ready_state(&state.get_untracked()) {
+                                refresh_warning.set(true);
+                            } else {
+                                state.set(AchievementsState::Empty);
+                            }
                         } else {
                             state.set(AchievementsState::Ready(badges));
+                            refresh_warning.set(false);
                         }
                     }
                 }
@@ -226,6 +315,8 @@ pub fn AchievementsView() -> impl IntoView {
                     if should_apply_generation(generation, request_generation.get_untracked()) {
                         if !should_preserve_ready_state(&state.get_untracked()) {
                             state.set(AchievementsState::Error);
+                        } else {
+                            refresh_warning.set(true);
                         }
                     }
                 }
@@ -253,18 +344,25 @@ pub fn AchievementsView() -> impl IntoView {
                     "Checking the local cache before refreshing from relays.",
                     false,
                 ),
+                AchievementsState::SignedOut => achievement_state_view(
+                    "person_off",
+                    "Sign in to view earned badges",
+                    "NIP-58 awards are resolved for the active public key.",
+                    false,
+                ),
                 AchievementsState::Empty => achievement_state_view(
                     "workspace_premium",
                     achievements_empty_message(),
                     "NIP-58 awards for this profile will appear here when they are found.",
                     false,
                 ),
-                AchievementsState::Error => achievement_state_view(
-                    "cloud_off",
-                    "Achievements unavailable",
-                    achievements_error_message(),
-                    true,
-                ),
+                AchievementsState::Error => view! {
+                    <section class="v2-achievement-state v2-achievement-state-error v2-panel" role="alert">
+                        <span class="material-symbols-outlined" aria-hidden="true">"cloud_off"</span>
+                        <div><h2>"Achievements unavailable"</h2><p>{achievements_error_message()}</p></div>
+                        <button class="v2-btn-secondary" on:click=move |_| refresh_generation.update(|value| *value = value.wrapping_add(1))>"Retry"</button>
+                    </section>
+                }.into_any(),
                 #[cfg(feature = "web")]
                 AchievementsState::WebUnavailable => achievement_state_view(
                     "desktop_windows",
@@ -273,6 +371,10 @@ pub fn AchievementsView() -> impl IntoView {
                     false,
                 ),
                 AchievementsState::Ready(badges) => view! {
+                    <div class="v2-achievement-results">
+                    <Show when=move || refresh_warning.get()>
+                        <div class="v2-achievement-partial"><div role="status"><strong>"Cached badges remain visible"</strong><span>"The relay refresh did not return a usable replacement set."</span></div><button class="v2-btn-secondary" on:click=move |_| refresh_generation.update(|value| *value = value.wrapping_add(1))>"Retry"</button></div>
+                    </Show>
                     <div class="v2-achievement-grid">
                         {badges
                             .into_iter()
@@ -286,14 +388,7 @@ pub fn AchievementsView() -> impl IntoView {
 
                                 view! {
                                     <article class="v2-achievement-card">
-                                        <div class="v2-achievement-art">
-                                            {match image {
-                                                Some(src) => view! { <img src=src alt=name.clone() /> }.into_any(),
-                                                None => view! {
-                                                    <span class="material-symbols-outlined" aria-hidden="true">"workspace_premium"</span>
-                                                }.into_any(),
-                                            }}
-                                        </div>
+                                        <div class="v2-achievement-art"><GameArtwork title=name.clone() state=artwork_state_from_url(image) role=ArtworkRole::Thumbnail /></div>
                                         <div class="v2-achievement-copy">
                                             <p class="v2-store-kicker">"Verified award"</p>
                                             <h2>{name}</h2>
@@ -308,6 +403,7 @@ pub fn AchievementsView() -> impl IntoView {
                                 }
                             })
                             .collect::<Vec<_>>()}
+                    </div>
                     </div>
                 }
                 .into_any(),

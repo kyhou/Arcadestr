@@ -1,5 +1,6 @@
 use leptos::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use tracing::warn;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::campaign_management::{
@@ -14,14 +15,23 @@ use crate::components::DateTimeRangePicker;
 #[cfg(not(feature = "web"))]
 use crate::components::PublishView;
 use crate::invoke_fetch_marketplace_stream;
-use crate::models::{AcquisitionPolicy, GameListing};
-use crate::tauri_bridge::{
-    invoke_discover_campaign_summaries, invoke_discover_campaigns, invoke_publish_campaign,
-    invoke_update_campaign_pointer, CampaignPointerInput, CampaignSummaryListingInput,
-    DiscoverCampaignSummariesRequest, DiscoverCampaignsRequest, DiscoveredCampaign,
-    UpdateCampaignPointerRequest,
+use crate::models::{
+    AcquisitionPolicy, GameListing, ListingSource, StorePageEnrichmentRequest,
+    StorePageEnrichmentState, StorePageListingRef,
 };
-#[cfg(not(feature = "web"))]
+use crate::tauri_bridge::{
+    invoke_discover_campaigns, invoke_enrich_store_pages, invoke_publish_campaign,
+    invoke_update_campaign_pointer, CampaignPointerInput, DiscoverCampaignsRequest,
+    DiscoveredCampaign, UpdateCampaignPointerRequest,
+};
+use crate::ui_v2::components::{
+    artwork_state_from_url, ArtworkRole, GameArtwork, PublisherDestination, PublisherTabItem,
+    PublisherTabs, StatusChip, StatusChipSize, StatusChipVariant,
+};
+use crate::ui_v2::views::marketplace_loader::canonical_listing_coordinate;
+use crate::ui_v2::views::store_page_publish::{
+    publisher_store_page_dirty_coordinates, publisher_store_page_partial_coordinates,
+};
 use crate::ui_v2::views::StorePageEditorView;
 use crate::ui_v2::views::{use_fallback_cover, valid_cover_url};
 
@@ -32,10 +42,576 @@ pub enum PublishViewState {
     EditPublication(GameListing),
     Game(GameListing),
     StorePage(GameListing),
+    Releases(GameListing),
     Campaign {
         listing: GameListing,
         campaign: Option<DiscoveredCampaign>,
     },
+}
+
+#[cfg(not(feature = "web"))]
+fn publisher_destination(state: &PublishViewState) -> PublisherDestination {
+    match state {
+        PublishViewState::Games => PublisherDestination::Dashboard,
+        PublishViewState::NewPublication => PublisherDestination::CreateGame,
+        PublishViewState::EditPublication(_) | PublishViewState::Game(_) => {
+            PublisherDestination::ManageGame
+        }
+        PublishViewState::StorePage(_) => PublisherDestination::StorePage,
+        PublishViewState::Releases(_) => PublisherDestination::Releases,
+        PublishViewState::Campaign { .. } => PublisherDestination::Promotions,
+    }
+}
+
+#[cfg(not(feature = "web"))]
+fn publisher_listing_context(state: &PublishViewState) -> Option<GameListing> {
+    match state {
+        PublishViewState::EditPublication(listing)
+        | PublishViewState::Game(listing)
+        | PublishViewState::StorePage(listing)
+        | PublishViewState::Releases(listing)
+        | PublishViewState::Campaign { listing, .. } => Some(listing.clone()),
+        PublishViewState::Games | PublishViewState::NewPublication => None,
+    }
+}
+
+#[cfg(not(feature = "web"))]
+fn publisher_tab_items(
+    has_listing: bool,
+    signed_in: bool,
+    signer_available: bool,
+) -> Vec<PublisherTabItem> {
+    [
+        (
+            PublisherDestination::Dashboard,
+            signed_in,
+            Some("Sign in as a publisher first."),
+        ),
+        (
+            PublisherDestination::CreateGame,
+            signed_in && signer_available,
+            Some("An available signer is required to create a game."),
+        ),
+        (
+            PublisherDestination::ManageGame,
+            signed_in && has_listing,
+            Some("Select a managed game first."),
+        ),
+        (
+            PublisherDestination::StorePage,
+            signed_in && has_listing,
+            Some("Select a managed game first."),
+        ),
+        (
+            PublisherDestination::Releases,
+            signed_in && has_listing,
+            Some("Select a managed game first."),
+        ),
+        (
+            PublisherDestination::Promotions,
+            signed_in && has_listing,
+            Some("Select a managed game first."),
+        ),
+        (
+            PublisherDestination::Activity,
+            false,
+            Some("Publisher activity is not available."),
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(destination, enabled, unavailable_reason)| PublisherTabItem {
+            destination,
+            enabled,
+            unavailable_reason: (!enabled).then_some(unavailable_reason).flatten(),
+        },
+    )
+    .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublisherSignerState {
+    Available,
+    Connecting,
+    Unavailable,
+    Unknown,
+}
+
+fn publisher_signer_state(
+    publisher_npub: Option<&str>,
+    active_account: Option<&crate::StoredAccount>,
+    connection_status: &str,
+) -> PublisherSignerState {
+    let Some(publisher_npub) = publisher_npub else {
+        return PublisherSignerState::Unavailable;
+    };
+    let Some(account) = active_account.filter(|account| account.npub == publisher_npub) else {
+        return PublisherSignerState::Unknown;
+    };
+    match account.signing_mode.to_ascii_lowercase().as_str() {
+        "local" | "nsec" | "debug" => PublisherSignerState::Available,
+        "nip46" | "remote" if connection_status.eq_ignore_ascii_case("connected") => {
+            PublisherSignerState::Available
+        }
+        "nip46" | "remote" if connection_status.eq_ignore_ascii_case("connecting") => {
+            PublisherSignerState::Connecting
+        }
+        "nip46" | "remote" | "readonly" | "read_only" | "nip07" => {
+            PublisherSignerState::Unavailable
+        }
+        _ => PublisherSignerState::Unknown,
+    }
+}
+
+fn signer_can_publish(state: PublisherSignerState) -> bool {
+    state == PublisherSignerState::Available
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublisherDashboardState {
+    SignedOut,
+    Loading,
+    Empty,
+    Error,
+    Partial,
+    Ready,
+}
+
+fn publisher_dashboard_state(
+    account_loading: bool,
+    signed_in: bool,
+    loading: bool,
+    has_listings: bool,
+    has_error: bool,
+) -> PublisherDashboardState {
+    if account_loading && !signed_in {
+        PublisherDashboardState::Loading
+    } else if !signed_in {
+        PublisherDashboardState::SignedOut
+    } else if loading && !has_listings {
+        PublisherDashboardState::Loading
+    } else if has_error && has_listings {
+        PublisherDashboardState::Partial
+    } else if has_error {
+        PublisherDashboardState::Error
+    } else if has_listings {
+        PublisherDashboardState::Ready
+    } else {
+        PublisherDashboardState::Empty
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ListingValidityState {
+    Valid,
+    Invalid(Vec<String>),
+}
+
+fn is_valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+fn listing_validity(listing: &GameListing) -> ListingValidityState {
+    let mut reasons = Vec::new();
+    let id = listing.id.trim();
+    if id.is_empty()
+        || id.len() > 64
+        || !id.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+    {
+        reasons.push("Game identifier is missing or invalid.".to_string());
+    }
+    if listing.title.trim().is_empty() || listing.title.chars().count() > 100 {
+        reasons.push("Title is missing or exceeds the supported length.".to_string());
+    }
+    if listing.description.trim().is_empty() || listing.description.chars().count() > 2000 {
+        reasons.push("Description is missing or exceeds the supported length.".to_string());
+    }
+    if listing.source != ListingSource::Nip99Listing {
+        reasons.push("The loaded record is not a current NIP-99 listing.".to_string());
+    }
+    if publisher_hex(&listing.publisher_npub).is_none() {
+        reasons.push("The signed publisher public key is invalid.".to_string());
+    }
+    if listing
+        .event_id
+        .as_deref()
+        .map(str::is_empty)
+        .unwrap_or(true)
+    {
+        reasons.push("A confirmed listing event identifier is unavailable.".to_string());
+    }
+    if let AcquisitionPolicy::TimedAccess { starts_at, ends_at } = listing.acquisition {
+        if starts_at >= ends_at {
+            reasons.push("Timed access must end after it starts.".to_string());
+        }
+    }
+    if listing.has_declared_price() {
+        let parts = listing.lud16.split('@').collect::<Vec<_>>();
+        if parts.len() != 2 || parts.iter().any(|part| part.trim().is_empty()) {
+            reasons.push("Priced access requires a valid Lightning address.".to_string());
+        }
+    }
+    if reasons.is_empty() {
+        ListingValidityState::Valid
+    } else {
+        ListingValidityState::Invalid(reasons)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReleaseSummaryState {
+    NotConfigured,
+    Current { version: String },
+    Invalid(Vec<String>),
+}
+
+fn release_summary_state(listing: &GameListing) -> ReleaseSummaryState {
+    let version = listing
+        .specs
+        .iter()
+        .find(|(key, _)| key == "version")
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let file_hash = listing
+        .specs
+        .iter()
+        .find(|(key, _)| key == "file_hash")
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let has_distribution = listing.nip94_event_id.is_some()
+        || listing.specs.iter().any(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "server" | "fulfillment_authorization" | "file_hash" | "version"
+            )
+        });
+    if !has_distribution {
+        return ReleaseSummaryState::NotConfigured;
+    }
+    let mut reasons = Vec::new();
+    if version.is_none() {
+        reasons.push("Managed distribution is missing a current version.".to_string());
+    }
+    match file_hash.as_deref() {
+        Some(value) if is_valid_sha256(value) => {}
+        Some(_) => reasons.push("The current build SHA-256 is invalid.".to_string()),
+        None => {
+            reasons.push("Managed distribution is missing a current build SHA-256.".to_string())
+        }
+    }
+    if reasons.is_empty() {
+        ReleaseSummaryState::Current {
+            version: version.unwrap_or_default(),
+        }
+    } else {
+        ReleaseSummaryState::Invalid(reasons)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StorePageSummaryState {
+    Loading,
+    Published,
+    NotAssociated,
+    NotFound,
+    Invalid,
+    Unavailable,
+}
+
+fn store_page_summary_state(
+    state: Option<&StorePageEnrichmentState>,
+    loading: bool,
+) -> StorePageSummaryState {
+    match state {
+        Some(StorePageEnrichmentState::Enriched(_)) => StorePageSummaryState::Published,
+        Some(StorePageEnrichmentState::NotAssociated) => StorePageSummaryState::NotAssociated,
+        Some(StorePageEnrichmentState::NotFound) => StorePageSummaryState::NotFound,
+        Some(StorePageEnrichmentState::Invalid) => StorePageSummaryState::Invalid,
+        Some(StorePageEnrichmentState::Unavailable) => StorePageSummaryState::Unavailable,
+        None if loading => StorePageSummaryState::Loading,
+        None => StorePageSummaryState::Unavailable,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CampaignDashboardState {
+    Loading,
+    Resolved(Vec<DiscoveredCampaign>),
+    Unavailable,
+}
+
+fn campaign_summary_label(state: &CampaignDashboardState) -> String {
+    match state {
+        CampaignDashboardState::Loading => "Campaigns: resolving...".to_string(),
+        CampaignDashboardState::Unavailable => "Campaigns: unavailable".to_string(),
+        CampaignDashboardState::Resolved(campaigns) if campaigns.is_empty() => {
+            "Campaigns: none resolved".to_string()
+        }
+        CampaignDashboardState::Resolved(campaigns) => {
+            let active = campaigns
+                .iter()
+                .filter(|campaign| campaign.classification == "active")
+                .count();
+            let upcoming = campaigns
+                .iter()
+                .filter(|campaign| campaign.classification == "upcoming")
+                .count();
+            let ended = campaigns
+                .iter()
+                .filter(|campaign| campaign.classification == "ended")
+                .count();
+            let cancelled = campaigns
+                .iter()
+                .filter(|campaign| campaign.classification == "cancelled")
+                .count();
+            format!("Campaigns: {active} active · {upcoming} upcoming · {ended} ended · {cancelled} cancelled")
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublisherAttentionItem {
+    listing_id: Option<String>,
+    game_title: Option<String>,
+    reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublisherAttentionGroup {
+    listing_id: Option<String>,
+    title: String,
+    reasons: Vec<String>,
+}
+
+fn group_attention_items(items: Vec<PublisherAttentionItem>) -> Vec<PublisherAttentionGroup> {
+    let mut groups = Vec::<PublisherAttentionGroup>::new();
+    for item in items {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.listing_id == item.listing_id)
+        {
+            group.reasons.push(item.reason);
+        } else {
+            groups.push(PublisherAttentionGroup {
+                listing_id: item.listing_id,
+                title: item
+                    .game_title
+                    .unwrap_or_else(|| "Publisher account".to_string()),
+                reasons: vec![item.reason],
+            });
+        }
+    }
+    groups
+}
+
+fn listing_attention_items(
+    listing: &GameListing,
+    store_page: StorePageSummaryState,
+    release: &ReleaseSummaryState,
+    campaign: &CampaignDashboardState,
+    has_local_partial: bool,
+) -> Vec<PublisherAttentionItem> {
+    let mut reasons = match listing_validity(listing) {
+        ListingValidityState::Valid => Vec::new(),
+        ListingValidityState::Invalid(reasons) => reasons,
+    };
+    if !listing.images.is_empty() && valid_cover_url(&listing.images).is_none() {
+        reasons.push("Configured artwork cannot be displayed from a supported URL.".to_string());
+    }
+    match store_page {
+        StorePageSummaryState::NotAssociated => {
+            reasons.push("Store Page is not associated with this listing.".to_string())
+        }
+        StorePageSummaryState::NotFound => {
+            reasons.push("The associated Store Page could not be resolved.".to_string())
+        }
+        StorePageSummaryState::Invalid => {
+            reasons.push("The associated Store Page is invalid.".to_string())
+        }
+        StorePageSummaryState::Loading
+        | StorePageSummaryState::Published
+        | StorePageSummaryState::Unavailable => {}
+    }
+    if let ReleaseSummaryState::Invalid(release_reasons) = release {
+        reasons.extend(release_reasons.iter().cloned());
+    }
+    if let CampaignDashboardState::Resolved(campaigns) = campaign {
+        if campaigns
+            .iter()
+            .any(|campaign| campaign.classification == "invalid")
+        {
+            reasons.push("At least one resolved campaign is invalid or incomplete.".to_string());
+        }
+        if campaigns
+            .iter()
+            .any(|campaign| !matches!(campaign.mode.as_str(), "" | "claim" | "claim_and_keep"))
+        {
+            reasons.push("At least one campaign uses an unsupported configuration.".to_string());
+        }
+        if campaigns.iter().any(|campaign| campaign.event_id.is_none()) {
+            reasons.push("At least one campaign publication event is unresolved.".to_string());
+        }
+    }
+    if has_local_partial {
+        reasons.push(
+            "Store Page publication is incomplete in this session and has retryable work."
+                .to_string(),
+        );
+    }
+    reasons
+        .into_iter()
+        .map(|reason| PublisherAttentionItem {
+            listing_id: Some(listing.id.clone()),
+            game_title: Some(listing.title.clone()),
+            reason,
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PublisherDashboardCounts {
+    loaded_listings: usize,
+    local_store_page_drafts: usize,
+    resolved_active_campaigns: usize,
+    attention_items: usize,
+    campaigns_complete_for_loaded_listings: bool,
+}
+
+fn dashboard_counts(
+    listings: &[GameListing],
+    dirty_coordinates: &HashSet<String>,
+    campaign_states: &HashMap<String, CampaignDashboardState>,
+    attention_items: &[PublisherAttentionItem],
+) -> PublisherDashboardCounts {
+    let mut resolved_active_campaigns = 0;
+    let campaigns_complete_for_loaded_listings =
+        listings
+            .iter()
+            .all(|listing| match campaign_states.get(&listing.id) {
+                Some(CampaignDashboardState::Resolved(campaigns)) => {
+                    resolved_active_campaigns += campaigns
+                        .iter()
+                        .filter(|campaign| campaign.classification == "active")
+                        .count();
+                    true
+                }
+                _ => false,
+            });
+    PublisherDashboardCounts {
+        loaded_listings: listings.len(),
+        local_store_page_drafts: dirty_coordinates.len(),
+        resolved_active_campaigns,
+        attention_items: attention_items.len(),
+        campaigns_complete_for_loaded_listings,
+    }
+}
+
+fn short_identifier(value: &str) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() <= 24 {
+        value.to_string()
+    } else {
+        format!(
+            "{}…{}",
+            characters[..12].iter().collect::<String>(),
+            characters[characters.len() - 8..]
+                .iter()
+                .collect::<String>()
+        )
+    }
+}
+
+fn store_page_label(state: &StorePageSummaryState) -> &'static str {
+    match state {
+        StorePageSummaryState::Loading => "Store Page resolving",
+        StorePageSummaryState::Published => "Store Page published",
+        StorePageSummaryState::NotAssociated => "Store Page not associated",
+        StorePageSummaryState::NotFound => "Store Page missing",
+        StorePageSummaryState::Invalid => "Store Page invalid",
+        StorePageSummaryState::Unavailable => "Store Page unavailable",
+    }
+}
+
+fn release_label(state: &ReleaseSummaryState) -> String {
+    match state {
+        ReleaseSummaryState::NotConfigured => "Current build not configured".to_string(),
+        ReleaseSummaryState::Current { version } => format!("Current build {version}"),
+        ReleaseSummaryState::Invalid(_) => "Current build needs attention".to_string(),
+    }
+}
+
+fn release_variant(state: &ReleaseSummaryState) -> StatusChipVariant {
+    match state {
+        ReleaseSummaryState::NotConfigured => StatusChipVariant::Unavailable,
+        ReleaseSummaryState::Current { .. } => StatusChipVariant::Verified,
+        ReleaseSummaryState::Invalid(_) => StatusChipVariant::Warning,
+    }
+}
+
+fn campaign_mode_label(mode: &str) -> String {
+    match mode {
+        "" | "claim" | "claim_and_keep" => "Claim and keep".to_string(),
+        value => format!("Unsupported configuration: {}", short_identifier(value)),
+    }
+}
+
+fn render_campaign_dashboard_summaries(
+    listings: Vec<GameListing>,
+    states: HashMap<String, CampaignDashboardState>,
+) -> AnyView {
+    let loading = states
+        .values()
+        .any(|state| matches!(state, CampaignDashboardState::Loading));
+    let unavailable = states
+        .values()
+        .any(|state| matches!(state, CampaignDashboardState::Unavailable));
+    let mut rows = Vec::new();
+    for listing in listings {
+        let Some(CampaignDashboardState::Resolved(campaigns)) = states.get(&listing.id) else {
+            continue;
+        };
+        for campaign in campaigns {
+            let pointer_state = if listing
+                .campaigns
+                .iter()
+                .any(|pointer| pointer.root_event_id == campaign.root_event_id)
+            {
+                "Listing pointer present"
+            } else {
+                "Listing pointer missing"
+            };
+            rows.push(view! {
+                <article class="v2-publisher-campaign-summary">
+                    <div><strong>{short_identifier(&campaign.campaign_id)}</strong><span>{listing.title.clone()}</span></div>
+                    <dl>
+                        <div><dt>"Type"</dt><dd>{campaign_mode_label(&campaign.mode)}</dd></div>
+                        <div><dt>"State"</dt><dd>{campaign_status(&campaign.classification)}</dd></div>
+                        <div><dt>"Start"</dt><dd>{format_unix(campaign.starts_at)}</dd></div>
+                        <div><dt>"End"</dt><dd>{format_unix(campaign.ends_at)}</dd></div>
+                        <div><dt>"Listing"</dt><dd>{pointer_state}</dd></div>
+                    </dl>
+                </article>
+            });
+        }
+    }
+    if rows.is_empty() && loading {
+        return view! { <p class="v2-publisher-summary-state" role="status">"Resolving campaigns for loaded authored listings..."</p> }.into_any();
+    }
+    if rows.is_empty() && unavailable {
+        return view! { <p class="v2-publisher-summary-state v2-publisher-summary-error" role="alert">"Campaign state is unavailable for the loaded authored listings. No empty result is inferred."</p> }.into_any();
+    }
+    if rows.is_empty() {
+        return view! { <p class="v2-publisher-summary-state">"No campaigns were resolved for the loaded authored listings."</p> }.into_any();
+    }
+    view! {
+        <div>
+            {(loading || unavailable).then(|| view! { <p class="v2-publisher-scope-warning" role="status">"Campaign summaries are partial; unresolved listings are not counted as having no campaigns."</p> })}
+            <div class="v2-publisher-campaign-summary-list">{rows}</div>
+        </div>
+    }
+    .into_any()
 }
 
 #[component]
@@ -43,8 +619,9 @@ pub enum PublishViewState {
 pub fn PublishV2View(
     state: PublishViewState,
     on_navigate: Callback<PublishViewState>,
+    on_open_listing: Callback<GameListing>,
 ) -> impl IntoView {
-    let _ = (state, on_navigate);
+    let _ = (state, on_navigate, on_open_listing);
     view! {
         <section class="v2-publisher-studio v2-publisher-unavailable" aria-labelledby="publisher-unavailable-title">
             <p class="v2-publisher-kicker">"Publisher studio"</p>
@@ -59,32 +636,76 @@ pub fn PublishV2View(
 pub fn PublishV2View(
     state: PublishViewState,
     on_navigate: Callback<PublishViewState>,
+    on_open_listing: Callback<GameListing>,
 ) -> impl IntoView {
+    let auth = use_context::<crate::AuthContext>().expect("AuthContext not provided");
+    let active_destination = publisher_destination(&state);
+    let listing_context = publisher_listing_context(&state);
+    let active_tab = Signal::derive(move || active_destination);
+    let tab_context = listing_context.clone();
+    let tab_navigate = on_navigate.clone();
+    let on_select_tab = Callback::new(move |destination| match destination {
+        PublisherDestination::Dashboard => tab_navigate.run(PublishViewState::Games),
+        PublisherDestination::CreateGame => tab_navigate.run(PublishViewState::NewPublication),
+        PublisherDestination::ManageGame => {
+            if let Some(listing) = tab_context.clone() {
+                tab_navigate.run(PublishViewState::Game(listing));
+            }
+        }
+        PublisherDestination::StorePage => {
+            if let Some(listing) = tab_context.clone() {
+                tab_navigate.run(PublishViewState::StorePage(listing));
+            }
+        }
+        PublisherDestination::Releases => {
+            if let Some(listing) = tab_context.clone() {
+                tab_navigate.run(PublishViewState::Releases(listing));
+            }
+        }
+        PublisherDestination::Promotions => {
+            if let Some(listing) = tab_context.clone() {
+                tab_navigate.run(PublishViewState::Campaign {
+                    listing,
+                    campaign: None,
+                });
+            }
+        }
+        PublisherDestination::Activity => {}
+    });
+
     view! {
-        {match state {
-            PublishViewState::Games => view! {
-                <PublishedGamesView on_navigate={on_navigate.clone()} />
-            }.into_any(),
-            PublishViewState::NewPublication => view! {
-                <PublishView
-                    on_back=Callback::new({
-                        let on_navigate = on_navigate.clone();
-                        move |_| on_navigate.run(PublishViewState::Games)
-                    })
-                    on_published=Callback::new({
-                        let on_navigate = on_navigate.clone();
-                        move |listing| on_navigate.run(PublishViewState::Game(listing))
-                    })
-                />
-            }.into_any(),
-            PublishViewState::EditPublication(listing) => {
-                let listing_for_back = listing.clone();
+        <div class="arc-publisher-shell">
+            {move || {
+                let publisher = auth.npub.get();
+                let signer = publisher_signer_state(
+                    publisher.as_deref(),
+                    auth.active_account.get().as_ref(),
+                    &auth.connection_status.get(),
+                );
                 view! {
+                    <PublisherTabs
+                        items=publisher_tab_items(
+                            listing_context.is_some(),
+                            publisher.is_some(),
+                            signer_can_publish(signer),
+                        )
+                        active=active_tab
+                        on_select=on_select_tab
+                    />
+                }
+            }}
+            {match state {
+                PublishViewState::Games => view! {
+                    <PublishedGamesView
+                        on_navigate={on_navigate.clone()}
+                        on_open_listing=on_open_listing
+                    />
+                }.into_any(),
+                PublishViewState::NewPublication => view! {
                     <PublishView
-                        listing=listing
                         on_back=Callback::new({
                             let on_navigate = on_navigate.clone();
-                            move |_| on_navigate.run(PublishViewState::Game(listing_for_back.clone()))
+                            move |_| on_navigate.run(PublishViewState::Games)
                         })
                         on_published=Callback::new({
                             let on_navigate = on_navigate.clone();
@@ -92,56 +713,96 @@ pub fn PublishV2View(
                         })
                     />
                 }.into_any()
-            }
-            PublishViewState::Game(listing) => view! {
-                <GameManagementView
-                    listing=listing
-                    on_back=Callback::new({ let on_navigate = on_navigate.clone(); move |_| on_navigate.run(PublishViewState::Games) })
-                    on_navigate={on_navigate.clone()}
-                />
-            }.into_any(),
-            PublishViewState::StorePage(listing) => view! {
-                <StorePageEditorView
-                    listing=listing.clone()
-                    on_back=Callback::new({ let on_navigate = on_navigate.clone(); let listing = listing.clone(); move |_| on_navigate.run(PublishViewState::Game(listing.clone())) })
-                    on_saved=Callback::new({ let on_navigate = on_navigate.clone(); move |listing| on_navigate.run(PublishViewState::Game(listing)) })
-                />
-            }.into_any(),
-            PublishViewState::Campaign { listing, campaign } => view! {
-                <CampaignEditorView
-                    listing=listing.clone()
-                    campaign=campaign
-                    on_back=Callback::new({ let on_navigate = on_navigate.clone(); let listing = listing.clone(); move |_| on_navigate.run(PublishViewState::Game(listing.clone())) })
-                    on_saved=Callback::new({ let on_navigate = on_navigate.clone(); move |listing| on_navigate.run(PublishViewState::Game(listing)) })
-                />
-            }.into_any(),
-        }}
+                ,
+                PublishViewState::EditPublication(listing) => {
+                    let listing_for_back = listing.clone();
+                    view! {
+                        <PublishView
+                            listing=listing
+                            on_back=Callback::new({
+                                let on_navigate = on_navigate.clone();
+                                move |_| on_navigate.run(PublishViewState::Game(listing_for_back.clone()))
+                            })
+                            on_published=Callback::new({
+                                let on_navigate = on_navigate.clone();
+                                move |listing| on_navigate.run(PublishViewState::Game(listing))
+                            })
+                        />
+                    }.into_any()
+                }
+                PublishViewState::Game(listing) => view! {
+                    <GameManagementView
+                        listing=listing
+                        on_back=Callback::new({ let on_navigate = on_navigate.clone(); move |_| on_navigate.run(PublishViewState::Games) })
+                        on_navigate={on_navigate.clone()}
+                    />
+                }.into_any(),
+                PublishViewState::StorePage(listing) => view! {
+                    <StorePageEditorView
+                        listing=listing.clone()
+                        on_back=Callback::new({ let on_navigate = on_navigate.clone(); let listing = listing.clone(); move |_| on_navigate.run(PublishViewState::Game(listing.clone())) })
+                        on_saved=Callback::new({ let on_navigate = on_navigate.clone(); move |listing| on_navigate.run(PublishViewState::Game(listing)) })
+                    />
+                }.into_any(),
+                PublishViewState::Releases(listing) => view! {
+                    <PublisherReleasesView
+                        listing=listing.clone()
+                        on_back=Callback::new({ let on_navigate = on_navigate.clone(); move |_| on_navigate.run(PublishViewState::Game(listing.clone())) })
+                        on_edit=Callback::new({ let on_navigate = on_navigate.clone(); move |listing| on_navigate.run(PublishViewState::EditPublication(listing)) })
+                    />
+                }.into_any(),
+                PublishViewState::Campaign { listing, campaign } => view! {
+                    <CampaignEditorView
+                        listing=listing.clone()
+                        campaign=campaign
+                        on_back=Callback::new({ let on_navigate = on_navigate.clone(); let listing = listing.clone(); move |_| on_navigate.run(PublishViewState::Game(listing.clone())) })
+                        on_saved=Callback::new({ let on_navigate = on_navigate.clone(); move |listing| on_navigate.run(PublishViewState::Game(listing)) })
+                    />
+                }.into_any(),
+            }}
+        </div>
     }
 }
 
 #[component]
-fn PublishedGamesView(on_navigate: Callback<PublishViewState>) -> impl IntoView {
+fn PublishedGamesView(
+    on_navigate: Callback<PublishViewState>,
+    on_open_listing: Callback<GameListing>,
+) -> impl IntoView {
     let auth = use_context::<crate::AuthContext>().expect("AuthContext not provided");
     let listings = RwSignal::new(Vec::<GameListing>::new());
     let loading = RwSignal::new(true);
-    let error = RwSignal::new(None::<String>);
-    let campaign_counts = RwSignal::new(HashMap::<String, (usize, usize)>::new());
-    let campaign_counts_loading = RwSignal::new(false);
-    let campaign_counts_error = RwSignal::new(false);
+    let refreshing = RwSignal::new(false);
+    let load_error = RwSignal::new(false);
+    let loaded_publisher = RwSignal::new(None::<String>);
     let listing_generation = RwSignal::new(0_u64);
     let listing_request = RwSignal::new(None::<(String, u64)>);
-    let summary_generation = RwSignal::new(0_u64);
-    let summary_fingerprint = RwSignal::new(String::new());
+    let campaign_states = RwSignal::new(HashMap::<String, CampaignDashboardState>::new());
+    let campaign_generation = RwSignal::new(0_u64);
+    let campaign_fingerprint = RwSignal::new(String::new());
+    let store_page_states = RwSignal::new(HashMap::<String, StorePageEnrichmentState>::new());
+    // Start resolving so an unresolved Store Page is never rendered as "unavailable"
+    // before the enrichment request has had a chance to run.
+    let store_page_loading = RwSignal::new(true);
+    let store_page_generation = RwSignal::new(0_u64);
+    let store_page_fingerprint = RwSignal::new(String::new());
+    let dirty_store_page_coordinates = RwSignal::new(HashSet::<String>::new());
+    let partial_store_page_coordinates = RwSignal::new(HashSet::<String>::new());
 
     let auth_for_refresh = auth.clone();
     let refresh = Callback::new(move |()| {
         let Some(publisher) = auth_for_refresh.npub.get() else {
             listing_generation.update(|value| *value = value.wrapping_add(1));
             listing_request.set(None);
+            loaded_publisher.set(None);
             listings.set(Vec::new());
-            campaign_counts.set(HashMap::new());
+            campaign_states.set(HashMap::new());
+            store_page_states.set(HashMap::new());
+            dirty_store_page_coordinates.set(HashSet::new());
+            partial_store_page_coordinates.set(HashSet::new());
             loading.set(false);
-            error.set(Some("Authenticate as the publisher to manage games".into()));
+            refreshing.set(false);
+            load_error.set(false);
             return;
         };
         if listing_request
@@ -154,8 +815,19 @@ fn PublishedGamesView(on_navigate: Callback<PublishViewState>) -> impl IntoView 
         listing_generation.update(|value| *value = value.wrapping_add(1));
         let request_generation = listing_generation.get_untracked();
         listing_request.set(Some((publisher.clone(), request_generation)));
-        loading.set(true);
-        error.set(None);
+        let account_changed = loaded_publisher.get_untracked().as_deref() != Some(&publisher);
+        if account_changed {
+            loaded_publisher.set(Some(publisher.clone()));
+            listings.set(Vec::new());
+            campaign_states.set(HashMap::new());
+            store_page_states.set(HashMap::new());
+            dirty_store_page_coordinates.set(HashSet::new());
+            partial_store_page_coordinates.set(HashSet::new());
+        }
+        let initial_load = listings.get_untracked().is_empty();
+        loading.set(initial_load);
+        refreshing.set(!initial_load);
+        load_error.set(false);
         let listings_signal = listings;
         let auth_for_request = auth_for_refresh.clone();
         spawn_local(async move {
@@ -181,6 +853,7 @@ fn PublishedGamesView(on_navigate: Callback<PublishViewState>) -> impl IntoView 
                     let items = received_for_complete.get_untracked();
                     listings_signal.set(current_user_listings(items, &publisher_for_complete));
                     loading.set(false);
+                    refreshing.set(false);
                     listing_request.set(None);
                 }),
             )
@@ -202,6 +875,7 @@ fn PublishedGamesView(on_navigate: Callback<PublishViewState>) -> impl IntoView 
                             .set(current_user_listings(received.get_untracked(), &publisher));
                         loading.set(false);
                     }
+                    refreshing.set(false);
                     listing_request.set(None);
                 }
                 Err(fetch_error) => {
@@ -213,8 +887,10 @@ fn PublishedGamesView(on_navigate: Callback<PublishViewState>) -> impl IntoView 
                     ) {
                         return;
                     }
-                    error.set(Some(fetch_error));
+                    warn!("publisher listing refresh failed: {}", fetch_error);
+                    load_error.set(true);
                     loading.set(false);
+                    refreshing.set(false);
                     listing_request.set(None);
                 }
             }
@@ -222,18 +898,44 @@ fn PublishedGamesView(on_navigate: Callback<PublishViewState>) -> impl IntoView 
     });
 
     Effect::new(move |_| refresh.run(()));
+
+    let auth_for_local_state = auth.clone();
     Effect::new(move |_| {
         let items = listings.get();
-        let Some(publisher_npub) = auth.npub.get() else {
-            summary_generation.update(|value| *value = value.wrapping_add(1));
-            summary_fingerprint.set(String::new());
-            campaign_counts.set(HashMap::new());
-            campaign_counts_loading.set(false);
+        let Some(publisher_npub) = auth_for_local_state.npub.get() else {
+            dirty_store_page_coordinates.set(HashSet::new());
+            partial_store_page_coordinates.set(HashSet::new());
+            return;
+        };
+        let coordinates = items
+            .iter()
+            .filter_map(canonical_listing_coordinate)
+            .collect::<HashSet<_>>();
+        dirty_store_page_coordinates.set(
+            publisher_store_page_dirty_coordinates(&publisher_npub)
+                .into_iter()
+                .filter(|coordinate| coordinates.contains(coordinate))
+                .collect(),
+        );
+        partial_store_page_coordinates.set(
+            publisher_store_page_partial_coordinates(&publisher_npub)
+                .into_iter()
+                .filter(|coordinate| coordinates.contains(coordinate))
+                .collect(),
+        );
+    });
+
+    let auth_for_campaigns = auth.clone();
+    Effect::new(move |_| {
+        let items = listings.get();
+        let Some(publisher_npub) = auth_for_campaigns.npub.get() else {
+            campaign_generation.update(|value| *value = value.wrapping_add(1));
+            campaign_fingerprint.set(String::new());
+            campaign_states.set(HashMap::new());
             return;
         };
         if items.is_empty() {
-            campaign_counts.set(HashMap::new());
-            campaign_counts_loading.set(false);
+            campaign_states.set(HashMap::new());
             return;
         }
         let fingerprint = format!(
@@ -241,118 +943,425 @@ fn PublishedGamesView(on_navigate: Callback<PublishViewState>) -> impl IntoView 
             publisher_npub,
             items
                 .iter()
-                .map(|listing| listing.id.as_str())
+                .map(|listing| {
+                    format!(
+                        "{}:{}:{}",
+                        listing.id,
+                        listing.event_id.as_deref().unwrap_or_default(),
+                        listing
+                            .campaigns
+                            .iter()
+                            .map(|pointer| format!(
+                                "{}@{}",
+                                pointer.root_event_id,
+                                pointer.relay_hint.as_deref().unwrap_or_default()
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("|")
         );
-        if fingerprint == summary_fingerprint.get_untracked() {
+        if fingerprint == campaign_fingerprint.get_untracked() {
             return;
         }
-        summary_fingerprint.set(fingerprint);
-        summary_generation.update(|value| *value = value.wrapping_add(1));
-        let request_generation = summary_generation.get_untracked();
-        campaign_counts_loading.set(true);
-        campaign_counts_error.set(false);
-        let request = DiscoverCampaignSummariesRequest {
-            publisher_npub: publisher_npub.clone(),
-            listings: items
-                .into_iter()
-                .map(|listing| CampaignSummaryListingInput {
-                    listing_id: listing.id,
-                })
+        campaign_fingerprint.set(fingerprint);
+        campaign_generation.update(|value| *value = value.wrapping_add(1));
+        let request_generation = campaign_generation.get_untracked();
+        campaign_states.set(
+            items
+                .iter()
+                .map(|listing| (listing.id.clone(), CampaignDashboardState::Loading))
                 .collect(),
+        );
+        for listing in items {
+            let listing_id = listing.id.clone();
+            let request = DiscoverCampaignsRequest {
+                publisher_npub: publisher_npub.clone(),
+                listing_id: listing_id.clone(),
+                pointers: listing
+                    .campaigns
+                    .into_iter()
+                    .map(|pointer| CampaignPointerInput {
+                        root_event_id: pointer.root_event_id,
+                        relay_hint: pointer.relay_hint,
+                    })
+                    .collect(),
+            };
+            let publisher_for_request = publisher_npub.clone();
+            let auth_for_request = auth_for_campaigns.clone();
+            spawn_local(async move {
+                let result = invoke_discover_campaigns(request).await;
+                if !accepts_account_response(
+                    auth_for_request.npub.get_untracked().as_deref(),
+                    &publisher_for_request,
+                    campaign_generation.get_untracked(),
+                    request_generation,
+                ) {
+                    return;
+                }
+                campaign_states.update(|states| {
+                    states.insert(
+                        listing_id,
+                        result
+                            .map(CampaignDashboardState::Resolved)
+                            .unwrap_or(CampaignDashboardState::Unavailable),
+                    );
+                });
+            });
+        }
+    });
+
+    let auth_for_store_pages = auth.clone();
+    Effect::new(move |_| {
+        let items = listings.get();
+        let Some(publisher_npub) = auth_for_store_pages.npub.get() else {
+            store_page_generation.update(|value| *value = value.wrapping_add(1));
+            store_page_fingerprint.set(String::new());
+            store_page_states.set(HashMap::new());
+            store_page_loading.set(false);
+            return;
         };
-        let auth_for_request = auth.clone();
+        let references = items
+            .iter()
+            .filter_map(|listing| {
+                Some(StorePageListingRef {
+                    listing_coordinate: canonical_listing_coordinate(listing)?,
+                    listing_event_id: listing.event_id.clone()?,
+                })
+            })
+            .take(64)
+            .collect::<Vec<_>>();
+        let fingerprint = format!(
+            "{}:{}",
+            publisher_npub,
+            references
+                .iter()
+                .map(|listing| format!(
+                    "{}:{}",
+                    listing.listing_coordinate, listing.listing_event_id
+                ))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        if fingerprint == store_page_fingerprint.get_untracked() {
+            return;
+        }
+        store_page_fingerprint.set(fingerprint);
+        store_page_generation.update(|value| *value = value.wrapping_add(1));
+        let request_generation = store_page_generation.get_untracked();
+        store_page_states.set(HashMap::new());
+        if references.is_empty() {
+            store_page_loading.set(false);
+            return;
+        }
+        store_page_loading.set(true);
+        let expected = references
+            .iter()
+            .map(|listing| {
+                (
+                    listing.listing_coordinate.clone(),
+                    listing.listing_event_id.clone(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let request = StorePageEnrichmentRequest {
+            generation: request_generation,
+            listings: references,
+        };
+        let auth_for_request = auth_for_store_pages.clone();
         spawn_local(async move {
-            let result = invoke_discover_campaign_summaries(request).await;
+            let result = invoke_enrich_store_pages(request).await;
             if !accepts_account_response(
                 auth_for_request.npub.get_untracked().as_deref(),
                 &publisher_npub,
-                summary_generation.get_untracked(),
+                store_page_generation.get_untracked(),
                 request_generation,
             ) {
                 return;
             }
+            let mut states = expected
+                .keys()
+                .map(|coordinate| (coordinate.clone(), StorePageEnrichmentState::Unavailable))
+                .collect::<HashMap<_, _>>();
             match result {
-                Ok(summaries) => campaign_counts.set(
-                    summaries
-                        .into_iter()
-                        .map(|summary| (summary.listing_id, (summary.active, summary.upcoming)))
-                        .collect(),
-                ),
-                Err(_) => {
-                    campaign_counts_error.set(true);
-                    summary_fingerprint.set(String::new());
+                Ok(response) if response.generation == request_generation => {
+                    for update in response.cached.into_iter().chain(response.refreshed) {
+                        if expected.get(&update.listing_coordinate)
+                            == Some(&update.listing_event_id)
+                        {
+                            states.insert(update.listing_coordinate, update.state);
+                        }
+                    }
                 }
+                Ok(_) => warn!("publisher Store Page summary returned a stale generation"),
+                Err(error) => warn!("publisher Store Page summary failed: {}", error),
             }
-            campaign_counts_loading.set(false);
+            store_page_states.set(states);
+            store_page_loading.set(false);
         });
     });
 
+    let auth_for_signer = auth.clone();
+    let signer_state = Signal::derive(move || {
+        let publisher = auth_for_signer.npub.get();
+        publisher_signer_state(
+            publisher.as_deref(),
+            auth_for_signer.active_account.get().as_ref(),
+            &auth_for_signer.connection_status.get(),
+        )
+    });
+    let auth_for_dashboard_state = auth.clone();
+    let dashboard_state = Signal::derive(move || {
+        publisher_dashboard_state(
+            auth_for_dashboard_state.is_loading.get(),
+            auth_for_dashboard_state.npub.get().is_some(),
+            loading.get(),
+            !listings.get().is_empty(),
+            load_error.get(),
+        )
+    });
+    let attention_items = Signal::derive(move || {
+        let dirty_partial = partial_store_page_coordinates.get();
+        let store_pages = store_page_states.get();
+        let campaigns = campaign_states.get();
+        let mut items = listings
+            .get()
+            .into_iter()
+            .flat_map(|listing| {
+                let coordinate = canonical_listing_coordinate(&listing);
+                let store_page = store_page_summary_state(
+                    coordinate
+                        .as_ref()
+                        .and_then(|coordinate| store_pages.get(coordinate)),
+                    store_page_loading.get(),
+                );
+                let campaign = campaigns
+                    .get(&listing.id)
+                    .cloned()
+                    .unwrap_or(CampaignDashboardState::Loading);
+                let release = release_summary_state(&listing);
+                listing_attention_items(
+                    &listing,
+                    store_page,
+                    &release,
+                    &campaign,
+                    coordinate
+                        .as_ref()
+                        .is_some_and(|coordinate| dirty_partial.contains(coordinate)),
+                )
+            })
+            .collect::<Vec<_>>();
+        match signer_state.get() {
+            PublisherSignerState::Available => {}
+            PublisherSignerState::Connecting => items.push(PublisherAttentionItem {
+                listing_id: None,
+                game_title: None,
+                reason:
+                    "The remote signer is still connecting; publication actions remain unavailable."
+                        .to_string(),
+            }),
+            PublisherSignerState::Unavailable => items.push(PublisherAttentionItem {
+                listing_id: None,
+                game_title: None,
+                reason: "No available signer can authorize publisher changes for this account."
+                    .to_string(),
+            }),
+            PublisherSignerState::Unknown => items.push(PublisherAttentionItem {
+                listing_id: None,
+                game_title: None,
+                reason: "Signer availability has not been resolved for the active account."
+                    .to_string(),
+            }),
+        }
+        items
+    });
+    let counts = Signal::derive(move || {
+        dashboard_counts(
+            &listings.get(),
+            &dirty_store_page_coordinates.get(),
+            &campaign_states.get(),
+            &attention_items.get(),
+        )
+    });
+
     view! {
-        <section class="v2-publisher-studio">
-            <header class="v2-publisher-header">
-                <div>
-                    <p class="v2-publisher-kicker">"Publisher studio"</p>
-                    <h1>"Published games"</h1>
-                    <p>"Manage each Game page, Network publication, and Claim and keep Promotion."</p>
-                </div>
+        <section class="v2-publisher-studio v2-publisher-dashboard">
+            <header class="v2-publisher-header v2-publisher-dashboard-header">
+                <div><h1>"Developer dashboard"</h1></div>
                 <div class="v2-publisher-actions">
-                    <button class="v2-btn-secondary" on:click=move |_| refresh.run(()) disabled=move || loading.get()>"Refresh"</button>
-                    <button class="v2-btn-primary" on:click=move |_| on_navigate.run(PublishViewState::NewPublication)>"New Network publication"</button>
+                    <button type="button" class="v2-btn-secondary" on:click=move |_| refresh.run(()) disabled=move || loading.get() || refreshing.get()>{move || if refreshing.get() { "Refreshing..." } else { "Refresh" }}</button>
+                    <button type="button" class="v2-btn-primary" aria-describedby="publisher-create-game-requirement" on:click=move |_| on_navigate.run(PublishViewState::NewPublication) disabled=move || !signer_can_publish(signer_state.get())>"+ Create Game"</button>
                 </div>
             </header>
-            {move || error.get().map(|message| view! { <div class="v2-panel v2-publisher-panel border border-error/40 text-error">{message}</div> })}
-            {move || if loading.get() {
-                view! { <div class="v2-panel v2-publisher-panel text-on-surface-variant">"Loading your published games..."</div> }.into_any()
-            } else if listings.get().is_empty() {
-                view! {
-                    <div class="v2-panel v2-publisher-panel text-center space-y-4">
-                        <h2 class="text-2xl font-headline font-bold">"No published games yet"</h2>
-                        <p class="text-on-surface-variant">"Create a Network publication first, then manage Promotions from its Game page."</p>
-                        <button class="v2-btn-primary" on:click=move |_| on_navigate.run(PublishViewState::NewPublication)>"Open publishing form"</button>
-                    </div>
-                }.into_any()
-            } else {
-                view! {
-                    <div class="v2-publisher-game-grid">
-                        {move || listings.get().into_iter().map(|listing| {
-                            let selected = listing.clone();
-                            let cover = valid_cover_url(&listing.images);
-                            let listing_id_for_counts = listing.id.clone();
-                            view! {
-                                <article class="v2-publisher-game-card">
-                                    {cover.map(|url| view! { <img src=url alt="cover" class="h-28 w-24 rounded-xl object-cover" on:error=use_fallback_cover /> }.into_any()).unwrap_or_else(|| view! { <div class="h-28 w-24 rounded-xl bg-surface-container-highest flex items-center justify-center text-2xl">"🎮"</div> }.into_any())}
-                                    <div class="min-w-0 flex-1">
-                                        <h2 class="text-xl font-headline font-bold truncate">{listing.title.clone()}</h2>
-                                        <p class="text-xs text-on-surface-variant truncate">{listing_coordinate(&listing)}</p>
-                                        <div class="mt-3 grid grid-cols-2 gap-2 text-sm">
-                                            <span>{format!("Price: {} sats", listing.price_sats)}</span>
-                                            <span>{access_label(&listing.acquisition)}</span>
-                                            <span>{version_label(&listing)}</span>
-                                            <span>{fulfillment_label(&listing)}</span>
+            <p id="publisher-create-game-requirement" class="v2-publisher-action-requirement">{move || match signer_state.get() { PublisherSignerState::Available => "Create Game uses the active account signer.", PublisherSignerState::Connecting => "Create Game is unavailable while the remote signer connects.", PublisherSignerState::Unavailable => "Create Game requires an available signer for the active account.", PublisherSignerState::Unknown => "Create Game remains unavailable until signer availability is resolved." }}</p>
+
+            {move || match dashboard_state.get() {
+                PublisherDashboardState::SignedOut => view! { <section class="v2-publisher-feedback" role="status"><span class="material-symbols-outlined" aria-hidden="true">"person_off"</span><div><h2>"Sign in to open the publisher dashboard"</h2><p>"Publisher listings and in-session authoring state are bound to the active account."</p></div></section> }.into_any(),
+                PublisherDashboardState::Loading => view! { <section class="v2-publisher-feedback" role="status"><span class="material-symbols-outlined" aria-hidden="true">"progress_activity"</span><div><h2>"Loading publisher state"</h2><p>"Checking authored NIP-99 listings before resolving independent Store Page and campaign state."</p></div></section> }.into_any(),
+                PublisherDashboardState::Error => view! { <section class="v2-publisher-feedback v2-publisher-feedback-error" role="alert"><span class="material-symbols-outlined" aria-hidden="true">"cloud_off"</span><div><h2>"Publisher listings unavailable"</h2><p>"No authored listings could be loaded. Retry without changing the active account."</p></div></section> }.into_any(),
+                PublisherDashboardState::Empty => view! { <section class="v2-publisher-feedback"><span class="material-symbols-outlined" aria-hidden="true">"sports_esports"</span><div><h2>"No authored listings in the loaded relay window"</h2><p>"Create Game starts the existing publication workflow. Unfinished Create Game state is not saved as a draft."</p>{signer_can_publish(signer_state.get()).then(|| view! { <button type="button" class="v2-btn-primary" on:click=move |_| on_navigate.run(PublishViewState::NewPublication)>"Create Game"</button> })}</div></section> }.into_any(),
+                PublisherDashboardState::Partial | PublisherDashboardState::Ready => view! {
+                    <div class="v2-publisher-dashboard-content" aria-live="polite" aria-busy=move || refreshing.get() || store_page_loading.get()>
+                        {(dashboard_state.get() == PublisherDashboardState::Partial).then(|| view! { <div class="v2-publisher-scope-warning" role="status"><strong>"Partial publisher results"</strong><span>"Previously loaded authored listings remain available after the latest refresh failed."</span></div> })}
+                        <dl class="v2-publisher-facts" aria-label="Resolved publisher counts">
+                            <div><dt>"Authored listings loaded"</dt><dd>{counts.get().loaded_listings}</dd></div>
+                            <div><dt>"Store Page drafts this session"</dt><dd>{counts.get().local_store_page_drafts}</dd></div>
+                            <div><dt>{if counts.get().campaigns_complete_for_loaded_listings { "Resolved active campaigns" } else { "Active campaigns in resolved results" }}</dt><dd>{counts.get().resolved_active_campaigns}</dd></div>
+                            <div><dt>"Items requiring attention"</dt><dd>{counts.get().attention_items}</dd></div>
+                        </dl>
+                        <p class="v2-publisher-relay-scope">"Counts apply only to the loaded authored-listing window. Relay completeness is not inferred."</p>
+
+                        <section class="v2-publisher-attention" aria-labelledby="publisher-attention-title">
+                            <div><p class="v2-publisher-kicker">"Actionable state only"</p><h2 id="publisher-attention-title">"Needs attention"</h2></div>
+                            {if attention_items.get().is_empty() {
+                                view! { <p>"No resolved actionable issues in the loaded publisher state."</p> }.into_any()
+                            } else {
+                                view! { <ul>{group_attention_items(attention_items.get()).into_iter().map(|group| { let listing = group.listing_id.as_ref().and_then(|id| listings.get().into_iter().find(|listing| &listing.id == id)); view! { <li><div><strong>{group.title}</strong><ul>{group.reasons.into_iter().map(|reason| view! { <li>{reason}</li> }).collect_view()}</ul></div>{listing.map(|listing| { let selected = listing.clone(); view! { <button type="button" class="v2-btn-secondary" on:click=move |_| on_navigate.run(PublishViewState::Game(selected.clone()))>"Review"</button> } })}</li> } }).collect_view()}</ul> }.into_any()
+                            }}
+                        </section>
+
+                        <div class="v2-publisher-game-list">
+                            {listings.get().into_iter().map(|listing| {
+                                let manage_listing = listing.clone();
+                                let store_listing = listing.clone();
+                                let public_listing = listing.clone();
+                                let coordinate = canonical_listing_coordinate(&listing);
+                                let resolved_store_pages = store_page_states.get();
+                                let store_page = store_page_summary_state(coordinate.as_ref().and_then(|coordinate| resolved_store_pages.get(coordinate)), store_page_loading.get());
+                                let release = release_summary_state(&listing);
+                                let validity = listing_validity(&listing);
+                                let campaign = campaign_states.get().get(&listing.id).cloned().unwrap_or(CampaignDashboardState::Loading);
+                                let has_draft = coordinate.as_ref().is_some_and(|coordinate| dirty_store_page_coordinates.get().contains(coordinate));
+                                let has_partial = coordinate.as_ref().is_some_and(|coordinate| partial_store_page_coordinates.get().contains(coordinate));
+                                let artwork = artwork_state_from_url(valid_cover_url(&listing.images));
+                                let title = listing.title.clone();
+                                view! {
+                                    <article class="v2-publisher-game-row">
+                                        <div class="v2-publisher-row-art"><GameArtwork title=title.clone() state=artwork role=ArtworkRole::Thumbnail /></div>
+                                        <div class="v2-publisher-row-copy">
+                                            <div class="v2-publisher-row-title"><h2>{title}</h2><span>{if listing.event_id.is_some() { format!("Published {}", format_unix(listing.created_at)) } else { format!("Listing timestamp {}", format_unix(listing.created_at)) }}</span></div>
+                                            <p class="v2-publisher-row-id">{format!("Game ID {}", short_identifier(&listing.id))}</p>
+                                            <div class="v2-publisher-row-statuses">
+                                                <StatusChip label=if listing.event_id.is_some() { "Published listing" } else { "Publication unresolved" } variant=if listing.event_id.is_some() { StatusChipVariant::Published } else { StatusChipVariant::Unverified } icon=None size=StatusChipSize::Compact />
+                                                <StatusChip label=match &validity { ListingValidityState::Valid => "Listing fields ready", ListingValidityState::Invalid(_) => "Listing fields need attention" } variant=match &validity { ListingValidityState::Valid => StatusChipVariant::Verified, ListingValidityState::Invalid(_) => StatusChipVariant::Warning } icon=None size=StatusChipSize::Compact />
+                                                {has_draft.then(|| view! { <StatusChip label="Store Page draft in this session" variant=StatusChipVariant::Draft icon=None size=StatusChipSize::Compact /> })}
+                                                {has_partial.then(|| view! { <StatusChip label="Store Page publication incomplete" variant=StatusChipVariant::Warning icon=None size=StatusChipSize::Compact /> })}
+                                            </div>
+                                            <p class="v2-publisher-row-meta">{format!("{} · {} · {}", access_label(&listing.acquisition), store_page_label(&store_page), release_label(&release))}</p>
+                                            <p class="v2-publisher-row-campaign">{campaign_summary_label(&campaign)}</p>
                                         </div>
-                                        <p class="mt-2 text-sm text-on-surface-variant">
-                                            {move || if let Some((active, upcoming)) = campaign_counts.get().get(&listing_id_for_counts).copied() {
-                                                 format!("Promotions: {active} Active · {upcoming} Upcoming")
-                                            } else if campaign_counts_error.get() {
-                                                 "Promotion status: chain unavailable".into()
-                                            } else if campaign_counts_loading.get() {
-                                                 "Promotions: checking Network publication...".into()
-                                            } else {
-                                                 "Promotions: 0 Active · 0 Upcoming".into()
-                                            }}
-                                        </p>
-                                        <button class="v2-btn-primary mt-4" on:click=move |_| on_navigate.run(PublishViewState::Game(selected.clone()))>"Open Game page"</button>
-                                    </div>
-                                </article>
-                            }
-                        }).collect_view()}
+                                        <div class="v2-publisher-row-actions">
+                                            <button type="button" class="v2-btn-secondary" on:click=move |_| on_navigate.run(PublishViewState::Game(manage_listing.clone()))>"Manage"</button>
+                                            <details class="v2-publisher-row-more"><summary>"More"</summary><div><button type="button" on:click=move |_| on_navigate.run(PublishViewState::StorePage(store_listing.clone()))>{if has_draft { "Continue Store Page draft" } else { "Store Page" }}</button><button type="button" on:click=move |_| on_open_listing.run(public_listing.clone())>"View public page"</button></div></details>
+                                        </div>
+                                    </article>
+                                }
+                            }).collect_view()}
+                        </div>
+
+                        <details class="v2-publisher-campaigns"><summary><span><span class="v2-publisher-kicker">"Resolved campaign chains"</span><strong>"Campaign summaries"</strong></span><span>"View"</span></summary><div aria-live="polite">{render_campaign_dashboard_summaries(listings.get(), campaign_states.get())}</div></details>
+
+                        <p class="v2-publisher-unavailable-metrics"><strong>"Metrics unavailable. "</strong>"Sales, revenue, claims, installs, views, ratings, wishlists, conversion, players, engagement, and trends are not rendered because no authoritative dashboard query exists."</p>
                     </div>
-                }.into_any()
+                }.into_any(),
             }}
         </section>
     }
+}
+
+#[component]
+fn PublisherReleasesView(
+    listing: GameListing,
+    on_back: Callback<()>,
+    on_edit: Callback<GameListing>,
+) -> impl IntoView {
+    let release = release_summary_state(&listing);
+    let listing_for_edit = listing.clone();
+    let file_hash = listing
+        .specs
+        .iter()
+        .find(|(key, _)| key == "file_hash")
+        .map(|(_, value)| short_identifier(value))
+        .unwrap_or_else(|| "Unavailable".to_string());
+
+    view! {
+        <section class="v2-publisher-studio v2-publisher-release-summary">
+            <button type="button" class="v2-btn-secondary v2-publisher-back" on:click=move |_| on_back.run(())>"Back to Game page"</button>
+            <header class="v2-publisher-dashboard-header">
+                <div><p class="v2-publisher-kicker">"Current signed listing"</p><h1>{format!("Release summary for {}", listing.title)}</h1><p>"Arcadestr does not currently model release history, changelogs, rollout, rollback, or immutable release records."</p></div>
+            </header>
+            <section class="v2-publisher-panel" aria-labelledby="current-build-title">
+                <div class="v2-publisher-section-heading"><div><p class="v2-publisher-kicker">"Listing-backed state"</p><h2 id="current-build-title">"Current build"</h2></div><StatusChip label=release_label(&release) variant=release_variant(&release) icon=None size=StatusChipSize::Compact /></div>
+                <dl class="v2-publisher-release-facts">
+                    <div><dt>"Publication"</dt><dd>{if listing.event_id.is_some() { "Resolved current listing" } else { "Publication unresolved" }}</dd></div>
+                    <div><dt>"Version"</dt><dd>{version_label(&listing)}</dd></div>
+                    <div><dt>"Build SHA-256"</dt><dd>{file_hash}</dd></div>
+                    <div><dt>"Published timestamp"</dt><dd>{format_unix(listing.created_at)}</dd></div>
+                </dl>
+                {match &release {
+                    ReleaseSummaryState::Invalid(reasons) => view! { <div class="v2-publisher-scope-warning" role="alert"><strong>"Current build needs attention"</strong><span>{reasons.join(" ")}</span></div> }.into_any(),
+                    ReleaseSummaryState::NotConfigured => view! { <p class="v2-publisher-summary-state">"This listing does not declare managed build distribution. No missing release is inferred."</p> }.into_any(),
+                    ReleaseSummaryState::Current { .. } => view! { <p class="v2-publisher-summary-state">"Version and SHA-256 come from the current signed listing; this is not a release-history record."</p> }.into_any(),
+                }}
+                <button type="button" class="v2-btn-primary" on:click=move |_| on_edit.run(listing_for_edit.clone())>"Edit and republish listing"</button>
+            </section>
+        </section>
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ManageSummaryCard {
+    title: &'static str,
+    state: String,
+    detail: &'static str,
+}
+
+/// Maps already-resolved publisher state into the four handoff management cards.
+/// Every card line is derived from authoritative listing, Store Page, release, or
+/// campaign state; no card falls back to a fabricated value.
+fn manage_summary_cards(
+    listing: &GameListing,
+    store_page: &StorePageSummaryState,
+    has_local_draft: bool,
+    release: &ReleaseSummaryState,
+    campaign: &CampaignDashboardState,
+) -> Vec<ManageSummaryCard> {
+    let store_page_state = if has_local_draft {
+        format!(
+            "{} · draft in this session",
+            store_page_label(store_page).to_ascii_lowercase()
+        )
+    } else {
+        store_page_label(store_page).to_string()
+    };
+    vec![
+        ManageSummaryCard {
+            title: "Store information",
+            state: store_page_state,
+            detail: "Buyer-facing presentation, separate from price, access, and fulfillment.",
+        },
+        ManageSummaryCard {
+            title: "Releases",
+            state: release_label(release),
+            detail: "Derived from the current signed listing; no release history is modelled.",
+        },
+        ManageSummaryCard {
+            title: "Access & promotions",
+            state: format!(
+                "{} · {}",
+                access_label(&listing.acquisition),
+                campaign_summary_label(campaign)
+            ),
+            detail: "Claim and keep grants durable access; a Promotion link is only a hint.",
+        },
+        ManageSummaryCard {
+            title: "Distribution",
+            state: fulfillment_label(listing),
+            detail: "Authoritative fulfillment configuration from the signed listing.",
+        },
+    ]
 }
 
 #[component]
@@ -381,10 +1390,12 @@ fn GameManagementView(
     let listing_for_store_page = listing.clone();
     let on_navigate_for_edit = on_navigate.clone();
     let on_navigate_for_store_page = on_navigate.clone();
+    let on_navigate_for_releases = on_navigate.clone();
     let discovery_generation = RwSignal::new(0_u64);
     let discovery_account = RwSignal::new(None::<String>);
+    let auth_for_discovery = auth.clone();
     Effect::new(move |_| {
-        let Some(initiating_npub) = auth.npub.get() else {
+        let Some(initiating_npub) = auth_for_discovery.npub.get() else {
             discovery_generation.update(|value| *value = value.wrapping_add(1));
             discovery_account.set(None);
             campaigns.set(Vec::new());
@@ -417,7 +1428,7 @@ fn GameManagementView(
             listing_id: listing_id.clone(),
             pointers: pointers.clone(),
         };
-        let auth_for_request = auth.clone();
+        let auth_for_request = auth_for_discovery.clone();
         spawn_local(async move {
             let result = invoke_discover_campaigns(request).await;
             if !accepts_account_response(
@@ -437,55 +1448,269 @@ fn GameManagementView(
         });
     });
 
+    let store_page_state = RwSignal::new(None::<StorePageEnrichmentState>);
+    // Start resolving so an unresolved Store Page is never rendered as "unavailable"
+    // before the enrichment request has had a chance to run.
+    let store_page_loading = RwSignal::new(true);
+    let store_page_generation = RwSignal::new(0_u64);
+    let store_page_account = RwSignal::new(None::<String>);
+    let auth_for_store_page = auth.clone();
+    let listing_for_store_page_state = listing.clone();
+    Effect::new(move |_| {
+        let account = auth_for_store_page.npub.get();
+        let matches_publisher = account
+            .as_deref()
+            .is_some_and(|account| account == listing_for_store_page_state.publisher_npub);
+        let Some(account) = account.filter(|_| matches_publisher) else {
+            store_page_generation.update(|value| *value = value.wrapping_add(1));
+            store_page_account.set(None);
+            store_page_state.set(None);
+            store_page_loading.set(false);
+            return;
+        };
+        if store_page_account.get_untracked().as_deref() == Some(account.as_str()) {
+            return;
+        }
+        store_page_generation.update(|value| *value = value.wrapping_add(1));
+        let request_generation = store_page_generation.get_untracked();
+        store_page_account.set(Some(account.clone()));
+        store_page_state.set(None);
+        let association = canonical_listing_coordinate(&listing_for_store_page_state)
+            .zip(listing_for_store_page_state.event_id.clone());
+        let Some((coordinate, event_id)) = association else {
+            store_page_loading.set(false);
+            store_page_state.set(Some(StorePageEnrichmentState::Unavailable));
+            return;
+        };
+        store_page_loading.set(true);
+        let request = StorePageEnrichmentRequest {
+            generation: request_generation,
+            listings: vec![StorePageListingRef {
+                listing_coordinate: coordinate.clone(),
+                listing_event_id: event_id.clone(),
+            }],
+        };
+        let auth_for_request = auth_for_store_page.clone();
+        spawn_local(async move {
+            let result = invoke_enrich_store_pages(request).await;
+            if !accepts_account_response(
+                auth_for_request.npub.get_untracked().as_deref(),
+                &account,
+                store_page_generation.get_untracked(),
+                request_generation,
+            ) {
+                return;
+            }
+            let resolved = match result {
+                Ok(response) if response.generation == request_generation => response
+                    .cached
+                    .into_iter()
+                    .chain(response.refreshed)
+                    .find(|update| {
+                        update.listing_coordinate == coordinate
+                            && update.listing_event_id == event_id
+                    })
+                    .map(|update| update.state)
+                    .unwrap_or(StorePageEnrichmentState::Unavailable),
+                Ok(_) => {
+                    warn!("managed Store Page summary returned a stale generation");
+                    StorePageEnrichmentState::Unavailable
+                }
+                Err(error) => {
+                    warn!("managed Store Page summary failed: {}", error);
+                    StorePageEnrichmentState::Unavailable
+                }
+            };
+            store_page_state.set(Some(resolved));
+            store_page_loading.set(false);
+        });
+    });
+
+    let auth_for_signer = auth.clone();
+    let signer_state = Signal::derive(move || {
+        let publisher = auth_for_signer.npub.get();
+        publisher_signer_state(
+            publisher.as_deref(),
+            auth_for_signer.active_account.get().as_ref(),
+            &auth_for_signer.connection_status.get(),
+        )
+    });
+    let auth_for_local_state = auth.clone();
+    let listing_for_local_state = listing.clone();
+    let local_store_page = Signal::derive(move || {
+        let Some(account) = auth_for_local_state.npub.get() else {
+            return (false, false);
+        };
+        if account != listing_for_local_state.publisher_npub {
+            return (false, false);
+        }
+        let Some(coordinate) = canonical_listing_coordinate(&listing_for_local_state) else {
+            return (false, false);
+        };
+        (
+            publisher_store_page_dirty_coordinates(&account).contains(&coordinate),
+            publisher_store_page_partial_coordinates(&account).contains(&coordinate),
+        )
+    });
+
+    let listing_for_summary = listing.clone();
+    let campaign_state = Signal::derive(move || {
+        if loading.get() {
+            CampaignDashboardState::Loading
+        } else if error.get().is_some() {
+            CampaignDashboardState::Unavailable
+        } else {
+            CampaignDashboardState::Resolved(campaigns.get())
+        }
+    });
+    let summary_store_page = Signal::derive(move || {
+        store_page_summary_state(store_page_state.get().as_ref(), store_page_loading.get())
+    });
+    let listing_for_release = listing.clone();
+    let release_state = Signal::derive(move || release_summary_state(&listing_for_release));
+    let summary_cards = Signal::derive(move || {
+        manage_summary_cards(
+            &listing_for_summary,
+            &summary_store_page.get(),
+            local_store_page.get().0,
+            &release_state.get(),
+            &campaign_state.get(),
+        )
+    });
+    let listing_for_attention = listing.clone();
+    let attention_groups = Signal::derive(move || {
+        group_attention_items(listing_attention_items(
+            &listing_for_attention,
+            summary_store_page.get(),
+            &release_state.get(),
+            &campaign_state.get(),
+            local_store_page.get().1,
+        ))
+    });
+
+    let listing_for_releases = listing.clone();
+    let listing_for_artwork = listing.clone();
+    let title_for_artwork = listing.title.clone();
+
     view! {
-        <section class="v2-publisher-studio">
-            <button class="v2-btn-secondary v2-publisher-back" on:click=move |_| on_back.run(())>"Back to Published games"</button>
-            <header class="v2-publisher-game-hero">
-                {valid_cover_url(&listing.images).map(|url| view! { <img src=url alt="cover" class="h-32 w-24 rounded-xl object-cover" on:error=use_fallback_cover /> }.into_any()).unwrap_or_else(|| view! { <div class="h-32 w-24 rounded-xl bg-surface-container-highest flex items-center justify-center text-3xl">"🎮"</div> }.into_any())}
-                <div class="flex-1">
-                    <p class="v2-publisher-kicker">"Game page"</p>
-                    <h1>{listing.title.clone()}</h1>
-                    <p class="text-sm text-on-surface-variant break-all">{listing_coordinate(&listing)}</p>
-                    <div class="mt-4 flex flex-wrap gap-2 text-sm">
-                        <span class="v2-chip">{format!("{} sats", listing.price_sats)}</span>
-                        <span class="v2-chip">{access_label(&listing.acquisition)}</span>
-                        <span class="v2-chip">{version_label(&listing)}</span>
-                    </div>
+        <section class="v2-publisher-studio v2-publisher-manage">
+            <button type="button" class="v2-btn-secondary v2-publisher-back" on:click=move |_| on_back.run(())>"Back to Published games"</button>
+            <header class="v2-publisher-manage-header">
+                <div class="v2-publisher-manage-art">
+                    <GameArtwork
+                        title=title_for_artwork
+                        state=artwork_state_from_url(valid_cover_url(&listing_for_artwork.images))
+                        role=ArtworkRole::Thumbnail
+                    />
                 </div>
-                <button class="v2-btn-secondary" on:click=move |_| on_navigate_for_edit.run(PublishViewState::EditPublication(listing_for_edit.clone()))>"Edit Network publication"</button>
+                <div class="v2-publisher-manage-identity">
+                    <p class="v2-publisher-kicker">"Game page"</p>
+                    <h1>{format!("Manage · {}", listing.title)}</h1>
+                    <p class="v2-publisher-manage-coordinate">{listing_coordinate(&listing)}</p>
+                    <div class="v2-publisher-row-statuses">
+                        <StatusChip
+                            label=if listing.event_id.is_some() { "Published listing" } else { "Publication unresolved" }
+                            variant=if listing.event_id.is_some() { StatusChipVariant::Published } else { StatusChipVariant::Unverified }
+                            icon=None
+                            size=StatusChipSize::Compact
+                        />
+                        {match listing_validity(&listing) {
+                            ListingValidityState::Valid => view! { <StatusChip label="Listing fields ready" variant=StatusChipVariant::Verified icon=None size=StatusChipSize::Compact /> },
+                            ListingValidityState::Invalid(_) => view! { <StatusChip label="Listing fields need attention" variant=StatusChipVariant::Warning icon=None size=StatusChipSize::Compact /> },
+                        }}
+                        {move || local_store_page.get().0.then(|| view! { <StatusChip label="Store Page draft in this session" variant=StatusChipVariant::Draft icon=None size=StatusChipSize::Compact /> })}
+                    </div>
+                    <p class="v2-publisher-manage-meta">{format!("{} · {} · {} sats declared", access_label(&listing.acquisition), version_label(&listing), listing.price_sats)}</p>
+                </div>
+                <div class="v2-publisher-actions">
+                    <button
+                        type="button"
+                        class="v2-btn-secondary"
+                        aria-describedby="publisher-manage-signer-requirement"
+                        disabled=move || !signer_can_publish(signer_state.get())
+                        on:click=move |_| on_navigate_for_edit.run(PublishViewState::EditPublication(listing_for_edit.clone()))
+                    >"Edit Network publication"</button>
+                </div>
             </header>
+            <p id="publisher-manage-signer-requirement" class="v2-publisher-action-requirement">{move || match signer_state.get() {
+                PublisherSignerState::Available => "Republishing and Promotion actions use the active account signer.",
+                PublisherSignerState::Connecting => "Republishing and Promotion actions are unavailable while the remote signer connects.",
+                PublisherSignerState::Unavailable => "Republishing and Promotion actions require an available signer for the active account.",
+                PublisherSignerState::Unknown => "Republishing and Promotion actions remain unavailable until signer availability is resolved.",
+            }}</p>
+
+            <div class="v2-publisher-manage-cards" aria-live="polite" aria-busy=move || store_page_loading.get() || loading.get()>
+                {move || summary_cards.get().into_iter().map(|card| view! {
+                    <article class="v2-publisher-manage-card">
+                        <h2>{card.title}</h2>
+                        <p class="v2-publisher-manage-card-state">{card.state}</p>
+                        <p class="v2-publisher-manage-card-detail">{card.detail}</p>
+                    </article>
+                }).collect_view()}
+            </div>
+
+            <section class="v2-publisher-attention" aria-labelledby="publisher-manage-attention-title">
+                <div><p class="v2-publisher-kicker">"Actionable state only"</p><h2 id="publisher-manage-attention-title">"Needs attention"</h2></div>
+                {move || {
+                    let groups = attention_groups.get();
+                    if groups.is_empty() {
+                        view! { <p>"No resolved actionable issues for this managed game."</p> }.into_any()
+                    } else {
+                        view! { <ul>{groups.into_iter().map(|group| view! { <li><div><strong>{group.title}</strong><ul>{group.reasons.into_iter().map(|reason| view! { <li>{reason}</li> }).collect_view()}</ul></div></li> }).collect_view()}</ul> }.into_any()
+                    }
+                }}
+            </section>
+
             <div class="v2-publisher-management-layout">
             <main class="v2-publisher-main">
             <section class="v2-publisher-panel">
-                <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                    <div><h2>"Store Page"</h2><p class="text-sm text-on-surface-variant">"Edit buyer-facing presentation separately from authoritative price, access, builds, and fulfillment."</p></div>
-                    <button class="v2-btn-primary" on:click=move |_| on_navigate_for_store_page.run(PublishViewState::StorePage(listing_for_store_page.clone()))>"Manage Store Page"</button>
+                <div class="v2-publisher-section-heading">
+                    <div><h2>"Store Page"</h2><p class="v2-publisher-summary-state">"Edit buyer-facing presentation separately from authoritative price, access, builds, and fulfillment."</p></div>
+                    <button type="button" class="v2-btn-primary" on:click=move |_| on_navigate_for_store_page.run(PublishViewState::StorePage(listing_for_store_page.clone()))>{move || if local_store_page.get().0 { "Continue Store Page draft" } else { "Manage Store Page" }}</button>
+                </div>
+                <p class="v2-publisher-summary-state">{move || format!("Resolved association: {}", store_page_label(&summary_store_page.get()))}</p>
+                {move || local_store_page.get().1.then(|| view! { <div class="v2-publisher-scope-warning" role="status"><strong>"Store Page publication incomplete"</strong><span>"A publication started in this session did not complete on every target. Reopen the editor to retry the remaining work."</span></div> })}
+            </section>
+            <section class="v2-publisher-panel">
+                <div class="v2-publisher-section-heading">
+                    <div><h2>"Releases"</h2><p class="v2-publisher-summary-state">"Version and build hash come from the current signed listing; no release history is modelled."</p></div>
+                    <button type="button" class="v2-btn-secondary" on:click=move |_| on_navigate_for_releases.run(PublishViewState::Releases(listing_for_releases.clone()))>"Open release summary"</button>
+                </div>
+                <div class="v2-publisher-row-statuses">
+                    {move || { let release = release_state.get(); view! { <StatusChip label=release_label(&release) variant=release_variant(&release) icon=None size=StatusChipSize::Compact /> } }}
                 </div>
             </section>
             <section class="v2-publisher-panel">
                 <h2>"Network publication"</h2>
-                <dl class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 text-sm">
-                    <div><dt class="text-on-surface-variant">"Published"</dt><dd>{format_unix(listing.created_at)}</dd></div>
-                    <div><dt class="text-on-surface-variant">"Platforms"</dt><dd>{if listing.platforms.is_empty() { "Unspecified".into() } else { listing.platforms.join(", ") }}</dd></div>
-                    <div><dt class="text-on-surface-variant">"ADP fulfillment"</dt><dd>{fulfillment_label(&listing)}</dd></div>
-                    <div><dt class="text-on-surface-variant">"ADP server"</dt><dd class="break-all">{adp_server_label(&listing)}</dd></div>
-                    <div><dt class="text-on-surface-variant">"Promotion links"</dt><dd>{listing.campaigns.len()}</dd></div>
+                <dl class="v2-publisher-detail-facts">
+                    <div><dt>"Published"</dt><dd>{format_unix(listing.created_at)}</dd></div>
+                    <div><dt>"Platforms"</dt><dd>{if listing.platforms.is_empty() { "Unspecified".into() } else { listing.platforms.join(", ") }}</dd></div>
+                    <div><dt>"ADP fulfillment"</dt><dd>{fulfillment_label(&listing)}</dd></div>
+                    <div><dt>"ADP server"</dt><dd>{adp_server_label(&listing)}</dd></div>
+                    <div><dt>"Promotion links"</dt><dd>{listing.campaigns.len()}</dd></div>
                 </dl>
-                <details class="v2-publisher-diagnostics"><summary>"Network diagnostics"</summary><p class="break-all">{format!("Listing event: {}", listing.event_id.clone().unwrap_or_else(|| "Unavailable".into()))}</p></details>
+                <details class="v2-publisher-diagnostics"><summary>"Network diagnostics"</summary><p>{format!("Listing event: {}", listing.event_id.clone().unwrap_or_else(|| "Unavailable".into()))}</p></details>
             </section>
             <section class="v2-publisher-panel">
-                <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                    <div><h2>"Promotions"</h2><p class="text-sm text-on-surface-variant">"Claim and keep creates durable access. A Promotion link is an advisory discovery hint, never validity."</p></div>
-                    <button class="v2-btn-primary" on:click=move |_| on_navigate.run(PublishViewState::Campaign { listing: listing_for_button.clone(), campaign: None })>"New Promotion"</button>
+                <div class="v2-publisher-section-heading">
+                    <div><h2>"Promotions"</h2><p class="v2-publisher-summary-state">"Claim and keep creates durable access. A Promotion link is an advisory discovery hint, never validity."</p></div>
+                    <button
+                        type="button"
+                        class="v2-btn-primary"
+                        aria-describedby="publisher-manage-signer-requirement"
+                        disabled=move || !signer_can_publish(signer_state.get())
+                        on:click=move |_| on_navigate.run(PublishViewState::Campaign { listing: listing_for_button.clone(), campaign: None })
+                    >"New Promotion"</button>
                 </div>
-                {move || error.get().map(|message| view! { <p class="text-error" role="alert">{format!("Promotion chain unavailable: {message}")}</p> })}
-                {move || if loading.get() { view! { <p class="text-on-surface-variant">"Discovering Promotions..."</p> }.into_any() } else if error.get().is_some() { view! { <></> }.into_any() } else if campaigns.get().is_empty() { view! { <p class="text-on-surface-variant">"No valid Promotions found. Discovery checks Promotion links and relay search."</p> }.into_any() } else { let selected_listing = listing_for_effect.clone(); let navigate = on_navigate.clone(); view! { <div class="v2-publisher-promotion-list">{campaigns.get().into_iter().map(|campaign| campaign_row(campaign, selected_listing.clone(), navigate.clone())).collect_view()}</div> }.into_any() }}
+                {move || error.get().map(|message| view! { <p class="v2-publisher-summary-state v2-publisher-summary-error" role="alert">{format!("Promotion chain unavailable: {message}")}</p> })}
+                {move || if loading.get() { view! { <p class="v2-publisher-summary-state" role="status">"Discovering Promotions..."</p> }.into_any() } else if error.get().is_some() { view! { <></> }.into_any() } else if campaigns.get().is_empty() { view! { <p class="v2-publisher-summary-state">"No valid Promotions found. Discovery checks Promotion links and relay search."</p> }.into_any() } else { let selected_listing = listing_for_effect.clone(); let navigate = on_navigate.clone(); view! { <div class="v2-publisher-promotion-list">{campaigns.get().into_iter().map(|campaign| campaign_row(campaign, selected_listing.clone(), navigate.clone())).collect_view()}</div> }.into_any() }}
             </section>
             </main>
             <aside class="v2-publisher-panel v2-publisher-sidebar">
                 <h2>"Distribution"</h2>
-                <div><h3 class="font-bold">"Platforms"</h3><p class="text-sm text-on-surface-variant">{if listing.platforms.is_empty() { "Unspecified".into() } else { listing.platforms.join(", ") }}</p></div>
-                <div><h3 class="font-bold">"Acquisition policy"</h3><p class="text-sm text-on-surface-variant">{access_label(&listing.acquisition)}</p><p class="text-xs text-on-surface-variant mt-1">"Timed access is configured on the Game page, not as a Claim and keep Promotion."</p></div>
+                <div><h3>"Platforms"</h3><p class="v2-publisher-summary-state">{if listing.platforms.is_empty() { "Unspecified".into() } else { listing.platforms.join(", ") }}</p></div>
+                <div><h3>"Acquisition policy"</h3><p class="v2-publisher-summary-state">{access_label(&listing.acquisition)}</p><p class="v2-publisher-summary-state">"Timed access is configured on the Game page, not as a Claim and keep Promotion."</p></div>
+                <div><h3>"Unavailable actions"</h3><p class="v2-publisher-summary-state">"Unlisting, disabling public or timed access, and individual access revocation are not rendered because no backing command exists. Promotion cancellation is prospective and is handled in the Promotions panel."</p></div>
             </aside>
             </div>
         </section>
@@ -773,7 +1998,7 @@ fn campaign_row(
             match result {
                 Ok(response) => {
                     let pointer_failed = response.pointer_update_error.is_some();
-                    action_completed.set(!pointer_failed);
+                    action_completed.set(true);
                     action_in_progress.set(false);
                     pointer_cleanup_retry.set(pointer_failed && remove_pointer);
                     let updated = apply_campaign_response_pointer_mutation(
@@ -1384,6 +2609,52 @@ fn timezone_label() -> String {
 mod tests {
     use super::*;
 
+    const TEST_PUBLISHER: &str = "npub1kvl9ev2wcjdecvyk0xhqacdwa505fqn6zpqwmwpd7vn4p565amyqesnwt4";
+
+    fn sample_listing() -> GameListing {
+        let mut listing = serde_json::from_value::<GameListing>(serde_json::json!({
+            "id": "sample-game",
+            "source": "nip99_listing",
+            "title": "Sample Game",
+            "description": "A complete signed listing.",
+            "publisher_npub": TEST_PUBLISHER,
+            "event_id": "event-id",
+            "created_at": 100
+        }))
+        .expect("sample listing");
+        listing.acquisition = AcquisitionPolicy::Public;
+        listing
+    }
+
+    fn sample_campaign(classification: &str) -> DiscoveredCampaign {
+        DiscoveredCampaign {
+            root_event_id: format!("root-{classification}"),
+            campaign_id: format!("campaign-{classification}"),
+            starts_at: 10,
+            ends_at: 20,
+            classification: classification.to_string(),
+            event_id: Some(format!("event-{classification}")),
+            predecessor_event_id: None,
+            mode: "claim_and_keep".to_string(),
+        }
+    }
+
+    fn sample_account(npub: &str, signing_mode: &str) -> crate::StoredAccount {
+        crate::StoredAccount {
+            id: "account".to_string(),
+            npub: npub.to_string(),
+            name: None,
+            signing_mode: signing_mode.to_string(),
+            last_used: 0,
+            is_current: true,
+            picture: None,
+            display_name: None,
+            username: None,
+            nip05: None,
+            about: None,
+        }
+    }
+
     #[test]
     fn cancellation_with_pointer_prompts_for_cleanup() {
         assert_eq!(
@@ -1437,5 +2708,418 @@ mod tests {
         let source = include_str!("publish.rs");
         assert!(!source.contains(&["window.", "confirm"].concat()));
         assert!(!source.contains(&["window().", "confirm"].concat()));
+    }
+
+    #[cfg(not(feature = "web"))]
+    #[test]
+    fn publisher_tabs_disable_destinations_without_real_context() {
+        assert_eq!(
+            publisher_destination(&PublishViewState::Games),
+            PublisherDestination::Dashboard
+        );
+        assert_eq!(
+            publisher_destination(&PublishViewState::NewPublication),
+            PublisherDestination::CreateGame
+        );
+
+        let items = publisher_tab_items(false, true, true);
+        assert!(items
+            .iter()
+            .any(|item| { item.destination == PublisherDestination::Dashboard && item.enabled }));
+        assert!(items
+            .iter()
+            .any(|item| { item.destination == PublisherDestination::CreateGame && item.enabled }));
+        for unsupported in [
+            PublisherDestination::ManageGame,
+            PublisherDestination::StorePage,
+            PublisherDestination::Releases,
+            PublisherDestination::Promotions,
+            PublisherDestination::Activity,
+        ] {
+            assert!(items
+                .iter()
+                .any(|item| item.destination == unsupported && !item.enabled));
+        }
+
+        let contextual = publisher_tab_items(true, true, true);
+        for destination in [
+            PublisherDestination::ManageGame,
+            PublisherDestination::StorePage,
+            PublisherDestination::Releases,
+            PublisherDestination::Promotions,
+        ] {
+            assert!(contextual
+                .iter()
+                .any(|item| item.destination == destination && item.enabled));
+        }
+        assert!(contextual.iter().any(|item| {
+            item.destination == PublisherDestination::Activity
+                && !item.enabled
+                && item.unavailable_reason == Some("Publisher activity is not available.")
+        }));
+
+        let signer_unavailable = publisher_tab_items(true, true, false);
+        assert!(signer_unavailable
+            .iter()
+            .any(|item| { item.destination == PublisherDestination::CreateGame && !item.enabled }));
+        assert!(signer_unavailable
+            .iter()
+            .any(|item| { item.destination == PublisherDestination::Promotions && item.enabled }));
+    }
+
+    #[test]
+    fn signed_out_loading_empty_error_and_partial_states_are_distinct() {
+        assert_eq!(
+            publisher_dashboard_state(false, false, false, false, false),
+            PublisherDashboardState::SignedOut
+        );
+        assert_eq!(
+            publisher_dashboard_state(true, false, false, false, false),
+            PublisherDashboardState::Loading
+        );
+        assert_eq!(
+            publisher_dashboard_state(false, true, true, false, false),
+            PublisherDashboardState::Loading
+        );
+        assert_eq!(
+            publisher_dashboard_state(false, true, false, false, true),
+            PublisherDashboardState::Error
+        );
+        assert_eq!(
+            publisher_dashboard_state(false, true, true, true, true),
+            PublisherDashboardState::Partial
+        );
+        assert_eq!(
+            publisher_dashboard_state(false, true, false, false, false),
+            PublisherDashboardState::Empty
+        );
+    }
+
+    #[test]
+    fn signer_availability_is_bound_to_the_active_account() {
+        let local = sample_account(TEST_PUBLISHER, "local");
+        assert_eq!(
+            publisher_signer_state(Some(TEST_PUBLISHER), Some(&local), "disconnected"),
+            PublisherSignerState::Available
+        );
+        let remote = sample_account(TEST_PUBLISHER, "nip46");
+        assert_eq!(
+            publisher_signer_state(Some(TEST_PUBLISHER), Some(&remote), "connected"),
+            PublisherSignerState::Available
+        );
+        assert_eq!(
+            publisher_signer_state(Some(TEST_PUBLISHER), Some(&remote), "disconnected"),
+            PublisherSignerState::Unavailable
+        );
+        assert_eq!(
+            publisher_signer_state(Some("npub1other"), Some(&local), "connected"),
+            PublisherSignerState::Unknown
+        );
+        assert!(!signer_can_publish(PublisherSignerState::Connecting));
+    }
+
+    #[test]
+    fn stale_publisher_responses_are_rejected() {
+        assert!(accepts_account_response(
+            Some(TEST_PUBLISHER),
+            TEST_PUBLISHER,
+            4,
+            4
+        ));
+        assert!(!accepts_account_response(
+            Some("npub1other"),
+            TEST_PUBLISHER,
+            4,
+            4
+        ));
+        assert!(!accepts_account_response(
+            Some(TEST_PUBLISHER),
+            TEST_PUBLISHER,
+            5,
+            4
+        ));
+    }
+
+    #[test]
+    fn local_store_page_draft_does_not_claim_listing_publication() {
+        let listing = sample_listing();
+        let coordinate =
+            canonical_listing_coordinate(&listing).unwrap_or_else(|| "coordinate".into());
+        let dirty = HashSet::from([coordinate]);
+        let counts = dashboard_counts(&[listing.clone()], &dirty, &HashMap::new(), &[]);
+        assert_eq!(counts.local_store_page_drafts, 1);
+        assert!(listing.event_id.is_some());
+        assert_eq!(
+            store_page_summary_state(Some(&StorePageEnrichmentState::NotAssociated), false),
+            StorePageSummaryState::NotAssociated
+        );
+    }
+
+    #[test]
+    fn listing_validity_reports_exact_actionable_reasons() {
+        assert_eq!(
+            listing_validity(&sample_listing()),
+            ListingValidityState::Valid
+        );
+        let mut invalid = sample_listing();
+        invalid.id = "INVALID ID".to_string();
+        invalid.title.clear();
+        invalid.event_id = None;
+        let ListingValidityState::Invalid(reasons) = listing_validity(&invalid) else {
+            panic!("listing should be invalid");
+        };
+        assert!(reasons.iter().any(|reason| reason.contains("identifier")));
+        assert!(reasons.iter().any(|reason| reason.contains("Title")));
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.contains("event identifier")));
+    }
+
+    #[test]
+    fn store_page_states_do_not_collapse_unavailable_into_missing() {
+        assert_eq!(
+            store_page_summary_state(None, true),
+            StorePageSummaryState::Loading
+        );
+        assert_eq!(
+            store_page_summary_state(None, false),
+            StorePageSummaryState::Unavailable
+        );
+        assert_eq!(
+            store_page_summary_state(Some(&StorePageEnrichmentState::NotAssociated), false),
+            StorePageSummaryState::NotAssociated
+        );
+        assert_eq!(
+            store_page_summary_state(Some(&StorePageEnrichmentState::NotFound), false),
+            StorePageSummaryState::NotFound
+        );
+        assert_eq!(
+            store_page_summary_state(Some(&StorePageEnrichmentState::Invalid), false),
+            StorePageSummaryState::Invalid
+        );
+        assert_eq!(
+            store_page_summary_state(Some(&StorePageEnrichmentState::Unavailable), false),
+            StorePageSummaryState::Unavailable
+        );
+    }
+
+    #[test]
+    fn release_state_requires_version_and_valid_hash_only_when_configured() {
+        assert_eq!(
+            release_summary_state(&sample_listing()),
+            ReleaseSummaryState::NotConfigured
+        );
+        let mut configured = sample_listing();
+        configured.specs = vec![
+            ("server".into(), "https://distribution.example".into()),
+            ("version".into(), "1.2.3".into()),
+            ("file_hash".into(), "a".repeat(64)),
+        ];
+        assert_eq!(
+            release_summary_state(&configured),
+            ReleaseSummaryState::Current {
+                version: "1.2.3".into()
+            }
+        );
+        configured.specs.retain(|(key, _)| key != "file_hash");
+        assert!(matches!(
+            release_summary_state(&configured),
+            ReleaseSummaryState::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn campaign_lifecycle_and_unavailable_states_remain_distinct() {
+        let campaigns = vec![
+            sample_campaign("active"),
+            sample_campaign("ended"),
+            sample_campaign("cancelled"),
+        ];
+        let label = campaign_summary_label(&CampaignDashboardState::Resolved(campaigns));
+        assert!(label.contains("1 active"));
+        assert!(label.contains("1 ended"));
+        assert!(label.contains("1 cancelled"));
+        assert_eq!(
+            campaign_summary_label(&CampaignDashboardState::Resolved(Vec::new())),
+            "Campaigns: none resolved"
+        );
+        assert_eq!(
+            campaign_summary_label(&CampaignDashboardState::Unavailable),
+            "Campaigns: unavailable"
+        );
+    }
+
+    #[test]
+    fn partial_publication_and_invalid_campaign_create_exact_attention() {
+        let listing = sample_listing();
+        let campaign = DiscoveredCampaign {
+            event_id: None,
+            mode: "unsupported".into(),
+            ..sample_campaign("invalid")
+        };
+        let items = listing_attention_items(
+            &listing,
+            StorePageSummaryState::Published,
+            &ReleaseSummaryState::NotConfigured,
+            &CampaignDashboardState::Resolved(vec![campaign]),
+            true,
+        );
+        assert!(items
+            .iter()
+            .any(|item| item.reason.contains("incomplete in this session")));
+        assert!(items
+            .iter()
+            .any(|item| item.reason.contains("invalid or incomplete")));
+        assert!(items
+            .iter()
+            .any(|item| item.reason.contains("unsupported configuration")));
+        assert!(items
+            .iter()
+            .any(|item| item.reason.contains("event is unresolved")));
+        let groups = group_attention_items(items);
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].reasons.len() >= 4);
+    }
+
+    #[test]
+    fn authored_listing_validation_excludes_legacy_and_other_publishers() {
+        let authored = sample_listing();
+        let mut legacy = authored.clone();
+        legacy.id = "legacy".into();
+        legacy.source = ListingSource::Legacy;
+        let mut other = authored.clone();
+        other.id = "other".into();
+        other.publisher_npub = "npub1other".into();
+        let result = current_user_listings(vec![authored.clone(), legacy, other], TEST_PUBLISHER);
+        assert_eq!(result, vec![authored]);
+    }
+
+    #[test]
+    fn real_counts_are_qualified_when_campaign_results_are_partial() {
+        let listing = sample_listing();
+        let attention = vec![PublisherAttentionItem {
+            listing_id: Some(listing.id.clone()),
+            game_title: Some(listing.title.clone()),
+            reason: "Exact reason".into(),
+        }];
+        let campaigns = HashMap::from([(
+            listing.id.clone(),
+            CampaignDashboardState::Resolved(vec![sample_campaign("active")]),
+        )]);
+        let complete =
+            dashboard_counts(&[listing.clone()], &HashSet::new(), &campaigns, &attention);
+        assert_eq!(complete.loaded_listings, 1);
+        assert_eq!(complete.resolved_active_campaigns, 1);
+        assert_eq!(complete.attention_items, 1);
+        assert!(complete.campaigns_complete_for_loaded_listings);
+
+        let partial = dashboard_counts(&[listing], &HashSet::new(), &HashMap::new(), &attention);
+        assert_eq!(partial.resolved_active_campaigns, 0);
+        assert!(!partial.campaigns_complete_for_loaded_listings);
+    }
+
+    #[test]
+    fn unsupported_metrics_and_fixture_data_are_omitted() {
+        let source = include_str!("publish.rs");
+        for fabricated in [
+            ["Revenue", ": 0"].concat(),
+            ["Sales", ": 0"].concat(),
+            ["Views", ": 0"].concat(),
+            ["Nova", " Choir"].concat(),
+            ["Echoes", " of Aster"].concat(),
+            ["~340", " claims"].concat(),
+        ] {
+            assert!(!source.contains(&fabricated));
+        }
+        assert!(source.contains("Metrics unavailable"));
+    }
+
+    #[test]
+    fn missing_artwork_uses_the_shared_deterministic_fallback_state() {
+        assert_eq!(
+            artwork_state_from_url(valid_cover_url(&sample_listing().images)),
+            crate::ui_v2::components::ArtworkState::Missing
+        );
+    }
+
+    #[test]
+    fn manage_cards_never_infer_missing_results_from_unresolved_state() {
+        let listing = sample_listing();
+        let resolving = manage_summary_cards(
+            &listing,
+            &StorePageSummaryState::Loading,
+            false,
+            &ReleaseSummaryState::NotConfigured,
+            &CampaignDashboardState::Loading,
+        );
+        assert_eq!(resolving[0].state, "Store Page resolving");
+        assert_eq!(resolving[1].state, "Current build not configured");
+        assert!(resolving[2].state.contains("Campaigns: resolving"));
+
+        let unavailable = manage_summary_cards(
+            &listing,
+            &StorePageSummaryState::Unavailable,
+            false,
+            &ReleaseSummaryState::NotConfigured,
+            &CampaignDashboardState::Unavailable,
+        );
+        assert_eq!(unavailable[0].state, "Store Page unavailable");
+        assert!(unavailable[2].state.contains("Campaigns: unavailable"));
+        assert!(!unavailable[2].state.contains("none resolved"));
+
+        let empty = manage_summary_cards(
+            &listing,
+            &StorePageSummaryState::NotAssociated,
+            false,
+            &ReleaseSummaryState::NotConfigured,
+            &CampaignDashboardState::Resolved(Vec::new()),
+        );
+        assert_eq!(empty[0].state, "Store Page not associated");
+        assert!(empty[2].state.contains("none resolved"));
+    }
+
+    #[test]
+    fn manage_cards_keep_in_session_drafts_distinct_from_published_store_pages() {
+        let listing = sample_listing();
+        let published = manage_summary_cards(
+            &listing,
+            &StorePageSummaryState::Published,
+            false,
+            &ReleaseSummaryState::Current {
+                version: "1.2.0".to_string(),
+            },
+            &CampaignDashboardState::Resolved(vec![sample_campaign("active")]),
+        );
+        let drafting = manage_summary_cards(
+            &listing,
+            &StorePageSummaryState::Published,
+            true,
+            &ReleaseSummaryState::Current {
+                version: "1.2.0".to_string(),
+            },
+            &CampaignDashboardState::Resolved(vec![sample_campaign("active")]),
+        );
+
+        assert_eq!(published[0].state, "Store Page published");
+        assert!(drafting[0].state.contains("draft in this session"));
+        assert_ne!(published[0].state, drafting[0].state);
+        assert_eq!(published[1].state, "Current build 1.2.0");
+        assert!(published[2].state.contains("1 active"));
+        assert_eq!(published[3].state, fulfillment_label(&listing));
+    }
+
+    #[test]
+    fn managed_game_omits_unsupported_actions_and_gates_publication_on_a_signer() {
+        let source = include_str!("publish.rs");
+        for absent in [
+            ["Unlist", " game"].concat(),
+            ["Disable", " public/timed access"].concat(),
+            ["Revoke", " individual access"].concat(),
+            ["DANGER", " ZONE"].concat(),
+        ] {
+            assert!(!source.contains(&absent), "unsupported action rendered");
+        }
+        assert!(source.contains("publisher-manage-signer-requirement"));
+        assert!(source.contains("Unlisting, disabling public or timed access"));
     }
 }

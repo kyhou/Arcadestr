@@ -147,16 +147,31 @@ fn draft_key(publisher: &str, listing_coordinate: &str) -> String {
     format!("{publisher}|{listing_coordinate}")
 }
 
-fn cached_draft(key: &str) -> Option<CachedDraft> {
-    PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| drafts.borrow().get(key).cloned())
-}
-
-fn retain_account_drafts(publisher: &str) {
+pub(crate) fn publisher_store_page_dirty_coordinates(publisher: &str) -> Vec<String> {
+    let prefix = format!("{publisher}|");
     PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| {
         drafts
-            .borrow_mut()
-            .retain(|key, _| key.starts_with(&format!("{publisher}|")));
-    });
+            .borrow()
+            .iter()
+            .filter(|(_, entry)| entry.input_dirty || entry.draft != entry.baseline)
+            .filter_map(|(key, _)| key.strip_prefix(&prefix).map(ToString::to_string))
+            .collect()
+    })
+}
+
+pub(crate) fn publisher_store_page_partial_coordinates(publisher: &str) -> Vec<String> {
+    let prefix = format!("{publisher}|");
+    PUBLISHER_STORE_PAGE_RECOVERY.with(|recoveries| {
+        recoveries
+            .borrow()
+            .keys()
+            .filter_map(|key| key.strip_prefix(&prefix).map(ToString::to_string))
+            .collect()
+    })
+}
+
+fn cached_draft(key: &str) -> Option<CachedDraft> {
+    PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| drafts.borrow().get(key).cloned())
 }
 
 fn save_cached_draft(
@@ -593,8 +608,9 @@ pub fn StorePageEditorView(
     let canonical_publisher_hex = blossom_publisher_hex(&publisher).unwrap_or_default();
     let coordinate = listing_coordinate(&listing);
     let key = draft_key(&publisher, &coordinate);
-    let cached = cached_draft(&key);
-    let recovered = recovery(&key);
+    let active_publisher = auth.npub.get_untracked().as_deref() == Some(publisher.as_str());
+    let cached = active_publisher.then(|| cached_draft(&key)).flatten();
+    let recovered = active_publisher.then(|| recovery(&key)).flatten();
     let fallback = StorePageDraft::new(listing.id.clone(), vec![coordinate.clone()]);
     let mut initial_draft = cached
         .as_ref()
@@ -730,11 +746,6 @@ pub fn StorePageEditorView(
                     "Account changed. Switch back to the publisher account and reload before publishing."
                         .to_string(),
                 ));
-                if let Some(current) = current {
-                    retain_account_drafts(&current);
-                } else {
-                    PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| drafts.borrow_mut().clear());
-                }
             }
         }
     });
@@ -818,6 +829,14 @@ pub fn StorePageEditorView(
                 loading.set(false);
                 return;
             };
+            if initiating_account != publisher {
+                loading.set(false);
+                message.set(Some(
+                    "Switch to the publisher account before loading Store Page authoring state."
+                        .to_string(),
+                ));
+                return;
+            }
             operation_generation.update(|value| *value = value.wrapping_add(1));
             let generation = operation_generation.get_untracked();
             spawn_local({
@@ -1027,7 +1046,8 @@ pub fn StorePageEditorView(
             let recovery_key = recovery_key.clone();
             spawn_local(async move {
                 let result =
-                    invoke_publish_store_page(publisher, request_draft.clone(), mutations).await;
+                    invoke_publish_store_page(publisher, request_draft.clone(), mutations.clone())
+                        .await;
                 if !accepts_account_response(
                     auth.npub.get_untracked().as_deref(),
                     &initiating_account,
@@ -1037,24 +1057,19 @@ pub fn StorePageEditorView(
                     if let Ok(mut response) = result {
                         response.complete = false;
                         response.retryable = true;
-                        if let Some(event_id) =
+                        let selected_listing_event_id =
                             selected_replacement_event_id(&response, &selected_coordinate)
-                        {
-                            transaction_selected_listing_event_id.set(Some(event_id));
-                        }
+                                .or(listing_for_saved.event_id);
                         save_recovery(
                             &recovery_key,
                             PublisherRecovery {
-                                response: response.clone(),
-                                mutations: transaction_mutations.get_untracked(),
+                                response,
+                                mutations,
                                 draft: request_draft,
-                                selected_listing_event_id: transaction_selected_listing_event_id
-                                    .get_untracked(),
+                                selected_listing_event_id,
                             },
                         );
-                        partial.set(Some(response));
                     }
-                    publishing.set(false);
                     return;
                 }
                 match result {
@@ -1145,6 +1160,11 @@ pub fn StorePageEditorView(
             let listing_for_saved = listing_for_saved.clone();
             let selected_coordinate = selected_coordinate.clone();
             let recovery_key = recovery_key.clone();
+            let recovery_draft = transaction_draft
+                .get_untracked()
+                .unwrap_or_else(|| draft.get_untracked());
+            let recovery_selected_listing_event_id =
+                transaction_selected_listing_event_id.get_untracked();
             spawn_local(async move {
                 let result = invoke_retry_store_page_pointer_sync(
                     publisher,
@@ -1160,26 +1180,19 @@ pub fn StorePageEditorView(
                     generation,
                 ) {
                     if let Ok(response) = result {
-                        if let Some(event_id) =
+                        let selected_listing_event_id =
                             selected_replacement_event_id(&response, &selected_coordinate)
-                        {
-                            transaction_selected_listing_event_id.set(Some(event_id));
-                        }
+                                .or(recovery_selected_listing_event_id);
                         save_recovery(
                             &recovery_key,
                             PublisherRecovery {
-                                response: response.clone(),
-                                mutations: transaction_mutations.get_untracked(),
-                                draft: transaction_draft
-                                    .get_untracked()
-                                    .unwrap_or_else(|| draft.get_untracked()),
-                                selected_listing_event_id: transaction_selected_listing_event_id
-                                    .get_untracked(),
+                                response,
+                                mutations: all_mutations,
+                                draft: recovery_draft,
+                                selected_listing_event_id,
                             },
                         );
-                        partial.set(Some(response));
                     }
-                    publishing.set(false);
                     return;
                 }
                 match result {
@@ -1698,9 +1711,43 @@ mod tests {
         let baseline = draft.clone();
         draft.content.description_markdown = "unsaved".into();
         save_cached_draft("npub-a|listing", draft.clone(), baseline, Vec::new(), true);
-        retain_account_drafts("npub-b");
-        assert!(cached_draft("npub-a|listing").is_none());
+        assert!(cached_draft("npub-a|listing").is_some());
         assert!(cached_draft("npub-b|listing").is_none());
+        assert_eq!(
+            publisher_store_page_dirty_coordinates("npub-a"),
+            vec!["listing".to_string()]
+        );
+        assert!(publisher_store_page_dirty_coordinates("npub-b").is_empty());
+        PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| drafts.borrow_mut().clear());
+    }
+
+    #[test]
+    fn publisher_dashboard_sees_only_dirty_in_session_store_page_drafts() {
+        let clean = StorePageDraft::new("clean".into(), vec!["clean-listing".into()]);
+        save_cached_draft(
+            "npub-dashboard|clean-listing",
+            clean.clone(),
+            clean,
+            Vec::new(),
+            false,
+        );
+        let baseline = StorePageDraft::new("dirty".into(), vec!["dirty-listing".into()]);
+        let mut dirty = baseline.clone();
+        dirty.content.description_markdown = "Unsaved".into();
+        save_cached_draft(
+            "npub-dashboard|dirty-listing",
+            dirty,
+            baseline,
+            Vec::new(),
+            true,
+        );
+
+        assert_eq!(
+            publisher_store_page_dirty_coordinates("npub-dashboard"),
+            vec!["dirty-listing".to_string()]
+        );
+        assert!(publisher_store_page_dirty_coordinates("npub-other").is_empty());
+        PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| drafts.borrow_mut().clear());
     }
 
     #[test]

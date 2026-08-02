@@ -8,23 +8,17 @@ pub fn PageHeader(
     #[prop(optional)] action: Option<AnyView>,
 ) -> impl IntoView {
     view! {
-        <header class="mb-8 flex flex-wrap items-end justify-between gap-4">
-            <div class="min-w-0">
+        <header class="arc-page-header">
+            <div class="arc-page-heading">
                 {eyebrow.map(|eyebrow| view! {
-                    <p class="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-secondary">
-                        {eyebrow}
-                    </p>
+                    <p class="arc-page-eyebrow">{eyebrow}</p>
                 })}
-                <h1 class="font-display text-4xl font-bold leading-tight text-on-surface md:text-5xl">
-                    {title}
-                </h1>
+                <h1>{title}</h1>
                 {description.map(|description| view! {
-                    <p class="mt-2 max-w-2xl text-sm leading-relaxed text-on-surface-variant md:text-base">
-                        {description}
-                    </p>
+                    <p class="arc-page-description">{description}</p>
                 })}
             </div>
-            {action.map(|action| view! { <div class="shrink-0">{action}</div> })}
+            {action.map(|action| view! { <div class="arc-page-actions">{action}</div> })}
         </header>
     }
 }

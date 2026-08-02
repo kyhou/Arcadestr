@@ -1,17 +1,115 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::campaign_management::current_user_listings;
 use crate::components::BadgeShowcase;
-use crate::models::{npub_fallback_label, GameListing, Nip05Status, UserProfile};
+use crate::models::{
+    npub_fallback_label, AcquisitionPolicy, GameListing, Nip05Status, UserProfile,
+};
 use crate::tauri_bridge::invoke_verify_nip05;
-use crate::ui_v2::components::Button;
+use crate::ui_v2::components::{
+    artwork_state_from_url, ArtworkRole, EmptyState, FeedbackLayout, GameArtwork, LoadingState,
+    StatusChip, StatusChipSize, StatusChipVariant,
+};
 use crate::ui_v2::views::marketplace_loader::use_marketplace_listings_with_limit;
-use crate::ui_v2::views::{use_fallback_cover, valid_cover_url, FALLBACK_COVER};
+use crate::ui_v2::views::valid_cover_url;
 use crate::AuthContext;
 
 #[path = "../../components/nip05_badge.rs"]
 mod nip05_badge;
 use nip05_badge::Nip05Badge;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileMetadataState {
+    SignedOut,
+    Loading,
+    Missing,
+    Error,
+    Ready,
+    ReadyWithError,
+}
+
+fn profile_has_visible_metadata(profile: &UserProfile) -> bool {
+    [
+        profile.display_name.as_deref(),
+        profile.name.as_deref(),
+        profile.picture.as_deref(),
+        profile.about.as_deref(),
+        profile.website.as_deref(),
+        profile.nip05.as_deref(),
+        profile.lud16.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty())
+}
+
+fn profile_for_account(profile: Option<UserProfile>, npub: Option<&str>) -> Option<UserProfile> {
+    profile.filter(|profile| Some(profile.npub.as_str()) == npub)
+}
+
+fn profile_metadata_state(
+    npub: Option<&str>,
+    profile: Option<&UserProfile>,
+    loading: bool,
+    has_error: bool,
+) -> ProfileMetadataState {
+    if loading {
+        ProfileMetadataState::Loading
+    } else if npub.is_none() {
+        if has_error {
+            ProfileMetadataState::Error
+        } else {
+            ProfileMetadataState::SignedOut
+        }
+    } else if profile.is_some_and(profile_has_visible_metadata) {
+        if has_error {
+            ProfileMetadataState::ReadyWithError
+        } else {
+            ProfileMetadataState::Ready
+        }
+    } else if has_error {
+        ProfileMetadataState::Error
+    } else {
+        ProfileMetadataState::Missing
+    }
+}
+
+fn profile_display_name(profile: Option<&UserProfile>, npub: Option<&str>) -> String {
+    profile
+        .map(UserProfile::display)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| npub.map(npub_fallback_label))
+        .unwrap_or_else(|| "Profile unavailable".to_string())
+}
+
+fn abbreviate_public_key(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= 24 {
+        value.to_string()
+    } else {
+        format!(
+            "{}…{}",
+            chars[..12].iter().collect::<String>(),
+            chars[chars.len() - 8..].iter().collect::<String>()
+        )
+    }
+}
+
+fn profile_access_chip(listing: &GameListing) -> (&'static str, StatusChipVariant) {
+    match listing.acquisition {
+        AcquisitionPolicy::Public => ("Public", StatusChipVariant::Public),
+        AcquisitionPolicy::TimedAccess { .. } => ("Timed access", StatusChipVariant::TimedAccess),
+        AcquisitionPolicy::Gated if listing.has_declared_price() => {
+            ("Paid", StatusChipVariant::Active)
+        }
+        AcquisitionPolicy::Gated => ("Gated", StatusChipVariant::Gated),
+    }
+}
+
+fn reviews_unavailable_message() -> &'static str {
+    "Verified reviews are not available because Arcadestr has no authoritative review query or purchase-linked review model."
+}
 
 fn normalize_nip05_identifier(identifier: &str) -> Option<(String, String, String)> {
     let trimmed = identifier.trim();
@@ -70,7 +168,10 @@ fn should_auto_verify_nip05(
     last_attempt_key: Option<&str>,
 ) -> bool {
     let identifier = nip05_status_identifier(status);
-    if identifier.is_empty() || expected_npub.is_empty() {
+    if identifier.is_empty()
+        || status.normalized_identifier.trim().is_empty()
+        || expected_npub.is_empty()
+    {
         return false;
     }
     if status.verified
@@ -95,11 +196,48 @@ fn should_apply_nip05_response(
         && requested_identifier == current_identifier
 }
 
+fn checked_nip05_response(status: Nip05Status, requested_identifier: &str) -> Option<Nip05Status> {
+    let (expected, _, _) = normalize_nip05_identifier(requested_identifier)?;
+    let (returned, _, _) = normalize_nip05_identifier(&nip05_status_identifier(&status))?;
+    let consistent_verification = status.verified == status.status.eq_ignore_ascii_case("verified");
+    (expected == returned && consistent_verification).then_some(status)
+}
+
 fn valid_public_url(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let parsed = url::Url::parse(value.trim()).ok()?;
-        matches!(parsed.scheme(), "http" | "https").then(|| value.trim().to_string())
+        if parsed.scheme() != "https" || !is_public_url_host(&parsed) {
+            return None;
+        }
+        Some(value.trim().to_string())
     })
+}
+
+fn is_public_url_host(url: &url::Url) -> bool {
+    let Some(host) = url.host() else {
+        return false;
+    };
+    match host {
+        url::Host::Domain(domain) => !domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(address) => {
+            let octets = address.octets();
+            !(address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_broadcast()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1])))
+        }
+        url::Host::Ipv6(address) => {
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.is_multicast())
+        }
+    }
 }
 
 #[component]
@@ -110,10 +248,12 @@ pub fn ProfileV2View(
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let verification_available = !cfg!(feature = "web");
     let marketplace_state = use_marketplace_listings_with_limit(50);
-    let nip05_status = RwSignal::new(nip05_status_from_profile(
-        auth.profile.get_untracked().as_ref(),
-    ));
+    let initial_npub = auth.npub.get_untracked();
+    let initial_profile =
+        profile_for_account(auth.profile.get_untracked(), initial_npub.as_deref());
+    let nip05_status = RwSignal::new(nip05_status_from_profile(initial_profile.as_ref()));
     let last_auto_nip05_attempt = RwSignal::new(None::<String>);
+    let avatar_failed = RwSignal::new(false);
 
     let listings = marketplace_state.listings;
     let listings_auth = auth.clone();
@@ -121,26 +261,33 @@ pub fn ProfileV2View(
         let Some(npub) = listings_auth.npub.get() else {
             return Vec::new();
         };
-        listings
-            .get()
-            .into_iter()
-            .filter(|listing| listing.publisher_npub == npub)
-            .collect::<Vec<_>>()
+        current_user_listings(listings.get(), &npub)
     });
-    let current_npub = Signal::derive(move || auth.npub.get().unwrap_or_default());
+    let current_npub_auth = auth.clone();
+    let current_npub = Signal::derive(move || current_npub_auth.npub.get().unwrap_or_default());
+    let profile_auth = auth.clone();
+    let profile = Signal::derive(move || {
+        let npub = profile_auth.npub.get();
+        profile_for_account(profile_auth.profile.get(), npub.as_deref())
+    });
     let display_name = Signal::derive(move || {
-        auth.profile
-            .get()
-            .map(|profile| profile.display())
-            .or_else(|| auth.npub.get().map(|npub| npub_fallback_label(&npub)))
-            .unwrap_or_else(|| "Unknown account".to_string())
+        profile_display_name(profile.get().as_ref(), Some(current_npub.get().as_str()))
     });
-    let profile = Signal::derive(move || auth.profile.get());
+    let metadata_auth = auth.clone();
+    let metadata_state = Signal::derive(move || {
+        profile_metadata_state(
+            metadata_auth.npub.get().as_deref(),
+            profile.get().as_ref(),
+            metadata_auth.is_loading.get(),
+            metadata_auth.error.get().is_some(),
+        )
+    });
 
     let auth_for_auto_verify = auth.clone();
     Effect::new(move |_| {
         nip05_status.set(nip05_status_from_profile(profile.get().as_ref()));
         last_auto_nip05_attempt.set(None);
+        avatar_failed.set(false);
     });
 
     Effect::new(move |_| {
@@ -172,10 +319,19 @@ pub fn ProfileV2View(
                 return;
             }
             match result {
-                Ok(status) => nip05_status.set(status),
-                Err(error) => nip05_status.set(Nip05Status {
+                Ok(status) => match checked_nip05_response(status, &identifier) {
+                    Some(status) => nip05_status.set(status),
+                    None => nip05_status.set(Nip05Status {
+                        status: "failed".to_string(),
+                        message: "The identity service returned an inconsistent response."
+                            .to_string(),
+                        ..default_nip05_status(Some(identifier))
+                    }),
+                },
+                Err(_) => nip05_status.set(Nip05Status {
                     status: "failed".to_string(),
-                    message: format!("Verification failed: {error}"),
+                    message: "NIP-05 lookup failed. Retry when the identity service is available."
+                        .to_string(),
                     ..default_nip05_status(Some(identifier))
                 }),
             }
@@ -200,10 +356,19 @@ pub fn ProfileV2View(
                 return;
             }
             match result {
-                Ok(status) => nip05_status.set(status),
-                Err(error) => nip05_status.set(Nip05Status {
+                Ok(status) => match checked_nip05_response(status, &identifier) {
+                    Some(status) => nip05_status.set(status),
+                    None => nip05_status.set(Nip05Status {
+                        status: "failed".to_string(),
+                        message: "The identity service returned an inconsistent response."
+                            .to_string(),
+                        ..default_nip05_status(Some(identifier))
+                    }),
+                },
+                Err(_) => nip05_status.set(Nip05Status {
                     status: "failed".to_string(),
-                    message: format!("Verification failed: {error}"),
+                    message: "NIP-05 lookup failed. Retry when the identity service is available."
+                        .to_string(),
                     ..default_nip05_status(Some(identifier))
                 }),
             }
@@ -211,103 +376,118 @@ pub fn ProfileV2View(
     });
 
     view! {
-        <section class="v2-profile-wrap">
-            <header class="v2-profile-hero v2-panel-glass">
-                <div class="v2-profile-avatar-wrap">
-                    {move || {
-                        let value = profile.get();
-                        let picture = value.as_ref().and_then(|profile| profile.picture.clone());
-                        match picture {
-                            Some(url) => view! { <img class="v2-profile-avatar" src=url alt="" on:error=use_fallback_cover /> }.into_any(),
-                            None => view! {
-                                <div class="v2-profile-avatar v2-profile-avatar-fallback" aria-hidden="true">
-                                    {move || display_name.get().chars().next().unwrap_or('?').to_uppercase().to_string()}
-                                </div>
-                            }.into_any(),
-                        }
-                    }}
-                </div>
-                <div class="v2-profile-identity">
-                    <p class="v2-store-kicker">"Public profile"</p>
-                    <h1 class="v2-display">{move || display_name.get()}</h1>
-                    {move || profile.get().and_then(|profile| profile.name).filter(|name| !name.trim().is_empty()).map(|name| view! { <p class="v2-profile-username">{name}</p> })}
-                    <p class="v2-profile-npub">{move || current_npub.get()}</p>
-                    {if verification_available {
-                        view! { <Nip05Badge status=nip05_status.into() on_verify=on_verify_nip05 /> }.into_any()
-                    } else {
-                        view! {
-                            <p class="v2-profile-muted">
-                                {move || {
-                                    let identifier = nip05_status_identifier(&nip05_status.get());
-                                    if identifier.is_empty() {
-                                        "No NIP-05 identifier is available.".to_string()
-                                    } else {
-                                        format!("{identifier} · Verification unavailable on standalone web")
-                                    }
-                                }}
-                            </p>
-                        }.into_any()
-                    }}
-                </div>
-            </header>
-
-            <div class="v2-profile-layout">
-                <main class="v2-profile-main">
-                    <section class="v2-profile-card v2-panel">
-                        <h2>"About"</h2>
-                        {move || profile.get().and_then(|profile| profile.about).filter(|about| !about.trim().is_empty()).map(|about| view! { <p class="v2-profile-about">{about}</p> }).unwrap_or_else(|| view! { <p class="v2-profile-muted">{"No public biography is available.".to_string()}</p> })}
-                        <dl class="v2-profile-metadata">
-                            {move || profile.get().and_then(|profile| valid_public_url(profile.website)).map(|website| {
-                                let href = website.clone();
-                                view! { <div><dt>"Website"</dt><dd><a href=href target="_blank" rel="noopener noreferrer">{website}</a></dd></div> }
-                            })}
-                            {move || profile.get().and_then(|profile| profile.lud16).filter(|value| !value.trim().is_empty()).map(|value| view! { <div><dt>"Lightning address"</dt><dd>{value}</dd></div> })}
-                            {move || profile.get().and_then(|profile| profile.nip05).filter(|value| !value.trim().is_empty()).map(|value| view! {
-                                <div><dt>"NIP-05 identifier"</dt><dd>{value}<span>{move || if nip05_status.get().verified { "Verified" } else { "Not verified" }}</span></dd></div>
-                            })}
-                        </dl>
-                        <p class="v2-profile-readonly-note">"Profile editing is not available in this client. This page reflects signed public metadata fetched from relays."</p>
-                    </section>
-
-                    <section class="v2-profile-card v2-panel">
-                        <div class="v2-profile-section-header">
-                            <div><p class="v2-store-kicker">"Publisher catalog"</p><h2>"Published games"</h2></div>
-                            <Button on_click=move |_| on_open_publish.run(())>"Open publishing"</Button>
-                        </div>
-                        {move || if marketplace_state.loading.get() && my_listings.get().is_empty() {
-                            view! { <p class="v2-profile-muted" role="status">"Loading published listings..."</p> }.into_any()
-                        } else if marketplace_state.error.get().is_some() && my_listings.get().is_empty() {
-                            let error = marketplace_state.error.get().unwrap_or_default();
-                            view! { <p class="v2-settings-alert v2-settings-alert-error">{error}</p> }.into_any()
-                        } else if my_listings.get().is_empty() {
-                            view! { <p class="v2-profile-muted">"No published listings were found for this account."</p> }.into_any()
-                        } else {
-                            let refresh_error = marketplace_state.error.get();
-                            view! {
-                                <div>
-                                    {refresh_error.map(|_| view! { <p class="v2-settings-alert" role="status">"Relay refresh failed; cached published games remain available."</p> })}
-                                    <div class="v2-profile-listings-grid">
-                                        {my_listings.get().into_iter().map(|listing| {
-                                            let selected = listing.clone();
-                                            let image = valid_cover_url(&listing.images).unwrap_or_else(|| FALLBACK_COVER.to_string());
-                                            view! {
-                                                <button class="v2-profile-listing-card" on:click=move |_| on_open_listing.run(selected.clone())>
-                                                    <img src=image alt="" on:error=use_fallback_cover />
-                                                    <span><strong>{listing.title}</strong><small>{format!("{} {}", listing.price, listing.currency)}</small></span>
-                                                </button>
-                                            }
-                                        }).collect::<Vec<_>>()}
-                                    </div>
-                                </div>
-                            }.into_any()
+        <section class="arc-profile-page">
+            <Show
+                when=move || !current_npub.get().is_empty()
+                fallback=move || match metadata_state.get() {
+                    ProfileMetadataState::Loading => view! {
+                        <div><h1 class="arc-profile-page-title">"Profile"</h1><LoadingState title="Loading active account" description="Profile identity remains hidden until the active public key is available.".to_string() layout=FeedbackLayout::Panel /></div>
+                    }.into_any(),
+                    ProfileMetadataState::Error | ProfileMetadataState::ReadyWithError => view! {
+                        <div><h1 class="arc-profile-page-title">"Profile"</h1><div class="arc-profile-notice arc-profile-notice-error" role="alert"><strong>"Active account unavailable"</strong><span>"Profile identity cannot be shown because the active public key could not be resolved."</span></div></div>
+                    }.into_any(),
+                    ProfileMetadataState::SignedOut | ProfileMetadataState::Missing | ProfileMetadataState::Ready => view! {
+                        <div><h1 class="arc-profile-page-title">"Profile"</h1><EmptyState title="Sign in to view your profile" description="Public metadata, authored listings, NIP-05 identity, and earned badges are loaded for the active account." icon="person_off" layout=FeedbackLayout::Panel /></div>
+                    }.into_any(),
+                }
+            >
+                <header class="arc-profile-header">
+                    <div class="arc-profile-avatar">
+                        {move || {
+                            let picture = profile.get().and_then(|profile| valid_public_url(profile.picture));
+                            if let Some(url) = picture.filter(|_| !avatar_failed.get()) {
+                                view! { <img src=url alt=format!("Profile image for {}", display_name.get()) on:error=move |_| avatar_failed.set(true) /> }.into_any()
+                            } else {
+                                view! { <div class="arc-profile-avatar-fallback" role="img" aria-label=format!("Initial avatar for {}", display_name.get())>{display_name.get().chars().next().unwrap_or('?').to_uppercase().to_string()}</div> }.into_any()
+                            }
                         }}
-                    </section>
-                </main>
+                    </div>
+                    <div class="arc-profile-identity">
+                        <div class="arc-profile-title-row">
+                            <div>
+                                <p class="v2-store-kicker">"Public profile"</p>
+                                <h1>{move || display_name.get()}</h1>
+                            </div>
+                            <div class="arc-profile-actions"><button class="v2-btn-secondary" on:click=move |_| on_open_publish.run(())>"Open publishing"</button></div>
+                        </div>
+                        <div class="arc-profile-identity-chips">
+                            <StatusChip label="Current account" variant=StatusChipVariant::Active icon=Some("person") size=StatusChipSize::Compact />
+                            {move || (!my_listings.get().is_empty()).then(|| view! { <StatusChip label=format!("Publisher of {} loaded game(s)", my_listings.get().len()) variant=StatusChipVariant::Published icon=Some("sports_esports") size=StatusChipSize::Compact /> })}
+                        </div>
+                        {move || profile.get().and_then(|profile| profile.name).filter(|name| !name.trim().is_empty()).map(|name| view! { <p class="arc-profile-username">{name}</p> })}
+                        <p class="arc-profile-key">{move || abbreviate_public_key(&current_npub.get())}</p>
+                        {if verification_available {
+                            view! { <Nip05Badge status=nip05_status.into() on_verify=on_verify_nip05 /> }.into_any()
+                        } else {
+                            view! { <p class="arc-profile-muted">{move || { let identifier = nip05_status_identifier(&nip05_status.get()); if identifier.is_empty() { "No NIP-05 identifier is available.".to_string() } else { format!("{identifier} · Verification unavailable on standalone web") } }}</p> }.into_any()
+                        }}
+                    </div>
+                </header>
 
-                <aside class="v2-profile-badges">
-                    <BadgeShowcase profile_identifier=current_npub />
-                </aside>
-            </div>
+                {move || match metadata_state.get() {
+                    ProfileMetadataState::Loading => view! { <LoadingState title="Loading profile metadata" description="Checking cached metadata while the active account finishes loading.".to_string() layout=FeedbackLayout::Compact /> }.into_any(),
+                    ProfileMetadataState::Error => view! { <div class="arc-profile-notice arc-profile-notice-error" role="alert"><strong>"Profile metadata unavailable"</strong><span>"The current account remains visible, but relay metadata could not be resolved."</span></div> }.into_any(),
+                    ProfileMetadataState::Missing => view! { <div class="arc-profile-notice" role="status"><strong>"No public profile metadata"</strong><span>"This account has no usable name, biography, website, or profile image in the current metadata result."</span></div> }.into_any(),
+                    ProfileMetadataState::ReadyWithError => view! { <div class="arc-profile-notice" role="status"><strong>"Profile refresh incomplete"</strong><span>"Previously loaded metadata remains visible because the latest refresh failed."</span></div> }.into_any(),
+                    ProfileMetadataState::Ready | ProfileMetadataState::SignedOut => view! { <></> }.into_any(),
+                }}
+
+                <div class="arc-profile-layout">
+                    <main class="arc-profile-main">
+                        <section class="arc-profile-about" aria-labelledby="profile-about-title">
+                            <p class="v2-store-kicker">"About"</p><h2 id="profile-about-title" class="sr-only">"About this profile"</h2>
+                            {move || profile.get().and_then(|profile| profile.about).filter(|about| !about.trim().is_empty()).map(|about| view! { <p>{about}</p> }.into_any()).unwrap_or_else(|| view! { <p class="arc-profile-muted">"No public biography is available."</p> }.into_any())}
+                            <dl class="arc-profile-metadata">
+                                {move || profile.get().and_then(|profile| valid_public_url(profile.website)).map(|website| { let href = website.clone(); view! { <div><dt>"Website"</dt><dd><a href=href target="_blank" rel="noopener noreferrer">{website}</a></dd></div> } })}
+                                {move || profile.get().and_then(|profile| profile.lud16).filter(|value| !value.trim().is_empty()).map(|value| view! { <div><dt>"Lightning address"</dt><dd>{value}</dd></div> })}
+                            </dl>
+                            <details class="arc-profile-key-details"><summary>"Public identity details"</summary><p>{move || current_npub.get()}</p></details>
+                            <p class="arc-profile-readonly">"Read-only signed metadata. Profile editing is not implemented in this client."</p>
+                        </section>
+
+                        <section class="arc-profile-section" aria-labelledby="profile-games-title">
+                            <div class="arc-profile-section-header"><div><p class="v2-store-kicker">"Publisher catalog"</p><h2 id="profile-games-title">"Published games"</h2></div></div>
+                            {move || if marketplace_state.loading.get() && my_listings.get().is_empty() {
+                                view! { <LoadingState title="Loading published listings" description="The profile remains available while authored listing events load.".to_string() layout=FeedbackLayout::Compact /> }.into_any()
+                            } else if marketplace_state.error.get().is_some() && my_listings.get().is_empty() {
+                                view! { <div class="arc-profile-notice arc-profile-notice-error" role="alert"><strong>"Published listings unavailable"</strong><span>"No authored listings are available from the current marketplace result."</span></div> }.into_any()
+                            } else if my_listings.get().is_empty() {
+                                view! { <EmptyState title="No authored listings in the loaded catalog" description="The latest marketplace window contains no current NIP-99 listings authored by this account." icon="sports_esports" layout=FeedbackLayout::Compact /> }.into_any()
+                            } else {
+                                let refresh_failed = marketplace_state.error.get().is_some();
+                                view! {
+                                    <div>
+                                        {refresh_failed.then(|| if marketplace_state.using_cached_data.get() {
+                                            view! { <div class="arc-profile-notice" role="status"><strong>"Cached publisher catalog"</strong><span>"Cached authored listings remain visible after a relay refresh failure."</span></div> }
+                                        } else {
+                                            view! { <div class="arc-profile-notice" role="status"><strong>"Partial publisher catalog"</strong><span>"Authored listings received before the marketplace refresh failed remain visible."</span></div> }
+                                        })}
+                                        <div class="arc-profile-listings-grid">
+                                            {my_listings.get().into_iter().map(|listing| {
+                                                let selected = listing.clone();
+                                                let title = listing.title.clone();
+                                                let artwork = artwork_state_from_url(valid_cover_url(&listing.images));
+                                                let (access_label, access_variant) = profile_access_chip(&listing);
+                                                view! {
+                                                    <button class="arc-profile-listing-card" on:click=move |_| on_open_listing.run(selected.clone())>
+                                                        <div class="arc-profile-listing-art"><GameArtwork title=title.clone() state=artwork role=ArtworkRole::Card /></div>
+                                                        <span class="arc-profile-listing-copy"><strong>{title}</strong><small>{format!("{} {}", listing.price, listing.currency)}</small><StatusChip label=access_label variant=access_variant icon=None size=StatusChipSize::Compact /></span>
+                                                    </button>
+                                                }
+                                            }).collect::<Vec<_>>()}
+                                        </div>
+                                    </div>
+                                }.into_any()
+                            }}
+                        </section>
+
+                        <section class="arc-profile-section arc-profile-unavailable" aria-labelledby="profile-reviews-title">
+                            <p class="v2-store-kicker">"Reviews"</p><h2 id="profile-reviews-title">"Verified buyer reviews unavailable"</h2><p>{reviews_unavailable_message()}</p>
+                        </section>
+                    </main>
+                    <aside class="arc-profile-side"><BadgeShowcase profile_identifier=current_npub /></aside>
+                </div>
+            </Show>
         </section>
     }
 }
@@ -353,6 +533,21 @@ mod tests {
     }
 
     #[test]
+    fn nip05_response_must_match_identifier_and_verification_flag() {
+        let valid = Nip05Status {
+            verified: true,
+            status: "verified".into(),
+            ..default_nip05_status(Some("player@example.com".into()))
+        };
+        assert!(checked_nip05_response(valid.clone(), "player@example.com").is_some());
+        assert!(checked_nip05_response(valid.clone(), "other@example.com").is_none());
+
+        let mut contradictory = valid;
+        contradictory.verified = false;
+        assert!(checked_nip05_response(contradictory, "player@example.com").is_none());
+    }
+
+    #[test]
     fn auto_verify_skips_completed_or_duplicate_attempts() {
         let mut status = nip05_status_from_profile(Some(&profile(false)));
         assert!(should_auto_verify_nip05(&status, "npub1test", None));
@@ -364,6 +559,9 @@ mod tests {
         status.verified = true;
         status.status = "verified".to_string();
         assert!(!should_auto_verify_nip05(&status, "npub1test", None));
+
+        let invalid = default_nip05_status(Some("not-an-identifier".into()));
+        assert!(!should_auto_verify_nip05(&invalid, "npub1test", None));
     }
 
     #[test]
@@ -371,5 +569,116 @@ mod tests {
         let source = include_str!("profile.rs");
         assert!(!source.contains(concat!("Edit ", "Profile")));
         assert!(!source.contains(concat!("Save ", "Profile")));
+        assert!(!source.contains(concat!("Follow ", "profile")));
+        assert!(!source.contains(concat!("Message ", "profile")));
+    }
+
+    #[test]
+    fn profile_state_keeps_signed_out_loading_missing_and_error_distinct() {
+        assert_eq!(
+            profile_metadata_state(None, None, false, false),
+            ProfileMetadataState::SignedOut
+        );
+        assert_eq!(
+            profile_metadata_state(Some("npub"), None, true, false),
+            ProfileMetadataState::Loading
+        );
+        assert_eq!(
+            profile_metadata_state(Some("npub"), None, false, true),
+            ProfileMetadataState::Error
+        );
+        assert_eq!(
+            profile_metadata_state(Some("npub"), None, false, false),
+            ProfileMetadataState::Missing
+        );
+        let mut loaded = UserProfile::default();
+        loaded.name = Some("Player".into());
+        assert_eq!(
+            profile_metadata_state(Some("npub"), Some(&loaded), false, false),
+            ProfileMetadataState::Ready
+        );
+        assert_eq!(
+            profile_metadata_state(Some("npub"), Some(&loaded), false, true),
+            ProfileMetadataState::ReadyWithError
+        );
+
+        let about_only = UserProfile {
+            about: Some("Biography".into()),
+            ..UserProfile::default()
+        };
+        assert_eq!(
+            profile_metadata_state(Some("npub"), Some(&about_only), false, false),
+            ProfileMetadataState::Ready
+        );
+    }
+
+    #[test]
+    fn profile_metadata_must_match_the_active_account() {
+        assert!(profile_for_account(Some(profile(false)), Some("npub1test")).is_some());
+        assert!(profile_for_account(Some(profile(false)), Some("npub1other")).is_none());
+    }
+
+    #[test]
+    fn profile_media_and_links_require_public_https_urls() {
+        assert_eq!(
+            valid_public_url(Some("https://cdn.example.org/avatar.png".into())),
+            Some("https://cdn.example.org/avatar.png".into())
+        );
+        assert_eq!(valid_public_url(Some("http://example.org".into())), None);
+        assert_eq!(
+            valid_public_url(Some("https://127.0.0.1/image".into())),
+            None
+        );
+        assert_eq!(
+            valid_public_url(Some("https://localhost/image".into())),
+            None
+        );
+        assert_eq!(
+            valid_public_url(Some("https://[fe80::1]/image".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn display_name_and_public_key_fallbacks_are_safe() {
+        assert_eq!(
+            profile_display_name(None, Some("npub1abcdefghijklmnop")),
+            npub_fallback_label("npub1abcdefghijklmnop")
+        );
+        assert_eq!(abbreviate_public_key("short-key"), "short-key");
+        assert_eq!(
+            abbreviate_public_key("npub1abcdefghijklmnopqrstuvwxyz0123456789"),
+            "npub1abcdefg…23456789"
+        );
+    }
+
+    #[test]
+    fn publisher_status_requires_current_nip99_author_evidence() {
+        let mut authored = serde_json::from_value::<GameListing>(serde_json::json!({
+            "id": "game",
+            "source": "nip99_listing",
+            "title": "Game",
+            "description": "Description",
+            "publisher_npub": "npub1author",
+            "created_at": 1
+        }))
+        .expect("listing");
+        let mut legacy = authored.clone();
+        legacy.id = "legacy".into();
+        legacy.source = crate::models::ListingSource::Legacy;
+        let mut other = authored.clone();
+        other.id = "other".into();
+        other.publisher_npub = "npub1other".into();
+
+        let mut result =
+            current_user_listings(vec![authored.clone(), legacy, other], "npub1author");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.remove(0).id, authored.id);
+    }
+
+    #[test]
+    fn reviews_are_unavailable_not_successfully_empty() {
+        assert!(reviews_unavailable_message().contains("no authoritative review query"));
+        assert!(!reviews_unavailable_message().contains("No reviews yet"));
     }
 }

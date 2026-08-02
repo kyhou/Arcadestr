@@ -52,19 +52,20 @@ fn tier_rows(tier: &StorePageRequirementTier) -> Vec<(&'static str, String)> {
 fn media_view(item: StorePageMedia) -> AnyView {
     if item.media_type == "video" {
         view! {
-            <figure class="overflow-hidden rounded-2xl bg-black">
-                <video class="aspect-video w-full" controls preload="metadata" poster=item.thumbnail_url.clone()>
+            <figure class="v2-detail-rich-media v2-detail-rich-media-video">
+                <video controls preload="metadata" poster=item.thumbnail_url.clone()>
                     <source src=item.url />
                     "This direct video cannot be played."
                 </video>
-                {item.caption.map(|caption| view! { <figcaption class="p-3 text-sm text-on-surface-variant">{caption}</figcaption> })}
+                {item.caption.map(|caption| view! { <figcaption>{caption}</figcaption> })}
             </figure>
-        }.into_any()
+        }
+        .into_any()
     } else {
         view! {
-            <figure class="overflow-hidden rounded-2xl bg-surface-container-low">
-                <img class="aspect-video w-full object-cover" src=item.url alt=item.alt.unwrap_or_else(|| "Game media".into()) on:error=use_fallback_cover />
-                {item.caption.map(|caption| view! { <figcaption class="p-3 text-sm text-on-surface-variant">{caption}</figcaption> })}
+            <figure class="v2-detail-rich-media">
+                <img src=item.url alt=item.alt.unwrap_or_else(|| "Game media".into()) on:error=use_fallback_cover />
+                {item.caption.map(|caption| view! { <figcaption>{caption}</figcaption> })}
             </figure>
         }.into_any()
     }
@@ -120,13 +121,13 @@ pub fn StorePageRichDetail(
         <Show when=move || !selected_media.get_value().is_empty()>
             <section class="v2-detail-section" aria-labelledby="store-page-media-title">
                 <p class="v2-store-kicker">"Media"</p><h2 id="store-page-media-title">"Gallery"</h2>
-                <div class="mt-4">{move || selected_media.get_value().get(selected.get()).cloned().map(media_view)}</div>
-                <button type="button" class="v2-btn-secondary mt-3" on:click=move |_| expanded.set(true)>"Expand media"</button>
-                <dialog node_ref=dialog_ref class="m-auto w-[min(92vw,72rem)] rounded-2xl bg-surface-container-high p-4 text-on-surface backdrop:bg-black/80" on:cancel=move |_event: web_sys::Event| expanded.set(false)>
+                <div class="v2-detail-media-stage">{move || selected_media.get_value().get(selected.get()).cloned().map(media_view)}</div>
+                <button type="button" class="v2-btn-secondary v2-detail-expand-media" on:click=move |_| expanded.set(true)>"Expand media"</button>
+                <dialog node_ref=dialog_ref class="v2-detail-media-dialog" on:cancel=move |_event: web_sys::Event| expanded.set(false)>
                     <div>{move || selected_media.get_value().get(selected.get()).cloned().map(media_view)}</div>
-                    <button type="button" class="v2-btn-secondary mt-3" autofocus on:click=move |_| expanded.set(false)>"Close media"</button>
+                    <button type="button" class="v2-btn-secondary v2-detail-expand-media" autofocus on:click=move |_| expanded.set(false)>"Close media"</button>
                 </dialog>
-                <div class="mt-3 flex gap-2 overflow-x-auto pb-2" role="list" aria-label="Select game media">
+                <div class="v2-detail-media-thumbs" role="list" aria-label="Select game media">
                     {media.clone().into_iter().enumerate().map(|(index, item)| {
                         let thumbnail = item.thumbnail_url.clone().unwrap_or_else(|| {
                             if item.media_type == "video" {
@@ -135,8 +136,8 @@ pub fn StorePageRichDetail(
                                 item.url.clone()
                             }
                         });
-                        view! { <button type="button" class="shrink-0 rounded-lg outline-none ring-primary focus-visible:ring-2" on:click=move |_| selected.set(index)>
-                            <img class="h-16 w-28 rounded-lg object-cover" src=thumbnail alt=item.alt.unwrap_or_else(|| format!("Select {}", label(&item.role))) on:error=use_fallback_cover />
+                        view! { <button type="button" class="v2-detail-media-thumb" class:active=move || selected.get() == index aria-pressed=move || selected.get() == index on:click=move |_| selected.set(index)>
+                            <img src=thumbnail alt=item.alt.unwrap_or_else(|| format!("Select {}", label(&item.role))) on:error=use_fallback_cover />
                         </button> }
                     }).collect_view()}
                 </div>

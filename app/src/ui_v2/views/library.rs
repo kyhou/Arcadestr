@@ -12,20 +12,80 @@ use crate::tauri_bridge::{
     invoke_get_installed_games, invoke_get_library_games, invoke_get_listing_ownership,
     invoke_get_platform_info, InstalledGame, LibraryGame,
 };
-use crate::ui_v2::components::PageHeader;
+use crate::ui_v2::components::{
+    artwork_state_from_url, ArtworkRole, EmptyState, ErrorSeverity, ErrorState, FeedbackLayout,
+    GameArtwork, LoadingState, PageHeader, PageTabItem, PageTabSemantics, PageTabs, StatusChip,
+    StatusChipSize, StatusChipVariant,
+};
 use crate::ui_v2::views::marketplace_loader::use_marketplace_listings_with_limit;
-use crate::ui_v2::views::{use_fallback_cover, valid_cover_url, FALLBACK_COVER};
+use crate::ui_v2::views::valid_cover_url;
 use crate::AuthContext;
 
 const LIBRARY_MARKETPLACE_LIMIT: usize = 200;
 const INSTALLATION_SCOPE_LABEL: &str = "Installed on this device; not account-scoped";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum MetadataFilter {
+enum LibraryFilter {
     #[default]
     All,
-    Available,
-    Missing,
+    Saved,
+    Installed,
+    NotInstalled,
+    TimedAccess,
+    NeedsAttention,
+}
+
+impl LibraryFilter {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Saved => "saved",
+            Self::Installed => "installed",
+            Self::NotInstalled => "not-installed",
+            Self::TimedAccess => "timed-access",
+            Self::NeedsAttention => "needs-attention",
+        }
+    }
+
+    fn from_id(id: &str) -> Self {
+        match id {
+            "saved" => Self::Saved,
+            "installed" => Self::Installed,
+            "not-installed" => Self::NotInstalled,
+            "timed-access" => Self::TimedAccess,
+            "needs-attention" => Self::NeedsAttention,
+            _ => Self::All,
+        }
+    }
+
+    const fn empty_copy(self) -> (&'static str, &'static str) {
+        match self {
+            Self::All => (
+                "Your library is empty",
+                "Saved account games and artifacts registered on this device will appear here.",
+            ),
+            Self::Saved => (
+                "No account-saved games",
+                "Games added to the active account's library will appear here.",
+            ),
+            Self::Installed => (
+                "No installed artifacts",
+                "Verified artifacts registered on this device will appear here.",
+            ),
+            Self::NotInstalled => (
+                "No saved games waiting for download",
+                "Every matched account-saved game is already registered on this device.",
+            ),
+            Self::TimedAccess => (
+                "No timed-access games",
+                "No saved or installed listing currently uses a timed-access policy.",
+            ),
+            Self::NeedsAttention => (
+                "No library issues found",
+                "No visible records have expired access, ownership lookup failures, malformed coordinates, or compatibility warnings.",
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +99,34 @@ enum LibraryCompatibility {
 enum LibraryAvailability {
     DesktopRegistry,
     DesktopOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryContentState {
+    Loading,
+    BlockingError,
+    Empty,
+    Ready,
+}
+
+fn library_content_state(
+    visible_count: usize,
+    has_saved_data: bool,
+    has_installed_data: bool,
+    waiting_for_saved: bool,
+    waiting_for_installed: bool,
+    saved_failed: bool,
+    registry_failed: bool,
+) -> LibraryContentState {
+    if visible_count > 0 {
+        LibraryContentState::Ready
+    } else if waiting_for_saved || waiting_for_installed {
+        LibraryContentState::Loading
+    } else if !has_saved_data && !has_installed_data && (registry_failed || saved_failed) {
+        LibraryContentState::BlockingError
+    } else {
+        LibraryContentState::Empty
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -242,7 +330,6 @@ fn entry_matches_search(entry: &LibraryEntry, query: &str) -> bool {
         fallback_title(entry),
         publisher_label(entry),
         entry.installed.game_coordinate.clone(),
-        entry.installed.file_path.clone(),
         entry.installed.version.clone().unwrap_or_default(),
     ];
     if let Some(listing) = &entry.listing {
@@ -251,11 +338,107 @@ fn entry_matches_search(entry: &LibraryEntry, query: &str) -> bool {
     normalize_search(&fields.join(" ")).contains(&query)
 }
 
-fn entry_matches_metadata_filter(entry: &LibraryEntry, filter: MetadataFilter) -> bool {
+fn installed_entry_matches_filter(
+    entry: &LibraryEntry,
+    filter: LibraryFilter,
+    compatibility: LibraryCompatibility,
+    ownership_failed: bool,
+    now: u64,
+) -> bool {
     match filter {
-        MetadataFilter::All => true,
-        MetadataFilter::Available => entry.listing.is_some(),
-        MetadataFilter::Missing => entry.listing.is_none(),
+        LibraryFilter::All | LibraryFilter::Installed => true,
+        LibraryFilter::Saved | LibraryFilter::NotInstalled => false,
+        LibraryFilter::TimedAccess => entry
+            .listing
+            .as_ref()
+            .is_some_and(|listing| matches!(listing.acquisition, AcquisitionPolicy::TimedAccess { .. })),
+        LibraryFilter::NeedsAttention => {
+            entry.malformed_coordinate
+                || compatibility == LibraryCompatibility::Incompatible
+                || ownership_failed
+                || entry.listing.as_ref().is_some_and(|listing| {
+                    matches!(listing.acquisition, AcquisitionPolicy::TimedAccess { ends_at, .. } if now >= ends_at)
+                })
+        }
+    }
+}
+
+fn saved_entry_matches_search(
+    saved: &LibraryGame,
+    listing: Option<&GameListing>,
+    query: &str,
+) -> bool {
+    let query = normalize_search(query);
+    if query.is_empty() {
+        return true;
+    }
+    let mut fields = vec![saved.game_coordinate.clone()];
+    if let Some(listing) = listing {
+        fields.push(listing.title.clone());
+        fields.push(
+            listing
+                .stall_name
+                .clone()
+                .unwrap_or_else(|| npub_fallback_label(&listing.publisher_npub)),
+        );
+        fields.extend(listing.platforms.iter().cloned());
+    }
+    normalize_search(&fields.join(" ")).contains(&query)
+}
+
+fn saved_entry_matches_filter(
+    saved: &LibraryGame,
+    listing: Option<&GameListing>,
+    installed_coordinates: &HashSet<String>,
+    filter: LibraryFilter,
+    compatibility: LibraryCompatibility,
+    now: u64,
+) -> bool {
+    let installed = installed_coordinates.contains(&saved.game_coordinate);
+    match filter {
+        LibraryFilter::All => !installed,
+        LibraryFilter::Saved => true,
+        LibraryFilter::Installed => false,
+        LibraryFilter::NotInstalled => !installed,
+        LibraryFilter::TimedAccess => listing.is_some_and(|listing| {
+            matches!(listing.acquisition, AcquisitionPolicy::TimedAccess { .. })
+        }),
+        LibraryFilter::NeedsAttention => {
+            compatibility == LibraryCompatibility::Incompatible
+                || listing.is_some_and(|listing| {
+                    matches!(listing.acquisition, AcquisitionPolicy::TimedAccess { ends_at, .. } if now >= ends_at)
+                })
+        }
+    }
+}
+
+fn artifact_file_label(path: &str) -> String {
+    path.trim()
+        .rsplit(['/', '\\'])
+        .find(|name| !name.is_empty())
+        .unwrap_or("Unavailable")
+        .to_string()
+}
+
+fn access_chip(listing: &GameListing, now: u64) -> (&'static str, StatusChipVariant) {
+    match listing.acquisition {
+        AcquisitionPolicy::Public => ("Public", StatusChipVariant::Public),
+        AcquisitionPolicy::Gated => ("Gated", StatusChipVariant::Gated),
+        AcquisitionPolicy::TimedAccess { starts_at, .. } if now < starts_at => {
+            ("Timed: upcoming", StatusChipVariant::Pending)
+        }
+        AcquisitionPolicy::TimedAccess { ends_at, .. } if now >= ends_at => {
+            ("Timed: expired", StatusChipVariant::Expired)
+        }
+        AcquisitionPolicy::TimedAccess { .. } => ("Timed: active", StatusChipVariant::TimedAccess),
+    }
+}
+
+fn compatibility_chip(compatibility: LibraryCompatibility) -> (&'static str, StatusChipVariant) {
+    match compatibility {
+        LibraryCompatibility::Compatible => ("Compatible", StatusChipVariant::Success),
+        LibraryCompatibility::Incompatible => ("Unsupported", StatusChipVariant::Error),
+        LibraryCompatibility::Unknown => ("Compatibility unknown", StatusChipVariant::Neutral),
     }
 }
 
@@ -307,14 +490,17 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
     let availability = target_library_availability(standalone_web);
     let installed_games = RwSignal::new(Vec::<InstalledGame>::new());
     let saved_games = RwSignal::new(Vec::<LibraryGame>::new());
+    let saved_account = RwSignal::new(None::<String>);
     let saved_loading = RwSignal::new(false);
     let saved_error = RwSignal::new(None::<String>);
     let registry_loading = RwSignal::new(!standalone_web);
     let registry_error = RwSignal::new(None::<String>);
     let refresh_generation = RwSignal::new(0_u64);
     let platform = RwSignal::new(None::<PlatformInfo>);
+    let platform_loading = RwSignal::new(!standalone_web);
+    let platform_error = RwSignal::new(false);
     let search = RwSignal::new(String::new());
-    let metadata_filter = RwSignal::new(MetadataFilter::All);
+    let library_filter = RwSignal::new(LibraryFilter::All);
     let ownership = RwSignal::new(HashMap::<(String, String), bool>::new());
     let ownership_loading = RwSignal::new(HashSet::<String>::new());
     let ownership_errors = RwSignal::new(HashSet::<String>::new());
@@ -324,14 +510,19 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
 
     let saved_auth = auth.clone();
     Effect::new(move |_| {
-        let _ = refresh_generation.get();
+        let requested_generation = refresh_generation.get();
         let requested_account = saved_auth.npub.get();
-        saved_games.set(Vec::new());
         saved_error.set(None);
         let Some(requested_account) = requested_account else {
+            saved_account.set(None);
+            saved_games.set(Vec::new());
             saved_loading.set(false);
             return;
         };
+        if saved_account.get_untracked().as_deref() != Some(requested_account.as_str()) {
+            saved_games.set(Vec::new());
+            saved_account.set(Some(requested_account.clone()));
+        }
         if availability == LibraryAvailability::DesktopOnly {
             saved_loading.set(false);
             return;
@@ -341,7 +532,9 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
         let auth_for_response = saved_auth.clone();
         spawn_local(async move {
             let result = invoke_get_library_games().await;
-            if auth_for_response.npub.get_untracked().as_deref() != Some(requested_account.as_str())
+            if refresh_generation.get_untracked() != requested_generation
+                || auth_for_response.npub.get_untracked().as_deref()
+                    != Some(requested_account.as_str())
             {
                 return;
             }
@@ -363,7 +556,7 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
     }
 
     Effect::new(move |_| {
-        let _ = refresh_generation.get();
+        let requested_generation = refresh_generation.get();
         if availability == LibraryAvailability::DesktopOnly {
             registry_loading.set(false);
             return;
@@ -371,7 +564,11 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
         registry_loading.set(true);
         registry_error.set(None);
         spawn_local(async move {
-            match invoke_get_installed_games().await {
+            let result = invoke_get_installed_games().await;
+            if refresh_generation.get_untracked() != requested_generation {
+                return;
+            }
+            match result {
                 Ok(games) => installed_games.set(games),
                 Err(error) => registry_error.set(Some(error)),
             }
@@ -384,9 +581,11 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
             return;
         }
         spawn_local(async move {
-            if let Ok(value) = invoke_get_platform_info().await {
-                platform.set(Some(value));
+            match invoke_get_platform_info().await {
+                Ok(value) => platform.set(Some(value)),
+                Err(_) => platform_error.set(true),
             }
+            platform_loading.set(false);
         });
     });
 
@@ -418,7 +617,7 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
             ownership_loading.set(HashSet::new());
             return;
         };
-        let candidates = current_entries
+        let mut candidates = current_entries
             .into_iter()
             .filter_map(|entry| {
                 let listing = entry.listing?;
@@ -429,6 +628,19 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
                 ))
             })
             .collect::<Vec<_>>();
+        let mut seen_coordinates = candidates
+            .iter()
+            .map(|(coordinate, _, _)| coordinate.clone())
+            .collect::<HashSet<_>>();
+        for (saved, listing) in saved_entries.get() {
+            let Some(listing) = listing else {
+                continue;
+            };
+            if seen_coordinates.insert(saved.game_coordinate.clone()) {
+                candidates.push((saved.game_coordinate, listing.publisher_npub, listing.id));
+            }
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
         ownership_loading.set(
             candidates
                 .iter()
@@ -464,252 +676,303 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
             }
         });
     });
-    let visible_entries = Signal::derive(move || {
+    let installed_coordinates = Signal::derive(move || {
+        installed_games
+            .get()
+            .into_iter()
+            .map(|game| game.game_coordinate)
+            .collect::<HashSet<_>>()
+    });
+    let visible_installed_entries = Signal::derive(move || {
         entries
             .get()
             .into_iter()
             .filter(|entry| entry_matches_search(entry, &search.get()))
-            .filter(|entry| entry_matches_metadata_filter(entry, metadata_filter.get()))
+            .filter(|entry| {
+                let coordinate = &entry.installed.game_coordinate;
+                installed_entry_matches_filter(
+                    entry,
+                    library_filter.get(),
+                    listing_compatibility(entry.listing.as_ref(), platform.get().as_ref()),
+                    ownership_errors.get().contains(coordinate),
+                    library_now.get(),
+                )
+            })
             .collect::<Vec<_>>()
+    });
+    let visible_saved_entries = Signal::derive(move || {
+        let installed = installed_coordinates.get();
+        saved_entries
+            .get()
+            .into_iter()
+            .filter(|(saved, listing)| {
+                saved_entry_matches_search(saved, listing.as_ref(), &search.get())
+            })
+            .filter(|(saved, listing)| {
+                saved_entry_matches_filter(
+                    saved,
+                    listing.as_ref(),
+                    &installed,
+                    library_filter.get(),
+                    listing_compatibility(listing.as_ref(), platform.get().as_ref()),
+                    library_now.get(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let tabs = vec![
+        PageTabItem::local("all", "All"),
+        PageTabItem::local("saved", "Saved"),
+        PageTabItem::local("installed", "Installed"),
+        PageTabItem::local("not-installed", "Not installed"),
+        PageTabItem::local("timed-access", "Timed access"),
+        PageTabItem::local("needs-attention", "Needs attention"),
+    ];
+    let selected_filter = Signal::derive(move || library_filter.get().id().to_string());
+    let select_filter = Callback::new(move |id: String| {
+        library_filter.set(LibraryFilter::from_id(&id));
+    });
+    let retry_refresh = Callback::new(move |_| {
+        refresh_generation.update(|generation| *generation = generation.wrapping_add(1));
+    });
+    let retry_refresh_error = Callback::new(move |_: leptos::ev::MouseEvent| {
+        refresh_generation.update(|generation| *generation = generation.wrapping_add(1));
     });
 
     view! {
-        <section class="v2-library-wrap">
+        <section class="arc-library-page">
             <PageHeader
-                eyebrow="Your collection".to_string()
-                title="Game Library".to_string()
-                description="Games saved to your account and downloaded artifacts recorded on this device.".to_string()
-                action=view! { <span class="v2-library-collection-label">"Your games"</span> }.into_any()
+                title="Library".to_string()
+                action=view! {
+                    <span class="arc-library-summary">
+                        {move || format!("{} saved · {} installed", saved_games.get().len(), installed_games.get().len())}
+                    </span>
+                }.into_any()
             />
 
             {if availability == LibraryAvailability::DesktopOnly {
                 view! {
-                    <section class="v2-library-state-card v2-panel-glass">
-                        <span class="material-symbols-outlined" aria-hidden="true">"desktop_windows"</span>
-                        <h2>"Desktop Library unavailable on web"</h2>
-                        <p>"Installed-game records and native filesystem information are available only in the Arcadestr desktop application."</p>
-                    </section>
+                    <EmptyState
+                        title="Desktop Library unavailable on web"
+                        description="Installed-game records and native filesystem information are available only in the Arcadestr desktop application."
+                        icon="desktop_windows"
+                        layout=FeedbackLayout::Panel
+                    />
                 }.into_any()
             } else {
                 view! {
-                    <div class="v2-library-layout">
-                        <main class="v2-library-main">
-                            <section class="v2-library-summary-card v2-panel">
-                                <p class="v2-store-kicker">"Account library"</p>
-                                <h2>"Saved games"</h2>
-                                {move || if auth.npub.get().is_none() {
-                                    view! { <p>"Sign in to view games saved to your account."</p> }.into_any()
-                                } else if saved_loading.get() {
-                                    view! { <p role="status">"Loading your saved games..."</p> }.into_any()
-                                } else if let Some(error) = saved_error.get() {
-                                    view! { <p class="v2-detail-alert v2-detail-alert-error">{format!("Library unavailable: {error}")}</p> }.into_any()
-                                } else if saved_entries.get().is_empty() {
-                                    view! { <p>"No games have been added to this account's library yet."</p> }.into_any()
-                                } else {
-                                    let cards = saved_entries.get().into_iter().map(|(saved, listing)| {
-                                        let fallback = parse_game_coordinate(&saved.game_coordinate)
-                                            .map(|(_, listing_id)| listing_id.to_string())
-                                            .unwrap_or_else(|| "Saved game".to_string());
-                                        let title = listing.as_ref().map(|item| item.title.clone()).unwrap_or(fallback);
-                                        let cover = listing.as_ref().and_then(|item| valid_cover_url(&item.images)).unwrap_or_else(|| FALLBACK_COVER.to_string());
-                                        view! {
-                                            <article class="v2-library-card">
-                                                <div class="v2-library-card-media">
-                                                    <img src=cover alt=format!("{title} cover") loading="lazy" on:error=use_fallback_cover />
-                                                    <div class="v2-library-card-badges"><span>"In library"</span></div>
-                                                </div>
-                                                <div class="v2-library-card-body">
-                                                    <div><p class="v2-store-kicker">"Account saved"</p><h2>{title}</h2></div>
-                                                    <dl class="v2-library-card-details">
-                                                        <div><dt>"Listing coordinate"</dt><dd>{saved.game_coordinate}</dd></div>
-                                                    </dl>
-                                                    {listing.map(|listing| {
-                                                        let selected = listing.clone();
-                                                        view! { <button class="v2-btn-primary" on:click=move |_| on_open_listing.run(selected.clone())>"View game"</button> }
-                                                    })}
-                                                </div>
-                                            </article>
-                                        }
-                                    }).collect::<Vec<_>>();
-                                    view! { <section class="v2-library-card-grid" aria-label="Saved games">{cards}</section> }.into_any()
-                                }}
-                            </section>
+                    <PageTabs
+                        items=tabs
+                        selected=selected_filter
+                        on_select=select_filter
+                        aria_label="Filter library".to_string()
+                        semantics=PageTabSemantics::Filter
+                    />
 
-                            <section class="v2-library-controls v2-panel">
-                                <div class="v2-library-search-field">
-                                    <label for="library-search">"Search installed games"</label>
-                                    <div>
-                                        <span class="material-symbols-outlined" aria-hidden="true">"search"</span>
-                                        <input
-                                            id="library-search"
-                                            class="v2-input"
-                                            type="search"
-                                            placeholder="Title, publisher, version, platform, or coordinate"
-                                            bind:value=search
-                                        />
-                                    </div>
-                                </div>
-                                <fieldset class="v2-library-filter-group">
-                                    <legend>"Store metadata"</legend>
-                                    <button class="v2-tab" class:active=move || metadata_filter.get() == MetadataFilter::All aria-pressed=move || metadata_filter.get() == MetadataFilter::All on:click=move |_| metadata_filter.set(MetadataFilter::All)>"All"</button>
-                                    <button class="v2-tab" class:active=move || metadata_filter.get() == MetadataFilter::Available aria-pressed=move || metadata_filter.get() == MetadataFilter::Available on:click=move |_| metadata_filter.set(MetadataFilter::Available)>"Details available"</button>
-                                    <button class="v2-tab" class:active=move || metadata_filter.get() == MetadataFilter::Missing aria-pressed=move || metadata_filter.get() == MetadataFilter::Missing on:click=move |_| metadata_filter.set(MetadataFilter::Missing)>"Details unavailable"</button>
-                                </fieldset>
-                                <button class="v2-btn-secondary" on:click=move |_| refresh_generation.update(|generation| *generation = generation.wrapping_add(1)) disabled=move || registry_loading.get()>
-                                    {move || if registry_loading.get() { "Refreshing..." } else { "Refresh local registry" }}
-                                </button>
-                            </section>
+                    <section class="arc-library-toolbar" aria-label="Library controls">
+                        <label class="arc-library-search" for="library-search">
+                            <span class="material-symbols-outlined" aria-hidden="true">"search"</span>
+                            <span class="sr-only">"Search library"</span>
+                            <input
+                                id="library-search"
+                                type="search"
+                                placeholder="Search title, publisher, version, platform, or coordinate"
+                                bind:value=search
+                            />
+                        </label>
+                        <button class="v2-btn-secondary" on:click=move |_| retry_refresh.run(()) disabled=move || registry_loading.get() || saved_loading.get()>
+                            {move || if registry_loading.get() || saved_loading.get() { "Refreshing..." } else { "Refresh" }}
+                        </button>
+                    </section>
 
-                            <p class="v2-library-result-count" role="status" aria-live="polite">
-                                {move || format!("{} of {} installed entries shown", visible_entries.get().len(), entries.get().len())}
-                            </p>
+                    <p class="arc-library-result-count" role="status" aria-live="polite">
+                        {move || format!("{} library record(s) shown", visible_saved_entries.get().len() + visible_installed_entries.get().len())}
+                    </p>
 
-                            <Show when=move || marketplace.error.get().is_some() && !installed_games.get().is_empty()>
-                                <div class="v2-library-notice">
-                                    <strong>"Current store details could not be refreshed."</strong>
-                                    <span>"Local installed entries remain available below. Some covers, titles, ownership, and compatibility information may be missing."</span>
-                                </div>
-                            </Show>
-                            <Show when=move || registry_error.get().is_some() && !installed_games.get().is_empty()>
-                                <div class="v2-library-notice">
-                                    <strong>"The local registry refresh failed."</strong>
-                                    <span>"Previously loaded installed records remain visible. Retry when the desktop service is available."</span>
-                                </div>
-                            </Show>
-                            <Show when=move || marketplace.loading.get() && !installed_games.get().is_empty()>
-                                <div class="v2-library-notice" role="status">
-                                    <strong>"Loading current store details..."</strong>
-                                    <span>"Installed records are already available; covers and listing metadata will appear when matched."</span>
-                                </div>
-                            </Show>
+                    <Show when=move || auth.npub.get().is_none()>
+                        <div class="arc-library-notice">
+                            <span class="material-symbols-outlined" aria-hidden="true">"person_off"</span>
+                            <div><strong>"Account library unavailable while signed out"</strong><p>"Device installation records remain visible. Sign in to load account-saved games and ownership."</p></div>
+                        </div>
+                    </Show>
+                    <Show when=move || marketplace.error.get().is_some() && (!saved_games.get().is_empty() || !installed_games.get().is_empty())>
+                        <div class="arc-library-notice">
+                            <span class="material-symbols-outlined" aria-hidden="true">"cloud_off"</span>
+                            <div><strong>"Store metadata is partial"</strong><p>"Local and account records remain visible, but some artwork, titles, access policy, and compatibility details may be unavailable."</p></div>
+                        </div>
+                    </Show>
+                    <Show when=move || registry_error.get().is_some() && !installed_games.get().is_empty()>
+                        <div class="arc-library-notice">
+                            <span class="material-symbols-outlined" aria-hidden="true">"database"</span>
+                            <div><strong>"Local registry refresh failed"</strong><p>"Previously loaded device records remain visible below."</p></div>
+                            <button class="v2-btn-secondary" on:click=move |_| retry_refresh.run(()) disabled=move || registry_loading.get()>"Retry"</button>
+                        </div>
+                    </Show>
+                    <Show when=move || saved_error.get().is_some() && (!saved_games.get().is_empty() || !installed_games.get().is_empty())>
+                        <div class="arc-library-notice">
+                            <span class="material-symbols-outlined" aria-hidden="true">"sync_problem"</span>
+                            <div><strong>"Account library refresh failed"</strong><p>"Previously loaded account records remain visible below."</p></div>
+                            <button class="v2-btn-secondary" on:click=move |_| retry_refresh.run(()) disabled=move || saved_loading.get()>"Retry"</button>
+                        </div>
+                    </Show>
+                    <Show when=move || platform_loading.get() || platform_error.get()>
+                        <div class="arc-library-notice" role="status">
+                            <span class="material-symbols-outlined" aria-hidden="true">"devices"</span>
+                            <div><strong>{move || if platform_loading.get() { "Checking device compatibility" } else { "Device compatibility unavailable" }}</strong><p>"Unknown compatibility does not imply that an artifact is supported."</p></div>
+                        </div>
+                    </Show>
 
-                            {move || if registry_loading.get() {
+                    {move || {
+                        let no_saved_data = saved_games.get().is_empty();
+                        let no_installed_data = installed_games.get().is_empty();
+                        let visible_count = visible_saved_entries.get().len() + visible_installed_entries.get().len();
+                        let content_state = library_content_state(
+                            visible_count,
+                            !no_saved_data,
+                            !no_installed_data,
+                            auth.npub.get().is_some() && saved_loading.get() && no_saved_data,
+                            registry_loading.get() && no_installed_data,
+                            saved_error.get().is_some(),
+                            registry_error.get().is_some(),
+                        );
+                        if content_state == LibraryContentState::Loading {
+                            view! {
+                                <LoadingState
+                                    title="Loading Library"
+                                    description="Reading device installation records and account-saved games without hiding partial results.".to_string()
+                                    layout=FeedbackLayout::Panel
+                                />
+                            }.into_any()
+                        } else if content_state == LibraryContentState::BlockingError {
+                            let account_failed = saved_error.get().is_some();
+                            let local_failed = registry_error.get().is_some();
+                            let (title, message) = match (account_failed, local_failed) {
+                                (true, true) => ("Library records unavailable", "Neither account-saved games nor the local installation registry could be loaded."),
+                                (true, false) => ("Account library unavailable", "Account-saved games could not be loaded and no local installation records are available."),
+                                (false, true) => ("Installation registry unavailable", "The local installation registry could not be read and no account-saved games are available."),
+                                (false, false) => ("Library records unavailable", "No Library records are currently available."),
+                            };
+                            view! {
+                                <ErrorState
+                                    title=title
+                                    message=message
+                                    on_retry=retry_refresh_error
+                                    retry_busy=Signal::derive(move || registry_loading.get())
+                                    severity=ErrorSeverity::Recoverable
+                                />
+                            }.into_any()
+                        } else {
+                            let saved_rows = visible_saved_entries.get().into_iter().map(|(saved, listing)| {
+                                let fallback = parse_game_coordinate(&saved.game_coordinate)
+                                    .map(|(_, listing_id)| format!("Saved game: {listing_id}"))
+                                    .unwrap_or_else(|| "Saved game".to_string());
+                                let title = listing.as_ref().map(|item| item.title.clone()).unwrap_or(fallback);
+                                let publisher = listing.as_ref().map(|item| item.stall_name.clone().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| npub_fallback_label(&item.publisher_npub))).unwrap_or_else(|| "Publisher unavailable".to_string());
+                                let artwork = artwork_state_from_url(listing.as_ref().and_then(|item| valid_cover_url(&item.images)));
+                                let compatibility = listing_compatibility(listing.as_ref(), platform.get().as_ref());
+                                let compatibility_state = compatibility_chip(compatibility);
+                                let detail_listing = listing.clone();
+                                let saved_is_installed = installed_coordinates.get().contains(&saved.game_coordinate);
+                                let active_npub = auth.npub.get();
+                                let durable_owned = ownership_for_active_account(&ownership.get(), active_npub.as_deref(), &saved.game_coordinate);
+                                let checking_ownership = ownership_loading.get().contains(&saved.game_coordinate);
+                                let ownership_failed = ownership_errors.get().contains(&saved.game_coordinate);
                                 view! {
-                                    <section class="v2-library-state-card v2-panel-glass" role="status">
-                                        <h2>"Loading installed games"</h2>
-                                        <p>"Reading the local installed-game registry."</p>
-                                    </section>
-                                }.into_any()
-                            } else if registry_error.get().is_some() && installed_games.get().is_empty() {
-                                let error = registry_error.get().unwrap_or_default();
+                                    <article class="arc-library-row">
+                                        <div class="arc-library-art"><GameArtwork title=title.clone() state=artwork role=ArtworkRole::Thumbnail /></div>
+                                        <div class="arc-library-row-copy"><h2>{title}</h2><p>{publisher}</p><small>{if saved_is_installed { "Saved to the active account · Installed on this device" } else { "Saved to the active account · Not installed on this device" }}</small></div>
+                                        <div class="arc-library-row-states" aria-label="Game states">
+                                            {listing.as_ref().map(|listing| { let (label, variant) = access_chip(listing, library_now.get()); view! { <StatusChip label=label variant=variant icon=None size=StatusChipSize::Compact /> } })}
+                                            {if durable_owned {
+                                                view! { <StatusChip label="Owned" variant=StatusChipVariant::Owned icon=Some("verified_user") size=StatusChipSize::Compact /> }.into_any()
+                                            } else if checking_ownership {
+                                                view! { <StatusChip label="Checking ownership" variant=StatusChipVariant::Pending icon=None size=StatusChipSize::Compact /> }.into_any()
+                                            } else if ownership_failed {
+                                                view! { <StatusChip label="Ownership unknown" variant=StatusChipVariant::Warning icon=None size=StatusChipSize::Compact /> }.into_any()
+                                            } else { view! { <></> }.into_any() }}
+                                            <StatusChip label="Saved" variant=StatusChipVariant::Neutral icon=Some("bookmark") size=StatusChipSize::Compact />
+                                            {saved_is_installed.then(|| view! { <StatusChip label="Installed" variant=StatusChipVariant::Installed icon=Some("download_done") size=StatusChipSize::Compact /> })}
+                                            <StatusChip label=compatibility_state.0 variant=compatibility_state.1 icon=None size=StatusChipSize::Compact />
+                                        </div>
+                                        <div class="arc-library-row-action">
+                                            {detail_listing.map(|listing| { let selected = listing.clone(); view! { <button class="v2-btn-primary" on:click=move |_| on_open_listing.run(selected.clone())>"View details"</button> } })}
+                                        </div>
+                                    </article>
+                                }
+                            }).collect::<Vec<_>>();
+
+                            let installed_rows = visible_installed_entries.get().into_iter().map(|entry| {
+                                let listing = entry.listing.clone();
+                                let title = fallback_title(&entry);
+                                let publisher = publisher_label(&entry);
+                                let artwork = artwork_state_from_url(entry.listing.as_ref().and_then(|listing| valid_cover_url(&listing.images)));
+                                let version = sanitize_optional_value(entry.installed.version.as_deref());
+                                let coordinate = entry.installed.game_coordinate.clone();
+                                let active_npub = auth.npub.get();
+                                let durable_owned = ownership_for_active_account(&ownership.get(), active_npub.as_deref(), &coordinate);
+                                let checking_ownership = ownership_loading.get().contains(&coordinate);
+                                let ownership_failed = ownership_errors.get().contains(&coordinate);
+                                let compatibility = listing_compatibility(entry.listing.as_ref(), platform.get().as_ref());
+                                let compatibility_state = compatibility_chip(compatibility);
+                                let installed_meta = [version.clone().map(|value| format!("Version {value}")), Some(format_installed_at(entry.installed.installed_at))].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+                                let artifact_file = artifact_file_label(&entry.installed.file_path);
+                                let stored_coordinate = if coordinate.trim().is_empty() { "Malformed or unavailable".to_string() } else { coordinate.clone() };
                                 view! {
-                                    <section class="v2-library-state-card v2-panel-glass" role="alert">
-                                        <h2>"Installed registry unavailable"</h2>
-                                        <p>{error}</p>
-                                        <button class="v2-btn-secondary" on:click=move |_| refresh_generation.update(|generation| *generation = generation.wrapping_add(1))>"Retry"</button>
-                                    </section>
-                                }.into_any()
-                            } else if installed_games.get().is_empty() {
-                                view! {
-                                    <section class="v2-library-state-card v2-panel-glass">
-                                        <span class="material-symbols-outlined" aria-hidden="true">"download_done"</span>
-                                        <h2>"No installed games"</h2>
-                                        <p>"Games installed through the desktop acquisition flow will appear here."</p>
-                                    </section>
-                                }.into_any()
-                            } else if visible_entries.get().is_empty() {
-                                view! {
-                                    <section class="v2-library-state-card v2-panel-glass">
-                                        <h2>"No installed entries match"</h2>
-                                        <p>"Change the search text or metadata filter to show other local records."</p>
-                                    </section>
-                                }.into_any()
-                            } else {
-                                let cards = visible_entries.get().into_iter().map(|entry| {
-                                    let listing = entry.listing.clone();
-                                    let title = fallback_title(&entry);
-                                    let publisher = publisher_label(&entry);
-                                    let cover = entry.listing.as_ref().and_then(|listing| valid_cover_url(&listing.images)).unwrap_or_else(|| FALLBACK_COVER.to_string());
-                                    let version = sanitize_optional_value(entry.installed.version.as_deref());
-                                    let coordinate = entry.installed.game_coordinate.clone();
-                                    let active_npub = auth.npub.get();
-                                    let durable_owned = ownership_for_active_account(
-                                        &ownership.get(),
-                                        active_npub.as_deref(),
-                                        &coordinate,
-                                    );
-                                    let access = entry.listing.as_ref().map(|listing| access_presentation(listing, durable_owned, library_now.get()));
-                                    let checking_ownership = ownership_loading.get().contains(&coordinate);
-                                    let ownership_failed = ownership_errors.get().contains(&coordinate);
-                                    let compatibility = listing_compatibility(entry.listing.as_ref(), platform.get().as_ref());
+                                    <article class="arc-library-row arc-library-row-installed">
+                                        <div class="arc-library-art"><GameArtwork title=title.clone() state=artwork role=ArtworkRole::Thumbnail /></div>
+                                        <div class="arc-library-row-copy">
+                                            <h2>{title}</h2><p>{publisher}</p><small>{installed_meta}</small>
+                                            {if entry.listing.is_none() { view! { <span class="arc-library-row-warning">"Current store metadata was not loaded in the discovery window."</span> }.into_any() } else { view! { <></> }.into_any() }}
+                                            {if entry.malformed_coordinate { view! { <span class="arc-library-row-warning">"Stored listing coordinate is malformed."</span> }.into_any() } else { view! { <></> }.into_any() }}
+                                            <details class="arc-library-technical"><summary>"Local record details"</summary><dl><div><dt>"Artifact file"</dt><dd>{artifact_file}</dd></div><div><dt>"Listing coordinate"</dt><dd>{stored_coordinate}</dd></div></dl></details>
+                                        </div>
+                                        <div class="arc-library-row-states" aria-label="Game states">
+                                            {entry.listing.as_ref().map(|listing| { let (label, variant) = access_chip(listing, library_now.get()); view! { <StatusChip label=label variant=variant icon=None size=StatusChipSize::Compact /> } })}
+                                            {if durable_owned {
+                                                view! { <StatusChip label="Owned" variant=StatusChipVariant::Owned icon=Some("verified_user") size=StatusChipSize::Compact /> }.into_any()
+                                            } else if checking_ownership {
+                                                view! { <StatusChip label="Checking ownership" variant=StatusChipVariant::Pending icon=None size=StatusChipSize::Compact /> }.into_any()
+                                            } else if ownership_failed {
+                                                view! { <StatusChip label="Ownership unknown" variant=StatusChipVariant::Warning icon=None size=StatusChipSize::Compact /> }.into_any()
+                                            } else { view! { <></> }.into_any() }}
+                                            <StatusChip label="Installed" variant=StatusChipVariant::Installed icon=Some("download_done") size=StatusChipSize::Compact />
+                                            <StatusChip label=compatibility_state.0 variant=compatibility_state.1 icon=None size=StatusChipSize::Compact />
+                                        </div>
+                                        <div class="arc-library-row-action">
+                                            {match listing { Some(listing) => { let selected = listing.clone(); view! { <button class="v2-btn-primary" on:click=move |_| on_open_listing.run(selected.clone())>"View details"</button> }.into_any() }, None => view! { <span class="arc-library-action-unavailable">"Details unavailable"</span> }.into_any() }}
+                                        </div>
+                                    </article>
+                                }
+                            }).collect::<Vec<_>>();
+
+                            if saved_rows.is_empty() && installed_rows.is_empty() {
+                                let (title, description) = library_filter.get().empty_copy();
+                                let has_filter = library_filter.get() != LibraryFilter::All || !search.get().trim().is_empty();
+                                if has_filter {
                                     view! {
-                                        <article class="v2-library-card">
-                                            <div class="v2-library-card-media">
-                                                <img src=cover alt=format!("{title} cover") loading="lazy" on:error=use_fallback_cover />
-                                                <div class="v2-library-card-badges">
-                                                    <span>"Installed"</span>
-                                                    {access.map(|access| view! { <span class:v2-library-owned=access.durable_owned>{access.label}</span> })}
-                                                    {if checking_ownership {
-                                                        view! { <span>"Checking ownership"</span> }.into_any()
-                                                    } else if ownership_failed {
-                                                        view! { <span>"Ownership check unavailable"</span> }.into_any()
-                                                    } else {
-                                                        view! { <></> }.into_any()
-                                                    }}
-                                                    {match compatibility {
-                                                        LibraryCompatibility::Compatible => view! { <span>"Compatible"</span> }.into_any(),
-                                                        LibraryCompatibility::Incompatible => view! { <span class="v2-library-incompatible">"Not compatible with this device"</span> }.into_any(),
-                                                        LibraryCompatibility::Unknown => view! { <></> }.into_any(),
-                                                    }}
-                                                </div>
-                                            </div>
-                                            <div class="v2-library-card-body">
-                                                <div>
-                                                    <p class="v2-store-kicker">{publisher}</p>
-                                                    <h2>{title}</h2>
-                                                    <p class="v2-library-scope">{INSTALLATION_SCOPE_LABEL}</p>
-                                                </div>
-                                                {if entry.listing.is_none() && marketplace.loading.get() {
-                                                    view! { <p class="v2-library-metadata-missing">"Looking for the matching signed listing..."</p> }.into_any()
-                                                } else if entry.listing.is_none() {
-                                                    view! { <p class="v2-library-metadata-missing">"Current store details are unavailable. The local installed record is preserved."</p> }.into_any()
-                                                } else {
-                                                    view! { <></> }.into_any()
-                                                }}
-                                                {if entry.malformed_coordinate {
-                                                    view! { <p class="v2-library-metadata-missing">"The stored listing coordinate is malformed; metadata matching is disabled for this entry."</p> }.into_any()
-                                                } else {
-                                                    view! { <></> }.into_any()
-                                                }}
-                                                <dl class="v2-library-card-details">
-                                                    {version.map(|version| view! { <div><dt>"Installed version"</dt><dd>{version}</dd></div> })}
-                                                    <div><dt>"Installed"</dt><dd>{format_installed_at(entry.installed.installed_at)}</dd></div>
-                                                    <div><dt>"Artifact location"</dt><dd>{if entry.installed.file_path.trim().is_empty() { "Unavailable".to_string() } else { entry.installed.file_path.clone() }}</dd></div>
-                                                    <div><dt>"Listing coordinate"</dt><dd>{if entry.installed.game_coordinate.trim().is_empty() { "Malformed or unavailable".to_string() } else { entry.installed.game_coordinate.clone() }}</dd></div>
-                                                </dl>
-                                                {match listing {
-                                                    Some(listing) => {
-                                                        let selected = listing.clone();
-                                                        view! { <button class="v2-btn-primary" on:click=move |_| on_open_listing.run(selected.clone())>"View store details"</button> }.into_any()
-                                                    }
-                                                    None => view! { <p class="v2-library-no-action">"A detail action will be available when the matching signed listing is loaded."</p> }.into_any(),
-                                                }}
-                                            </div>
-                                        </article>
-                                    }
-                                }).collect::<Vec<_>>();
-                                view! { <section class="v2-library-card-grid" aria-label="Installed games">{cards}</section> }.into_any()
-                            }}
-                        </main>
-
-                        <aside class="v2-library-summary">
-                            <section class="v2-library-summary-card v2-panel">
-                                <p class="v2-store-kicker">"Local inventory"</p>
-                                <h2>"Library summary"</h2>
-                                <dl>
-                                    <div><dt>"Installed records"</dt><dd>{move || entries.get().len()}</dd></div>
-                                    <div><dt>"Store details found"</dt><dd>{move || entries.get().iter().filter(|entry| entry.listing.is_some()).count()}</dd></div>
-                                    <div><dt>"Store details missing"</dt><dd>{move || entries.get().iter().filter(|entry| entry.listing.is_none()).count()}</dd></div>
-                                    <div><dt>"Incompatible listings"</dt><dd>{move || entries.get().iter().filter(|entry| listing_compatibility(entry.listing.as_ref(), platform.get().as_ref()) == LibraryCompatibility::Incompatible).count()}</dd></div>
-                                </dl>
-                            </section>
-                            <section class="v2-library-summary-card v2-panel">
-                                <p class="v2-store-kicker">"What this means"</p>
-                                <h2>"Device registry"</h2>
-                                <p>"These records are shared by accounts using this Arcadestr installation. An installed artifact does not by itself prove a purchase or permanent entitlement for the active account."</p>
-                            </section>
-                        </aside>
-                    </div>
+                                        <EmptyState
+                                            title=title
+                                            description=description
+                                            icon="library_books"
+                                            primary_action=view! { <button class="v2-btn-secondary" on:click=move |_| { library_filter.set(LibraryFilter::All); search.set(String::new()); }>"Clear filters"</button> }.into_any()
+                                            layout=FeedbackLayout::Panel
+                                        />
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <EmptyState title=title description=description icon="library_books" layout=FeedbackLayout::Panel />
+                                    }.into_any()
+                                }
+                            } else {
+                                view! {
+                                    <div class="arc-library-sections">
+                                        {(!saved_rows.is_empty()).then(|| view! { <section><p class="v2-store-kicker">"Account saved"</p><div class="arc-library-list">{saved_rows}</div></section> })}
+                                        {(!installed_rows.is_empty()).then(|| view! { <section><p class="v2-store-kicker">"Installed on this device"</p><div class="arc-library-list">{installed_rows}</div><p class="arc-library-device-note">{format!("{INSTALLATION_SCOPE_LABEL}. Installation does not prove account ownership.")}</p></section> })}
+                                    </div>
+                                }.into_any()
+                            }
+                        }
+                    }}
                 }.into_any()
             }}
         </section>
@@ -939,6 +1202,150 @@ mod tests {
         assert!(entry_matches_search(&entries[0], "  NEON   game "));
         assert!(entry_matches_search(&entries[0], "1.0.0"));
         assert!(!entry_matches_search(&entries[0], "different"));
+        assert!(!entry_matches_search(&entries[0], "/games/artifact.bin"));
+        assert_eq!(
+            artifact_file_label("/private/home/player/game.bin"),
+            "game.bin"
+        );
+        assert_eq!(
+            artifact_file_label(r"C:\Users\player\Arcadestr\game.exe"),
+            "game.exe"
+        );
+    }
+
+    #[test]
+    fn library_filters_map_only_to_real_saved_and_installed_state() {
+        let listing = listing("filter-game");
+        let coordinate = listing_coordinate(&listing).expect("valid coordinate");
+        let saved = LibraryGame {
+            game_coordinate: coordinate.clone(),
+            added_at: 10,
+        };
+        let installed_coordinates = HashSet::from([coordinate.clone()]);
+
+        assert!(saved_entry_matches_filter(
+            &saved,
+            Some(&listing),
+            &installed_coordinates,
+            LibraryFilter::Saved,
+            LibraryCompatibility::Compatible,
+            100,
+        ));
+        assert!(!saved_entry_matches_filter(
+            &saved,
+            Some(&listing),
+            &installed_coordinates,
+            LibraryFilter::NotInstalled,
+            LibraryCompatibility::Compatible,
+            100,
+        ));
+
+        let entries = reconcile_installed_entries(
+            vec![installed(coordinate, 20)],
+            std::slice::from_ref(&listing),
+        );
+        assert!(installed_entry_matches_filter(
+            &entries[0],
+            LibraryFilter::Installed,
+            LibraryCompatibility::Compatible,
+            false,
+            100,
+        ));
+        assert!(!installed_entry_matches_filter(
+            &entries[0],
+            LibraryFilter::Saved,
+            LibraryCompatibility::Compatible,
+            false,
+            100,
+        ));
+    }
+
+    #[test]
+    fn loading_is_never_presented_as_an_empty_library() {
+        assert_eq!(
+            library_content_state(0, false, false, true, true, false, false),
+            LibraryContentState::Loading
+        );
+        assert_eq!(
+            library_content_state(0, false, false, false, false, false, false),
+            LibraryContentState::Empty
+        );
+        assert_eq!(
+            library_content_state(1, false, true, true, false, false, false),
+            LibraryContentState::Ready
+        );
+    }
+
+    #[test]
+    fn registry_failure_is_blocking_only_without_preserved_records() {
+        assert_eq!(
+            library_content_state(0, false, false, false, false, false, true),
+            LibraryContentState::BlockingError
+        );
+        assert_eq!(
+            library_content_state(1, false, true, false, false, false, true),
+            LibraryContentState::Ready
+        );
+    }
+
+    #[test]
+    fn timed_and_attention_filters_preserve_access_boundaries() {
+        let mut timed = listing("timed-filter");
+        timed.acquisition = AcquisitionPolicy::TimedAccess {
+            starts_at: 10,
+            ends_at: 20,
+        };
+        let coordinate = listing_coordinate(&timed).expect("valid coordinate");
+        let entries = reconcile_installed_entries(vec![installed(coordinate, 1)], &[timed]);
+
+        assert!(installed_entry_matches_filter(
+            &entries[0],
+            LibraryFilter::TimedAccess,
+            LibraryCompatibility::Compatible,
+            false,
+            15,
+        ));
+        assert!(installed_entry_matches_filter(
+            &entries[0],
+            LibraryFilter::NeedsAttention,
+            LibraryCompatibility::Compatible,
+            false,
+            20,
+        ));
+        assert_eq!(
+            access_chip(entries[0].listing.as_ref().expect("listing"), 20),
+            ("Timed: expired", StatusChipVariant::Expired)
+        );
+    }
+
+    #[test]
+    fn compatibility_mapping_does_not_infer_from_partial_labels() {
+        let mut value = listing("platform-game");
+        value.platforms = vec!["linux-x86_64".to_string()];
+        assert_eq!(
+            listing_compatibility(Some(&value), None),
+            LibraryCompatibility::Unknown
+        );
+        assert_eq!(
+            listing_compatibility(
+                Some(&value),
+                Some(&PlatformInfo {
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                })
+            ),
+            LibraryCompatibility::Compatible
+        );
+        assert_eq!(
+            listing_compatibility(
+                Some(&value),
+                Some(&PlatformInfo {
+                    os: "linux".into(),
+                    arch: "aarch64".into(),
+                })
+            ),
+            LibraryCompatibility::Incompatible
+        );
     }
 
     #[test]

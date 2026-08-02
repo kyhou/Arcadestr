@@ -628,6 +628,14 @@ pub struct DownloadCompletePayload {
     pub file_path: String,
 }
 
+/// Byte progress emitted while an ADP artifact is downloading.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DownloadProgressPayload {
+    pub game_coordinate: String,
+    pub bytes: u64,
+    pub total: Option<u64>,
+}
+
 /// Invoke desktop `get_installed_games` command.
 #[cfg(not(feature = "web"))]
 pub async fn invoke_get_installed_games() -> Result<Vec<InstalledGame>, String> {
@@ -1242,6 +1250,30 @@ where
     Err("ADP installation events are only available in desktop builds.".to_string())
 }
 
+/// Listen for desktop `download-progress` events.
+#[cfg(not(feature = "web"))]
+pub async fn listen_download_progress<F>(mut callback: F) -> Result<Box<dyn FnOnce()>, String>
+where
+    F: FnMut(DownloadProgressPayload) + 'static,
+{
+    let cleanup = crate::tauri_invoke::listen("download-progress", move |value| {
+        if let Ok(payload) = serde_json::from_value::<DownloadProgressPayload>(value) {
+            callback(payload);
+        }
+    })
+    .await?;
+    Ok(Box::new(cleanup))
+}
+
+/// Web fallback for `download-progress` events.
+#[cfg(feature = "web")]
+pub async fn listen_download_progress<F>(_callback: F) -> Result<Box<dyn FnOnce()>, String>
+where
+    F: FnMut(DownloadProgressPayload) + 'static,
+{
+    Err("ADP installation events are only available in desktop builds.".to_string())
+}
+
 /// Invoke desktop `nip49_import` command.
 #[cfg(not(feature = "web"))]
 pub async fn invoke_nip49_import(request: Nip49ImportRequest) -> Result<String, String> {
@@ -1797,5 +1829,19 @@ mod tests {
             store_page_publishing_unsupported_error(),
             "Store Page publishing is unavailable in standalone web builds."
         );
+    }
+
+    #[test]
+    fn download_progress_payload_matches_the_existing_desktop_event_contract() {
+        let payload: DownloadProgressPayload = serde_json::from_value(serde_json::json!({
+            "game_coordinate": "30402:publisher:game",
+            "bytes": 512,
+            "total": 1024
+        }))
+        .expect("desktop progress payload should deserialize");
+
+        assert_eq!(payload.bytes, 512);
+        assert_eq!(payload.total, Some(1024));
+        assert_eq!(payload.game_coordinate, "30402:publisher:game");
     }
 }

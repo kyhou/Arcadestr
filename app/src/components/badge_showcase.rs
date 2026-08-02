@@ -4,6 +4,7 @@ use crate::models::{EarnedBadgeSummary, ProfileBadgeEntry};
 use crate::tauri_bridge::{
     fetch_earned_badges, fetch_profile_badges, get_cached_earned_badges, get_cached_profile_badges,
 };
+use crate::ui_v2::components::{artwork_state_from_url, ArtworkRole, GameArtwork};
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
 use tracing::{info, warn};
@@ -16,8 +17,24 @@ enum BadgeShowcaseState {
     Loading,
     Empty,
     Error,
-    Ready(Vec<EarnedBadgeSummary>),
+    Ready {
+        badges: Vec<EarnedBadgeSummary>,
+        source: BadgeShowcaseSource,
+        refresh_warning: Option<BadgeShowcaseWarning>,
+    },
     WebUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BadgeShowcaseSource {
+    ProfileSelection,
+    EarnedFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BadgeShowcaseWarning {
+    SelectionRefresh,
+    EarnedFallbackRefresh,
 }
 
 #[component]
@@ -33,13 +50,12 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
     #[cfg(not(feature = "web"))]
     Effect::new(move |_| {
         let requested_profile_identifier = profile_identifier.get();
+        let generation = request_generation.get_untracked().saturating_add(1);
+        request_generation.set(generation);
         if requested_profile_identifier.is_empty() {
             state.set(BadgeShowcaseState::Empty);
             return;
         }
-
-        let generation = request_generation.get_untracked().saturating_add(1);
-        request_generation.set(generation);
 
         state.set(BadgeShowcaseState::Loading);
         spawn_local(async move {
@@ -51,9 +67,11 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                 Ok(profile_entries) if !profile_entries.is_empty() => {
                     let cached_count = profile_entries.len();
                     if should_apply_generation(generation, request_generation.get_untracked()) {
-                        state.set(BadgeShowcaseState::Ready(profile_entries_to_summaries(
-                            profile_entries,
-                        )));
+                        state.set(BadgeShowcaseState::Ready {
+                            badges: profile_entries_to_summaries(profile_entries),
+                            source: BadgeShowcaseSource::ProfileSelection,
+                            refresh_warning: None,
+                        });
                         cached_rendered = true;
                         info!(
                             count = cached_count,
@@ -61,7 +79,7 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                         );
                     }
                 }
-                Ok(_) | Err(_) => {
+                Ok(_) => {
                     match get_cached_earned_badges(requested_profile_identifier.clone()).await {
                         Ok(earned) => {
                             let capped = cap_fallback_badges(earned);
@@ -72,7 +90,11 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                                 )
                             {
                                 let cached_count = capped.len();
-                                state.set(BadgeShowcaseState::Ready(capped));
+                                state.set(BadgeShowcaseState::Ready {
+                                    badges: capped,
+                                    source: BadgeShowcaseSource::EarnedFallback,
+                                    refresh_warning: None,
+                                });
                                 cached_rendered = true;
                                 info!(
                                     count = cached_count,
@@ -83,6 +105,7 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                         Err(error) => warn!("failed to load cached badge showcase: {}", error),
                     }
                 }
+                Err(error) => warn!("failed to load cached profile badge selection: {}", error),
             }
 
             if should_yield_before_relay_refresh(cached_rendered) {
@@ -99,12 +122,14 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                         "relay refreshed profile badge showcase"
                     );
                     if should_apply_generation(generation, request_generation.get_untracked()) {
-                        state.set(BadgeShowcaseState::Ready(profile_entries_to_summaries(
-                            profile_entries,
-                        )));
+                        state.set(BadgeShowcaseState::Ready {
+                            badges: profile_entries_to_summaries(profile_entries),
+                            source: BadgeShowcaseSource::ProfileSelection,
+                            refresh_warning: None,
+                        });
                     }
                 }
-                Ok(_) | Err(_) => match fetch_earned_badges(requested_profile_identifier).await {
+                Ok(_) => match fetch_earned_badges(requested_profile_identifier).await {
                     Ok(earned) => {
                         info!(
                             count = earned.len(),
@@ -115,19 +140,47 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                             if capped.is_empty() {
                                 state.set(BadgeShowcaseState::Empty);
                             } else {
-                                state.set(BadgeShowcaseState::Ready(capped));
+                                state.set(BadgeShowcaseState::Ready {
+                                    badges: capped,
+                                    source: BadgeShowcaseSource::EarnedFallback,
+                                    refresh_warning: None,
+                                });
                             }
                         }
                     }
                     Err(error) => {
                         if should_apply_generation(generation, request_generation.get_untracked()) {
-                            if !matches!(state.get_untracked(), BadgeShowcaseState::Ready(_)) {
-                                warn!("failed to refresh badge showcase: {}", error);
-                                state.set(BadgeShowcaseState::Error);
+                            warn!("failed to refresh badge showcase: {}", error);
+                            match state.get_untracked() {
+                                BadgeShowcaseState::Ready { badges, source, .. } => {
+                                    state.set(BadgeShowcaseState::Ready {
+                                        badges,
+                                        source,
+                                        refresh_warning: Some(
+                                            BadgeShowcaseWarning::EarnedFallbackRefresh,
+                                        ),
+                                    });
+                                }
+                                _ => state.set(BadgeShowcaseState::Error),
                             }
                         }
                     }
                 },
+                Err(error) => {
+                    warn!("failed to refresh profile badge selection: {}", error);
+                    if should_apply_generation(generation, request_generation.get_untracked()) {
+                        match state.get_untracked() {
+                            BadgeShowcaseState::Ready { badges, source, .. } => {
+                                state.set(BadgeShowcaseState::Ready {
+                                    badges,
+                                    source,
+                                    refresh_warning: Some(BadgeShowcaseWarning::SelectionRefresh),
+                                });
+                            }
+                            _ => state.set(BadgeShowcaseState::Error),
+                        }
+                    }
+                }
             }
         });
     });
@@ -136,7 +189,7 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
         <section class="v2-panel v2-badge-showcase">
             <div class="v2-badge-showcase-header">
                 <span class="material-symbols-outlined" aria-hidden="true">"workspace_premium"</span>
-                <div><p class="v2-store-kicker">"NIP-58"</p><h3>"Achievements"</h3></div>
+                <div><p class="v2-store-kicker">"NIP-58"</p><h2>"Achievements"</h2></div>
             </div>
             {move || match state.get() {
                 BadgeShowcaseState::Loading => {
@@ -154,9 +207,13 @@ pub fn BadgeShowcase(profile_identifier: Signal<String>) -> impl IntoView {
                     </p>
                 }
                 .into_any(),
-                BadgeShowcaseState::Ready(badges) => view! {
-                    <div class="v2-badge-showcase-row">
-                        {badges.into_iter().map(render_badge_chip).collect::<Vec<_>>()}
+                BadgeShowcaseState::Ready { badges, source, refresh_warning } => view! {
+                    <div>
+                        <p class="v2-badge-showcase-source">{showcase_source_message(source)}</p>
+                        {refresh_warning.map(|warning| view! { <p class="v2-badge-showcase-warning" role="status">{showcase_warning_message(warning)}</p> })}
+                        <div class="v2-badge-showcase-row">
+                            {badges.into_iter().map(render_badge_chip).collect::<Vec<_>>()}
+                        </div>
                     </div>
                 }
                 .into_any(),
@@ -188,11 +245,33 @@ fn should_yield_before_relay_refresh(cached_rendered: bool) -> bool {
 }
 
 fn badge_showcase_empty_message() -> &'static str {
-    "No verified badges are available for this profile."
+    "No showcased or earned badges were resolved for this profile."
 }
 
 fn badge_showcase_error_message() -> &'static str {
-    "Could not load this badge showcase. Please try again later."
+    "Badge showcase data is unavailable. Previously verified badges are not being inferred."
+}
+
+fn showcase_source_message(source: BadgeShowcaseSource) -> &'static str {
+    match source {
+        BadgeShowcaseSource::ProfileSelection => {
+            "Selected by this profile in its current NIP-58 showcase."
+        }
+        BadgeShowcaseSource::EarnedFallback => {
+            "Verified earned badges shown as a fallback; these are not selected for the profile showcase."
+        }
+    }
+}
+
+fn showcase_warning_message(warning: BadgeShowcaseWarning) -> &'static str {
+    match warning {
+        BadgeShowcaseWarning::SelectionRefresh => {
+            "Previously resolved badges remain visible because showcase selection could not be refreshed."
+        }
+        BadgeShowcaseWarning::EarnedFallbackRefresh => {
+            "Previously resolved badges remain visible because earned badge fallback data could not be refreshed."
+        }
+    }
 }
 
 fn should_apply_generation(request_generation: u64, current_generation: u64) -> bool {
@@ -212,7 +291,8 @@ fn render_badge_chip(badge: EarnedBadgeSummary) -> impl IntoView {
         .definition
         .thumb_url
         .clone()
-        .or_else(|| badge.definition.image_url.clone());
+        .or_else(|| badge.definition.image_url.clone())
+        .and_then(valid_badge_image_url);
     let name = badge
         .definition
         .name
@@ -224,10 +304,7 @@ fn render_badge_chip(badge: EarnedBadgeSummary) -> impl IntoView {
     view! {
         <article class="v2-badge-chip">
             <div class="v2-badge-chip-art">
-                {match image {
-                    Some(src) => view! { <img src=src alt=name.clone() /> }.into_any(),
-                    None => view! { <span class="material-symbols-outlined" aria-hidden="true">"military_tech"</span> }.into_any(),
-                }}
+                <GameArtwork title=name.clone() state=artwork_state_from_url(image) role=ArtworkRole::Thumbnail />
             </div>
             <div>
                 <strong>{name}</strong>
@@ -238,11 +315,51 @@ fn render_badge_chip(badge: EarnedBadgeSummary) -> impl IntoView {
     }
 }
 
+fn valid_badge_image_url(value: String) -> Option<String> {
+    let parsed = url::Url::parse(value.trim()).ok()?;
+    if parsed.scheme() != "https" || !is_public_url_host(&parsed) {
+        return None;
+    }
+    Some(value.trim().to_string())
+}
+
+fn is_public_url_host(url: &url::Url) -> bool {
+    let Some(host) = url.host() else {
+        return false;
+    };
+    match host {
+        url::Host::Domain(domain) => !domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(address) => {
+            let octets = address.octets();
+            !(address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_broadcast()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1])))
+        }
+        url::Host::Ipv6(address) => {
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.is_multicast())
+        }
+    }
+}
+
 fn short_pubkey(pubkey: &str) -> String {
-    if pubkey.len() <= 12 {
+    let chars = pubkey.chars().collect::<Vec<_>>();
+    if chars.len() <= 12 {
         pubkey.to_string()
     } else {
-        format!("{}…{}", &pubkey[..6], &pubkey[pubkey.len() - 6..])
+        format!(
+            "{}…{}",
+            chars[..6].iter().collect::<String>(),
+            chars[chars.len() - 6..].iter().collect::<String>()
+        )
     }
 }
 
@@ -310,8 +427,64 @@ mod tests {
     fn showcase_empty_and_error_messages_are_safe() {
         assert_eq!(
             badge_showcase_empty_message(),
-            "No verified badges are available for this profile."
+            "No showcased or earned badges were resolved for this profile."
         );
         assert!(!badge_showcase_error_message().contains("relay"));
+    }
+
+    #[test]
+    fn selected_and_fallback_badges_are_never_conflated() {
+        assert!(
+            showcase_source_message(BadgeShowcaseSource::ProfileSelection)
+                .contains("Selected by this profile")
+        );
+        assert!(
+            showcase_source_message(BadgeShowcaseSource::EarnedFallback).contains("not selected")
+        );
+    }
+
+    #[test]
+    fn badge_media_accepts_only_public_http_schemes() {
+        assert_eq!(
+            valid_badge_image_url("https://cdn.example.org/badge.png".into()),
+            Some("https://cdn.example.org/badge.png".into())
+        );
+        assert_eq!(valid_badge_image_url("javascript:alert(1)".into()), None);
+        assert_eq!(
+            valid_badge_image_url("http://cdn.example.org/badge.png".into()),
+            None
+        );
+        assert_eq!(
+            valid_badge_image_url("https://127.0.0.1/badge.png".into()),
+            None
+        );
+        assert_eq!(
+            valid_badge_image_url("https://localhost/badge.png".into()),
+            None
+        );
+        assert_eq!(
+            valid_badge_image_url("https://[fe80::1]/badge.png".into()),
+            None
+        );
+        assert_eq!(
+            valid_badge_image_url("file:///tmp/private.png".into()),
+            None
+        );
+    }
+
+    #[test]
+    fn pubkey_abbreviation_handles_non_ascii_input() {
+        assert_eq!(short_pubkey("abcdeféghijklmnop"), "abcdef…klmnop");
+    }
+
+    #[test]
+    fn refresh_warning_identifies_the_failed_evidence_source() {
+        assert!(
+            showcase_warning_message(BadgeShowcaseWarning::SelectionRefresh).contains("selection")
+        );
+        assert!(
+            showcase_warning_message(BadgeShowcaseWarning::EarnedFallbackRefresh)
+                .contains("fallback")
+        );
     }
 }

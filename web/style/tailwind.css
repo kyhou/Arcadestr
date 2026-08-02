@@ -4,48 +4,164 @@
 
 @layer base {
   :root {
-    --noir-background: 0.16 0.02 270;
-    --noir-foreground: 0.96 0.01 270;
-    --noir-surface-lowest: 0.13 0.015 270;
-    --noir-surface-low: 0.19 0.02 270;
-    --noir-surface: 0.215 0.025 273;
-    --noir-surface-high: 0.24 0.03 275;
-    --noir-surface-highest: 0.265 0.032 275;
-    --noir-surface-bright: 0.29 0.035 275;
-    --noir-primary: 0.78 0.16 300;
-    --noir-primary-dim: 0.6 0.24 295;
-    --noir-on-primary: 0.16 0.05 270;
-    --noir-secondary: 0.82 0.16 220;
-    --noir-secondary-dim: 0.72 0.15 220;
-    --noir-on-secondary: 0.16 0.05 270;
-    --noir-tertiary: 0.78 0.14 355;
-    --noir-tertiary-dim: 0.69 0.14 355;
-    --noir-on-tertiary: 0.16 0.05 270;
-    --noir-muted: 0.24 0.02 270;
-    --noir-muted-foreground: 0.68 0.03 270;
-    --noir-destructive: 0.66 0.22 20;
-    --noir-on-destructive: 0.98 0.01 270;
-    --noir-outline: 0.58 0.025 270;
-    --noir-success: 0.75 0.15 160;
+    /* Arcadestr handoff foundations. RGB channels keep the supplied hex
+       surfaces exact while preserving Tailwind alpha modifiers. */
+    --noir-background: 11 11 13;
+    --noir-foreground: 234 230 223;
+    --noir-surface-lowest: 13 13 16;
+    --noir-surface-low: 18 18 21;
+    --noir-surface: 18 18 21;
+    --noir-surface-high: 20 20 23;
+    --noir-surface-highest: 20 20 23;
+    --noir-surface-bright: 26 26 29;
+    --noir-on-primary: 11 11 13;
+    --noir-on-secondary: 11 11 13;
+    --noir-on-tertiary: 11 11 13;
+    --noir-on-destructive: 255 255 255;
 
-    --noir-radius: 0.75rem;
-    --noir-radius-card: 1.25rem;
-    --noir-shadow-ambient: 0 20px 40px rgb(0 0 0 / 40%);
-    --noir-shadow-glow-primary: 0 0 32px oklch(var(--noir-primary) / 35%);
-    --noir-gradient-primary: linear-gradient(
-      135deg,
-      oklch(var(--noir-primary)),
-      oklch(var(--noir-primary-dim))
-    );
-    --noir-gradient-hero: linear-gradient(
-      180deg,
-      transparent 0%,
-      oklch(0.1 0.02 270 / 85%) 100%
-    );
-    --noir-font-body: 'Inter', ui-sans-serif, system-ui, -apple-system,
-      BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    --noir-font-display: 'Space Grotesk', 'Inter', ui-sans-serif, system-ui,
-      sans-serif;
+    --noir-primary: 0.78 0.16 60;
+    --noir-primary-dim: 0.7 0.15 60;
+    --noir-secondary: 0.8 0.14 195;
+    --noir-secondary-dim: 0.6 0.13 195;
+    --noir-tertiary: 0.68 0.15 300;
+    --noir-tertiary-dim: 0.6 0.13 300;
+    --noir-muted: 0.3 0.01 60;
+    --noir-muted-foreground: 0.6 0.01 60;
+    --noir-disabled-foreground: 0.45 0.01 60;
+    --noir-outline: 0.4 0.03 60;
+    --noir-destructive: 0.6 0.18 25;
+    --noir-success: 0.72 0.16 145;
+    --noir-warning: 0.7 0.15 60;
+
+    --arc-background: #0b0b0d;
+    --arc-surface-lowest: #0d0d10;
+    --arc-surface: #121215;
+    --arc-surface-recessed: #141417;
+    --arc-surface-artwork: #141419;
+    --arc-progress-track: #1a1a1d;
+    --arc-text-primary: #eae6df;
+    --arc-text-heading: #fff;
+    --arc-text-secondary: oklch(0.68 0.01 60);
+    --arc-text-muted: oklch(0.55 0.01 60);
+    --arc-text-subdued: oklch(0.45 0.01 60);
+    --arc-text-disabled: #888;
+    --arc-accent: oklch(var(--noir-primary));
+    --arc-action: oklch(var(--noir-secondary));
+    --arc-success: oklch(var(--noir-success));
+    --arc-warning: oklch(var(--noir-warning));
+    --arc-error: oklch(var(--noir-destructive));
+    --arc-info: oklch(var(--noir-tertiary));
+    --arc-border-subtle: rgb(255 255 255 / 10%);
+    --arc-border-default: rgb(255 255 255 / 18%);
+    --arc-border-strong: rgb(255 255 255 / 25%);
+    --arc-border-card: oklch(0.3 0.01 60);
+    --arc-border-control: oklch(0.32 0.01 60);
+    --arc-separator: oklch(0.4 0.03 60 / 30%);
+    --arc-separator-strong: oklch(0.4 0.03 60 / 35%);
+    --arc-separator-recessed: oklch(0.32 0.02 60 / 50%);
+    --arc-focus-ring: oklch(0.78 0.16 60);
+    --arc-selection: oklch(0.78 0.16 60 / 35%);
+    --arc-disabled-background: #2a2a2e;
+    --arc-unavailable-background: #333;
+
+    --arc-font-mono: ui-monospace, 'SFMono-Regular', 'Consolas', monospace;
+    --noir-font-body: var(--arc-font-mono);
+    --noir-font-display: var(--arc-font-mono);
+    --arc-weight-regular: 400;
+    --arc-weight-medium: 500;
+    --arc-weight-semibold: 600;
+    --arc-weight-bold: 700;
+    --arc-weight-black: 800;
+    --arc-leading-solid: 1;
+    --arc-leading-tight: 1.08;
+    --arc-leading-title: 1.15;
+    --arc-leading-copy: 1.55;
+    --arc-leading-body: 1.6;
+    --arc-leading-relaxed: 1.7;
+    --arc-leading-loose: 1.8;
+    --arc-tracking-tight: 0.5px;
+    --arc-tracking-control: 1px;
+    --arc-tracking-label: 1.5px;
+    --arc-tracking-wordmark: 2px;
+
+    --arc-text-10: 10px;
+    --arc-text-10-5: 10.5px;
+    --arc-text-11: 11px;
+    --arc-text-11-5: 11.5px;
+    --arc-text-12: 12px;
+    --arc-text-12-5: 12.5px;
+    --arc-text-13: 13px;
+    --arc-text-14: 14px;
+    --arc-text-15: 15px;
+    --arc-text-16: 16px;
+    --arc-text-17: 17px;
+    --arc-text-18: 18px;
+    --arc-text-19: 19px;
+    --arc-text-20: 20px;
+    --arc-text-22: 22px;
+    --arc-text-24: 24px;
+    --arc-text-32: 32px;
+    --arc-text-34: 34px;
+
+    --arc-space-1: 4px;
+    --arc-space-2: 8px;
+    --arc-space-3: 12px;
+    --arc-space-4: 16px;
+    --arc-space-5: 20px;
+    --arc-space-6: 24px;
+    --arc-space-7: 28px;
+    --arc-space-8: 30px;
+    --arc-space-1px: 1px;
+    --arc-space-2px: 2px;
+    --arc-space-5px: 5px;
+    --arc-space-6px: 6px;
+    --arc-space-7px: 7px;
+    --arc-space-9px: 9px;
+    --arc-space-10px: 10px;
+    --arc-space-11px: 11px;
+    --arc-space-13px: 13px;
+    --arc-space-14px: 14px;
+    --arc-space-18px: 18px;
+    --arc-space-22px: 22px;
+    --arc-space-26px: 26px;
+    --arc-space-60px: 60px;
+    --arc-space-70px: 70px;
+    --arc-page-inline: 28px;
+    --arc-page-block: 26px;
+    --arc-shell-height: 64px;
+    --arc-control-sm: 32px;
+    --arc-control-md: 36px;
+    --arc-panel-settings: 220px;
+    --arc-panel-editor: 190px;
+    --arc-content-max: 1440px;
+    --arc-content-standard: 1180px;
+    --arc-content-form-sm: 480px;
+    --arc-content-form-md: 520px;
+    --arc-content-form-lg: 560px;
+    --arc-content-form-xl: 640px;
+    --arc-content-releases: 700px;
+    --arc-content-manage: 760px;
+    --arc-content-activity: 820px;
+    --arc-panel-detail: 380px;
+    --arc-dialog-width: 440px;
+    --arc-login-width: 440px;
+
+    --arc-radius-xs: 3px;
+    --arc-radius-sm: 4px;
+    --arc-radius-md: 6px;
+    --arc-radius-lg: 8px;
+    --arc-radius-dialog: 10px;
+    --noir-radius: var(--arc-radius-sm);
+    --noir-radius-card: var(--arc-radius-lg);
+    --arc-logo-clip: polygon(0 30%, 70% 0, 100% 30%, 100% 100%, 30% 100%, 0 70%);
+    --arc-card-clip: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+    --noir-shadow-ambient: 0 8px 24px rgb(0 0 0 / 50%);
+    --noir-shadow-glow-primary: 0 0 6px oklch(var(--noir-primary) / 35%);
+    --noir-gradient-primary: linear-gradient(135deg, var(--arc-accent), oklch(var(--noir-primary-dim)));
+    --noir-gradient-hero: linear-gradient(180deg, transparent 0%, rgb(11 11 13 / 88%) 100%);
+    --arc-overlay: rgb(0 0 0 / 60%);
+    --arc-overlay-control: rgb(10 10 12 / 70%);
+    --arc-overlay-favorite: rgb(0 0 0 / 55%);
   }
 
   *,
@@ -55,10 +171,14 @@
   }
 
   body {
-    background: oklch(var(--noir-background)) !important;
-    color: oklch(var(--noir-foreground)) !important;
+    min-width: 0;
+    min-height: 100vh;
+    background-color: var(--arc-background) !important;
+    background-image: radial-gradient(circle, rgb(255 255 255 / 2%) 1px, transparent 1px);
+    background-size: 24px 24px;
+    color: var(--arc-text-primary) !important;
     font-family: var(--noir-font-body) !important;
-    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+    font-feature-settings: normal;
   }
 
   h1,
@@ -66,7 +186,26 @@
   h3,
   .font-display {
     font-family: var(--noir-font-display);
-    letter-spacing: -0.02em;
+    letter-spacing: normal;
+  }
+
+  ::selection {
+    background: var(--arc-selection);
+    color: var(--arc-text-heading);
+  }
+
+  a {
+    color: var(--arc-action);
+  }
+
+  a:hover {
+    color: oklch(0.85 0.14 195);
+  }
+
+  input[type='search'] {
+    -webkit-appearance: none;
+    appearance: none;
+    line-height: normal;
   }
 
   .material-symbols-outlined {
@@ -76,10 +215,8 @@
 
 @layer utilities {
   .noir-glass {
-    background: oklch(var(--noir-surface-high) / 65%);
-    border: 1px solid oklch(1 0 0 / 8%);
-    -webkit-backdrop-filter: blur(24px);
-    backdrop-filter: blur(24px);
+    background: rgb(var(--noir-surface-high) / 92%);
+    border: 1px solid var(--arc-border-subtle);
   }
 
   .noir-text-gradient {

@@ -16,18 +16,112 @@ use crate::tauri_bridge::{
     invoke_connect_nwc_wallet, invoke_discover_campaigns, invoke_enrich_store_page_detail,
     invoke_get_installed_games, invoke_get_listing_ownership, invoke_get_platform_info,
     invoke_install_game, invoke_is_game_in_library, invoke_pay_nwc_invoice,
-    invoke_request_lnurl_invoice, listen_download_complete,
+    invoke_request_lnurl_invoice, listen_download_complete, listen_download_progress,
 };
 use crate::tauri_bridge::{
     CampaignPointerInput, ClaimEntitlementRequest, ConfirmPurchaseRequest, ConnectNwcWalletRequest,
-    DiscoverCampaignsRequest, DiscoveredCampaign, PayNwcInvoiceRequest, RequestLnurlInvoiceRequest,
+    DiscoverCampaignsRequest, DiscoveredCampaign, DownloadProgressPayload, PayNwcInvoiceRequest,
+    RequestLnurlInvoiceRequest,
 };
-use crate::ui_v2::components::StorePageRichDetail;
+use crate::ui_v2::components::{
+    artwork_state_from_url, ArtworkRole, GameArtwork, StatusChip, StatusChipSize,
+    StatusChipVariant, StorePageRichDetail,
+};
 use crate::ui_v2::views::browse_games::listing_categories;
-use crate::ui_v2::views::{use_fallback_cover, FALLBACK_COVER};
+use crate::ui_v2::views::use_fallback_cover;
 use crate::{invoke_fetch_profile, AuthContext};
 
 type DownloadCompleteCleanup = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+type DownloadProgressCleanup = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InstallFlowState {
+    Preparing,
+    Downloading { bytes: u64, total: Option<u64> },
+    Finalizing,
+    Completed,
+    Failed(InstallFailurePresentation),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstallFailurePresentation {
+    title: &'static str,
+    message: &'static str,
+    retryable: bool,
+}
+
+fn install_flow_from_progress(payload: &DownloadProgressPayload) -> InstallFlowState {
+    if payload
+        .total
+        .is_some_and(|total| total > 0 && payload.bytes >= total)
+    {
+        InstallFlowState::Finalizing
+    } else {
+        InstallFlowState::Downloading {
+            bytes: payload.bytes,
+            total: payload.total,
+        }
+    }
+}
+
+fn download_progress_percent(bytes: u64, total: Option<u64>) -> Option<u8> {
+    let total = total.filter(|total| *total > 0)?;
+    Some(((bytes.min(total) as u128 * 100) / total as u128) as u8)
+}
+
+fn format_download_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
+    }
+}
+
+fn install_failure_presentation(error: &str) -> InstallFailurePresentation {
+    let normalized = error.to_lowercase();
+    if normalized.contains("hash")
+        || normalized.contains("integrity")
+        || normalized.contains("mismatch")
+        || normalized.contains("quarantine")
+    {
+        InstallFailurePresentation {
+            title: "Integrity verification failed",
+            message: "The downloaded artifact was rejected and was not registered as installed.",
+            retryable: true,
+        }
+    } else if normalized.contains("auth")
+        || normalized.contains("ownership")
+        || normalized.contains("entitlement")
+        || normalized.contains("unauthorized")
+    {
+        InstallFailurePresentation {
+            title: "Download authorization failed",
+            message: "Current access could not be verified. No installation was recorded.",
+            retryable: true,
+        }
+    } else if normalized.contains("platform") || normalized.contains("unsupported") {
+        InstallFailurePresentation {
+            title: "Artifact is not compatible",
+            message: "The available artifact does not support this device.",
+            retryable: false,
+        }
+    } else {
+        InstallFailurePresentation {
+            title: "Download could not finish",
+            message:
+                "The artifact was not verified or registered. Retry when the source is available.",
+            retryable: true,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum DetailOperation {
@@ -45,6 +139,7 @@ enum DetailOperation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrimaryAction {
     CheckingOwnership,
+    CheckingInstallation,
     Buy,
     Claim,
     Install,
@@ -56,6 +151,7 @@ enum PrimaryAction {
     SignIn,
     NoPaymentAddress,
     Unavailable,
+    LocalStateUnavailable,
     Busy(DetailOperation),
 }
 
@@ -94,6 +190,8 @@ fn select_primary_action(
     owned: bool,
     installed: bool,
     ownership_loading: bool,
+    installation_loading: bool,
+    installation_error: bool,
     campaigns: &[DiscoveredCampaign],
     campaign_pending: bool,
     compatibility: DetailCompatibility,
@@ -110,7 +208,7 @@ fn select_primary_action(
             DetailOperation::ConfirmingPurchase => "Recording ownership...",
             DetailOperation::Claiming => "Claiming access...",
             DetailOperation::AddingToLibrary => "Adding to library...",
-            DetailOperation::Installing => "Installing...",
+            DetailOperation::Installing => "Preparing download...",
             DetailOperation::Idle => "Working...",
         };
         return PrimaryActionDecision {
@@ -133,6 +231,22 @@ fn select_primary_action(
             action: PrimaryAction::Installed,
             label: "Installed",
             explanation: "The game is installed on this device.",
+            enabled: false,
+        };
+    }
+    if installation_loading {
+        return PrimaryActionDecision {
+            action: PrimaryAction::CheckingInstallation,
+            label: "Checking this device...",
+            explanation: "Reading the local installation registry before enabling a download.",
+            enabled: false,
+        };
+    }
+    if installation_error {
+        return PrimaryActionDecision {
+            action: PrimaryAction::LocalStateUnavailable,
+            label: "Installation status unavailable",
+            explanation: "Retry the local registry lookup before downloading this artifact.",
             enabled: false,
         };
     }
@@ -236,17 +350,16 @@ fn select_primary_action(
         },
         PrimaryAction::Install => PrimaryActionDecision {
             action: desired,
-            label: if matches!(listing.acquisition, AcquisitionPolicy::Public) {
-                "Play Game"
-            } else if owned {
-                "Install"
-            } else {
+            label: if matches!(listing.acquisition, AcquisitionPolicy::TimedAccess { .. }) && !owned
+            {
                 "Download while available"
+            } else {
+                "Download"
             },
             explanation: if matches!(listing.acquisition, AcquisitionPolicy::Public) {
-                "Adds the game to your library and starts the download."
+                "Downloads, verifies, and registers the current artifact on this device."
             } else if owned {
-                "Durable ownership is confirmed for the active account."
+                "Ownership is confirmed before the artifact is downloaded and verified."
             } else {
                 "Access depends on the listing's current public or timed policy."
             },
@@ -458,7 +571,7 @@ fn operation_status(operation: DetailOperation) -> &'static str {
         DetailOperation::ConfirmingPurchase => "Confirming payment and recording ownership...",
         DetailOperation::Claiming => "Claiming permanent access...",
         DetailOperation::AddingToLibrary => "Adding the game to your library...",
-        DetailOperation::Installing => "Downloading and installing the game...",
+        DetailOperation::Installing => "Downloading and verifying the game artifact...",
     }
 }
 
@@ -534,19 +647,12 @@ fn detail_response_is_current(
 #[component]
 pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoView {
     let media = valid_image_urls(&listing.images);
-    let hero_image = media
-        .first()
-        .cloned()
-        .unwrap_or_else(|| FALLBACK_COVER.to_string());
+    let hero_image = media.first().cloned();
     let gallery_images = media.into_iter().skip(1).collect::<Vec<_>>();
     let categories = listing_categories(&listing)
         .into_iter()
         .map(|category| category.label)
         .collect::<Vec<_>>();
-    let kicker = categories
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "Game".to_string());
     let release_label = format_timestamp(listing.created_at);
     let protocol_label = match listing.source {
         ListingSource::Nip15Product => "NIP-15",
@@ -555,8 +661,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     };
     let technical = technical_fields(&listing);
     let publisher_npub = listing.publisher_npub.clone();
-    let seller_lud16 = listing.lud16.clone();
-    let has_lightning = !seller_lud16.trim().is_empty();
     let title = listing.title.clone();
     let description = listing.description.clone();
 
@@ -573,13 +677,23 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let library_added: RwSignal<bool> = RwSignal::new(false);
     let library_loading: RwSignal<bool> = RwSignal::new(!cfg!(feature = "web"));
     let install_complete: RwSignal<bool> = RwSignal::new(false);
+    let install_state_loading: RwSignal<bool> = RwSignal::new(!cfg!(feature = "web"));
+    let install_state_error = RwSignal::new(false);
+    let install_state_refresh = RwSignal::new(0_u64);
     let operation = RwSignal::new(DetailOperation::Idle);
+    let install_flow = RwSignal::new(None::<InstallFlowState>);
+    let install_attempt_active = RwSignal::new(false);
+    let install_attempt_account = RwSignal::new(None::<String>);
+    let install_dialog_ref = NodeRef::<leptos::html::Dialog>::new();
     let campaigns: RwSignal<Vec<DiscoveredCampaign>> = RwSignal::new(Vec::new());
     let campaign_loading: RwSignal<bool> = RwSignal::new(true);
     let campaign_error: RwSignal<Option<String>> = RwSignal::new(None);
     let campaign_refresh = RwSignal::new(0_u64);
     let pending_claim: RwSignal<Option<DiscoveredCampaign>> = RwSignal::new(None);
     let platform_info: RwSignal<Option<PlatformInfo>> = RwSignal::new(None);
+    let platform_loading = RwSignal::new(!cfg!(feature = "web"));
+    let platform_error = RwSignal::new(false);
+    let platform_refresh = RwSignal::new(0_u64);
     let decision_time = RwSignal::new(current_unix_secs());
 
     #[cfg(target_arch = "wasm32")]
@@ -599,19 +713,50 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let detail_presentation = RwSignal::new(None::<GameDetailPresentation>);
     let detail_generation = RwSignal::new(0_u64);
     let listing_event_current = RwSignal::new(cfg!(feature = "web"));
+    let listing_validation_loading = RwSignal::new(!cfg!(feature = "web"));
+    let listing_validation_error = RwSignal::new(false);
+    let listing_validation_refresh = RwSignal::new(0_u64);
     let detail_coordinate = game_coordinate(&listing);
     let detail_event_id = listing.event_id.clone();
     let _commerce = detail_commerce(&listing);
 
+    let install_auth = auth.clone();
+    Effect::new(move |_| {
+        let active_account = install_auth.npub.get();
+        if install_attempt_active.get_untracked()
+            && install_attempt_account.get_untracked() != active_account
+        {
+            install_attempt_active.set(false);
+            install_flow.set(None);
+            operation.set(DetailOperation::Idle);
+        }
+    });
+
+    Effect::new(move |_| {
+        let flow_open = install_flow.get().is_some();
+        if let Some(dialog) = install_dialog_ref.get() {
+            if flow_open && !dialog.open() {
+                let _ = dialog.show_modal();
+            } else if !flow_open && dialog.open() {
+                dialog.close();
+            }
+        }
+    });
+
     Effect::new(move |_| {
         let _account = auth.npub.get();
+        let _ = listing_validation_refresh.get();
         detail_generation.update(|value| *value = value.wrapping_add(1));
         listing_event_current.set(cfg!(feature = "web"));
+        listing_validation_loading.set(!cfg!(feature = "web"));
+        listing_validation_error.set(false);
         let requested_generation = detail_generation.get_untracked();
         let (Some(coordinate), Some(event_id)) =
             (detail_coordinate.clone(), detail_event_id.clone())
         else {
             detail_presentation.set(None);
+            listing_validation_loading.set(false);
+            listing_validation_error.set(true);
             return;
         };
         spawn_local(async move {
@@ -624,6 +769,10 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             )
             .await;
             let Ok(response) = response else {
+                if detail_generation.get_untracked() == requested_generation {
+                    listing_validation_loading.set(false);
+                    listing_validation_error.set(true);
+                }
                 return;
             };
             if detail_generation.get_untracked() != requested_generation
@@ -632,6 +781,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 return;
             }
             listing_event_current.set(response.listing_event_current);
+            listing_validation_error.set(!response.listing_event_current);
             if let Some(cached) = response.cached {
                 if detail_response_is_current(
                     detail_generation.get_untracked(),
@@ -664,15 +814,25 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 | StorePageDetailState::Invalid
                 | StorePageDetailState::Unsupported => detail_presentation.set(None),
             }
+            listing_validation_loading.set(false);
         });
     });
     on_cleanup(move || detail_generation.update(|value| *value = value.wrapping_add(1)));
 
     Effect::new(move |_| {
+        let requested_refresh = platform_refresh.get();
+        platform_loading.set(!cfg!(feature = "web"));
+        platform_error.set(false);
         spawn_local(async move {
-            if let Ok(info) = invoke_get_platform_info().await {
-                platform_info.set(Some(info));
+            let result = invoke_get_platform_info().await;
+            if platform_refresh.get_untracked() != requested_refresh {
+                return;
             }
+            match result {
+                Ok(info) => platform_info.set(Some(info)),
+                Err(_) => platform_error.set(true),
+            }
+            platform_loading.set(false);
         });
     });
 
@@ -742,17 +902,28 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
 
     if let Some(coordinate) = install_game_coordinate.clone() {
         Effect::new(move |_| {
+            let requested_refresh = install_state_refresh.get();
             let coordinate = coordinate.clone();
+            install_state_loading.set(true);
+            install_state_error.set(false);
             spawn_local(async move {
-                if let Ok(installed_games) = invoke_get_installed_games().await {
-                    install_complete.set(
+                let result = invoke_get_installed_games().await;
+                if install_state_refresh.get_untracked() != requested_refresh {
+                    return;
+                }
+                match result {
+                    Ok(installed_games) => install_complete.set(
                         installed_games
                             .iter()
                             .any(|game| game.game_coordinate == coordinate),
-                    );
+                    ),
+                    Err(_) => install_state_error.set(true),
                 }
+                install_state_loading.set(false);
             });
         });
+    } else {
+        install_state_loading.set(false);
     }
 
     let on_buy = {
@@ -1005,6 +1176,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 return;
             }
             let initiating_account = play_auth.npub.get_untracked();
+            install_attempt_account.set(initiating_account.clone());
+            install_attempt_active.set(true);
+            install_flow.set(Some(InstallFlowState::Preparing));
             operation.set(DetailOperation::Installing);
             buy_error.set(None);
             success_message.set(None);
@@ -1014,16 +1188,28 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             spawn_local(async move {
                 if matches!(listing.acquisition, AcquisitionPolicy::Public) {
                     let Some(coordinate) = coordinate else {
-                        buy_error.set(Some("Game listing coordinate is invalid.".to_string()));
+                        let failure = InstallFailurePresentation {
+                            title: "Download unavailable",
+                            message: "The signed listing coordinate is invalid, so no artifact was downloaded.",
+                            retryable: false,
+                        };
+                        buy_error.set(Some(failure.message.to_string()));
+                        install_flow.set(Some(InstallFlowState::Failed(failure)));
+                        install_attempt_active.set(false);
                         operation.set(DetailOperation::Idle);
                         return;
                     };
                     if let Err(error) = invoke_add_game_to_library(coordinate).await {
-                        buy_error.set(Some(format!("Could not add game to library: {error}")));
+                        let failure = install_failure_presentation(&error);
+                        buy_error.set(Some(failure.message.to_string()));
+                        install_flow.set(Some(InstallFlowState::Failed(failure)));
+                        install_attempt_active.set(false);
                         operation.set(DetailOperation::Idle);
                         return;
                     }
                     if auth_for_response.npub.get_untracked() != initiating_account {
+                        install_attempt_active.set(false);
+                        install_flow.set(None);
                         operation.set(DetailOperation::Idle);
                         return;
                     }
@@ -1032,11 +1218,31 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 match invoke_install_game(&listing).await {
                     Ok(()) => {
                         install_complete.set(true);
-                        success_message.set(Some("Installation completed.".to_string()));
+                        install_state_error.set(false);
+                        install_state_loading.set(false);
+                        if auth_for_response.npub.get_untracked() != initiating_account {
+                            return;
+                        }
+                        if !install_attempt_active.get_untracked() {
+                            return;
+                        }
+                        install_attempt_active.set(false);
+                        install_flow.set(Some(InstallFlowState::Completed));
+                        success_message.set(Some(
+                            "Artifact verified and registered on this device.".to_string(),
+                        ));
                         operation.set(DetailOperation::Idle);
                     }
                     Err(err) => {
-                        buy_error.set(Some(format!("Install failed: {err}")));
+                        if !install_attempt_active.get_untracked()
+                            || auth_for_response.npub.get_untracked() != initiating_account
+                        {
+                            return;
+                        }
+                        let failure = install_failure_presentation(&err);
+                        install_attempt_active.set(false);
+                        install_flow.set(Some(InstallFlowState::Failed(failure.clone())));
+                        buy_error.set(Some(failure.message.to_string()));
                         operation.set(DetailOperation::Idle);
                     }
                 }
@@ -1101,10 +1307,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         spawn_local(async move {
             if let Ok(listener) = listen_download_complete(move |payload| {
                 if expected_install_coordinate.as_deref() == Some(payload.game_coordinate.as_str())
+                    && install_attempt_active.get_untracked()
                 {
-                    install_complete.set(true);
-                    success_message.set(Some("Installation completed.".to_string()));
-                    operation.set(DetailOperation::Idle);
+                    install_flow.set(Some(InstallFlowState::Finalizing));
                 }
             })
             .await
@@ -1125,6 +1330,53 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     on_cleanup(move || {
         *download_complete_disposed_for_teardown.borrow_mut() = true;
         if let Some(cleanup) = download_complete_cleanup_for_teardown.borrow_mut().take() {
+            cleanup();
+        }
+    });
+
+    let expected_progress_coordinate = install_game_coordinate.clone();
+    let download_progress_cleanup: DownloadProgressCleanup = Rc::new(RefCell::new(None));
+    let download_progress_disposed = Rc::new(RefCell::new(false));
+    let download_progress_registration_started = Rc::new(RefCell::new(false));
+    let download_progress_cleanup_for_effect = Rc::clone(&download_progress_cleanup);
+    let download_progress_disposed_for_effect = Rc::clone(&download_progress_disposed);
+    let download_progress_registration_started_for_effect =
+        Rc::clone(&download_progress_registration_started);
+    Effect::new(move |_| {
+        if *download_progress_registration_started_for_effect.borrow() {
+            return;
+        }
+        *download_progress_registration_started_for_effect.borrow_mut() = true;
+
+        let expected_coordinate = expected_progress_coordinate.clone();
+        let cleanup_handle = Rc::clone(&download_progress_cleanup_for_effect);
+        let disposed = Rc::clone(&download_progress_disposed_for_effect);
+        spawn_local(async move {
+            if let Ok(listener) = listen_download_progress(move |payload| {
+                if expected_coordinate.as_deref() == Some(payload.game_coordinate.as_str())
+                    && install_attempt_active.get_untracked()
+                {
+                    install_flow.set(Some(install_flow_from_progress(&payload)));
+                }
+            })
+            .await
+            {
+                if *disposed.borrow() {
+                    listener();
+                } else {
+                    *cleanup_handle.borrow_mut() = Some(listener);
+                }
+            }
+        });
+    });
+
+    let download_progress_cleanup_for_teardown =
+        SendWrapper::new(Rc::clone(&download_progress_cleanup));
+    let download_progress_disposed_for_teardown =
+        SendWrapper::new(Rc::clone(&download_progress_disposed));
+    on_cleanup(move || {
+        *download_progress_disposed_for_teardown.borrow_mut() = true;
+        if let Some(cleanup) = download_progress_cleanup_for_teardown.borrow_mut().take() {
             cleanup();
         }
     });
@@ -1247,11 +1499,21 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         let decision_auth = decision_auth.clone();
         move || {
             let discovered = campaigns.get();
+            if listing_validation_error.get() {
+                return PrimaryActionDecision {
+                    action: PrimaryAction::Unavailable,
+                    label: "Listing validation unavailable",
+                    explanation: "Retry validation before acquiring or downloading this listing.",
+                    enabled: false,
+                };
+            }
             select_primary_action(
                 &listing,
                 purchase_confirmed.get(),
                 install_complete.get(),
-                ownership_loading.get() || !listing_event_current.get(),
+                ownership_loading.get() || listing_validation_loading.get(),
+                install_state_loading.get(),
+                install_state_error.get(),
                 &discovered,
                 campaign_loading.get() || campaign_error.get().is_some(),
                 listing_compatibility(&listing, platform_info.get().as_ref()),
@@ -1274,6 +1536,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 pending_claim.set(active_campaign(&discovered));
             }
             PrimaryAction::CheckingOwnership
+            | PrimaryAction::CheckingInstallation
             | PrimaryAction::Busy(_)
             | PrimaryAction::Installed
             | PrimaryAction::Incompatible
@@ -1282,9 +1545,12 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             | PrimaryAction::TimedExpired
             | PrimaryAction::SignIn
             | PrimaryAction::NoPaymentAddress
-            | PrimaryAction::Unavailable => {}
+            | PrimaryAction::Unavailable
+            | PrimaryAction::LocalStateUnavailable => {}
         })
     };
+    let retry_primary = on_primary.clone();
+    let decision_for_retry = primary_decision.clone();
     let decision_for_label = primary_decision.clone();
     let decision_for_disabled = primary_decision.clone();
     let decision_for_explanation = primary_decision.clone();
@@ -1299,44 +1565,224 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         }
         AcquisitionPolicy::Gated => "Restricted".to_string(),
     };
+    let (access_variant, access_icon) = match listing.acquisition {
+        AcquisitionPolicy::Public => (StatusChipVariant::Public, Some("public")),
+        AcquisitionPolicy::TimedAccess { .. } => (StatusChipVariant::TimedAccess, Some("schedule")),
+        AcquisitionPolicy::Gated if listing.has_declared_price() => {
+            (StatusChipVariant::Active, Some("bolt"))
+        }
+        AcquisitionPolicy::Gated => (StatusChipVariant::Gated, Some("lock")),
+    };
+    let listing_platforms = listing.platforms.clone();
+    let listing_version = listing
+        .specs
+        .iter()
+        .find(|(key, value)| key == "version" && !value.trim().is_empty())
+        .map(|(_, value)| value.clone());
+    let listing_release_date = format_date(listing.created_at);
+    let platform_detection_required = !listing.platforms.is_empty();
     let listing_for_compatibility = listing.clone();
     let listing_for_seller = listing.clone();
     let listing_title_for_header = title.clone();
     let listing_description_for_header = description.clone();
     let listing_hero_for_header = hero_image.clone();
-    let listing_categories_for_header = categories.clone();
+    let artwork_title = title.clone();
 
     view! {
         <section class="v2-detail-wrap">
             <button class="v2-btn-ghost v2-detail-back" on:click=move |_| on_back.run(())>
-                <span class="material-symbols-outlined">"arrow_back"</span>
-                "Back"
+                <span aria-hidden="true">"<"</span>
+                "Back to browse"
             </button>
 
-            <header class="v2-panel-glass v2-detail-hero">
-                <div class="v2-detail-hero-copy">
-                    <p class="v2-store-kicker">{move || detail_presentation.get().and_then(|page| page.genres.first().cloned()).unwrap_or_else(|| kicker.clone())}</p>
-                    <h1 class="v2-display v2-detail-title">{move || detail_presentation.get().and_then(|page| page.title).unwrap_or_else(|| listing_title_for_header.clone())}</h1>
-                    <p class="v2-hero-description">{move || detail_presentation.get().and_then(|page| page.summary).unwrap_or_else(|| truncate_chars(&listing_description_for_header, 300))}</p>
-                    <div class="v2-detail-tags">
+            <div class="v2-detail-layout">
+                <main class="v2-detail-main-column">
+                    <header class="v2-detail-hero">
                         {move || {
-                            let values = detail_presentation.get().map(|page| page.genres.into_iter().chain(page.features).take(8).collect::<Vec<_>>()).filter(|values| !values.is_empty()).unwrap_or_else(|| listing_categories_for_header.clone());
-                            values.into_iter().map(|category| view! { <span class="v2-chip">{category}</span> }).collect_view()
+                            let artwork_url = detail_presentation
+                                .get()
+                                .and_then(|page| {
+                                    page.media
+                                        .iter()
+                                        .find(|item| item.role == "hero")
+                                        .or_else(|| page.media.iter().find(|item| item.role == "capsule"))
+                                        .map(|item| item.url.clone())
+                                })
+                                .or_else(|| listing_hero_for_header.clone());
+                            view! {
+                                <GameArtwork
+                                    title=artwork_title.clone()
+                                    state=artwork_state_from_url(artwork_url)
+                                    role=ArtworkRole::Hero
+                                />
+                            }
                         }}
-                    </div>
-                </div>
-                <div class="v2-detail-cover-frame">
-                    <img src=move || detail_presentation.get().and_then(|page| page.media.iter().find(|item| item.role == "hero").or_else(|| page.media.iter().find(|item| item.role == "capsule")).map(|item| item.url.clone())).unwrap_or_else(|| listing_hero_for_header.clone()) alt=format!("{title} cover") on:error=use_fallback_cover />
-                </div>
-                <aside class="v2-detail-buy-panel v2-panel">
-                    <p class="v2-store-kicker">"Access"</p>
-                    <div class="v2-detail-price">
-                        {move || if purchase_confirmed.get() {
-                            "Owned".to_string()
+                        <div class="v2-detail-hero-shade" aria-hidden="true"></div>
+                        <h1 class="v2-detail-title">{move || detail_presentation.get().and_then(|page| page.title).unwrap_or_else(|| listing_title_for_header.clone())}</h1>
+                    </header>
+
+                    <section class="v2-detail-section v2-detail-about" aria-labelledby="detail-about-title">
+                        <p class="v2-store-kicker">"About"</p>
+                        <h2 id="detail-about-title" class="sr-only">"About this game"</h2>
+                        <p>{move || detail_presentation.get().and_then(|page| page.summary).filter(|value| !value.trim().is_empty()).unwrap_or_else(|| listing_description_for_header.clone())}</p>
+                        <div class="v2-detail-tags">
+                            {move || {
+                                let values = detail_presentation
+                                    .get()
+                                    .map(|page| page.genres.into_iter().chain(page.features).take(8).collect::<Vec<_>>())
+                                    .filter(|values| !values.is_empty())
+                                    .unwrap_or_else(|| categories.clone());
+                                values.into_iter().map(|category| view! { <span class="v2-chip">{category}</span> }).collect_view()
+                            }}
+                        </div>
+                    </section>
+
+                    <section class="v2-detail-section" aria-labelledby="detail-compatibility-title">
+                        <p id="detail-compatibility-title" class="v2-store-kicker">"Compatibility"</p>
+                        <div class="v2-detail-compatibility">
+                            {if listing_platforms.is_empty() {
+                                view! { <span class="v2-chip">"No platform restriction declared"</span> }.into_any()
+                            } else {
+                                listing_platforms.iter().map(|platform| view! { <span class="v2-chip">{platform.clone()}</span> }).collect_view().into_any()
+                            }}
+                            <span class="v2-detail-compatibility-state" role="status" aria-live="polite">
+                                {move || match listing_compatibility(&listing_for_compatibility, platform_info.get().as_ref()) {
+                                    DetailCompatibility::Compatible => "Compatible with this device",
+                                    DetailCompatibility::Incompatible => "Not available for this device",
+                                    DetailCompatibility::Unknown if platform_error.get() => "Device compatibility unavailable",
+                                    DetailCompatibility::Unknown => "Checking this device",
+                                }}
+                            </span>
+                        </div>
+                    </section>
+
+                    <section class="v2-detail-section" aria-labelledby="detail-release-title">
+                        <p id="detail-release-title" class="v2-store-kicker">"Release info"</p>
+                        <p class="v2-detail-release-info">
+                            {move || {
+                                let mut values = vec![detail_presentation.get().and_then(|page| page.release_date).filter(|value| !value.trim().is_empty()).unwrap_or_else(|| listing_release_date.clone())];
+                                if let Some(version) = listing_version.clone() {
+                                    values.push(format!("Version {version}"));
+                                }
+                                values.join(" · ")
+                            }}
+                        </p>
+                    </section>
+
+                    <section class="v2-detail-section" aria-labelledby="detail-developer-title">
+                        <p id="detail-developer-title" class="v2-store-kicker">"Developer"</p>
+                        {move || if profile_loading.get() {
+                            view! { <p class="v2-social-meta">"Loading publisher profile..."</p> }.into_any()
                         } else {
-                            unowned_access_label.clone()
+                            let profile = seller_profile.get();
+                            let store_identity = detail_presentation.get().and_then(|page| page.developer.or(page.publisher)).filter(|value| !value.trim().is_empty());
+                            let display = store_identity.unwrap_or_else(|| seller_display(profile.as_ref(), &listing_for_seller));
+                            let avatar = profile
+                                .as_ref()
+                                .and_then(|item| item.picture.as_ref())
+                                .and_then(|url| valid_image_urls(std::slice::from_ref(url)).into_iter().next())
+                                .unwrap_or_default();
+                            let nip05 = profile.as_ref().and_then(|item| item.nip05.clone());
+                            view! {
+                                <div class="v2-detail-seller-identity">
+                                    {if avatar.is_empty() {
+                                        view! { <div class="v2-detail-seller-avatar">{display.chars().next().unwrap_or('?').to_string()}</div> }.into_any()
+                                    } else {
+                                        view! { <img class="v2-detail-seller-avatar" src=avatar alt="Publisher avatar" on:error=use_fallback_cover /> }.into_any()
+                                    }}
+                                    <div>
+                                        <h3>{display}</h3>
+                                        {nip05.map(|value| view! { <p class="v2-detail-publisher-verification">{value}</p> })}
+                                        <p class="v2-social-meta">{truncate_chars(&publisher_npub, 28)}</p>
+                                    </div>
+                                </div>
+                                {if profile_error.get() {
+                                    view! { <p class="v2-social-meta">"Relay profile unavailable; showing the published listing identity."</p> }.into_any()
+                                } else {
+                                    view! { <></> }.into_any()
+                                }}
+                            }.into_any()
+                        }}
+                    </section>
+
+                    {if !gallery_images.is_empty() {
+                        view! {
+                            <section class="v2-detail-media" aria-label="Game media">
+                                {gallery_images.iter().map(|url| view! {
+                                    <img src=url.clone() alt=format!("{title} screenshot") loading="lazy" on:error=use_fallback_cover />
+                                }).collect::<Vec<_>>()}
+                            </section>
+                        }.into_any()
+                    } else {
+                        view! { <></> }.into_any()
+                    }}
+
+                    {move || detail_presentation.get().map(|presentation| view! { <StorePageRichDetail presentation=presentation /> })}
+
+                    <section class="v2-detail-section v2-detail-description-block">
+                        <div class="v2-section-header"><h2>"Access campaigns"</h2></div>
+                        {move || if campaign_loading.get() {
+                            view! { <p class="v2-social-meta">"Checking signed campaign events..."</p> }.into_any()
+                        } else if let Some(error) = campaign_error.get() {
+                            view! {
+                                <div class="v2-detail-alert v2-detail-alert-error">
+                                    <p>{format!("Campaign lookup failed: {error}")}</p>
+                                    <button class="v2-btn-secondary" on:click=move |_| campaign_refresh.update(|generation| *generation = generation.wrapping_add(1))>
+                                        "Retry campaign lookup"
+                                    </button>
+                                </div>
+                            }.into_any()
+                        } else if campaigns.get().is_empty() {
+                            view! { <p class="v2-social-meta">"No entitlement campaigns are attached to this listing."</p> }.into_any()
+                        } else {
+                            let cards = campaigns.get().into_iter().map(|campaign| view! {
+                                <article class="v2-detail-campaign-card">
+                                    <div>
+                                        <strong>{campaign.campaign_id}</strong>
+                                        <p class="v2-social-meta">
+                                            {format!("{} to {}", format_date(campaign.starts_at), format_date(campaign.ends_at))}
+                                        </p>
+                                    </div>
+                                    <span class="v2-chip">{campaign.classification}</span>
+                                </article>
+                            }).collect::<Vec<_>>();
+                            view! { <div class="v2-detail-campaign-list">{cards}</div> }.into_any()
+                        }}
+                    </section>
+
+                    <section class="v2-detail-section v2-detail-description-block">
+                        <h2>"Technical details"</h2>
+                        <div class="v2-spec-grid">
+                            {technical.iter().flat_map(|(label, value)| vec![
+                                view! { <span>{label.clone()}</span> }.into_any(),
+                                view! { <span class="v2-detail-technical-value">{value.clone()}</span> }.into_any(),
+                            ]).collect::<Vec<_>>()}
+                        </div>
+                    </section>
+                </main>
+
+                <aside class="v2-detail-sidebar">
+                    <section class="v2-detail-buy-panel" aria-labelledby="detail-access-title">
+                    <p class="v2-store-kicker">"Access"</p>
+                    <h2 id="detail-access-title" class="sr-only">"Access options"</h2>
+                    <div class="v2-detail-access-states">
+                        <StatusChip
+                            label=unowned_access_label
+                            variant=access_variant
+                            icon=access_icon
+                            size=StatusChipSize::Standard
+                        />
+                        {move || if install_complete.get() {
+                            view! { <StatusChip label="Installed" variant=StatusChipVariant::Installed icon=Some("download_done") size=StatusChipSize::Compact /> }.into_any()
+                        } else if purchase_confirmed.get() {
+                            view! { <StatusChip label="Owned" variant=StatusChipVariant::Owned icon=Some("verified_user") size=StatusChipSize::Compact /> }.into_any()
+                        } else if active_campaign(&campaigns.get()).is_some() {
+                            view! { <StatusChip label="Free claim available" variant=StatusChipVariant::Success icon=Some("redeem") size=StatusChipSize::Compact /> }.into_any()
+                        } else {
+                            view! { <></> }.into_any()
                         }}
                     </div>
+                    <p class="v2-detail-access-note">{move || decision_for_explanation().explanation}</p>
                     <button
                         class="v2-btn-primary"
                         on:click=move |_| on_primary.run(())
@@ -1344,6 +1790,21 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     >
                         {move || decision_for_label().label}
                     </button>
+                    <Show when=move || install_state_error.get()>
+                        <button class="v2-btn-secondary" disabled=move || install_state_loading.get() on:click=move |_| install_state_refresh.update(|generation| *generation = generation.wrapping_add(1))>
+                            {move || if install_state_loading.get() { "Checking..." } else { "Retry device status" }}
+                        </button>
+                    </Show>
+                    <Show when=move || listing_validation_error.get()>
+                        <button class="v2-btn-secondary" disabled=move || listing_validation_loading.get() on:click=move |_| listing_validation_refresh.update(|generation| *generation = generation.wrapping_add(1))>
+                            {move || if listing_validation_loading.get() { "Validating..." } else { "Retry listing validation" }}
+                        </button>
+                    </Show>
+                    <Show when=move || platform_detection_required && platform_error.get() && !cfg!(feature = "web")>
+                        <button class="v2-btn-secondary" disabled=move || platform_loading.get() on:click=move |_| platform_refresh.update(|generation| *generation = generation.wrapping_add(1))>
+                            {move || if platform_loading.get() { "Checking..." } else { "Retry compatibility check" }}
+                        </button>
+                    </Show>
                     <Show when=move || {
                         show_add_to_library(
                             &listing,
@@ -1363,7 +1824,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                             "Add to Library"
                         </button>
                     </Show>
-                    <p class="v2-social-meta">{move || decision_for_explanation().explanation}</p>
                     {move || if operation.get() != DetailOperation::Idle {
                         view! { <p class="v2-detail-status">{operation_status(operation.get())}</p> }.into_any()
                     } else {
@@ -1442,122 +1902,99 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     <div class="v2-detail-buy-meta">
                         <span>{release_label.clone()}</span>
                         <span>{format!("Protocol: {protocol_label}")}</span>
-                        <span>{move || match listing_compatibility(&listing_for_compatibility, platform_info.get().as_ref()) {
-                            DetailCompatibility::Compatible => "Compatible with this device",
-                            DetailCompatibility::Incompatible => "Not available for this device",
-                            DetailCompatibility::Unknown => "Device compatibility unavailable",
-                        }}</span>
                     </div>
-                </aside>
-            </header>
-
-            {if !gallery_images.is_empty() {
-                view! {
-                    <section class="v2-detail-media" aria-label="Game media">
-                        {gallery_images.iter().map(|url| view! {
-                            <img src=url.clone() alt=format!("{title} screenshot") loading="lazy" on:error=use_fallback_cover />
-                        }).collect::<Vec<_>>()}
-                    </section>
-                }.into_any()
-            } else {
-                view! { <></> }.into_any()
-            }}
-
-            <div class="v2-detail-grid">
-                <main class="v2-detail-main-column">
-                    {move || if detail_presentation.get().and_then(|page| page.description_html).is_none() {
-                        view! { <section class="v2-panel-glass v2-detail-description-block"><p class="v2-store-kicker">"About this game"</p><h2>{title.clone()}</h2><p>{description.clone()}</p></section> }.into_any()
-                    } else { view! { <></> }.into_any() }}
-
-                    {move || detail_presentation.get().map(|presentation| view! { <StorePageRichDetail presentation=presentation /> })}
-
-                    <section class="v2-panel-glass v2-detail-description-block">
-                        <div class="v2-section-header"><h2>"Access campaigns"</h2></div>
-                        {move || if campaign_loading.get() {
-                            view! { <p class="v2-social-meta">"Checking signed campaign events..."</p> }.into_any()
-                        } else if let Some(error) = campaign_error.get() {
-                            view! {
-                                <div class="v2-detail-alert v2-detail-alert-error">
-                                    <p>{format!("Campaign lookup failed: {error}")}</p>
-                                    <button class="v2-btn-secondary" on:click=move |_| campaign_refresh.update(|generation| *generation = generation.wrapping_add(1))>
-                                        "Retry campaign lookup"
-                                    </button>
-                                </div>
-                            }.into_any()
-                        } else if campaigns.get().is_empty() {
-                            view! { <p class="v2-social-meta">"No entitlement campaigns are attached to this listing."</p> }.into_any()
-                        } else {
-                            let cards = campaigns.get().into_iter().map(|campaign| view! {
-                                <article class="v2-detail-campaign-card">
-                                    <div>
-                                        <strong>{campaign.campaign_id}</strong>
-                                        <p class="v2-social-meta">
-                                            {format!("{} to {}", format_date(campaign.starts_at), format_date(campaign.ends_at))}
-                                        </p>
-                                    </div>
-                                    <span class="v2-chip">{campaign.classification}</span>
-                                </article>
-                            }).collect::<Vec<_>>();
-                            view! { <div class="v2-detail-campaign-list">{cards}</div> }.into_any()
-                        }}
                     </section>
 
-                    <section class="v2-panel-glass v2-detail-description-block">
-                        <h2>"Technical details"</h2>
-                        <div class="v2-spec-grid">
-                            {technical.iter().flat_map(|(label, value)| vec![
-                                view! { <span>{label.clone()}</span> }.into_any(),
-                                view! { <span class="v2-detail-technical-value">{value.clone()}</span> }.into_any(),
-                            ]).collect::<Vec<_>>()}
-                        </div>
-                    </section>
-                </main>
-
-                <aside class="v2-panel v2-detail-seller-card">
-                    <p class="v2-store-kicker">"Published by"</p>
-                    {move || if profile_loading.get() {
-                        view! { <p class="v2-social-meta">"Loading seller profile..."</p> }.into_any()
-                    } else {
-                        let profile = seller_profile.get();
-                        let display = seller_display(profile.as_ref(), &listing_for_seller);
-                        let avatar = profile
-                            .as_ref()
-                            .and_then(|item| item.picture.as_ref())
-                            .and_then(|url| valid_image_urls(std::slice::from_ref(url)).into_iter().next())
-                            .unwrap_or_default();
-                        let about = profile.as_ref().and_then(|item| item.about.clone());
-                        let nip05 = profile.as_ref().and_then(|item| item.nip05.clone());
-                        let lightning = profile.as_ref().and_then(|item| item.lud16.clone())
-                            .filter(|value| !value.trim().is_empty())
-                            .or_else(|| has_lightning.then(|| seller_lud16.clone()));
-                        view! {
-                            <div>
-                                <div class="v2-detail-seller-identity">
-                                    {if avatar.is_empty() {
-                                        view! { <div class="v2-detail-seller-avatar">{display.chars().next().unwrap_or('?').to_string()}</div> }.into_any()
-                                    } else {
-                                        view! { <img class="v2-detail-seller-avatar" src=avatar alt="Seller avatar" on:error=use_fallback_cover /> }.into_any()
-                                    }}
-                                    <div>
-                                        <h3>{display}</h3>
-                                        <p class="v2-social-meta">{truncate_chars(&publisher_npub, 28)}</p>
-                                    </div>
-                                </div>
-                                {about.filter(|value| !value.trim().is_empty()).map(|value| view! {
-                                    <p class="v2-detail-seller-about">{truncate_chars(&value, 240)}</p>
-                                })}
-                                {nip05.map(|value| view! { <p class="v2-social-meta">{value}</p> })}
-                                {lightning.map(|value| view! { <p class="v2-social-meta">{format!("Lightning: {value}")}</p> })}
-                                {if profile_error.get() {
-                                    view! { <p class="v2-social-meta">"Relay profile unavailable; showing listing identity."</p> }.into_any()
-                                } else {
-                                    view! { <></> }.into_any()
-                                }}
-                            </div>
-                        }.into_any()
-                    }}
+                    <Show when=move || purchase_confirmed.get()>
+                        <section class="v2-detail-ownership-panel" aria-labelledby="detail-ownership-title">
+                            <p id="detail-ownership-title" class="v2-store-kicker">"Ownership status"</p>
+                            <p>"Permanent access is recorded for the active account."</p>
+                        </section>
+                    </Show>
                 </aside>
             </div>
+
+            <dialog
+                node_ref=install_dialog_ref
+                class="v2-install-dialog"
+                aria-labelledby="install-dialog-title"
+                on:cancel=move |event: web_sys::Event| {
+                    if install_attempt_active.get_untracked() {
+                        event.prevent_default();
+                    } else {
+                        install_flow.set(None);
+                    }
+                }
+            >
+                {move || install_flow.get().map(|flow| {
+                    let retry_primary = retry_primary.clone();
+                    let retry_allowed = decision_for_retry().action == PrimaryAction::Install;
+                    match flow {
+                        InstallFlowState::Preparing => view! {
+                            <div class="v2-install-dialog-body">
+                                <p class="v2-store-kicker">"Verified download"</p>
+                                <h2 id="install-dialog-title" role="status" aria-live="polite">"Preparing download"</h2>
+                                <p>"Resolving current access and the signed artifact source."</p>
+                                <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Preparing download"></div>
+                                <p class="v2-install-dialog-note">"This window stays open while the active operation is running."</p>
+                            </div>
+                        }.into_any(),
+                        InstallFlowState::Downloading { bytes, total } => {
+                            let percent = download_progress_percent(bytes, total);
+                            let transferred = total.map(|total| format!("{} of {}", format_download_bytes(bytes.min(total)), format_download_bytes(total)));
+                            view! {
+                                <div class="v2-install-dialog-body">
+                                    <p class="v2-store-kicker">"Verified download"</p>
+                                    <h2 id="install-dialog-title" role="status" aria-live="polite">"Downloading artifact"</h2>
+                                    <p>"Only transferred bytes reported by the desktop downloader are shown."</p>
+                                    {if let Some(percent) = percent {
+                                        view! {
+                                            <div class="v2-install-progress" role="progressbar" aria-label="Artifact download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent.to_string()>
+                                                <span style=format!("width: {percent}%")></span>
+                                            </div>
+                                            <div class="v2-install-progress-copy"><strong>{format!("{percent}%")}</strong><span>{transferred.unwrap_or_default()}</span></div>
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Artifact download progress"></div>
+                                            <div class="v2-install-progress-copy"><strong>"Downloading"</strong><span>"Total size unavailable"</span></div>
+                                        }.into_any()
+                                    }}
+                                    <p class="v2-install-dialog-note">"Cancellation is unavailable in the current installer."</p>
+                                </div>
+                            }.into_any()
+                        }
+                        InstallFlowState::Finalizing => view! {
+                            <div class="v2-install-dialog-body">
+                                <p class="v2-store-kicker">"Integrity check"</p>
+                                <h2 id="install-dialog-title" role="status" aria-live="polite">"Verifying and registering"</h2>
+                                <p>"The download finished. Arcadestr is verifying the exact artifact hash before recording it on this device."</p>
+                                <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Verifying artifact integrity"></div>
+                                <p class="v2-install-dialog-note">"The artifact is not marked installed until verification and registry persistence finish."</p>
+                            </div>
+                        }.into_any(),
+                        InstallFlowState::Completed => view! {
+                            <div class="v2-install-dialog-body" role="status">
+                                <p class="v2-store-kicker">"Complete"</p>
+                                <h2 id="install-dialog-title">"Artifact verified and registered"</h2>
+                                <p>"The local artifact is recorded on this device. Arcadestr does not yet launch or extract game packages."</p>
+                                <button class="v2-btn-primary" autofocus on:click=move |_| install_flow.set(None)>"Close"</button>
+                            </div>
+                        }.into_any(),
+                        InstallFlowState::Failed(failure) => view! {
+                            <div class="v2-install-dialog-body" role="alert">
+                                <p class="v2-store-kicker">"Download failed"</p>
+                                <h2 id="install-dialog-title">{failure.title}</h2>
+                                <p>{failure.message}</p>
+                                <div class="v2-install-dialog-actions">
+                                    {(failure.retryable && retry_allowed).then(|| view! { <button class="v2-btn-primary" autofocus disabled=move || operation_blocks_dispatch(operation.get()) on:click=move |_| retry_primary.run(())>"Retry download"</button> })}
+                                    <button class="v2-btn-secondary" disabled=move || operation_blocks_dispatch(operation.get()) on:click=move |_| install_flow.set(None)>"Close"</button>
+                                </div>
+                            </div>
+                        }.into_any(),
+                    }
+                })}
+            </dialog>
         </section>
     }
 }
@@ -1624,6 +2061,8 @@ mod tests {
             listing,
             owned,
             installed,
+            false,
+            false,
             false,
             campaigns,
             campaign_loading,
@@ -1904,6 +2343,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
             &[],
             false,
             DetailCompatibility::Compatible,
@@ -1918,10 +2359,52 @@ mod tests {
     }
 
     #[test]
-    fn public_game_actions_add_to_library_or_play() {
+    fn local_installation_lookup_blocks_duplicate_downloads_until_resolved() {
+        let listing = listing(AcquisitionPolicy::Public);
+        let loading = select_primary_action(
+            &listing,
+            false,
+            false,
+            false,
+            true,
+            false,
+            &[],
+            false,
+            DetailCompatibility::Compatible,
+            DetailOperation::Idle,
+            false,
+            true,
+            100,
+        );
+        assert_eq!(loading.action, PrimaryAction::CheckingInstallation);
+        assert!(!loading.enabled);
+
+        let failed = select_primary_action(
+            &listing,
+            false,
+            false,
+            false,
+            false,
+            true,
+            &[],
+            false,
+            DetailCompatibility::Compatible,
+            DetailOperation::Idle,
+            false,
+            true,
+            100,
+        );
+        assert_eq!(failed.action, PrimaryAction::LocalStateUnavailable);
+        assert!(!failed.enabled);
+    }
+
+    #[test]
+    fn public_game_actions_add_to_library_or_download() {
         let public = listing(AcquisitionPolicy::Public);
         let result = select_primary_action(
             &public,
+            false,
+            false,
             false,
             false,
             false,
@@ -1935,7 +2418,7 @@ mod tests {
         );
 
         assert_eq!(result.action, PrimaryAction::Install);
-        assert_eq!(result.label, "Play Game");
+        assert_eq!(result.label, "Download");
         assert!(show_add_to_library(
             &public, true, false, true, false, false, false
         ));
@@ -1950,6 +2433,56 @@ mod tests {
         assert!(!show_add_to_library(
             &gated, true, false, true, false, false, false
         ));
+    }
+
+    #[test]
+    fn download_progress_is_determinate_only_with_a_reliable_total() {
+        assert_eq!(download_progress_percent(25, Some(100)), Some(25));
+        assert_eq!(download_progress_percent(150, Some(100)), Some(100));
+        assert_eq!(download_progress_percent(25, None), None);
+        assert_eq!(download_progress_percent(25, Some(0)), None);
+
+        let downloading = install_flow_from_progress(&DownloadProgressPayload {
+            game_coordinate: "30402:publisher:game".into(),
+            bytes: 25,
+            total: Some(100),
+        });
+        assert_eq!(
+            downloading,
+            InstallFlowState::Downloading {
+                bytes: 25,
+                total: Some(100)
+            }
+        );
+    }
+
+    #[test]
+    fn completed_download_waits_for_integrity_and_registry_completion() {
+        let phase = install_flow_from_progress(&DownloadProgressPayload {
+            game_coordinate: "30402:publisher:game".into(),
+            bytes: 100,
+            total: Some(100),
+        });
+        assert_eq!(phase, InstallFlowState::Finalizing);
+        assert_ne!(phase, InstallFlowState::Completed);
+    }
+
+    #[test]
+    fn install_failures_use_safe_actionable_categories() {
+        let integrity = install_failure_presentation(
+            "hash mismatch at /private/home/player/downloads/game.bin; quarantined",
+        );
+        assert_eq!(integrity.title, "Integrity verification failed");
+        assert!(integrity.retryable);
+        assert!(!integrity.message.contains("/private/"));
+
+        let auth = install_failure_presentation("ownership authorization rejected");
+        assert_eq!(auth.title, "Download authorization failed");
+        assert!(auth.retryable);
+        assert!(auth.message.contains("No installation was recorded"));
+
+        let unsupported = install_failure_presentation("unsupported platform");
+        assert!(!unsupported.retryable);
     }
 
     #[test]
