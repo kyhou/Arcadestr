@@ -1794,6 +1794,132 @@ fn resolve_confirmation(
     }
 }
 
+/// Campaign publication has two independent stages: the campaign event chain and
+/// the advisory listing pointer. They are never collapsed into one success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CampaignStage {
+    NotAttempted,
+    Pending,
+    Complete,
+    Failed,
+}
+
+impl CampaignStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotAttempted => "Not attempted",
+            Self::Pending => "In progress",
+            Self::Complete => "Published",
+            Self::Failed => "Failed",
+        }
+    }
+
+    fn variant(self) -> StatusChipVariant {
+        match self {
+            Self::NotAttempted => StatusChipVariant::Neutral,
+            Self::Pending => StatusChipVariant::Pending,
+            Self::Complete => StatusChipVariant::Verified,
+            Self::Failed => StatusChipVariant::Error,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CampaignPublicationLifecycle {
+    event: CampaignStage,
+    pointer: CampaignStage,
+    pointer_retryable: bool,
+}
+
+fn campaign_publication_lifecycle(
+    submitting: bool,
+    published_root_event_id: Option<&str>,
+    pointer_requested: bool,
+    pointer_error: Option<&str>,
+) -> CampaignPublicationLifecycle {
+    let event = match published_root_event_id {
+        Some(id) if !id.trim().is_empty() => CampaignStage::Complete,
+        Some(_) => CampaignStage::Failed,
+        None if submitting => CampaignStage::Pending,
+        None => CampaignStage::NotAttempted,
+    };
+    let pointer = if !pointer_requested {
+        CampaignStage::NotAttempted
+    } else if pointer_error.is_some() {
+        CampaignStage::Failed
+    } else if event == CampaignStage::Complete {
+        CampaignStage::Complete
+    } else if submitting {
+        CampaignStage::Pending
+    } else {
+        CampaignStage::NotAttempted
+    };
+    CampaignPublicationLifecycle {
+        event,
+        pointer,
+        // Only a published chain can have its advisory link retried.
+        pointer_retryable: pointer == CampaignStage::Failed && event == CampaignStage::Complete,
+    }
+}
+
+/// Overall wording. A published campaign chain whose advisory link failed is
+/// never reported as a finished publication.
+fn campaign_overall_label(lifecycle: CampaignPublicationLifecycle) -> &'static str {
+    use CampaignStage::*;
+    match (lifecycle.event, lifecycle.pointer) {
+        (NotAttempted, _) => "Not published",
+        (Pending, _) | (_, Pending) => "Publishing",
+        (Failed, _) => "Promotion publication failed",
+        (Complete, NotAttempted) => "Promotion published; no Game page link was requested",
+        (Complete, Complete) => "Promotion published and linked from the Game page",
+        (Complete, Failed) => "Promotion published; Game page link failed and can be retried",
+    }
+}
+
+fn campaign_status_variant(classification: &str) -> StatusChipVariant {
+    match classification {
+        "upcoming" => StatusChipVariant::Pending,
+        "active" => StatusChipVariant::Active,
+        "ended" => StatusChipVariant::Expired,
+        "cancelled" => StatusChipVariant::Cancelled,
+        _ => StatusChipVariant::Warning,
+    }
+}
+
+/// Advisory listing-pointer state for one campaign row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CampaignPointerState {
+    Present,
+    Stale,
+    Missing,
+}
+
+fn campaign_pointer_state(points_here: bool, live: bool) -> CampaignPointerState {
+    match (points_here, live) {
+        (true, true) => CampaignPointerState::Present,
+        (true, false) => CampaignPointerState::Stale,
+        (false, _) => CampaignPointerState::Missing,
+    }
+}
+
+impl CampaignPointerState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Present => "Game page link present",
+            Self::Stale => "Game page link stale",
+            Self::Missing => "Game page link missing",
+        }
+    }
+
+    fn variant(self) -> StatusChipVariant {
+        match self {
+            Self::Present => StatusChipVariant::Verified,
+            Self::Stale => StatusChipVariant::Warning,
+            Self::Missing => StatusChipVariant::Neutral,
+        }
+    }
+}
+
 #[component]
 fn CampaignConfirmationDialog(
     confirmation: RwSignal<Option<CampaignConfirmation>>,
@@ -1834,15 +1960,15 @@ fn CampaignConfirmationDialog(
                 class="v2-publisher-dialog-card"
                 on:click=move |event| event.stop_propagation()
             >
-                <div class="space-y-2">
-                    <h2 class="text-xl font-headline font-bold">
+                <div class="v2-publisher-dialog-copy">
+                    <h2 class="v2-publisher-dialog-title">
                         {move || confirmation.get().map(CampaignConfirmation::title).unwrap_or_default()}
                     </h2>
-                    <p class="text-sm text-on-surface-variant">
+                    <p class="v2-publisher-dialog-message">
                         {move || confirmation.get().map(CampaignConfirmation::message).unwrap_or_default()}
                     </p>
                 </div>
-                <div class="flex flex-wrap justify-end gap-3">
+                <div class="v2-publisher-dialog-actions">
                     <button node_ref=reject_ref class="v2-btn-secondary" on:click=move |_| on_decision.run(Some(false))>
                         {move || confirmation.get().map(CampaignConfirmation::reject_label).unwrap_or_default()}
                     </button>
@@ -2059,11 +2185,12 @@ fn campaign_row(
     view! {
         <article class="v2-publisher-promotion-row">
             <div>
-                <div class="flex flex-wrap items-center gap-2"><strong>{campaign.campaign_id.clone()}</strong><span class="v2-chip">{status}</span>{if points_here && (is_upcoming || is_active) { view! { <span class="v2-chip">"Promotion link present"</span> }.into_any() } else if points_here { view! { <span class="v2-chip">"Promotion link stale"</span> }.into_any() } else { view! { <span class="text-xs text-on-surface-variant">"Promotion link missing"</span> }.into_any() }}</div>
-                <p class="text-sm text-on-surface-variant mt-2">{format!("{} to {}", format_unix(campaign.starts_at), format_unix(campaign.ends_at))}</p>
-                <details class="v2-publisher-diagnostics"><summary>"Network diagnostics"</summary><p class="break-all mt-1">{format!("Campaign root event: {} | current event: {}", campaign.root_event_id, campaign.event_id.clone().unwrap_or_default())}</p></details>
+                <div class="v2-publisher-row-statuses"><strong class="v2-campaign-id">{short_identifier(&campaign.campaign_id)}</strong><StatusChip label=status variant=campaign_status_variant(&campaign.classification) icon=None size=StatusChipSize::Compact />{ let pointer = campaign_pointer_state(points_here, is_upcoming || is_active); view! { <StatusChip label=pointer.label() variant=pointer.variant() icon=None size=StatusChipSize::Compact /> } }</div>
+                <p class="v2-campaign-window">{format!("{} to {}", format_unix(campaign.starts_at), format_unix(campaign.ends_at))}</p>
+                <p class="v2-campaign-mode">{campaign_mode_label(&campaign.mode)}</p>
+                <details class="v2-publisher-diagnostics"><summary>"Network diagnostics"</summary><p>{format!("Campaign root event: {} | current event: {}", short_identifier(&campaign.root_event_id), short_identifier(campaign.event_id.as_deref().unwrap_or("unresolved")))}</p></details>
             </div>
-            <div class="flex flex-wrap gap-2">
+            <div class="v2-campaign-actions">
                 {if is_upcoming { view! { <button class="v2-btn-secondary" disabled=move || action_in_progress.get() || action_completed.get() on:click={move |_| {
                     if action_in_progress.get_untracked() || action_completed.get_untracked() {
                         return;
@@ -2079,9 +2206,9 @@ fn campaign_row(
                 {if !points_here && (is_upcoming || is_active) { view! { <button class="v2-btn-secondary" disabled=move || action_in_progress.get() || action_completed.get() on:click=move |_| pointer_for_add.run(false)>"Add Promotion link"</button> }.into_any() } else if points_here && !is_upcoming && !is_active { view! { <button class="v2-btn-secondary" disabled=move || action_in_progress.get() || action_completed.get() on:click=move |_| pointer_for_remove.run(true)>"Remove stale Promotion link"</button> }.into_any() } else { view! { <></> }.into_any() }}
                 {move || pointer_cleanup_retry.get().then(|| { let retry = pointer_for_retry.clone(); view! { <button class="v2-btn-secondary" disabled=move || action_in_progress.get() on:click=move |_| retry.run(true)>"Retry Promotion link cleanup"</button> } })}
             </div>
-            {move || action_completed.get().then(|| view! { <p class="text-sm text-secondary">"Completed"</p> })}
-            {move || cancel_message.get().map(|message| view! { <p class="text-sm text-secondary">{message}</p> })}
-            {move || pointer_message.get().map(|message| view! { <p class="text-sm text-secondary">{message}</p> })}
+            {move || action_completed.get().then(|| view! { <p class="v2-campaign-note v2-campaign-note-ok">"Requested operation completed"</p> })}
+            {move || cancel_message.get().map(|message| view! { <p class="v2-campaign-note">{message}</p> })}
+            {move || pointer_message.get().map(|message| view! { <p class="v2-campaign-note">{message}</p> })}
             <CampaignConfirmationDialog confirmation=confirmation on_decision=on_confirmation_decision />
         </article>
     }
@@ -2131,6 +2258,7 @@ fn CampaignEditorView(
     });
     let submitting = RwSignal::new(false);
     let completed = RwSignal::new(false);
+    let published_root_event_id = RwSignal::new(None::<String>);
     let message = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     let operation_generation = RwSignal::new(0_u64);
@@ -2229,6 +2357,10 @@ fn CampaignEditorView(
             match result {
                 Ok(response) => {
                     completed.set(true);
+                    // Presentation bookkeeping only: records which chain event was
+                    // accepted so the publication panel can keep the campaign and
+                    // pointer stages separate.
+                    published_root_event_id.set(Some(response.root_event_id.clone()));
                     if let Some(pointer_error) = response.pointer_update_error.as_ref() {
                         if campaign_pointer_failure_retryable(&response) {
                             pointer_retry.set(Some((response.root_event_id.clone(), false)));
@@ -2478,8 +2610,8 @@ fn CampaignEditorView(
         <section class="v2-publisher-studio v2-publisher-editor">
             <button class="v2-btn-secondary v2-publisher-back" on:click=move |_| back.run(())>"Back to Game page"</button>
             <header class="v2-publisher-game-hero">
-                {valid_cover_url(&listing.images).map(|url| view! { <img src=url alt="cover" class="h-20 w-16 rounded-lg object-cover" on:error=use_fallback_cover /> }.into_any()).unwrap_or_else(|| view! { <div class="h-20 w-16 rounded-lg bg-surface-container-highest flex items-center justify-center text-2xl">"🎮"</div> }.into_any())}
-                <div><p class="v2-publisher-kicker">{if editing { "Promotion details" } else { "New Promotion" }}</p><h1>{format!("{} for {}", if editing { "Promotion" } else { "Create a Promotion" }, listing.title)}</h1>{campaign.as_ref().map(|item| view! { <span class="v2-chip">{campaign_status(&item.classification)}</span> })}</div>
+                <div class="v2-publisher-manage-art"><GameArtwork title=listing.title.clone() state=artwork_state_from_url(valid_cover_url(&listing.images)) role=ArtworkRole::Thumbnail /></div>
+                <div><p class="v2-publisher-kicker">{if editing { "Promotion details" } else { "New Promotion" }}</p><h1>{format!("{} for {}", if editing { "Promotion" } else { "Create a Promotion" }, listing.title)}</h1>{campaign.as_ref().map(|item| view! { <div class="v2-publisher-row-statuses"><StatusChip label=campaign_status(&item.classification) variant=campaign_status_variant(&item.classification) icon=None size=StatusChipSize::Compact /></div> })}</div>
             </header>
             <div class="v2-publisher-management-layout">
             <main class="v2-publisher-main">
@@ -2487,7 +2619,7 @@ fn CampaignEditorView(
                 <div class="v2-publisher-authority" role="note"><strong>"Developer-only authority"</strong><p>"Only the developer account that published this game can create, edit, or cancel a Promotion. A fulfillment provider cannot perform these actions."</p></div>
                 {terms_read_only.then(|| view! { <p class="v2-publisher-readonly" role="status">"Active, Ended, and Cancelled Promotion terms are immutable. This view is read-only."</p> })}
                 <div><label for="campaign-id">"Promotion ID"</label><input id="campaign-id" class="v2-input" readonly=true prop:value=move || form.get().campaign_id /></div>
-                <div><h2>"Claim and keep"</h2><div class="v2-publisher-option"><strong>"Free Claim and keep"</strong><p>"People may claim before the exclusive end time and keep durable access permanently."</p></div><p class="text-sm text-on-surface-variant">"Timed access belongs to the Game page acquisition policy, not this Promotion."</p></div>
+                <div><h2>"Claim and keep"</h2><div class="v2-publisher-option"><strong>"Free Claim and keep"</strong><p>"People may claim before the exclusive end time and keep durable access permanently."</p></div><p class="v2-campaign-help">"Timed access belongs to the Game page acquisition policy, not this Promotion."</p></div>
                 <DateTimeRangePicker
                     starts_at=Signal::derive(move || form.get().starts_at)
                     ends_at=Signal::derive(move || form.get().ends_at)
@@ -2495,12 +2627,31 @@ fn CampaignEditorView(
                     on_ends_at=Callback::new(move |value| form.update(|current| current.ends_at = value))
                     disabled=Signal::derive(move || terms_read_only || completed.get())
                 />
-                <p class="text-xs text-on-surface-variant">"Times use your local timezone. Claims at or after the end are not accepted. Local timezone: "{timezone_label()}</p>
-                {move || live_validation.get().map(|text| view! { <p class="text-sm text-error" role="alert">{text}</p> })}
+                <p class="v2-campaign-help">"Times use your local timezone. Claims at or after the end are not accepted. Local timezone: "{timezone_label()}</p>
+                {move || live_validation.get().map(|text| view! { <p class="v2-campaign-blocker" role="alert">{text}</p> })}
                 <div class="v2-publisher-link-option"><label><input type="checkbox" disabled=move || terms_read_only || completed.get() prop:checked=move || form.get().update_listing_pointer on:change:target=move |event| form.update(|current| current.update_listing_pointer = event.target().checked()) /><span><strong>"Add a Promotion link to the Game page"</strong><span>"Recommended advisory discovery hint. Promotion validity never depends on this link."</span></span></label></div>
-                {move || error.get().map(|text| view! { <p class="text-error" role="alert">{text}</p> })}
-                {move || message.get().map(|text| view! { <p class="text-secondary" role="status">{text}</p> })}
-                <div class="v2-publisher-actions v2-publisher-actions-end"><button class="v2-btn-secondary" on:click=move |_| back.run(())>{move || if terms_read_only { "Close" } else if completed.get() { "Back to Game page" } else { "Discard changes" }}</button>{move || completed.get().then(|| view! { <span class="v2-chip">"Completed"</span> })}{move || { let retry = retry_pointer.clone(); pointer_retry.get().is_some().then(move || view! { <button class="v2-btn-secondary" disabled=move || submitting.get() on:click=move |_| retry.run(())>"Retry Promotion link"</button> }) }}{if cancellable { view! { <button class="v2-btn-secondary" disabled=move || submitting.get() || completed.get() on:click=cancel>"Cancel Promotion"</button> }.into_any() } else { view! { <></> }.into_any() }}{if !terms_read_only { view! { <button class="v2-btn-primary" disabled=move || submitting.get() || completed.get() || live_validation.get().is_some() on:click=save>{move || if completed.get() { "Completed" } else if submitting.get() { "Publishing..." } else { "Publish Promotion" }}</button> }.into_any() } else { view! { <></> }.into_any() }}</div>
+                {move || error.get().map(|text| view! { <p class="v2-campaign-blocker" role="alert">{text}</p> })}
+                {move || message.get().map(|text| view! { <p class="v2-campaign-note" role="status">{text}</p> })}
+                {move || {
+                    let lifecycle = campaign_publication_lifecycle(
+                        submitting.get(),
+                        completed.get().then(|| published_root_event_id.get()).flatten().as_deref(),
+                        form.get().update_listing_pointer,
+                        pointer_retry.get().is_some().then_some("pointer update failed"),
+                    );
+                    (lifecycle.event != CampaignStage::NotAttempted).then(|| view! {
+                        <section class="v2-campaign-publication" aria-labelledby="campaign-publication-title">
+                            <h3 id="campaign-publication-title">"Publication status"</h3>
+                            <p class="v2-campaign-overall">{campaign_overall_label(lifecycle)}</p>
+                            <dl class="v2-campaign-stage-grid">
+                                <div><dt>"Promotion chain event"</dt><dd><StatusChip label=lifecycle.event.label() variant=lifecycle.event.variant() icon=None size=StatusChipSize::Compact /></dd></div>
+                                <div><dt>"Game page link"</dt><dd><StatusChip label=lifecycle.pointer.label() variant=lifecycle.pointer.variant() icon=None size=StatusChipSize::Compact /></dd></div>
+                            </dl>
+                            {lifecycle.pointer_retryable.then(|| view! { <p class="v2-campaign-help">"The Promotion itself is authoritative and already published. Only the advisory Game page link needs retrying."</p> })}
+                        </section>
+                    })
+                }}
+                <div class="v2-publisher-actions v2-publisher-actions-end"><button class="v2-btn-secondary" on:click=move |_| back.run(())>{move || if terms_read_only { "Close" } else if completed.get() { "Back to Game page" } else { "Discard changes" }}</button>{move || completed.get().then(|| view! { <StatusChip label="Requested operation completed" variant=StatusChipVariant::Verified icon=None size=StatusChipSize::Compact /> })}{move || { let retry = retry_pointer.clone(); pointer_retry.get().is_some().then(move || view! { <button class="v2-btn-secondary" disabled=move || submitting.get() on:click=move |_| retry.run(())>"Retry Promotion link"</button> }) }}{if cancellable { view! { <button class="v2-btn-secondary" disabled=move || submitting.get() || completed.get() on:click=cancel>"Cancel Promotion"</button> }.into_any() } else { view! { <></> }.into_any() }}{if !terms_read_only { view! { <button class="v2-btn-primary" disabled=move || submitting.get() || completed.get() || live_validation.get().is_some() on:click=save>{move || if completed.get() { "Completed" } else if submitting.get() { "Publishing..." } else { "Publish Promotion" }}</button> }.into_any() } else { view! { <></> }.into_any() }}</div>
             </section>
             </main>
             <aside class="v2-publisher-panel v2-publisher-sidebar"><h2>"Promotion policy"</h2><ul><li>"Developer account controls publication and cancellation."</li><li>"End time is exclusive and shown in your local timezone."</li><li>"Claims create durable access."</li><li>"Campaign cancellation stops new claims without revoking prior claims."</li><li>"Promotion links are advisory and retryable."</li></ul><details class="v2-publisher-diagnostics"><summary>"Protocol diagnostics"</summary><p>"Campaign chain events are validated independently from listing pointer events."</p></details></aside>
@@ -3042,6 +3193,147 @@ mod tests {
             artwork_state_from_url(valid_cover_url(&sample_listing().images)),
             crate::ui_v2::components::ArtworkState::Missing
         );
+    }
+
+    #[test]
+    fn campaign_event_and_pointer_publication_never_collapse() {
+        // Chain published, advisory link published.
+        let both = campaign_publication_lifecycle(false, Some("root-1"), true, None);
+        assert_eq!(both.event, CampaignStage::Complete);
+        assert_eq!(both.pointer, CampaignStage::Complete);
+        assert_eq!(
+            campaign_overall_label(both),
+            "Promotion published and linked from the Game page"
+        );
+        assert!(!both.pointer_retryable);
+
+        // Chain published, link failed: never reported as a finished publication.
+        let link_failed = campaign_publication_lifecycle(false, Some("root-1"), true, Some("boom"));
+        assert_eq!(link_failed.event, CampaignStage::Complete);
+        assert_eq!(link_failed.pointer, CampaignStage::Failed);
+        assert!(link_failed.pointer_retryable);
+        assert_eq!(
+            campaign_overall_label(link_failed),
+            "Promotion published; Game page link failed and can be retried"
+        );
+
+        // No link requested is not a link failure.
+        let no_link = campaign_publication_lifecycle(false, Some("root-1"), false, None);
+        assert_eq!(no_link.pointer, CampaignStage::NotAttempted);
+        assert!(!no_link.pointer_retryable);
+
+        // Busy and untouched states stay distinct from any result.
+        assert_eq!(
+            campaign_publication_lifecycle(true, None, true, None).event,
+            CampaignStage::Pending
+        );
+        assert_eq!(
+            campaign_publication_lifecycle(false, None, true, None).event,
+            CampaignStage::NotAttempted
+        );
+        assert_eq!(
+            campaign_overall_label(campaign_publication_lifecycle(false, None, false, None)),
+            "Not published"
+        );
+
+        // An empty chain id is a failure, never a silent success.
+        assert_eq!(
+            campaign_publication_lifecycle(false, Some("  "), false, None).event,
+            CampaignStage::Failed
+        );
+    }
+
+    #[test]
+    fn campaign_lifecycle_states_map_to_distinct_chips() {
+        for (classification, expected) in [
+            ("upcoming", StatusChipVariant::Pending),
+            ("active", StatusChipVariant::Active),
+            ("ended", StatusChipVariant::Expired),
+            ("cancelled", StatusChipVariant::Cancelled),
+            ("garbage", StatusChipVariant::Warning),
+        ] {
+            assert_eq!(campaign_status_variant(classification), expected);
+        }
+        // Status text and chip variant must not disagree about lifecycle.
+        assert_eq!(campaign_status("cancelled"), "Cancelled");
+        assert_eq!(campaign_status("garbage"), "Invalid/incomplete");
+    }
+
+    #[test]
+    fn advisory_pointer_state_is_separate_from_campaign_validity() {
+        assert_eq!(
+            campaign_pointer_state(true, true),
+            CampaignPointerState::Present
+        );
+        assert_eq!(
+            campaign_pointer_state(true, false),
+            CampaignPointerState::Stale
+        );
+        assert_eq!(
+            campaign_pointer_state(false, true),
+            CampaignPointerState::Missing
+        );
+        for state in [
+            CampaignPointerState::Present,
+            CampaignPointerState::Stale,
+            CampaignPointerState::Missing,
+        ] {
+            // The advisory link never claims to determine campaign validity.
+            assert!(!state.label().to_ascii_lowercase().contains("valid"));
+        }
+    }
+
+    #[test]
+    fn cancellation_is_presented_as_prospective_not_deletion() {
+        let message = CampaignConfirmation::CancelCampaign.message();
+        assert!(message.contains("Prior claims remain valid"));
+        assert!(message.contains("does not revoke prior claims"));
+        for forbidden in ["delete", "erase", "revoke all", "remove history"] {
+            assert!(
+                !message.to_ascii_lowercase().contains(forbidden),
+                "cancellation wording implies destruction: {forbidden}"
+            );
+        }
+        assert_eq!(
+            CampaignConfirmation::CancelCampaign.accept_label(),
+            "Cancel Promotion"
+        );
+    }
+
+    #[test]
+    fn publisher_activity_is_unavailable_rather_than_an_empty_feed() {
+        let items = publisher_tab_items(true, true, true);
+        let activity = items
+            .iter()
+            .find(|item| item.destination == PublisherDestination::Activity)
+            .expect("activity tab");
+        assert!(!activity.enabled);
+        assert_eq!(
+            activity.unavailable_reason,
+            Some("Publisher activity is not available.")
+        );
+        let source = include_str!("publish.rs");
+        for fabricated in [
+            ["No activity", " yet"].concat(),
+            ["Recent", " activity"].concat(),
+            ["activity", " feed"].concat(),
+        ] {
+            assert!(!source.contains(&fabricated), "simulated activity surface");
+        }
+    }
+
+    #[test]
+    fn unsupported_campaign_actions_are_absent() {
+        let source = include_str!("publish.rs");
+        for absent in [
+            ["Duplicate", " Promotion"].concat(),
+            ["Pause", " Promotion"].concat(),
+            ["Resume", " Promotion"].concat(),
+            ["Export", " claims"].concat(),
+            ["Delete", " history"].concat(),
+        ] {
+            assert!(!source.contains(&absent), "unsupported action rendered");
+        }
     }
 
     #[test]

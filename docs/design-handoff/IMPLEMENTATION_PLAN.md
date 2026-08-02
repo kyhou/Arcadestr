@@ -471,6 +471,23 @@ There is no new revoke dialog until a real command and scope exist.
 - `desktop/tauri.conf.json` only if review explicitly approves a desktop minimum
   window size; do not silently make the current resizable window fixed.
 
+Carried over from Phase 10: status-chip contrast was corrected by eye, not
+measured. `--arc-text-subdued` on the card surface was visibly illegible at the
+10.5px compact chip size, and `arc-status-expired` and `arc-status-cancelled`
+were byte-identical despite being different outcomes; both were changed during
+Phase 10 runtime review. No trustworthy ratio was obtained because the desktop
+WebKitGTK webview's canvas `fillStyle` does not resolve `oklch()`, so in-page
+measurement silently returned stale values. Phase 13 must:
+
+- measure every `arc-status-*` chip variant against its real backgrounds with a
+  tool that resolves `oklch()` correctly, not in-webview canvas sampling;
+- confirm each variant clears WCAG AA for its rendered size (compact chips are
+  10.5px, so 4.5:1 applies, not the large-text threshold);
+- check the same for muted body copy using `--arc-text-subdued` and
+  `--arc-text-muted` anywhere it appears at small sizes;
+- verify terminal states stay distinguishable from each other by more than
+  color alone.
+
 Carried over from Phase 9: the Store Page editor was migrated onto the canonical
 token system as a whole surface, but its eight tab panels were not individually
 compared against the handoff. Phase 13 must:

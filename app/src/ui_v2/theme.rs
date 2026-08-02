@@ -5447,11 +5447,20 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .arc-status-gated,
 .arc-status-unavailable,
+/* Ended and Cancelled are both terminal, but they are different outcomes and
+   must not read as the same chip. --arc-text-subdued was also too dark for
+   10.5px chip text on the card surface (~2.5:1). */
 .arc-status-expired,
 .arc-status-cancelled {
   border-color: var(--arc-border-default);
   background: rgb(255 255 255 / 4%);
-  color: var(--arc-text-subdued);
+  color: var(--arc-text-muted);
+}
+
+.arc-status-cancelled {
+  border-style: dashed;
+  border-color: oklch(0.6 0.18 25 / 55%);
+  color: oklch(0.74 0.09 25);
 }
 
 .arc-status-neutral {
@@ -7675,6 +7684,218 @@ dialog.v2-confirm-backdrop::backdrop {
 
   .v2-publisher-campaign-summary {
     grid-template-columns: 1fr;
+  }
+}
+
+/* Promotions and campaign management */
+.v2-publisher-editor {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  gap: 12px;
+}
+
+.v2-publisher-editor h1 {
+  margin: 0;
+  font: 800 18px/1.3 var(--arc-font-mono);
+  letter-spacing: 0;
+}
+
+.v2-publisher-editor h2,
+.v2-publisher-editor h3 {
+  margin: 0 0 8px;
+  font-family: var(--arc-font-mono);
+  font-size: 12.5px;
+  line-height: 1.35;
+  letter-spacing: 0;
+}
+
+.v2-publisher-editor h3 {
+  font-size: 11px;
+}
+
+.v2-publisher-editor p,
+.v2-publisher-editor li,
+.v2-publisher-editor label,
+.v2-publisher-editor legend,
+.v2-publisher-editor dt,
+.v2-publisher-editor dd,
+.v2-publisher-editor summary {
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.v2-publisher-editor .v2-publisher-kicker {
+  margin-bottom: 3px;
+  color: var(--arc-text-muted);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+}
+
+.v2-publisher-editor .v2-publisher-panel,
+.v2-publisher-editor .v2-publisher-game-hero {
+  border: 1px solid var(--arc-border-card);
+  border-radius: var(--arc-radius-md);
+  padding: 14px 16px;
+  background: var(--arc-surface);
+  box-shadow: none;
+}
+
+/* The shared hero uses space-between for its two-column dashboard use; with only
+   artwork plus a title block that pushed the copy to the far right edge. */
+.v2-publisher-editor .v2-publisher-game-hero {
+  align-items: center;
+  justify-content: flex-start;
+  gap: 14px;
+}
+
+.v2-publisher-editor .v2-publisher-game-hero > div:last-child {
+  min-width: 0;
+  flex: 1;
+}
+
+.v2-publisher-editor .v2-btn-primary,
+.v2-publisher-editor .v2-btn-secondary {
+  min-height: 32px;
+  border-radius: var(--arc-radius-xs);
+  padding: 7px 12px;
+  font-size: 11px;
+}
+
+.v2-publisher-editor .v2-publisher-management-layout,
+.v2-publisher-editor .v2-publisher-main,
+.v2-publisher-editor .v2-publisher-form {
+  gap: 12px;
+}
+
+.v2-publisher-editor .v2-publisher-sidebar {
+  top: 78px;
+}
+
+.v2-publisher-editor .v2-publisher-sidebar ul {
+  gap: 5px;
+  padding-left: 16px;
+  color: var(--arc-text-secondary);
+}
+
+/* Campaign rows */
+.v2-publisher-promotion-row {
+  border: 1px solid var(--arc-border-card);
+  border-radius: var(--arc-radius-md);
+  padding: 12px 14px;
+  background: var(--arc-surface);
+}
+
+.v2-campaign-id {
+  overflow-wrap: anywhere;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.v2-campaign-window,
+.v2-campaign-mode,
+.v2-campaign-help {
+  margin: 6px 0 0;
+  color: var(--arc-text-muted);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.v2-campaign-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.v2-campaign-note {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--arc-text-secondary);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.v2-campaign-note-ok {
+  color: var(--arc-success);
+}
+
+.v2-campaign-blocker {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--arc-error);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+/* Campaign publication lifecycle */
+.v2-campaign-publication {
+  margin-top: 10px;
+  border: 1px solid var(--arc-border-card);
+  border-radius: var(--arc-radius-sm);
+  padding: 12px;
+  background: var(--arc-surface-recessed);
+}
+
+.v2-campaign-overall {
+  margin: 0 0 9px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.v2-campaign-stage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  margin: 0;
+}
+
+.v2-campaign-stage-grid > div {
+  min-width: 0;
+  border-left: 2px solid var(--arc-border-strong);
+  padding-left: 9px;
+}
+
+.v2-campaign-stage-grid dt {
+  margin: 0 0 4px;
+  color: var(--arc-text-muted);
+}
+
+.v2-campaign-stage-grid dd {
+  margin: 0;
+}
+
+/* Confirmation dialog */
+.v2-publisher-dialog-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.v2-publisher-dialog-title {
+  margin: 0;
+  font-family: var(--arc-font-mono);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.v2-publisher-dialog-message {
+  margin: 0;
+  color: var(--arc-text-secondary);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+
+.v2-publisher-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-top: 14px;
+}
+
+@media (max-width: 760px) {
+  .v2-campaign-stage-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
