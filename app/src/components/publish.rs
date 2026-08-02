@@ -21,6 +21,9 @@ use crate::tauri_bridge::{
 use crate::ui_v2::components::blossom_media_upload::{
     fresh_request_id, preferred_candidate, publisher_hex, stable_error_message,
 };
+use crate::ui_v2::views::publish::{
+    publisher_signer_state, signer_can_publish, PublisherSignerState,
+};
 use crate::ui_v2::views::use_fallback_cover;
 use crate::{AuthContext, GameListing};
 
@@ -95,8 +98,201 @@ impl PublishStage {
     }
 }
 
-#[cfg(test)]
+/// Arcadestr has no Create Game draft persistence. The workflow must say so
+/// instead of offering the prototype's draft-saving control.
 const SUPPORTS_DRAFTS: bool = false;
+
+/// Truthful state of a single stage in the indicator.
+///
+/// `Complete` is never inferred from "was visited": a passed stage whose fields
+/// were later broken reports `NeedsAttention`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageStatus {
+    Complete,
+    NeedsAttention,
+    Current,
+    Upcoming,
+}
+
+fn stage_status(stage: PublishStage, current: PublishStage, valid: bool) -> StageStatus {
+    if stage == current {
+        StageStatus::Current
+    } else if stage.index() < current.index() {
+        if valid {
+            StageStatus::Complete
+        } else {
+            StageStatus::NeedsAttention
+        }
+    } else {
+        StageStatus::Upcoming
+    }
+}
+
+/// Forward jumping stays blocked: a stage is only reachable once the workflow has
+/// already validated its way there.
+fn stage_reachable(stage: PublishStage, current: PublishStage) -> bool {
+    stage.index() <= current.index()
+}
+
+impl StageStatus {
+    fn class(self) -> &'static str {
+        match self {
+            Self::Complete => "v2-create-stage-complete",
+            Self::NeedsAttention => "v2-create-stage-attention",
+            Self::Current => "v2-create-stage-current",
+            Self::Upcoming => "v2-create-stage-upcoming",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "Complete",
+            Self::NeedsAttention => "Needs attention",
+            Self::Current => "Current",
+            Self::Upcoming => "Not started",
+        }
+    }
+}
+
+/// Blocking issues gathered across stages for the review summary, in stage order.
+fn blocking_stage_errors(
+    details: &Result<(), String>,
+    pricing: &Result<(), String>,
+    builds: &Result<(), String>,
+) -> Vec<(PublishStage, String)> {
+    [
+        (PublishStage::Details, details),
+        (PublishStage::Pricing, pricing),
+        (PublishStage::Builds, builds),
+    ]
+    .into_iter()
+    .filter_map(|(stage, result)| result.as_ref().err().map(|error| (stage, error.clone())))
+    .collect()
+}
+
+/// Where the workflow stands for the author, kept separate from publication
+/// outcome so a local edit is never described as a published listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthoringState {
+    NotStarted,
+    UnsavedChanges,
+    Blocked,
+    ReadyToPublish,
+}
+
+fn authoring_state(editing: bool, dirty: bool, blocking_issues: usize) -> AuthoringState {
+    if blocking_issues == 0 {
+        AuthoringState::ReadyToPublish
+    } else if dirty {
+        AuthoringState::UnsavedChanges
+    } else if editing {
+        AuthoringState::Blocked
+    } else {
+        AuthoringState::NotStarted
+    }
+}
+
+impl AuthoringState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotStarted => "Nothing entered yet",
+            Self::UnsavedChanges => "Unsaved changes · not publishable yet",
+            Self::Blocked => "Required information is missing",
+            Self::ReadyToPublish => "Ready to publish",
+        }
+    }
+}
+
+/// Publication presentation derived from authoritative command state. A local
+/// command completing is never enough to claim relay publication succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationPhase {
+    Idle,
+    Publishing,
+    Partial,
+    Published,
+    Failed,
+    StaleAccount,
+}
+
+fn publication_phase(
+    is_publishing: bool,
+    account_stale: bool,
+    outcome: PublicationOutcome,
+) -> PublicationPhase {
+    if account_stale {
+        return PublicationPhase::StaleAccount;
+    }
+    match outcome {
+        PublicationOutcome::Publishing => PublicationPhase::Publishing,
+        PublicationOutcome::Partial => PublicationPhase::Partial,
+        PublicationOutcome::Complete => PublicationPhase::Published,
+        PublicationOutcome::Failed => PublicationPhase::Failed,
+        PublicationOutcome::Idle if is_publishing => PublicationPhase::Publishing,
+        PublicationOutcome::Idle => PublicationPhase::Idle,
+    }
+}
+
+impl PublicationPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Not published",
+            Self::Publishing => "Publishing to the network",
+            Self::Partial => "Partially published",
+            Self::Published => "Published",
+            Self::Failed => "Publication failed",
+            Self::StaleAccount => "Account changed during publication",
+        }
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            Self::Idle => "v2-create-phase-idle",
+            Self::Publishing => "v2-create-phase-busy",
+            Self::Partial | Self::StaleAccount => "v2-create-phase-warning",
+            Self::Published => "v2-create-phase-ok",
+            Self::Failed => "v2-create-phase-error",
+        }
+    }
+}
+
+/// Signer presentation for the publication action, mapped from the shared
+/// publisher signer state so both publisher surfaces gate identically.
+fn signer_requirement_message(state: PublisherSignerState) -> &'static str {
+    match state {
+        PublisherSignerState::Available => {
+            "Network publication is authorized by the active account signer."
+        }
+        PublisherSignerState::Connecting => {
+            "Network publication is unavailable while the remote signer connects."
+        }
+        PublisherSignerState::Unavailable => {
+            "Network publication requires an available signer for the active account."
+        }
+        PublisherSignerState::Unknown => {
+            "Network publication stays unavailable until signer availability is resolved."
+        }
+    }
+}
+
+/// Snapshot of every author-editable field, used only to tell pristine from dirty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FormSnapshot {
+    id: String,
+    title: String,
+    description: String,
+    tags: String,
+    price: String,
+    lud16: String,
+    platforms: String,
+    version: String,
+    operator_url: String,
+    acquisition: String,
+    starts_at: String,
+    ends_at: String,
+    image_count: usize,
+    fulfillment_enabled: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicationOutcome {
@@ -427,10 +623,10 @@ impl ServerStatus {
 
     fn class(self) -> &'static str {
         match self {
-            ServerStatus::Idle => "text-on-surface-variant",
-            ServerStatus::Pending => "text-secondary",
-            ServerStatus::Ok => "text-secondary",
-            ServerStatus::Failed => "text-error",
+            ServerStatus::Idle => "v2-create-status-neutral",
+            ServerStatus::Pending => "v2-create-status-busy",
+            ServerStatus::Ok => "v2-create-status-ok",
+            ServerStatus::Failed => "v2-create-status-error",
         }
     }
 }
@@ -1435,6 +1631,193 @@ mod tests {
         #[cfg(not(feature = "web"))]
         assert!(build_capability_message().contains("desktop app can"));
     }
+
+    #[test]
+    fn four_production_stages_keep_their_real_names_and_order() {
+        assert_eq!(PublishStage::ALL.len(), 4);
+        assert_eq!(
+            PublishStage::ALL.map(PublishStage::title),
+            [
+                "Game details",
+                "Pricing and access",
+                "Builds and distribution",
+                "Review and publish",
+            ]
+        );
+        assert_eq!(PublishStage::Details.next(), Some(PublishStage::Pricing));
+        assert_eq!(PublishStage::Review.next(), None);
+        assert_eq!(PublishStage::Details.previous(), None);
+    }
+
+    #[test]
+    fn visiting_a_stage_never_marks_it_complete_on_its_own() {
+        // Behind the current stage, completeness follows live validation only.
+        assert_eq!(
+            stage_status(PublishStage::Details, PublishStage::Builds, true),
+            StageStatus::Complete
+        );
+        assert_eq!(
+            stage_status(PublishStage::Details, PublishStage::Builds, false),
+            StageStatus::NeedsAttention
+        );
+        assert_eq!(
+            stage_status(PublishStage::Builds, PublishStage::Builds, false),
+            StageStatus::Current
+        );
+        assert_eq!(
+            stage_status(PublishStage::Review, PublishStage::Builds, true),
+            StageStatus::Upcoming
+        );
+    }
+
+    #[test]
+    fn forward_jumping_stays_blocked_while_backward_navigation_is_safe() {
+        assert!(stage_reachable(PublishStage::Details, PublishStage::Builds));
+        assert!(stage_reachable(PublishStage::Builds, PublishStage::Builds));
+        assert!(!stage_reachable(PublishStage::Review, PublishStage::Builds));
+        assert!(advance_stage(PublishStage::Details, Err("blocked".into())).is_err());
+        assert_eq!(
+            advance_stage(PublishStage::Details, Ok(())),
+            Ok(PublishStage::Pricing)
+        );
+    }
+
+    #[test]
+    fn blocking_issues_are_reported_in_stage_order_with_actionable_text() {
+        let issues = blocking_stage_errors(
+            &Err("Title is required".to_string()),
+            &Ok(()),
+            &Err("Version is required for fulfillment".to_string()),
+        );
+        assert_eq!(
+            issues,
+            vec![
+                (PublishStage::Details, "Title is required".to_string()),
+                (
+                    PublishStage::Builds,
+                    "Version is required for fulfillment".to_string()
+                ),
+            ]
+        );
+        assert!(blocking_stage_errors(&Ok(()), &Ok(()), &Ok(())).is_empty());
+    }
+
+    #[test]
+    fn authoring_state_separates_untouched_dirty_blocked_and_ready() {
+        assert_eq!(authoring_state(false, false, 2), AuthoringState::NotStarted);
+        assert_eq!(authoring_state(true, false, 2), AuthoringState::Blocked);
+        assert_eq!(
+            authoring_state(false, true, 2),
+            AuthoringState::UnsavedChanges
+        );
+        assert_eq!(
+            authoring_state(false, true, 0),
+            AuthoringState::ReadyToPublish
+        );
+        // Nothing in this workflow may describe itself as a saved draft.
+        for state in [
+            AuthoringState::NotStarted,
+            AuthoringState::UnsavedChanges,
+            AuthoringState::Blocked,
+            AuthoringState::ReadyToPublish,
+        ] {
+            assert!(!state.label().to_ascii_lowercase().contains("draft"));
+            assert!(!state.label().to_ascii_lowercase().contains("published"));
+        }
+    }
+
+    #[test]
+    fn dirty_detection_ignores_untouched_forms() {
+        let pristine = FormSnapshot::default();
+        let mut edited = pristine.clone();
+        assert_eq!(pristine, edited);
+        edited.title = "Nova".to_string();
+        assert_ne!(pristine, edited);
+    }
+
+    #[test]
+    fn publication_phase_never_reports_success_before_an_authoritative_result() {
+        assert_eq!(
+            publication_phase(false, false, PublicationOutcome::Idle),
+            PublicationPhase::Idle
+        );
+        assert_eq!(
+            publication_phase(true, false, PublicationOutcome::Idle),
+            PublicationPhase::Publishing
+        );
+        assert_eq!(
+            publication_phase(false, false, PublicationOutcome::Publishing),
+            PublicationPhase::Publishing
+        );
+        assert_eq!(
+            publication_phase(false, false, PublicationOutcome::Partial),
+            PublicationPhase::Partial
+        );
+        assert_eq!(
+            publication_phase(false, false, PublicationOutcome::Failed),
+            PublicationPhase::Failed
+        );
+        assert_eq!(
+            publication_phase(false, false, PublicationOutcome::Complete),
+            PublicationPhase::Published
+        );
+        // A stale account outranks any result produced for the previous account.
+        assert_eq!(
+            publication_phase(false, true, PublicationOutcome::Complete),
+            PublicationPhase::StaleAccount
+        );
+        assert_ne!(
+            PublicationPhase::Partial.label(),
+            PublicationPhase::Published.label()
+        );
+    }
+
+    #[test]
+    fn signer_requirements_distinguish_every_publisher_signer_state() {
+        let messages = [
+            PublisherSignerState::Available,
+            PublisherSignerState::Connecting,
+            PublisherSignerState::Unavailable,
+            PublisherSignerState::Unknown,
+        ]
+        .map(signer_requirement_message);
+        let mut unique = messages.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 4);
+        assert!(signer_can_publish(PublisherSignerState::Available));
+        assert!(!signer_can_publish(PublisherSignerState::Connecting));
+        assert!(!signer_can_publish(PublisherSignerState::Unavailable));
+        assert!(!signer_can_publish(PublisherSignerState::Unknown));
+    }
+
+    #[test]
+    fn media_presentation_reuses_existing_selection_semantics() {
+        let hosted = ListingImageDraft::Hosted("https://cdn.example.com/cover.png".to_string());
+        assert!(!has_pending_images(std::slice::from_ref(&hosted)));
+        assert!(image_server_ready(std::slice::from_ref(&hosted), None));
+        assert_eq!(
+            hosted_image_urls(std::slice::from_ref(&hosted)),
+            Ok(vec!["https://cdn.example.com/cover.png".to_string()])
+        );
+        assert!(listing_image_mime("image/png"));
+        assert!(!listing_image_mime("image/gif"));
+    }
+
+    #[test]
+    fn unsupported_prototype_controls_are_absent_from_the_workflow() {
+        let source = include_str!("publish.rs");
+        for absent in [
+            ["Simulate", " publish failure"].concat(),
+            ["Release", " notes"].concat(),
+            ["Short", " summary"].concat(),
+            ["Live", " on the store now"].concat(),
+            ["Step 1 of ", "5"].concat(),
+        ] {
+            assert!(!source.contains(&absent), "unsupported control rendered");
+        }
+        assert!(source.contains("does not store Create Game drafts"));
+    }
 }
 
 /// Publish view component - form for creating NIP-99 listings with optional ADP fulfillment.
@@ -1946,79 +2329,91 @@ pub fn PublishView(
         });
     });
 
-    let on_next = move |_| {
-        let stage = current_stage.get_untracked();
-        let validation = match stage {
-            PublishStage::Details => {
-                let id_value = id.get_untracked();
-                let title_value = title.get_untracked();
-                let description_value = description.get_untracked();
-                validate_listing(
-                    &id_value,
-                    &title_value,
-                    &description_value,
-                    0,
-                    "",
-                    false,
-                    &[],
-                    &None,
-                    &None,
-                    "",
-                    &FulfillmentMode::None,
-                    "",
-                )
-                .and_then(|_| hosted_image_urls(&image_drafts.get_untracked()).map(|_| ()))
-                .and_then(|_| {
-                    if !image_server_ready(
-                        &image_drafts.get_untracked(),
-                        image_upload_server.get_untracked().as_deref(),
-                    ) {
-                        image_server_error.set(Some(
-                            "Add an enabled Blossom server before continuing.".into(),
-                        ));
-                        Err("Add a Blossom upload server below before continuing.".into())
-                    } else {
-                        Ok(())
-                    }
-                })
-            }
-            PublishStage::Pricing => price_for_acquisition(
-                acquisition_kind.get_untracked(),
-                &price_input.get_untracked(),
-                &lud16.get_untracked(),
+    // Single source of stage validation, reused by forward navigation, the stage
+    // indicator, and the review summary so no surface can disagree about whether a
+    // stage is actually satisfied.
+    let validate_stage = move |stage: PublishStage| -> Result<(), String> {
+        match stage {
+            PublishStage::Details => validate_listing(
+                &id.get(),
+                &title.get(),
+                &description.get(),
+                0,
+                "",
+                false,
+                &[],
+                &None,
+                &None,
+                "",
+                &FulfillmentMode::None,
+                "",
             )
+            .and_then(|_| hosted_image_urls(&image_drafts.get()).map(|_| ()))
             .and_then(|_| {
-                acquisition_policy_from_form(
-                    acquisition_kind.get_untracked(),
-                    &acquisition_starts_at.get_untracked(),
-                    &acquisition_ends_at.get_untracked(),
-                )
-                .map(|_| ())
+                if image_server_ready(&image_drafts.get(), image_upload_server.get().as_deref()) {
+                    Ok(())
+                } else {
+                    Err("Add a Blossom upload server below before continuing.".into())
+                }
             }),
-            PublishStage::Builds => {
-                let platforms = parse_platform_tags(&platforms_input.get_untracked()).map(|_| ());
-                platforms.and_then(|_| {
-                    if !fulfillment_enabled.get_untracked() {
+            PublishStage::Pricing => {
+                price_for_acquisition(acquisition_kind.get(), &price_input.get(), &lud16.get())
+                    .and_then(|_| {
+                        acquisition_policy_from_form(
+                            acquisition_kind.get(),
+                            &acquisition_starts_at.get(),
+                            &acquisition_ends_at.get(),
+                        )
+                        .map(|_| ())
+                    })
+            }
+            PublishStage::Builds => parse_platform_tags(&platforms_input.get())
+                .map(|_| ())
+                .and_then(|_| {
+                    if !fulfillment_enabled.get() {
                         return Ok(());
                     }
                     validate_listing(
-                        &id.get_untracked(),
-                        &title.get_untracked(),
-                        &description.get_untracked(),
+                        &id.get(),
+                        &title.get(),
+                        &description.get(),
                         0,
                         "",
                         true,
-                        &servers.get_untracked(),
-                        &file_path.get_untracked(),
-                        &file_hash.get_untracked(),
-                        &version.get_untracked(),
-                        &fulfillment_mode.get_untracked(),
-                        &operator_url.get_untracked(),
+                        &servers.get(),
+                        &file_path.get(),
+                        &file_hash.get(),
+                        &version.get(),
+                        &fulfillment_mode.get(),
+                        &operator_url.get(),
                     )
-                })
-            }
+                }),
             PublishStage::Review => Err("Already at the review stage".to_string()),
-        };
+        }
+    };
+
+    let blocking_issues = move || {
+        blocking_stage_errors(
+            &validate_stage(PublishStage::Details),
+            &validate_stage(PublishStage::Pricing),
+            &validate_stage(PublishStage::Builds),
+        )
+    };
+
+    let on_next = move |_| {
+        let stage = current_stage.get_untracked();
+        let validation = validate_stage(stage);
+        if stage == PublishStage::Details
+            && validation.is_err()
+            && !image_server_ready(
+                &image_drafts.get_untracked(),
+                image_upload_server.get_untracked().as_deref(),
+            )
+        {
+            image_server_error.set(Some(
+                "Add an enabled Blossom server before continuing.".into(),
+            ));
+        }
         match advance_stage(stage, validation) {
             Ok(next) => {
                 current_stage.set(next);
@@ -2530,51 +2925,114 @@ pub fn PublishView(
         )
     };
 
+    let form_snapshot = move || FormSnapshot {
+        id: id.get(),
+        title: title.get(),
+        description: description.get(),
+        tags: tag_input.get(),
+        price: price_input.get(),
+        lud16: lud16.get(),
+        platforms: platforms_input.get(),
+        version: version.get(),
+        operator_url: operator_url.get(),
+        acquisition: format!("{:?}", acquisition_kind.get()),
+        starts_at: acquisition_starts_at.get(),
+        ends_at: acquisition_ends_at.get(),
+        image_count: image_drafts.get().len(),
+        fulfillment_enabled: fulfillment_enabled.get(),
+    };
+    let initial_snapshot = StoredValue::new(form_snapshot());
+    let is_dirty = move || form_snapshot() != initial_snapshot.get_value();
+
+    let signer_state = Signal::derive(move || {
+        let publisher = auth.npub.get();
+        publisher_signer_state(
+            publisher.as_deref(),
+            auth.active_account.get().as_ref(),
+            &auth.connection_status.get(),
+        )
+    });
+    let signed_in = Signal::derive(move || auth.npub.get().is_some());
+    let can_publish_now = Signal::derive(move || {
+        signed_in.get() && signer_can_publish(signer_state.get()) && blocking_issues().is_empty()
+    });
+    let authoring = move || authoring_state(editing, is_dirty(), blocking_issues().len());
+    let phase = move || {
+        publication_phase(
+            is_publishing.get(),
+            publication_account_stale.get(),
+            publication_state.get().outcome,
+        )
+    };
+    let workflow_kind = if editing {
+        "Update game page"
+    } else {
+        "Create game"
+    };
+
     view! {
-        <main class="v2-publish-wizard max-w-6xl mx-auto px-8 py-10">
-            <header class="mb-8">
-                <p class="text-xs font-bold uppercase tracking-widest text-primary mb-2">"Publishing workflow"</p>
-                <h1 class="text-5xl font-extrabold font-headline tracking-tighter mb-2">{if editing { "Update your " } else { "Publish a " }}<span class="text-primary italic">"game page"</span></h1>
-                <p class="text-on-surface-variant max-w-2xl">"Complete each stage, review the result, then authorize publication from your active account."</p>
+        <main class="v2-publisher-studio v2-create-workflow">
+            <header class="v2-create-header">
+                <h1 class="v2-create-title">{move || format!("{workflow_kind} · Step {} of {} — {}", current_stage.get().index() + 1, PublishStage::ALL.len(), current_stage.get().title())}</h1>
+                <p class="v2-create-subtitle">{move || match current_stage.get() {
+                    PublishStage::Details => "This builds the buyer-facing game page metadata published in the listing.",
+                    PublishStage::Pricing => "A zero price never enables public access on its own — choose the access model explicitly.",
+                    PublishStage::Builds => "Build verification is computed from the selected file; there is no freeform hash field.",
+                    PublishStage::Review => "Review the authored values and active-account authorization before network publication.",
+                }}</p>
             </header>
 
-            <nav class="v2-publish-steps mb-8" aria-label="Publishing stages">
-                <ol class="grid gap-3 md:grid-cols-4">
-                    {PublishStage::ALL.into_iter().map(|stage| view! {
-                        <li><button type="button" class="w-full rounded-xl bg-surface-container-high p-4 text-left disabled:opacity-40"
-                            aria-current=move || (current_stage.get() == stage).then_some("step")
-                            disabled=move || { stage > current_stage.get() || is_publishing.get() }
-                            on:click=move |_| { current_stage.set(stage); stage_error.set(None); }>
-                            <span class="block text-[10px] font-bold uppercase tracking-widest text-secondary">{format!("Stage {}", stage.index() + 1)}</span>
-                            <span class="font-bold">{stage.title()}</span>
-                        </button></li>
+            <nav class="v2-create-stages" aria-label="Create Game stages">
+                <ol>
+                    {PublishStage::ALL.into_iter().map(|stage| {
+                        let status = move || stage_status(stage, current_stage.get(), validate_stage(stage).is_ok());
+                        view! {
+                            <li>
+                                <button
+                                    type="button"
+                                    class=move || format!("v2-create-stage {}", status().class())
+                                    aria-current=move || (current_stage.get() == stage).then_some("step")
+                                    disabled=move || !stage_reachable(stage, current_stage.get()) || is_publishing.get()
+                                    title=move || (!stage_reachable(stage, current_stage.get())).then_some("Complete the current stage first.")
+                                    on:click=move |_| { current_stage.set(stage); stage_error.set(None); }
+                                >
+                                    <span class="v2-create-stage-index">{format!("Step {}", stage.index() + 1)}</span>
+                                    <span class="v2-create-stage-title">{stage.title()}</span>
+                                    <span class="v2-create-stage-status">{move || status().label()}</span>
+                                </button>
+                            </li>
+                        }
                     }).collect_view()}
                 </ol>
             </nav>
-            {move || stage_error.get().map(|msg| view! { <div id="publish-stage-error" role="alert" class="mb-6 rounded-xl border border-error/30 bg-error-container/30 px-4 py-3 text-sm font-medium text-error">{msg}</div> })}
 
-            <div class="grid grid-cols-12 gap-8">
-                <div class=move || if matches!(current_stage.get(), PublishStage::Details | PublishStage::Builds) { "col-span-12 lg:col-span-8 space-y-8" } else { "hidden" }>
+            {move || stage_error.get().map(|msg| view! { <div id="publish-stage-error" role="alert" class="v2-create-alert v2-create-alert-error">{msg}</div> })}
+            {move || error_message.get().map(|msg| view! { <div role="alert" class="v2-create-alert v2-create-alert-error">{msg}</div> })}
+            {(!SUPPORTS_DRAFTS).then(|| view! {
+                <p class="v2-create-persistence-note">"Arcadestr does not store Create Game drafts. Nothing here is saved locally or on a relay until network publication succeeds; leaving this workflow discards it."</p>
+            })}
+
+            <div class="v2-create-surface">
                     <Show when=move || current_stage.get() == PublishStage::Details>
-                    <section class="v2-publish-stage bg-surface-container-high/60 backdrop-blur-2xl border border-outline-variant/15 rounded-3xl p-8" aria-labelledby="publish-details-title">
-                        <h2 id="publish-details-title" class="text-2xl font-bold font-headline mb-6">"Game details"</h2>
-                        <div class="space-y-5">
+                    <section class="v2-create-stage-panel" aria-labelledby="publish-details-title">
+                        <h2 id="publish-details-title" class="v2-create-section-title">"Game details"</h2>
+                        <div class="v2-create-fields">
                             <div>
-                                <label for="publish-id" class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Game page identifier (required)"</label>
-                                <input id="publish-id" required=true aria-describedby="publish-id-help" class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" placeholder="my-game-v1" prop:value={move || id.get()} on:input:target=move |ev| id.set(ev.target().value()) readonly=editing disabled={move || is_publishing.get()} />
-                                <p id="publish-id-help" class="text-xs text-on-surface-variant mt-2">{if editing { "This permanent identifier is locked while updating the existing Game page." } else { "This permanent identifier becomes the Game page coordinate. Protocol detail: it is the listing d tag." }}</p>
+                                <label for="publish-id" class="v2-create-field-label">"Game page identifier (required)"</label>
+                                <input id="publish-id" required=true aria-describedby="publish-id-help" class="v2-input" placeholder="my-game-v1" prop:value={move || id.get()} on:input:target=move |ev| id.set(ev.target().value()) readonly=editing disabled={move || is_publishing.get()} />
+                                <p id="publish-id-help" class="v2-create-help">{if editing { "This permanent identifier is locked while updating the existing Game page." } else { "This permanent identifier becomes the Game page coordinate. Protocol detail: it is the listing d tag." }}</p>
                             </div>
                             <div>
-                                <label for="publish-title" class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Title (required)"</label>
-                                <input id="publish-title" required=true class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" placeholder="Neon Drifter" prop:value={move || title.get()} on:input:target=move |ev| title.set(ev.target().value()) disabled={move || is_publishing.get()} />
+                                <label for="publish-title" class="v2-create-field-label">"Title (required)"</label>
+                                <input id="publish-title" required=true class="v2-input" placeholder="Neon Drifter" prop:value={move || title.get()} on:input:target=move |ev| title.set(ev.target().value()) disabled={move || is_publishing.get()} />
                             </div>
                             <div>
-                                <label for="publish-description" class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Description (required)"</label>
-                                <textarea id="publish-description" required=true class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" rows=5 placeholder="Tell players about your game..." prop:value={move || description.get()} on:input:target=move |ev| description.set(ev.target().value()) disabled={move || is_publishing.get()} />
+                                <label for="publish-description" class="v2-create-field-label">"Description (required)"</label>
+                                <textarea id="publish-description" required=true class="v2-input" rows=5 placeholder="Tell players about your game..." prop:value={move || description.get()} on:input:target=move |ev| description.set(ev.target().value()) disabled={move || is_publishing.get()} />
                             </div>
                             <div>
-                                    <label for="publish-tag-choice" class="block text-xs font-bold uppercase tracking-widest text-primary mb-2">"Tags"</label>
-                                    <select id="publish-tag-choice" aria-describedby="publish-tags-help" class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" prop:value=move || tag_choice.get() on:change:target=move |ev| {
+                                    <label for="publish-tag-choice" class="v2-create-field-label">"Tags"</label>
+                                    <select id="publish-tag-choice" aria-describedby="publish-tags-help" class="v2-input" prop:value=move || tag_choice.get() on:change:target=move |ev| {
                                         let selected = ev.target().value();
                                         tag_input.update(|input| *input = add_game_tag(input, &selected));
                                         tag_choice.set(String::new());
@@ -2584,28 +3042,28 @@ pub fn PublishView(
                                             <option value=tag disabled=move || parse_csv_values(&tag_input.get()).iter().any(|selected| selected.eq_ignore_ascii_case(tag))>{tag}</option>
                                         }).collect_view()}
                                     </select>
-                                    <div class="mt-3 flex flex-wrap gap-2">
+                                    <div class="v2-create-chip-row">
                                         {move || parse_csv_values(&tag_input.get()).into_iter().map(|tag| {
                                             let tag_to_remove = tag.clone();
                                             view! {
-                                                <span class="v2-chip flex items-center gap-2">
+                                                <span class="v2-create-chip">
                                                     {tag}
-                                                    <button type="button" class="text-error" aria-label=format!("Remove {tag_to_remove}") on:click=move |_| tag_input.update(|input| *input = remove_game_tag(input, &tag_to_remove)) disabled=move || is_publishing.get()>"Remove"</button>
+                                                    <button type="button" class="v2-create-chip-remove" aria-label=format!("Remove {tag_to_remove}") on:click=move |_| tag_input.update(|input| *input = remove_game_tag(input, &tag_to_remove)) disabled=move || is_publishing.get()>"Remove"</button>
                                                 </span>
                                             }
                                         }).collect_view()}
                                     </div>
-                                    <label for="publish-tags" class="block text-xs font-bold uppercase tracking-widest text-on-surface-variant mt-4 mb-2">"Custom tags"</label>
-                                    <input id="publish-tags" aria-describedby="publish-tags-help" class="w-full bg-surface-container-highest border-none rounded-md p-4 text-on-surface" placeholder="Add comma-separated custom tags" prop:value={move || tag_input.get()} on:input:target=move |ev| tag_input.set(ev.target().value()) disabled={move || is_publishing.get()} />
-                                    <p id="publish-tags-help" class="text-xs text-on-surface-variant mt-2">"Choose common tags above or enter additional comma-separated tags."</p>
+                                    <label for="publish-tags" class="v2-create-field-label">"Custom tags"</label>
+                                    <input id="publish-tags" aria-describedby="publish-tags-help" class="v2-input" placeholder="Add comma-separated custom tags" prop:value={move || tag_input.get()} on:input:target=move |ev| tag_input.set(ev.target().value()) disabled={move || is_publishing.get()} />
+                                    <p id="publish-tags-help" class="v2-create-help">"Choose common tags above or enter additional comma-separated tags."</p>
                             </div>
                         </div>
                     </section>
 
-                    <section class="v2-publish-stage bg-surface-container-high/60 backdrop-blur-2xl border border-outline-variant/15 rounded-3xl p-6" aria-labelledby="publish-images-title">
-                        <div class="mb-4 flex items-center gap-3">
+                    <section class="v2-create-stage-panel" aria-labelledby="publish-images-title">
+                        <div class="v2-create-panel-heading">
                             <span class="material-symbols-outlined flex h-9 w-9 items-center justify-center rounded-lg bg-secondary/10 text-xl text-secondary" aria-hidden="true">"image"</span>
-                            <h2 id="publish-images-title" class="text-2xl font-bold font-headline">"Cover & screenshots"</h2>
+                            <h2 id="publish-images-title" class="v2-create-section-title">"Cover & screenshots"</h2>
                         </div>
                         {move || {
                             match image_drafts.get().first().cloned() {
@@ -2619,26 +3077,26 @@ pub fn PublishView(
                                         ),
                                     };
                                     view! {
-                                        <article class="group relative h-48 overflow-hidden rounded-2xl border-2 border-dashed border-secondary/50 bg-surface-container-low">
-                                            <img class="h-full w-full object-cover" src=src alt="Game cover preview" on:error=use_fallback_cover />
-                                            <div class="absolute inset-x-0 bottom-0 flex items-end justify-between gap-3 bg-gradient-to-t from-black/85 to-transparent p-4 pt-10">
-                                                <div class="min-w-0"><p class="truncate text-sm font-bold text-white">{title}</p><p class="truncate text-xs text-white/70">{detail}</p></div>
-                                                <div class="flex shrink-0 gap-2">
-                                                    <button type="button" class="rounded-lg bg-black/60 px-3 py-2 text-xs font-bold text-white hover:bg-black/80" on:click=move |_| on_select_image.run(0) disabled=move || is_selecting_image.get() || is_publishing.get()>"Replace"</button>
-                                                    <button type="button" class="rounded-lg bg-error/90 px-3 py-2 text-xs font-bold text-white hover:bg-error" on:click=move |_| remove_image.run(0) disabled=move || is_publishing.get()>"Remove"</button>
+                                        <article class="v2-create-cover">
+                                            <img class="v2-create-media-image" src=src alt="Game cover preview" on:error=use_fallback_cover />
+                                            <div class="v2-create-cover-overlay">
+                                                <div class="v2-create-media-meta"><p class="v2-create-media-name">{title}</p><p class="v2-create-media-detail">{detail}</p></div>
+                                                <div class="v2-create-media-actions">
+                                                    <button type="button" class="v2-create-media-button" on:click=move |_| on_select_image.run(0) disabled=move || is_selecting_image.get() || is_publishing.get()>"Replace"</button>
+                                                    <button type="button" class="v2-create-media-button v2-create-media-remove" on:click=move |_| remove_image.run(0) disabled=move || is_publishing.get()>"Remove"</button>
                                                 </div>
                                             </div>
                                         </article>
                                     }.into_any()
                                 }
                                 None => view! {
-                                    <button type="button" class="flex h-48 w-full items-center justify-center rounded-2xl border-2 border-dashed border-secondary/50 bg-surface-container-low text-center transition-colors hover:border-secondary hover:bg-surface-container" on:click=move |_| on_select_image.run(0) disabled=move || is_selecting_image.get() || is_publishing.get()>
-                                        <span><span class="material-symbols-outlined mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-surface-container-high text-on-surface-variant" aria-hidden="true">"arrow_upward"</span><span class="mt-2 block font-bold">{move || if is_selecting_image.get() { "Selecting image..." } else { "Hero banner upload" }}</span><span class="block text-xs text-on-surface-variant">"Recommended: 1920×1080px"</span></span>
+                                    <button type="button" class="v2-create-cover v2-create-cover-empty" on:click=move |_| on_select_image.run(0) disabled=move || is_selecting_image.get() || is_publishing.get()>
+                                        <span><span class="material-symbols-outlined v2-create-drop-icon" aria-hidden="true">"arrow_upward"</span><span class="v2-create-drop-title">{move || if is_selecting_image.get() { "Selecting image..." } else { "Hero banner upload" }}</span><span class="v2-create-help">"Recommended: 1920×1080px"</span></span>
                                     </button>
                                 }.into_any(),
                             }
                         }}
-                        <div class="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                        <div class="v2-create-shot-grid">
                             {move || {
                                 let images = image_drafts.get();
                                 let screenshots_disabled = images.is_empty();
@@ -2651,17 +3109,17 @@ pub fn PublishView(
                                                 ListingImageDraft::Pending(selection) => (selection.preview_data_url.unwrap_or_default(), selection.filename),
                                             };
                                             view! {
-                                                <article class="group relative aspect-square overflow-hidden rounded-xl border-2 border-dashed border-secondary/50 bg-surface-container-low">
-                                                    <img class="h-full w-full object-cover" src=src alt=format!("Game screenshot {}", image_index) on:error=use_fallback_cover />
-                                                    <div class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 to-transparent p-2 pt-8">
-                                                        <p class="truncate text-[11px] font-bold text-white">{title}</p>
-                                                        <div class="mt-1 flex gap-2"><button type="button" class="text-[10px] font-bold text-white hover:text-secondary" on:click=move |_| on_select_image.run(image_index) disabled=move || is_selecting_image.get() || is_publishing.get()>"Replace"</button><button type="button" class="text-[10px] font-bold text-error hover:text-white" on:click=move |_| remove_image.run(image_index) disabled=move || is_publishing.get()>"Remove"</button></div>
+                                                <article class="v2-create-shot">
+                                                    <img class="v2-create-media-image" src=src alt=format!("Game screenshot {}", image_index) on:error=use_fallback_cover />
+                                                    <div class="v2-create-shot-overlay">
+                                                        <p class="v2-create-media-name">{title}</p>
+                                                        <div class="v2-create-media-actions"><button type="button" class="v2-create-media-link" on:click=move |_| on_select_image.run(image_index) disabled=move || is_selecting_image.get() || is_publishing.get()>"Replace"</button><button type="button" class="v2-create-media-link v2-create-media-remove" on:click=move |_| remove_image.run(image_index) disabled=move || is_publishing.get()>"Remove"</button></div>
                                                     </div>
                                                 </article>
                                             }.into_any()
                                         }
                                         None => view! {
-                                            <button type="button" class="flex aspect-square items-center justify-center rounded-xl border-2 border-dashed border-secondary/50 bg-surface-container-low text-on-surface-variant transition-colors hover:border-secondary hover:text-secondary disabled:cursor-not-allowed disabled:opacity-40" aria-label="Add screenshot" on:click=move |_| on_select_image.run(image_index) disabled=move || screenshots_disabled || is_selecting_image.get() || is_publishing.get()>
+                                            <button type="button" class="v2-create-shot v2-create-shot-empty" aria-label="Add screenshot" on:click=move |_| on_select_image.run(image_index) disabled=move || screenshots_disabled || is_selecting_image.get() || is_publishing.get()>
                                                 <span class="material-symbols-outlined" aria-hidden="true">"add"</span>
                                             </button>
                                         }.into_any(),
@@ -2670,37 +3128,37 @@ pub fn PublishView(
                             }}
                         </div>
                         <Show when=move || has_pending_images(&image_drafts.get()) && image_upload_server.get().is_none()>
-                            <section class="mt-4 rounded-2xl border border-secondary/30 bg-surface-container-low p-4" aria-labelledby="publish-blossom-server-title">
-                                <div class="flex items-start gap-3">
-                                    <span class="material-symbols-outlined mt-0.5 text-secondary" aria-hidden="true">"cloud_upload"</span>
-                                    <div class="min-w-0 flex-1">
-                                        <h3 id="publish-blossom-server-title" class="font-bold">"Add a Blossom upload server"</h3>
-                                        <p class="mt-1 text-xs text-on-surface-variant">"Your images need a Blossom server. Add one here; it will also be saved to your Store Page media settings."</p>
-                                        <div class="mt-3 flex flex-col gap-2 sm:flex-row">
+                            <section class="v2-create-subpanel" aria-labelledby="publish-blossom-server-title">
+                                <div class="v2-create-subpanel-row">
+                                    <span class="material-symbols-outlined v2-create-subpanel-icon" aria-hidden="true">"cloud_upload"</span>
+                                    <div class="v2-create-subpanel-body">
+                                        <h3 id="publish-blossom-server-title" class="v2-create-subsection-title">"Add a Blossom upload server"</h3>
+                                        <p class="v2-create-help">"Your images need a Blossom server. Add one here; it will also be saved to your Store Page media settings."</p>
+                                        <div class="v2-create-inline-row">
                                             <label for="publish-blossom-server" class="sr-only">"Blossom server URL"</label>
-                                            <input id="publish-blossom-server" type="url" class="min-w-0 flex-1 rounded-md border-none bg-surface-container-highest p-3 text-sm text-on-surface" placeholder="https://blossom.example" prop:value=move || image_server_origin.get() on:input:target=move |event| { image_server_origin.set(event.target().value()); image_server_error.set(None); } disabled=move || is_saving_image_server.get() || is_publishing.get() />
-                                            <button type="button" class="rounded-md bg-secondary px-4 py-3 text-sm font-bold text-on-secondary disabled:opacity-40" on:click=move |_| save_image_server.run(()) disabled=move || image_server_origin.get().trim().is_empty() || is_saving_image_server.get() || is_publishing.get()>{move || if is_saving_image_server.get() { "Saving…" } else { "Save server" }}</button>
+                                            <input id="publish-blossom-server" type="url" class="v2-input" placeholder="https://blossom.example" prop:value=move || image_server_origin.get() on:input:target=move |event| { image_server_origin.set(event.target().value()); image_server_error.set(None); } disabled=move || is_saving_image_server.get() || is_publishing.get() />
+                                            <button type="button" class="v2-btn-secondary" on:click=move |_| save_image_server.run(()) disabled=move || image_server_origin.get().trim().is_empty() || is_saving_image_server.get() || is_publishing.get()>{move || if is_saving_image_server.get() { "Saving…" } else { "Save server" }}</button>
                                         </div>
-                                        {move || image_server_error.get().map(|error| view! { <p class="mt-2 text-xs font-bold text-error" role="alert">{error}</p> })}
+                                        {move || image_server_error.get().map(|error| view! { <p class="v2-create-inline-error" role="alert">{error}</p> })}
                                     </div>
                                 </div>
                             </section>
                         </Show>
                         {move || image_upload_server.get().filter(|_| has_pending_images(&image_drafts.get())).map(|server| view! {
-                            <p class="mt-3 flex items-center gap-2 text-xs text-secondary"><span class="material-symbols-outlined text-base" aria-hidden="true">"cloud_done"</span><span>"Images will upload to "<span class="font-mono">{server}</span>" when you publish."</span></p>
+                            <p class="v2-create-inline-note"><span class="material-symbols-outlined v2-create-inline-icon" aria-hidden="true">"cloud_done"</span><span>"Images will upload to "<span class="v2-create-mono-inline">{server}</span>" when you publish."</span></p>
                         })}
-                        <p class="mt-3 text-xs text-on-surface-variant">"JPEG, PNG, or WebP. Images stay local until you publish."</p>
+                        <p class="v2-create-help">"JPEG, PNG, or WebP. Images stay local until you publish."</p>
                     </section>
                     </Show>
 
                     <Show when=move || current_stage.get() == PublishStage::Builds>
-                    <section class="v2-publish-stage bg-surface-container-high/60 backdrop-blur-2xl border border-outline-variant/15 rounded-3xl p-8">
-                        <h2 class="text-2xl font-bold font-headline mb-2">"Builds and distribution"</h2>
-                        <p class="text-sm text-on-surface-variant mb-6">"Enable automated installation only when you have a build and distribution provider. Otherwise this remains a metadata-only game page."</p>
-                        <p class="text-xs text-on-surface-variant mb-6">{build_capability_message()}</p>
-                        <div class="mb-6">
-                            <label for="publish-platforms" class="block text-xs font-bold uppercase tracking-widest text-secondary mb-2">"Platforms"</label>
-                            <select id="publish-platforms" aria-describedby="publish-platforms-help" class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" prop:value=move || platform_choice.get() on:change:target=move |ev| {
+                    <section class="v2-create-stage-panel" aria-labelledby="publish-builds-title">
+                        <h2 id="publish-builds-title" class="v2-create-section-title">"Builds and distribution"</h2>
+                        <p class="v2-create-help">"Enable automated installation only when you have a build and distribution provider. Otherwise this remains a metadata-only game page."</p>
+                        <p class="v2-create-help">{build_capability_message()}</p>
+                        <div class="v2-create-field">
+                            <label for="publish-platforms" class="v2-create-field-label">"Platforms"</label>
+                            <select id="publish-platforms" aria-describedby="publish-platforms-help" class="v2-input" prop:value=move || platform_choice.get() on:change:target=move |ev| {
                                 let selected = ev.target().value();
                                 platforms_input.update(|input| *input = add_platform(input, &selected));
                                 platform_choice.set(String::new());
@@ -2710,19 +3168,19 @@ pub fn PublishView(
                                     <option value=tag disabled=move || parse_csv_values(&platforms_input.get()).iter().any(|selected| selected == tag)>{label}</option>
                                 }).collect_view()}
                             </select>
-                            <p id="publish-platforms-help" class="text-xs text-on-surface-variant mt-2">"Add every supported target. Leave the selection empty to publish for all platforms."</p>
-                            <div class="mt-3 flex flex-wrap gap-2">
+                            <p id="publish-platforms-help" class="v2-create-help">"Add every supported target. Leave the selection empty to publish for all platforms."</p>
+                            <div class="v2-create-chip-row">
                                 {move || {
                                     let selected = parse_csv_values(&platforms_input.get());
                                     if selected.is_empty() {
-                                        view! { <span class="v2-chip">"All platforms"</span> }.into_any()
+                                        view! { <span class="v2-create-chip">"All platforms"</span> }.into_any()
                                     } else {
                                         selected.into_iter().map(|platform| {
                                             let platform_to_remove = platform.clone();
                                             view! {
-                                                <span class="v2-chip flex items-center gap-2">
+                                                <span class="v2-create-chip">
                                                     {platform}
-                                                    <button type="button" class="text-error" aria-label=format!("Remove {platform_to_remove}") on:click=move |_| platforms_input.update(|input| *input = remove_platform(input, &platform_to_remove)) disabled=move || is_publishing.get()>"Remove"</button>
+                                                    <button type="button" class="v2-create-chip-remove" aria-label=format!("Remove {platform_to_remove}") on:click=move |_| platforms_input.update(|input| *input = remove_platform(input, &platform_to_remove)) disabled=move || is_publishing.get()>"Remove"</button>
                                                 </span>
                                             }
                                         }).collect_view().into_any()
@@ -2730,7 +3188,7 @@ pub fn PublishView(
                                 }}
                             </div>
                         </div>
-                        <label class="flex items-center gap-3 p-4 rounded-xl bg-surface-container/50 mb-6">
+                        <label class="v2-create-toggle">
                              <input type="checkbox" checked={move || fulfillment_enabled.get()} disabled=move || is_publishing.get() || existing_fulfillment_locked on:change:target=move |ev| {
                                  let enabled = ev.target().checked();
                                  fulfillment_enabled.set(enabled);
@@ -2740,16 +3198,16 @@ pub fn PublishView(
                                      fulfillment_mode.set(FulfillmentMode::None);
                                  }
                              } />
-                            <span class="font-bold">"Enable automated installation"</span>
+                            <span class="v2-create-toggle-label">"Enable automated installation"</span>
                         </label>
-                        {existing_fulfillment_locked.then(|| view! { <p class="mb-6 text-xs text-on-surface-variant">"This existing publishing authorization cannot be removed by an ordinary Game page update. Keep the current mode to reuse its key, or deliberately choose another mode to replace the authorization."</p> })}
+                        {existing_fulfillment_locked.then(|| view! { <p class="v2-create-help">"This existing publishing authorization cannot be removed by an ordinary Game page update. Keep the current mode to reuse its key, or deliberately choose another mode to replace the authorization."</p> })}
 
                         <Show when=move || fulfillment_enabled.get()>
-                            <div class="space-y-6">
+                            <div class="v2-create-fields">
                                 <button type="button" aria-pressed=move || fulfillment_mode.get() == FulfillmentMode::Delegate class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate {
-                                    "w-full rounded-2xl border border-secondary/60 bg-secondary-container/20 p-5 text-left"
+                                    "v2-create-mode-option v2-create-mode-selected"
                                 } else {
-                                    "w-full rounded-2xl border border-outline-variant/20 bg-surface-container-highest/50 p-5 text-left"
+                                    "v2-create-mode-option"
                                 } on:click=move |_| {
                                     if fulfillment_mode.get_untracked() != FulfillmentMode::Delegate {
                                         fulfillment_mode.set(FulfillmentMode::Delegate);
@@ -2758,50 +3216,50 @@ pub fn PublishView(
                                         }
                                     }
                                 }>
-                                    <span class="flex items-center justify-between gap-3">
-                                        <span class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "text-lg font-bold text-secondary" } else { "text-lg font-bold text-on-surface" }>"Authorize a distribution provider"</span>
-                                        <span class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "rounded-full bg-secondary px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-on-secondary" } else { "rounded-full bg-surface-container-highest px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant" }>
+                                    <span class="v2-create-row-between">
+                                        <span class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "v2-create-mode-title v2-create-mode-title-active" } else { "v2-create-mode-title" }>"Authorize a distribution provider"</span>
+                                        <span class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "v2-create-selected-badge" } else { "v2-create-selected-badge v2-create-selected-badge-idle" }>
                                             {move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "Selected" } else { "Switch to provider" }}
                                         </span>
                                     </span>
-                                    <span class="mt-1 block text-sm text-on-surface-variant">"Recommended. The provider manages fulfillment authorization and build distribution for this game."</span>
+                                    <span class="v2-create-help">"Recommended. The provider manages fulfillment authorization and build distribution for this game."</span>
                                     <Show when=move || fulfillment_mode.get() == FulfillmentMode::Delegate>
-                                        <span class="mt-3 block break-all rounded-lg bg-surface-container-highest/70 px-3 py-2 text-xs font-mono text-on-surface">{move || operator_url.get()}</span>
+                                        <span class="v2-create-mono-value">{move || operator_url.get()}</span>
                                         <Show when=move || operator_auto_added.get().is_some()>
-                                            <span class="mt-2 block text-xs text-on-surface-variant">"This provider is also included as a distribution server."</span>
+                                            <span class="v2-create-help">"This provider is also included as a distribution server."</span>
                                         </Show>
                                     </Show>
                                 </button>
 
-                                <details class="rounded-2xl bg-surface-container/50 p-4">
-                                    <summary class="cursor-pointer font-bold text-on-surface">
+                                <details class="v2-create-disclosure">
+                                    <summary class="v2-create-disclosure-summary">
                                         {move || if fulfillment_mode.get() == FulfillmentMode::Direct { "Advanced distribution options - direct account signing selected" } else { "Advanced distribution options" }}
                                     </summary>
-                                    <div class="mt-4 space-y-5">
+                                    <div class="v2-create-fields">
                                         <button type="button" aria-pressed=move || fulfillment_mode.get() == FulfillmentMode::Direct class=move || if fulfillment_mode.get() == FulfillmentMode::Direct {
-                                            "w-full rounded-xl border border-secondary/60 bg-secondary-container/20 p-4 text-left"
+                                            "v2-create-mode-option v2-create-mode-selected"
                                         } else {
-                                            "w-full rounded-xl border border-transparent bg-surface-container-highest p-4 text-left"
+                                            "v2-create-mode-option"
                                         } on:click=move |_| fulfillment_mode.set(FulfillmentMode::Direct)>
-                                            <span class="flex items-center justify-between gap-3">
-                                                <span class=move || if fulfillment_mode.get() == FulfillmentMode::Direct { "font-bold text-secondary" } else { "font-bold text-on-surface" }>"Use my active account instead"</span>
+                                            <span class="v2-create-row-between">
+                                                <span class=move || if fulfillment_mode.get() == FulfillmentMode::Direct { "v2-create-mode-title v2-create-mode-title-active" } else { "v2-create-mode-title" }>"Use my active account instead"</span>
                                                 <Show when=move || fulfillment_mode.get() == FulfillmentMode::Direct>
-                                                    <span class="rounded-full bg-secondary px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-on-secondary">"Selected"</span>
+                                                    <span class="v2-create-selected-badge">"Selected"</span>
                                                 </Show>
                                             </span>
-                                            <span class="text-xs text-on-surface-variant">"Sign fulfillment directly without provisioning a provider key."</span>
+                                            <span class="v2-create-help">"Sign fulfillment directly without provisioning a provider key."</span>
                                         </button>
 
                                         <Show when=move || matches!(fulfillment_mode.get(), FulfillmentMode::Delegate)>
-                                            <div class="rounded-xl bg-surface-container-highest/50 p-4 space-y-3">
-                                                <label for="publish-provider-url" class="block text-xs font-bold uppercase tracking-widest text-secondary">"Use a different distribution provider"</label>
-                                                <div class="flex flex-col gap-2 md:flex-row">
-                                                    <input id="publish-provider-url" class="flex-1 bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="https://provider.example.com" prop:value={move || operator_url.get()} on:input:target=move |ev| {
+                                            <div class="v2-create-subpanel v2-create-fields">
+                                                <label for="publish-provider-url" class="v2-create-field-label">"Use a different distribution provider"</label>
+                                                <div class="v2-create-inline-row">
+                                                    <input id="publish-provider-url" class="v2-input" placeholder="https://provider.example.com" prop:value={move || operator_url.get()} on:input:target=move |ev| {
                                                         let next = ev.target().value();
                                                         operator_url.set(next.clone());
                                                         if operator_auto_added.get_untracked().is_some() { sync_operator_server(next); }
                                                     } />
-                                                    <select aria-label="Copy provider URL from a selected server" class="bg-surface-container-highest border-none rounded-md p-3 text-on-surface" on:change:target=move |ev| {
+                                                    <select aria-label="Copy provider URL from a selected server" class="v2-input" on:change:target=move |ev| {
                                                         let selected = ev.target().value();
                                                         if !selected.is_empty() {
                                                             operator_url.set(selected.clone());
@@ -2816,7 +3274,7 @@ pub fn PublishView(
                                                         }).collect_view()}
                                                     </select>
                                                 </div>
-                                                <label class="flex items-center gap-2 text-sm text-on-surface-variant">
+                                                <label class="v2-create-checkbox-row">
                                                     <input type="checkbox" checked={move || operator_auto_added.get().is_some()} on:change:target=move |ev| {
                                                         if ev.target().checked() {
                                                             sync_operator_server(operator_url.get());
@@ -2830,13 +3288,13 @@ pub fn PublishView(
                                             </div>
                                         </Show>
 
-                                <div class="rounded-xl bg-surface-container-highest/50 p-4 space-y-4">
-                                    <div class="flex items-center justify-between gap-3">
-                                         <h3 class="font-bold">"Discovered distribution providers"</h3>
-                                        <span class="text-xs text-on-surface-variant">"Live relay query; manual entry still works if discovery fails."</span>
+                                <div class="v2-create-subpanel v2-create-fields">
+                                    <div class="v2-create-row-between">
+                                         <h3 class="v2-create-subsection-title">"Discovered distribution providers"</h3>
+                                        <span class="v2-create-help">"Live relay query; manual entry still works if discovery fails."</span>
                                     </div>
-                                    {move || discovery_error.get().map(|msg| view! { <div class="rounded-xl border border-error/30 bg-error-container/30 px-4 py-3 text-sm font-medium text-error">{msg}</div> })}
-                                    <div class="space-y-2">
+                                    {move || discovery_error.get().map(|msg| view! { <div class="v2-create-alert v2-create-alert-error">{msg}</div> })}
+                                    <div class="v2-create-list">
                                         {move || discovered_servers.get().into_iter().map(|server| {
                                             let checked_url = server.url.clone();
                                             let label = server.name.clone().unwrap_or_else(|| server.url.clone());
@@ -2845,37 +3303,37 @@ pub fn PublishView(
                                             let label_for_change = label.clone();
                                             let label_display = label.clone();
                                             view! {
-                                                <label class="flex items-center justify-between gap-3 rounded-xl bg-surface-container-highest p-3">
-                                                    <span><input type="checkbox" class="mr-3" checked={move || servers.get().iter().any(|entry| entry.url == url_for_checked)} on:change:target=move |ev| {
+                                                <label class="v2-create-server-row">
+                                                    <span><input type="checkbox" class="v2-create-checkbox" checked={move || servers.get().iter().any(|entry| entry.url == url_for_checked)} on:change:target=move |ev| {
                                                         if ev.target().checked() { add_server(url_for_change.clone(), label_for_change.clone(), false); }
                                                         else { remove_server(url_for_change.clone()); }
                                                     } />{label_display}</span>
-                                                    <span class="text-xs text-on-surface-variant">{server.supported_adp.unwrap_or_default()}</span>
+                                                    <span class="v2-create-help">{server.supported_adp.unwrap_or_default()}</span>
                                                 </label>
                                             }
                                         }).collect_view()}
                                     </div>
-                                    <div class="flex gap-2">
+                                    <div class="v2-create-inline-row">
                                         <label for="publish-custom-server" class="sr-only">"Custom distribution server URL"</label>
-                                        <input id="publish-custom-server" class="flex-1 bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="Add custom server URL" prop:value={move || custom_server.get()} on:input:target=move |ev| custom_server.set(ev.target().value()) />
-                                        <button type="button" class="px-4 py-2 rounded-md bg-secondary text-on-secondary font-bold" on:click={on_add_custom_server}>"Add"</button>
+                                        <input id="publish-custom-server" class="v2-input" placeholder="Add custom server URL" prop:value={move || custom_server.get()} on:input:target=move |ev| custom_server.set(ev.target().value()) />
+                                        <button type="button" class="v2-btn-secondary" on:click={on_add_custom_server}>"Add"</button>
                                     </div>
-                                    <div class="space-y-2">
+                                    <div class="v2-create-list">
                                         {move || servers.get().into_iter().map(|server| {
                                             let reachability = server.reachability;
                                             let upload = server.upload;
                                             let url = server.url.clone();
                                             view! {
-                                                <div class="flex items-center justify-between gap-3 rounded-xl bg-surface-container-highest p-3">
+                                                <div class="v2-create-server-row">
                                                     <div>
-                                                        <p class="text-sm font-bold">{server.label}</p>
-                                                        <p class="text-xs text-on-surface-variant">{server.url}</p>
+                                                        <p class="v2-create-server-name">{server.label}</p>
+                                                        <p class="v2-create-help">{server.url}</p>
                                                     </div>
-                                                    <div class="text-right text-xs">
+                                                    <div class="v2-create-server-status">
                                                          <p class={reachability.class()}>{format!("Provider check: {}", reachability.label())}</p>
                                                          <p class={upload.class()}>{format!("Build upload: {}", upload.label())}</p>
                                                     </div>
-                                                    <button type="button" class="text-error text-sm" on:click=move |_| remove_server(url.clone())>"Remove"</button>
+                                                    <button type="button" class="v2-create-media-link v2-create-media-remove" on:click=move |_| remove_server(url.clone())>"Remove"</button>
                                                 </div>
                                             }
                                         }).collect_view()}
@@ -2884,53 +3342,51 @@ pub fn PublishView(
                                     </div>
                                 </details>
 
-                                <div class="grid md:grid-cols-2 gap-5">
+                                <div class="v2-create-field-pair">
                                     <div>
-                                        <span id="publish-build-label" class="block text-xs font-bold uppercase tracking-widest text-secondary mb-2">"Build file (required for automated installation)"</span>
-                                        <button type="button" aria-labelledby="publish-build-label" aria-describedby="publish-hash-status" class="w-full rounded-md bg-surface-container-highest p-3 text-left" on:click={on_select_file} disabled={move || is_hashing.get() || is_publishing.get()}>
+                                        <span id="publish-build-label" class="v2-create-field-label">"Build file (required for automated installation)"</span>
+                                        <button type="button" aria-labelledby="publish-build-label" aria-describedby="publish-hash-status" class="v2-create-file-button" on:click={on_select_file} disabled={move || is_hashing.get() || is_publishing.get()}>
                                             {move || if is_hashing.get() { "Hashing…".to_string() } else { file_path.get().unwrap_or_else(|| if file_hash.get().is_some() { "Using existing build — select replacement".to_string() } else { "Select archive".to_string() }) }}
                                         </button>
                                         {move || (is_hashing.get()).then(|| hash_progress.get()).flatten().map(|progress| {
                                             let percent = progress_percent(progress.bytes_hashed, progress.total_bytes);
                                             view! {
-                                                <div class="mt-3 rounded-xl bg-surface-container-highest/60 p-3" role="progressbar" aria-label="Build hashing progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>
-                                                    <div class="mb-2 flex items-center justify-between gap-3 text-xs font-bold">
-                                                        <span class="text-on-surface">"Computing SHA-256"</span>
-                                                        <span class="text-primary">{format!("{percent}%")}</span>
+                                                <div class="v2-create-progress" role="progressbar" aria-label="Build hashing progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>
+                                                    <div class="v2-create-progress-heading">
+                                                        <span>"Computing SHA-256"</span>
+                                                        <span>{format!("{percent}%")}</span>
                                                     </div>
-                                                    <div class="h-2.5 overflow-hidden rounded-full bg-surface-container-lowest">
-                                                        <div class="h-full rounded-full bg-primary transition-[width] duration-200" style=format!("width: {percent}%")></div>
+                                                    <div class="v2-create-progress-track">
+                                                        <div class="v2-create-progress-fill" style=format!("width: {percent}%")></div>
                                                     </div>
                                                 </div>
                                             }
                                         })}
-                                        <p id="publish-hash-status" aria-live="polite" class="text-xs text-on-surface-variant mt-2">{move || if is_hashing.get() { "Computing the read-only SHA-256 hash…".to_string() } else { file_hash.get().map(|hash| format!("Read-only SHA-256: {}", format_sha256(&hash))).unwrap_or_else(|| "Hash appears after file selection.".to_string()) }}</p>
+                                        <p id="publish-hash-status" aria-live="polite" class="v2-create-help">{move || if is_hashing.get() { "Computing the read-only SHA-256 hash…".to_string() } else { file_hash.get().map(|hash| format!("Read-only SHA-256: {}", format_sha256(&hash))).unwrap_or_else(|| "Hash appears after file selection.".to_string()) }}</p>
                                     </div>
                                     <div>
-                                        <label for="publish-version" class="block text-xs font-bold uppercase tracking-widest text-secondary mb-2">"Version (required)"</label>
-                                        <input id="publish-version" required=true class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="1.0.0" prop:value={move || version.get()} on:input:target=move |ev| version.set(ev.target().value()) />
+                                        <label for="publish-version" class="v2-create-field-label">"Version (required)"</label>
+                                        <input id="publish-version" required=true class="v2-input" placeholder="1.0.0" prop:value={move || version.get()} on:input:target=move |ev| version.set(ev.target().value()) />
                                     </div>
                                 </div>
                             </div>
                         </Show>
                     </section>
                     </Show>
-                </div>
 
-                <aside class=move || if matches!(current_stage.get(), PublishStage::Pricing | PublishStage::Review) { "col-span-12 space-y-8" } else { "col-span-12 lg:col-span-4 space-y-8" }>
                     <Show when=move || current_stage.get() == PublishStage::Pricing>
-                    <section class="v2-publish-stage bg-surface-container-high/60 backdrop-blur-2xl border border-outline-variant/15 rounded-3xl p-6">
-                        <h2 class="text-2xl font-bold font-headline mb-2">"Pricing and access"</h2>
-                        <p class="text-sm text-on-surface-variant mb-5">"Paid access is the default. Select public or timed access only when the game should be available without an entitlement."</p>
-                        <div class="space-y-5">
+                    <section class="v2-create-stage-panel" aria-labelledby="publish-pricing-title">
+                        <h2 id="publish-pricing-title" class="v2-create-section-title">"Pricing and access"</h2>
+                        <p class="v2-create-help">"Paid access is the default. Select public or timed access only when the game should be available without an entitlement."</p>
+                        <div class="v2-create-fields">
                             <div>
-                                <label class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2" for="acquisition-policy">"Access model"</label>
-                                <select id="acquisition-policy" class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" on:change:target=move |ev| acquisition_kind.set(AcquisitionKind::from_value(&ev.target().value())) disabled=move || is_publishing.get()>
+                                <label class="v2-create-field-label" for="acquisition-policy">"Access model"</label>
+                                <select id="acquisition-policy" class="v2-input" on:change:target=move |ev| acquisition_kind.set(AcquisitionKind::from_value(&ev.target().value())) disabled=move || is_publishing.get()>
                                     <option value="gated" selected=move || acquisition_kind.get() == AcquisitionKind::Gated>"Paid access (default)"</option>
                                     <option value="public" selected=move || acquisition_kind.get() == AcquisitionKind::Public>"Public access"</option>
                                     <option value="timed-access" selected=move || acquisition_kind.get() == AcquisitionKind::TimedAccess>"Timed public access"</option>
                                 </select>
-                                <p class="text-xs text-on-surface-variant mt-2">{move || match acquisition_kind.get() {
+                                <p class="v2-create-help">{move || match acquisition_kind.get() {
                                     AcquisitionKind::Gated => "A positive price and Lightning address are required.",
                                     AcquisitionKind::Public => "Anyone can access the game. Its published price is 0 sats.",
                                     AcquisitionKind::TimedAccess => "Anyone can access the game during the selected window. Its published price is 0 sats.",
@@ -2938,16 +3394,16 @@ pub fn PublishView(
                             </div>
                             <Show when=move || acquisition_kind.get() == AcquisitionKind::Gated>
                                 <div>
-                                    <label for="publish-price" class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2">"Price in sats (required)"</label>
-                                    <input id="publish-price" required=true class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" type="number" min=1 step=1 prop:value={move || price_input.get()} on:input:target=move |ev| price_input.set(ev.target().value()) />
+                                    <label for="publish-price" class="v2-create-field-label">"Price in sats (required)"</label>
+                                    <input id="publish-price" required=true class="v2-input" type="number" min=1 step=1 prop:value={move || price_input.get()} on:input:target=move |ev| price_input.set(ev.target().value()) />
                                 </div>
                                 <div>
-                                    <label for="publish-lud16" class="block text-[10px] font-bold uppercase tracking-widest text-secondary mb-2">"Lightning address (required)"</label>
-                                    <input id="publish-lud16" required=true class="w-full bg-surface-container-highest border-none rounded-md p-3 text-on-surface" placeholder="you@example.com" prop:value={move || lud16.get()} on:input:target=move |ev| lud16.set(ev.target().value()) />
+                                    <label for="publish-lud16" class="v2-create-field-label">"Lightning address (required)"</label>
+                                    <input id="publish-lud16" required=true class="v2-input" placeholder="you@example.com" prop:value={move || lud16.get()} on:input:target=move |ev| lud16.set(ev.target().value()) />
                                 </div>
                             </Show>
                             <Show when=move || matches!(acquisition_kind.get(), AcquisitionKind::TimedAccess)>
-                                <div class="grid gap-3">
+                                <div class="v2-create-fields">
                                     <DateTimeRangePicker
                                         starts_at=Signal::derive(move || acquisition_starts_at.get())
                                         ends_at=Signal::derive(move || acquisition_ends_at.get())
@@ -2955,7 +3411,7 @@ pub fn PublishView(
                                         on_ends_at=Callback::new(move |value| acquisition_ends_at.set(value))
                                         disabled=Signal::derive(move || is_publishing.get())
                                     />
-                                    <p class="text-xs text-on-surface-variant">"Times use your local timezone."</p>
+                                    <p class="v2-create-help">"Times use your local timezone."</p>
                                 </div>
                             </Show>
                         </div>
@@ -2963,89 +3419,137 @@ pub fn PublishView(
                     </Show>
 
                     <Show when=move || current_stage.get() == PublishStage::Review>
-                    <section class="v2-publish-stage bg-surface-container-high/60 backdrop-blur-2xl border border-outline-variant/15 rounded-3xl p-6">
-                        <h2 class="text-2xl font-bold font-headline mb-2">"Review and publish"</h2>
-                        <p class="text-sm text-on-surface-variant mb-5">"Review the game page and active-account authorization before network publication."</p>
-                        <p class="text-[10px] font-bold uppercase tracking-widest text-tertiary mb-2">"Publishing authorization"</p>
-                        <div class="bg-surface-container-highest rounded-md p-3 text-xs font-mono text-on-surface break-all">{move || auth.npub.get().unwrap_or_else(|| "Not authenticated".to_string())}</div>
-                        <p class="text-xs text-on-surface-variant mt-3">"Read-only active account. Protocol detail: the signer publishes the Nostr events."</p>
-                        <dl class="mt-5 space-y-3 text-sm">
-                            <div><dt class="font-bold">"Identifier"</dt><dd class="text-on-surface-variant break-all">{move || id.get()}</dd></div>
-                            <div><dt class="font-bold">"Metadata"</dt><dd class="text-on-surface-variant">{move || format!("{}; {} tags; {} images", title.get(), parse_csv_values(&tag_input.get()).len(), image_drafts.get().len())}</dd></div>
-                            <div><dt class="font-bold">"Description"</dt><dd class="text-on-surface-variant whitespace-pre-wrap">{move || description.get()}</dd></div>
-                            <div><dt class="font-bold">"Pricing"</dt><dd class="text-on-surface-variant">{move || match acquisition_kind.get() { AcquisitionKind::Gated => format!("{} sats via {}", price_input.get(), lud16.get()), AcquisitionKind::Public | AcquisitionKind::TimedAccess => "Not for sale (0 sats)".to_string() }}</dd></div>
-                            <div><dt class="font-bold">"Current access"</dt><dd class="text-on-surface-variant">{move || match acquisition_kind.get() { AcquisitionKind::Gated => "Paid".to_string(), AcquisitionKind::Public => "Public".to_string(), AcquisitionKind::TimedAccess => format!("Timed from {} to {} (local)", acquisition_starts_at.get(), acquisition_ends_at.get()) }}</dd></div>
-                            <div><dt class="font-bold">"Platforms / version"</dt><dd class="text-on-surface-variant">{move || format!("{} / {}", platform_summary(&platforms_input.get()), version.get())}</dd></div>
-                            <div><dt class="font-bold">"Distribution provider/server"</dt><dd class="text-on-surface-variant">{move || if fulfillment_enabled.get() { format!("{} server(s); {}", servers.get().len(), operator_url.get()) } else { "Metadata only".to_string() }}</dd></div>
-                            <div><dt class="font-bold">"Build file / hash"</dt><dd class="text-on-surface-variant break-all">{move || format!("{} / {}", file_path.get().unwrap_or_else(|| "existing or none".into()), file_hash.get().map(|hash| format_sha256(&hash)).unwrap_or_else(|| "none".into()))}</dd></div>
-                            <div><dt class="font-bold">"Authorization"</dt><dd class="text-on-surface-variant">{move || match fulfillment_mode.get() { FulfillmentMode::None => "Game page only", FulfillmentMode::Direct => "Active account", FulfillmentMode::Delegate => "Distribution provider" }}</dd></div>
-                            <div><dt class="font-bold">"Promotion links"</dt><dd class="text-on-surface-variant">{format!("{} preserved", existing_campaigns.len())}</dd></div>
-                            <div><dt class="font-bold">"Publishing authorization key"</dt><dd class="text-on-surface-variant break-all">{existing_fulfillment_pubkey.clone().unwrap_or_else(|| "Prepared during publication when required".into())}</dd></div>
+                    <section class="v2-create-stage-panel" aria-labelledby="publish-review-title">
+                        <h2 id="publish-review-title" class="v2-create-section-title">"Review and publish"</h2>
+
+                        <article class="v2-create-summary-card">
+                            <p class="v2-create-summary-title">{move || { let value = title.get(); if value.trim().is_empty() { "Untitled game page".to_string() } else { value } }}</p>
+                            <p class="v2-create-summary-meta">{move || format!(
+                                "{} · {} · {}",
+                                match acquisition_kind.get() {
+                                    AcquisitionKind::Gated => format!("{} sats", price_input.get()),
+                                    AcquisitionKind::Public => "Public access".to_string(),
+                                    AcquisitionKind::TimedAccess => "Timed public access".to_string(),
+                                },
+                                if version.get().trim().is_empty() { "no version declared".to_string() } else { format!("v{}", version.get().trim()) },
+                                platform_summary(&platforms_input.get()),
+                            )}</p>
+                        </article>
+
+                        <dl class="v2-create-review-facts">
+                            <div><dt>"Identifier"</dt><dd>{move || id.get()}</dd></div>
+                            <div><dt>"Metadata"</dt><dd>{move || format!("{} tags · {} images", parse_csv_values(&tag_input.get()).len(), image_drafts.get().len())}</dd></div>
+                            <div><dt>"Description"</dt><dd class="v2-create-review-prewrap">{move || description.get()}</dd></div>
+                            <div><dt>"Pricing"</dt><dd>{move || match acquisition_kind.get() { AcquisitionKind::Gated => format!("{} sats via {}", price_input.get(), lud16.get()), AcquisitionKind::Public | AcquisitionKind::TimedAccess => "Not for sale (0 sats)".to_string() }}</dd></div>
+                            <div><dt>"Current access"</dt><dd>{move || match acquisition_kind.get() { AcquisitionKind::Gated => "Paid".to_string(), AcquisitionKind::Public => "Public".to_string(), AcquisitionKind::TimedAccess => format!("Timed from {} to {} (local)", acquisition_starts_at.get(), acquisition_ends_at.get()) }}</dd></div>
+                            <div><dt>"Platforms / version"</dt><dd>{move || format!("{} / {}", platform_summary(&platforms_input.get()), version.get())}</dd></div>
+                            <div><dt>"Distribution provider/server"</dt><dd>{move || if fulfillment_enabled.get() { format!("{} server(s); {}", servers.get().len(), operator_url.get()) } else { "Metadata only".to_string() }}</dd></div>
+                            <div><dt>"Build file / hash"</dt><dd>{move || format!("{} / {}", file_path.get().unwrap_or_else(|| "existing or none".into()), file_hash.get().map(|hash| format_sha256(&hash)).unwrap_or_else(|| "none".into()))}</dd></div>
+                            <div><dt>"Authorization"</dt><dd>{move || match fulfillment_mode.get() { FulfillmentMode::None => "Game page only", FulfillmentMode::Direct => "Active account", FulfillmentMode::Delegate => "Distribution provider" }}</dd></div>
+                            <div><dt>"Promotion links"</dt><dd>{format!("{} preserved", existing_campaigns.len())}</dd></div>
+                            <div><dt>"Publishing authorization key"</dt><dd>{existing_fulfillment_pubkey.clone().unwrap_or_else(|| "Prepared during publication when required".into())}</dd></div>
                         </dl>
-                        <h3 class="font-bold mt-6 mb-3">"Readiness checklist"</h3>
-                        <ul class="space-y-2 text-sm">
-                            <li>{move || if checklist().metadata { "✓ Game details" } else { "✕ Game details need attention" }}</li>
-                            <li>{move || if checklist().pricing_and_access { "✓ Pricing and access" } else { "✕ Pricing or access needs attention" }}</li>
-                            <li>{move || if checklist().distribution { "✓ Builds and distribution" } else { "✕ Builds or distribution needs attention" }}</li>
-                            <li>{move || if checklist().authorization { "✓ Publishing authorization" } else { "✕ Publishing authorization needs attention" }}</li>
+
+                        <div class="v2-create-authorization">
+                            <p class="v2-create-field-label">"Publishing authorization"</p>
+                            <p class="v2-create-account">{move || auth.npub.get().unwrap_or_else(|| "Not signed in".to_string())}</p>
+                            <p class="v2-create-help" id="publish-signer-requirement">{move || signer_requirement_message(signer_state.get())}</p>
+                            {move || (!signed_in.get()).then(|| view! { <p class="v2-create-alert v2-create-alert-error" role="alert">"Sign in before starting network publication."</p> })}
+                        </div>
+
+                        <p class="v2-create-kicker">"Readiness checklist"</p>
+                        <ul class="v2-create-checklist">
+                            <li class=move || if checklist().metadata { "v2-create-check-ok" } else { "v2-create-check-blocked" }>{move || if checklist().metadata { "Game details complete" } else { "Game details need attention" }}</li>
+                            <li class=move || if checklist().pricing_and_access { "v2-create-check-ok" } else { "v2-create-check-blocked" }>{move || if checklist().pricing_and_access { "Pricing and access complete" } else { "Pricing or access needs attention" }}</li>
+                            <li class=move || if checklist().distribution { "v2-create-check-ok" } else { "v2-create-check-blocked" }>{move || if checklist().distribution { "Builds and distribution complete" } else { "Builds or distribution needs attention" }}</li>
+                            <li class=move || if checklist().authorization { "v2-create-check-ok" } else { "v2-create-check-blocked" }>{move || if checklist().authorization { "Publishing authorization complete" } else { "Publishing authorization needs attention" }}</li>
                         </ul>
-                        <ul class="mt-3 text-xs text-on-surface-variant">{move || checklist().warnings.into_iter().map(|warning| view! { <li>{format!("Warning: {warning}")}</li> }).collect_view()}</ul>
+                        <ul class="v2-create-warnings">{move || checklist().warnings.into_iter().map(|warning| view! { <li>{format!("Warning: {warning}")}</li> }).collect_view()}</ul>
+
+                        {move || {
+                            let issues = blocking_issues();
+                            (!issues.is_empty()).then(|| view! {
+                                <div class="v2-create-alert v2-create-alert-error" role="alert">
+                                    <strong>{format!("{} blocking issue(s) must be resolved before publication", issues.len())}</strong>
+                                    <ul>{issues.into_iter().map(|(stage, error)| view! {
+                                        <li><button type="button" class="v2-create-issue-link" on:click=move |_| { current_stage.set(stage); stage_error.set(None); }>{format!("{}: {}", stage.title(), error)}</button></li>
+                                    }).collect_view()}</ul>
+                                </div>
+                            })
+                        }}
                     </section>
                     </Show>
 
-                    <section class="bg-gradient-to-br from-surface-container-high to-surface-container-lowest border border-outline-variant/10 rounded-3xl p-6" aria-labelledby="publication-status-title">
-                        <h2 id="publication-status-title" class="text-lg font-bold font-headline mb-4">"Publication status"</h2>
-                        {move || error_message.get().map(|msg| view! { <div class="mb-4 rounded-xl border border-error/30 bg-error-container/30 px-4 py-3 text-sm font-medium text-error">{msg}</div> })}
+                    <Show when=move || current_stage.get() == PublishStage::Review || phase() != PublicationPhase::Idle>
+                    <section class="v2-create-stage-panel" aria-labelledby="publication-status-title">
+                        <div class="v2-create-status-heading">
+                            <h2 id="publication-status-title" class="v2-create-section-title">"Publication status"</h2>
+                            <span class=move || format!("v2-create-phase {}", phase().class())>{move || phase().label()}</span>
+                        </div>
+                        <p class="v2-create-help">{move || match phase() {
+                            PublicationPhase::Idle => "Nothing has been sent to the network from this workflow yet.",
+                            PublicationPhase::Publishing => "The publication command is running. Relay acceptance is only reported once the command returns.",
+                            PublicationPhase::Partial => "The game page exists on the network, but the remaining publication work did not complete.",
+                            PublicationPhase::Published => "The listing event was accepted; the workflow can continue into management.",
+                            PublicationPhase::Failed => "Publication failed. Nothing partial is claimed for this attempt.",
+                            PublicationPhase::StaleAccount => "The active account changed during publication. Results from the previous account are rejected.",
+                        }}</p>
                         <div aria-live="polite" aria-atomic="true">
                         {move || publication_state.get().message.map(|msg| {
-                            let class = match publication_state.get().outcome { PublicationOutcome::Complete => "text-secondary", PublicationOutcome::Partial | PublicationOutcome::Failed => "text-error", _ => "text-on-surface-variant" };
+                            let class = match publication_state.get().outcome { PublicationOutcome::Complete => "v2-create-status-ok", PublicationOutcome::Partial | PublicationOutcome::Failed => "v2-create-status-error", _ => "v2-create-status-neutral" };
                             view! { <p class={class}>{msg}</p> }
                         })}
-                        {move || image_upload_status.get().map(|status| view! { <p class="mt-3 text-sm font-bold text-primary" role="status">{status}</p> })}
+                        {move || image_upload_status.get().map(|status| view! { <p class="v2-create-status-busy" role="status">{status}</p> })}
                         {move || upload_progress.get().and_then(|event| {
                             let bytes_uploaded = event.bytes_uploaded?;
                             let total_bytes = event.total_bytes?;
                             let percent = progress_percent(bytes_uploaded, total_bytes);
                             let server = event.server_url.unwrap_or_else(|| "distribution server".to_string());
                             Some(view! {
-                                <div class="mt-4" role="progressbar" aria-label="Build upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>
-                                    <div class="mb-2 flex items-center justify-between gap-3 text-xs font-bold">
-                                        <span class="truncate">{format!("Uploading to {server}")}</span>
+                                <div class="v2-create-progress" role="progressbar" aria-label="Build upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>
+                                    <div class="v2-create-progress-heading">
+                                        <span>{format!("Uploading to {server}")}</span>
                                         <span>{format!("{percent}%")}</span>
                                     </div>
-                                    <div class="h-2.5 overflow-hidden rounded-full bg-surface-container-highest">
-                                        <div class="h-full rounded-full bg-primary transition-[width] duration-200" style=format!("width: {percent}%")></div>
+                                    <div class="v2-create-progress-track">
+                                        <div class="v2-create-progress-fill" style=format!("width: {percent}%")></div>
                                     </div>
                                 </div>
                             })
                         })}
-                        <ul class="mt-3 space-y-2 text-xs text-on-surface-variant">
+                        <ul class="v2-create-progress-log">
                             {move || progress_events.get().into_iter().map(|event| view! {
                                 <li>{progress_label(&event)}</li>
                             }).collect_view()}
                         </ul>
                         </div>
                     </section>
-                </aside>
+                    </Show>
             </div>
 
-            <div class="mt-6 flex flex-wrap items-center justify-between gap-3">
-                <button type="button" class="px-6 py-3 rounded-md bg-surface-container-highest font-bold disabled:opacity-40" disabled=move || (!can_exit && current_stage.get() == PublishStage::Details) || is_publishing.get() on:click=move |_| {
-                    if let Some(previous) = current_stage.get_untracked().previous() {
-                        current_stage.set(previous);
-                        stage_error.set(None);
-                    } else if let Some(on_back) = on_back {
-                        on_back.run(());
-                    }
-                }>"Back"</button>
-                <Show when=move || current_stage.get() != PublishStage::Review>
-                    <button type="button" class="px-8 py-3 rounded-md bg-primary text-on-primary font-bold" on:click=on_next disabled=move || is_publishing.get()>"Continue"</button>
-                </Show>
-                <Show when=move || current_stage.get() == PublishStage::Review>
-                    <button type="button" class="px-8 py-3 rounded-md bg-gradient-to-r from-primary to-primary-dim text-on-primary font-bold" on:click=move |_| on_submit.run(()) disabled=move || is_hashing.get() || is_selecting_image.get() || is_publishing.get()>
-                        {move || if is_publishing.get() { "Publishing to network…".to_string() } else { match (editing, fulfillment_enabled.get()) { (true, true) => "Update game page and distribution", (true, false) => "Update game page", (false, true) => "Publish game page and build", (false, false) => "Publish game page" }.to_string() }}
-                    </button>
-                </Show>
+            <div class="v2-create-actions">
+                <div class="v2-create-actions-state">
+                    <span class="v2-create-authoring">{move || authoring().label()}</span>
+                    {move || is_dirty().then(|| view! { <span class="v2-create-authoring-dirty">"Not saved anywhere"</span> })}
+                </div>
+                <div class="v2-create-actions-buttons">
+                    <button type="button" class="v2-btn-secondary" disabled=move || (!can_exit && current_stage.get() == PublishStage::Details) || is_publishing.get() on:click=move |_| {
+                        if let Some(previous) = current_stage.get_untracked().previous() {
+                            current_stage.set(previous);
+                            stage_error.set(None);
+                        } else if let Some(on_back) = on_back {
+                            on_back.run(());
+                        }
+                    }>{move || if current_stage.get() == PublishStage::Details { "Leave without publishing" } else { "Back" }}</button>
+                    <Show when=move || current_stage.get() != PublishStage::Review>
+                        <button type="button" class="v2-btn-primary" on:click=on_next disabled=move || is_publishing.get()>"Continue >"</button>
+                    </Show>
+                    <Show when=move || current_stage.get() == PublishStage::Review>
+                        <button type="button" class="v2-btn-primary" aria-describedby="publish-signer-requirement" on:click=move |_| on_submit.run(()) disabled=move || is_hashing.get() || is_selecting_image.get() || is_publishing.get() || !can_publish_now.get()>
+                            {move || if is_publishing.get() { "Publishing to network…".to_string() } else { match (editing, fulfillment_enabled.get()) { (true, true) => "Update game page and distribution", (true, false) => "Update game page", (false, true) => "Publish game page and build", (false, false) => "Publish game page" }.to_string() }}
+                        </button>
+                    </Show>
+                </div>
             </div>
         </main>
     }

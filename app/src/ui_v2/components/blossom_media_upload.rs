@@ -3,6 +3,8 @@ use std::rc::Rc;
 
 use arcadestr_core::store_page::{StorePageDraft, StorePageMediaItem};
 use leptos::prelude::*;
+
+use crate::ui_v2::components::{StatusChip, StatusChipSize, StatusChipVariant};
 use send_wrapper::SendWrapper;
 use wasm_bindgen_futures::spawn_local;
 
@@ -54,6 +56,101 @@ pub(crate) fn role_accepts_mime(role: &str, mime: &str) -> bool {
         }
         "video/mp4" | "video/webm" => role == "trailer",
         _ => false,
+    }
+}
+
+/// Visual treatment for the upload dialog, mapped from state the component
+/// already emits. Nothing here infers progress or success on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UploadPresentation {
+    Idle,
+    Selecting,
+    Selected,
+    Busy,
+    Uploading,
+    Uploaded,
+    Cancelled,
+    Retryable,
+    Rejected,
+    PaymentRequired,
+}
+
+impl UploadPresentation {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "No file selected",
+            Self::Selecting => "Selecting file",
+            Self::Selected => "File selected; not uploaded",
+            Self::Busy => "Preparing upload",
+            Self::Uploading => "Uploading",
+            Self::Uploaded => "Uploaded to the Blossom server",
+            Self::Cancelled => "Upload cancelled",
+            Self::Retryable => "Upload failed; retry available",
+            Self::Rejected => "Rejected",
+            Self::PaymentRequired => "Payment required",
+        }
+    }
+
+    pub(crate) fn variant(self) -> StatusChipVariant {
+        match self {
+            Self::Idle => StatusChipVariant::Neutral,
+            Self::Selecting | Self::Busy => StatusChipVariant::Pending,
+            Self::Selected => StatusChipVariant::Draft,
+            Self::Uploading => StatusChipVariant::Downloading,
+            Self::Uploaded => StatusChipVariant::Verified,
+            Self::Cancelled => StatusChipVariant::Cancelled,
+            Self::Retryable => StatusChipVariant::Warning,
+            Self::Rejected => StatusChipVariant::Error,
+            Self::PaymentRequired => StatusChipVariant::Unavailable,
+        }
+    }
+}
+
+/// A completed Blossom upload is hosted media, never a published Store Page.
+/// Error codes decide rejection versus retryable failure; the component's own
+/// validation stays authoritative.
+pub(crate) fn upload_presentation(
+    state: UploadState,
+    has_selection: bool,
+    error_message: Option<&str>,
+    phase: Option<&str>,
+) -> UploadPresentation {
+    if let Some(message) = error_message {
+        // Classified from the stable message the component already renders, so
+        // no error-handling path has to change to drive presentation.
+        if message == stable_error_message("payment_required") {
+            return UploadPresentation::PaymentRequired;
+        }
+        if [
+            "unsupported_media",
+            "file_too_large",
+            "unsafe_destination",
+            "invalid_server",
+            "integrity_mismatch",
+            "publisher_mismatch",
+        ]
+        .into_iter()
+        .any(|code| stable_error_message(code) == message)
+        {
+            return UploadPresentation::Rejected;
+        }
+        if message == stable_error_message("cancelled") {
+            return UploadPresentation::Cancelled;
+        }
+        return UploadPresentation::Retryable;
+    }
+    match state {
+        UploadState::Idle if has_selection => UploadPresentation::Selected,
+        UploadState::Idle => UploadPresentation::Idle,
+        UploadState::Selecting => UploadPresentation::Selecting,
+        UploadState::Ready if phase == Some(phase_label("complete")) => {
+            UploadPresentation::Uploaded
+        }
+        UploadState::Ready if phase.is_some() => UploadPresentation::Busy,
+        UploadState::Ready => UploadPresentation::Selected,
+        UploadState::Uploading => UploadPresentation::Uploading,
+        UploadState::Cancelled => UploadPresentation::Cancelled,
+        UploadState::Failed => UploadPresentation::Retryable,
     }
 }
 
@@ -873,7 +970,7 @@ pub fn BlossomMediaUpload(
     });
 
     view! {
-        <dialog node_ref=dialog_ref class="m-auto max-h-[90vh] w-[min(46rem,94vw)] overflow-auto rounded-2xl bg-surface-container-high p-6 text-on-surface backdrop:bg-black/70" on:cancel=move |event: web_sys::Event| {
+        <dialog node_ref=dialog_ref class="v2-publisher-dialog v2-store-dialog v2-blossom-dialog" on:cancel=move |event: web_sys::Event| {
             event.prevent_default();
             if state.get_untracked() == UploadState::Uploading {
                 close_confirmation.set(true);
@@ -896,16 +993,27 @@ pub fn BlossomMediaUpload(
             <section class="v2-store-card"><h3>"Upload server"</h3>
                 {move || {
                     let enabled = settings.get().map(|value| value.servers.into_iter().filter(|server| server.enabled).collect::<Vec<_>>()).unwrap_or_default();
-                    if enabled.is_empty() { view! { <p class="text-error">"No enabled Blossom servers are configured. Add one below."</p> }.into_any() } else { view! { <label>"Server"<select class="v2-input" prop:value=move || selected_server.get().unwrap_or_default() on:change=move |event| selected_server.set(Some(event_target_value(&event)))>{enabled.into_iter().map(|server| { let origin = server.origin.clone(); let label = server.label.map(|label| format!("{label} — {origin}")).unwrap_or_else(|| origin.clone()); view! { <option value=origin>{label}</option> } }).collect_view()}</select></label> }.into_any() }
+                    if enabled.is_empty() { view! { <p class="v2-store-alert">"No enabled Blossom servers are configured. Add one below."</p> }.into_any() } else { view! { <label>"Server"<select class="v2-input" prop:value=move || selected_server.get().unwrap_or_default() on:change=move |event| selected_server.set(Some(event_target_value(&event)))>{enabled.into_iter().map(|server| { let origin = server.origin.clone(); let label = server.label.map(|label| format!("{label} — {origin}")).unwrap_or_else(|| origin.clone()); view! { <option value=origin>{label}</option> } }).collect_view()}</select></label> }.into_any() }
                 }}
                 <details><summary>"Configure servers"</summary><div class="v2-store-form-grid"><label>"Origin"<input class="v2-input" placeholder="https://blossom.example" prop:value=move || server_origin.get() on:input=move |event| server_origin.set(event_target_value(&event)) /></label><label>"Optional label"<input class="v2-input" prop:value=move || server_label.get() on:input=move |event| server_label.set(event_target_value(&event)) /></label><button type="button" class="v2-btn-secondary" on:click=move |_| add_server.run(())>"Add server"</button></div>
                     {move || settings.get().map(|value| { let preferred = value.preferred_server; value.servers.into_iter().map(|server| { let origin_remove = server.origin.clone(); let origin_preferred = server.origin.clone(); let is_preferred = preferred.as_deref() == Some(server.origin.as_str()); view! { <div class="v2-store-card"><strong>{server.label.unwrap_or_else(|| server.origin.clone())}</strong><p class="v2-store-mono">{server.origin}</p><p>{if server.enabled { "Enabled" } else { "Disabled" }}</p><div class="v2-store-card-actions"><button type="button" disabled=is_preferred on:click=move |_| make_preferred.run(origin_preferred.clone())>{if is_preferred { "Preferred" } else { "Make preferred" }}</button><button type="button" on:click=move |_| remove_server.run(origin_remove.clone())>"Remove"</button></div></div> } }).collect_view() })}
                 </details>
             </section>
-            {move || status.get().map(|value| view! { <p role="status">{value}</p> })}
-            <Show when=move || state.get() == UploadState::Uploading><progress max=move || bytes.get().1.max(1) value=move || bytes.get().0></progress><p>{move || { let (done, total) = bytes.get(); format!("{} / {}", human_size(done), human_size(total)) }}</p></Show>
-            {move || error.get().map(|value| view! { <p class="text-error" role="alert">{value}</p> })}
-            <div class="mt-4 flex flex-wrap gap-3">
+            <div class="v2-blossom-status">
+                {move || { let presentation = upload_presentation(state.get(), selection.get().is_some(), error.get().as_deref(), status.get().as_deref()); view! { <StatusChip label=presentation.label() variant=presentation.variant() icon=None size=StatusChipSize::Compact /> } }}
+                {move || status.get().map(|value| view! { <span class="v2-blossom-phase" role="status">{value}</span> })}
+            </div>
+            <Show when=move || state.get() == UploadState::Uploading>
+                {move || { let (done, total) = bytes.get(); let percent = if total == 0 { 0 } else { ((done.saturating_mul(100)) / total).min(100) }; view! {
+                    <div class="v2-create-progress" role="progressbar" aria-label="Blossom upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>
+                        <div class="v2-create-progress-heading"><span>{format!("{} / {}", human_size(done), human_size(total))}</span><span>{format!("{percent}%")}</span></div>
+                        <div class="v2-create-progress-track"><div class="v2-create-progress-fill" style=format!("width: {percent}%")></div></div>
+                    </div>
+                } }}
+            </Show>
+            {move || error.get().map(|value| view! { <p class="v2-store-alert" role="alert">{value}</p> })}
+            <p class="v2-store-help">"A completed upload stores the file on the Blossom server. It becomes part of the Store Page only when you publish."</p>
+            <div class="v2-store-dialog-actions">
                 <button type="button" class="v2-btn-primary" disabled=move || selection.get().is_none() || selected_server.get().is_none() || state.get() == UploadState::Uploading on:click=move |_| upload.run(false)>"Upload"</button>
                 <Show when=move || matches!(state.get(), UploadState::Failed | UploadState::Cancelled) && selection.get().is_some()><button type="button" class="v2-btn-secondary" on:click=move |_| upload.run(true)>"Retry"</button></Show>
                 <Show when=move || state.get() == UploadState::Uploading><button type="button" class="v2-btn-secondary" on:click=move |_| cancel_upload.run(false)>"Cancel upload"</button></Show>
@@ -1144,5 +1252,85 @@ mod tests {
             Some("selection"),
             Some("request")
         ));
+    }
+    #[test]
+    fn upload_presentation_separates_every_state_the_component_emits() {
+        use UploadPresentation::*;
+        assert_eq!(
+            upload_presentation(UploadState::Idle, false, None, None),
+            Idle
+        );
+        assert_eq!(
+            upload_presentation(UploadState::Selecting, false, None, None),
+            Selecting
+        );
+        assert_eq!(
+            upload_presentation(UploadState::Idle, true, None, None),
+            Selected
+        );
+        assert_eq!(
+            upload_presentation(UploadState::Ready, true, None, Some(phase_label("hash"))),
+            Busy
+        );
+        assert_eq!(
+            upload_presentation(UploadState::Uploading, true, None, None),
+            Uploading
+        );
+        assert_eq!(
+            upload_presentation(
+                UploadState::Ready,
+                true,
+                None,
+                Some(phase_label("complete"))
+            ),
+            Uploaded
+        );
+        assert_eq!(
+            upload_presentation(UploadState::Cancelled, true, None, None),
+            Cancelled
+        );
+        assert_eq!(
+            upload_presentation(UploadState::Failed, true, None, None),
+            Retryable
+        );
+    }
+
+    #[test]
+    fn upload_errors_separate_rejection_payment_and_retryable_failure() {
+        use UploadPresentation::*;
+        let classify = |code: &str| {
+            upload_presentation(
+                UploadState::Failed,
+                true,
+                Some(stable_error_message(code)),
+                None,
+            )
+        };
+        assert_eq!(classify("payment_required"), PaymentRequired);
+        assert_eq!(classify("unsafe_destination"), Rejected);
+        assert_eq!(classify("unsupported_media"), Rejected);
+        assert_eq!(classify("file_too_large"), Rejected);
+        assert_eq!(classify("integrity_mismatch"), Rejected);
+        assert_eq!(classify("publisher_mismatch"), Rejected);
+        assert_eq!(classify("cancelled"), Cancelled);
+        assert_eq!(classify("network_failure"), Retryable);
+        assert_eq!(classify("rate_limited"), Retryable);
+    }
+
+    #[test]
+    fn a_completed_upload_is_never_described_as_a_published_store_page() {
+        for presentation in [
+            UploadPresentation::Uploaded,
+            UploadPresentation::Selected,
+            UploadPresentation::Uploading,
+        ] {
+            let label = presentation.label().to_ascii_lowercase();
+            assert!(!label.contains("store page"));
+            assert!(!label.contains("live"));
+        }
+        assert!(UploadPresentation::Uploaded.label().contains("Blossom"));
+        assert!(UploadPresentation::Selected
+            .label()
+            .contains("not uploaded"));
     }
 }

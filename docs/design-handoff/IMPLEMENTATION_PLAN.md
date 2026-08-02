@@ -471,6 +471,17 @@ There is no new revoke dialog until a real command and scope exist.
 - `desktop/tauri.conf.json` only if review explicitly approves a desktop minimum
   window size; do not silently make the current resizable window fixed.
 
+Carried over from Phase 9: the Store Page editor was migrated onto the canonical
+token system as a whole surface, but its eight tab panels were not individually
+compared against the handoff. Phase 13 must:
+
+- compare all eight Store Page tab panels individually against the handoff
+  (Basic Info, Description, Media, Feature Sections, Requirements, Languages,
+  Accessibility, Links);
+- verify field spacing, control grouping, label geometry, responsive stacking,
+  and the tab-specific media layouts;
+- remove the remaining visual approximations found during that pass.
+
 Carried over from Phase 7: the WebKitGTK webview used by the desktop shell
 renders the contents of a **closed** `<details>` element, so collapsed
 disclosures leak their body outside the surrounding panel. Phase 7 added a

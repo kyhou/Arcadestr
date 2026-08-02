@@ -129,15 +129,17 @@ fn publisher_tab_items(
     .collect()
 }
 
+/// Signer availability for the active publisher account. Shared with the Create
+/// Game workflow so both surfaces gate publication on the same authoritative state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PublisherSignerState {
+pub(crate) enum PublisherSignerState {
     Available,
     Connecting,
     Unavailable,
     Unknown,
 }
 
-fn publisher_signer_state(
+pub(crate) fn publisher_signer_state(
     publisher_npub: Option<&str>,
     active_account: Option<&crate::StoredAccount>,
     connection_status: &str,
@@ -163,7 +165,7 @@ fn publisher_signer_state(
     }
 }
 
-fn signer_can_publish(state: PublisherSignerState) -> bool {
+pub(crate) fn signer_can_publish(state: PublisherSignerState) -> bool {
     state == PublisherSignerState::Available
 }
 

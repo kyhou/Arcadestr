@@ -12,7 +12,7 @@ const VIDEO_THUMBNAIL_FALLBACK: &str = "data:image/svg+xml,%3Csvg xmlns='http://
 #[component]
 fn SafeStorePageContent(html: SafeStorePageHtml, preview: bool) -> impl IntoView {
     view! {
-        <div class="store-page-safe-html prose max-w-none text-on-surface-variant" inner_html=html.as_str().to_string() on:click=move |event| {
+        <div class="store-page-safe-html v2-detail-prose" inner_html=html.as_str().to_string() on:click=move |event| {
             if preview {
                 event.prevent_default();
             }
@@ -164,30 +164,30 @@ pub fn StorePageRichDetail(
 
         <Show when=move || !requirements_when.is_empty()>
             <section class="v2-detail-section"><p class="v2-store-kicker">"System requirements"</p><h2>"Requirements"</h2>
-                {requirements_view.clone().into_iter().map(|requirement| view! { <article class="mt-4 rounded-xl bg-surface-container-low p-4"><h3>{label(&requirement.platform)}</h3>
-                    {[("Minimum", requirement.minimum), ("Recommended", requirement.recommended)].into_iter().filter_map(|(heading, tier)| tier.map(|tier| view! { <div class="mt-3"><h4>{heading}</h4><dl>{tier_rows(&tier).into_iter().map(|(name, value)| view! { <div class="grid gap-1 sm:grid-cols-[10rem_1fr]"><dt>{name}</dt><dd>{value}</dd></div> }).collect_view()}</dl></div> })).collect_view()}
+                {requirements_view.clone().into_iter().map(|requirement| view! { <article class="v2-detail-requirement"><h3>{label(&requirement.platform)}</h3>
+                    {[("Minimum", requirement.minimum), ("Recommended", requirement.recommended)].into_iter().filter_map(|(heading, tier)| tier.map(|tier| view! { <div class="v2-detail-note"><h4>{heading}</h4><dl>{tier_rows(&tier).into_iter().map(|(name, value)| view! { <div class="v2-detail-requirement-grid"><dt>{name}</dt><dd>{value}</dd></div> }).collect_view()}</dl></div> })).collect_view()}
                 </article> }).collect_view()}
             </section>
         </Show>
 
         <Show when=move || !languages_when.is_empty()>
-            <section class="v2-detail-section"><p class="v2-store-kicker">"Languages"</p><h2>"Language support"</h2><div class="mt-3 grid gap-2 sm:grid-cols-2">
-                {languages_view.clone().into_iter().map(|language| view! { <div class="rounded-xl bg-surface-container-low p-3"><strong>{label(&language.code)}</strong><p class="text-sm text-on-surface-variant">{[language.interface.then_some("Interface"), language.audio.then_some("Audio"), language.subtitles.then_some("Subtitles")].into_iter().flatten().collect::<Vec<_>>().join(" · ")}</p></div> }).collect_view()}
+            <section class="v2-detail-section"><p class="v2-store-kicker">"Languages"</p><h2>"Language support"</h2><div class="v2-detail-grid">
+                {languages_view.clone().into_iter().map(|language| view! { <div class="v2-detail-note"><strong>{label(&language.code)}</strong><p class="v2-store-help">{[language.interface.then_some("Interface"), language.audio.then_some("Audio"), language.subtitles.then_some("Subtitles")].into_iter().flatten().collect::<Vec<_>>().join(" · ")}</p></div> }).collect_view()}
             </div></section>
         </Show>
 
         <Show when=move || !accessibility_when.is_empty()>
-            <section class="v2-detail-section"><p class="v2-store-kicker">"Accessibility"</p><h2>"Accessibility features"</h2><p class="text-sm text-on-surface-variant">"Accessibility information provided by the publisher."</p><ul class="mt-3 space-y-2">
-                {accessibility_view.clone().into_iter().map(|entry| view! { <li class="rounded-xl bg-surface-container-low p-3"><strong>{label(&entry.feature)}</strong>{if entry.supported { " · Supported" } else { " · Not supported" }}{entry.notes.map(|notes| view! { <p class="text-sm text-on-surface-variant">{notes}</p> })}</li> }).collect_view()}
+            <section class="v2-detail-section"><p class="v2-store-kicker">"Accessibility"</p><h2>"Accessibility features"</h2><p class="v2-store-help">"Accessibility information provided by the publisher."</p><ul class="v2-detail-grid">
+                {accessibility_view.clone().into_iter().map(|entry| view! { <li class="v2-detail-note"><strong>{label(&entry.feature)}</strong>{if entry.supported { " · Supported" } else { " · Not supported" }}{entry.notes.map(|notes| view! { <p class="v2-store-help">{notes}</p> })}</li> }).collect_view()}
             </ul></section>
         </Show>
 
         <Show when=move || links_when.iter().any(|(_, value)| value.is_some())>
-            <section class="v2-detail-section"><p class="v2-store-kicker">"Links"</p><h2>"Official links"</h2><div class="mt-3 flex flex-wrap gap-2">
+            <section class="v2-detail-section"><p class="v2-store-kicker">"Links"</p><h2>"Official links"</h2><div class="v2-detail-link-row">
                 {links_view.clone().into_iter().filter_map(|(name, value)| value.map(|url| if preview {
-                    view! { <span class="rounded-full bg-surface-container-high px-4 py-2 text-sm text-on-surface-variant" title=url>{name}</span> }.into_any()
+                    view! { <span class="v2-detail-link v2-detail-link-disabled" title=url>{name}</span> }.into_any()
                 } else {
-                    view! { <a class="rounded-full bg-surface-container-high px-4 py-2 text-sm text-primary outline-none ring-primary focus-visible:ring-2" href=url target="_blank" rel="noopener noreferrer">{name}</a> }.into_any()
+                    view! { <a class="v2-detail-link" href=url target="_blank" rel="noopener noreferrer">{name}</a> }.into_any()
                 })).collect_view()}
             </div></section>
         </Show>

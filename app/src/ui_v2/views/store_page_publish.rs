@@ -90,6 +90,54 @@ fn focus_editor_tab(id: &str) {
     }
 }
 
+/// Focus a stable in-panel target when one exists, otherwise fall back to the
+/// tab control itself. Returns whether a focus target was found.
+fn focus_editor_element(element_id: &str) -> bool {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return false;
+    };
+    let Some(element) = document.get_element_by_id(element_id) else {
+        return false;
+    };
+    match element.dyn_into::<web_sys::HtmlElement>() {
+        Ok(element) => {
+            let _ = element.focus();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Where the first blocking issue lives. Routing reuses the existing
+/// `diagnostic_tab` mapping so no second validation rule can drift from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlockerTarget {
+    tab: &'static str,
+    /// Stable element id to focus, when the owning panel exposes one.
+    element_id: Option<String>,
+    message: String,
+}
+
+/// Panels that expose a stable focus target today. Everything else falls back to
+/// its tab control rather than inventing an id.
+fn blocker_focus_element(tab: &str) -> Option<String> {
+    match tab {
+        "basic" => Some("store-editor-basic".to_string()),
+        _ => None,
+    }
+}
+
+fn first_blocker_target(blockers: &[String]) -> Option<BlockerTarget> {
+    blockers.first().map(|message| {
+        let tab = diagnostic_tab(message);
+        BlockerTarget {
+            tab,
+            element_id: blocker_focus_element(tab),
+            message: message.clone(),
+        }
+    })
+}
+
 fn unique_editor_id<'a>(prefix: &str, existing_ids: impl IntoIterator<Item = &'a str>) -> String {
     let existing = existing_ids
         .into_iter()
@@ -559,6 +607,186 @@ fn readiness(
             .push("Add accessibility information.".into());
     }
     value
+}
+
+/// Outcome of one publication stage. Store Page event publication and listing
+/// pointer publication are tracked separately and never collapsed into one
+/// generic success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageOutcome {
+    NotAttempted,
+    Pending,
+    Partial,
+    Complete,
+    Failed,
+}
+
+impl StageOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotAttempted => "Not attempted",
+            Self::Pending => "In progress",
+            Self::Partial => "Partially published",
+            Self::Complete => "Published",
+            Self::Failed => "Failed",
+        }
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            Self::NotAttempted => "v2-store-stage-idle",
+            Self::Pending => "v2-store-stage-busy",
+            Self::Partial => "v2-store-stage-warning",
+            Self::Complete => "v2-store-stage-ok",
+            Self::Failed => "v2-store-stage-error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PublicationLifecycle {
+    store_page: StageOutcome,
+    pointers: StageOutcome,
+    retryable: bool,
+}
+
+fn store_page_stage(publishing: bool, response: Option<&PublishStorePageResponse>) -> StageOutcome {
+    let Some(response) = response else {
+        return if publishing {
+            StageOutcome::Pending
+        } else {
+            StageOutcome::NotAttempted
+        };
+    };
+    match response.store_page.as_ref() {
+        None => StageOutcome::NotAttempted,
+        Some(outcome) if outcome.success_count == 0 => StageOutcome::Failed,
+        Some(outcome) if outcome.propagation_confirmed => StageOutcome::Complete,
+        Some(_) => StageOutcome::Partial,
+    }
+}
+
+fn pointer_stage(publishing: bool, response: Option<&PublishStorePageResponse>) -> StageOutcome {
+    let Some(response) = response else {
+        return if publishing {
+            StageOutcome::Pending
+        } else {
+            StageOutcome::NotAttempted
+        };
+    };
+    if response.listing_updates.is_empty() {
+        return StageOutcome::NotAttempted;
+    }
+    let confirmed = response
+        .listing_updates
+        .iter()
+        .filter(|outcome| outcome.published && outcome.propagation_confirmed)
+        .count();
+    let published = response
+        .listing_updates
+        .iter()
+        .filter(|outcome| outcome.published)
+        .count();
+    if confirmed == response.listing_updates.len() {
+        StageOutcome::Complete
+    } else if published == 0 {
+        StageOutcome::Failed
+    } else {
+        StageOutcome::Partial
+    }
+}
+
+fn publication_lifecycle(
+    publishing: bool,
+    response: Option<&PublishStorePageResponse>,
+) -> PublicationLifecycle {
+    PublicationLifecycle {
+        store_page: store_page_stage(publishing, response),
+        pointers: pointer_stage(publishing, response),
+        retryable: response.is_some_and(|response| response.retryable),
+    }
+}
+
+/// Overall publication wording. "Published" requires every attempted stage to be
+/// complete; a Store Page event accepted without its pointer update is never
+/// described as a finished publication.
+fn overall_publication_label(lifecycle: PublicationLifecycle) -> &'static str {
+    use StageOutcome::*;
+    match (lifecycle.store_page, lifecycle.pointers) {
+        (NotAttempted, NotAttempted) => "Not published from this editor",
+        (Pending, _) | (_, Pending) => "Publishing",
+        (Complete, Complete) => "Store Page and listing pointers published",
+        (Complete, NotAttempted) => "Store Page published; no pointer update was required",
+        (Complete, Partial) => "Store Page published; listing pointers partially published",
+        (Complete, Failed) => "Store Page published; listing pointer update failed",
+        (Partial, _) => "Store Page event only partially published",
+        (Failed, _) => "Store Page publication failed",
+        (NotAttempted, _) => "Listing pointer work only",
+    }
+}
+
+/// The editor keeps changes in memory for the session. Nothing here may be
+/// described as saved: no durable draft persistence exists.
+fn draft_persistence_label(dirty: bool) -> &'static str {
+    if dirty {
+        "Unsaved in-memory changes"
+    } else {
+        "No in-memory changes"
+    }
+}
+
+fn revision_label(loaded_event_id: Option<&str>) -> String {
+    match loaded_event_id {
+        Some(id) => format!("Published revision loaded: {id}"),
+        None => "No published Store Page revision yet".to_string(),
+    }
+}
+
+/// Per-tab validation treatment derived from the authoritative readiness output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorTabState {
+    Neutral,
+    Warned,
+    Blocked,
+}
+
+fn editor_tab_state(tab: &str, blockers: &[String], warnings: &[String]) -> EditorTabState {
+    if blockers.iter().any(|item| diagnostic_tab(item) == tab) {
+        EditorTabState::Blocked
+    } else if warnings.iter().any(|item| diagnostic_tab(item) == tab) {
+        EditorTabState::Warned
+    } else {
+        EditorTabState::Neutral
+    }
+}
+
+/// Presentation state for one draft media entry. A local selection or a
+/// completed Blossom upload is never presented as published Store Page media.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaSlotState {
+    Empty,
+    Invalid,
+    Referenced,
+}
+
+fn media_slot_state(url: &str, media_type: &str) -> MediaSlotState {
+    if url.trim().is_empty() {
+        MediaSlotState::Empty
+    } else if safe_media_preview(url, media_type) {
+        MediaSlotState::Referenced
+    } else {
+        MediaSlotState::Invalid
+    }
+}
+
+impl MediaSlotState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Empty => "No media URL yet",
+            Self::Invalid => "Enter a supported HTTPS media URL",
+            Self::Referenced => "Referenced in the draft; not published until you publish",
+        }
+    }
 }
 
 fn retryable_mutations(
@@ -1423,6 +1651,8 @@ pub fn StorePageEditorView(
     let coordinate_for_readiness = StoredValue::new(coordinate.clone());
     let coordinate_for_requirements = StoredValue::new(coordinate.clone());
     let coordinate_for_preview = StoredValue::new(coordinate.clone());
+    let coordinate_for_tabs = StoredValue::new(coordinate.clone());
+    let selected_platforms_for_tabs = StoredValue::new(listing.platforms.clone());
     let publisher_for_retry_disabled = StoredValue::new(publisher.clone());
     let publisher_for_discard = StoredValue::new(publisher.clone());
 
@@ -1430,7 +1660,7 @@ pub fn StorePageEditorView(
         <section class="v2-publisher-studio v2-store-page-editor">
             <button class="v2-btn-secondary v2-publisher-back" on:click=on_back_click>"Back to game management"</button>
             <header class="v2-publisher-game-hero">
-                <div><p class="v2-publisher-kicker">"Store Page editor"</p><h1>{listing.title.clone()}</h1><p class="text-sm text-on-surface-variant">"Drafts stay local until Publish is selected."</p></div>
+                <div><p class="v2-publisher-kicker">"Store Page editor"</p><h1>{listing.title.clone()}</h1><p class="v2-store-help">"Drafts stay local until Publish is selected."</p></div>
             </header>
             <BlossomMediaUpload
                 dialog_role=blossom_dialog_role
@@ -1441,23 +1671,30 @@ pub fn StorePageEditorView(
                 input_dirty=input_dirty
             />
             {move || loading.get().then(|| view! { <p>"Loading current Store Page and signed listings..."</p> })}
-            {move || message.get().map(|value| view! { <p class="rounded-xl bg-surface-container-high p-3" role="status">{value}</p> })}
-            {move || form_error.get().map(|value| view! { <p class="text-error" role="alert">{value}</p> })}
+            {move || message.get().map(|value| view! { <p class="v2-store-notice" role="status">{value}</p> })}
+            {move || form_error.get().map(|value| view! { <p class="v2-store-alert" role="alert">{value}</p> })}
             {move || partial.get().map(|result| {
+                let lifecycle = publication_lifecycle(publishing.get(), Some(&result));
                 let page_status = result.store_page.as_ref().map(|page| {
                     format!(
-                        "Store Page {}: accepted by {} relay(s), propagation {}",
+                        "Store Page event {}: accepted by {} relay(s), {} failure(s), propagation {}",
                         page.event_id,
                         page.success_count,
+                        page.failure_count,
                         if page.propagation_confirmed { "confirmed" } else { "not confirmed" }
                     )
                 }).unwrap_or_else(|| "Store Page was not republished during this retry.".to_string());
-                view! { <section class="v2-publisher-panel border border-tertiary" aria-labelledby="partial-store-page-title">
+                view! { <section class="v2-publisher-panel v2-store-publication" aria-labelledby="partial-store-page-title">
                     <h2 id="partial-store-page-title">"Incomplete publication"</h2>
+                    <p class="v2-store-overall-status">{overall_publication_label(lifecycle)}</p>
+                    <dl class="v2-store-stage-grid">
+                        <div><dt>"Store Page event"</dt><dd class=lifecycle.store_page.class()>{lifecycle.store_page.label()}</dd></div>
+                        <div><dt>"Listing pointer update"</dt><dd class=lifecycle.pointers.class()>{lifecycle.pointers.label()}</dd></div>
+                    </dl>
                     <p>{page_status}</p>
-                    {result.cache_error.map(|error| view! { <p class="text-error">{format!("Local cache update failed: {error}")}</p> })}
-                    <ul class="mt-3 space-y-2">{result.listing_updates.into_iter().map(|outcome| view! { <li class="rounded-xl bg-surface-container-low p-3"><strong>{outcome.listing_coordinate}</strong><p>{format!("{:?}: published={}, propagation={}", outcome.action, outcome.published, outcome.propagation_confirmed)}</p>{outcome.error.map(|error| view! { <p class="text-error">{error}</p> })}</li> }).collect_view()}</ul>
-                    <button class="v2-btn-secondary mt-3" type="button" disabled=move || validating.get() || publishing.get() || auth.npub.get().as_deref() != Some(publisher_for_retry_disabled.get_value().as_str()) on:click=move |_| retry.run(())>"Retry incomplete synchronization"</button>
+                    {result.cache_error.map(|error| view! { <p class="v2-store-alert">{format!("Local cache update failed: {error}")}</p> })}
+                    <ul class="v2-store-outcome-list">{result.listing_updates.into_iter().map(|outcome| view! { <li class="v2-store-outcome-row"><strong>{outcome.listing_coordinate}</strong><p>{format!("{:?}: published={}, propagation={}", outcome.action, outcome.published, outcome.propagation_confirmed)}</p>{outcome.error.map(|error| view! { <p class="v2-store-alert">{error}</p> })}</li> }).collect_view()}</ul>
+                    <button class="v2-btn-secondary" type="button" disabled=move || validating.get() || publishing.get() || auth.npub.get().as_deref() != Some(publisher_for_retry_disabled.get_value().as_str()) on:click=move |_| retry.run(())>"Retry incomplete listing pointer synchronization"</button>
                 </section> }
             })}
 
@@ -1474,45 +1711,71 @@ pub fn StorePageEditorView(
             </Show>
 
             <nav class="v2-store-editor-tabs" role="tablist" aria-label="Store Page fields">
-                {EDITOR_TABS.into_iter().map(|(id, label)| view! { <button id=format!("store-editor-tab-{id}") aria-controls=format!("store-editor-{id}") tabindex=move || if active_tab.get() == id { 0 } else { -1 } type="button" role="tab" aria-selected=move || active_tab.get() == id class:v2-store-editor-tab-active=move || active_tab.get() == id on:keydown=move |event| { let next = match event.key().as_str() { "ArrowRight" => Some(adjacent_tab(id, 1)), "ArrowLeft" => Some(adjacent_tab(id, -1)), "Home" => Some(EDITOR_TABS[0].0), "End" => Some(EDITOR_TABS[EDITOR_TABS.len() - 1].0), _ => None }; if let Some(next) = next { event.prevent_default(); active_tab.set(next); focus_editor_tab(next); } } on:click=move |_| active_tab.set(id)>{label}</button> }).collect_view()}
+                {EDITOR_TABS.into_iter().map(|(id, label)| {
+                    let tab_state = move || {
+                        let platforms = linked_platforms(&selected_platforms_for_tabs.get_value(), &associations.get(), &coordinate_for_tabs.get_value());
+                        let state = readiness(&draft.get(), &associations.get(), &platforms, &diagnostics.get());
+                        editor_tab_state(id, &state.blockers, &state.warnings)
+                    };
+                    view! { <button
+                        id=format!("store-editor-tab-{id}")
+                        aria-controls=format!("store-editor-{id}")
+                        tabindex=move || if active_tab.get() == id { 0 } else { -1 }
+                        type="button"
+                        role="tab"
+                        aria-selected=move || active_tab.get() == id
+                        class:v2-store-editor-tab-active=move || active_tab.get() == id
+                        class:v2-store-editor-tab-blocked=move || tab_state() == EditorTabState::Blocked
+                        class:v2-store-editor-tab-warned=move || tab_state() == EditorTabState::Warned
+                        on:keydown=move |event| { let next = match event.key().as_str() { "ArrowRight" => Some(adjacent_tab(id, 1)), "ArrowLeft" => Some(adjacent_tab(id, -1)), "Home" => Some(EDITOR_TABS[0].0), "End" => Some(EDITOR_TABS[EDITOR_TABS.len() - 1].0), _ => None }; if let Some(next) = next { event.prevent_default(); active_tab.set(next); focus_editor_tab(next); } }
+                        on:click=move |_| active_tab.set(id)
+                    >
+                        <span>{label}</span>
+                        {move || match tab_state() {
+                            EditorTabState::Blocked => Some(view! { <span class="v2-store-tab-flag v2-store-tab-flag-blocked"><span aria-hidden="true">"!"</span><span class="sr-only">"has blocking issues"</span></span> }),
+                            EditorTabState::Warned => Some(view! { <span class="v2-store-tab-flag v2-store-tab-flag-warned"><span aria-hidden="true">"*"</span><span class="sr-only">"has warnings"</span></span> }),
+                            EditorTabState::Neutral => None,
+                        }}
+                    </button> }
+                }).collect_view()}
             </nav>
             <button type="button" class="v2-btn-secondary v2-store-readiness-toggle" aria-expanded=move || readiness_open.get() on:click=move |_| readiness_open.update(|open| *open = !*open)>"Readiness"</button>
             <div class="v2-publisher-management-layout v2-store-editor-layout">
-            <main class="v2-publisher-main space-y-5">
-                <fieldset class="contents" disabled=move || publishing.get() || partial.get().is_some()>
-                <Show when=move || active_tab.get() == "basic"><section id="store-editor-basic" role="tabpanel" class="v2-publisher-panel grid gap-4 sm:grid-cols-2">
-                    <h2 class="sm:col-span-2">"Basic Info"</h2>
+            <main class="v2-publisher-main v2-store-editor-main">
+                <fieldset class="v2-store-fieldset" disabled=move || publishing.get() || partial.get().is_some()>
+                <Show when=move || active_tab.get() == "basic"><section id="store-editor-basic" role="tabpanel" class="v2-publisher-panel v2-store-form-grid">
+                    <h2 class="v2-store-span-all">"Basic Info"</h2>
                     <label>"Presentation ID"<input class="v2-input" disabled=move || draft.get().loaded_event_id.is_some() prop:value=move || draft.get().presentation_id on:input=move |event| draft.update(|value| value.presentation_id = event_target_value(&event)) /></label>
                     <div><span class="v2-store-field-label">"Release date"</span><DatePicker value=Signal::derive(move || draft.get().content.basic.release_date.unwrap_or_default()) on_value=Callback::new(move |date| draft.update(|value| value.content.basic.release_date = optional(date))) disabled=Signal::derive(move || publishing.get() || partial.get().is_some()) /></div>
                     <label>"Title"<input class="v2-input" prop:value=move || draft.get().content.basic.title.unwrap_or_default() on:input:target=move |event| draft.update(|value| value.content.basic.title = optional_editor_text(event.target().value())) /></label>
                     <label>"Summary"<textarea class="v2-input" prop:value=move || draft.get().content.basic.summary.unwrap_or_default() on:input:target=move |event| draft.update(|value| value.content.basic.summary = optional_editor_text(event.target().value())) /><small>{move || format!("{} characters", draft.get().content.basic.summary.as_deref().unwrap_or_default().chars().count())}</small></label>
                     <label>"Developer display name"<input class="v2-input" prop:value=move || draft.get().content.basic.developer.unwrap_or_default() on:input:target=move |event| draft.update(|value| value.content.basic.developer = optional_editor_text(event.target().value())) /></label>
                     <label>"Publisher display name"<input class="v2-input" prop:value=move || draft.get().content.basic.publisher.unwrap_or_default() on:input:target=move |event| draft.update(|value| value.content.basic.publisher = optional_editor_text(event.target().value())) /></label>
-                    <div class="sm:col-span-2"><span class="v2-store-field-label">"Genres"</span><div class="v2-store-chip-row">{move || draft.get().content.discovery.genres.unwrap_or_default().into_iter().enumerate().map(|(index, value)| view! { <button type="button" class="v2-chip" aria-label=format!("Remove genre {value}") on:click=move |_| draft.update(|item| { if let Some(values) = &mut item.content.discovery.genres { values.remove(index); } })>{value.clone()}" ×"</button> }).collect_view()}</div><div class="v2-store-add-row"><input class="v2-input" list="store-genre-suggestions" placeholder="Add genre" prop:value=move || genre_input.get() on:input=move |event| genre_input.set(event_target_value(&event)) /><datalist id="store-genre-suggestions"><option value="Action"/><option value="Adventure"/><option value="Puzzle"/><option value="Role-playing"/><option value="Strategy"/></datalist><button type="button" class="v2-btn-secondary" on:click=move |_| { let value = genre_input.get_untracked().trim().to_string(); if !value.is_empty() { draft.update(|item| item.content.discovery.genres.get_or_insert_default().push(value)); genre_input.set(String::new()); } }>"Add"</button></div></div>
-                    <div class="sm:col-span-2"><span class="v2-store-field-label">"Features"</span><div class="v2-store-chip-row">{move || draft.get().content.discovery.features.unwrap_or_default().into_iter().enumerate().map(|(index, value)| view! { <button type="button" class="v2-chip" aria-label=format!("Remove feature {value}") on:click=move |_| draft.update(|item| { if let Some(values) = &mut item.content.discovery.features { values.remove(index); } })>{value.clone()}" ×"</button> }).collect_view()}</div><div class="v2-store-add-row"><input class="v2-input" list="store-feature-suggestions" placeholder="Add feature" prop:value=move || feature_input.get() on:input=move |event| feature_input.set(event_target_value(&event)) /><datalist id="store-feature-suggestions"><option value="Single-player"/><option value="Multiplayer"/><option value="Controller support"/><option value="Achievements"/></datalist><button type="button" class="v2-btn-secondary" on:click=move |_| { let value = feature_input.get_untracked().trim().to_string(); if !value.is_empty() { draft.update(|item| item.content.discovery.features.get_or_insert_default().push(value)); feature_input.set(String::new()); } }>"Add"</button></div></div>
-                    <section class="sm:col-span-2"><h3>"Associated listings"</h3><p class="text-sm text-on-surface-variant">"Signed current-user-owned revisions. Changes publish as explicit pointer mutations."</p>{move || associations.get().into_iter().enumerate().map(|(index, row)| { let status = if row.reciprocal { "Reciprocal pointer current" } else { "Reciprocal pointer missing or incomplete" }; view! { <article class="v2-store-card"><strong>{row.listing_coordinate}</strong><p class="v2-store-mono">{row.event_id}</p><p>{status}</p><label>"Association action"<select class="v2-input" prop:value=format!("{:?}", row.action).to_ascii_lowercase() on:change=move |event| { let action = match event_target_value(&event).as_str() { "link" => ListingPointerMutation::Link, "unlink" => ListingPointerMutation::Unlink, _ => ListingPointerMutation::Review }; associations.update(|rows| if let Some(row) = rows.get_mut(index) { row.action = action; }); association_review_required.set(associations.get_untracked().iter().any(|row| row.action == ListingPointerMutation::Review)); input_dirty.set(true); }><option value="link">"Link"</option><option value="unlink">"Unlink"</option><option value="review">"Review"</option></select></label></article> } }).collect_view()}</section>
+                    <div class="v2-store-span-all"><span class="v2-store-field-label">"Genres"</span><div class="v2-store-chip-row">{move || draft.get().content.discovery.genres.unwrap_or_default().into_iter().enumerate().map(|(index, value)| view! { <button type="button" class="v2-chip" aria-label=format!("Remove genre {value}") on:click=move |_| draft.update(|item| { if let Some(values) = &mut item.content.discovery.genres { values.remove(index); } })>{value.clone()}" ×"</button> }).collect_view()}</div><div class="v2-store-add-row"><input class="v2-input" list="store-genre-suggestions" placeholder="Add genre" prop:value=move || genre_input.get() on:input=move |event| genre_input.set(event_target_value(&event)) /><datalist id="store-genre-suggestions"><option value="Action"/><option value="Adventure"/><option value="Puzzle"/><option value="Role-playing"/><option value="Strategy"/></datalist><button type="button" class="v2-btn-secondary" on:click=move |_| { let value = genre_input.get_untracked().trim().to_string(); if !value.is_empty() { draft.update(|item| item.content.discovery.genres.get_or_insert_default().push(value)); genre_input.set(String::new()); } }>"Add"</button></div></div>
+                    <div class="v2-store-span-all"><span class="v2-store-field-label">"Features"</span><div class="v2-store-chip-row">{move || draft.get().content.discovery.features.unwrap_or_default().into_iter().enumerate().map(|(index, value)| view! { <button type="button" class="v2-chip" aria-label=format!("Remove feature {value}") on:click=move |_| draft.update(|item| { if let Some(values) = &mut item.content.discovery.features { values.remove(index); } })>{value.clone()}" ×"</button> }).collect_view()}</div><div class="v2-store-add-row"><input class="v2-input" list="store-feature-suggestions" placeholder="Add feature" prop:value=move || feature_input.get() on:input=move |event| feature_input.set(event_target_value(&event)) /><datalist id="store-feature-suggestions"><option value="Single-player"/><option value="Multiplayer"/><option value="Controller support"/><option value="Achievements"/></datalist><button type="button" class="v2-btn-secondary" on:click=move |_| { let value = feature_input.get_untracked().trim().to_string(); if !value.is_empty() { draft.update(|item| item.content.discovery.features.get_or_insert_default().push(value)); feature_input.set(String::new()); } }>"Add"</button></div></div>
+                    <section class="v2-store-span-all"><h3>"Associated listings"</h3><p class="v2-store-help">"Signed current-user-owned revisions. Changes publish as explicit pointer mutations."</p>{move || associations.get().into_iter().enumerate().map(|(index, row)| { let status = if row.reciprocal { "Reciprocal pointer current" } else { "Reciprocal pointer missing or incomplete" }; view! { <article class="v2-store-card"><strong>{row.listing_coordinate}</strong><p class="v2-store-mono">{row.event_id}</p><p>{status}</p><label>"Association action"<select class="v2-input" prop:value=format!("{:?}", row.action).to_ascii_lowercase() on:change=move |event| { let action = match event_target_value(&event).as_str() { "link" => ListingPointerMutation::Link, "unlink" => ListingPointerMutation::Unlink, _ => ListingPointerMutation::Review }; associations.update(|rows| if let Some(row) = rows.get_mut(index) { row.action = action; }); association_review_required.set(associations.get_untracked().iter().any(|row| row.action == ListingPointerMutation::Review)); input_dirty.set(true); }><option value="link">"Link"</option><option value="unlink">"Unlink"</option><option value="review">"Review"</option></select></label></article> } }).collect_view()}</section>
                 </section></Show>
 
-                <Show when=move || active_tab.get() == "description"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Description"</h2><div role="group" aria-label="Description mode"><button type="button" class="v2-btn-secondary" aria-pressed=move || !description_preview.get() on:click=move |_| description_preview.set(false)>"Write"</button><button type="button" class="v2-btn-secondary" aria-pressed=move || description_preview.get() on:click=move |_| description_preview.set(true)>"Preview"</button></div></div><Show when=move || !description_preview.get()><div class="v2-store-toolbar" role="toolbar" aria-label="Markdown formatting"><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("**bold**"))>"Bold"</button><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("\n## Heading\n"))>"Heading"</button><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("\n- item"))>"List"</button></div><label>"Markdown description"<textarea class="v2-input min-h-64" prop:value=move || draft.get().content.description_markdown on:input=move |event| draft.update(|value| value.content.description_markdown = event_target_value(&event)) /></label><small>{move || format!("{} characters", draft.get().content.description_markdown.chars().count())}</small></Show><Show when=move || description_preview.get()><div class="v2-store-canonical-placeholder"><strong>"Canonical preview only"</strong><p>"Validate the draft to render sanitized content with the buyer Store Page renderer below."</p><button type="button" class="v2-btn-secondary" on:click=move |_| run_validation.run(())>"Validate canonical preview"</button></div></Show><details class="v2-publisher-diagnostics"><summary>"Description diagnostics"</summary>{move || diagnostics.get().into_iter().map(|item| view! { <p>{item}</p> }).collect_view()}</details></section></Show>
+                <Show when=move || active_tab.get() == "description"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Description"</h2><div role="group" aria-label="Description mode"><button type="button" class="v2-btn-secondary" aria-pressed=move || !description_preview.get() on:click=move |_| description_preview.set(false)>"Write"</button><button type="button" class="v2-btn-secondary" aria-pressed=move || description_preview.get() on:click=move |_| description_preview.set(true)>"Preview"</button></div></div><Show when=move || !description_preview.get()><div class="v2-store-toolbar" role="toolbar" aria-label="Markdown formatting"><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("**bold**"))>"Bold"</button><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("\n## Heading\n"))>"Heading"</button><button type="button" on:click=move |_| draft.update(|value| value.content.description_markdown.push_str("\n- item"))>"List"</button></div><label>"Markdown description"<textarea class="v2-input v2-store-textarea-lg" prop:value=move || draft.get().content.description_markdown on:input=move |event| draft.update(|value| value.content.description_markdown = event_target_value(&event)) /></label><small>{move || format!("{} characters", draft.get().content.description_markdown.chars().count())}</small></Show><Show when=move || description_preview.get()><div class="v2-store-canonical-placeholder"><strong>"Canonical preview only"</strong><p>"Validate the draft to render sanitized content with the buyer Store Page renderer below."</p><button type="button" class="v2-btn-secondary" on:click=move |_| run_validation.run(())>"Validate canonical preview"</button></div></Show><details class="v2-publisher-diagnostics"><summary>"Description diagnostics"</summary>{move || diagnostics.get().into_iter().map(|item| view! { <p>{item}</p> }).collect_view()}</details></section></Show>
 
-                <Show when=move || active_tab.get() == "media"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Media"</h2><div class="flex flex-wrap gap-2" role="group" aria-label="Add Store Page media"><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("hero".into()))>"Upload hero"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("capsule".into()))>"Upload capsule"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("screenshot".into()))>"Add screenshot"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("trailer".into()))>"Add trailer"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("feature".into()))>"Add feature image"</button><button type="button" class="v2-btn-secondary" on:click=move |_| draft.update(|value| { let id = unique_editor_id("media", value.content.media.iter().map(|item| item.id.as_str())); value.content.media.push(StorePageMediaItem { id, media_type: "image".into(), role: "screenshot".into(), url: String::new(), sha256: None, mime_type: None, size: None, thumbnail_url: None, alt: None, caption: None, width: None, height: None }); })>"Use existing URL"</button></div></div><p class="text-sm text-on-surface-variant">"Removing media only removes its draft reference; it does not delete the hosted blob."</p>{move || draft.get().content.media.into_iter().enumerate().map(|(index, item)| view! { <article class="v2-store-card"><div class="v2-store-card-actions"><button type="button" aria-label="Move media up" disabled=index == 0 on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.media, index, -1)); }>"↑"</button><button type="button" aria-label="Move media down" on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.media, index, 1)); }>"↓"</button><button type="button" aria-label="Delete media" on:click=move |_| { if pending_removal.get_untracked() == Some(("media", index)) { pending_removal.set(None); draft.update(|value| { let removed_id = value.content.media.get(index).map(|item| item.id.clone()); if index < value.content.media.len() { value.content.media.remove(index); } if let Some(removed_id) = removed_id { for section in &mut value.content.sections { if section.media_id.as_deref() == Some(removed_id.as_str()) { section.media_id = None; } } } }); } else { pending_removal.set(Some(("media", index))); } }>{move || if pending_removal.get() == Some(("media", index)) { "Confirm remove draft reference" } else { "Remove reference" }}</button></div><div class="v2-store-form-grid"><label>"Type"<select class="v2-input" prop:value=item.media_type.clone() on:change=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.media_type = event_target_value(&event); })><option value="image">"Image"</option><option value="video">"Video"</option></select></label><label>"Role"<select class="v2-input" prop:value=item.role.clone() on:change=move |event| { let role = event_target_value(&event); if matches!(role.as_str(), "hero" | "capsule") && draft.get_untracked().content.media.iter().enumerate().any(|(other, item)| other != index && item.role == role) { form_error.set(Some(format!("Only one {role} is allowed."))); } else { draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.role = role; }); } }><option value="hero">"Hero"</option><option value="capsule">"Capsule"</option><option value="screenshot">"Screenshot"</option><option value="trailer">"Trailer"</option><option value="feature">"Feature"</option></select></label><label class="sm:col-span-2">"HTTPS URL"<input type="url" class="v2-input" prop:value=item.url.clone() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.url = event_target_value(&event); }) /></label><label>"Thumbnail URL"<input type="url" class="v2-input" prop:value=item.thumbnail_url.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.thumbnail_url = optional(event_target_value(&event)); }) /></label><label>"Alternative text"<input class="v2-input" prop:value=item.alt.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.alt = optional(event_target_value(&event)); }) /></label><label>"Caption"<input class="v2-input" prop:value=item.caption.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.caption = optional(event_target_value(&event)); }) /></label><label>"Width"<input type="number" min="1" class="v2-input" prop:value=item.width.map(|value| value.to_string()).unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.width = event_target_value(&event).parse().ok(); }) /></label><label>"Height"<input type="number" min="1" class="v2-input" prop:value=item.height.map(|value| value.to_string()).unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.height = event_target_value(&event).parse().ok(); }) /></label></div><div class="v2-store-canonical-placeholder"><strong>{if safe_media_preview(&item.url, &item.media_type) { "Ready for core validation" } else { "Enter a supported HTTPS media URL" }}</strong><p>"Media is rendered only after canonical validation in Preview."</p></div></article> }).collect_view()}</section></Show>
+                <Show when=move || active_tab.get() == "media"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Media"</h2><div class="v2-store-chip-row" role="group" aria-label="Add Store Page media"><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("hero".into()))>"Upload hero"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("capsule".into()))>"Upload capsule"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("screenshot".into()))>"Add screenshot"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("trailer".into()))>"Add trailer"</button><button type="button" class="v2-btn-secondary" on:click=move |_| blossom_dialog_role.set(Some("feature".into()))>"Add feature image"</button><button type="button" class="v2-btn-secondary" on:click=move |_| draft.update(|value| { let id = unique_editor_id("media", value.content.media.iter().map(|item| item.id.as_str())); value.content.media.push(StorePageMediaItem { id, media_type: "image".into(), role: "screenshot".into(), url: String::new(), sha256: None, mime_type: None, size: None, thumbnail_url: None, alt: None, caption: None, width: None, height: None }); })>"Use existing URL"</button></div></div><p class="v2-store-help">"Removing media only removes its draft reference; it does not delete the hosted blob."</p>{move || draft.get().content.media.into_iter().enumerate().map(|(index, item)| view! { <article class="v2-store-card"><div class="v2-store-card-actions"><button type="button" aria-label="Move media up" disabled=index == 0 on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.media, index, -1)); }>"↑"</button><button type="button" aria-label="Move media down" on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.media, index, 1)); }>"↓"</button><button type="button" aria-label="Delete media" on:click=move |_| { if pending_removal.get_untracked() == Some(("media", index)) { pending_removal.set(None); draft.update(|value| { let removed_id = value.content.media.get(index).map(|item| item.id.clone()); if index < value.content.media.len() { value.content.media.remove(index); } if let Some(removed_id) = removed_id { for section in &mut value.content.sections { if section.media_id.as_deref() == Some(removed_id.as_str()) { section.media_id = None; } } } }); } else { pending_removal.set(Some(("media", index))); } }>{move || if pending_removal.get() == Some(("media", index)) { "Confirm remove draft reference" } else { "Remove reference" }}</button></div><div class="v2-store-form-grid"><label>"Type"<select class="v2-input" prop:value=item.media_type.clone() on:change=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.media_type = event_target_value(&event); })><option value="image">"Image"</option><option value="video">"Video"</option></select></label><label>"Role"<select class="v2-input" prop:value=item.role.clone() on:change=move |event| { let role = event_target_value(&event); if matches!(role.as_str(), "hero" | "capsule") && draft.get_untracked().content.media.iter().enumerate().any(|(other, item)| other != index && item.role == role) { form_error.set(Some(format!("Only one {role} is allowed."))); } else { draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.role = role; }); } }><option value="hero">"Hero"</option><option value="capsule">"Capsule"</option><option value="screenshot">"Screenshot"</option><option value="trailer">"Trailer"</option><option value="feature">"Feature"</option></select></label><label class="v2-store-span-all">"HTTPS URL"<input type="url" class="v2-input" prop:value=item.url.clone() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.url = event_target_value(&event); }) /></label><label>"Thumbnail URL"<input type="url" class="v2-input" prop:value=item.thumbnail_url.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.thumbnail_url = optional(event_target_value(&event)); }) /></label><label>"Alternative text"<input class="v2-input" prop:value=item.alt.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.alt = optional(event_target_value(&event)); }) /></label><label>"Caption"<input class="v2-input" prop:value=item.caption.clone().unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.caption = optional(event_target_value(&event)); }) /></label><label>"Width"<input type="number" min="1" class="v2-input" prop:value=item.width.map(|value| value.to_string()).unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.width = event_target_value(&event).parse().ok(); }) /></label><label>"Height"<input type="number" min="1" class="v2-input" prop:value=item.height.map(|value| value.to_string()).unwrap_or_default() on:input=move |event| draft.update(|value| if let Some(item) = value.content.media.get_mut(index) { item.height = event_target_value(&event).parse().ok(); }) /></label></div><div class="v2-store-canonical-placeholder"><strong>{media_slot_state(&item.url, &item.media_type).label()}</strong><p>"Media is rendered only after canonical validation in Preview. A completed upload is not a published Store Page."</p></div></article> }).collect_view()}</section></Show>
 
-                <Show when=move || active_tab.get() == "sections"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Feature Sections"</h2><button type="button" class="v2-btn-secondary" on:click=move |_| draft.update(|value| { let id = unique_editor_id("section", value.content.sections.iter().map(|section| section.id.as_str())); value.content.sections.push(StorePageSection { id, heading: String::new(), body_markdown: String::new(), media_id: None, layout: "text".into() }); })>"Add section"</button></div>{move || { let media = draft.get().content.media; draft.get().content.sections.into_iter().enumerate().map(|(index, section)| { let options = media.clone(); view! { <article class="v2-store-card"><div class="v2-store-card-actions"><button type="button" aria-label="Move section up" disabled=index == 0 on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.sections, index, -1)); }>"↑"</button><button type="button" aria-label="Move section down" on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.sections, index, 1)); }>"↓"</button><button type="button" aria-label="Remove section" on:click=move |_| { if pending_removal.get_untracked() == Some(("section", index)) { pending_removal.set(None); draft.update(|value| { if index < value.content.sections.len() { value.content.sections.remove(index); } }); } else { pending_removal.set(Some(("section", index))); } }>{move || if pending_removal.get() == Some(("section", index)) { "Confirm remove" } else { "Remove" }}</button></div><label>"Layout"<select class="v2-input" prop:value=section.layout on:change=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.layout = event_target_value(&event); })><option value="text">"Text"</option><option value="media-left">"Media left"</option><option value="media-right">"Media right"</option><option value="media-wide">"Media wide"</option></select></label><label>"Heading"<input class="v2-input" prop:value=section.heading on:input=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.heading = event_target_value(&event); }) /></label><label>"Media"<select class="v2-input" prop:value=section.media_id.unwrap_or_default() on:change=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.media_id = optional(event_target_value(&event)); })><option value="">"No media"</option>{options.into_iter().map(|item| view! { <option value=item.id.clone()>{format!("{} · {}", item.role, item.id)}</option> }).collect_view()}</select></label><label>"Section Markdown"<textarea class="v2-input min-h-32" prop:value=section.body_markdown on:input=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.body_markdown = event_target_value(&event); }) /></label><button type="button" class="v2-btn-secondary" on:click=move |_| run_validation.run(())>"Preview canonical section"</button></article> } }).collect_view() }}</section></Show>
+                <Show when=move || active_tab.get() == "sections"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Feature Sections"</h2><button type="button" class="v2-btn-secondary" on:click=move |_| draft.update(|value| { let id = unique_editor_id("section", value.content.sections.iter().map(|section| section.id.as_str())); value.content.sections.push(StorePageSection { id, heading: String::new(), body_markdown: String::new(), media_id: None, layout: "text".into() }); })>"Add section"</button></div>{move || { let media = draft.get().content.media; draft.get().content.sections.into_iter().enumerate().map(|(index, section)| { let options = media.clone(); view! { <article class="v2-store-card"><div class="v2-store-card-actions"><button type="button" aria-label="Move section up" disabled=index == 0 on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.sections, index, -1)); }>"↑"</button><button type="button" aria-label="Move section down" on:click=move |_| { pending_removal.set(None); draft.update(|value| move_item(&mut value.content.sections, index, 1)); }>"↓"</button><button type="button" aria-label="Remove section" on:click=move |_| { if pending_removal.get_untracked() == Some(("section", index)) { pending_removal.set(None); draft.update(|value| { if index < value.content.sections.len() { value.content.sections.remove(index); } }); } else { pending_removal.set(Some(("section", index))); } }>{move || if pending_removal.get() == Some(("section", index)) { "Confirm remove" } else { "Remove" }}</button></div><label>"Layout"<select class="v2-input" prop:value=section.layout on:change=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.layout = event_target_value(&event); })><option value="text">"Text"</option><option value="media-left">"Media left"</option><option value="media-right">"Media right"</option><option value="media-wide">"Media wide"</option></select></label><label>"Heading"<input class="v2-input" prop:value=section.heading on:input=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.heading = event_target_value(&event); }) /></label><label>"Media"<select class="v2-input" prop:value=section.media_id.unwrap_or_default() on:change=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.media_id = optional(event_target_value(&event)); })><option value="">"No media"</option>{options.into_iter().map(|item| view! { <option value=item.id.clone()>{format!("{} · {}", item.role, item.id)}</option> }).collect_view()}</select></label><label>"Section Markdown"<textarea class="v2-input v2-store-textarea-md" prop:value=section.body_markdown on:input=move |event| draft.update(|value| if let Some(section) = value.content.sections.get_mut(index) { section.body_markdown = event_target_value(&event); }) /></label><button type="button" class="v2-btn-secondary" on:click=move |_| run_validation.run(())>"Preview canonical section"</button></article> } }).collect_view() }}</section></Show>
 
-                <Show when=move || active_tab.get() == "requirements"><section role="tabpanel" class="v2-publisher-panel"><h2>"Requirements"</h2><p class="text-sm text-on-surface-variant">"Platforms come from the selected linked authoritative listing; no compatibility is inferred."</p>{move || { let platforms = linked_platforms(&selected_platforms.get_value(), &associations.get(), &coordinate_for_requirements.get_value()); if platforms.is_empty() { view! { <p>"Link the selected listing to edit its declared platform requirements."</p> }.into_any() } else { platforms.into_iter().map(|platform| { let label = platform_label(&platform); let platform_min = platform.clone(); let platform_rec = platform.clone(); view! { <article class="v2-store-card"><h3>{label}</h3>{[("Minimum", true), ("Recommended", false)].into_iter().map(|(name, minimum)| { let key = if minimum { platform_min.clone() } else { platform_rec.clone() }; view! { <fieldset class="v2-store-tier"><legend>{name}</legend>{[("Operating system", "os"), ("Processor", "processor"), ("Memory", "memory"), ("Graphics", "graphics"), ("Storage", "storage"), ("Additional", "additional")].into_iter().map(|(label, field)| { let key = key.clone(); let value_key = key.clone(); view! { <label>{label}<input class="v2-input" prop:value=move || { let requirement = draft.get().content.requirements.get(&value_key).cloned().unwrap_or_default(); let tier = if minimum { requirement.minimum } else { requirement.recommended }; tier.and_then(|tier| match field { "os" => tier.os, "processor" => tier.processor, "memory" => tier.memory, "graphics" => tier.graphics, "storage" => tier.storage, _ => tier.additional }).unwrap_or_default() } on:input=move |event| { let input = optional(event_target_value(&event)); draft.update(|value| { let requirement = value.content.requirements.entry(key.clone()).or_default(); let tier = if minimum { requirement.minimum.get_or_insert_default() } else { requirement.recommended.get_or_insert_default() }; match field { "os" => tier.os = input, "processor" => tier.processor = input, "memory" => tier.memory = input, "graphics" => tier.graphics = input, "storage" => tier.storage = input, _ => tier.additional = input } }); } /></label> } }).collect_view()}</fieldset> } }).collect_view()}</article> } }).collect_view().into_any() } }}</section></Show>
+                <Show when=move || active_tab.get() == "requirements"><section role="tabpanel" class="v2-publisher-panel"><h2>"Requirements"</h2><p class="v2-store-help">"Platforms come from the selected linked authoritative listing; no compatibility is inferred."</p>{move || { let platforms = linked_platforms(&selected_platforms.get_value(), &associations.get(), &coordinate_for_requirements.get_value()); if platforms.is_empty() { view! { <p>"Link the selected listing to edit its declared platform requirements."</p> }.into_any() } else { platforms.into_iter().map(|platform| { let label = platform_label(&platform); let platform_min = platform.clone(); let platform_rec = platform.clone(); view! { <article class="v2-store-card"><h3>{label}</h3>{[("Minimum", true), ("Recommended", false)].into_iter().map(|(name, minimum)| { let key = if minimum { platform_min.clone() } else { platform_rec.clone() }; view! { <fieldset class="v2-store-tier"><legend>{name}</legend>{[("Operating system", "os"), ("Processor", "processor"), ("Memory", "memory"), ("Graphics", "graphics"), ("Storage", "storage"), ("Additional", "additional")].into_iter().map(|(label, field)| { let key = key.clone(); let value_key = key.clone(); view! { <label>{label}<input class="v2-input" prop:value=move || { let requirement = draft.get().content.requirements.get(&value_key).cloned().unwrap_or_default(); let tier = if minimum { requirement.minimum } else { requirement.recommended }; tier.and_then(|tier| match field { "os" => tier.os, "processor" => tier.processor, "memory" => tier.memory, "graphics" => tier.graphics, "storage" => tier.storage, _ => tier.additional }).unwrap_or_default() } on:input=move |event| { let input = optional(event_target_value(&event)); draft.update(|value| { let requirement = value.content.requirements.entry(key.clone()).or_default(); let tier = if minimum { requirement.minimum.get_or_insert_default() } else { requirement.recommended.get_or_insert_default() }; match field { "os" => tier.os = input, "processor" => tier.processor = input, "memory" => tier.memory = input, "graphics" => tier.graphics = input, "storage" => tier.storage = input, _ => tier.additional = input } }); } /></label> } }).collect_view()}</fieldset> } }).collect_view()}</article> } }).collect_view().into_any() } }}</section></Show>
 
                 <Show when=move || active_tab.get() == "languages"><section role="tabpanel" class="v2-publisher-panel"><div class="v2-store-section-heading"><h2>"Languages"</h2><div class="v2-store-add-row"><label>"Language"<select class="v2-input" prop:value=move || locale_input.get() on:change=move |event| locale_input.set(event_target_value(&event))><option value="en">"English (en)"</option><option value="es">"Spanish (es)"</option><option value="pt-BR">"Portuguese — Brazil (pt-BR)"</option><option value="fr">"French (fr)"</option><option value="de">"German (de)"</option><option value="ja">"Japanese (ja)"</option><option value="zh-CN">"Chinese — Simplified (zh-CN)"</option></select></label><button type="button" class="v2-btn-secondary" on:click=move |_| { let code = locale_input.get_untracked(); draft.update(|value| { let values = value.content.languages.get_or_insert_default(); if !values.iter().any(|entry| entry.code == code) { values.push(LanguageSupport { code, interface: true, audio: false, subtitles: false }); } }); }>"Add language"</button></div></div>{move || draft.get().content.languages.unwrap_or_default().into_iter().enumerate().map(|(index, language)| view! { <article class="v2-store-card v2-store-language-row"><strong>{language.code}</strong><label><input type="checkbox" prop:checked=language.interface on:change=move |event| draft.update(|value| if let Some(entry) = value.content.languages.as_mut().and_then(|values| values.get_mut(index)) { entry.interface = event_target_checked(&event); }) />" Interface"</label><label><input type="checkbox" prop:checked=language.audio on:change=move |event| draft.update(|value| if let Some(entry) = value.content.languages.as_mut().and_then(|values| values.get_mut(index)) { entry.audio = event_target_checked(&event); }) />" Audio"</label><label><input type="checkbox" prop:checked=language.subtitles on:change=move |event| draft.update(|value| if let Some(entry) = value.content.languages.as_mut().and_then(|values| values.get_mut(index)) { entry.subtitles = event_target_checked(&event); }) />" Subtitles"</label><button type="button" on:click=move |_| draft.update(|value| if let Some(values) = &mut value.content.languages { values.remove(index); if values.is_empty() { value.content.languages = None; } })>"Remove"</button></article> }).collect_view()}</section></Show>
 
-                <Show when=move || active_tab.get() == "accessibility"><section role="tabpanel" class="v2-publisher-panel"><h2>"Accessibility"</h2><p class="text-sm text-on-surface-variant">"Publisher-provided accessibility information. Verify every claim."</p>{[("Visual", "colorblind-modes"), ("Visual", "scalable-text"), ("Hearing", "subtitles"), ("Hearing", "closed-captions"), ("Input", "remappable-controls"), ("Input", "single-stick")].into_iter().map(|(group, feature)| view! { <article class="v2-store-accessibility-row"><div><small>{group}</small><strong>{platform_label(feature)}</strong></div><label><input type="checkbox" prop:checked=move || draft.get().content.accessibility.iter().find(|entry| entry.feature == feature).is_some_and(|entry| entry.supported) on:change=move |event| { let supported = event_target_checked(&event); draft.update(|value| { if let Some(entry) = value.content.accessibility.iter_mut().find(|entry| entry.feature == feature) { entry.supported = supported; } else { value.content.accessibility.push(AccessibilityFeature { feature: feature.into(), supported, notes: None }); } }); } />" Supported"</label><label>"Optional notes"<input class="v2-input" prop:value=move || draft.get().content.accessibility.iter().find(|entry| entry.feature == feature).and_then(|entry| entry.notes.clone()).unwrap_or_default() on:input=move |event| { let notes = optional(event_target_value(&event)); draft.update(|value| { if let Some(entry) = value.content.accessibility.iter_mut().find(|entry| entry.feature == feature) { entry.notes = notes; } else { value.content.accessibility.push(AccessibilityFeature { feature: feature.into(), supported: false, notes }); } }); } /></label></article> }).collect_view()}<details class="v2-publisher-diagnostics"><summary>"Advanced custom identifier"</summary><div class="v2-store-add-row"><input class="v2-input" placeholder="publisher-defined-feature" prop:value=move || custom_accessibility.get() on:input=move |event| custom_accessibility.set(event_target_value(&event)) /><button type="button" class="v2-btn-secondary" on:click=move |_| { let feature = custom_accessibility.get_untracked().trim().to_string(); if !feature.is_empty() { draft.update(|value| value.content.accessibility.push(AccessibilityFeature { feature, supported: true, notes: None })); custom_accessibility.set(String::new()); } }>"Add"</button></div></details></section></Show>
+                <Show when=move || active_tab.get() == "accessibility"><section role="tabpanel" class="v2-publisher-panel"><h2>"Accessibility"</h2><p class="v2-store-help">"Publisher-provided accessibility information. Verify every claim."</p>{[("Visual", "colorblind-modes"), ("Visual", "scalable-text"), ("Hearing", "subtitles"), ("Hearing", "closed-captions"), ("Input", "remappable-controls"), ("Input", "single-stick")].into_iter().map(|(group, feature)| view! { <article class="v2-store-accessibility-row"><div><small>{group}</small><strong>{platform_label(feature)}</strong></div><label><input type="checkbox" prop:checked=move || draft.get().content.accessibility.iter().find(|entry| entry.feature == feature).is_some_and(|entry| entry.supported) on:change=move |event| { let supported = event_target_checked(&event); draft.update(|value| { if let Some(entry) = value.content.accessibility.iter_mut().find(|entry| entry.feature == feature) { entry.supported = supported; } else { value.content.accessibility.push(AccessibilityFeature { feature: feature.into(), supported, notes: None }); } }); } />" Supported"</label><label>"Optional notes"<input class="v2-input" prop:value=move || draft.get().content.accessibility.iter().find(|entry| entry.feature == feature).and_then(|entry| entry.notes.clone()).unwrap_or_default() on:input=move |event| { let notes = optional(event_target_value(&event)); draft.update(|value| { if let Some(entry) = value.content.accessibility.iter_mut().find(|entry| entry.feature == feature) { entry.notes = notes; } else { value.content.accessibility.push(AccessibilityFeature { feature: feature.into(), supported: false, notes }); } }); } /></label></article> }).collect_view()}<details class="v2-publisher-diagnostics"><summary>"Advanced custom identifier"</summary><div class="v2-store-add-row"><input class="v2-input" placeholder="publisher-defined-feature" prop:value=move || custom_accessibility.get() on:input=move |event| custom_accessibility.set(event_target_value(&event)) /><button type="button" class="v2-btn-secondary" on:click=move |_| { let feature = custom_accessibility.get_untracked().trim().to_string(); if !feature.is_empty() { draft.update(|value| value.content.accessibility.push(AccessibilityFeature { feature, supported: true, notes: None })); custom_accessibility.set(String::new()); } }>"Add"</button></div></details></section></Show>
 
-                <Show when=move || active_tab.get() == "links"><section role="tabpanel" class="v2-publisher-panel grid gap-4 sm:grid-cols-2"><h2 class="sm:col-span-2">"Links"</h2>
+                <Show when=move || active_tab.get() == "links"><section role="tabpanel" class="v2-publisher-panel v2-store-form-grid"><h2 class="v2-store-span-all">"Links"</h2>
                     <label>"Website"<input class="v2-input" prop:value=move || draft.get().content.links.website.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.website = optional(event_target_value(&event))) /></label>
                     <label>"Support"<input class="v2-input" prop:value=move || draft.get().content.links.support.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.support = optional(event_target_value(&event))) /></label>
                     <label>"Documentation"<input class="v2-input" prop:value=move || draft.get().content.links.documentation.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.documentation = optional(event_target_value(&event))) /></label>
                     <label>"Source"<input class="v2-input" prop:value=move || draft.get().content.links.source.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.source = optional(event_target_value(&event))) /></label>
                     <label>"Community"<input class="v2-input" prop:value=move || draft.get().content.links.community.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.community = optional(event_target_value(&event))) /></label>
                     <label>"Privacy policy"<input class="v2-input" prop:value=move || draft.get().content.links.privacy_policy.unwrap_or_default() on:input=move |event| draft.update(|draft| draft.content.links.privacy_policy = optional(event_target_value(&event))) /></label>
-                    <div class="sm:col-span-2"><p class="text-sm text-on-surface-variant">"Only validated HTTPS links are opened. Backend validation remains authoritative."</p>{move || [draft.get().content.links.website, draft.get().content.links.support, draft.get().content.links.documentation, draft.get().content.links.source, draft.get().content.links.community, draft.get().content.links.privacy_policy].into_iter().flatten().map(|url| if safe_https_link(&url) { view! { <a class="v2-btn-secondary" href=url target="_blank" rel="noopener noreferrer">"Test safe link"</a> }.into_any() } else { view! { <span class="text-error">"Enter a complete HTTPS URL"</span> }.into_any() }).collect_view()}</div>
+                    <div class="v2-store-span-all"><p class="v2-store-help">"Only validated HTTPS links are opened. Backend validation remains authoritative."</p>{move || [draft.get().content.links.website, draft.get().content.links.support, draft.get().content.links.documentation, draft.get().content.links.source, draft.get().content.links.community, draft.get().content.links.privacy_policy].into_iter().flatten().map(|url| if safe_https_link(&url) { view! { <a class="v2-btn-secondary" href=url target="_blank" rel="noopener noreferrer">"Test safe link"</a> }.into_any() } else { view! { <span class="v2-store-alert">"Enter a complete HTTPS URL"</span> }.into_any() }).collect_view()}</div>
                 </section></Show>
                 <Show when=move || active_tab.get() == "sections">
                     <button type="button" class="v2-btn-secondary" on:click=move |_| run_validation.run(())>"Preview sections with canonical validation"</button>
@@ -1524,17 +1787,17 @@ pub fn StorePageEditorView(
                         <div class="v2-store-preview-banner"><strong>"Canonical validated preview"</strong><span>"Commerce and external navigation are disabled"</span><label>"Associated listing"<select disabled><option>{coordinate_for_preview.get_value()}</option></select></label><div role="group" aria-label="Preview width"><button type="button" aria-pressed=move || !preview_narrow.get() on:click=move |_| preview_narrow.set(false)>"Desktop"</button><button type="button" aria-pressed=move || preview_narrow.get() on:click=move |_| preview_narrow.set(true)>"Narrow"</button></div></div>
                         <h2>{presentation.title.clone().unwrap_or_else(|| listing.title.clone())}</h2>
                         <p>{presentation.summary.clone().unwrap_or_else(|| listing.description.clone())}</p>
-                        <div class="my-4 rounded-xl bg-surface-container-high p-3"><strong>"Authoritative listing commerce"</strong><p>{preview_commerce_label(listing.price, &listing.currency, &listing.acquisition)}</p></div>
+                        <div class="v2-store-preview-commerce"><strong>"Authoritative listing commerce"</strong><p>{preview_commerce_label(listing.price, &listing.currency, &listing.acquisition)}</p></div>
                         <StorePageRichDetail presentation=presentation preview=true />
                     </section>
                 })}
             </main>
-            <aside class="v2-publisher-panel v2-publisher-sidebar v2-store-readiness" class:v2-store-readiness-open=move || readiness_open.get()><h2>"Readiness"</h2>{move || { let platforms = linked_platforms(&listing_for_preview.platforms, &associations.get(), &coordinate_for_readiness.get_value()); let state = readiness(&draft.get(), &associations.get(), &platforms, &diagnostics.get()); view! { <div><p>{if draft.get() == baseline.get() && !input_dirty.get() { "Saved revision" } else { "Unsaved local changes" }}</p><p class="text-sm">{draft.get().loaded_event_id.map(|id| format!("Current revision: {id}")).unwrap_or_else(|| "New unpublished Store Page".into())}</p><h3>"Blocking issues"</h3>{if state.blockers.is_empty() { view! { <p class="text-secondary">"No known blockers"</p> }.into_any() } else { view! { <ul>{state.blockers.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul> }.into_any() }}<h3>"Association warnings"</h3><ul>{state.warnings.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul><h3>"Recommendations"</h3><ul>{state.recommendations.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul></div> } }}<p class="text-sm text-on-surface-variant">"Preview uses the core sanitizer and buyer renderer."</p></aside>
+            <aside class="v2-publisher-panel v2-publisher-sidebar v2-store-readiness" class:v2-store-readiness-open=move || readiness_open.get()><h2>"Readiness"</h2>{move || { let platforms = linked_platforms(&listing_for_preview.platforms, &associations.get(), &coordinate_for_readiness.get_value()); let state = readiness(&draft.get(), &associations.get(), &platforms, &diagnostics.get()); view! { <div><p class="v2-store-persistence">{draft_persistence_label(!(draft.get() == baseline.get() && !input_dirty.get()))}</p><p class="v2-store-revision">{revision_label(draft.get().loaded_event_id.as_deref())}</p><p class="v2-store-persistence-note">"Editor changes live only in this session. Closing Arcadestr discards them; publication is the only durable action."</p><h3>"Blocking issues"</h3>{if state.blockers.is_empty() { view! { <p class="v2-store-ok">"No known blockers"</p> }.into_any() } else { let target = first_blocker_target(&state.blockers); view! { <div><ul>{state.blockers.iter().cloned().map(|item| { let tab = diagnostic_tab(&item); view! { <li><button type="button" class="v2-store-blocker-link" on:click=move |_| { active_tab.set(tab); focus_editor_tab(tab); }>{item}</button></li> } }).collect_view()}</ul>{target.map(|target| { let tab = target.tab; let element_id = target.element_id.clone(); view! { <button type="button" class="v2-btn-secondary v2-store-first-blocker" on:click=move |_| { active_tab.set(tab); if !element_id.as_deref().is_some_and(focus_editor_element) { focus_editor_tab(tab); } }>{format!("Go to first blocker: {}", target.message)}</button> } })}</div> }.into_any() }}<h3>"Association warnings"</h3><ul>{state.warnings.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul><h3>"Recommendations"</h3><ul>{state.recommendations.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul></div> } }}<p class="v2-store-help">"Preview uses the core sanitizer and buyer renderer."</p></aside>
             </div>
 
-            <footer class="v2-store-editor-footer"><span role="status">{move || if validating.get() { "Validating…" } else if publishing.get() { "Publishing…" } else if draft.get() == baseline.get() && !input_dirty.get() { "Saved" } else { "Unsaved" }}</span><button class="v2-btn-secondary" type="button" disabled=move || validating.get() on:click=move |_| run_validation.run(())>{move || if validating.get() { "Validating..." } else { "Preview" }}</button><button class="v2-btn-primary" type="button" disabled=move || publishing.get() on:click=move |_| publish.run(())>{move || if publishing.get() { "Publishing..." } else { "Publish" }}</button><details class="v2-store-overflow"><summary class="v2-btn-secondary">"More"</summary><div><label>"New presentation ID"<input class="v2-input" prop:value=move || clone_id.get() on:input=move |event| clone_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| clone_page.run(())>"Clone"</button><label>"Existing presentation ID"<input class="v2-input" prop:value=move || link_existing_id.get() on:input=move |event| link_existing_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| link_existing.run(())>"Link existing"</button><button type="button" on:click=move |_| show_discard.set(true)>"Reset / discard draft"</button><details><summary>"Protocol diagnostics"</summary>{move || diagnostics.get().into_iter().map(|item| view! { <p>{item}</p> }).collect_view()}</details></div></details></footer>
+            <footer class="v2-store-editor-footer"><span class="v2-store-footer-status" role="status">{move || if validating.get() { "Validating…".to_string() } else if publishing.get() { "Publishing…".to_string() } else { draft_persistence_label(!(draft.get() == baseline.get() && !input_dirty.get())).to_string() }}</span><button class="v2-btn-secondary" type="button" disabled=move || validating.get() on:click=move |_| run_validation.run(())>{move || if validating.get() { "Validating..." } else { "Preview" }}</button><button class="v2-btn-primary" type="button" disabled=move || publishing.get() on:click=move |_| publish.run(())>{move || if publishing.get() { "Publishing..." } else { "Publish" }}</button><details class="v2-store-overflow"><summary class="v2-btn-secondary">"More"</summary><div><label>"New presentation ID"<input class="v2-input" prop:value=move || clone_id.get() on:input=move |event| clone_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| clone_page.run(())>"Clone"</button><label>"Existing presentation ID"<input class="v2-input" prop:value=move || link_existing_id.get() on:input=move |event| link_existing_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| link_existing.run(())>"Link existing"</button><button type="button" on:click=move |_| show_discard.set(true)>"Reset / discard draft"</button><details><summary>"Protocol diagnostics"</summary>{move || diagnostics.get().into_iter().map(|item| view! { <p>{item}</p> }).collect_view()}</details></div></details></footer>
 
-            <dialog node_ref=discard_dialog_ref class="m-auto rounded-2xl bg-surface-container-high p-6 text-on-surface backdrop:bg-black/70" on:cancel=move |event: web_sys::Event| { event.prevent_default(); show_discard.set(false); }><h2>"Discard Store Page draft?"</h2><p>"Unsaved changes will be removed for this game."</p><div class="mt-4 flex gap-3"><button class="v2-btn-secondary" autofocus on:click=move |_| show_discard.set(false)>"Keep editing"</button><button class="v2-btn-primary" on:click={let key = key.clone(); move |_| { if loading.get_untracked() || validating.get_untracked() || publishing.get_untracked() || partial.get_untracked().is_some() || auth.npub.get_untracked().as_deref() != Some(publisher_for_discard.get_value().as_str()) { show_discard.set(false); message.set(Some("The draft cannot be discarded while an operation is active or the publisher account is unavailable.".into())); return; } PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| { drafts.borrow_mut().remove(&key); }); on_back.run(()); }}>"Discard changes"</button></div></dialog>
+            <dialog node_ref=discard_dialog_ref class="v2-publisher-dialog v2-store-dialog" on:cancel=move |event: web_sys::Event| { event.prevent_default(); show_discard.set(false); }><h2>"Discard Store Page draft?"</h2><p>"Unsaved changes will be removed for this game."</p><div class="v2-store-dialog-actions"><button class="v2-btn-secondary" autofocus on:click=move |_| show_discard.set(false)>"Keep editing"</button><button class="v2-btn-primary" on:click={let key = key.clone(); move |_| { if loading.get_untracked() || validating.get_untracked() || publishing.get_untracked() || partial.get_untracked().is_some() || auth.npub.get_untracked().as_deref() != Some(publisher_for_discard.get_value().as_str()) { show_discard.set(false); message.set(Some("The draft cannot be discarded while an operation is active or the publisher account is unavailable.".into())); return; } PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| { drafts.borrow_mut().remove(&key); }); on_back.run(()); }}>"Discard changes"</button></div></dialog>
         </section>
     }
 }
@@ -1991,5 +2254,234 @@ mod tests {
             2,
             1
         ));
+    }
+
+    fn publication_response(
+        page: Option<(usize, bool)>,
+        pointers: &[(bool, bool)],
+    ) -> PublishStorePageResponse {
+        PublishStorePageResponse {
+            store_page_coordinate: "page".into(),
+            store_page: page.map(
+                |(success_count, propagation_confirmed)| EventPublishOutcome {
+                    event_id: "page-event".into(),
+                    success_count,
+                    failure_count: if success_count == 0 { 1 } else { 0 },
+                    propagation_confirmed,
+                },
+            ),
+            listing_updates: pointers
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, (published, propagation_confirmed))| ListingPointerPublishOutcome {
+                        listing_coordinate: format!("listing-{index}"),
+                        action: ListingPointerMutation::Link,
+                        replacement_event_id: published.then(|| format!("event-{index}")),
+                        published: *published,
+                        propagation_confirmed: *propagation_confirmed,
+                        error: (!published).then(|| "failed".to_string()),
+                    },
+                )
+                .collect(),
+            complete: false,
+            retryable: true,
+            cache_error: None,
+            retry_scope_complete: false,
+        }
+    }
+
+    #[test]
+    fn store_page_and_pointer_publication_never_collapse_into_one_state() {
+        let both_done = publication_response(Some((2, true)), &[(true, true)]);
+        let lifecycle = publication_lifecycle(false, Some(&both_done));
+        assert_eq!(lifecycle.store_page, StageOutcome::Complete);
+        assert_eq!(lifecycle.pointers, StageOutcome::Complete);
+        assert_eq!(
+            overall_publication_label(lifecycle),
+            "Store Page and listing pointers published"
+        );
+
+        // Store Page accepted, pointer failed: never reported as published.
+        let pointer_failed = publication_response(Some((2, true)), &[(false, false)]);
+        let lifecycle = publication_lifecycle(false, Some(&pointer_failed));
+        assert_eq!(lifecycle.store_page, StageOutcome::Complete);
+        assert_eq!(lifecycle.pointers, StageOutcome::Failed);
+        assert_eq!(
+            overall_publication_label(lifecycle),
+            "Store Page published; listing pointer update failed"
+        );
+
+        // Mixed pointer results stay partial rather than complete.
+        let pointer_partial = publication_response(Some((2, true)), &[(true, true), (true, false)]);
+        assert_eq!(
+            pointer_stage(false, Some(&pointer_partial)),
+            StageOutcome::Partial
+        );
+
+        // Store Page accepted by relays without propagation confirmation is partial.
+        let page_partial = publication_response(Some((1, false)), &[]);
+        assert_eq!(
+            store_page_stage(false, Some(&page_partial)),
+            StageOutcome::Partial
+        );
+        assert_eq!(
+            pointer_stage(false, Some(&page_partial)),
+            StageOutcome::NotAttempted
+        );
+
+        // Zero relay acceptances is a failure, not a partial success.
+        let page_failed = publication_response(Some((0, false)), &[]);
+        assert_eq!(
+            store_page_stage(false, Some(&page_failed)),
+            StageOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn publication_stages_report_pending_while_busy_and_idle_before_any_attempt() {
+        let idle = publication_lifecycle(false, None);
+        assert_eq!(idle.store_page, StageOutcome::NotAttempted);
+        assert_eq!(idle.pointers, StageOutcome::NotAttempted);
+        assert_eq!(
+            overall_publication_label(idle),
+            "Not published from this editor"
+        );
+
+        let busy = publication_lifecycle(true, None);
+        assert_eq!(busy.store_page, StageOutcome::Pending);
+        assert_eq!(overall_publication_label(busy), "Publishing");
+    }
+
+    #[test]
+    fn in_memory_editor_state_is_never_labelled_saved() {
+        assert_eq!(draft_persistence_label(true), "Unsaved in-memory changes");
+        assert_eq!(draft_persistence_label(false), "No in-memory changes");
+        for dirty in [true, false] {
+            assert!(!draft_persistence_label(dirty)
+                .to_ascii_lowercase()
+                .contains("saved revision"));
+        }
+        assert!(revision_label(None).contains("No published Store Page revision"));
+        assert!(revision_label(Some("abc")).contains("abc"));
+
+        // The source must not reintroduce a bare "Saved" state label.
+        let source = include_str!("store_page_publish.rs");
+        assert!(!source.contains(concat!("{ \"Saved", "\" }")));
+        assert!(!source.contains(concat!("\"Saved ", "revision\"")));
+    }
+
+    #[test]
+    fn tab_state_follows_authoritative_readiness_output() {
+        let blockers = vec!["media: unsupported URL".to_string()];
+        let warnings = vec!["Association: listing needs review".to_string()];
+        assert_eq!(
+            editor_tab_state("media", &blockers, &warnings),
+            EditorTabState::Blocked
+        );
+        assert_eq!(
+            editor_tab_state("basic", &[], &warnings),
+            EditorTabState::Warned
+        );
+        assert_eq!(
+            editor_tab_state("links", &blockers, &warnings),
+            EditorTabState::Neutral
+        );
+    }
+
+    #[test]
+    fn blockers_warnings_and_recommendations_stay_separate() {
+        let draft = StorePageDraft::new(String::new(), Vec::new());
+        let state = readiness(&draft, &[], &[], &[]);
+        // Missing optional media is advisory, never a blocker.
+        assert!(state
+            .recommendations
+            .iter()
+            .any(|item| item.contains("hero")));
+        assert!(!state.blockers.iter().any(|item| item.contains("hero")));
+        // A missing association blocks publication.
+        assert!(state
+            .blockers
+            .iter()
+            .any(|item| item.contains("listing association")));
+        assert!(state
+            .recommendations
+            .iter()
+            .all(|item| !state.blockers.contains(item)));
+    }
+
+    #[test]
+    fn media_slots_never_describe_a_local_reference_as_published() {
+        assert_eq!(media_slot_state("", "image"), MediaSlotState::Empty);
+        assert_eq!(
+            media_slot_state("http://insecure.example/a.png", "image"),
+            MediaSlotState::Invalid
+        );
+        for state in [
+            MediaSlotState::Empty,
+            MediaSlotState::Invalid,
+            MediaSlotState::Referenced,
+        ] {
+            assert!(!state.label().to_ascii_lowercase().contains("published to"));
+        }
+        assert!(MediaSlotState::Referenced.label().contains("not published"));
+    }
+
+    #[test]
+    fn first_blocker_routes_to_the_owning_tab_with_a_focus_fallback() {
+        let blockers = vec![
+            "media: unsupported URL".to_string(),
+            "Title is required.".to_string(),
+        ];
+        let target = first_blocker_target(&blockers).expect("a blocker target");
+        assert_eq!(target.tab, "media");
+        assert_eq!(target.message, "media: unsupported URL");
+        // Media has no stable in-panel target, so focus falls back to its tab.
+        assert_eq!(target.element_id, None);
+
+        // Basic Info exposes a stable panel id and is used directly.
+        let basic =
+            first_blocker_target(&["Title is required.".to_string()]).expect("a blocker target");
+        assert_eq!(basic.tab, "basic");
+        assert_eq!(basic.element_id.as_deref(), Some("store-editor-basic"));
+
+        // No blockers means no navigation action at all.
+        assert_eq!(first_blocker_target(&[]), None);
+    }
+
+    #[test]
+    fn first_blocker_navigation_does_not_resolve_the_blocker() {
+        let blockers = vec!["Title is required.".to_string()];
+        let before = first_blocker_target(&blockers);
+        // Selecting the target is presentation only; the same blocker remains.
+        let after = first_blocker_target(&blockers);
+        assert_eq!(before, after);
+        assert!(after.is_some());
+    }
+
+    #[test]
+    fn retry_targets_only_incomplete_pointer_work_and_keeps_published_identifiers() {
+        let mutations = vec![
+            StorePageListingMutation {
+                listing_coordinate: "listing-0".into(),
+                expected_event_id: "a".into(),
+                action: ListingPointerMutation::Link,
+                relay_hint: None,
+                published_event_id: None,
+            },
+            StorePageListingMutation {
+                listing_coordinate: "listing-1".into(),
+                expected_event_id: "b".into(),
+                action: ListingPointerMutation::Link,
+                relay_hint: None,
+                published_event_id: None,
+            },
+        ];
+        // listing-0 published but unconfirmed, listing-1 not published at all.
+        let response = publication_response(Some((2, true)), &[(true, false), (false, false)]);
+        let retry = retryable_mutations(&response, &mutations);
+        assert_eq!(retry.len(), 2);
+        assert_eq!(retry[0].published_event_id.as_deref(), Some("event-0"));
+        assert_eq!(retry[1].published_event_id, None);
     }
 }
