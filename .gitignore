@@ -52,3 +52,7 @@ tsx-1000/
 *.bak
 tmp.*
 /docs
+!/docs/
+/docs/*
+!/docs/design-handoff/
+!/docs/design-handoff/**

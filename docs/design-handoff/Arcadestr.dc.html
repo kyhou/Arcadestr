@@ -1,0 +1,1515 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<style>
+body{margin:0;background:#0b0b0d}
+::selection{background:oklch(0.78 0.16 60 / .35)}
+a{color:oklch(0.8 0.14 195)}
+a:hover{color:oklch(0.85 0.14 195)}
+</style>
+</helmet>
+
+<div style="min-height:100vh;background:#0b0b0d;color:#eae6df;font-family:ui-monospace,'SFMono-Regular','Consolas',monospace;background-image:radial-gradient(circle,rgba(255,255,255,.02) 1px,transparent 1px);background-size:24px 24px">
+
+<!-- ============ TOP BAR ============ -->
+<sc-if value="{{ showTopBar }}" hint-placeholder-val="{{ true }}">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:0 28px;height:64px;border-bottom:1px solid oklch(0.4 0.03 60 / .3);background:#0d0d10;position:sticky;top:0;z-index:50">
+  <div style="display:flex;align-items:center;gap:30px">
+    <div style="display:flex;align-items:center;gap:10px;cursor:pointer" onClick="{{ goHome }}">
+      <div style="width:20px;height:20px;background:oklch(0.78 0.16 60);clip-path:polygon(0 30%,70% 0,100% 30%,100% 100%,30% 100%,0 70%)"></div>
+      <div style="font:800 19px/1 ui-monospace,monospace;letter-spacing:2px;color:#fff">ARCADESTR</div>
+    </div>
+    <div style="display:flex;gap:22px;font:700 12.5px ui-monospace,monospace">
+      <span style="cursor:pointer;color:{{ storeNavColor }}" onClick="{{ goStore }}">DISCOVER</span>
+      <span style="cursor:pointer;color:{{ libraryNavColor }}" onClick="{{ goLibrary }}">LIBRARY</span>
+      <span style="cursor:pointer;color:{{ communityNavColor }}" onClick="{{ goCommunity }}">COMMUNITY</span>
+      <span style="cursor:pointer;color:{{ publishNavColor }}" onClick="{{ goPublish }}">PUBLISH</span>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <div style="display:flex;align-items:center;gap:8px;width:260px;height:32px;background:#141417;border:1px solid oklch(0.32 0.01 60);border-radius:4px;padding:0 10px">
+      <span style="flex:none;width:12px;height:12px;border:2px solid oklch(0.5 0.01 60);border-radius:50%"></span>
+      <span style="font:400 11.5px ui-monospace,monospace;color:oklch(0.52 0.01 60)">Search games, creators, tags</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:7px;padding:6px 10px;border:1px solid oklch(0.45 0.13 195);border-radius:3px;font:700 10.5px ui-monospace,monospace;color:oklch(0.8 0.14 195);cursor:pointer;white-space:nowrap;flex:none;flex-shrink:0" onClick="{{ goNetwork }}">
+      <span style="flex:none;width:7px;height:7px;border-radius:50%;background:oklch(0.8 0.14 195);box-shadow:0 0 6px oklch(0.8 0.14 195)"></span>{{ relayLabel }}
+    </div>
+    <sc-if value="{{ signedIn }}" hint-placeholder-val="{{ true }}">
+      <div style="position:relative">
+        <div style="display:flex;align-items:center;gap:8px;padding:5px 10px 5px 5px;border:1px solid oklch(0.32 0.01 60);border-radius:3px;cursor:pointer" onClick="{{ toggleAccountMenu }}">
+          <div style="width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,oklch(0.55 0.1 320),oklch(0.4 0.1 260))"></div>
+          <span style="font:700 11px ui-monospace,monospace;color:oklch(0.75 0.01 60)">npub1...7k2m</span>
+        </div>
+        <sc-if value="{{ accountMenuOpen }}" hint-placeholder-val="{{ false }}">
+          <div style="position:absolute;right:0;top:38px;width:190px;background:#141417;border:1px solid oklch(0.32 0.01 60);border-radius:6px;padding:6px;display:flex;flex-direction:column;gap:2px;box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:60">
+            <div style="padding:9px 10px;font:600 12px ui-monospace,monospace;cursor:pointer;border-radius:4px" onClick="{{ goProfile }}">View profile</div>
+            <div style="padding:9px 10px;font:600 12px ui-monospace,monospace;cursor:pointer;border-radius:4px" onClick="{{ goSettings }}">Settings</div>
+            <div style="padding:9px 10px;font:600 12px ui-monospace,monospace;cursor:pointer;border-radius:4px" onClick="{{ openSwitcher }}">Switch account</div>
+            <div style="height:1px;background:oklch(0.3 0.01 60);margin:4px 0"></div>
+            <div style="padding:9px 10px;font:600 12px ui-monospace,monospace;cursor:pointer;border-radius:4px;color:oklch(0.65 0.18 25)" onClick="{{ signOut }}">Sign out</div>
+          </div>
+        </sc-if>
+      </div>
+    </sc-if>
+    <sc-if value="{{ notSignedIn }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:8px 16px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ goLogin }}">SIGN IN</div>
+    </sc-if>
+  </div>
+</div>
+</sc-if>
+
+<!-- ============ LOGIN ============ -->
+<sc-if value="{{ isLogin }}" hint-placeholder-val="{{ false }}">
+<div style="max-width:440px;margin:70px auto;padding:0 20px">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:28px;justify-content:center">
+    <div style="width:22px;height:22px;background:oklch(0.78 0.16 60);clip-path:polygon(0 30%,70% 0,100% 30%,100% 100%,30% 100%,0 70%)"></div>
+    <div style="font:800 20px/1 ui-monospace,monospace;letter-spacing:2px;color:#fff">ARCADESTR</div>
+  </div>
+  <div style="background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:26px">
+    <div style="font:800 15px ui-monospace,monospace;margin-bottom:6px">Connect your account</div>
+    <div style="font:400 12px/1.6 ui-monospace,monospace;color:oklch(0.6 0.01 60);margin-bottom:20px">Arcadestr requests signatures from your signing app — it never needs your private key.</div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div style="padding:13px 16px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 13px ui-monospace,monospace;border-radius:5px;cursor:pointer;text-align:center" onClick="{{ completeLogin }}">Connect signing app (recommended)</div>
+      <div style="padding:13px 16px;border:1px solid rgba(255,255,255,.22);font:700 13px ui-monospace,monospace;border-radius:5px;cursor:pointer;text-align:center" onClick="{{ completeLogin }}">Use browser signer</div>
+      <div style="padding:13px 16px;border:1px solid rgba(255,255,255,.22);font:700 13px ui-monospace,monospace;border-radius:5px;cursor:pointer;text-align:center" onClick="{{ completeLogin }}">Scan QR from mobile</div>
+    </div>
+    <div style="margin:18px 0;height:1px;background:rgba(255,255,255,.1)"></div>
+    <div style="font:700 10.5px ui-monospace,monospace;letter-spacing:1px;color:oklch(0.55 0.01 60);margin-bottom:10px">SAVED ACCOUNTS</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid rgba(255,255,255,.12);border-radius:6px;cursor:pointer" onClick="{{ completeLogin }}">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,oklch(0.55 0.1 320),oklch(0.4 0.1 260))"></div>
+        <span style="font:600 12px ui-monospace,monospace">npub1...7k2m</span>
+      </div>
+      <span style="font:700 10px ui-monospace,monospace;color:oklch(0.6 0.01 60)">USE</span>
+    </div>
+    <div style="margin-top:16px;font:600 10.5px ui-monospace,monospace;color:oklch(0.45 0.01 60);cursor:pointer;text-decoration:underline">Advanced: import encrypted key</div>
+  </div>
+</div>
+</sc-if>
+
+<!-- ============ MAIN AREA ============ -->
+<sc-if value="{{ showMain }}" hint-placeholder-val="{{ true }}">
+<div style="max-width:1440px;margin:0 auto;padding-bottom:60px">
+
+<!-- ===== STORE: HOME ===== -->
+<sc-if value="{{ isStoreHome }}" hint-placeholder-val="{{ true }}">
+  <div style="display:grid;grid-template-columns:38% 62%;min-height:380px;border-bottom:1px solid oklch(0.4 0.03 60 / .35)">
+    <div style="padding:26px 30px;border-right:1px solid oklch(0.32 0.02 60 / .5);display:flex;flex-direction:column;gap:10px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font:800 10.5px ui-monospace,monospace;letter-spacing:2px;color:oklch(0.8 0.16 60)">[ FEATURED TITLE ]</span>
+        <span style="flex:1;height:1px;background:repeating-linear-gradient(90deg,oklch(0.45 0.03 60) 0 4px,transparent 4px 8px)"></span>
+      </div>
+      <div style="font:800 32px/1.08 ui-monospace,monospace;letter-spacing:.5px;color:#fff">{{ featuredGame.title }}</div>
+      <div style="font:600 11px ui-monospace,monospace;color:oklch(0.55 0.01 60)">by {{ featuredGame.developer }} · {{ featuredGame.platforms }}</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:2px">
+        <sc-for list="{{ featuredGame.tagChips }}" as="tag" hint-placeholder-count="2">
+          <span style="padding:4px 11px;border:1px solid oklch(0.5 0.13 210);background:oklch(0.5 0.13 210 / .14);color:oklch(0.78 0.13 210);font:700 11px ui-monospace,monospace;border-radius:4px">{{ tag }}</span>
+        </sc-for>
+        <span style="padding:4px 11px;border:{{ featuredGame.badgeBorder }};background:{{ featuredGame.badgeBg }};color:{{ featuredGame.badgeColor }};font:800 11px ui-monospace,monospace;border-radius:4px">{{ featuredGame.badgeLabel }}</span>
+        <sc-if value="{{ featuredGame.hasStatus }}" hint-placeholder-val="{{ false }}">
+          <span style="padding:4px 11px;font:700 11px ui-monospace,monospace;color:{{ featuredGame.statusColor }}">{{ featuredGame.statusLabel }}</span>
+        </sc-if>
+      </div>
+      <div style="font:400 12.5px/1.55 ui-monospace,monospace;color:oklch(0.62 0.01 60);max-width:400px;margin-top:2px">{{ featuredGame.description }}</div>
+      <div style="display:flex;gap:12px;margin-top:8px">
+        <div style="padding:11px 20px;background:{{ featuredGame.actionBg }};color:#0b0b0d;font:800 13px ui-monospace,monospace;border-radius:5px;cursor:pointer" onClick="{{ featuredGame.action }}">{{ featuredGame.actionLabel }}</div>
+        <div style="padding:11px 20px;border:1px solid oklch(0.5 0.13 210);color:oklch(0.8 0.13 210);font:800 13px ui-monospace,monospace;border-radius:5px;cursor:pointer" onClick="{{ featuredGame.openDetails }}">DETAILS &gt;</div>
+      </div>
+      <div style="display:flex;gap:16px;margin-top:4px;font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">
+        <span>⚡ LIGHTNING</span><span>((•)) NOSTR</span><span>🔒 PERMANENT OWNERSHIP</span>
+      </div>
+    </div>
+    <div style="position:relative;background:#141419;cursor:pointer" onClick="{{ featuredGame.openDetails }}">
+      <div style="position:absolute;inset:0;background:radial-gradient(circle at 70% 30%, oklch(0.5 0.14 60 / .5), transparent 45%),radial-gradient(circle at 30% 75%, oklch(0.35 0.12 240 / .55), transparent 55%),linear-gradient(160deg,#141419,#0b0b0e 70%)"></div>
+      <div style="position:absolute;inset:0;background:linear-gradient(0deg,#0b0b0d 4%,transparent 46%)"></div>
+      <div style="position:absolute;top:0;left:0;right:0;bottom:52px;display:flex;align-items:flex-end;justify-content:center;padding-bottom:16px;font:600 11px ui-monospace,monospace;color:oklch(0.4 0.01 60);letter-spacing:.5px">KEY ART — SUPPLIED BY PUBLISHER</div>
+      <div style="position:absolute;left:0;right:0;bottom:0;height:52px;background:rgba(10,10,12,.7);backdrop-filter:blur(2px);display:flex;align-items:center;justify-content:space-between;padding:0 16px">
+        <div style="display:flex;gap:6px">
+          <span style="width:24px;height:5px;background:oklch(0.78 0.16 60);border-radius:3px"></span>
+          <span style="width:14px;height:5px;background:rgba(255,255,255,.22);border-radius:3px"></span>
+          <span style="width:14px;height:5px;background:rgba(255,255,255,.22);border-radius:3px"></span>
+          <span style="width:14px;height:5px;background:rgba(255,255,255,.22);border-radius:3px"></span>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font:700 10.5px ui-monospace,monospace;color:oklch(0.6 0.01 60)">01 / 04</span>
+          <div tabIndex="0" style="width:34px;height:34px;border:1px solid rgba(255,255,255,.3);border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:16px;color:#fff;cursor:pointer" onClick="{{ stopProp }}">‹</div>
+          <div tabIndex="0" style="width:34px;height:34px;border:1px solid rgba(255,255,255,.3);border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:16px;color:#fff;cursor:pointer" onClick="{{ stopProp }}">›</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="padding:26px 28px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px">
+      <span style="font:800 12px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">◆ MORE ON THE STORE</span>
+      <span style="flex:1;height:1px;background:repeating-linear-gradient(90deg,oklch(0.4 0.03 60 / .6) 0 4px,transparent 4px 8px)"></span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:18px">
+      <sc-for list="{{ homeGrid }}" as="g" hint-placeholder-count="4">
+        <div style="clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));border:1px solid oklch(0.3 0.01 60);background:#121215;cursor:pointer" onClick="{{ g.open }}">
+          <div style="position:relative;height:160px;background:#141417">
+            <sc-if value="{{ g.hasArt }}" hint-placeholder-val="{{ true }}">
+              <div style="position:absolute;inset:0;background:{{ g.artBg }}"></div>
+              <div style="position:absolute;inset:0;background:linear-gradient(0deg,#121215 10%,transparent 60%)"></div>
+            </sc-if>
+            <sc-if value="{{ g.noArt }}" hint-placeholder-val="{{ false }}">
+              <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:600 10.5px ui-monospace,monospace;color:oklch(0.4 0.01 60);background:repeating-linear-gradient(135deg,#191919 0 10px,#141414 10px 20px)">ARTWORK PENDING</div>
+            </sc-if>
+            <div style="position:absolute;left:14px;bottom:12px;font:800 17px/1.15 ui-monospace,monospace;color:#fff">{{ g.title }}</div>
+            <div tabIndex="0" style="position:absolute;left:10px;top:10px;width:30px;height:30px;border-radius:50%;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;font-size:15px;cursor:pointer;color:{{ g.favActive }}" onClick="{{ g.toggleFav }}">{{ g.favIcon }}</div>
+          </div>
+          <div style="padding:12px 14px;display:flex;flex-direction:column;gap:7px">
+            <div style="font:600 10.5px ui-monospace,monospace;color:oklch(0.62 0.01 60)">{{ g.meta }}</div>
+            <span style="align-self:flex-start;display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border:{{ g.badgeBorder }};background:{{ g.badgeBg }};color:{{ g.badgeColor }};font:800 11px ui-monospace,monospace;border-radius:3px">{{ g.badgeLabel }}</span>
+            <sc-if value="{{ g.hasStatus }}" hint-placeholder-val="{{ false }}">
+              <span style="font:700 10.5px ui-monospace,monospace;color:{{ g.statusColor }}">{{ g.statusLabel }}</span>
+            </sc-if>
+            <div tabIndex="0" style="margin-top:2px;padding:8px;border:{{ g.actionBorder }};background:{{ g.actionBg }};color:{{ g.actionColor }};font:800 11px ui-monospace,monospace;border-radius:4px;text-align:center" onClick="{{ g.runAction }}">{{ g.actionLabel }}</div>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+</sc-if>
+
+<!-- ===== STORE: BROWSE ===== -->
+<sc-if value="{{ isStoreBrowse }}" hint-placeholder-val="{{ false }}">
+  <div style="padding:26px 28px">
+    <div style="font:800 22px ui-monospace,monospace;margin-bottom:16px">Browse games</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">
+      <select style="background:#141417;color:#eae6df;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:8px 10px;font:600 12px ui-monospace,monospace" onChange="{{ setAcquisitionFilter }}">
+        <option value="all">Acquisition: All</option>
+        <option value="paid">Paid</option>
+        <option value="public">Public access</option>
+        <option value="timed">Timed access</option>
+        <option value="claim">Claim &amp; keep</option>
+        <option value="owned">Owned</option>
+      </select>
+      <select style="background:#141417;color:#eae6df;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:8px 10px;font:600 12px ui-monospace,monospace" onChange="{{ setPlatformFilter }}">
+        <option value="all">Platform: All</option>
+        <option value="Windows">Windows</option>
+        <option value="Linux">Linux</option>
+        <option value="macOS">macOS</option>
+        <option value="Web">Web</option>
+      </select>
+      <select style="background:#141417;color:#eae6df;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:8px 10px;font:600 12px ui-monospace,monospace" onChange="{{ setSort }}">
+        <option value="recommended">Sort: Recommended</option>
+        <option value="newest">Newest</option>
+        <option value="price">Price</option>
+        <option value="title">Title</option>
+      </select>
+      <div style="flex:1"></div>
+      <span style="font:600 11px ui-monospace,monospace;color:oklch(0.55 0.01 60);align-self:center">{{ resultCount }} results</span>
+    </div>
+    <sc-if value="{{ hasBrowseResults }}" hint-placeholder-val="{{ true }}">
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:18px">
+        <sc-for list="{{ browseGrid }}" as="g" hint-placeholder-count="4">
+          <div style="clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));border:1px solid oklch(0.3 0.01 60);background:#121215;cursor:pointer" onClick="{{ g.open }}">
+            <div style="position:relative;height:150px;background:#141417">
+              <sc-if value="{{ g.hasArt }}" hint-placeholder-val="{{ true }}">
+                <div style="position:absolute;inset:0;background:{{ g.artBg }}"></div>
+                <div style="position:absolute;inset:0;background:linear-gradient(0deg,#121215 10%,transparent 60%)"></div>
+              </sc-if>
+              <sc-if value="{{ g.noArt }}" hint-placeholder-val="{{ false }}">
+                <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:600 10.5px ui-monospace,monospace;color:oklch(0.4 0.01 60);background:repeating-linear-gradient(135deg,#191919 0 10px,#141414 10px 20px)">ARTWORK PENDING</div>
+              </sc-if>
+              <div style="position:absolute;left:14px;bottom:12px;font:800 16px/1.15 ui-monospace,monospace;color:#fff">{{ g.title }}</div>
+              <div tabIndex="0" style="position:absolute;left:10px;top:10px;width:28px;height:28px;border-radius:50%;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;font-size:14px;cursor:pointer" onClick="{{ g.toggleFav }}">{{ g.favIcon }}</div>
+            </div>
+            <div style="padding:12px 14px;display:flex;flex-direction:column;gap:7px">
+              <div style="font:600 10.5px ui-monospace,monospace;color:oklch(0.62 0.01 60)">{{ g.meta }}</div>
+              <span style="align-self:flex-start;display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border:{{ g.badgeBorder }};background:{{ g.badgeBg }};color:{{ g.badgeColor }};font:800 11px ui-monospace,monospace;border-radius:3px">{{ g.badgeLabel }}</span>
+              <sc-if value="{{ g.hasStatus }}" hint-placeholder-val="{{ false }}">
+                <span style="font:700 10.5px ui-monospace,monospace;color:{{ g.statusColor }}">{{ g.statusLabel }}</span>
+              </sc-if>
+              <div tabIndex="0" style="margin-top:2px;padding:8px;border:{{ g.actionBorder }};background:{{ g.actionBg }};color:{{ g.actionColor }};font:800 11px ui-monospace,monospace;border-radius:4px;text-align:center" onClick="{{ g.runAction }}">{{ g.actionLabel }}</div>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+    <sc-if value="{{ noBrowseResults }}" hint-placeholder-val="{{ false }}">
+      <div style="text-align:center;padding:60px 0;color:oklch(0.5 0.01 60);font:600 13px ui-monospace,monospace">No games match these filters. Try clearing a filter.</div>
+    </sc-if>
+  </div>
+</sc-if>
+
+<!-- ===== STORE: GAME DETAILS ===== -->
+<sc-if value="{{ isStoreDetails }}" hint-placeholder-val="{{ false }}">
+  <div style="padding:26px 28px">
+    <div style="font:700 11px ui-monospace,monospace;color:oklch(0.55 0.01 60);margin-bottom:14px;cursor:pointer" onClick="{{ goBrowse }}">&lt; Back to browse</div>
+    <div style="display:grid;grid-template-columns:1fr 380px;gap:26px">
+      <div>
+        <div style="position:relative;height:340px;border-radius:8px;overflow:hidden;background:{{ currentGame.artBg }};margin-bottom:20px">
+          <div style="position:absolute;inset:0;background:linear-gradient(0deg,rgba(0,0,0,.5) 0%,transparent 45%)"></div>
+          <div style="position:absolute;left:24px;bottom:20px;font:800 34px ui-monospace,monospace;color:#fff">{{ currentGame.title }}</div>
+        </div>
+        <div style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60);margin-bottom:10px">ABOUT</div>
+        <div style="font:400 13px/1.7 ui-monospace,monospace;color:oklch(0.68 0.01 60);margin-bottom:22px">{{ currentGame.description }}</div>
+
+        <div style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60);margin-bottom:10px">COMPATIBILITY</div>
+        <div style="display:flex;gap:8px;margin-bottom:22px">
+          <sc-for list="{{ currentGame.platformChips }}" as="p" hint-placeholder-count="2">
+            <span style="padding:5px 11px;border:1px solid rgba(255,255,255,.2);border-radius:4px;font:700 11px ui-monospace,monospace">{{ p }}</span>
+          </sc-for>
+        </div>
+
+        <div style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60);margin-bottom:10px">RELEASE INFO</div>
+        <div style="font:400 12px/1.8 ui-monospace,monospace;color:oklch(0.62 0.01 60);margin-bottom:22px">Version {{ currentGame.version }} · {{ currentGame.size }} · Updated {{ currentGame.updated }}</div>
+
+        <div style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60);margin-bottom:10px">DEVELOPER</div>
+        <div style="display:flex;align-items:center;gap:10px;cursor:pointer" onClick="{{ goDeveloperProfile }}">
+          <div style="width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,oklch(0.5 0.1 200),oklch(0.4 0.1 260))"></div>
+          <div><div style="font:700 13px ui-monospace,monospace">{{ currentGame.developer }}</div><div style="font:600 10.5px ui-monospace,monospace;color:oklch(0.55 0.13 195)">✓ Verified</div></div>
+        </div>
+      </div>
+
+      <div>
+        <div style="background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:22px;margin-bottom:16px">
+          <div style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.6 0.01 60);margin-bottom:10px">ACCESS</div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+            <span style="display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border:{{ currentGame.badgeBorder }};background:{{ currentGame.badgeBg }};color:{{ currentGame.badgeColor }};font:800 12px ui-monospace,monospace;border-radius:4px">{{ currentGame.badgeLabel }}</span>
+            <sc-if value="{{ currentGame.hasStatus }}" hint-placeholder-val="{{ false }}">
+              <span style="font:700 11.5px ui-monospace,monospace;color:{{ currentGame.statusColor }}">{{ currentGame.statusLabel }}</span>
+            </sc-if>
+          </div>
+          <div style="font:400 11.5px/1.6 ui-monospace,monospace;color:oklch(0.55 0.01 60);margin-bottom:16px">{{ currentGame.accessNote }}</div>
+          <div style="padding:14px;background:{{ currentGame.actionBg }};color:{{ currentGame.actionColor }};font:800 14px ui-monospace,monospace;border-radius:5px;cursor:pointer;text-align:center" onClick="{{ currentGame.action }}">{{ currentGame.actionLabel }}</div>
+          <div style="margin-top:10px;cursor:pointer;font:600 11px ui-monospace,monospace;color:oklch(0.55 0.01 60);text-align:center" onClick="{{ currentGame.toggleFav }}">{{ currentGame.favLabel }}</div>
+        </div>
+        <sc-if value="{{ currentGame.showOwnershipPanel }}" hint-placeholder-val="{{ false }}">
+          <div style="background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:20px">
+            <div style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.6 0.01 60);margin-bottom:10px">OWNERSHIP STATUS</div>
+            <div style="font:600 12px ui-monospace,monospace;color:oklch(0.72 0.16 145)">{{ currentGame.ownershipNote }}</div>
+            <div style="margin-top:10px;font:700 11px ui-monospace,monospace;color:oklch(0.7 0.13 195);cursor:pointer;text-decoration:underline" onClick="{{ currentGame.openReceipt }}">{{ currentGame.receiptLinkLabel }}</div>
+          </div>
+        </sc-if>
+      </div>
+    </div>
+  </div>
+</sc-if>
+
+<!-- ===== LIBRARY ===== -->
+<sc-if value="{{ isLibrary }}" hint-placeholder-val="{{ false }}">
+  <div style="padding:26px 28px">
+    <div style="font:800 22px ui-monospace,monospace;margin-bottom:16px">Library</div>
+    <div style="display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap">
+      <sc-for list="{{ libraryTabs }}" as="t" hint-placeholder-count="6">
+        <div style="padding:8px 14px;border:1px solid {{ t.border }};background:{{ t.bg }};color:{{ t.color }};font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ t.select }}">{{ t.label }}</div>
+      </sc-for>
+    </div>
+
+    <sc-if value="{{ libraryHasItems }}" hint-placeholder-val="{{ true }}">
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <sc-for list="{{ libraryRows }}" as="r" hint-placeholder-count="2">
+          <div style="display:flex;align-items:center;gap:16px;padding:14px 16px;background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px">
+            <div style="width:56px;height:56px;border-radius:6px;background:{{ r.artBg }};flex:none"></div>
+            <div style="flex:1">
+              <div style="font:700 14px ui-monospace,monospace">{{ r.title }}</div>
+              <div style="font:600 11px ui-monospace,monospace;color:oklch(0.55 0.01 60)">{{ r.subtitle }}</div>
+            </div>
+            <span style="padding:5px 10px;border:{{ r.badgeBorder }};background:{{ r.badgeBg }};color:{{ r.badgeColor }};font:700 10.5px ui-monospace,monospace;border-radius:4px">{{ r.badgeLabel }}</span>
+            <div style="padding:9px 16px;background:{{ r.actionBg }};color:{{ r.actionColor }};font:800 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ r.action }}">{{ r.actionLabel }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+    <sc-if value="{{ libraryEmpty }}" hint-placeholder-val="{{ false }}">
+      <div style="text-align:center;padding:60px 0;color:oklch(0.5 0.01 60);font:600 13px ui-monospace,monospace">{{ libraryEmptyText }}</div>
+    </sc-if>
+  </div>
+</sc-if>
+
+<!-- ===== COMMUNITY ===== -->
+<sc-if value="{{ isCommunity }}" hint-placeholder-val="{{ false }}">
+  <div style="padding:26px 28px">
+    <div style="display:flex;gap:8px;margin-bottom:20px">
+      <div style="padding:8px 14px;border:1px solid {{ profileTabBorder }};color:{{ profileTabColor }};font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ goCommunityProfile }}">PROFILE</div>
+      <div style="padding:8px 14px;border:1px solid {{ achievementsTabBorder }};color:{{ achievementsTabColor }};font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ goCommunityAchievements }}">ACHIEVEMENTS</div>
+      <div style="padding:8px 14px;border:1px solid {{ feedTabBorder }};color:{{ feedTabColor }};font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ goCommunityFeed }}">SOCIAL FEED</div>
+    </div>
+
+    <sc-if value="{{ isCommunityProfile }}" hint-placeholder-val="{{ true }}">
+      <div style="display:flex;align-items:center;gap:18px;margin-bottom:24px">
+        <div style="width:70px;height:70px;border-radius:50%;background:linear-gradient(135deg,oklch(0.55 0.1 320),oklch(0.4 0.1 260))"></div>
+        <div>
+          <div style="font:800 20px ui-monospace,monospace">Nightglass Studio</div>
+          <div style="font:600 11.5px ui-monospace,monospace;color:oklch(0.55 0.13 195)">✓ nightglass@arcadestr.io</div>
+          <div style="font:600 10.5px ui-monospace,monospace;color:oklch(0.5 0.01 60);margin-top:4px">npub1a2b...9f2k</div>
+        </div>
+        <div style="flex:1"></div>
+        <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.22);font:700 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ goEditProfile }}">Edit profile</div>
+      </div>
+      <div style="font:400 12.5px/1.6 ui-monospace,monospace;color:oklch(0.62 0.01 60);max-width:560px;margin-bottom:22px">Independent studio building small, strange games. Two-person team, Bitcoin-only.</div>
+      <div style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60);margin-bottom:12px">PUBLISHED GAMES</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px">
+        <sc-for list="{{ myGamesGrid }}" as="g" hint-placeholder-count="2">
+          <div style="background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px;overflow:hidden;cursor:pointer" onClick="{{ g.open }}">
+            <div style="height:100px;background:{{ g.artBg }}"></div>
+            <div style="padding:12px 14px;font:700 13px ui-monospace,monospace">{{ g.title }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ isCommunityEditProfile }}" hint-placeholder-val="{{ false }}">
+      <div style="max-width:480px;display:flex;flex-direction:column;gap:14px">
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">DISPLAY NAME<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" value="Nightglass Studio"></label>
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">ABOUT<textarea style="display:block;margin-top:6px;width:100%;height:70px;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:400 12px ui-monospace,monospace">Independent studio building small, strange games.</textarea></label>
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">WEBSITE<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" value="https://nightglass.studio"></label>
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">LIGHTNING ADDRESS<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" value="studio@getalby.com"></label>
+        <div style="display:flex;gap:10px;margin-top:6px">
+          <div style="padding:10px 18px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ goCommunityProfile }}">Save changes</div>
+          <div style="padding:10px 18px;border:1px solid rgba(255,255,255,.25);font:800 12.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ goCommunityProfile }}">Cancel</div>
+        </div>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ isCommunityAchievements }}" hint-placeholder-val="{{ false }}">
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px">
+        <sc-for list="{{ badges }}" as="b" hint-placeholder-count="4">
+          <div style="background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:16px;text-align:center">
+            <div style="width:48px;height:48px;border-radius:10px;background:{{ b.artBg }};margin:0 auto 10px"></div>
+            <div style="font:700 12px ui-monospace,monospace">{{ b.name }}</div>
+            <div style="font:600 10px ui-monospace,monospace;color:oklch(0.5 0.01 60);margin-top:4px">{{ b.date }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ isCommunityFeed }}" hint-placeholder-val="{{ false }}">
+      <div style="text-align:center;padding:60px 0;color:oklch(0.5 0.01 60);font:600 13px ui-monospace,monospace">Social feed is not available yet in this build.<br>Follow, post, and reply are planned but not implemented — nothing below is live activity.</div>
+    </sc-if>
+  </div>
+</sc-if>
+
+<!-- ===== PUBLISH ===== -->
+<sc-if value="{{ isPublish }}" hint-placeholder-val="{{ false }}">
+  <div style="padding:26px 28px">
+    <div style="display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap">
+      <sc-for list="{{ publishTabs }}" as="t" hint-placeholder-count="6">
+        <div style="padding:8px 14px;border:1px solid {{ t.border }};color:{{ t.color }};font:700 11px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ t.select }}">{{ t.label }}</div>
+      </sc-for>
+    </div>
+
+    <sc-if value="{{ isPublishDashboard }}" hint-placeholder-val="{{ true }}">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
+        <div style="font:800 20px ui-monospace,monospace">Developer dashboard</div>
+        <div style="padding:10px 18px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ startCreateGame }}">+ CREATE GAME</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <sc-for list="{{ myGamesRows }}" as="g" hint-placeholder-count="2">
+          <div style="display:flex;align-items:center;gap:16px;padding:14px 16px;background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px">
+            <div style="width:44px;height:44px;border-radius:6px;background:{{ g.artBg }};flex:none"></div>
+            <div style="flex:1"><div style="font:700 13px ui-monospace,monospace">{{ g.title }}</div><div style="font:600 10.5px ui-monospace,monospace;color:oklch(0.55 0.01 60)">{{ g.meta }}</div></div>
+            <span style="padding:5px 10px;border:1px solid rgba(255,255,255,.2);font:700 10.5px ui-monospace,monospace;border-radius:4px;color:oklch(0.7 0.01 60)">{{ g.status }}</span>
+            <div style="padding:8px 14px;border:1px solid rgba(255,255,255,.25);font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ g.manage }}">MANAGE</div>
+          </div>
+        </sc-for>
+      </div>
+      <div style="margin-top:20px;padding:16px;border:1px solid oklch(0.5 0.13 300 / .5);background:oklch(0.5 0.13 300 / .08);border-radius:8px;font:600 12px ui-monospace,monospace;color:oklch(0.75 0.13 300)">⚠ Attention needed: "Nova Choir" is a draft — missing a payment address before it can be published.</div>
+    </sc-if>
+
+    <sc-if value="{{ isPublishCreateBasic }}" hint-placeholder-val="{{ false }}">
+      <div style="font:800 18px ui-monospace,monospace;margin-bottom:4px">Create game · Step 1 of 5 — Basic information</div>
+      <div style="font:400 11.5px ui-monospace,monospace;color:oklch(0.5 0.01 60);margin-bottom:20px">This builds the public store page shown to buyers.</div>
+      <div style="max-width:560px;display:flex;flex-direction:column;gap:14px">
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">GAME TITLE<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" placeholder="e.g. Nova Choir"></label>
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">SHORT SUMMARY<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:400 12px ui-monospace,monospace" placeholder="One line for the store card"></label>
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">FULL DESCRIPTION<textarea style="display:block;margin-top:6px;width:100%;height:90px;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:400 12px ui-monospace,monospace" placeholder="Full store description"></textarea></label>
+        <div style="display:flex;gap:12px">
+          <div style="flex:1"><span style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">COVER IMAGE</span><image-slot id="pub-cover" shape="rounded" style="display:block;margin-top:6px;width:100%;height:100px;background:#141417;border:1px dashed rgba(255,255,255,.25);border-radius:5px" placeholder="cover art, 16:9"></image-slot></div>
+          <div style="flex:1"><span style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">SCREENSHOTS</span><image-slot id="pub-shot1" shape="rounded" style="display:block;margin-top:6px;width:100%;height:100px;background:#141417;border:1px dashed rgba(255,255,255,.25);border-radius:5px" placeholder="screenshot"></image-slot></div>
+        </div>
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">GENRES &amp; TAGS<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" placeholder="Adventure, Puzzle, Singleplayer"></label>
+        <div style="display:flex;gap:10px;margin-top:6px">
+          <div style="padding:11px 20px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ nextToPricing }}">Continue &gt;</div>
+          <div style="padding:11px 20px;border:1px solid rgba(255,255,255,.25);font:800 12.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ startCreateGame }}">Save draft</div>
+        </div>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ isPublishCreatePricing }}" hint-placeholder-val="{{ false }}">
+      <div style="font:800 18px ui-monospace,monospace;margin-bottom:4px">Create game · Step 2 of 5 — Pricing &amp; access</div>
+      <div style="font:400 11.5px ui-monospace,monospace;color:oklch(0.5 0.01 60);margin-bottom:20px">A zero price never enables public access on its own — it must be set explicitly below.</div>
+      <div style="max-width:560px;display:flex;flex-direction:column;gap:14px">
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">BASE SELLING MODEL<select style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace"><option>Paid</option><option>No paid purchase option</option></select></label>
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">PRICE (SATS)<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" value="4200"></label>
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">PAYMENT ADDRESS (LIGHTNING)<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" placeholder="you@yourdomain.com"></label>
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">CURRENT UNGATED ACCESS<select style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace"><option>Gated (default)</option><option>Public access</option><option>Timed access</option></select></label>
+        <div style="font:400 11px/1.6 ui-monospace,monospace;color:oklch(0.5 0.01 60)">Claim-and-keep promotions are created separately after this game is published, from the Promotions tab.</div>
+        <div style="display:flex;gap:10px;margin-top:6px">
+          <div style="padding:11px 20px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ nextToBuilds }}">Continue &gt;</div>
+          <div style="padding:11px 20px;border:1px solid rgba(255,255,255,.25);font:800 12.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ backToBasic }}">Back</div>
+        </div>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ isPublishCreateBuilds }}" hint-placeholder-val="{{ false }}">
+      <div style="font:800 18px ui-monospace,monospace;margin-bottom:4px">Create game · Step 3 of 5 — Builds &amp; compatibility</div>
+      <div style="font:400 11.5px ui-monospace,monospace;color:oklch(0.5 0.01 60);margin-bottom:20px">File verification is calculated automatically — there's no freeform hash field.</div>
+      <div style="max-width:560px;display:flex;flex-direction:column;gap:14px">
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">RELEASE VERSION<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" value="1.0.0"></label>
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">PLATFORMS<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" placeholder="Windows, macOS, Linux"></label>
+        <div style="display:flex;align-items:center;gap:12px;padding:14px;border:1px dashed rgba(255,255,255,.25);border-radius:6px;cursor:pointer" onClick="{{ simulateHash }}">
+          <span style="font:700 12px ui-monospace,monospace">📁 Choose build archive…</span>
+          <span style="flex:1"></span>
+          <span style="font:600 11px ui-monospace,monospace;color:{{ hashStatusColor }}">{{ hashStatusText }}</span>
+        </div>
+        <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">RELEASE NOTES<textarea style="display:block;margin-top:6px;width:100%;height:70px;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:400 12px ui-monospace,monospace"></textarea></label>
+        <div style="display:flex;gap:10px;margin-top:6px">
+          <div style="padding:11px 20px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ nextToProvider }}">Continue &gt;</div>
+          <div style="padding:11px 20px;border:1px solid rgba(255,255,255,.25);font:800 12.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ nextToPricing }}">Back</div>
+        </div>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ isPublishCreateProvider }}" hint-placeholder-val="{{ false }}">
+      <div style="font:800 18px ui-monospace,monospace;margin-bottom:4px">Create game · Step 4 of 5 — Distribution provider</div>
+      <div style="font:400 11.5px ui-monospace,monospace;color:oklch(0.5 0.01 60);margin-bottom:20px">The provider can store this build and issue purchase/access records for it. It cannot edit your profile.</div>
+      <div style="max-width:560px;display:flex;flex-direction:column;gap:12px">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:14px;background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px">
+          <div><div style="font:700 13px ui-monospace,monospace">Arcadestr Official Distribution</div><div style="font:600 10.5px ui-monospace,monospace;color:oklch(0.55 0.01 60)">dist.arcadestr.io</div></div>
+          <span style="padding:6px 12px;border:1px solid oklch(0.5 0.13 195);background:oklch(0.5 0.13 195 / .12);color:oklch(0.75 0.13 195);font:700 11px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ simulateProvider }}">{{ providerStatus }}</span>
+        </div>
+        <div style="display:flex;gap:10px;margin-top:6px">
+          <div style="padding:11px 20px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ nextToReview }}">Continue &gt;</div>
+          <div style="padding:11px 20px;border:1px solid rgba(255,255,255,.25);font:800 12.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ nextToBuilds }}">Back</div>
+        </div>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ isPublishCreateReview }}" hint-placeholder-val="{{ false }}">
+      <div style="font:800 18px ui-monospace,monospace;margin-bottom:4px">Create game · Step 5 of 5 — Review &amp; publish</div>
+      <div style="max-width:560px;display:flex;flex-direction:column;gap:16px">
+        <div style="background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:16px">
+          <div style="font:800 15px ui-monospace,monospace">Nova Choir</div>
+          <div style="font:600 11px ui-monospace,monospace;color:oklch(0.55 0.01 60);margin-top:4px">4,200 sats · v1.0.0 · Windows, macOS, Linux</div>
+        </div>
+        <div style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">READINESS CHECKLIST</div>
+        <div style="display:flex;flex-direction:column;gap:8px;font:600 12px ui-monospace,monospace">
+          <div style="color:oklch(0.72 0.16 145)">✓ Required store fields complete</div>
+          <div style="color:oklch(0.72 0.16 145)">✓ Payment address set</div>
+          <div style="color:oklch(0.72 0.16 145)">✓ Build uploaded &amp; verified</div>
+          <div style="color:oklch(0.72 0.16 145)">✓ Provider connected</div>
+        </div>
+        <div style="display:flex;gap:10px;margin-top:6px">
+          <div tabIndex="0" style="padding:12px 22px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 13px ui-monospace,monospace;border-radius:5px;cursor:pointer" onClick="{{ publishGame }}">PUBLISH GAME</div>
+          <div tabIndex="0" style="padding:12px 22px;border:1px solid rgba(255,255,255,.25);font:800 13px ui-monospace,monospace;border-radius:5px;cursor:pointer" onClick="{{ nextToProvider }}">Back</div>
+          <div tabIndex="0" style="padding:12px 22px;border:1px dashed oklch(0.6 0.18 25);color:oklch(0.7 0.18 25);font:700 12px ui-monospace,monospace;border-radius:5px;cursor:pointer" onClick="{{ simulatePublishFailure }}">Simulate publish failure</div>
+        </div>
+        <sc-if value="{{ justPublished }}" hint-placeholder-val="{{ false }}">
+          <div style="padding:12px 14px;border:1px solid oklch(0.5 0.16 145);background:oklch(0.5 0.16 145 / .1);color:oklch(0.75 0.16 145);font:700 12px ui-monospace,monospace;border-radius:6px">✓ Published. Live on the store now.</div>
+        </sc-if>
+        <sc-if value="{{ publishFailed }}" hint-placeholder-val="{{ false }}">
+          <div style="padding:12px 14px;border:1px solid oklch(0.6 0.18 25);background:oklch(0.6 0.18 25 / .1);color:oklch(0.75 0.18 25);font:700 12px ui-monospace,monospace;border-radius:6px">
+            ✕ Publish failed — the distribution provider didn't confirm the build. Nothing went live.
+            <div tabIndex="0" style="display:inline-block;margin-top:8px;padding:7px 14px;border:1px solid oklch(0.75 0.18 25);border-radius:4px;cursor:pointer" onClick="{{ retryPublish }}">Retry</div>
+          </div>
+        </sc-if>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ isPublishManage }}" hint-placeholder-val="{{ false }}">
+      <div style="font:800 20px ui-monospace,monospace;margin-bottom:16px">Manage · Echoes of Aster</div>
+      <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:14px;max-width:760px">
+        <div style="background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:16px;cursor:pointer" onClick="{{ goPublishCreateBasicEdit }}"><div style="font:700 12.5px ui-monospace,monospace">Store information</div><div style="font:600 10.5px ui-monospace,monospace;color:oklch(0.55 0.01 60);margin-top:4px">Edit metadata &amp; media</div></div>
+        <div style="background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:16px;cursor:pointer" onClick="{{ goPublishReleases }}"><div style="font:700 12.5px ui-monospace,monospace">Releases</div><div style="font:600 10.5px ui-monospace,monospace;color:oklch(0.55 0.01 60);margin-top:4px">v1.2.0 active</div></div>
+        <div style="background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:16px;cursor:pointer" onClick="{{ goPublishPromotions }}"><div style="font:700 12.5px ui-monospace,monospace">Access &amp; promotions</div><div style="font:600 10.5px ui-monospace,monospace;color:oklch(0.55 0.01 60);margin-top:4px">Paid · no active campaign</div></div>
+        <div style="background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:16px;cursor:pointer" onClick="{{ goPublishActivity }}"><div style="font:700 12.5px ui-monospace,monospace">Distribution</div><div style="font:600 10.5px ui-monospace,monospace;color:oklch(0.55 0.01 60);margin-top:4px">1 provider connected</div></div>
+      </div>
+      <div style="margin-top:22px;padding:18px;border:1px solid oklch(0.55 0.18 25 / .5);border-radius:8px">
+        <div style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.7 0.18 25);margin-bottom:10px">DANGER ZONE</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <div style="padding:9px 16px;border:1px solid oklch(0.6 0.18 25);color:oklch(0.75 0.18 25);font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ openRevokeModal }}">Revoke individual access…</div>
+          <div style="padding:9px 16px;border:1px solid oklch(0.6 0.18 25);color:oklch(0.75 0.18 25);font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer">Unlist game</div>
+          <div style="padding:9px 16px;border:1px solid oklch(0.6 0.18 25);color:oklch(0.75 0.18 25);font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer">Disable public/timed access</div>
+        </div>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ isPublishReleases }}" hint-placeholder-val="{{ false }}">
+      <div style="font:800 20px ui-monospace,monospace;margin-bottom:16px">Releases · Echoes of Aster</div>
+      <div style="display:flex;flex-direction:column;gap:8px;max-width:700px">
+        <sc-for list="{{ releaseRows }}" as="rel" hint-placeholder-count="2">
+          <div style="display:flex;align-items:center;gap:14px;padding:12px 14px;background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:6px">
+            <div style="font:700 12px ui-monospace,monospace;width:60px">{{ rel.version }}</div>
+            <div style="font:600 11px ui-monospace,monospace;color:oklch(0.55 0.01 60);flex:1">{{ rel.date }} · {{ rel.platforms }} · {{ rel.size }}</div>
+            <span style="padding:4px 10px;border:1px solid {{ rel.statusBorder }};color:{{ rel.statusColor }};font:700 10.5px ui-monospace,monospace;border-radius:4px">{{ rel.status }}</span>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ isPublishPromotions }}" hint-placeholder-val="{{ false }}">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <div style="font:800 20px ui-monospace,monospace">Promotions</div>
+        <div tabIndex="0" style="padding:9px 16px;background:oklch(0.72 0.16 145);color:#0b0b0d;font:800 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ openCampaignForm }}">+ Create promotion</div>
+      </div>
+      <sc-if value="{{ campaignFormOpen }}" hint-placeholder-val="{{ false }}">
+        <div style="max-width:520px;background:#121215;border:1px solid oklch(0.72 0.16 145 / .4);border-radius:8px;padding:18px;margin-bottom:16px;display:flex;flex-direction:column;gap:12px">
+          <div style="font:800 13px ui-monospace,monospace">New promotion</div>
+          <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">GAME<select style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:9px;color:#eae6df;font:600 12.5px ui-monospace,monospace"><option>Echoes of Aster</option><option>Nova Choir</option></select></label>
+          <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">TYPE<select style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:9px;color:#eae6df;font:600 12.5px ui-monospace,monospace" onChange="{{ setCampaignType }}"><option value="claim">Claim &amp; keep (permanent)</option><option value="timed">Timed access (temporary)</option></select></label>
+          <div style="display:flex;gap:10px">
+            <label style="flex:1;font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">START<input type="date" style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:8px;color:#eae6df;font:500 12px ui-monospace,monospace"></label>
+            <label style="flex:1;font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">END<input type="date" style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:8px;color:#eae6df;font:500 12px ui-monospace,monospace"></label>
+          </div>
+          <div style="font:500 10.5px ui-monospace,monospace;color:oklch(0.55 0.01 60)">Claim &amp; keep grants permanent ownership to anyone who claims before it ends. Timed access only lasts while the window is open.</div>
+          <div style="display:flex;gap:8px">
+            <div tabIndex="0" style="padding:9px 16px;background:oklch(0.72 0.16 145);color:#0b0b0d;font:800 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ createCampaign }}">Create</div>
+            <div tabIndex="0" style="padding:9px 16px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ closeCampaignForm }}">Cancel</div>
+          </div>
+        </div>
+      </sc-if>
+      <div style="display:flex;flex-direction:column;gap:10px;max-width:700px">
+        <div style="padding:14px 16px;background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:8px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div style="font:700 13px ui-monospace,monospace">Launch Week — Glyph Seeker</div>
+            <span style="padding:4px 10px;border:1px solid oklch(0.55 0.16 145);color:oklch(0.72 0.16 145);font:700 10.5px ui-monospace,monospace;border-radius:4px">ACTIVE</span>
+          </div>
+          <div style="font:600 11px ui-monospace,monospace;color:oklch(0.55 0.01 60);margin-top:6px">Claim &amp; keep · Jul 28 – Aug 4, 2026 · ~340 claims (approximate — relay coverage may be incomplete)</div>
+          <div style="margin-top:10px;display:flex;gap:8px">
+            <div style="padding:7px 14px;border:1px solid oklch(0.6 0.18 25);color:oklch(0.75 0.18 25);font:700 11px ui-monospace,monospace;border-radius:4px;cursor:pointer">Cancel promotion</div>
+          </div>
+          <div style="margin-top:8px;font:500 10.5px ui-monospace,monospace;color:oklch(0.5 0.01 60)">Cancelling stops new claims immediately. Everyone who already claimed keeps the game.</div>
+        </div>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ isPublishActivity }}" hint-placeholder-val="{{ false }}">
+      <div style="font:800 20px ui-monospace,monospace;margin-bottom:16px">Purchase &amp; access activity</div>
+      <div style="display:flex;flex-direction:column;gap:6px;max-width:820px">
+        <sc-for list="{{ activityRows }}" as="a" hint-placeholder-count="3">
+          <div style="display:flex;align-items:center;gap:14px;padding:11px 14px;background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:6px;font:600 11.5px ui-monospace,monospace">
+            <span style="flex:1">{{ a.game }}</span>
+            <span style="color:oklch(0.55 0.01 60);width:120px">{{ a.buyer }}</span>
+            <span style="width:110px">{{ a.type }}</span>
+            <span style="width:80px;color:oklch(0.55 0.01 60)">{{ a.amount }}</span>
+            <span style="color:{{ a.statusColor }}">{{ a.status }}</span>
+          </div>
+        </sc-for>
+      </div>
+      <div style="margin-top:12px;font:500 10.5px ui-monospace,monospace;color:oklch(0.5 0.01 60)">Relay availability may make totals incomplete.</div>
+    </sc-if>
+
+    <sc-if value="{{ isPublishStorePage }}" hint-placeholder-val="{{ false }}">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+        <div style="font:800 20px ui-monospace,monospace">Store page · {{ storeTitleDraft }}</div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <sc-if value="{{ unsavedChanges }}" hint-placeholder-val="{{ false }}">
+            <span style="font:700 11px ui-monospace,monospace;color:oklch(0.72 0.15 300)">● Unsaved changes</span>
+          </sc-if>
+          <div style="padding:9px 16px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ saveDraft }}">Save draft</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:190px 1fr;gap:22px">
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <sc-for list="{{ storePageTabs }}" as="t" hint-placeholder-count="8">
+            <div style="display:flex;align-items:center;gap:8px;padding:9px 10px;border:{{ t.border }};border-radius:5px;font:700 11.5px ui-monospace,monospace;color:{{ t.color }};cursor:pointer" onClick="{{ t.select }}">
+              <span style="width:6px;height:6px;border-radius:50%;background:{{ t.dot }};flex:none"></span>{{ t.label }}
+            </div>
+          </sc-for>
+        </div>
+        <div>
+          <sc-if value="{{ isStorePageBasic }}" hint-placeholder-val="{{ true }}">
+            <div style="max-width:520px;display:flex;flex-direction:column;gap:14px">
+              <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">GAME TITLE<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" value="{{ storeTitleDraft }}" onChange="{{ markDirty }}"></label>
+              <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">SHORT SUMMARY<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:400 12px ui-monospace,monospace" defaultValue="Roguelike bullet-hell across a collapsing dyson swarm." onChange="{{ markDirty }}"></label>
+              <div style="font:600 11px ui-monospace,monospace;color:oklch(0.72 0.16 145)">✓ Section complete</div>
+            </div>
+          </sc-if>
+          <sc-if value="{{ isStorePageDescription }}" hint-placeholder-val="{{ false }}">
+            <div style="max-width:560px">
+              <textarea style="width:100%;height:160px;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:400 12px ui-monospace,monospace" defaultValue="Every run rewrites the map. A roguelike bullet-hell set across a collapsing dyson swarm." onChange="{{ markDirty }}"></textarea>
+              <div style="margin-top:8px;font:600 11px ui-monospace,monospace;color:oklch(0.72 0.16 145)">✓ Section complete</div>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ isStorePageMedia }}" hint-placeholder-val="{{ false }}">
+            <div style="max-width:640px;display:flex;flex-direction:column;gap:20px">
+              <div>
+                <div style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60);margin-bottom:8px">COVER IMAGE — JPEG/PNG/WebP up to 20 MiB. GIF is not supported.</div>
+
+                <sc-if value="{{ mediaIdle }}" hint-placeholder-val="{{ true }}">
+                  <div style="display:flex;gap:10px">
+                    <div style="padding:10px 16px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ selectMediaFile }}">Choose file…</div>
+                    <div style="padding:10px 16px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ switchToUrlMode }}">Provide URL instead</div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ mediaUrlMode }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex;flex-direction:column;gap:8px">
+                    <input style="background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:500 12px ui-monospace,monospace" placeholder="https://…/cover.jpg">
+                    <div style="font:500 10.5px ui-monospace,monospace;color:oklch(0.6 0.13 300)">Replacing an uploaded file's URL manually clears its SHA-256/MIME/size integrity metadata.</div>
+                    <div style="display:flex;gap:8px">
+                      <div style="padding:9px 16px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ useManualUrl }}">Use URL</div>
+                      <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ cancelUpload }}">Cancel</div>
+                    </div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ mediaSelected }}" hint-placeholder-val="{{ false }}">
+                  <div style="background:#0d0d10;border:1px solid rgba(255,255,255,.12);border-radius:6px;padding:14px">
+                    <div style="font:600 12px ui-monospace,monospace">cover-art-final.png · 2.1 MB</div>
+                    <div style="font:600 11px ui-monospace,monospace;color:oklch(0.72 0.16 145);margin:8px 0">✓ Valid type &amp; size</div>
+                    <label style="font:700 10.5px ui-monospace,monospace;color:oklch(0.55 0.01 60)">MEDIA SERVER (BLOSSOM)
+                      <select style="display:block;margin-top:4px;background:#141417;color:#eae6df;border:1px solid rgba(255,255,255,.18);border-radius:4px;padding:8px;font:600 11.5px ui-monospace,monospace">
+                        <option>blossom.arcadestr.io — authorized</option>
+                        <option>blossom.nostr.build — authorized</option>
+                      </select>
+                    </label>
+                    <div style="display:flex;gap:8px;margin-top:12px">
+                      <div style="padding:9px 16px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ beginUpload }}">Start upload</div>
+                      <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ cancelUpload }}">Cancel</div>
+                    </div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ mediaUploading }}" hint-placeholder-val="{{ false }}">
+                  <div style="background:#0d0d10;border:1px solid rgba(255,255,255,.12);border-radius:6px;padding:14px">
+                    <div style="font:600 12px ui-monospace,monospace;margin-bottom:8px">Uploading to blossom.arcadestr.io…</div>
+                    <div style="height:7px;background:#1a1a1d;border-radius:4px;overflow:hidden;margin-bottom:10px"><div style="height:100%;width:55%;background:oklch(0.78 0.16 60)"></div></div>
+                    <div style="display:flex;gap:8px">
+                      <div style="padding:9px 16px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ completeUpload }}">Finish (simulate)</div>
+                      <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ cancelUpload }}">Cancel upload</div>
+                    </div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ mediaSuccess }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex;gap:14px;align-items:center;background:#0d0d10;border:1px solid rgba(255,255,255,.12);border-radius:6px;padding:14px">
+                    <div style="width:70px;height:44px;border-radius:4px;background:radial-gradient(circle at 60% 30%,oklch(0.5 0.14 60 / .45),transparent 55%),linear-gradient(160deg,#181414,#0e0e10 75%);flex:none"></div>
+                    <div style="flex:1">
+                      <div style="font:600 12px ui-monospace,monospace;color:oklch(0.72 0.16 145)">✓ Uploaded to blossom.arcadestr.io</div>
+                      <div style="font:600 10px ui-monospace,monospace;color:oklch(0.5 0.01 60);cursor:pointer;margin-top:4px">▸ Technical details: sha256 a3f5…21b0 · image/png · 2.1 MB</div>
+                    </div>
+                    <div style="padding:8px 14px;border:1px solid rgba(255,255,255,.25);font:700 11px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ removeMedia }}">Replace</div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ mediaManualSuccess }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex;gap:14px;align-items:center;background:#0d0d10;border:1px solid rgba(255,255,255,.12);border-radius:6px;padding:14px">
+                    <div style="width:70px;height:44px;border-radius:4px;background:repeating-linear-gradient(45deg,#222 0 6px,#181818 6px 12px);flex:none"></div>
+                    <div style="flex:1">
+                      <div style="font:600 12px ui-monospace,monospace;color:oklch(0.75 0.13 195)">Manually supplied URL — no integrity metadata</div>
+                    </div>
+                    <div style="padding:8px 14px;border:1px solid rgba(255,255,255,.25);font:700 11px ui-monospace,monospace;border-radius:4px;cursor:pointer" onClick="{{ removeMedia }}">Replace</div>
+                  </div>
+                </sc-if>
+              </div>
+
+              <div>
+                <div style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60);margin-bottom:8px">SCREENSHOTS (ordered)</div>
+                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
+                  <image-slot id="shot-1" shape="rounded" style="height:80px;background:#141417;border:1px dashed rgba(255,255,255,.25);border-radius:5px" placeholder="screenshot 1"></image-slot>
+                  <image-slot id="shot-2" shape="rounded" style="height:80px;background:#141417;border:1px dashed rgba(255,255,255,.25);border-radius:5px" placeholder="screenshot 2"></image-slot>
+                  <image-slot id="shot-3" shape="rounded" style="height:80px;background:#141417;border:1px dashed rgba(255,255,255,.25);border-radius:5px" placeholder="screenshot 3"></image-slot>
+                </div>
+              </div>
+
+              <div>
+                <div style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60);margin-bottom:8px">OTHER UPLOAD STATES (reference)</div>
+                <div style="display:flex;flex-direction:column;gap:6px;font:600 11px ui-monospace,monospace">
+                  <div style="color:oklch(0.65 0.18 25)">✕ GIF rejected — format not supported</div>
+                  <div style="color:oklch(0.65 0.18 25)">✕ File exceeds 20 MiB limit</div>
+                  <div style="color:oklch(0.65 0.18 25)">✕ Signer authentication failed — approve in your signing app and retry</div>
+                  <div style="color:oklch(0.65 0.18 25)">✕ Server rejected upload</div>
+                  <div style="color:oklch(0.7 0.15 60)">⚠ Payment required by this media server</div>
+                  <div style="color:oklch(0.65 0.18 25)">✕ Unsafe or invalid URL blocked</div>
+                  <div style="color:oklch(0.65 0.18 25)">✕ Integrity mismatch — uploaded file hash didn't match</div>
+                  <div style="color:oklch(0.65 0.18 25)">✕ Oversized server response rejected</div>
+                  <div style="color:oklch(0.7 0.15 60)">⚠ Partial failure — succeeded on 1 of 2 selected servers</div>
+                  <div style="color:oklch(0.55 0.13 195)">↻ Duplicate detected — already present on server, reused instantly</div>
+                </div>
+                <div style="margin-top:8px;font:500 10.5px ui-monospace,monospace;color:oklch(0.5 0.01 60)">Only one upload runs per media slot at a time. Cancelling, switching accounts, or picking a newer file discards any in-flight or stale result.</div>
+              </div>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ isStorePageVideo }}" hint-placeholder-val="{{ false }}">
+            <div style="max-width:520px">
+              <div style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60);margin-bottom:8px">TRAILER — MP4 or WebM, up to 500 MiB (optional)</div>
+              <div style="display:flex;gap:10px">
+                <div style="padding:10px 16px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12px ui-monospace,monospace;border-radius:4px;cursor:pointer">Choose file…</div>
+                <div style="padding:10px 16px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:4px;cursor:pointer">Provide URL instead</div>
+              </div>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ isStorePageTags }}" hint-placeholder-val="{{ false }}">
+            <div style="display:flex;gap:8px;flex-wrap:wrap;max-width:520px">
+              <span style="padding:6px 12px;border:1px solid oklch(0.7 0.16 60);background:oklch(0.7 0.16 60 / .14);color:oklch(0.8 0.16 60);font:700 11px ui-monospace,monospace;border-radius:4px">Adventure ✓</span>
+              <span style="padding:6px 12px;border:1px solid rgba(255,255,255,.2);font:700 11px ui-monospace,monospace;border-radius:4px;color:oklch(0.6 0.01 60)">Roguelike</span>
+              <span style="padding:6px 12px;border:1px solid rgba(255,255,255,.2);font:700 11px ui-monospace,monospace;border-radius:4px;color:oklch(0.6 0.01 60)">Singleplayer</span>
+              <input style="margin-top:10px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:500 12px ui-monospace,monospace" placeholder="Add a custom tag…">
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ isStorePageLinks }}" hint-placeholder-val="{{ false }}">
+            <div style="max-width:480px;display:flex;flex-direction:column;gap:14px">
+              <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">WEBSITE<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" value="https://nightglass.studio"></label>
+              <label style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">SUPPORT CONTACT<input style="display:block;margin-top:6px;width:100%;background:#141417;border:1px solid rgba(255,255,255,.18);border-radius:5px;padding:10px;color:#eae6df;font:600 13px ui-monospace,monospace" value="support@nightglass.studio"></label>
+              <div style="font:500 11px ui-monospace,monospace;color:oklch(0.5 0.01 60)">Payment address is set in Pricing &amp; access, not here.</div>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ isStorePageRequirements }}" hint-placeholder-val="{{ false }}">
+            <div style="max-width:480px;display:flex;flex-direction:column;gap:10px;font:500 12px ui-monospace,monospace;color:oklch(0.6 0.01 60)">
+              <div>Minimum: Windows 10 · Quad-core CPU · 8 GB RAM · GTX 1050 · 4 GB storage</div>
+              <div>Recommended: Windows 11 · 6-core CPU · 16 GB RAM · RTX 3060 · 4 GB storage</div>
+              <div style="font:600 11px ui-monospace,monospace;color:oklch(0.6 0.01 60)">Optional section — leaving it blank does not block publishing.</div>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ isStorePagePreview }}" hint-placeholder-val="{{ false }}">
+            <div style="padding:10px 14px;background:oklch(0.68 0.15 300 / .14);border:1px solid oklch(0.6 0.15 300);color:oklch(0.8 0.15 300);font:700 11.5px ui-monospace,monospace;border-radius:5px;margin-bottom:16px">DRAFT PREVIEW — this is not the published page. Buyers won't see these edits until you publish.</div>
+            <div style="max-width:560px;border:1px solid rgba(255,255,255,.12);border-radius:8px;overflow:hidden">
+              <div style="height:180px;background:radial-gradient(circle at 60% 30%,oklch(0.5 0.14 60 / .45),transparent 55%),linear-gradient(160deg,#181414,#0e0e10 75%)"></div>
+              <div style="padding:16px">
+                <div style="font:800 20px ui-monospace,monospace;color:#fff">{{ storeTitleDraft }}</div>
+                <div style="font:600 11px ui-monospace,monospace;color:oklch(0.55 0.01 60);margin-top:6px">by Nightglass Studio · Adventure · Windows, Linux</div>
+              </div>
+            </div>
+          </sc-if>
+        </div>
+      </div>
+    </sc-if>
+  </div>
+</sc-if>
+
+<!-- ===== ACCOUNT / SETTINGS ===== -->
+<sc-if value="{{ isAccount }}" hint-placeholder-val="{{ false }}">
+  <div style="display:grid;grid-template-columns:220px 1fr;gap:26px;padding:26px 28px">
+    <div style="display:flex;flex-direction:column;gap:2px">
+      <sc-for list="{{ settingsNav }}" as="s" hint-placeholder-count="6">
+        <div style="padding:10px 12px;border-radius:5px;font:700 12px ui-monospace,monospace;cursor:pointer;background:{{ s.bg }};color:{{ s.color }}" onClick="{{ s.select }}">{{ s.label }}</div>
+      </sc-for>
+    </div>
+    <div>
+      <sc-if value="{{ isSettingsHome }}" hint-placeholder-val="{{ true }}">
+        <div style="font:800 18px ui-monospace,monospace;margin-bottom:16px">Settings</div>
+        <div style="font:600 12px ui-monospace,monospace;color:oklch(0.55 0.01 60)">Arcadestr v0.9.4 · Up to date</div>
+      </sc-if>
+      <sc-if value="{{ isSettingsSecurity }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 18px ui-monospace,monospace;margin-bottom:16px">Security &amp; signing</div>
+        <div style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60);margin-bottom:10px">SAVED ACCOUNTS</div>
+        <div style="display:flex;flex-direction:column;gap:8px;max-width:460px;margin-bottom:20px">
+          <sc-for list="{{ savedAccounts }}" as="acc" hint-placeholder-count="2">
+            <div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:6px">
+              <div style="width:26px;height:26px;border-radius:50%;background:{{ acc.artBg }}"></div>
+              <span style="font:600 12px ui-monospace,monospace;flex:1">{{ acc.label }}</span>
+              <span style="font:700 10px ui-monospace,monospace;color:oklch(0.6 0.13 145)">{{ acc.status }}</span>
+            </div>
+          </sc-for>
+        </div>
+        <div style="display:flex;gap:10px">
+          <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.25);font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer">Export encrypted backup</div>
+          <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.25);font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer">Import encrypted backup</div>
+        </div>
+      </sc-if>
+      <sc-if value="{{ isSettingsNetwork }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 18px ui-monospace,monospace;margin-bottom:16px">Network</div>
+        <div style="font:600 12px ui-monospace,monospace;color:oklch(0.72 0.16 145);margin-bottom:14px">● Connected — 8 of 10 configured relays reachable</div>
+        <div style="display:flex;flex-direction:column;gap:6px;max-width:500px;margin-bottom:16px">
+          <sc-for list="{{ relayList }}" as="rl" hint-placeholder-count="3">
+            <div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:#121215;border:1px solid rgba(255,255,255,.1);border-radius:6px;font:600 11.5px ui-monospace,monospace">
+              <span style="width:8px;height:8px;border-radius:50%;background:{{ rl.dot }}"></span>
+              <span style="flex:1">{{ rl.url }}</span>
+              <span style="color:oklch(0.5 0.01 60)">{{ rl.latency }}</span>
+            </div>
+          </sc-for>
+        </div>
+        <div style="display:flex;gap:10px">
+          <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.25);font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer">+ Add server</div>
+          <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.25);font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer">Restore defaults</div>
+        </div>
+      </sc-if>
+      <sc-if value="{{ isSettingsBackup }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 18px ui-monospace,monospace;margin-bottom:16px">Data &amp; backup</div>
+        <div style="font:400 12px/1.6 ui-monospace,monospace;color:oklch(0.6 0.01 60);max-width:480px;margin-bottom:16px">Backups include profiles, settings, cached listings, and purchase records. They do not include your private key.</div>
+        <div style="display:flex;gap:10px">
+          <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.25);font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer">Create backup</div>
+          <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.25);font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer">Restore backup</div>
+        </div>
+      </sc-if>
+      <sc-if value="{{ isSettingsAppearance }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 18px ui-monospace,monospace;margin-bottom:16px">Appearance</div>
+        <div style="font:700 11px ui-monospace,monospace;color:oklch(0.6 0.01 60);margin-bottom:8px">THEME</div>
+        <div style="font:600 12px ui-monospace,monospace;color:oklch(0.8 0.16 60);margin-bottom:16px">● Dark (recommended for this build)</div>
+        <label style="display:flex;align-items:center;gap:10px;font:600 12px ui-monospace,monospace"><input type="checkbox">Reduce motion</label>
+      </sc-if>
+      <sc-if value="{{ isSettingsAbout }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 18px ui-monospace,monospace;margin-bottom:16px">About &amp; diagnostics</div>
+        <div style="font:600 12px ui-monospace,monospace;color:oklch(0.6 0.01 60);margin-bottom:6px">Arcadestr v0.9.4</div>
+        <div style="font:600 12px ui-monospace,monospace;color:oklch(0.6 0.01 60);margin-bottom:16px">Protocol support: ADP-01, NIP-102, Entitlement Grant draft (all compatible)</div>
+        <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.25);font:700 11.5px ui-monospace,monospace;border-radius:4px;cursor:pointer;display:inline-block">Export diagnostics</div>
+      </sc-if>
+    </div>
+  </div>
+</sc-if>
+
+<!-- ===== SPEC / DESIGN NOTES ===== -->
+<sc-if value="{{ isSpec }}" hint-placeholder-val="{{ false }}">
+  <div style="padding:30px 28px;max-width:920px;font:400 13px/1.7 ui-monospace,monospace;color:oklch(0.72 0.01 60)">
+    <div style="font:800 24px ui-monospace,monospace;color:#fff;margin-bottom:6px">Design notes</div>
+    <div style="font:600 12px ui-monospace,monospace;color:oklch(0.55 0.01 60);margin-bottom:26px">Functionality inventory, preservation matrix, and audit for this redesign.</div>
+
+    <div style="font:800 13px ui-monospace,monospace;color:oklch(0.8 0.16 60);margin:22px 0 8px">1. FUNCTIONALITY INVENTORY (confirmed by source documents)</div>
+    <div>User roles: Player (buyer), Developer/Publisher, Operator (backend-only, no UI). Primary workflows: discovery/browse/search, four acquisition paths, download/install, library management, publishing, campaign management, profile/achievements, settings/diagnostics. Account-scoped: favorites, purchases, claims, library ownership, publishing identity. Desktop-only: filesystem install, install-location settings, native file picker. Empty/loading/error/offline/stale/incompatible/unavailable states are required on every network-backed screen.</div>
+
+    <div style="font:800 13px ui-monospace,monospace;color:oklch(0.8 0.16 60);margin:22px 0 8px">2. PRESERVATION MATRIX (old → new)</div>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      <div>• Browse/Store front (existing) → <b style="color:#fff">Discover ▸ Store home / Browse</b></div>
+      <div>• Game detail + buy flow (existing) → <b style="color:#fff">Discover ▸ Game details</b> + Payment/Claim/Access modals (new, split out for clarity)</div>
+      <div>• Library (existing) → <b style="color:#fff">Library</b>, tabs expanded: Owned / Installed / Not installed / Updates / Favorites / Access problems</div>
+      <div>• Publish view (existing, single form) → <b style="color:#fff">Publish</b> dashboard + 5-step create wizard + Manage/Releases/Promotions/Activity (relocated &amp; split, no capability removed)</div>
+      <div>• Account selector / settings scattered across components (existing) → <b style="color:#fff">Account menu + Settings</b> (consolidated per inventory's recommendation)</div>
+      <div>• Social feed (existing) → <b style="color:#fff">Community ▸ Social feed</b>, explicitly marked unavailable (matches current truthful-unavailable implementation)</div>
+      <div>• Favorites — <i>no dedicated screen existed in the source inventory.</i> Modeled as a heart toggle on every game card plus a Library tab, both account-scoped. Flagged as an interpretation, not a removal.</div>
+    </div>
+
+    <div style="font:800 13px ui-monospace,monospace;color:oklch(0.8 0.16 60);margin:22px 0 8px">3. RELOCATED / CONSOLIDATED</div>
+    <div>Purchase receipt and Permanent access record were merged into one "Acquisition history" list with type-specific detail modals, since both are read-only durable-record views differing only in payment-vs-grant provenance. Distribution-provider technical fields (fulfillment keys, attestations) are demoted to a collapsed "Technical details" section everywhere, per the terminology table.</div>
+
+    <div style="font:800 13px ui-monospace,monospace;color:oklch(0.8 0.16 60);margin:22px 0 8px">4. FLAGGED AMBIGUITIES (resolved with a stated default)</div>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      <div>• Favorites has no source screen — defaulted to card toggle + Library tab (see above).</div>
+      <div>• "Claim count ... approximate" — shown with an explicit approximation label per the source's instruction, rather than hidden.</div>
+      <div>• Timed-access badge color is new (this redesign's addition); the source material color-coded paid/public/claim but didn't specify timed — assigned violet to keep all four states visually distinct.</div>
+      <div>• Access badges (acquisition path) and status chips (ownership/install) were split into two independent semantic labels, never merged — a card or hero can show "PAID" + "OWNED · NOT INSTALLED" simultaneously, but never a Buy action once owned. The mixed home-row heading was renamed from "Claim & Keep — ends in 2d 4h" (falsely implying all four listed acquisition types were a single expiring claim) to "More on the store," a neutral label; "ends in Xd" now only appears on the Timed access and active Claim & Keep badges/promotion panels, which have real deadlines.</div>
+    </div>
+
+    <div style="font:800 13px ui-monospace,monospace;color:oklch(0.8 0.16 60);margin:22px 0 8px">5. NOT MODELED / LIGHTER FIDELITY IN THIS PASS</div>
+    <div>Install-location settings, developer NIP-05 verification flow detail, and per-relay latency testing are represented as static/simplified panels rather than fully wired flows. No community feed content is fabricated, consistent with the source constraint against inventing social activity.</div>
+  </div>
+</sc-if>
+
+</div>
+</sc-if>
+
+<!-- footer -->
+<div style="max-width:1440px;margin:0 auto;padding:18px 28px;display:flex;justify-content:space-between;font:600 10.5px ui-monospace,monospace;color:oklch(0.4 0.01 60)">
+  <span>ARCADESTR — DECENTRALIZED GAME MARKETPLACE</span>
+  <span style="cursor:pointer;text-decoration:underline" onClick="{{ goSpec }}">Design notes: functionality inventory &amp; preservation matrix</span>
+</div>
+
+<!-- ============ MODALS ============ -->
+<sc-if value="{{ modalOpen }}" hint-placeholder-val="{{ false }}">
+  <div style="position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100" onClick="{{ closeModalBackdrop }}">
+    <div style="width:440px;max-height:86vh;overflow:auto;background:#141417;border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:26px" onClick="{{ stopProp }}">
+
+      <sc-if value="{{ isPaymentModal }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 16px ui-monospace,monospace;margin-bottom:4px">Buy {{ currentGame.title }}</div>
+        <div style="font:700 20px ui-monospace,monospace;color:oklch(0.8 0.16 60);margin-bottom:16px">{{ currentGame.price }} sats</div>
+        <sc-if value="{{ paymentWaiting }}" hint-placeholder-val="{{ true }}">
+          <div style="background:#0d0d10;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:20px;text-align:center;margin-bottom:16px">
+            <div style="width:120px;height:120px;margin:0 auto 12px;background:repeating-linear-gradient(45deg,#222 0 6px,#111 6px 12px);border-radius:6px"></div>
+            <div style="font:600 11px ui-monospace,monospace;color:oklch(0.55 0.01 60)">lnbc1...4x2q (tap to copy)</div>
+            <div style="font:600 11px ui-monospace,monospace;color:oklch(0.6 0.13 300);margin-top:8px">Expires in 9:58</div>
+          </div>
+          <div style="font:600 12px ui-monospace,monospace;color:oklch(0.6 0.13 195);margin-bottom:14px">⏳ Waiting for payment…</div>
+          <div style="display:flex;gap:10px">
+            <div style="flex:1;padding:11px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ simulatePaymentReceived }}">Open wallet (simulate payment)</div>
+            <div style="padding:11px 16px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:5px;cursor:pointer" onClick="{{ closeModal }}">Cancel</div>
+          </div>
+        </sc-if>
+        <sc-if value="{{ paymentConfirmed }}" hint-placeholder-val="{{ false }}">
+          <div style="text-align:center;padding:10px 0 20px">
+            <div style="font:800 34px ui-monospace,monospace;color:oklch(0.72 0.16 145)">✓</div>
+            <div style="font:700 14px ui-monospace,monospace;margin-top:6px">Payment confirmed</div>
+            <div style="font:400 11.5px ui-monospace,monospace;color:oklch(0.55 0.01 60);margin-top:6px">Your purchase record is being published. Access and installation are ready now.</div>
+          </div>
+          <div style="padding:12px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 13px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ finishPurchase }}">Continue to install</div>
+        </sc-if>
+      </sc-if>
+
+      <sc-if value="{{ isClaimModal }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 16px ui-monospace,monospace;margin-bottom:4px">Claim {{ currentGame.title }}</div>
+        <div style="font:600 12px ui-monospace,monospace;color:oklch(0.72 0.16 145);margin-bottom:16px">Launch Week promotion · ends Aug 4, 2026</div>
+        <div style="font:400 12.5px/1.6 ui-monospace,monospace;color:oklch(0.68 0.01 60);margin-bottom:16px">Claim this game now and keep it in your library after the promotion ends. This account will receive access:</div>
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:#0d0d10;border:1px solid rgba(255,255,255,.12);border-radius:6px;margin-bottom:18px">
+          <div style="width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,oklch(0.55 0.1 320),oklch(0.4 0.1 260))"></div>
+          <span style="font:600 12px ui-monospace,monospace">npub1...7k2m</span>
+        </div>
+        <sc-if value="{{ claimReady }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex;gap:10px">
+            <div style="flex:1;padding:11px;background:oklch(0.72 0.16 145);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ startSignerApproval }}">Claim game</div>
+            <div style="padding:11px 16px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:5px;cursor:pointer" onClick="{{ closeModal }}">Cancel</div>
+          </div>
+        </sc-if>
+        <sc-if value="{{ claimWaitingSigner }}" hint-placeholder-val="{{ false }}">
+          <div style="text-align:center;padding:10px 0">
+            <div style="font:600 12.5px ui-monospace,monospace;color:oklch(0.75 0.13 195);margin-bottom:14px">Approve this action in your signing app.</div>
+            <div style="padding:11px;background:oklch(0.72 0.16 145);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:5px;cursor:pointer" onClick="{{ approveSigner }}">Simulate approval</div>
+          </div>
+        </sc-if>
+        <sc-if value="{{ claimClaimed }}" hint-placeholder-val="{{ false }}">
+          <div style="text-align:center;padding:10px 0 20px">
+            <div style="font:800 34px ui-monospace,monospace;color:oklch(0.72 0.16 145)">✓</div>
+            <div style="font:700 14px ui-monospace,monospace;margin-top:6px">Claimed and added to library</div>
+          </div>
+          <div style="padding:12px;background:oklch(0.72 0.16 145);color:#0b0b0d;font:800 13px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ finishClaim }}">Continue to install</div>
+        </sc-if>
+      </sc-if>
+
+      <sc-if value="{{ isDownloadModal }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 16px ui-monospace,monospace;margin-bottom:16px">Installing {{ currentGame.title }}</div>
+        <div style="font:700 12px ui-monospace,monospace;color:{{ downloadStepColor }};margin-bottom:10px">{{ downloadStepLabel }}</div>
+        <div style="height:8px;background:#0d0d10;border-radius:4px;overflow:hidden;margin-bottom:16px">
+          <div style="height:100%;width:{{ downloadPct }};background:oklch(0.78 0.16 60);transition:width .3s"></div>
+        </div>
+        <sc-if value="{{ downloadInProgress }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex;gap:10px">
+            <div style="flex:1;padding:11px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ advanceDownload }}">Advance (simulate)</div>
+            <div style="padding:11px 16px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:5px;cursor:pointer" onClick="{{ closeModal }}">Cancel</div>
+          </div>
+        </sc-if>
+        <sc-if value="{{ downloadDone }}" hint-placeholder-val="{{ false }}">
+          <div style="font:600 12px ui-monospace,monospace;color:oklch(0.72 0.16 145);margin-bottom:14px">✓ File verification passed</div>
+          <div style="display:flex;gap:10px">
+            <div style="flex:1;padding:11px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ closeModal }}">Play</div>
+            <div style="padding:11px 16px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:5px;cursor:pointer" onClick="{{ closeModal }}">Open folder</div>
+          </div>
+        </sc-if>
+      </sc-if>
+
+      <sc-if value="{{ isReceiptModal }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 16px ui-monospace,monospace;margin-bottom:16px">{{ receiptTitle }}</div>
+        <div style="display:flex;flex-direction:column;gap:10px;font:600 12px ui-monospace,monospace">
+          <div style="display:flex;justify-content:space-between"><span style="color:oklch(0.55 0.01 60)">Game</span><span>{{ currentGame.title }}</span></div>
+          <div style="display:flex;justify-content:space-between"><span style="color:oklch(0.55 0.01 60)">Type</span><span>{{ receiptType }}</span></div>
+          <div style="display:flex;justify-content:space-between"><span style="color:oklch(0.55 0.01 60)">Date</span><span>Jul 29, 2026</span></div>
+          <div style="display:flex;justify-content:space-between"><span style="color:oklch(0.55 0.01 60)">Amount</span><span>{{ receiptAmount }}</span></div>
+          <div style="display:flex;justify-content:space-between"><span style="color:oklch(0.55 0.01 60)">Status</span><span style="color:oklch(0.72 0.16 145)">Verified</span></div>
+        </div>
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid rgba(255,255,255,.1)">
+          <div style="font:700 10.5px ui-monospace,monospace;color:oklch(0.5 0.01 60);cursor:pointer">▸ Technical details (order ID, event ID, verification)</div>
+        </div>
+        <div style="margin-top:16px;padding:11px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ closeModal }}">Close</div>
+      </sc-if>
+
+      <sc-if value="{{ isRevokeModal }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 16px ui-monospace,monospace;margin-bottom:6px;color:oklch(0.75 0.18 25)">Revoke individual access</div>
+        <div style="font:400 12px/1.6 ui-monospace,monospace;color:oklch(0.65 0.01 60);margin-bottom:16px">npub1...9k2f will lose future download and reinstall access for this grant. Cancelling the original promotion is not required and other claimants are unaffected.</div>
+        <div style="display:flex;gap:10px">
+          <div style="flex:1;padding:11px;background:oklch(0.6 0.18 25);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ closeModal }}">Revoke access</div>
+          <div style="padding:11px 16px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:5px;cursor:pointer" onClick="{{ closeModal }}">Cancel</div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ isSwitcherModal }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 16px ui-monospace,monospace;margin-bottom:16px">Switch account</div>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">
+          <sc-for list="{{ savedAccounts }}" as="acc" hint-placeholder-count="2">
+            <div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:#0d0d10;border:1px solid rgba(255,255,255,.12);border-radius:6px;cursor:pointer" onClick="{{ closeModal }}">
+              <div style="width:26px;height:26px;border-radius:50%;background:{{ acc.artBg }}"></div>
+              <span style="font:600 12px ui-monospace,monospace;flex:1">{{ acc.label }}</span>
+              <span style="font:700 10px ui-monospace,monospace;color:oklch(0.6 0.13 145)">{{ acc.status }}</span>
+            </div>
+          </sc-for>
+        </div>
+        <div style="padding:11px;border:1px dashed rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ closeModal }}">+ Add account</div>
+      </sc-if>
+
+      <sc-if value="{{ isUnsavedConfirmModal }}" hint-placeholder-val="{{ false }}">
+        <div style="font:800 16px ui-monospace,monospace;margin-bottom:6px">Leave without saving?</div>
+        <div style="font:400 12px/1.6 ui-monospace,monospace;color:oklch(0.65 0.01 60);margin-bottom:18px">Your store page has unsaved changes. They'll be lost if you leave without saving.</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div style="padding:11px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12.5px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ saveAndLeave }}">Save draft and leave</div>
+          <div style="padding:11px;border:1px solid oklch(0.6 0.18 25);color:oklch(0.75 0.18 25);font:700 12px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ discardAndLeave }}">Discard changes and leave</div>
+          <div style="padding:11px;border:1px solid rgba(255,255,255,.25);font:700 12px ui-monospace,monospace;border-radius:5px;text-align:center;cursor:pointer" onClick="{{ cancelLeave }}">Cancel</div>
+        </div>
+      </sc-if>
+
+    </div>
+  </div>
+</sc-if>
+
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+const AMBER = 'oklch(0.78 0.16 60)';
+const AMBER_BG = 'oklch(0.78 0.16 60)';
+const GREEN = 'oklch(0.72 0.16 145)';
+const CYAN = 'oklch(0.8 0.14 195)';
+const VIOLET = 'oklch(0.68 0.15 300)';
+const DIM = 'oklch(0.55 0.01 60)';
+
+const GAMES = [
+  { id:'aster', title:'Echoes of Aster', developer:'Nightglass Studio', tags:['Adventure'], platforms:['Windows','Linux'], acquisition:'paid', price:4200, description:'Roguelike bullet-hell across a collapsing dyson swarm. Every run rewrites the map.', version:'1.2.0', size:'3.4 GB', updated:'Jul 12, 2026', art:'radial-gradient(circle at 60% 30%, oklch(0.5 0.14 60 / .45), transparent 55%),linear-gradient(160deg,#181414,#0e0e10 75%)' },
+  { id:'glyph', title:'Glyph Seeker', developer:'Loom Interactive', tags:['Puzzle'], platforms:['Windows','Linux'], acquisition:'claim', description:'A quiet, glyph-decoding puzzle game about a dead language and the people who spoke it.', version:'1.0.1', size:'1.1 GB', updated:'Jul 20, 2026', art:'radial-gradient(circle at 40% 25%, oklch(0.5 0.14 300 / .4), transparent 55%),linear-gradient(160deg,#181420,#0f0d13 75%)' },
+  { id:'epoch', title:'Static Epoch', developer:'Halide Games', tags:['Simulation'], platforms:['Web'], acquisition:'public', description:'A slow city-builder that runs entirely in the browser. Free while the developer keeps it open.', version:'0.8.3', size:'—', updated:'Jul 18, 2026', art:'radial-gradient(circle at 55% 30%, oklch(0.5 0.13 210 / .4), transparent 55%),linear-gradient(160deg,#12181f,#0d1013 75%)' },
+  { id:'ferro', title:'Ferro Tactics', developer:'Ironvale', tags:['Strategy'], platforms:['Windows'], acquisition:'timed', description:'Turn-based mech tactics. Free to download during the current promotional window only.', version:'2.1.0', size:'2.8 GB', updated:'Jul 22, 2026', art:'radial-gradient(circle at 45% 25%, oklch(0.55 0.15 300 / .4), transparent 55%),linear-gradient(160deg,#1a1420,#100d13 75%)' },
+  { id:'aurora', title:'Aurora Choir', developer:'Halide Games', tags:['Simulation'], platforms:['macOS'], acquisition:'paid', price:1800, description:'A macOS-only ambient choir simulator. Not yet built for your current platform.', version:'1.0.0', size:'900 MB', updated:'Jul 24, 2026', art:null },
+  { id:'moss', title:'Whispers in the Moss', developer:'Fernlight', tags:['Adventure'], platforms:['Windows','macOS'], acquisition:'paid', price:2400, description:'A wandering forest adventure told almost entirely without words.', version:'1.4.0', size:'2.1 GB', updated:'Jun 30, 2026', art:'radial-gradient(circle at 60% 20%, oklch(0.5 0.14 145 / .45), transparent 55%),linear-gradient(160deg,#14201a,#0e120f 75%)' },
+];
+
+class Component extends DCLogic {
+  state = {
+    nav: 'store', accountMenuOpen: false, signedIn: true,
+    storeScreen: 'home', selectedGameId: 'aster',
+    browseAcquisition: 'all', browsePlatform: 'all', browseSort: 'recommended',
+    libraryTab: 'owned',
+    communityScreen: 'profile',
+    publishScreen: 'dashboard',
+    settingsSection: 'home',
+    modal: null,
+    paymentPhase: 'waiting', claimPhase: 'ready', downloadPhase: 'downloading',
+    favorites: {},
+    ownership: { aster:'none', glyph:'none', epoch:'none', ferro:'none', moss:'purchased' },
+    installed: { moss:true },
+    hashSimulated: false, providerConnected: false, justPublished: false,
+    storePageTab: 'basic', storeTitleDraft: 'Echoes of Aster', unsavedChanges: false,
+    mediaUploadPhase: 'idle', mediaMode: 'upload',
+    pendingNavAction: null,
+    publishFailed: false,
+    myPlatform: 'Windows',
+    campaignFormOpen: false, campaignType: 'claim',
+  };
+
+  openCampaignForm = () => this.setState({ campaignFormOpen:true });
+  closeCampaignForm = () => this.setState({ campaignFormOpen:false });
+  setCampaignType = (e) => this.setState({ campaignType: e.target.value });
+  createCampaign = () => this.setState({ campaignFormOpen:false });
+  simulatePublishFailure = () => this.setState({ publishFailed:true, justPublished:false });
+  retryPublish = () => this.setState({ publishFailed:false, justPublished:true });
+
+  guardedNav = (fn) => {
+    if (this.state.nav === 'publish' && this.state.publishScreen === 'storePage' && this.state.unsavedChanges) {
+      this.setState({ pendingNavAction: () => fn(), modal: 'unsavedConfirm' });
+    } else {
+      fn();
+    }
+  };
+  discardAndLeave = () => { const fn = this.state.pendingNavAction; this.setState({ unsavedChanges:false, modal:null, pendingNavAction:null }); if (fn) fn(); };
+  saveAndLeave = () => { const fn = this.state.pendingNavAction; this.setState({ unsavedChanges:false, modal:null, pendingNavAction:null }); if (fn) fn(); };
+  cancelLeave = () => this.setState({ modal:null, pendingNavAction:null });
+
+  setStorePageTab = (t) => this.setState({ storePageTab:t });
+  openStorePage = () => this.setState({ nav:'publish', publishScreen:'storePage', storePageTab:'basic' });
+  markDirty = (e) => this.setState({ storeTitleDraft: e.target.value, unsavedChanges:true });
+  saveDraft = () => this.setState({ unsavedChanges:false });
+  selectMediaFile = () => this.setState({ mediaUploadPhase:'selected', mediaMode:'upload' });
+  switchToUrlMode = () => this.setState({ mediaMode:'url' });
+  useManualUrl = () => this.setState({ mediaUploadPhase:'manual_success' });
+  beginUpload = () => this.setState({ mediaUploadPhase:'uploading' });
+  completeUpload = () => this.setState({ mediaUploadPhase:'success' });
+  cancelUpload = () => this.setState({ mediaUploadPhase:'idle', mediaMode:'upload' });
+  retryUpload = () => this.setState({ mediaUploadPhase:'uploading' });
+  removeMedia = () => this.setState({ mediaUploadPhase:'idle', mediaMode:'upload' });
+
+  goHome = () => this.guardedNav(() => this.setState({ nav:'store', storeScreen:'home' }));
+  goStore = () => this.guardedNav(() => this.setState({ nav:'store' }));
+  goLibrary = () => this.guardedNav(() => this.setState({ nav:'library' }));
+  goCommunity = () => this.guardedNav(() => this.setState({ nav:'community', communityScreen:'profile' }));
+  goPublish = () => this.guardedNav(() => this.setState({ nav:'publish', publishScreen:'dashboard' }));
+  goSettings = () => this.guardedNav(() => this.setState({ nav:'account', accountMenuOpen:false, settingsSection:'home' }));
+  goProfile = () => this.guardedNav(() => this.setState({ nav:'community', communityScreen:'profile', accountMenuOpen:false }));
+  goDeveloperProfile = () => this.setState({ nav:'community', communityScreen:'profile' });
+  goNetwork = () => this.setState({ nav:'account', settingsSection:'network' });
+  goLogin = () => this.setState({ nav:'login' });
+  goSpec = () => this.setState({ nav:'spec' });
+  toggleAccountMenu = () => this.setState(s => ({ accountMenuOpen: !s.accountMenuOpen }));
+  openSwitcher = () => this.guardedNav(() => this.setState({ modal:'accountSwitcher', accountMenuOpen:false }));
+  signOut = () => this.setState({ signedIn:false, nav:'login', accountMenuOpen:false });
+  completeLogin = () => this.setState({ signedIn:true, nav:'store' });
+
+  goBrowse = () => this.setState({ storeScreen:'browse' });
+  openGame = (id) => this.setState({ selectedGameId:id, storeScreen:'details', nav:'store' });
+  setAcquisitionFilter = (e) => this.setState({ browseAcquisition: e.target.value });
+  setPlatformFilter = (e) => this.setState({ browsePlatform: e.target.value });
+  setSort = (e) => this.setState({ browseSort: e.target.value });
+  toggleFavorite = (id) => this.setState(s => ({ favorites: { ...s.favorites, [id]: !s.favorites[id] } }));
+
+  openModal = (name) => this.setState({ modal:name });
+  closeModal = () => this.setState({ modal:null, paymentPhase:'waiting', claimPhase:'ready', downloadPhase:'downloading' });
+  stopProp = (e) => e.stopPropagation();
+  closeModalBackdrop = () => this.closeModal();
+
+  startBuy = (id) => this.setState({ selectedGameId:id, modal:'payment', paymentPhase:'waiting' });
+  simulatePaymentReceived = () => this.setState({ paymentPhase:'confirmed' });
+  finishPurchase = () => {
+    const id = this.state.selectedGameId;
+    this.setState(s => ({ ownership: { ...s.ownership, [id]: 'purchased' }, modal:'download', downloadPhase:'downloading' }));
+  };
+
+  startClaim = (id) => this.setState({ selectedGameId:id, modal:'claim', claimPhase:'ready' });
+  startSignerApproval = () => this.setState({ claimPhase:'waiting_signer' });
+  approveSigner = () => this.setState({ claimPhase:'claimed' });
+  finishClaim = () => {
+    const id = this.state.selectedGameId;
+    this.setState(s => ({ ownership: { ...s.ownership, [id]: 'claimed' }, modal:'download', downloadPhase:'downloading' }));
+  };
+
+  startInstall = (id) => this.setState({ selectedGameId:id, modal:'download', downloadPhase:'downloading' });
+  advanceDownload = () => {
+    const order = ['downloading','verifying','installing','complete'];
+    this.setState(s => {
+      const i = order.indexOf(s.downloadPhase);
+      const next = order[Math.min(i+1, order.length-1)];
+      const installed = next === 'complete' ? { ...s.installed, [s.selectedGameId]: true } : s.installed;
+      return { downloadPhase: next, installed };
+    });
+  };
+
+  openReceipt = (id) => this.setState({ selectedGameId:id, modal:'receipt' });
+  openAccessRecord = (id) => this.setState({ selectedGameId:id, modal:'receipt' });
+  openRevokeModal = () => this.setState({ modal:'revoke' });
+
+  setLibraryTab = (tab) => this.setState({ libraryTab: tab });
+  goCommunityProfile = () => this.setState({ communityScreen:'profile' });
+  goCommunityEditProfile = () => this.setState({ communityScreen:'editProfile' });
+  goEditProfile = () => this.setState({ communityScreen:'editProfile' });
+  goCommunityAchievements = () => this.setState({ communityScreen:'achievements' });
+  goCommunityFeed = () => this.setState({ communityScreen:'feed' });
+
+  startCreateGame = () => this.setState({ nav:'publish', publishScreen:'createBasic', justPublished:false });
+  nextToPricing = () => this.setState({ publishScreen:'createPricing' });
+  backToBasic = () => this.setState({ publishScreen:'createBasic' });
+  nextToBuilds = () => this.setState({ publishScreen:'createBuilds' });
+  simulateHash = () => this.setState({ hashSimulated:true });
+  nextToProvider = () => this.setState({ publishScreen:'createProvider' });
+  simulateProvider = () => this.setState({ providerConnected:true });
+  nextToReview = () => this.setState({ publishScreen:'createReview' });
+  publishGame = () => this.setState({ justPublished:true });
+  goPublishManage = () => this.setState({ publishScreen:'manage' });
+  goPublishCreateBasicEdit = () => this.setState({ publishScreen:'createBasic' });
+  goPublishReleases = () => this.setState({ publishScreen:'releases' });
+  goPublishPromotions = () => this.setState({ publishScreen:'promotions' });
+  goPublishActivity = () => this.setState({ publishScreen:'activity' });
+  setPublishScreen = (s) => this.setState({ publishScreen:s });
+
+  setSettingsSection = (s) => this.setState({ settingsSection:s });
+
+  // Access badge: always describes the acquisition PATH — never overridden by ownership/install.
+  accessBadgeFor(g) {
+    if (g.acquisition === 'paid') return { label:'⚡ PAID · '+g.price.toLocaleString()+' SATS', border:'none', bg:AMBER_BG, color:'#0b0b0d' };
+    if (g.acquisition === 'claim') return { label:'🎁 CLAIM & KEEP', border:'none', bg:GREEN, color:'#0b0b0d' };
+    if (g.acquisition === 'public') return { label:'🛈 PUBLIC ACCESS', border:'1px solid '+CYAN, bg:CYAN+' / .16', color:CYAN };
+    if (g.acquisition === 'timed') return { label:'⏳ TIMED ACCESS · 2D LEFT', border:'1px solid '+VIOLET, bg:VIOLET+' / .16', color:VIOLET };
+    return { label:'', border:'none', bg:'transparent', color:DIM };
+  }
+  // Status chip: always describes the account/device STATE — separate semantic dimension, shown alongside the access badge, never replacing it.
+  statusChipFor(g, ownership, installed) {
+    const own = ownership[g.id];
+    const inst = installed[g.id];
+    if (inst) return { label:'✓ INSTALLED', color:GREEN };
+    if (own === 'purchased' || own === 'claimed') return { label:'✓ OWNED · NOT INSTALLED', color:GREEN };
+    return null;
+  }
+  badgeFor(g, ownership, installed) { return this.accessBadgeFor(g); }
+
+  primaryAction(g, ownership, installed, myPlatform) {
+    const own = ownership[g.id];
+    const inst = installed[g.id];
+    if (myPlatform && g.platforms && !g.platforms.includes(myPlatform)) {
+      return { label:'INCOMPATIBLE WITH YOUR SYSTEM', bg:'#2a2a2e', color:'oklch(0.55 0.01 60)', action: () => {}, disabled:true };
+    }
+    // Ownership/installation gate every acquisition path — a paid game never shows "Buy" once owned, etc.
+    if (inst) return { label:'PLAY', bg:AMBER, color:'#0b0b0d', action: () => {} };
+    if (own === 'purchased' || own === 'claimed') return { label:'INSTALL', bg:AMBER, color:'#0b0b0d', action: () => this.startInstall(g.id) };
+    if (g.acquisition === 'paid') return { label:'BUY — '+g.price.toLocaleString()+' SATS', bg:AMBER, color:'#0b0b0d', action: () => this.startBuy(g.id) };
+    if (g.acquisition === 'claim') return { label:'CLAIM GAME', bg:GREEN, color:'#0b0b0d', action: () => this.startClaim(g.id) };
+    if (g.acquisition === 'public') return { label:'INSTALL', bg:CYAN, color:'#0b0b0d', action: () => this.startInstall(g.id) };
+    if (g.acquisition === 'timed') return { label:'INSTALL WHILE AVAILABLE', bg:VIOLET, color:'#0b0b0d', action: () => this.startInstall(g.id) };
+    return { label:'UNAVAILABLE', bg:'#333', color:'#888', action: () => {} };
+  }
+
+  buildCard(g, ownership, installed, favorites, myPlatform) {
+    const badge = this.accessBadgeFor(g);
+    const status = this.statusChipFor(g, ownership, installed);
+    const action = this.primaryAction(g, ownership, installed, myPlatform);
+    return {
+      id: g.id, title: g.title, artBg: g.art, hasArt: !!g.art, noArt: !g.art,
+      meta: g.tags[0].toUpperCase() + ' · ' + g.platforms.join('/').toUpperCase(),
+      badgeLabel: badge.label, badgeBorder: badge.border, badgeBg: badge.bg, badgeColor: badge.color,
+      hasStatus: !!status, statusLabel: status ? status.label : '', statusColor: status ? status.color : DIM,
+      actionLabel: action.label, actionBg: action.disabled ? 'transparent' : action.bg, actionColor: action.disabled ? action.color : action.color,
+      actionBorder: action.disabled ? '1px solid rgba(255,255,255,.15)' : 'none',
+      favIcon: favorites[g.id] ? '♥' : '♡',
+      favActive: !!favorites[g.id],
+      open: () => this.openGame(g.id),
+      toggleFav: (e) => { e.stopPropagation(); this.toggleFavorite(g.id); },
+      runAction: (e) => { e.stopPropagation(); if (!action.disabled) action.action(); else this.openGame(g.id); },
+    };
+  }
+
+  renderVals() {
+    const s = this.state;
+    const featured = GAMES.find(g => g.id === 'aster');
+    const featuredBadge = this.accessBadgeFor(featured);
+    const featuredStatus = this.statusChipFor(featured, s.ownership, s.installed);
+    const featuredAction = this.primaryAction(featured, s.ownership, s.installed, s.myPlatform);
+
+    const homeGrid = GAMES.filter(g => g.id !== 'aster' && g.id !== 'aurora').map(g => this.buildCard(g, s.ownership, s.installed, s.favorites, s.myPlatform));
+
+    let browseList = GAMES.filter(g => {
+      if (s.browseAcquisition !== 'all') {
+        if (s.browseAcquisition === 'owned') { if (!(s.ownership[g.id] === 'purchased' || s.ownership[g.id] === 'claimed')) return false; }
+        else if (g.acquisition !== s.browseAcquisition) return false;
+      }
+      if (s.browsePlatform !== 'all' && !g.platforms.includes(s.browsePlatform)) return false;
+      return true;
+    });
+    const browseGrid = browseList.map(g => this.buildCard(g, s.ownership, s.installed, s.favorites, s.myPlatform));
+
+    const currentGameData = GAMES.find(g => g.id === s.selectedGameId) || GAMES[0];
+    const cgBadge = this.accessBadgeFor(currentGameData);
+    const cgStatus = this.statusChipFor(currentGameData, s.ownership, s.installed);
+    const cgAction = this.primaryAction(currentGameData, s.ownership, s.installed, s.myPlatform);
+    const own = s.ownership[currentGameData.id];
+    let accessNote = 'Gated — requires purchase.';
+    if (currentGameData.acquisition === 'public') accessNote = 'Anyone may download while this listing allows public access. This access is not added permanently to your account.';
+    if (currentGameData.acquisition === 'timed') accessNote = 'Available only while the timed window is open (ends in 2 days). Reinstalling after it ends will require another valid access path.';
+    if (currentGameData.acquisition === 'claim') accessNote = 'Claim during the active promotion to keep this game permanently, even after the promotion ends.';
+    if (currentGameData.acquisition === 'paid') accessNote = 'A one-time Lightning purchase grants permanent, portable ownership.';
+    let ownershipNote = '';
+    if (own === 'purchased') ownershipNote = '✓ Purchased — permanent access on this account.';
+    if (own === 'claimed') ownershipNote = '✓ Claimed — permanent access on this account.';
+
+    const currentGame = {
+      ...currentGameData,
+      price: currentGameData.price,
+      tagChips: currentGameData.tags,
+      platformChips: currentGameData.platforms,
+      badgeLabel: cgBadge.label, badgeBorder: cgBadge.border, badgeBg: cgBadge.bg, badgeColor: cgBadge.color,
+      hasStatus: !!cgStatus, statusLabel: cgStatus ? cgStatus.label : '', statusColor: cgStatus ? cgStatus.color : DIM,
+      actionLabel: cgAction.label, actionBg: cgAction.bg, actionColor: cgAction.color, action: cgAction.action,
+      favLabel: s.favorites[currentGameData.id] ? '♥ Remove from favorites' : '♡ Add to favorites',
+      toggleFav: () => this.toggleFavorite(currentGameData.id),
+      accessNote, showOwnershipPanel: own === 'purchased' || own === 'claimed', ownershipNote,
+      receiptLinkLabel: currentGameData.acquisition === 'paid' ? 'View purchase receipt →' : 'View access record →',
+      openReceipt: () => this.openReceipt(currentGameData.id),
+    };
+
+    const libTabs = [
+      { key:'owned', label:'OWNED' }, { key:'installed', label:'INSTALLED' }, { key:'notInstalled', label:'NOT INSTALLED' },
+      { key:'favorites', label:'FAVORITES' }, { key:'updates', label:'UPDATES' }, { key:'accessProblems', label:'ACCESS PROBLEMS' },
+    ];
+    const libraryTabs = libTabs.map(t => ({
+      label: t.label,
+      border: '1px solid ' + (s.libraryTab === t.key ? AMBER : 'rgba(255,255,255,.18)'),
+      bg: s.libraryTab === t.key ? AMBER + ' / .14' : 'transparent',
+      color: s.libraryTab === t.key ? AMBER : DIM,
+      select: () => this.setLibraryTab(t.key),
+    }));
+
+    let libGames = [];
+    if (s.libraryTab === 'owned') libGames = GAMES.filter(g => s.ownership[g.id] === 'purchased' || s.ownership[g.id] === 'claimed');
+    else if (s.libraryTab === 'installed') libGames = GAMES.filter(g => s.installed[g.id]);
+    else if (s.libraryTab === 'notInstalled') libGames = GAMES.filter(g => (s.ownership[g.id] === 'purchased' || s.ownership[g.id] === 'claimed') && !s.installed[g.id]);
+    else if (s.libraryTab === 'favorites') libGames = GAMES.filter(g => s.favorites[g.id]);
+    else if (s.libraryTab === 'updates') libGames = GAMES.filter(g => g.id === 'moss');
+
+    const libraryRows = s.libraryTab === 'accessProblems' ? [{
+      artBg:'linear-gradient(160deg,#201414,#0f0d0d)', title:'Ferro Tactics', subtitle:'Claim revoked by developer — download access removed',
+      badgeLabel:'REVOKED', badgeBorder:'1px solid oklch(0.6 0.18 25)', badgeBg:'oklch(0.6 0.18 25 / .14)', badgeColor:'oklch(0.75 0.18 25)',
+      actionLabel:'DETAILS', actionBg:'transparent', actionColor:DIM, action:() => {},
+    }] : libGames.map(g => {
+      const badge = this.badgeFor(g, s.ownership, s.installed);
+      const inst = s.installed[g.id];
+      return {
+        artBg: g.art, title: g.title,
+        subtitle: (inst ? 'Installed · v'+g.version : (s.libraryTab==='updates' ? 'Update available: v1.5.0' : 'Not installed')),
+        badgeLabel: badge.label, badgeBorder: badge.border, badgeBg: badge.bg, badgeColor: badge.color,
+        actionLabel: s.libraryTab === 'updates' ? 'UPDATE' : (inst ? 'PLAY' : 'INSTALL'),
+        actionBg: AMBER, actionColor:'#0b0b0d',
+        action: () => this.startInstall(g.id),
+      };
+    });
+
+    const myGamesGrid = [GAMES[0], { id:'nova', title:'Nova Choir', art:'linear-gradient(160deg,#1a1420,#0f0d13)' }].map(g => ({
+      title: g.title, artBg: g.art || g.art, open: () => this.setState({ nav:'publish', publishScreen:'manage' }),
+    }));
+    const myGamesRows = [
+      { title:'Echoes of Aster', meta:'Paid · 4,200 sats · v1.2.0', status:'PUBLISHED', artBg: GAMES[0].art, manage: this.goPublishManage },
+      { title:'Nova Choir', meta:'Draft · pricing incomplete', status:'DRAFT', artBg:'linear-gradient(160deg,#1a1420,#0f0d13)', manage: () => this.setState({ nav:'publish', publishScreen:'createBasic' }) },
+    ];
+
+    const badges = [
+      { name:'Early Publisher', date:'Jun 2026', artBg:'linear-gradient(135deg,'+AMBER+',oklch(0.6 0.16 40))' },
+      { name:'First Sale', date:'Jun 2026', artBg:'linear-gradient(135deg,'+GREEN+',oklch(0.6 0.16 160))' },
+      { name:'Community Builder', date:'Jul 2026', artBg:'linear-gradient(135deg,'+CYAN+',oklch(0.5 0.13 230))' },
+      { name:'Verified Identity', date:'Jul 2026', artBg:'linear-gradient(135deg,'+VIOLET+',oklch(0.5 0.13 260))' },
+    ];
+
+    const pubTabsDef = [
+      { key:'dashboard', label:'DASHBOARD' }, { key:'createBasic', label:'CREATE GAME' }, { key:'manage', label:'MANAGE' },
+      { key:'releases', label:'RELEASES' }, { key:'promotions', label:'PROMOTIONS' }, { key:'activity', label:'ACTIVITY' },
+    ];
+    const publishTabs = pubTabsDef.map(t => ({
+      label: t.label,
+      border: '1px solid ' + (s.publishScreen === t.key || (t.key==='createBasic' && s.publishScreen.startsWith('create')) ? AMBER : 'rgba(255,255,255,.18)'),
+      color: s.publishScreen === t.key || (t.key==='createBasic' && s.publishScreen.startsWith('create')) ? AMBER : DIM,
+      select: () => this.setPublishScreen(t.key),
+    }));
+
+    const releaseRows = [
+      { version:'v1.2.0', date:'Jul 12, 2026', platforms:'Win/Linux', size:'3.4 GB', status:'ACTIVE', statusBorder:GREEN, statusColor:GREEN },
+      { version:'v1.1.0', date:'Jun 2, 2026', platforms:'Win/Linux', size:'3.2 GB', status:'SUPERSEDED', statusBorder:'rgba(255,255,255,.25)', statusColor:DIM },
+    ];
+    const activityRows = [
+      { game:'Echoes of Aster', buyer:'npub1...4f2a', type:'Purchase', amount:'4,200 sats', status:'Paid', statusColor:GREEN },
+      { game:'Glyph Seeker', buyer:'npub1...9c1e', type:'Promotion claim', amount:'—', status:'Granted', statusColor:GREEN },
+      { game:'Echoes of Aster', buyer:'npub1...7b3d', type:'Purchase', amount:'4,200 sats', status:'Refunded', statusColor:'oklch(0.7 0.15 60)' },
+    ];
+
+    const settingsDef = [
+      { key:'home', label:'Account' }, { key:'security', label:'Security & signing' }, { key:'network', label:'Network' },
+      { key:'backup', label:'Data & backup' }, { key:'appearance', label:'Appearance' }, { key:'about', label:'About & diagnostics' },
+    ];
+    const settingsNav = settingsDef.map(t => ({
+      label: t.label, bg: s.settingsSection === t.key ? AMBER + ' / .14' : 'transparent', color: s.settingsSection === t.key ? AMBER : '#eae6df',
+      select: () => this.setSettingsSection(t.key),
+    }));
+
+    const savedAccounts = [
+      { label:'npub1...7k2m', status:'ACTIVE', artBg:'linear-gradient(135deg,oklch(0.55 0.1 320),oklch(0.4 0.1 260))' },
+      { label:'npub1...2b9f', status:'SAVED', artBg:'linear-gradient(135deg,oklch(0.5 0.1 60),oklch(0.4 0.1 20))' },
+    ];
+    const relayList = [
+      { url:'wss://relay.arcadestr.io', latency:'44ms', dot:GREEN },
+      { url:'wss://relay.damus.io', latency:'112ms', dot:GREEN },
+      { url:'wss://nos.lol', latency:'—', dot:'oklch(0.6 0.18 25)' },
+    ];
+
+    const modalOpen = !!s.modal;
+
+    return {
+      showTopBar: s.nav !== 'login', showMain: s.nav !== 'login',
+      isLogin: s.nav === 'login',
+      isStoreHome: s.nav === 'store' && s.storeScreen === 'home',
+      isStoreBrowse: s.nav === 'store' && s.storeScreen === 'browse',
+      isStoreDetails: s.nav === 'store' && s.storeScreen === 'details',
+      isLibrary: s.nav === 'library',
+      isCommunity: s.nav === 'community',
+      isPublish: s.nav === 'publish',
+      isAccount: s.nav === 'account',
+      isSpec: s.nav === 'spec',
+      signedIn: s.signedIn, notSignedIn: !s.signedIn,
+      accountMenuOpen: s.accountMenuOpen,
+      relayLabel: '8 RELAYS',
+      storeNavColor: s.nav === 'store' ? AMBER : DIM, libraryNavColor: s.nav === 'library' ? AMBER : DIM,
+      communityNavColor: s.nav === 'community' ? AMBER : DIM, publishNavColor: s.nav === 'publish' ? AMBER : DIM,
+      goHome: this.goHome, goStore: this.goStore, goLibrary: this.goLibrary, goCommunity: this.goCommunity,
+      goPublish: this.goPublish, goSettings: this.goSettings, goProfile: this.goProfile, goNetwork: this.goNetwork,
+      goLogin: this.goLogin, goSpec: this.goSpec, toggleAccountMenu: this.toggleAccountMenu,
+      openSwitcher: this.openSwitcher, signOut: this.signOut, completeLogin: this.completeLogin,
+
+      featuredGame: { title: featured.title, description: featured.description, tagChips: featured.tags,
+        developer: featured.developer, platforms: featured.platforms.join(' / '),
+        badgeLabel: featuredBadge.label, badgeBorder: featuredBadge.border, badgeBg: featuredBadge.bg, badgeColor: featuredBadge.color,
+        hasStatus: !!featuredStatus, statusLabel: featuredStatus ? featuredStatus.label : '', statusColor: featuredStatus ? featuredStatus.color : DIM,
+        actionLabel: featuredAction.label, actionBg: featuredAction.bg, action: featuredAction.action, openDetails: () => this.openGame('aster') },
+      homeGrid,
+
+      goBrowse: this.goBrowse,
+      setAcquisitionFilter: this.setAcquisitionFilter, setPlatformFilter: this.setPlatformFilter, setSort: this.setSort,
+      resultCount: browseGrid.length, hasBrowseResults: browseGrid.length > 0, noBrowseResults: browseGrid.length === 0,
+      browseGrid,
+
+      currentGame, goDeveloperProfile: this.goDeveloperProfile,
+
+      libraryTabs, libraryHasItems: s.libraryTab === 'accessProblems' ? true : libraryRows.length > 0,
+      libraryEmpty: s.libraryTab !== 'accessProblems' && libraryRows.length === 0,
+      libraryEmptyText: s.libraryTab === 'favorites' ? 'No favorites yet. Tap the heart on any game to save it here.' : 'Nothing here yet.',
+      libraryRows,
+
+      profileTabBorder: '1px solid ' + (s.communityScreen === 'profile' || s.communityScreen === 'editProfile' ? AMBER : 'rgba(255,255,255,.18)'),
+      profileTabColor: (s.communityScreen === 'profile' || s.communityScreen === 'editProfile') ? AMBER : DIM,
+      achievementsTabBorder: '1px solid ' + (s.communityScreen === 'achievements' ? AMBER : 'rgba(255,255,255,.18)'),
+      achievementsTabColor: s.communityScreen === 'achievements' ? AMBER : DIM,
+      feedTabBorder: '1px solid ' + (s.communityScreen === 'feed' ? AMBER : 'rgba(255,255,255,.18)'),
+      feedTabColor: s.communityScreen === 'feed' ? AMBER : DIM,
+      goCommunityProfile: this.goCommunityProfile, goCommunityAchievements: this.goCommunityAchievements, goCommunityFeed: this.goCommunityFeed,
+      goEditProfile: this.goEditProfile,
+      isCommunityProfile: s.communityScreen === 'profile', isCommunityEditProfile: s.communityScreen === 'editProfile',
+      isCommunityAchievements: s.communityScreen === 'achievements', isCommunityFeed: s.communityScreen === 'feed',
+      myGamesGrid, badges,
+
+      publishTabs,
+      isPublishDashboard: s.publishScreen === 'dashboard', isPublishCreateBasic: s.publishScreen === 'createBasic',
+      isPublishCreatePricing: s.publishScreen === 'createPricing', isPublishCreateBuilds: s.publishScreen === 'createBuilds',
+      isPublishCreateProvider: s.publishScreen === 'createProvider', isPublishCreateReview: s.publishScreen === 'createReview',
+      isPublishManage: s.publishScreen === 'manage', isPublishReleases: s.publishScreen === 'releases',
+      isPublishPromotions: s.publishScreen === 'promotions', isPublishActivity: s.publishScreen === 'activity',
+      isPublishStorePage: s.publishScreen === 'storePage',
+      unsavedChanges: s.unsavedChanges, storeTitleDraft: s.storeTitleDraft, markDirty: this.markDirty, saveDraft: this.saveDraft,
+      storePageTabs: [
+        { key:'basic', label:'Basic info', dot:GREEN },
+        { key:'description', label:'Description', dot:GREEN },
+        { key:'media', label:'Media', dot: s.mediaUploadPhase === 'success' || s.mediaUploadPhase === 'manual_success' ? GREEN : VIOLET },
+        { key:'video', label:'Trailer (optional)', dot:'rgba(255,255,255,.25)' },
+        { key:'tags', label:'Genres & tags', dot:GREEN },
+        { key:'links', label:'Links & support', dot:GREEN },
+        { key:'requirements', label:'Requirements (optional)', dot:'rgba(255,255,255,.25)' },
+        { key:'preview', label:'Preview', dot:'rgba(255,255,255,.25)' },
+      ].map(t => ({
+        label: t.label, dot: t.dot,
+        border: '1px solid ' + (s.storePageTab === t.key ? AMBER : 'rgba(255,255,255,.18)'),
+        color: s.storePageTab === t.key ? AMBER : DIM,
+        select: () => this.setStorePageTab(t.key),
+      })),
+      isStorePageBasic: s.storePageTab === 'basic', isStorePageDescription: s.storePageTab === 'description',
+      isStorePageMedia: s.storePageTab === 'media', isStorePageVideo: s.storePageTab === 'video',
+      isStorePageTags: s.storePageTab === 'tags', isStorePageLinks: s.storePageTab === 'links',
+      isStorePageRequirements: s.storePageTab === 'requirements', isStorePagePreview: s.storePageTab === 'preview',
+      mediaIdle: s.mediaUploadPhase === 'idle', mediaSelected: s.mediaUploadPhase === 'selected',
+      mediaUploading: s.mediaUploadPhase === 'uploading', mediaSuccess: s.mediaUploadPhase === 'success',
+      mediaManualSuccess: s.mediaUploadPhase === 'manual_success', mediaUrlMode: s.mediaMode === 'url',
+      selectMediaFile: this.selectMediaFile, switchToUrlMode: this.switchToUrlMode, useManualUrl: this.useManualUrl,
+      beginUpload: this.beginUpload, completeUpload: this.completeUpload, cancelUpload: this.cancelUpload,
+      retryUpload: this.retryUpload, removeMedia: this.removeMedia,
+      openStorePage: this.openStorePage,
+      isUnsavedConfirmModal: s.modal === 'unsavedConfirm', discardAndLeave: this.discardAndLeave,
+      saveAndLeave: this.saveAndLeave, cancelLeave: this.cancelLeave,
+      startCreateGame: this.startCreateGame, nextToPricing: this.nextToPricing, backToBasic: this.backToBasic,
+      nextToBuilds: this.nextToBuilds, simulateHash: this.simulateHash,
+      hashStatusText: s.hashSimulated ? '✓ SHA-256 verified' : 'not yet selected',
+      hashStatusColor: s.hashSimulated ? GREEN : DIM,
+      nextToProvider: this.nextToProvider, simulateProvider: this.simulateProvider,
+      providerStatus: s.providerConnected ? 'CONNECTED' : 'CONNECT',
+      nextToReview: this.nextToReview, publishGame: this.publishGame, justPublished: s.justPublished,
+      publishFailed: s.publishFailed, simulatePublishFailure: this.simulatePublishFailure, retryPublish: this.retryPublish,
+      campaignFormOpen: s.campaignFormOpen, openCampaignForm: this.openCampaignForm, closeCampaignForm: this.closeCampaignForm,
+      setCampaignType: this.setCampaignType, createCampaign: this.createCampaign,
+      goPublishCreateBasicEdit: this.openStorePage, goPublishReleases: this.goPublishReleases,
+      goPublishPromotions: this.goPublishPromotions, goPublishActivity: this.goPublishActivity,
+      openRevokeModal: this.openRevokeModal,
+      myGamesRows, releaseRows, activityRows,
+
+      settingsNav,
+      isSettingsHome: s.settingsSection === 'home', isSettingsSecurity: s.settingsSection === 'security',
+      isSettingsNetwork: s.settingsSection === 'network', isSettingsBackup: s.settingsSection === 'backup',
+      isSettingsAppearance: s.settingsSection === 'appearance', isSettingsAbout: s.settingsSection === 'about',
+      savedAccounts, relayList,
+
+      modalOpen,
+      isPaymentModal: s.modal === 'payment', paymentWaiting: s.paymentPhase === 'waiting', paymentConfirmed: s.paymentPhase === 'confirmed',
+      simulatePaymentReceived: this.simulatePaymentReceived, finishPurchase: this.finishPurchase,
+      isClaimModal: s.modal === 'claim', claimReady: s.claimPhase === 'ready', claimWaitingSigner: s.claimPhase === 'waiting_signer', claimClaimed: s.claimPhase === 'claimed',
+      startSignerApproval: this.startSignerApproval, approveSigner: this.approveSigner, finishClaim: this.finishClaim,
+      isDownloadModal: s.modal === 'download',
+      downloadInProgress: s.downloadPhase !== 'complete', downloadDone: s.downloadPhase === 'complete',
+      downloadStepLabel: { downloading:'Downloading…', verifying:'Verifying file integrity…', installing:'Installing…', complete:'Complete' }[s.downloadPhase],
+      downloadStepColor: s.downloadPhase === 'complete' ? GREEN : AMBER,
+      downloadPct: { downloading:'35%', verifying:'70%', installing:'90%', complete:'100%' }[s.downloadPhase],
+      advanceDownload: this.advanceDownload,
+      isReceiptModal: s.modal === 'receipt',
+      receiptTitle: currentGameData.acquisition === 'paid' ? 'Purchase receipt' : 'Permanent access record',
+      receiptType: currentGameData.acquisition === 'paid' ? 'Paid purchase' : 'Promotion claim',
+      receiptAmount: currentGameData.acquisition === 'paid' ? (currentGameData.price + ' sats') : '—',
+      isRevokeModal: s.modal === 'revoke', isSwitcherModal: s.modal === 'accountSwitcher',
+      closeModal: this.closeModal, closeModalBackdrop: this.closeModalBackdrop, stopProp: this.stopProp,
+      openReceipt: this.openReceipt,
+    };
+  }
+}
+
+</script>
+</body>
+</html>
