@@ -471,6 +471,25 @@ There is no new revoke dialog until a real command and scope exist.
 - `desktop/tauri.conf.json` only if review explicitly approves a desktop minimum
   window size; do not silently make the current resizable window fixed.
 
+Carried over from Phase 11: the Settings surface and its dirty-state transition
+were verified against real application state, but several Accounts, NIP-49, and
+Settings states could not be reached safely or at all in the development
+environment. Reaching signed-out states would have left the app signed out with
+no way to re-authenticate, and the compositor refused every window resize during
+the verification session, so no 924x540 capture was possible. Phase 13 must:
+
+- visually confirm the duplicate-identity fix against a fresh bundle: with no
+  display name the heading shows one abbreviated key and the secondary key line
+  is omitted, while the copy-full-key control remains;
+- verify Login, NIP-49 (initial, validation failure, busy, failure),
+  account-switching, signer-unavailable, and signed-out states;
+- verify Settings validation-blocked, saving, and save-failed states;
+- verify the Purchases signed-out state;
+- verify Login, Purchases, and Settings at 924x540;
+- confirm the relay and insecure-WebSocket sections remain truthful with their
+  existing signal models, or move them onto the typed
+  `settings_operation_state` model if review shows a misleading state.
+
 Carried over from Phase 10: status-chip contrast was corrected by eye, not
 measured. `--arc-text-subdued` on the card surface was visibly illegible at the
 10.5px compact chip size, and `arc-status-expired` and `arc-status-cancelled`

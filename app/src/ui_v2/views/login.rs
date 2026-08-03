@@ -493,6 +493,17 @@ pub fn LoginV2View() -> impl IntoView {
                                             let avatar = account.picture.clone();
                                             let fallback = label.chars().next().unwrap_or('?').to_uppercase().to_string();
                                             let is_active = is_active_account(&account, auth_stored.get_value().npub.get().as_deref());
+                                            let label_for_copy = label.clone();
+                                            let npub_for_copy = account.npub.clone();
+                                            let copy_status = RwSignal::new(None::<String>);
+                                            let copy_npub = Callback::new(move |()| {
+                                                let Some(clipboard) = web_sys::window().map(|window| window.navigator().clipboard()) else {
+                                                    copy_status.set(Some("Clipboard unavailable.".to_string()));
+                                                    return;
+                                                };
+                                                let _ = clipboard.write_text(&npub_for_copy);
+                                                copy_status.set(Some("Public key copied.".to_string()));
+                                            });
                                             let connection = account_connection_label(
                                                 &account,
                                                 auth_stored.get_value().npub.get().as_deref(),
@@ -508,7 +519,8 @@ pub fn LoginV2View() -> impl IntoView {
                                                         }}
                                                         <div class="v2-auth-account-copy">
                                                             <h2>{label}</h2>
-                                                            <p>{abbreviated_npub(&account.npub)}</p>
+                                                            <p>{abbreviated_npub(&account.npub)}<button type="button" class="v2-btn-ghost v2-auth-copy-npub" aria-label=format!("Copy full public key for {}", label_for_copy) on:click=move |event| { event.stop_propagation(); copy_npub.run(()); }>"Copy public key"</button></p>
+                                                            {move || copy_status.get().map(|status| view! { <span class="v2-auth-copy-status" role="status">{status}</span> })}
                                                         </div>
                                                     </div>
                                                     <div class="v2-auth-account-statuses">
@@ -820,5 +832,82 @@ mod tests {
     fn stale_login_response_is_rejected_after_new_flow() {
         assert!(crate::should_apply_auth_response(7, 7));
         assert!(!crate::should_apply_auth_response(7, 8));
+    }
+    #[test]
+    fn account_presence_and_signer_readiness_stay_separate() {
+        let mut remote = account();
+        remote.signing_mode = "nip46".into();
+        // Same account, four different signer readiness states.
+        let states = ["connected", "connecting", "failed", "disconnected"].map(|status| {
+            account_connection_label(&remote, Some(remote.npub.as_str()), status, false)
+        });
+        let mut unique = states.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 4, "signer states collapsed: {states:?}");
+        // A saved-but-inactive account reports presence only, never readiness.
+        assert_eq!(
+            account_connection_label(&remote, Some("npub1other"), "connected", false),
+            "Saved"
+        );
+    }
+
+    #[test]
+    fn signer_type_is_reported_separately_from_connection() {
+        assert_eq!(account_mode_label("nip46"), "Remote signer");
+        assert_eq!(account_mode_label("local"), "Local encrypted key");
+        assert_eq!(account_mode_label("nip07"), "Browser extension");
+        assert_eq!(account_mode_label("readonly"), "Read-only account");
+        assert_eq!(account_mode_label("unknown-mode"), "Saved account");
+    }
+
+    #[test]
+    fn public_keys_are_abbreviated_and_never_shown_with_secret_material() {
+        let npub = "npub1kvl9ev2wcjdecvyk0xhqacdwa505fqn6zpqwmwpd7vn4p565amyqesnwt4";
+        let shown = abbreviated_npub(npub);
+        assert!(shown.len() < npub.len());
+        let source = include_str!("login.rs");
+        // The full key is only reachable through the deliberate copy control.
+        assert!(source.contains("Copy public key"));
+        // Secret entry stays masked and excluded from autofill; secrets are passed
+        // to commands but never rendered back into markup.
+        assert!(source
+            .contains(r#"id="local-nsec" class="v2-input" type="password" autocomplete="off""#));
+        // Split so the literals do not match this test's own source.
+        for rendered_secret in [
+            [">{nsec", "_input"].concat(),
+            [">{import", "_password"].concat(),
+            [">{pass", "word}"].concat(),
+            ["{decry", "pted"].concat(),
+        ] {
+            assert!(
+                !source.contains(&rendered_secret),
+                "secret material rendered into markup: {rendered_secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn nip49_import_does_not_claim_account_activation() {
+        let message = nip49_import_message("Key validated.");
+        assert!(message.contains("does not yet add or activate a saved account"));
+        assert!(!message.to_ascii_lowercase().contains("signed in"));
+        assert!(!message.to_ascii_lowercase().contains("account created"));
+    }
+
+    #[test]
+    fn unsupported_login_methods_are_absent() {
+        let source = include_str!("login.rs");
+        for absent in [
+            ["Cloud", " recovery"].concat(),
+            ["Sign in with ", "Google"].concat(),
+            ["Email", " login"].concat(),
+            ["Seed", " backup"].concat(),
+        ] {
+            assert!(
+                !source.contains(&absent),
+                "unsupported login method present"
+            );
+        }
     }
 }

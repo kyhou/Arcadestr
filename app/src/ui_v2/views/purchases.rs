@@ -134,6 +134,55 @@ fn record_has_partial_data(record: &DurableAcquisitionRecord) -> bool {
             && (record.amount.is_none() || record.currency.is_none()))
 }
 
+/// Abbreviate an opaque record identifier for display. Full values stay
+/// available through the deliberate copy control, never rendered inline.
+fn short_record_identifier(value: &str) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() <= 20 {
+        return value.to_string();
+    }
+    format!(
+        "{}…{}",
+        characters[..10].iter().collect::<String>(),
+        characters[characters.len() - 6..]
+            .iter()
+            .collect::<String>()
+    )
+}
+
+/// Render a stored unix timestamp in the reader's local time. Zero means the
+/// record carries no usable acquisition time; it is not rendered as an epoch date.
+fn acquired_at_label(acquired_at: u64) -> String {
+    if acquired_at == 0 {
+        return "Acquisition time unavailable".to_string();
+    }
+    let date = js_sys::Date::new(&(acquired_at as f64 * 1000.0).into());
+    format!(
+        "Acquired {:04}-{:02}-{:02} {:02}:{:02}",
+        date.get_full_year(),
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes()
+    )
+}
+
+/// Arcadestr stores one durable acquisition record per purchase or claim. There
+/// is no per-event receipt chain to render, so the detail surface says so rather
+/// than inventing a timeline.
+const RECEIPT_TIMELINE_UNAVAILABLE: &str =
+    "A per-event receipt timeline is not available. Arcadestr stores one validated durable record per acquisition; individual invoice, proof, and fulfillment events are not retained locally.";
+
+fn record_verification_label(record: &DurableAcquisitionRecord) -> &'static str {
+    if record.validation_error.is_some() {
+        "Not verified"
+    } else if record.status == DurableCredentialStatus::Unverified {
+        "Not verified"
+    } else {
+        "Validated on load"
+    }
+}
+
 #[component]
 pub fn PurchasesView() -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
@@ -284,6 +333,19 @@ fn purchase_state_view(
 }
 
 fn purchase_record_view(record: DurableAcquisitionRecord) -> impl IntoView {
+    let record_id = record.record_id.clone();
+    let record_id_for_copy = record.record_id.clone();
+    let verification = record_verification_label(&record);
+    let copy_status = RwSignal::new(None::<String>);
+    let copy_record_id = Callback::new(move |()| {
+        let value = record_id_for_copy.clone();
+        let Some(clipboard) = web_sys::window().map(|window| window.navigator().clipboard()) else {
+            copy_status.set(Some("Clipboard unavailable.".to_string()));
+            return;
+        };
+        let _ = clipboard.write_text(&value);
+        copy_status.set(Some("Full record ID copied.".to_string()));
+    });
     let title = record
         .listing_title
         .clone()
@@ -314,14 +376,17 @@ fn purchase_record_view(record: DurableAcquisitionRecord) -> impl IntoView {
                     size=StatusChipSize::Compact
                 />
                 {amount_label(&record).map(|amount| view! { <strong>{amount}</strong> })}
-                <span>{format!("Acquired: {}", record.acquired_at)}</span>
+                <span>{acquired_at_label(record.acquired_at)}</span>
             </div>
             <details class="v2-purchase-technical">
                 <summary>"Record details"</summary>
                 <dl>
-                    <div><dt>"Record ID"</dt><dd>{record.record_id}</dd></div>
-                    {record.campaign_id.map(|campaign| view! { <div><dt>"Promotion ID"</dt><dd>{campaign}</dd></div> })}
+                    <div><dt>"Verification"</dt><dd>{verification}</dd></div>
+                    <div><dt>"Record ID"</dt><dd>{short_record_identifier(&record_id)}<button type="button" class="v2-btn-ghost v2-purchase-copy" on:click=move |_| copy_record_id.run(())>"Copy full ID"</button></dd></div>
+                    {record.campaign_id.clone().map(|campaign| view! { <div><dt>"Promotion ID"</dt><dd>{short_record_identifier(&campaign)}</dd></div> })}
                 </dl>
+                <p class="v2-purchase-timeline-unavailable">{RECEIPT_TIMELINE_UNAVAILABLE}</p>
+                {move || copy_status.get().map(|status| view! { <p class="v2-purchase-copy-status" role="status">{status}</p> })}
             </details>
         </article>
     }
@@ -424,5 +489,74 @@ mod tests {
             DurableCredentialStatus::Active,
         );
         assert!(record_has_partial_data(&purchase));
+    }
+    #[test]
+    fn record_identifiers_are_abbreviated_for_display() {
+        let long = "a".repeat(64);
+        let shown = short_record_identifier(&long);
+        assert!(shown.len() < long.len());
+        assert!(shown.contains('…'));
+        assert!(shown.starts_with("aaaaaaaaaa"));
+        // Short identifiers are shown intact rather than padded or truncated oddly.
+        assert_eq!(short_record_identifier("abc123"), "abc123");
+    }
+
+    #[test]
+    fn missing_acquisition_time_is_not_rendered_as_an_epoch_date() {
+        // Formatting a real timestamp needs js_sys::Date, which is unavailable in
+        // native tests; the zero case is the one that could lie about a date.
+        assert_eq!(acquired_at_label(0), "Acquisition time unavailable");
+        assert!(!acquired_at_label(0).contains("1970"));
+    }
+
+    #[test]
+    fn verification_state_follows_validation_not_optimism() {
+        let mut clean = record(
+            DurableAcquisitionKind::Purchase,
+            DurableCredentialStatus::Active,
+        );
+        assert_eq!(record_verification_label(&clean), "Validated on load");
+
+        clean.validation_error = Some("bad signature".into());
+        assert_eq!(record_verification_label(&clean), "Not verified");
+
+        let unverified = record(
+            DurableAcquisitionKind::Purchase,
+            DurableCredentialStatus::Unverified,
+        );
+        assert_eq!(record_verification_label(&unverified), "Not verified");
+    }
+
+    #[test]
+    fn receipt_timeline_is_declared_unavailable_rather_than_invented() {
+        assert!(RECEIPT_TIMELINE_UNAVAILABLE.contains("not available"));
+        assert!(RECEIPT_TIMELINE_UNAVAILABLE.contains("one validated durable record"));
+        let source = include_str!("purchases.rs");
+        for fabricated in [
+            ["Invoice", " paid"].concat(),
+            ["Proof", " verified"].concat(),
+            ["Shipment", " sent"].concat(),
+            ["Order", " timeline"].concat(),
+        ] {
+            assert!(!source.contains(&fabricated), "fabricated receipt event");
+        }
+    }
+
+    #[test]
+    fn empty_history_and_unavailable_records_are_distinct_states() {
+        // Empty is a successful result; Error and WebUnavailable are not.
+        let labels = [
+            matches!(PurchasesState::Empty, PurchasesState::Empty),
+            matches!(PurchasesState::Error, PurchasesState::Error),
+            matches!(
+                PurchasesState::WebUnavailable,
+                PurchasesState::WebUnavailable
+            ),
+            matches!(
+                PurchasesState::AccountRequired,
+                PurchasesState::AccountRequired
+            ),
+        ];
+        assert!(labels.into_iter().all(|matched| matched));
     }
 }

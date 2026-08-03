@@ -7687,6 +7687,224 @@ dialog.v2-confirm-backdrop::backdrop {
   }
 }
 
+.v2-auth-copy-npub {
+  margin-left: 8px;
+  padding: 2px 8px;
+  font-size: 10px;
+}
+
+.v2-auth-copy-status {
+  display: block;
+  margin-top: 4px;
+  color: var(--arc-success);
+  font-size: 10px;
+}
+
+.v2-settings-state {
+  border: 1px solid var(--arc-border-control);
+  border-radius: var(--arc-radius-xs);
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.v2-settings-state-idle {
+  color: var(--arc-text-muted);
+}
+
+.v2-settings-state-busy {
+  border-color: oklch(0.5 0.13 195 / 60%);
+  color: var(--arc-info);
+}
+
+.v2-settings-state-warning {
+  border-color: oklch(0.72 0.15 75 / 60%);
+  color: var(--arc-warning);
+}
+
+.v2-settings-state-ok {
+  border-color: oklch(0.5 0.16 145 / 60%);
+  color: var(--arc-success);
+}
+
+.v2-settings-state-error {
+  border-color: oklch(0.6 0.18 25 / 60%);
+  color: var(--arc-error);
+}
+
+/* Purchases: bring the surface onto the canonical density used since Phase 7.
+   The hero still carried the pre-migration display scale (~48px title). */
+.v2-purchases {
+  display: grid;
+  gap: 12px;
+}
+
+.v2-purchases-hero {
+  min-height: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--arc-border-card);
+  border-radius: var(--arc-radius-md);
+  background: var(--arc-surface);
+}
+
+.v2-purchases-hero h1 {
+  margin: 3px 0 4px;
+  font: 800 18px/1.3 var(--arc-font-mono);
+  letter-spacing: 0;
+}
+
+.v2-purchases-hero .v2-store-kicker {
+  color: var(--arc-text-muted);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+}
+
+.v2-purchases-hero > p:last-child {
+  color: var(--arc-text-muted);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.v2-purchases h2 {
+  margin: 0;
+  font-family: var(--arc-font-mono);
+  font-size: 12.5px;
+  line-height: 1.35;
+}
+
+.v2-purchases p,
+.v2-purchases dt,
+.v2-purchases dd,
+.v2-purchases summary,
+.v2-purchases span {
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+/* Purchases: safe identifier presentation */
+.v2-purchase-copy {
+  margin-left: 8px;
+  padding: 2px 8px;
+  font-size: 10px;
+}
+
+.v2-purchase-copy-status {
+  margin: 8px 0 0;
+  color: var(--arc-success);
+  font-size: 10.5px;
+}
+
+.v2-purchase-timeline-unavailable {
+  margin: 10px 0 0;
+  border-left: 2px solid var(--arc-border-strong);
+  padding-left: 9px;
+  color: var(--arc-text-muted);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.v2-purchase-technical dd {
+  overflow-wrap: anywhere;
+}
+
+/* Settings: relay and Blossom server controls */
+.v2-settings-section-heading {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.v2-settings-heading-action {
+  flex-shrink: 0;
+}
+
+.v2-settings-field-pair {
+  display: grid;
+  gap: 10px;
+}
+
+.v2-settings-field-label,
+.v2-settings-inline-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.v2-settings-inline-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10.5px;
+}
+
+.v2-settings-field-input {
+  margin-top: 6px;
+}
+
+.v2-settings-server-meta {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.v2-settings-mono {
+  overflow-wrap: anywhere;
+  font-family: var(--arc-font-mono);
+  font-size: 10.5px;
+}
+
+.v2-blossom-health {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.v2-blossom-health-idle {
+  color: var(--arc-text-muted);
+}
+
+.v2-blossom-health-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+}
+
+.v2-blossom-health-dot-current {
+  background: currentcolor;
+}
+
+.v2-blossom-health-pulse {
+  animation: v2-blossom-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes v2-blossom-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .v2-blossom-health-pulse {
+    animation: none;
+  }
+}
+
+@media (min-width: 640px) {
+  .v2-settings-section-heading {
+    align-items: center;
+    flex-direction: row;
+  }
+
+  .v2-settings-field-pair {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 /* Promotions and campaign management */
 .v2-publisher-editor {
   width: 100%;

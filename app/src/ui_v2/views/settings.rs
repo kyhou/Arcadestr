@@ -141,6 +141,87 @@ fn blossom_health_presentation(status: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Secondary identity line for the active account. When no display name exists
+/// the heading already falls back to the abbreviated key, so repeating it would
+/// print the same value twice.
+fn identity_key_line(active_name: &str, npub: Option<&str>) -> Option<String> {
+    let Some(npub) = npub else {
+        return Some("Signed out".to_string());
+    };
+    let abbreviated = npub_fallback_label(npub);
+    (active_name != abbreviated).then_some(abbreviated)
+}
+
+/// Typed lifecycle for one settings section. Local edits are never described as
+/// saved: `Saved` is only reached after the backend command reports success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsOperationState {
+    Unavailable,
+    Loading,
+    Persisted,
+    Dirty,
+    Blocked,
+    Saving,
+    Saved,
+    Failed,
+}
+
+impl SettingsOperationState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "Unavailable",
+            Self::Loading => "Loading current settings",
+            Self::Persisted => "Showing saved settings",
+            Self::Dirty => "Unsaved changes",
+            Self::Blocked => "Fix the highlighted problem before saving",
+            Self::Saving => "Saving…",
+            Self::Saved => "Saved",
+            Self::Failed => "Save failed",
+        }
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            Self::Unavailable | Self::Persisted => "v2-settings-state-idle",
+            Self::Loading | Self::Saving => "v2-settings-state-busy",
+            Self::Dirty | Self::Blocked => "v2-settings-state-warning",
+            Self::Saved => "v2-settings-state-ok",
+            Self::Failed => "v2-settings-state-error",
+        }
+    }
+}
+
+/// Maps a section's existing signals into the typed state. `saved` is supplied by
+/// the caller only after an authoritative command success.
+#[allow(clippy::too_many_arguments)]
+fn settings_operation_state(
+    available: bool,
+    loading: bool,
+    saving: bool,
+    failed: bool,
+    blocked: bool,
+    dirty: bool,
+    saved: bool,
+) -> SettingsOperationState {
+    if !available {
+        SettingsOperationState::Unavailable
+    } else if loading {
+        SettingsOperationState::Loading
+    } else if saving {
+        SettingsOperationState::Saving
+    } else if failed {
+        SettingsOperationState::Failed
+    } else if blocked {
+        SettingsOperationState::Blocked
+    } else if dirty {
+        SettingsOperationState::Dirty
+    } else if saved {
+        SettingsOperationState::Saved
+    } else {
+        SettingsOperationState::Persisted
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SettingsRemoval {
     Idle,
@@ -336,6 +417,8 @@ pub fn SettingsView(
             .or_else(|| auth.npub.get().map(|npub| npub_fallback_label(&npub)))
             .unwrap_or_else(|| "No active account".to_string())
     });
+    let active_key_line =
+        Signal::derive(move || identity_key_line(&active_name.get(), auth.npub.get().as_deref()));
     let active_avatar = Signal::derive(move || {
         auth.profile
             .get()
@@ -670,7 +753,7 @@ pub fn SettingsView(
                         }}
                         <div>
                             <h3>{move || active_name.get()}</h3>
-                            <p>{move || auth.npub.get().map(|npub| npub_fallback_label(&npub)).unwrap_or_else(|| "Signed out".to_string())}</p>
+                            {move || active_key_line.get().map(|line| view! { <p>{line}</p> })}
                             <p>{move || {
                                 let mode = active_account.get().map(|account| signer_label(&account.signing_mode)).unwrap_or("Unknown signer");
                                 format!("{mode} · {}", auth.connection_status.get())
@@ -777,10 +860,19 @@ pub fn SettingsView(
                         <header class="v2-settings-card-header">
                             <span class="v2-settings-icon material-symbols-outlined" aria-hidden="true">"cloud_upload"</span>
                             <div><p class="v2-store-kicker">"Media hosting"</p><h2 id="settings-blossom-title">"Blossom servers"</h2></div>
+                            {move || { let state = settings_operation_state(
+                                availability.native_network,
+                                blossom_loading.get(),
+                                blossom_busy.get(),
+                                blossom_error.get().is_some(),
+                                false,
+                                !blossom_origin.get().trim().is_empty(),
+                                false,
+                            ); view! { <span class=move || format!("v2-settings-state {}", state.class()) role="status">{state.label()}</span> } }}
                         </header>
-                        <div class="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
+                        <div class="v2-settings-section-heading">
                             <p>"Blossom servers host game covers, screenshots, trailers, and Store Page media. Settings are scoped to the active account."</p>
-                            <button type="button" class="v2-btn-ghost shrink-0" disabled=move || blossom_loading.get() || blossom_health_loading.get() || blossom_settings.get().is_none() on:click=move |_| blossom_health_refresh.update(|value| *value = value.wrapping_add(1))>{move || if blossom_health_loading.get() { "Checking…" } else { "Refresh status" }}</button>
+                            <button type="button" class="v2-btn-ghost v2-settings-heading-action" disabled=move || blossom_loading.get() || blossom_health_loading.get() || blossom_settings.get().is_none() on:click=move |_| blossom_health_refresh.update(|value| *value = value.wrapping_add(1))>{move || if blossom_health_loading.get() { "Checking…" } else { "Refresh status" }}</button>
                         </div>
                         <Show when=move || blossom_loading.get()>
                             <p class="v2-settings-muted" role="status">"Loading Blossom servers…"</p>
@@ -803,7 +895,7 @@ pub fn SettingsView(
                                             let display = server.label.clone().unwrap_or_else(|| server.origin.clone());
                                             view! {
                                                 <article class="v2-settings-account-row">
-                                                    <div class="min-w-0"><strong>{display}</strong><span class="break-all font-mono">{server.origin}</span><span>{if is_preferred { "Preferred upload destination" } else if server.enabled { "Enabled" } else { "Disabled" }}</span></div>
+                                                    <div class="v2-settings-server-meta"><strong>{display}</strong><span class="v2-settings-mono">{server.origin}</span><span>{if is_preferred { "Preferred upload destination" } else if server.enabled { "Enabled" } else { "Disabled" }}</span></div>
                                                     <div class="v2-settings-row-actions">
                                                         {move || {
                                                             let health = blossom_health.get().get(&origin_health).cloned();
@@ -811,13 +903,13 @@ pub fn SettingsView(
                                                                 Some(health) => {
                                                                     let (label, color) = blossom_health_presentation(&health.status);
                                                                     let title = health.latency_ms.map(|latency| format!("{label} · {latency} ms")).unwrap_or_else(|| label.to_string());
-                                                                    view! { <span class=format!("inline-flex items-center gap-1.5 text-xs font-bold {color}") title=title><span class="v2-blossom-health-dot h-2.5 w-2.5 rounded-full" aria-hidden="true"></span>{label}</span> }.into_any()
+                                                                    view! { <span class=format!("v2-blossom-health {color}") title=title><span class="v2-blossom-health-dot" aria-hidden="true"></span>{label}</span> }.into_any()
                                                                 }
-                                                                None if blossom_health_loading.get() => view! { <span class="inline-flex items-center gap-1.5 text-xs font-bold text-on-surface-variant" role="status"><span class="h-2.5 w-2.5 animate-pulse rounded-full bg-current" aria-hidden="true"></span>"Checking"</span> }.into_any(),
-                                                                None => view! { <span class="inline-flex items-center gap-1.5 text-xs font-bold text-on-surface-variant"><span class="h-2.5 w-2.5 rounded-full bg-current" aria-hidden="true"></span>"Unknown"</span> }.into_any(),
+                                                                None if blossom_health_loading.get() => view! { <span class="v2-blossom-health v2-blossom-health-idle" role="status"><span class="v2-blossom-health-dot v2-blossom-health-dot-current v2-blossom-health-pulse" aria-hidden="true"></span>"Checking"</span> }.into_any(),
+                                                                None => view! { <span class="v2-blossom-health v2-blossom-health-idle"><span class="v2-blossom-health-dot v2-blossom-health-dot-current" aria-hidden="true"></span>"Unknown"</span> }.into_any(),
                                                             }
                                                         }}
-                                                        <label class="flex items-center gap-2 text-xs font-bold"><input type="checkbox" prop:checked=server.enabled disabled=move || blossom_busy.get() on:change=move |event| on_toggle_blossom_server.run((origin_toggle.clone(), label_toggle.clone(), event_target_checked(&event))) />"Enabled"</label>
+                                                        <label class="v2-settings-inline-label"><input type="checkbox" prop:checked=server.enabled disabled=move || blossom_busy.get() on:change=move |event| on_toggle_blossom_server.run((origin_toggle.clone(), label_toggle.clone(), event_target_checked(&event))) />"Enabled"</label>
                                                         <button type="button" class="v2-btn-ghost" disabled=move || is_preferred || !server.enabled || blossom_busy.get() on:click=move |_| on_prefer_blossom_server.run(origin_preferred.clone())>{if is_preferred { "Preferred" } else { "Make preferred" }}</button>
                                                         <button type="button" class="v2-btn-ghost v2-btn-danger" disabled=move || is_development_default || blossom_busy.get() on:click=move |_| on_remove_blossom_server.run(origin_remove.clone())>{if is_development_default { "Development default" } else { "Remove" }}</button>
                                                     </div>
@@ -828,9 +920,9 @@ pub fn SettingsView(
                                 }.into_any()
                             }
                         })}
-                        <div class="grid gap-3 md:grid-cols-2">
-                            <label class="text-sm font-bold">"Server URL"<input type="url" class="v2-input mt-2" placeholder="https://blossom.example" prop:value=move || blossom_origin.get() on:input=move |event| { blossom_origin.set(event_target_value(&event)); blossom_error.set(None); } disabled=move || blossom_loading.get() || blossom_busy.get() /></label>
-                            <label class="text-sm font-bold">"Label (optional)"<input class="v2-input mt-2" placeholder="Primary media server" prop:value=move || blossom_label.get() on:input=move |event| blossom_label.set(event_target_value(&event)) disabled=move || blossom_loading.get() || blossom_busy.get() /></label>
+                        <div class="v2-settings-field-pair">
+                            <label class="v2-settings-field-label">"Server URL"<input type="url" class="v2-input v2-settings-field-input" placeholder="https://blossom.example" prop:value=move || blossom_origin.get() on:input=move |event| { blossom_origin.set(event_target_value(&event)); blossom_error.set(None); } disabled=move || blossom_loading.get() || blossom_busy.get() /></label>
+                            <label class="v2-settings-field-label">"Label (optional)"<input class="v2-input v2-settings-field-input" placeholder="Primary media server" prop:value=move || blossom_label.get() on:input=move |event| blossom_label.set(event_target_value(&event)) disabled=move || blossom_loading.get() || blossom_busy.get() /></label>
                         </div>
                         <button type="button" class="v2-btn-primary" on:click=on_add_blossom_server disabled=move || blossom_loading.get() || blossom_busy.get() || blossom_origin.get().trim().is_empty()>{move || if blossom_busy.get() { "Saving…" } else { "Add server" }}</button>
                         {move || blossom_error.get().map(|error| view! { <p class="v2-settings-alert v2-settings-alert-error" role="alert">{error}</p> })}
@@ -991,5 +1083,103 @@ mod tests {
         assert!(!source.contains(concat!("Restore ", "Accounts")));
         assert!(!source.contains(concat!("Reduce ", "motion")));
         assert!(!source.contains(concat!("Larger ", "text")));
+    }
+    #[test]
+    fn settings_never_report_saved_before_authoritative_persistence() {
+        // A local edit is Dirty, not Saved.
+        assert_eq!(
+            settings_operation_state(true, false, false, false, false, true, false),
+            SettingsOperationState::Dirty
+        );
+        // Saved only when the caller passes an authoritative success.
+        assert_eq!(
+            settings_operation_state(true, false, false, false, false, false, true),
+            SettingsOperationState::Saved
+        );
+        // An in-flight save outranks dirtiness and never reads as saved.
+        assert_eq!(
+            settings_operation_state(true, false, true, false, false, true, true),
+            SettingsOperationState::Saving
+        );
+        // A failure outranks a stale success flag.
+        assert_eq!(
+            settings_operation_state(true, false, false, true, false, false, true),
+            SettingsOperationState::Failed
+        );
+        assert_eq!(
+            settings_operation_state(true, false, false, false, true, true, false),
+            SettingsOperationState::Blocked
+        );
+        assert_eq!(
+            settings_operation_state(false, false, false, false, false, false, false),
+            SettingsOperationState::Unavailable
+        );
+        assert_eq!(
+            settings_operation_state(true, true, false, false, false, false, false),
+            SettingsOperationState::Loading
+        );
+        assert_eq!(
+            settings_operation_state(true, false, false, false, false, false, false),
+            SettingsOperationState::Persisted
+        );
+    }
+
+    #[test]
+    fn settings_state_labels_are_distinct_and_never_claim_false_success() {
+        let states = [
+            SettingsOperationState::Unavailable,
+            SettingsOperationState::Loading,
+            SettingsOperationState::Persisted,
+            SettingsOperationState::Dirty,
+            SettingsOperationState::Blocked,
+            SettingsOperationState::Saving,
+            SettingsOperationState::Saved,
+            SettingsOperationState::Failed,
+        ];
+        let mut labels = states.map(SettingsOperationState::label).to_vec();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), states.len());
+        for state in states {
+            if state != SettingsOperationState::Saved {
+                assert_ne!(state.label(), "Saved");
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_settings_stay_unavailable_rather_than_disabled_controls() {
+        let native = settings_availability(false);
+        assert!(!native.backup_controls);
+        assert!(!native.appearance_controls);
+        let web = settings_availability(true);
+        assert!(!web.security_and_keys);
+        assert!(!web.native_network);
+        let source = include_str!("settings.rs");
+        assert!(source.contains("Full account backup and restore are unavailable"));
+        for absent in [
+            ["Cloud", " sync"].concat(),
+            ["Delete", " account"].concat(),
+            ["Telemetry", " settings"].concat(),
+        ] {
+            assert!(!source.contains(&absent), "unsupported control present");
+        }
+    }
+    #[test]
+    fn identity_shows_one_key_line_and_never_repeats_the_fallback() {
+        let npub = "npub1kvl9ev2wcjdecvyk0xhqacdwa505fqn6zpqwmwpd7vn4p565amyqesnwt4";
+        let abbreviated = npub_fallback_label(npub);
+        // Heading already IS the abbreviated key: no second copy.
+        assert_eq!(identity_key_line(&abbreviated, Some(npub)), None);
+        // A real display name keeps the key as separate metadata.
+        assert_eq!(
+            identity_key_line("Developer", Some(npub)),
+            Some(abbreviated)
+        );
+        // Signed out is stated rather than showing a blank line.
+        assert_eq!(
+            identity_key_line("No active account", None),
+            Some("Signed out".to_string())
+        );
     }
 }
