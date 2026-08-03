@@ -566,6 +566,13 @@ disclosure content.
 - No generated `web/dist/**` files are committed.
 - No protocol or backend format changes are expected.
 
+Phases 1–13 shipped at commit `3df8e79`. The items Phase 13 reviewed and
+deliberately left open are recorded in
+[`POST_MIGRATION_FOLLOWUPS.md`](POST_MIGRATION_FOLLOWUPS.md), including the two
+that still need real verification — the Store Page eight-tab geometry pass and
+the five unreached dialogs — both of which are gated on a real authored
+listing. None of them blocks release.
+
 ## 6. Migration phases
 
 Each phase is independently reviewable and commit-ready. Do not combine a

@@ -18,6 +18,10 @@
 /.worktrees
 /.tmp
 
+# Claude Code local workspace: machine-specific settings.local.json and
+# scratch worktrees. No shared configuration is tracked under it.
+/.claude/
+
 # Tauri auto-generated files
 /desktop/gen/
 
