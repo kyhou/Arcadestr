@@ -18,6 +18,7 @@ use crate::tauri_bridge::{
     PublishAdpListingRequest, PublishAdpListingResult, PublishProgressPayload,
     ResolveAdpOperatorRequest, StartBlossomUploadRequest,
 };
+use crate::ui_v2::components::aria::aria_bool;
 use crate::ui_v2::components::blossom_media_upload::{
     fresh_request_id, preferred_candidate, publisher_hex, stable_error_message,
 };
@@ -3212,7 +3213,7 @@ pub fn PublishView(
 
                         <Show when=move || fulfillment_enabled.get()>
                             <div class="v2-create-fields">
-                                <button type="button" aria-pressed=move || fulfillment_mode.get() == FulfillmentMode::Delegate class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate {
+                                <button type="button" aria-pressed=move || aria_bool(fulfillment_mode.get() == FulfillmentMode::Delegate) class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate {
                                     "v2-create-mode-option v2-create-mode-selected"
                                 } else {
                                     "v2-create-mode-option"
@@ -3244,7 +3245,7 @@ pub fn PublishView(
                                         {move || if fulfillment_mode.get() == FulfillmentMode::Direct { "Advanced distribution options - direct account signing selected" } else { "Advanced distribution options" }}
                                     </summary>
                                     <div class="v2-create-fields">
-                                        <button type="button" aria-pressed=move || fulfillment_mode.get() == FulfillmentMode::Direct class=move || if fulfillment_mode.get() == FulfillmentMode::Direct {
+                                        <button type="button" aria-pressed=move || aria_bool(fulfillment_mode.get() == FulfillmentMode::Direct) class=move || if fulfillment_mode.get() == FulfillmentMode::Direct {
                                             "v2-create-mode-option v2-create-mode-selected"
                                         } else {
                                             "v2-create-mode-option"

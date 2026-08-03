@@ -60,6 +60,41 @@ pub const UI_V2_STYLES: &str = r#"
   box-sizing: border-box;
 }
 
+/* The WebKitGTK webview used by the desktop shell renders the contents of a
+   *closed* <details>, so collapsed disclosures leak their body outside the
+   surrounding panel. Phase 7 scoped this to publisher surfaces; the defect is
+   in the webview, not in one page, and it affects every <details> in the
+   application — error-detail disclosures, Library rows, profile and purchases
+   panels, Blossom upload diagnostics, and the Store Page editor alike. No
+   surface relies on closed disclosure content staying visible, so the rule is
+   general. It lives here rather than in web/style/tailwind.css because this
+   sheet is injected unlayered and would otherwise be outranked by @layer base.
+   Removing it will reintroduce the leak on WebKitGTK; it is inert on engines
+   that implement <details> correctly. */
+details:not([open]) > *:not(summary) {
+  display: none;
+}
+
+/* Background scroll lock while a modal dialog is open. show_modal() already
+   traps focus, blocks pointer input, and marks the rest of the document inert
+   for assistive technology; scrolling is the one thing it leaves unlocked.
+
+   `overflow: hidden` does not lock the viewport in the WebKitGTK webview the
+   desktop shell uses — verified in the running app, the background still
+   scrolled with the rule applied to html, and to html and body together. A
+   pinned body is the technique that actually holds. The matching inline `top:
+   -<scrollY>px` is set by modal_background::acquire, which is what keeps the
+   background visually where the user left it instead of snapping to the top.
+
+   Not `inert` on .arc-app-shell: dialogs render inside that subtree, and an
+   inert ancestor would make the dialog itself unreachable. */
+body.arc-modal-open {
+  position: fixed;
+  left: 0;
+  right: 0;
+  width: 100%;
+}
+
 .arc-app-shell {
   min-height: 100vh;
   background: transparent;
@@ -183,7 +218,7 @@ pub const UI_V2_STYLES: &str = r#"
   align-items: center;
   gap: 8px;
   padding: 0 10px;
-  color: oklch(0.52 0.01 60);
+  color: var(--arc-text-placeholder);
 }
 
 .arc-search .material-symbols-outlined {
@@ -210,7 +245,7 @@ pub const UI_V2_STYLES: &str = r#"
 }
 
 .arc-search input::placeholder {
-  color: oklch(0.52 0.01 60);
+  color: var(--arc-text-placeholder);
   opacity: 1;
 }
 
@@ -375,7 +410,7 @@ pub const UI_V2_STYLES: &str = r#"
   margin-top: 3px;
   border-top: 1px solid var(--arc-border-subtle);
   border-radius: 0 0 var(--arc-radius-xs) var(--arc-radius-xs);
-  color: oklch(0.75 0.18 25);
+  color: var(--arc-error-text);
 }
 
 .arc-menu-heading {
@@ -551,8 +586,13 @@ pub const UI_V2_STYLES: &str = r#"
     padding: 4px;
   }
 
+  /* Narrow the page inset by redefining the token, not by overriding
+     padding-inline. Full-bleed surfaces cancel this inset with
+     calc(-1 * var(--arc-page-inline)); overriding the padding alone left the
+     token at 28px while the container used 20px, and .arc-store-home hung 8px
+     off each edge — the whole Store route scrolled horizontally below 820px. */
   .arc-page-container {
-    padding-inline: 20px;
+    --arc-page-inline: 20px;
   }
 }
 
@@ -3915,7 +3955,7 @@ select option:disabled {
 .v2-btn-danger {
   border: 1px solid oklch(0.6 0.18 25 / 45%);
   background: oklch(0.6 0.18 25 / 12%);
-  color: oklch(0.75 0.18 25);
+  color: var(--arc-error-text);
 }
 
 .v2-btn-danger:hover:not(:disabled) {
@@ -4822,7 +4862,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .nip05-badge-failed {
   border-color: var(--arc-error);
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 .nip05-badge-unverified {
@@ -5159,8 +5199,8 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-btn-primary:hover:not(:disabled) {
-  background: oklch(0.83 0.16 60);
-  border-color: oklch(0.83 0.16 60);
+  background: var(--arc-accent-hover);
+  border-color: var(--arc-accent-hover);
 }
 
 .v2-btn-secondary {
@@ -5235,7 +5275,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-input::placeholder {
-  color: oklch(0.52 0.01 60);
+  color: var(--arc-text-placeholder);
 }
 
 .v2-input.v2-topbar-search {
@@ -5246,7 +5286,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-input.v2-topbar-search::placeholder {
-  color: oklch(0.52 0.01 60);
+  color: var(--arc-text-placeholder);
   text-indent: 0;
 }
 
@@ -5408,21 +5448,21 @@ dialog.v2-confirm-backdrop::backdrop {
 .arc-status-verified {
   border-color: var(--arc-success);
   background: oklch(0.72 0.16 145 / 14%);
-  color: oklch(0.78 0.16 145);
+  color: var(--arc-success-text);
 }
 
 .arc-status-warning,
 .arc-status-update {
   border-color: var(--arc-warning);
   background: oklch(0.7 0.15 60 / 14%);
-  color: oklch(0.78 0.15 60);
+  color: var(--arc-warning-text);
 }
 
 .arc-status-error,
 .arc-status-unverified {
   border-color: var(--arc-error);
   background: oklch(0.6 0.18 25 / 12%);
-  color: oklch(0.75 0.18 25);
+  color: var(--arc-error-text);
 }
 
 .arc-status-pending,
@@ -5430,7 +5470,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .arc-status-draft {
   border-color: var(--arc-info);
   background: oklch(0.68 0.15 300 / 14%);
-  color: oklch(0.8 0.15 300);
+  color: var(--arc-info-text);
 }
 
 .arc-status-public {
@@ -5442,7 +5482,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .arc-status-timed {
   border-color: var(--arc-info);
   background: oklch(0.68 0.15 300 / 16%);
-  color: oklch(0.8 0.15 300);
+  color: var(--arc-info-text);
 }
 
 .arc-status-gated,
@@ -5793,7 +5833,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .arc-feedback-error .arc-feedback-icon,
 .arc-feedback-error h2 {
-  color: oklch(0.75 0.18 25);
+  color: var(--arc-error-text);
 }
 
 .arc-error-inline {
@@ -6073,7 +6113,7 @@ dialog.v2-confirm-backdrop::backdrop {
   border-top: 1px dashed var(--arc-separator-strong);
 }
 
-.arc-store-hero-copy h1 {
+.arc-store-hero-copy h2 {
   max-width: 100%;
   margin: 4px 0 0;
   overflow-wrap: anywhere;
@@ -6618,7 +6658,7 @@ dialog.v2-confirm-backdrop::backdrop {
     padding-inline: 22px;
   }
 
-  .arc-store-hero-copy h1 {
+  .arc-store-hero-copy h2 {
     font-size: 28px;
   }
 }
@@ -6833,11 +6873,9 @@ dialog.v2-confirm-backdrop::backdrop {
   cursor: pointer;
 }
 
-/* The WebKitGTK webview used by the desktop shell renders the contents of a
-   closed <details>; keep collapsed publisher disclosures actually collapsed. */
-.v2-publisher-studio details:not([open]) > *:not(summary) {
-  display: none;
-}
+/* See the application-wide closed-<details> workaround near the top of this
+   sheet. The publisher-scoped copy that used to live here was removed once the
+   rule was generalized; every publisher disclosure is still covered by it. */
 
 .v2-publisher-diagnostics p {
   margin: 0.55rem 0 0;
@@ -7385,7 +7423,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-publisher-summary-error {
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 .v2-publisher-unavailable-metrics {
@@ -7730,7 +7768,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-settings-state-error {
   border-color: oklch(0.6 0.18 25 / 60%);
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 /* Purchases: bring the surface onto the canonical density used since Phase 7.
@@ -8041,7 +8079,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-campaign-blocker {
   margin: 8px 0 0;
   overflow-wrap: anywhere;
-  color: var(--arc-error);
+  color: var(--arc-error-text);
   font-size: 10.5px;
   line-height: 1.5;
 }
@@ -8243,7 +8281,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-create-stage-attention .v2-create-stage-status {
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 .v2-create-stage-current {
@@ -8369,7 +8407,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-create-chip-remove {
   border: 0;
   background: transparent;
-  color: var(--arc-error);
+  color: var(--arc-error-text);
   font-family: inherit;
   font-size: 10px;
   cursor: pointer;
@@ -8396,7 +8434,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-create-alert-error {
   border-color: oklch(0.6 0.18 25 / 55%);
   background: oklch(0.6 0.18 25 / 10%);
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 .v2-create-issue-link {
@@ -8412,7 +8450,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-create-inline-error {
   margin: 8px 0 0;
-  color: var(--arc-error);
+  color: var(--arc-error-text);
   font-size: 10.5px;
 }
 
@@ -8541,7 +8579,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-create-media-detail {
   margin: 0;
   overflow: hidden;
-  color: oklch(0.97 0 0);
+  color: var(--arc-text-overlay);
   font-size: 10.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -8567,7 +8605,7 @@ dialog.v2-confirm-backdrop::backdrop {
   border-radius: var(--arc-radius-xs);
   padding: 4px 8px;
   background: oklch(0 0 0 / 60%);
-  color: oklch(0.97 0 0);
+  color: var(--arc-text-overlay);
   font-family: inherit;
   font-size: 10px;
   font-weight: 700;
@@ -8578,7 +8616,7 @@ dialog.v2-confirm-backdrop::backdrop {
   border: 0;
   padding: 0;
   background: transparent;
-  color: oklch(0.97 0 0);
+  color: var(--arc-text-overlay);
   font-family: inherit;
   font-size: 10px;
   font-weight: 700;
@@ -8586,7 +8624,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-create-media-remove {
-  color: var(--arc-error);
+  color: var(--arc-error-text);
   border-color: oklch(0.6 0.18 25 / 60%);
 }
 
@@ -8838,7 +8876,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-create-check-blocked {
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 .v2-create-check-blocked::before {
@@ -8886,7 +8924,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-create-phase-error {
   border-color: oklch(0.6 0.18 25 / 60%);
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 .v2-create-status-ok,
@@ -8904,7 +8942,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-create-status-error {
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 .v2-create-status-busy {
@@ -9190,7 +9228,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-store-tab-flag-blocked {
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 .v2-store-tab-flag-warned {
@@ -9226,7 +9264,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-store-alert {
   margin: 0;
-  color: var(--arc-error);
+  color: var(--arc-error-text);
   font-size: 10.5px;
   line-height: 1.5;
 }
@@ -9311,7 +9349,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-store-stage-error {
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 .v2-store-outcome-list {
@@ -10179,7 +10217,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .arc-dialog-alert {
   border-color: var(--arc-error);
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 .arc-dialog-status {
@@ -10205,7 +10243,7 @@ dialog.v2-confirm-backdrop::backdrop {
 /* Destructive tone is a visual marker only. Dismissal policy is typed in
    dialog.rs and never inferred from this class. */
 .arc-dialog-destructive .arc-dialog-title {
-  color: var(--arc-error);
+  color: var(--arc-error-text);
 }
 
 .arc-dialog-destructive .arc-dialog-panel {
@@ -10269,6 +10307,64 @@ dialog.v2-confirm-backdrop::backdrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_closed_details_workaround_covers_the_whole_application() {
+        // Phase 7 scoped this to .v2-publisher-studio, which left every other
+        // <details> in the application leaking its body on WebKitGTK.
+        assert!(
+            UI_V2_STYLES.contains("details:not([open]) > *:not(summary) {\n  display: none;\n}")
+        );
+        assert!(
+            !UI_V2_STYLES.contains(".v2-publisher-studio details:not([open])"),
+            "the narrower publisher-scoped copy must not survive alongside the general rule"
+        );
+    }
+
+    #[test]
+    fn an_open_modal_locks_the_background_with_a_pinned_body() {
+        // show_modal() supplies the focus trap and inertness but not scroll
+        // locking, so the background used to drift under an open dialog.
+        assert!(UI_V2_STYLES.contains("body.arc-modal-open {\n  position: fixed;"));
+        // overflow:hidden was measured as ineffective in WebKitGTK; a
+        // regression back to it would silently unlock the background.
+        assert!(!UI_V2_STYLES.contains("html.arc-modal-open"));
+    }
+
+    #[test]
+    fn the_shell_is_never_made_inert() {
+        // Dialogs render inside .arc-app-shell; an inert ancestor would make
+        // the dialog itself unreachable rather than protecting the background.
+        assert!(!UI_V2_STYLES.contains(".arc-app-shell[inert]"));
+        assert!(!UI_V2_STYLES.contains("arc-app-shell:has([open])"));
+    }
+
+    #[test]
+    fn status_text_uses_the_legible_error_token_not_the_fill_token() {
+        // --arc-error (oklch 0.6) measures 4.03:1 on --arc-progress-track,
+        // below WCAG AA for the small copy it was being used for. Fills and
+        // borders may still use it; text may not.
+        assert!(
+            !UI_V2_STYLES.contains("  color: var(--arc-error);"),
+            "status text must use --arc-error-text"
+        );
+        assert!(UI_V2_STYLES.contains("var(--arc-error-text)"));
+    }
+
+    #[test]
+    fn placeholders_and_status_text_do_not_reintroduce_raw_color_literals() {
+        for literal in [
+            "oklch(0.52 0.01 60)",
+            "oklch(0.75 0.18 25)",
+            "oklch(0.83 0.16 60)",
+            "oklch(0.97 0 0)",
+        ] {
+            assert!(
+                !UI_V2_STYLES.contains(literal),
+                "{literal} has a canonical token; it must not be duplicated inline"
+            );
+        }
+    }
 
     #[test]
     fn native_dropdown_options_use_readable_dark_colors() {

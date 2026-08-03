@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 
+use super::aria::aria_bool;
 use super::transient::{close_transient_on_outside_pointer, close_transient_when_modal_opens};
 use super::ArcadestrLogo;
 
@@ -134,7 +135,7 @@ pub fn TopBar(
                             type="button"
                             class="arc-relay-control"
                             aria-label="Show relay connections"
-                            aria-expanded=move || relay_menu_open.get()
+                            aria-expanded=move || aria_bool(relay_menu_open.get())
                             aria-controls="relay-status-menu"
                             title=move || match relay_count.get() {
                                 0 => "No connected relays".to_string(),
@@ -236,7 +237,7 @@ pub fn TopBar(
                             type="button"
                             class="arc-account-control"
                             aria-label=move || format!("Open account menu for {}", display_name.get())
-                            aria-expanded=move || account_menu_open.get()
+                            aria-expanded=move || aria_bool(account_menu_open.get())
                             aria-controls="account-control-menu"
                             title=move || {
                                 let status = connection_status.get();

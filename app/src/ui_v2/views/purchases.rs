@@ -358,7 +358,7 @@ fn purchase_record_view(record: DurableAcquisitionRecord) -> impl IntoView {
     view! {
         <article class="v2-purchase-record v2-panel">
             <div class="v2-purchase-record-mark" aria-hidden="true">
-                <span class="material-symbols-outlined">{if record.record_type == DurableAcquisitionKind::Purchase { "receipt_long" } else { "redeem" }}</span>
+                <span class="material-symbols-outlined" aria-hidden="true">{if record.record_type == DurableAcquisitionKind::Purchase { "receipt_long" } else { "redeem" }}</span>
             </div>
             <div class="v2-purchase-record-copy">
                 <p class="v2-store-kicker">{record_type}</p>

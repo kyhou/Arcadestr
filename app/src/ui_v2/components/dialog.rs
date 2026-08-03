@@ -503,6 +503,18 @@ pub fn Dialog(
         invoker.set_value(None);
     };
 
+    // Whether this dialog currently holds a share of the background scroll
+    // lock. Tracked per dialog instance so the release is exact even if the
+    // component unmounts while open.
+    let holds_background = StoredValue::new(false);
+
+    let release_background = move || {
+        if holds_background.get_value() {
+            holds_background.set_value(false);
+            crate::ui_v2::components::modal_background::release();
+        }
+    };
+
     Effect::new(move |_| {
         let is_open = open.get();
         let Some(dialog) = dialog_ref.get() else {
@@ -513,12 +525,22 @@ pub fn Dialog(
             crate::ui_v2::components::transient::notify_modal_opened();
             invoker.set_value(active_element());
             let _ = dialog.show_modal();
+            if !holds_background.get_value() {
+                holds_background.set_value(true);
+                crate::ui_v2::components::modal_background::acquire();
+            }
             apply_initial_focus();
         } else if !is_open && dialog.open() {
             dialog.close();
+            release_background();
             restore_focus();
         }
     });
+
+    // A route change can unmount an open dialog without the close path ever
+    // running. Without this the document would stay scroll-locked with no
+    // dialog on screen.
+    on_cleanup(release_background);
 
     let panel_class = format!("arc-dialog-panel arc-clipped-panel {}", width.class());
     let destructive = Signal::derive(move || {

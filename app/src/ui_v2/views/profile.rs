@@ -83,17 +83,34 @@ fn profile_display_name(profile: Option<&UserProfile>, npub: Option<&str>) -> St
         .unwrap_or_else(|| "Profile unavailable".to_string())
 }
 
+/// Whether the heading is showing the public key itself rather than a name.
+///
+/// With no usable display name, `profile_display_name` falls back to the
+/// abbreviated key — so rendering the standalone key line underneath printed
+/// the same identifier twice, in two different abbreviations.
+/// Checks the name fields directly rather than `UserProfile::display()`:
+/// `display()` already falls back to the abbreviated key itself, so it is
+/// never empty and cannot distinguish "has a name" from "showing the key".
+fn heading_is_public_key(profile: Option<&UserProfile>) -> bool {
+    profile
+        .and_then(|profile| {
+            profile
+                .display_name
+                .clone()
+                .or_else(|| profile.name.clone())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+}
+
+/// Abbreviate a public key for display.
+///
+/// Delegates to the shared label so an identifier reads identically wherever it
+/// appears. This used to truncate to the same 12/8 split but join with `…`
+/// while `npub_fallback_label` joined with `...`, so the profile heading and
+/// the key line disagreed character-for-character on the same key.
 fn abbreviate_public_key(value: &str) -> String {
-    let chars = value.chars().collect::<Vec<_>>();
-    if chars.len() <= 24 {
-        value.to_string()
-    } else {
-        format!(
-            "{}…{}",
-            chars[..12].iter().collect::<String>(),
-            chars[chars.len() - 8..].iter().collect::<String>()
-        )
-    }
+    npub_fallback_label(value)
 }
 
 fn profile_access_chip(listing: &GameListing) -> (&'static str, StatusChipVariant) {
@@ -415,7 +432,9 @@ pub fn ProfileV2View(
                             {move || (!my_listings.get().is_empty()).then(|| view! { <StatusChip label=format!("Publisher of {} loaded game(s)", my_listings.get().len()) variant=StatusChipVariant::Published icon=Some("sports_esports") size=StatusChipSize::Compact /> })}
                         </div>
                         {move || profile.get().and_then(|profile| profile.name).filter(|name| !name.trim().is_empty()).map(|name| view! { <p class="arc-profile-username">{name}</p> })}
-                        <p class="arc-profile-key">{move || abbreviate_public_key(&current_npub.get())}</p>
+                        {move || (!heading_is_public_key(profile.get().as_ref())).then(|| view! {
+                            <p class="arc-profile-key">{abbreviate_public_key(&current_npub.get())}</p>
+                        })}
                         {if verification_available {
                             view! { <Nip05Badge status=nip05_status.into() on_verify=on_verify_nip05 /> }.into_any()
                         } else {
@@ -565,6 +584,58 @@ mod tests {
     }
 
     #[test]
+    fn an_account_without_a_display_name_shows_its_key_once() {
+        // The heading falls back to the abbreviated key when there is no
+        // display name, so the standalone key line has to stand down or the
+        // same identifier renders twice.
+        assert!(heading_is_public_key(None));
+
+        let npub = "npub1kvl9ev2qqqqqqqqqqqqqqqqqqqqqqqqqqqqyqesnwt4";
+        assert_eq!(
+            profile_display_name(None, Some(npub)),
+            abbreviate_public_key(npub),
+            "heading and key line must agree character-for-character"
+        );
+
+        // A profile record that exists but carries no name still headings on
+        // the key. UserProfile::display() falls back to the key internally, so
+        // testing through it would wrongly report a name here.
+        let nameless = UserProfile {
+            npub: npub.into(),
+            ..UserProfile::default()
+        };
+        assert!(heading_is_public_key(Some(&nameless)));
+        assert_eq!(nameless.display(), abbreviate_public_key(npub));
+
+        let named = UserProfile {
+            npub: npub.into(),
+            display_name: Some("Astra".into()),
+            ..UserProfile::default()
+        };
+        assert!(!heading_is_public_key(Some(&named)));
+
+        let name_only = UserProfile {
+            npub: npub.into(),
+            name: Some("astra".into()),
+            ..UserProfile::default()
+        };
+        assert!(!heading_is_public_key(Some(&name_only)));
+    }
+
+    #[test]
+    fn identifiers_abbreviate_identically_everywhere() {
+        // Two helpers previously split at the same 12/8 boundary but joined
+        // with different ellipsis characters, so one key rendered two ways.
+        for value in [
+            "npub1kvl9ev2qqqqqqqqqqqqqqqqqqqqqqqqqqqqyqesnwt4",
+            "npub1short",
+            "",
+        ] {
+            assert_eq!(abbreviate_public_key(value), npub_fallback_label(value));
+        }
+    }
+
+    #[test]
     fn unsupported_profile_editing_is_omitted() {
         let source = include_str!("profile.rs");
         assert!(!source.contains(concat!("Edit ", "Profile")));
@@ -646,9 +717,11 @@ mod tests {
             npub_fallback_label("npub1abcdefghijklmnop")
         );
         assert_eq!(abbreviate_public_key("short-key"), "short-key");
+        // The separator is the shared label's `...`, not the `…` this helper
+        // used to emit on its own; one key must not render two ways.
         assert_eq!(
             abbreviate_public_key("npub1abcdefghijklmnopqrstuvwxyz0123456789"),
-            "npub1abcdefg…23456789"
+            "npub1abcdefg...23456789"
         );
     }
 

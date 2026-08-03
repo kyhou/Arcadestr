@@ -1,5 +1,6 @@
 //! Shared UI v2 components.
 
+pub mod aria;
 pub mod blossom_media_upload;
 pub mod button;
 pub mod dialog;
@@ -7,6 +8,7 @@ pub mod feedback;
 pub mod game_artwork;
 pub mod game_card;
 pub mod logo;
+pub mod modal_background;
 pub mod nav_item;
 pub mod page_container;
 pub mod page_header;
@@ -17,6 +19,7 @@ pub mod topbar;
 pub mod transient;
 pub mod unsaved_changes_dialog;
 
+pub use aria::aria_bool;
 pub use blossom_media_upload::BlossomMediaUpload;
 pub use button::{Button, ButtonSize, ButtonVariant, IconButton};
 pub use dialog::{
@@ -36,6 +39,7 @@ pub use game_card::{
     PlatformCompatibility,
 };
 pub use logo::ArcadestrLogo;
+pub use modal_background::{scroll_lock_transition, ScrollLockAction, MODAL_OPEN_CLASS};
 pub use nav_item::{MobileNavItem, NavItem};
 pub use page_container::{ClippedPanel, PageContainer};
 pub use page_header::PageHeader;

@@ -8,6 +8,7 @@ use leptos::task::spawn_local;
 
 use crate::models::{AcquisitionPolicy, GameListing, PlatformInfo, StorePageCardPresentation};
 use crate::tauri_bridge::{invoke_get_installed_games, invoke_get_platform_info};
+use crate::ui_v2::components::aria::aria_bool;
 use crate::ui_v2::components::{
     EmptyState, ErrorSeverity, ErrorState, GameCard, GameCardAction, GameCardCampaign,
     GameCardDensity, GameCardPresentation, GameCardSkeleton, InlineLoading, PartialRelayKind,
@@ -459,7 +460,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                 <button
                     type="button"
                     class=move || filter_chip_class(active_category.get().is_none())
-                    aria-pressed=move || active_category.get().is_none()
+                    aria-pressed=move || aria_bool(active_category.get().is_none())
                     on:click=move |_| active_category.set(None)
                 >"All"</button>
                 {move || categories.get().into_iter().map(|category| {
@@ -470,7 +471,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                         <button
                             type="button"
                             class=move || filter_chip_class(active_category.get().as_deref() == Some(key_for_active.as_str()))
-                            aria-pressed=move || active_category.get().as_deref() == Some(key.as_str())
+                            aria-pressed=move || aria_bool(active_category.get().as_deref() == Some(key.as_str()))
                             on:click=move |_| active_category.set(Some(key_for_click.clone()))
                         >{category.label}</button>
                     }

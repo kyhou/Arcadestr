@@ -41,16 +41,32 @@
     --arc-progress-track: #1a1a1d;
     --arc-text-primary: #eae6df;
     --arc-text-heading: #fff;
+    /* Neutral text ladder. Every step clears WCAG AA (4.5:1) against the
+       darkest surface it is rendered on (--arc-progress-track, #1a1a1d):
+       secondary 6.01:1, muted 5.15:1, subdued 4.76:1, placeholder 4.76:1.
+       Measured by resolving oklch() to sRGB directly; the desktop WebKitGTK
+       canvas fillStyle does not resolve oklch() and reports stale values. */
     --arc-text-secondary: oklch(0.68 0.01 60);
-    --arc-text-muted: oklch(0.55 0.01 60);
-    --arc-text-subdued: oklch(0.45 0.01 60);
+    --arc-text-muted: oklch(0.64 0.01 60);
+    --arc-text-subdued: oklch(0.62 0.01 60);
+    --arc-text-placeholder: oklch(0.62 0.01 60);
     --arc-text-disabled: #888;
     --arc-accent: oklch(var(--noir-primary));
+    --arc-accent-hover: oklch(0.83 0.16 60);
     --arc-action: oklch(var(--noir-secondary));
     --arc-success: oklch(var(--noir-success));
     --arc-warning: oklch(var(--noir-warning));
     --arc-error: oklch(var(--noir-destructive));
     --arc-info: oklch(var(--noir-tertiary));
+    /* Status colors legible as small text. The base status tokens are tuned
+       for fills and borders; --arc-error at 0.6 measures 4.03:1 on
+       --arc-progress-track, below AA, so status *text* uses these instead. */
+    --arc-success-text: oklch(0.78 0.16 145);
+    --arc-warning-text: oklch(0.78 0.15 60);
+    --arc-error-text: oklch(0.75 0.18 25);
+    --arc-info-text: oklch(0.8 0.15 300);
+    /* Text rendered over artwork, media overlays, and scrims. */
+    --arc-text-overlay: oklch(0.97 0 0);
     --arc-border-subtle: rgb(255 255 255 / 10%);
     --arc-border-default: rgb(255 255 255 / 18%);
     --arc-border-strong: rgb(255 255 255 / 25%);

@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 
 use crate::models::{AcquisitionPolicy, GameListing, StorePageCardPresentation};
+use crate::ui_v2::components::aria::aria_bool;
 use crate::ui_v2::components::{
     artwork_state_from_url, GameArtwork, GameCardSkeleton, StatusChip, StatusChipSize,
     StatusChipVariant,
@@ -311,7 +312,7 @@ pub fn GameCardVisual(
                     class="arc-game-card-favorite"
                     class:arc-game-card-favorite-active=selected
                     aria-label=if selected { "Remove from favorites" } else { "Add to favorites" }
-                    aria-pressed=selected
+                    aria-pressed=aria_bool(selected)
                     disabled=disabled
                     on:click=move |_| callback.run(!selected)
                 >

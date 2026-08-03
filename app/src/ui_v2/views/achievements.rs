@@ -328,7 +328,7 @@ pub fn AchievementsView() -> impl IntoView {
         <section class="v2-achievements">
             <header class="v2-achievements-hero v2-panel-glass">
                 <div class="v2-achievements-hero-mark" aria-hidden="true">
-                    <span class="material-symbols-outlined">"military_tech"</span>
+                    <span class="material-symbols-outlined" aria-hidden="true">"military_tech"</span>
                 </div>
                 <div>
                     <p class="v2-store-kicker">"NIP-58 proof collection"</p>

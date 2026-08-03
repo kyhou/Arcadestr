@@ -5,6 +5,7 @@ use leptos::prelude::*;
 use crate::models::{
     GameDetailPresentation, SafeStorePageHtml, StorePageMedia, StorePageRequirementTier,
 };
+use crate::ui_v2::components::aria::aria_bool;
 use crate::ui_v2::components::{
     Dialog, DialogCloseAction, DialogClosePolicy, DialogCloseRequest, DialogDismissal,
     DialogInitialFocus, DialogWidth,
@@ -165,7 +166,7 @@ pub fn StorePageRichDetail(
                                 item.url.clone()
                             }
                         });
-                        view! { <button type="button" class="v2-detail-media-thumb" class:active=move || selected.get() == index aria-pressed=move || selected.get() == index on:click=move |_| selected.set(index)>
+                        view! { <button type="button" class="v2-detail-media-thumb" class:active=move || selected.get() == index aria-pressed=move || aria_bool(selected.get() == index) on:click=move |_| selected.set(index)>
                             <img src=thumbnail alt=item.alt.unwrap_or_else(|| format!("Select {}", label(&item.role))) on:error=use_fallback_cover />
                         </button> }
                     }).collect_view()}

@@ -61,6 +61,13 @@ pub fn StoreFrontView(
 
     view! {
         <section class="arc-store-home">
+            // The handoff Store page shows no visible page title — the hero
+            // carries the visual weight. The route still needs exactly one
+            // page-level heading, and the hero title cannot serve as it: the
+            // hero is replaced by a loading, empty, error, or missing-artwork
+            // state whenever there is no featured listing, which left the whole
+            // route with no page heading at all.
+            <h1 class="sr-only">"Store"</h1>
             {move || match featured_listing.get() {
                 Some(listing) => {
                     let candidates = featured.get();
@@ -126,7 +133,7 @@ pub fn StoreFrontView(
                         >
                             <div class="arc-store-hero-copy">
                                 <div class="arc-store-hero-kicker"><span>"Featured game"</span><i aria-hidden="true"></i></div>
-                                <h1>{title.clone()}</h1>
+                                <h2>{title.clone()}</h2>
                                 <p class="arc-store-hero-publisher">{format!("{publisher} · {platform_label}")}</p>
                                 <div class="arc-store-hero-statuses">
                                     <StatusChip
@@ -646,6 +653,34 @@ fn current_unix_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::models::ListingSource;
+
+    #[test]
+    fn the_store_route_keeps_one_page_heading_in_every_hero_state() {
+        // Scope to production code: this test's own literals would otherwise
+        // satisfy the assertions it makes.
+        let full = include_str!("store_front.rs");
+        let production = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("test module marker");
+
+        // The hero is swapped out for a loading, empty, error, or
+        // missing-artwork state whenever there is no featured listing, so the
+        // page-level heading must not live inside it.
+        assert_eq!(
+            production.matches("<h1").count(),
+            1,
+            "exactly one page-level heading per route"
+        );
+        assert!(
+            production.contains(concat!("<h1 class=\"sr-only\">", "\"Store\"</h1>")),
+            "the Store route needs a state-independent page heading"
+        );
+        assert!(
+            production.contains("<h2>{title.clone()}</h2>"),
+            "the featured listing title stays a section heading, not the page heading"
+        );
+    }
 
     fn listing(id: &str, created_at: u64, images: Vec<String>) -> GameListing {
         GameListing {

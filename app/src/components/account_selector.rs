@@ -1,5 +1,6 @@
 use crate::models::{npub_fallback_label, Nip49ImportRequest};
 use crate::store::profiles::use_profile;
+use crate::ui_v2::components::aria::aria_bool;
 use crate::{AuthContext, StoredAccount};
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
@@ -433,7 +434,7 @@ pub fn AccountSelector(
                         class:active=move || add_account_tab.get() == AddAccountTab::ExistingMethods
                         on:click=move |_| add_account_tab.set(AddAccountTab::ExistingMethods)
                         role="tab"
-                        aria-selected=move || add_account_tab.get() == AddAccountTab::ExistingMethods
+                        aria-selected=move || aria_bool(add_account_tab.get() == AddAccountTab::ExistingMethods)
                     >
                         "Add New Account"
                     </button>
@@ -442,7 +443,7 @@ pub fn AccountSelector(
                         class:active=move || add_account_tab.get() == AddAccountTab::ImportFromBackup
                         on:click=move |_| add_account_tab.set(AddAccountTab::ImportFromBackup)
                         role="tab"
-                        aria-selected=move || add_account_tab.get() == AddAccountTab::ImportFromBackup
+                        aria-selected=move || aria_bool(add_account_tab.get() == AddAccountTab::ImportFromBackup)
                     >
                         "Import from Backup"
                     </button>
