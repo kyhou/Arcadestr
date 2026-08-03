@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 
+use super::transient::{close_transient_on_outside_pointer, close_transient_when_modal_opens};
 use super::ArcadestrLogo;
 
 #[cfg(target_arch = "wasm32")]
@@ -45,6 +46,14 @@ pub fn TopBar(
 ) -> impl IntoView {
     let relay_menu_open = RwSignal::new(false);
     let account_menu_open = RwSignal::new(false);
+
+    // Shared transient contract: an outside pointer press dismisses, and a
+    // modal opening dismisses. Escape and the close control already dismiss and
+    // restore focus to the trigger below.
+    close_transient_on_outside_pointer(relay_menu_open, "#relay-menu-wrap");
+    close_transient_on_outside_pointer(account_menu_open, "#account-menu-wrap");
+    close_transient_when_modal_opens(relay_menu_open);
+    close_transient_when_modal_opens(account_menu_open);
     let search_query = RwSignal::new(String::new());
 
     let close_account_and = move |action: Callback<()>| {
@@ -119,7 +128,7 @@ pub fn TopBar(
                         </label>
                     </form>
 
-                    <div class="arc-topbar-menu-wrap">
+                    <div id="relay-menu-wrap" class="arc-topbar-menu-wrap">
                         <button
                             id="relay-control-trigger"
                             type="button"
@@ -221,7 +230,7 @@ pub fn TopBar(
                         </Show>
                     </div>
 
-                    <div class="arc-topbar-menu-wrap">
+                    <div id="account-menu-wrap" class="arc-topbar-menu-wrap">
                         <button
                             id="account-control-trigger"
                             type="button"

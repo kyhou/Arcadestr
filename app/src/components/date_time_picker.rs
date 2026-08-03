@@ -1,6 +1,29 @@
 use leptos::prelude::*;
 use time::{Date, Month};
 
+use crate::ui_v2::components::transient::{
+    close_transient_on_outside_pointer, close_transient_when_modal_opens, focus_transient_invoker,
+    should_close_on_escape,
+};
+
+thread_local! {
+    static PICKER_TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Distinct trigger ids so several pickers on one page each restore focus to
+/// their own control.
+fn date_picker_ids() -> (String, String) {
+    let token = PICKER_TOKEN.with(|token| {
+        let next = token.get().wrapping_add(1);
+        token.set(next);
+        next
+    });
+    (
+        format!("arc-date-picker-trigger-{token}"),
+        format!("arc-date-picker-wrap-{token}"),
+    )
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum SelectionTarget {
     Start,
@@ -150,10 +173,19 @@ pub fn DatePicker(
         .unwrap_or(Date::MIN);
     let display_date = RwSignal::new(initial_date);
     let open = RwSignal::new(false);
+    let (trigger_id, wrap_id) = date_picker_ids();
+    let wrap_selector = format!("#{wrap_id}");
+    let trigger_for_escape = trigger_id.clone();
+
+    // Same transient contract as the topbar menus. This stays a disclosure: it
+    // does not trap focus and is not promoted to a modal.
+    close_transient_on_outside_pointer(open, wrap_selector);
+    close_transient_when_modal_opens(open);
 
     view! {
-        <div class="relative">
+        <div id=wrap_id class="relative">
             <button
+                id=trigger_id
                 type="button"
                 class="v2-input flex min-h-12 items-center justify-between gap-3 text-left"
                 aria-label="Choose release date"
@@ -173,7 +205,20 @@ pub fn DatePicker(
                 <span class="material-symbols-outlined text-lg text-on-surface-variant" aria-hidden="true">"calendar_month"</span>
             </button>
             <Show when=move || open.get()>
-                <section class="absolute left-0 top-[calc(100%+0.5rem)] z-50 w-[min(22rem,calc(100vw-3rem))] rounded-xl border border-outline-variant/40 bg-surface-container-highest p-3 shadow-ambient" aria-label="Release date calendar">
+                <section
+                    class="absolute left-0 top-[calc(100%+0.5rem)] z-50 w-[min(22rem,calc(100vw-3rem))] rounded-xl border border-outline-variant/40 bg-surface-container-highest p-3 shadow-ambient"
+                    aria-label="Release date calendar"
+                    on:keydown={
+                        let trigger_for_escape = trigger_for_escape.clone();
+                        move |event: leptos::ev::KeyboardEvent| {
+                            if should_close_on_escape(&event.key(), open.get_untracked()) {
+                                event.prevent_default();
+                                open.set(false);
+                                focus_transient_invoker(&trigger_for_escape);
+                            }
+                        }
+                    }
+                >
                     <header class="mb-2 grid grid-cols-[2rem_1fr_2rem] items-center">
                         <button type="button" class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-on-surface-variant hover:bg-surface-bright hover:text-on-surface" aria-label="Previous month" on:click=move |_| display_date.update(|date| *date = adjacent_month(*date, false))>
                             <span class="material-symbols-outlined text-lg">"chevron_left"</span>

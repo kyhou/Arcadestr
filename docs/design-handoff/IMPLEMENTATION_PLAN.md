@@ -471,6 +471,33 @@ There is no new revoke dialog until a real command and scope exist.
 - `desktop/tauri.conf.json` only if review explicitly approves a desktop minimum
   window size; do not silently make the current resizable window fixed.
 
+Carried over from Phase 12: modal dismissal, focus, and navigation safety were
+consolidated onto the canonical `Dialog` primitive and verified at runtime,
+including a 924x540 capture that the Phase 11 session could not obtain. Two
+accessibility defects were identified but deliberately left untouched, because
+both are semantics work that belongs to this phase rather than to a behavioral
+consolidation. Phase 13 must:
+
+- verify `aria-expanded` serialization and screen-reader behavior on every
+  transient disclosure. Leptos currently drops the attribute entirely when the
+  bound signal is `false` instead of emitting `aria-expanded="false"`, so the
+  topbar relay menu, the account menu, the date-picker popover, and the Store
+  Page readiness toggle advertise no collapsed state at all. Confirm the
+  rendered DOM with a real screen reader before choosing between a string-valued
+  binding and a shared helper;
+- apply modal background inertness where supported, with a safe fallback. The
+  page behind an open dialog still scrolls and its content remains reachable;
+  native `<dialog>` supplies the focus trap but not scroll locking. Prefer the
+  `inert` attribute or `overflow: hidden` scoped to the shell while a dialog is
+  open, and confirm the fallback leaves no surface unreachable in the WebKitGTK
+  webview when `inert` is unavailable.
+
+Also carried over from Phase 12: relays returned no listings during the
+verification session, so the install, media expansion, campaign confirmation,
+Store Page discard, and Blossom upload dialogs could not be exercised against
+real state. Each is covered by close-policy contract tests, but Phase 13 must
+capture them visually once listing data is available.
+
 Carried over from Phase 11: the Settings surface and its dirty-state transition
 were verified against real application state, but several Accounts, NIP-49, and
 Settings states could not be reached safely or at all in the development

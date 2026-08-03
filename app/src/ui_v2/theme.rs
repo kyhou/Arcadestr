@@ -9977,6 +9977,293 @@ dialog.v2-confirm-backdrop::backdrop {
     transform: none;
   }
 }
+/* ── Canonical dialog primitive (Phase 12) ──────────────────────────────────
+   One geometry and dismissal contract for every production dialog. Feature
+   files must not redefine dialog geometry; add a variant here instead. */
+
+.arc-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 140;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  max-height: none;
+  margin: 0;
+  padding: var(--arc-space-4);
+  border: 0;
+  background: rgb(5 7 10 / 80%);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: var(--arc-text-primary);
+  font-family: var(--arc-font-mono);
+  overscroll-behavior: contain;
+}
+
+.arc-dialog:not([open]) {
+  display: none;
+}
+
+.arc-dialog::backdrop {
+  background: rgb(5 7 10 / 80%);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.arc-dialog-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--arc-space-3);
+  width: 100%;
+  min-height: 0;
+  max-height: 100%;
+  padding: var(--arc-space-5);
+  background: var(--arc-surface);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 55%);
+  animation: arc-dialog-enter 140ms ease-out;
+}
+
+.arc-dialog-panel:focus {
+  outline: none;
+}
+
+.arc-dialog-panel:focus-visible {
+  outline: 2px solid var(--arc-focus-ring);
+  outline-offset: -2px;
+}
+
+.arc-dialog-compact {
+  max-width: 460px;
+}
+
+.arc-dialog-standard {
+  max-width: 640px;
+}
+
+.arc-dialog-wide {
+  max-width: 1040px;
+}
+
+@keyframes arc-dialog-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.arc-dialog-header {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--arc-space-3);
+}
+
+.arc-dialog-heading {
+  display: grid;
+  gap: var(--arc-space-1);
+  min-width: 0;
+}
+
+.arc-dialog-kicker {
+  margin: 0;
+  color: var(--arc-text-muted);
+  font-size: var(--arc-text-10-5);
+  letter-spacing: var(--arc-tracking-label);
+  text-transform: uppercase;
+}
+
+.arc-dialog-title {
+  margin: 0;
+  color: var(--arc-text-heading);
+  font-size: var(--arc-text-18);
+  font-weight: var(--arc-weight-bold);
+  line-height: var(--arc-leading-title);
+  overflow-wrap: anywhere;
+}
+
+.arc-dialog-description {
+  flex: 0 0 auto;
+  margin: 0;
+  color: var(--arc-text-secondary);
+  font-size: var(--arc-text-13);
+  line-height: var(--arc-leading-copy);
+  overflow-wrap: anywhere;
+}
+
+.arc-dialog-blocked-hint {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: var(--arc-space-2) var(--arc-space-3);
+  border: 1px solid var(--arc-border-subtle);
+  background: var(--arc-surface-recessed);
+  color: var(--arc-text-muted);
+  font-size: var(--arc-text-12);
+}
+
+.arc-dialog-close {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: var(--arc-control-md);
+  height: var(--arc-control-md);
+  border: 1px solid var(--arc-border-control);
+  border-radius: var(--arc-radius-xs);
+  background: var(--arc-surface-recessed);
+  color: var(--arc-text-secondary);
+}
+
+.arc-dialog-close:hover:not(:disabled) {
+  border-color: var(--arc-border-strong);
+  color: var(--arc-text-primary);
+}
+
+.arc-dialog-close:focus-visible {
+  outline: 2px solid var(--arc-focus-ring);
+  outline-offset: 2px;
+}
+
+.arc-dialog-close:disabled {
+  color: var(--arc-text-disabled);
+  cursor: not-allowed;
+}
+
+.arc-dialog-body {
+  display: grid;
+  flex: 1 1 auto;
+  align-content: start;
+  gap: var(--arc-space-3);
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: var(--arc-space-1);
+  color: var(--arc-text-primary);
+  font-size: var(--arc-text-13);
+  line-height: var(--arc-leading-copy);
+}
+
+.arc-dialog-body > p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.arc-dialog-body :is(h3, h4) {
+  margin: 0;
+  color: var(--arc-text-heading);
+  font-size: var(--arc-text-13);
+  letter-spacing: var(--arc-tracking-tight);
+}
+
+/* Validation and status panels inside a dialog body. */
+.arc-dialog-note,
+.arc-dialog-alert,
+.arc-dialog-status {
+  margin: 0;
+  padding: var(--arc-space-3);
+  border: 1px solid var(--arc-border-subtle);
+  background: var(--arc-surface-recessed);
+  font-size: var(--arc-text-12);
+  overflow-wrap: anywhere;
+}
+
+.arc-dialog-note {
+  color: var(--arc-text-muted);
+}
+
+.arc-dialog-alert {
+  border-color: var(--arc-error);
+  color: var(--arc-error);
+}
+
+.arc-dialog-status {
+  border-color: var(--arc-border-default);
+  color: var(--arc-text-secondary);
+}
+
+.arc-dialog-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--arc-space-2);
+  padding-top: var(--arc-space-3);
+  border-top: 1px solid var(--arc-separator-recessed);
+}
+
+.arc-dialog-actions > :only-child {
+  margin-left: auto;
+}
+
+/* Destructive tone is a visual marker only. Dismissal policy is typed in
+   dialog.rs and never inferred from this class. */
+.arc-dialog-destructive .arc-dialog-title {
+  color: var(--arc-error);
+}
+
+.arc-dialog-destructive .arc-dialog-panel {
+  border-color: var(--arc-error);
+}
+
+/* Media expansion fills the safe viewport area without page scrolling. */
+.arc-dialog-wide .arc-dialog-body img,
+.arc-dialog-wide .arc-dialog-body video {
+  width: 100%;
+  max-height: 68vh;
+  object-fit: contain;
+}
+
+/* Narrow desktop widths stack the action row instead of overflowing it. */
+@media (max-width: 720px) {
+  .arc-dialog {
+    padding: var(--arc-space-3);
+  }
+
+  .arc-dialog-panel {
+    padding: var(--arc-space-4);
+  }
+
+  .arc-dialog-actions {
+    flex-direction: column-reverse;
+    align-items: stretch;
+  }
+
+  .arc-dialog-actions > * {
+    width: 100%;
+  }
+}
+
+/* 924x540 is the smallest supported desktop viewport: the panel must never
+   exceed it, and the body, not the page, does the scrolling. */
+@media (max-height: 620px) {
+  .arc-dialog-panel {
+    gap: var(--arc-space-2);
+    padding: var(--arc-space-4);
+  }
+
+  .arc-dialog-wide .arc-dialog-body img,
+  .arc-dialog-wide .arc-dialog-body video {
+    max-height: 52vh;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .arc-dialog-panel {
+    animation: none;
+  }
+
+  .arc-dialog {
+    scroll-behavior: auto;
+  }
+}
+
 "#;
 
 #[cfg(test)]
@@ -10022,6 +10309,63 @@ mod tests {
         assert!(rule.contains("min-width: 0;"));
         assert!(rule.contains("max-width: 100%;"));
         assert!(rule.contains("overflow-wrap: anywhere;"));
+    }
+
+    #[test]
+    fn the_canonical_dialog_owns_one_geometry_contract() {
+        // Panel scrolls its body, never the page, and never exceeds the
+        // smallest supported desktop viewport (924x540).
+        assert!(UI_V2_STYLES.contains(".arc-dialog-panel {"));
+        assert!(UI_V2_STYLES.contains(".arc-dialog-body {"));
+        let body_rule = &UI_V2_STYLES[UI_V2_STYLES
+            .find(".arc-dialog-body {")
+            .expect("dialog body rule")..];
+        let body_rule = &body_rule[..body_rule.find('}').expect("rule should close")];
+        assert!(body_rule.contains("overflow-y: auto;"));
+        assert!(body_rule.contains("min-height: 0;"));
+
+        let panel_rule = &UI_V2_STYLES[UI_V2_STYLES
+            .find(".arc-dialog-panel {")
+            .expect("dialog panel rule")..];
+        let panel_rule = &panel_rule[..panel_rule.find('}').expect("rule should close")];
+        assert!(panel_rule.contains("max-height: 100%;"));
+        assert!(panel_rule.contains("flex-direction: column;"));
+
+        // Compact, standard, and wide are the only declared widths.
+        assert!(UI_V2_STYLES.contains(".arc-dialog-compact {"));
+        assert!(UI_V2_STYLES.contains(".arc-dialog-standard {"));
+        assert!(UI_V2_STYLES.contains(".arc-dialog-wide {"));
+    }
+
+    #[test]
+    fn dialog_actions_stay_reachable_and_stack_on_narrow_widths() {
+        let actions = &UI_V2_STYLES[UI_V2_STYLES
+            .find(".arc-dialog-actions {")
+            .expect("dialog action row")..];
+        let actions = &actions[..actions.find('}').expect("rule should close")];
+        // `flex: 0 0 auto` keeps the row outside the scrolling body, so the
+        // actions are always on screen however long the content is.
+        assert!(actions.contains("flex: 0 0 auto;"));
+        assert!(UI_V2_STYLES.contains("@media (max-width: 720px)"));
+        assert!(UI_V2_STYLES.contains("@media (max-height: 620px)"));
+    }
+
+    #[test]
+    fn the_dialog_respects_reduced_motion() {
+        let reduced = &UI_V2_STYLES[UI_V2_STYLES
+            .rfind("@media (prefers-reduced-motion: reduce)")
+            .expect("reduced-motion block")..];
+        assert!(reduced.contains(".arc-dialog-panel {\n    animation: none;"));
+    }
+
+    #[test]
+    fn dialog_styling_uses_canonical_tokens_only() {
+        let dialog_css = &UI_V2_STYLES[UI_V2_STYLES
+            .find("/* ── Canonical dialog primitive (Phase 12)")
+            .expect("dialog section")..];
+        assert!(!dialog_css.contains("--v2-"));
+        assert!(dialog_css.contains("var(--arc-surface)"));
+        assert!(dialog_css.contains("var(--arc-focus-ring)"));
     }
 
     #[test]

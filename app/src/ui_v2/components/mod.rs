@@ -2,6 +2,7 @@
 
 pub mod blossom_media_upload;
 pub mod button;
+pub mod dialog;
 pub mod feedback;
 pub mod game_artwork;
 pub mod game_card;
@@ -13,9 +14,17 @@ pub mod status_chip;
 pub mod store_page_detail;
 pub mod tabs;
 pub mod topbar;
+pub mod transient;
+pub mod unsaved_changes_dialog;
 
 pub use blossom_media_upload::BlossomMediaUpload;
 pub use button::{Button, ButtonSize, ButtonVariant, IconButton};
+pub use dialog::{
+    focus_restoration_target, initial_focus_target, resolve_close, Dialog, DialogCloseAction,
+    DialogCloseButtonPolicy, DialogClosePolicy, DialogCloseRequest, DialogCloseSource,
+    DialogDismissal, DialogFocusRestoration, DialogFocusTarget, DialogInitialFocus,
+    DialogInitialFocusKind, DialogSourcePolicy, DialogTone, DialogWidth, ROUTE_FOCUS_FALLBACK_ID,
+};
 pub use feedback::{
     EmptyState, ErrorSeverity, ErrorState, FeedbackLayout, GameCardSkeleton, InlineLoading,
     LoadingState, PartialRelayKind, PartialRelayState, Skeleton, SkeletonKind,
@@ -37,3 +46,12 @@ pub use tabs::{
     PublisherTabs,
 };
 pub use topbar::TopBar;
+pub use transient::{
+    close_transient_on_outside_pointer, close_transient_when_modal_opens, focus_transient_invoker,
+    notify_modal_opened, should_close_for_modal, should_close_on_escape,
+    should_close_on_outside_pointer,
+};
+pub use unsaved_changes_dialog::{
+    create_game_dirty, guard_navigation, resolve_guard, set_create_game_dirty, GuardResolution,
+    NavigationGuard, UnsavedChangesDialog, UnsavedWork,
+};

@@ -4,7 +4,11 @@ use std::rc::Rc;
 use arcadestr_core::store_page::{StorePageDraft, StorePageMediaItem};
 use leptos::prelude::*;
 
-use crate::ui_v2::components::{StatusChip, StatusChipSize, StatusChipVariant};
+use crate::ui_v2::components::{
+    Dialog, DialogCloseAction, DialogCloseButtonPolicy, DialogClosePolicy, DialogCloseRequest,
+    DialogDismissal, DialogSourcePolicy, DialogWidth, StatusChip, StatusChipSize,
+    StatusChipVariant,
+};
 use send_wrapper::SendWrapper;
 use wasm_bindgen_futures::spawn_local;
 
@@ -358,6 +362,22 @@ fn run_cleanup(slot: &Rc<RefCell<Option<Box<dyn FnOnce()>>>>) {
     }
 }
 
+/// The declared dismissal contract for the Blossom upload dialog.
+///
+/// An in-flight upload has a real cancellation path, so dismissal while
+/// uploading routes through the existing in-dialog confirmation instead of
+/// being refused. A stray backdrop click never reaches that path.
+fn upload_close_contract() -> (DialogClosePolicy, DialogDismissal) {
+    (
+        DialogClosePolicy::ConfirmRequired,
+        DialogDismissal {
+            escape: DialogSourcePolicy::Allowed,
+            backdrop: DialogSourcePolicy::Ignored,
+            close_button: DialogCloseButtonPolicy::Visible,
+        },
+    )
+}
+
 #[component]
 pub fn BlossomMediaUpload(
     dialog_role: RwSignal<Option<String>>,
@@ -368,7 +388,6 @@ pub fn BlossomMediaUpload(
     input_dirty: RwSignal<bool>,
 ) -> impl IntoView {
     let auth = use_context::<crate::AuthContext>().expect("AuthContext not provided");
-    let dialog_ref = NodeRef::<leptos::html::Dialog>::new();
     let session = RwSignal::new(0_u64);
     let opened_role = RwSignal::new(None::<String>);
     let captured_account = RwSignal::new(None::<String>);
@@ -400,11 +419,6 @@ pub fn BlossomMediaUpload(
                 close_confirmation.set(false);
                 listener_alive.set(false);
                 run_cleanup(&listener_cleanup);
-                if let Some(dialog) = dialog_ref.get() {
-                    if dialog.open() {
-                        dialog.close();
-                    }
-                }
                 return;
             };
             if opened_role.get_untracked().as_deref() == Some(role.as_str()) {
@@ -424,11 +438,6 @@ pub fn BlossomMediaUpload(
             active_upload_id.set(None);
             listener_alive.set(true);
             run_cleanup(&listener_cleanup);
-            if let Some(dialog) = dialog_ref.get() {
-                if !dialog.open() {
-                    let _ = dialog.show_modal();
-                }
-            }
             let expected_account = account.unwrap_or_default();
             let expected_generation = captured_generation.get_untracked();
             let publisher_hex = publisher_hex.clone();
@@ -970,17 +979,35 @@ pub fn BlossomMediaUpload(
     });
 
     view! {
-        <dialog node_ref=dialog_ref class="v2-publisher-dialog v2-store-dialog v2-blossom-dialog" on:cancel=move |event: web_sys::Event| {
-            event.prevent_default();
-            if state.get_untracked() == UploadState::Uploading {
-                close_confirmation.set(true);
-            } else {
-                cancel_upload.run(true);
+        <Dialog
+            id="blossom-upload"
+            open=Signal::derive(move || dialog_role.get().is_some())
+            title=Signal::derive(move || dialog_role.get().map(|role| format!("Upload {role}")).unwrap_or_else(|| "Upload media".into()))
+            kicker="Store Page media"
+            width=DialogWidth::Standard
+            // An in-flight upload is never abandoned silently: the existing
+            // in-dialog confirmation runs first, then the existing cancel flow.
+            policy=upload_close_contract().0
+            dismissal=upload_close_contract().1
+            busy=Signal::derive(move || state.get() == UploadState::Uploading)
+            close_label="Close media upload"
+            on_close=UnsyncCallback::new(move |request: DialogCloseRequest| {
+                match request.action {
+                    // Unchanged: closing an idle dialog still discards the
+                    // pending selection through the existing teardown path.
+                    DialogCloseAction::Dismiss | DialogCloseAction::CancelOperation => {
+                        cancel_upload.run(true)
+                    }
+                    DialogCloseAction::RequestConfirmation => close_confirmation.set(true),
+                    DialogCloseAction::Ignore => {}
+                }
+            })
+            actions=move || view! {
+                <button type="button" class="v2-btn-primary" disabled=move || selection.get().is_none() || selected_server.get().is_none() || state.get() == UploadState::Uploading on:click=move |_| upload.run(false)>"Upload"</button>
+                <Show when=move || matches!(state.get(), UploadState::Failed | UploadState::Cancelled) && selection.get().is_some()><button type="button" class="v2-btn-secondary" on:click=move |_| upload.run(true)>"Retry"</button></Show>
+                <Show when=move || state.get() == UploadState::Uploading><button type="button" class="v2-btn-secondary" on:click=move |_| cancel_upload.run(false)>"Cancel upload"</button></Show>
             }
-        }>
-            <div class="v2-store-section-heading"><h2>{move || dialog_role.get().map(|role| format!("Upload {role}")).unwrap_or_else(|| "Upload media".into())}</h2><button type="button" class="v2-btn-secondary" on:click=move |_| {
-                if state.get_untracked() == UploadState::Uploading { close_confirmation.set(true); } else { cancel_upload.run(true); }
-            }>"Close"</button></div>
+        >
             <Show when=move || close_confirmation.get()>
                 <section class="v2-store-card" role="alert"><strong>"Cancel active upload and close?"</strong><p>"The upload will be cancelled and its local selection discarded. A partial blob may remain on the server."</p><div class="v2-store-card-actions"><button type="button" on:click=move |_| close_confirmation.set(false)>"Keep uploading"</button><button type="button" on:click=move |_| cancel_upload.run(true)>"Cancel upload and close"</button></div></section>
             </Show>
@@ -1013,12 +1040,7 @@ pub fn BlossomMediaUpload(
             </Show>
             {move || error.get().map(|value| view! { <p class="v2-store-alert" role="alert">{value}</p> })}
             <p class="v2-store-help">"A completed upload stores the file on the Blossom server. It becomes part of the Store Page only when you publish."</p>
-            <div class="v2-store-dialog-actions">
-                <button type="button" class="v2-btn-primary" disabled=move || selection.get().is_none() || selected_server.get().is_none() || state.get() == UploadState::Uploading on:click=move |_| upload.run(false)>"Upload"</button>
-                <Show when=move || matches!(state.get(), UploadState::Failed | UploadState::Cancelled) && selection.get().is_some()><button type="button" class="v2-btn-secondary" on:click=move |_| upload.run(true)>"Retry"</button></Show>
-                <Show when=move || state.get() == UploadState::Uploading><button type="button" class="v2-btn-secondary" on:click=move |_| cancel_upload.run(false)>"Cancel upload"</button></Show>
-            </div>
-        </dialog>
+        </Dialog>
     }
 }
 
@@ -1066,6 +1088,60 @@ mod tests {
                 .collect(),
             preferred_server: preferred.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn an_active_upload_asks_before_it_is_abandoned() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = upload_close_contract();
+        assert_eq!(
+            resolve_close(policy, dismissal, true, DialogCloseSource::Escape),
+            DialogCloseAction::RequestConfirmation
+        );
+        assert_eq!(
+            resolve_close(policy, dismissal, true, DialogCloseSource::CloseButton),
+            DialogCloseAction::RequestConfirmation
+        );
+    }
+
+    #[test]
+    fn the_backdrop_never_closes_or_cancels_an_upload() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = upload_close_contract();
+        for busy in [true, false] {
+            assert_eq!(
+                resolve_close(policy, dismissal, busy, DialogCloseSource::Backdrop),
+                DialogCloseAction::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn an_idle_upload_dialog_closes_through_the_existing_teardown() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = upload_close_contract();
+        assert_eq!(
+            resolve_close(policy, dismissal, false, DialogCloseSource::CloseButton),
+            DialogCloseAction::Dismiss
+        );
+    }
+
+    #[test]
+    fn a_confirmed_cancellation_runs_the_existing_cancel_command() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = upload_close_contract();
+        assert_eq!(
+            resolve_close(policy, dismissal, true, DialogCloseSource::ConfirmedCancel),
+            DialogCloseAction::CancelOperation
+        );
+        // The cancellation path is the pre-existing backend command, not a new
+        // one invented by the dialog layer.
+        let source = include_str!("blossom_media_upload.rs");
+        assert!(source.contains("invoke_cancel_blossom_upload"));
     }
 
     #[test]

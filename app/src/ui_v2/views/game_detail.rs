@@ -24,8 +24,9 @@ use crate::tauri_bridge::{
     RequestLnurlInvoiceRequest,
 };
 use crate::ui_v2::components::{
-    artwork_state_from_url, ArtworkRole, GameArtwork, StatusChip, StatusChipSize,
-    StatusChipVariant, StorePageRichDetail,
+    artwork_state_from_url, ArtworkRole, Dialog, DialogCloseAction, DialogCloseButtonPolicy,
+    DialogClosePolicy, DialogCloseRequest, DialogDismissal, DialogSourcePolicy, DialogWidth,
+    GameArtwork, StatusChip, StatusChipSize, StatusChipVariant, StorePageRichDetail,
 };
 use crate::ui_v2::views::browse_games::listing_categories;
 use crate::ui_v2::views::use_fallback_cover;
@@ -48,6 +49,43 @@ struct InstallFailurePresentation {
     title: &'static str,
     message: &'static str,
     retryable: bool,
+}
+
+/// The declared dismissal contract for the install dialog.
+///
+/// The current installer offers no cancellation, so while an attempt is active
+/// nothing dismisses the dialog and the close control says why.
+fn install_close_contract() -> (DialogClosePolicy, DialogDismissal) {
+    (
+        DialogClosePolicy::BlockedWhileBusy,
+        DialogDismissal {
+            escape: DialogSourcePolicy::Allowed,
+            backdrop: DialogSourcePolicy::Ignored,
+            close_button: DialogCloseButtonPolicy::DisabledWhileBusy,
+        },
+    )
+}
+
+impl InstallFlowState {
+    /// Overline shown above the dialog title.
+    fn kicker(&self) -> &'static str {
+        match self {
+            Self::Preparing | Self::Downloading { .. } => "Verified download",
+            Self::Finalizing => "Integrity check",
+            Self::Completed => "Complete",
+            Self::Failed(_) => "Download failed",
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match self {
+            Self::Preparing => "Preparing download",
+            Self::Downloading { .. } => "Downloading artifact",
+            Self::Finalizing => "Verifying and registering",
+            Self::Completed => "Artifact verified and registered",
+            Self::Failed(failure) => failure.title,
+        }
+    }
 }
 
 fn install_flow_from_progress(payload: &DownloadProgressPayload) -> InstallFlowState {
@@ -684,7 +722,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let install_flow = RwSignal::new(None::<InstallFlowState>);
     let install_attempt_active = RwSignal::new(false);
     let install_attempt_account = RwSignal::new(None::<String>);
-    let install_dialog_ref = NodeRef::<leptos::html::Dialog>::new();
     let campaigns: RwSignal<Vec<DiscoveredCampaign>> = RwSignal::new(Vec::new());
     let campaign_loading: RwSignal<bool> = RwSignal::new(true);
     let campaign_error: RwSignal<Option<String>> = RwSignal::new(None);
@@ -729,17 +766,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             install_attempt_active.set(false);
             install_flow.set(None);
             operation.set(DetailOperation::Idle);
-        }
-    });
-
-    Effect::new(move |_| {
-        let flow_open = install_flow.get().is_some();
-        if let Some(dialog) = install_dialog_ref.get() {
-            if flow_open && !dialog.open() {
-                let _ = dialog.show_modal();
-            } else if !flow_open && dialog.open() {
-                dialog.close();
-            }
         }
     });
 
@@ -1914,87 +1940,95 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 </aside>
             </div>
 
-            <dialog
-                node_ref=install_dialog_ref
-                class="v2-install-dialog"
-                aria-labelledby="install-dialog-title"
-                on:cancel=move |event: web_sys::Event| {
-                    if install_attempt_active.get_untracked() {
-                        event.prevent_default();
-                    } else {
+            <Dialog
+                id="install-dialog"
+                open=Signal::derive(move || install_flow.get().is_some())
+                title=Signal::derive(move || install_flow.get().map(|flow| flow.title().to_string()).unwrap_or_default())
+                kicker=Signal::derive(move || install_flow.get().map(|flow| flow.kicker().to_string()).unwrap_or_default())
+                title_live=true
+                width=DialogWidth::Standard
+                // An install attempt cannot be cancelled by the current
+                // installer, so the dialog refuses dismissal while one runs
+                // rather than leaving the operation orphaned.
+                policy=install_close_contract().0
+                dismissal=install_close_contract().1
+                busy=Signal::derive(move || install_attempt_active.get())
+                close_label="Close download status"
+                close_blocked_hint="Cancellation is unavailable in the current installer, so this window stays open until the active operation finishes."
+                on_close=UnsyncCallback::new(move |request: DialogCloseRequest| {
+                    // While an attempt is active this resolves to Ignore, so
+                    // Escape and the close control do nothing at all.
+                    if request.action == DialogCloseAction::Dismiss {
                         install_flow.set(None);
+                    }
+                })
+                actions={
+                    let retry_primary = StoredValue::new_local(retry_primary.clone());
+                    let decision_for_retry = StoredValue::new_local(decision_for_retry.clone());
+                    move || view! {
+                        {move || install_flow.get().map(|flow| {
+                            let retry_primary = retry_primary.get_value();
+                            let retry_allowed =
+                                (decision_for_retry.get_value())().action == PrimaryAction::Install;
+                            match flow {
+                                InstallFlowState::Completed => view! {
+                                    <button class="v2-btn-primary" on:click=move |_| install_flow.set(None)>"Close"</button>
+                                }.into_any(),
+                                InstallFlowState::Failed(failure) => view! {
+                                    // Retry and close stay distinct actions.
+                                    {(failure.retryable && retry_allowed).then(|| view! {
+                                        <button class="v2-btn-primary" disabled=move || operation_blocks_dispatch(operation.get()) on:click=move |_| retry_primary.run(())>"Retry download"</button>
+                                    })}
+                                    <button class="v2-btn-secondary" disabled=move || operation_blocks_dispatch(operation.get()) on:click=move |_| install_flow.set(None)>"Close"</button>
+                                }.into_any(),
+                                _ => view! { <></> }.into_any(),
+                            }
+                        })}
                     }
                 }
             >
                 {move || install_flow.get().map(|flow| {
-                    let retry_primary = retry_primary.clone();
-                    let retry_allowed = decision_for_retry().action == PrimaryAction::Install;
                     match flow {
                         InstallFlowState::Preparing => view! {
-                            <div class="v2-install-dialog-body">
-                                <p class="v2-store-kicker">"Verified download"</p>
-                                <h2 id="install-dialog-title" role="status" aria-live="polite">"Preparing download"</h2>
-                                <p>"Resolving current access and the signed artifact source."</p>
-                                <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Preparing download"></div>
-                                <p class="v2-install-dialog-note">"This window stays open while the active operation is running."</p>
-                            </div>
+                            <p>"Resolving current access and the signed artifact source."</p>
+                            <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Preparing download"></div>
+                            <p class="arc-dialog-note">"This window stays open while the active operation is running."</p>
                         }.into_any(),
                         InstallFlowState::Downloading { bytes, total } => {
                             let percent = download_progress_percent(bytes, total);
                             let transferred = total.map(|total| format!("{} of {}", format_download_bytes(bytes.min(total)), format_download_bytes(total)));
                             view! {
-                                <div class="v2-install-dialog-body">
-                                    <p class="v2-store-kicker">"Verified download"</p>
-                                    <h2 id="install-dialog-title" role="status" aria-live="polite">"Downloading artifact"</h2>
-                                    <p>"Only transferred bytes reported by the desktop downloader are shown."</p>
-                                    {if let Some(percent) = percent {
-                                        view! {
-                                            <div class="v2-install-progress" role="progressbar" aria-label="Artifact download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent.to_string()>
-                                                <span style=format!("width: {percent}%")></span>
-                                            </div>
-                                            <div class="v2-install-progress-copy"><strong>{format!("{percent}%")}</strong><span>{transferred.unwrap_or_default()}</span></div>
-                                        }.into_any()
-                                    } else {
-                                        view! {
-                                            <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Artifact download progress"></div>
-                                            <div class="v2-install-progress-copy"><strong>"Downloading"</strong><span>"Total size unavailable"</span></div>
-                                        }.into_any()
-                                    }}
-                                    <p class="v2-install-dialog-note">"Cancellation is unavailable in the current installer."</p>
-                                </div>
+                                <p>"Only transferred bytes reported by the desktop downloader are shown."</p>
+                                {if let Some(percent) = percent {
+                                    view! {
+                                        <div class="v2-install-progress" role="progressbar" aria-label="Artifact download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent.to_string()>
+                                            <span style=format!("width: {percent}%")></span>
+                                        </div>
+                                        <div class="v2-install-progress-copy"><strong>{format!("{percent}%")}</strong><span>{transferred.unwrap_or_default()}</span></div>
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Artifact download progress"></div>
+                                        <div class="v2-install-progress-copy"><strong>"Downloading"</strong><span>"Total size unavailable"</span></div>
+                                    }.into_any()
+                                }}
+                                <p class="arc-dialog-note">"Cancellation is unavailable in the current installer."</p>
                             }.into_any()
                         }
                         InstallFlowState::Finalizing => view! {
-                            <div class="v2-install-dialog-body">
-                                <p class="v2-store-kicker">"Integrity check"</p>
-                                <h2 id="install-dialog-title" role="status" aria-live="polite">"Verifying and registering"</h2>
-                                <p>"The download finished. Arcadestr is verifying the exact artifact hash before recording it on this device."</p>
-                                <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Verifying artifact integrity"></div>
-                                <p class="v2-install-dialog-note">"The artifact is not marked installed until verification and registry persistence finish."</p>
-                            </div>
+                            <p>"The download finished. Arcadestr is verifying the exact artifact hash before recording it on this device."</p>
+                            <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Verifying artifact integrity"></div>
+                            <p class="arc-dialog-note">"The artifact is not marked installed until verification and registry persistence finish."</p>
                         }.into_any(),
                         InstallFlowState::Completed => view! {
-                            <div class="v2-install-dialog-body" role="status">
-                                <p class="v2-store-kicker">"Complete"</p>
-                                <h2 id="install-dialog-title">"Artifact verified and registered"</h2>
-                                <p>"The local artifact is recorded on this device. Arcadestr does not yet launch or extract game packages."</p>
-                                <button class="v2-btn-primary" autofocus on:click=move |_| install_flow.set(None)>"Close"</button>
-                            </div>
+                            <p role="status">"The local artifact is recorded on this device. Arcadestr does not yet launch or extract game packages."</p>
                         }.into_any(),
                         InstallFlowState::Failed(failure) => view! {
-                            <div class="v2-install-dialog-body" role="alert">
-                                <p class="v2-store-kicker">"Download failed"</p>
-                                <h2 id="install-dialog-title">{failure.title}</h2>
-                                <p>{failure.message}</p>
-                                <div class="v2-install-dialog-actions">
-                                    {(failure.retryable && retry_allowed).then(|| view! { <button class="v2-btn-primary" autofocus disabled=move || operation_blocks_dispatch(operation.get()) on:click=move |_| retry_primary.run(())>"Retry download"</button> })}
-                                    <button class="v2-btn-secondary" disabled=move || operation_blocks_dispatch(operation.get()) on:click=move |_| install_flow.set(None)>"Close"</button>
-                                </div>
-                            </div>
+                            <p role="alert">{failure.message}</p>
                         }.into_any(),
                     }
                 })}
-            </dialog>
+            </Dialog>
         </section>
     }
 }
@@ -2002,6 +2036,62 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_active_install_attempt_cannot_be_dismissed() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = install_close_contract();
+        for source in [
+            DialogCloseSource::Escape,
+            DialogCloseSource::Backdrop,
+            DialogCloseSource::CloseButton,
+            DialogCloseSource::Cancel,
+        ] {
+            assert_eq!(
+                resolve_close(policy, dismissal, true, source),
+                DialogCloseAction::Ignore,
+                "{source:?} must not interrupt an active install"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finished_install_dialog_can_be_closed() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = install_close_contract();
+        assert_eq!(
+            resolve_close(policy, dismissal, false, DialogCloseSource::Escape),
+            DialogCloseAction::Dismiss
+        );
+        assert_eq!(
+            resolve_close(policy, dismissal, false, DialogCloseSource::CloseButton),
+            DialogCloseAction::Dismiss
+        );
+    }
+
+    #[test]
+    fn the_install_dialog_never_offers_an_unsupported_cancellation() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = install_close_contract();
+        // No confirmation prompt: there is no installer cancellation to
+        // confirm, and offering one would be a lie.
+        assert_ne!(
+            resolve_close(policy, dismissal, true, DialogCloseSource::Escape),
+            DialogCloseAction::RequestConfirmation
+        );
+        let source = include_str!("game_detail.rs");
+        assert!(source.contains("Cancellation is unavailable in the current installer"));
+    }
+
+    #[test]
+    fn retry_and_close_remain_distinct_install_actions() {
+        let source = include_str!("game_detail.rs");
+        assert!(source.contains(r#">"Retry download"</button>"#));
+        assert!(source.contains(r#">"Close"</button>"#));
+    }
 
     fn listing(acquisition: AcquisitionPolicy) -> GameListing {
         GameListing {

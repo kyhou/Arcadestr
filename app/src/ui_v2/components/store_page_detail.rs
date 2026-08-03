@@ -5,6 +5,10 @@ use leptos::prelude::*;
 use crate::models::{
     GameDetailPresentation, SafeStorePageHtml, StorePageMedia, StorePageRequirementTier,
 };
+use crate::ui_v2::components::{
+    Dialog, DialogCloseAction, DialogClosePolicy, DialogCloseRequest, DialogDismissal,
+    DialogInitialFocus, DialogWidth,
+};
 use crate::ui_v2::views::use_fallback_cover;
 
 const VIDEO_THUMBNAIL_FALLBACK: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 9'%3E%3Crect width='16' height='9' fill='%23191a22'/%3E%3Cpath d='M6 3.2v2.6L10 4.5z' fill='%23aaa4b5'/%3E%3C/svg%3E";
@@ -49,6 +53,17 @@ fn tier_rows(tier: &StorePageRequirementTier) -> Vec<(&'static str, String)> {
     .collect()
 }
 
+/// The declared dismissal contract for the media expansion dialog.
+///
+/// Nothing is pending behind it, so every channel dismisses. It is a viewer,
+/// never a confirmation.
+fn media_close_contract() -> (DialogClosePolicy, DialogDismissal) {
+    (
+        DialogClosePolicy::Dismissible,
+        DialogDismissal::freely_dismissible(),
+    )
+}
+
 fn media_view(item: StorePageMedia) -> AnyView {
     if item.media_type == "video" {
         view! {
@@ -84,7 +99,7 @@ pub fn StorePageRichDetail(
         .collect::<Vec<_>>();
     let selected = RwSignal::new(0usize);
     let expanded = RwSignal::new(false);
-    let dialog_ref = NodeRef::<leptos::html::Dialog>::new();
+    let close_media_ref = NodeRef::<leptos::html::Button>::new();
     let selected_media = StoredValue::new(media.clone());
     let media_by_id = presentation
         .media
@@ -107,26 +122,40 @@ pub fn StorePageRichDetail(
     let accessibility_view = presentation.accessibility.clone();
     let links_when = links.clone();
     let links_view = links.clone();
-    Effect::new(move |_| {
-        if let Some(dialog) = dialog_ref.get() {
-            if expanded.get() {
-                let _ = dialog.show_modal();
-            } else {
-                dialog.close();
-            }
-        }
-    });
-
     view! {
         <Show when=move || !selected_media.get_value().is_empty()>
             <section class="v2-detail-section" aria-labelledby="store-page-media-title">
                 <p class="v2-store-kicker">"Media"</p><h2 id="store-page-media-title">"Gallery"</h2>
                 <div class="v2-detail-media-stage">{move || selected_media.get_value().get(selected.get()).cloned().map(media_view)}</div>
                 <button type="button" class="v2-btn-secondary v2-detail-expand-media" on:click=move |_| expanded.set(true)>"Expand media"</button>
-                <dialog node_ref=dialog_ref class="v2-detail-media-dialog" on:cancel=move |_event: web_sys::Event| expanded.set(false)>
+                <Dialog
+                    id="store-page-media"
+                    open=Signal::derive(move || expanded.get())
+                    title="Expanded media"
+                    kicker="Media"
+                    width=DialogWidth::Wide
+                    // Nothing is pending behind this dialog, so every channel
+                    // dismisses it. It is a viewer, not a confirmation.
+                    policy=media_close_contract().0
+                    dismissal=media_close_contract().1
+                    initial_focus=DialogInitialFocus::Button(close_media_ref)
+                    close_label="Close expanded media"
+                    on_close=UnsyncCallback::new(move |request: DialogCloseRequest| {
+                        if request.action == DialogCloseAction::Dismiss {
+                            expanded.set(false);
+                        }
+                    })
+                    actions=move || view! {
+                        <button
+                            node_ref=close_media_ref
+                            type="button"
+                            class="v2-btn-secondary"
+                            on:click=move |_| expanded.set(false)
+                        >"Close media"</button>
+                    }
+                >
                     <div>{move || selected_media.get_value().get(selected.get()).cloned().map(media_view)}</div>
-                    <button type="button" class="v2-btn-secondary v2-detail-expand-media" autofocus on:click=move |_| expanded.set(false)>"Close media"</button>
-                </dialog>
+                </Dialog>
                 <div class="v2-detail-media-thumbs" role="list" aria-label="Select game media">
                     {media.clone().into_iter().enumerate().map(|(index, item)| {
                         let thumbnail = item.thumbnail_url.clone().unwrap_or_else(|| {
@@ -197,6 +226,35 @@ pub fn StorePageRichDetail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expanded_media_is_dismissible_from_every_channel() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = media_close_contract();
+        for source in [
+            DialogCloseSource::Escape,
+            DialogCloseSource::Backdrop,
+            DialogCloseSource::CloseButton,
+        ] {
+            assert_eq!(
+                resolve_close(policy, dismissal, false, source),
+                DialogCloseAction::Dismiss,
+                "{source:?} should close the media viewer"
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_media_is_not_a_destructive_confirmation() {
+        // Assert against the production source only, not this test module.
+        let source = include_str!("store_page_detail.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes the test module");
+        assert!(!source.contains("DialogTone"));
+        assert!(!source.contains("v2-btn-danger"));
+    }
 
     #[test]
     fn game_detail_safe_html_has_no_public_string_constructor_or_deserializer() {

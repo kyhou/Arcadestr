@@ -2944,6 +2944,14 @@ pub fn PublishView(
     let initial_snapshot = StoredValue::new(form_snapshot());
     let is_dirty = move || form_snapshot() != initial_snapshot.get_value();
 
+    // Create Game has no draft persistence, so leaving this form discards the
+    // inputs. Publish the dirty flag so the shell can guard navigation, and
+    // clear it when the form goes away.
+    Effect::new(move |_| {
+        crate::ui_v2::components::set_create_game_dirty(is_dirty());
+    });
+    on_cleanup(|| crate::ui_v2::components::set_create_game_dirty(false));
+
     let signer_state = Signal::derive(move || {
         let publisher = auth.npub.get();
         publisher_signer_state(

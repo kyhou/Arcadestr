@@ -3,8 +3,14 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::models::{npub_fallback_label, GameListing};
 use crate::relay_state::{apply_relay_event, merge_relay_snapshot};
-use crate::ui_v2::components::{PageContainer, TopBar};
+use crate::ui_v2::components::{
+    create_game_dirty, guard_navigation, set_create_game_dirty, NavigationGuard, PageContainer,
+    TopBar, UnsavedChangesDialog, UnsavedWork, ROUTE_FOCUS_FALLBACK_ID,
+};
 use crate::ui_v2::theme::UI_V2_STYLES;
+use crate::ui_v2::views::store_page_publish::{
+    discard_publisher_store_page_drafts, publisher_store_page_dirty_coordinates,
+};
 use crate::ui_v2::views::{
     AchievementsView, BrowseGamesView, BrowseRequest, GameDetailView, LibraryView, ProfileV2View,
     PublishV2View, PublishViewState, PurchasesView, SettingsView, SocialView, StoreFrontView,
@@ -24,6 +30,39 @@ fn detail_back_destination(origin: DetailOrigin) -> UiV2View {
         DetailOrigin::Library => UiV2View::Library,
         DetailOrigin::Publisher => UiV2View::Publish(PublishViewState::Games),
     }
+}
+
+/// Which editor, if any, the current route is showing with unsaved input.
+///
+/// Only the editor actually on screen can have unsaved input to lose, so a
+/// dirty Store Page draft for some other listing never blocks navigation from
+/// an unrelated screen.
+fn unsaved_work_for_route(
+    view: &UiV2View,
+    create_game_is_dirty: bool,
+    store_page_dirty: bool,
+) -> Option<UnsavedWork> {
+    match view {
+        UiV2View::Publish(PublishViewState::NewPublication) if create_game_is_dirty => {
+            Some(UnsavedWork::CreateGame)
+        }
+        UiV2View::Publish(PublishViewState::StorePage(_)) if store_page_dirty => {
+            Some(UnsavedWork::StorePage)
+        }
+        _ => None,
+    }
+}
+
+/// What the shell will do once the unsaved-navigation guard is answered.
+#[derive(Clone, PartialEq)]
+enum PendingNavigation {
+    Route(UiV2View),
+    SignOut,
+}
+
+/// A navigation to the same route is not a navigation and is never guarded.
+fn is_route_change(from: &UiV2View, to: &UiV2View) -> bool {
+    from != to
 }
 
 fn should_reset_publisher_route(account_changed: bool, view: &UiV2View) -> bool {
@@ -51,9 +90,184 @@ enum UiV2View {
 #[cfg(test)]
 mod tests {
     use super::{
-        detail_back_destination, should_reset_publisher_route, BrowseRequest, DetailOrigin,
-        PublishViewState, UiV2View,
+        detail_back_destination, is_route_change, should_reset_publisher_route,
+        unsaved_work_for_route, BrowseRequest, DetailOrigin, PublishViewState, UiV2View,
     };
+    use crate::ui_v2::components::{guard_navigation, NavigationGuard, UnsavedWork};
+
+    /// The `UiV2Root` body only. In this file the test module precedes the
+    /// component, so assertions must not read their own literals back.
+    fn root_source() -> &'static str {
+        // `concat!` so this marker is not itself a literal in the file being
+        // scanned; the test module precedes the component.
+        include_str!("shell.rs")
+            .split(concat!("pub fn Ui", "V2Root"))
+            .nth(1)
+            .expect("UiV2Root component source")
+    }
+
+    #[test]
+    fn leaving_a_dirty_create_game_form_is_guarded() {
+        let view = UiV2View::Publish(PublishViewState::NewPublication);
+        assert_eq!(
+            unsaved_work_for_route(&view, true, false),
+            Some(UnsavedWork::CreateGame)
+        );
+        assert_eq!(
+            guard_navigation(unsaved_work_for_route(&view, true, false)),
+            NavigationGuard::Confirm(UnsavedWork::CreateGame)
+        );
+    }
+
+    #[test]
+    fn leaving_a_dirty_store_page_editor_is_guarded() {
+        let view = UiV2View::Publish(PublishViewState::StorePage(listing()));
+        assert_eq!(
+            unsaved_work_for_route(&view, false, true),
+            Some(UnsavedWork::StorePage)
+        );
+    }
+
+    #[test]
+    fn clean_editors_never_block_navigation() {
+        assert_eq!(
+            unsaved_work_for_route(
+                &UiV2View::Publish(PublishViewState::NewPublication),
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            unsaved_work_for_route(
+                &UiV2View::Publish(PublishViewState::StorePage(listing())),
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(guard_navigation(None), NavigationGuard::Proceed);
+    }
+
+    #[test]
+    fn dirty_state_in_one_editor_does_not_block_navigation_from_another_screen() {
+        // A dirty Store Page draft for some other listing must not guard the
+        // Library or the Store.
+        assert_eq!(unsaved_work_for_route(&UiV2View::Library, true, true), None);
+        assert_eq!(unsaved_work_for_route(&UiV2View::Store, true, true), None);
+        assert_eq!(
+            unsaved_work_for_route(&UiV2View::Publish(PublishViewState::Games), true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn navigating_to_the_current_route_is_not_a_navigation() {
+        assert!(!is_route_change(&UiV2View::Store, &UiV2View::Store));
+        assert!(is_route_change(&UiV2View::Store, &UiV2View::Library));
+    }
+
+    #[test]
+    fn signing_out_of_a_dirty_editor_is_guarded_like_any_other_navigation() {
+        // Sign-out routes through the same interception point, so the guard
+        // decision is identical to a route change.
+        let view = UiV2View::Publish(PublishViewState::NewPublication);
+        assert_eq!(
+            guard_navigation(unsaved_work_for_route(&view, true, false)),
+            NavigationGuard::Confirm(UnsavedWork::CreateGame)
+        );
+        let source = root_source();
+        assert!(source.contains("PendingNavigation::SignOut"));
+        assert!(source.contains("request_navigation.run(PendingNavigation::SignOut)"));
+    }
+
+    #[test]
+    fn every_shell_navigation_callback_routes_through_the_guard() {
+        let source = root_source();
+        // Only three places may set the route directly: the account-switch
+        // publisher reset, and the two guard resolutions. Every user-facing
+        // navigation callback must go through `navigate_guarded`.
+        let direct_sets = source.matches("current_view.set(").count();
+        assert_eq!(
+            direct_sets, 3,
+            "unguarded current_view.set found; route every navigation through navigate_guarded"
+        );
+        for callback in [
+            "navigate_store",
+            "navigate_browse",
+            "navigate_library",
+            "navigate_social",
+            "navigate_publish",
+            "navigate_profile",
+            "navigate_achievements",
+            "navigate_purchases",
+            "navigate_settings",
+        ] {
+            let body = source
+                .split(&format!("let {callback} ="))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{callback} should exist"));
+            let body = &body[..body.find(";\n").unwrap_or(body.len())];
+            assert!(
+                body.contains("navigate_guarded.run("),
+                "{callback} must route through the navigation guard"
+            );
+        }
+    }
+
+    #[test]
+    fn discard_and_continue_reaches_the_pending_route() {
+        let source = root_source();
+        assert!(source.contains("on_discard_and_continue"));
+        assert!(source.contains("discard_publisher_store_page_drafts"));
+        assert!(source.contains("set_create_game_dirty(false)"));
+    }
+
+    #[test]
+    fn keep_editing_drops_the_pending_route_and_stays_put() {
+        let source = root_source();
+        let handler = source
+            .split("let on_keep_editing = Callback::new(move |_| {")
+            .nth(1)
+            .expect("keep-editing handler should exist");
+        let handler = &handler[..handler.find("\n    });").expect("handler should close")];
+        assert!(handler.contains("pending_work.set(None)"));
+        assert!(handler.contains("pending_navigation.set(None)"));
+        // Keeping the user in the editor must never move the route.
+        assert!(!handler.contains("current_view"));
+    }
+
+    fn listing() -> crate::models::GameListing {
+        use crate::models::{AcquisitionPolicy, GameListing, ListingSource};
+
+        GameListing {
+            id: "listing".to_string(),
+            source: ListingSource::Nip99Listing,
+            title: "Game".to_string(),
+            description: String::new(),
+            images: Vec::new(),
+            download_url: String::new(),
+            price: 0.0,
+            currency: "SATS".to_string(),
+            price_sats: 0,
+            quantity: None,
+            tags: Vec::new(),
+            specs: Vec::new(),
+            publisher_npub: "npub1publisher".to_string(),
+            stall_id: String::new(),
+            stall_name: None,
+            lud16: String::new(),
+            event_id: None,
+            created_at: 0,
+            platforms: Vec::new(),
+            nip94_event_id: None,
+            acquisition: AcquisitionPolicy::default(),
+            campaigns: Vec::new(),
+            is_owned: false,
+            #[cfg(debug_assertions)]
+            nip99_raw_event_json: None,
+        }
+    }
 
     #[test]
     fn shell_does_not_use_generated_identity_or_fake_controls() {
@@ -277,53 +491,131 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
             .unwrap_or_else(|| "?".to_string())
     });
 
-    let navigate_store = Callback::new(move |_| current_view.set(UiV2View::Store));
-    let navigate_browse = Callback::new(move |_| {
-        current_view.set(UiV2View::Browse(BrowseRequest::default()));
-    });
-    let search_browse = Callback::new(move |query: String| {
-        current_view.set(UiV2View::Browse(BrowseRequest::for_query(query)));
-    });
-    let navigate_store_category = Callback::new(move |request: BrowseRequest| {
-        current_view.set(UiV2View::Browse(request));
-    });
-    let navigate_library = Callback::new(move |_| current_view.set(UiV2View::Library));
-    let navigate_social = Callback::new(move |_| current_view.set(UiV2View::Social));
-    let navigate_publish = Callback::new(move |_| {
-        current_view.set(UiV2View::Publish(PublishViewState::Games));
-    });
-    let navigate_profile = Callback::new(move |_| current_view.set(UiV2View::Profile));
-    let navigate_achievements = Callback::new(move |_| current_view.set(UiV2View::Achievements));
-    let navigate_purchases = Callback::new(move |_| current_view.set(UiV2View::Purchases));
-    let navigate_settings = Callback::new(move |_| current_view.set(UiV2View::Settings));
+    // ── Unsaved-navigation guard ────────────────────────────────────────
+    // Every shell route change funnels through `navigate_guarded`, so primary
+    // navigation, publisher tab navigation, route replacement, detail back,
+    // and sign-out are all covered by one interception point.
+    let pending_navigation = RwSignal::new(None::<PendingNavigation>);
+    let pending_work = RwSignal::new(None::<UnsavedWork>);
 
-    let on_select_listing = Callback::new(move |listing: GameListing| {
-        current_view.set(UiV2View::Detail(listing, DetailOrigin::Store));
-    });
-    let on_select_library_listing = Callback::new(move |listing: GameListing| {
-        current_view.set(UiV2View::Detail(listing, DetailOrigin::Library));
-    });
-    let on_back_from_detail = Callback::new(move |_| {
-        let origin = match current_view.get_untracked() {
-            UiV2View::Detail(_, origin) => origin,
-            _ => DetailOrigin::Store,
-        };
-        current_view.set(detail_back_destination(origin));
-    });
-    let on_open_publish_from_profile = Callback::new(move |_| {
-        current_view.set(UiV2View::Publish(PublishViewState::Games));
-    });
-    let on_open_listing_from_profile = Callback::new(move |listing: GameListing| {
-        current_view.set(UiV2View::Detail(listing, DetailOrigin::Store));
-    });
-    let on_disconnect = Callback::new(move |_| {
-        let auth_ctx = auth.clone();
+    let auth_for_guard = StoredValue::new_local(auth.clone());
+    let unsaved_for_current_route = move || {
+        let publisher = auth_for_guard
+            .get_value()
+            .npub
+            .get_untracked()
+            .unwrap_or_default();
+        let store_page_dirty =
+            !publisher.is_empty() && !publisher_store_page_dirty_coordinates(&publisher).is_empty();
+        unsaved_work_for_route(
+            &current_view.get_untracked(),
+            create_game_dirty(),
+            store_page_dirty,
+        )
+    };
+
+    let auth_for_signout = StoredValue::new_local(auth.clone());
+    let perform_sign_out = move || {
+        let auth_ctx = auth_for_signout.get_value();
         spawn_local(async move {
             match auth_ctx.logout_nip46().await {
                 Ok(_) => auth_ctx.error.set(None),
                 Err(err) => auth_ctx.error.set(Some(err)),
             }
         });
+    };
+
+    let request_navigation = Callback::new(move |pending: PendingNavigation| {
+        if let PendingNavigation::Route(target) = &pending {
+            if !is_route_change(&current_view.get_untracked(), target) {
+                return;
+            }
+        }
+        match guard_navigation(unsaved_for_current_route()) {
+            NavigationGuard::Proceed => match pending {
+                PendingNavigation::Route(target) => current_view.set(target),
+                PendingNavigation::SignOut => perform_sign_out(),
+            },
+            NavigationGuard::Confirm(work) => {
+                pending_work.set(Some(work));
+                pending_navigation.set(Some(pending));
+            }
+        }
+    });
+
+    let navigate_guarded = Callback::new(move |target: UiV2View| {
+        request_navigation.run(PendingNavigation::Route(target));
+    });
+
+    let on_keep_editing = Callback::new(move |_| {
+        pending_work.set(None);
+        pending_navigation.set(None);
+    });
+
+    let on_discard_and_continue = Callback::new(move |_| {
+        // Drop the unsaved input for the editor being left. This is the same
+        // operation the editor's own Discard control performs.
+        match pending_work.get_untracked() {
+            Some(UnsavedWork::CreateGame) => set_create_game_dirty(false),
+            Some(UnsavedWork::StorePage) => {
+                if let Some(publisher) = auth_for_guard.get_value().npub.get_untracked() {
+                    discard_publisher_store_page_drafts(&publisher);
+                }
+            }
+            None => {}
+        }
+        let pending = pending_navigation.get_untracked();
+        pending_work.set(None);
+        pending_navigation.set(None);
+        match pending {
+            Some(PendingNavigation::Route(target)) => current_view.set(target),
+            Some(PendingNavigation::SignOut) => perform_sign_out(),
+            None => {}
+        }
+    });
+
+    let navigate_store = Callback::new(move |_| navigate_guarded.run(UiV2View::Store));
+    let navigate_browse = Callback::new(move |_| {
+        navigate_guarded.run(UiV2View::Browse(BrowseRequest::default()));
+    });
+    let search_browse = Callback::new(move |query: String| {
+        navigate_guarded.run(UiV2View::Browse(BrowseRequest::for_query(query)));
+    });
+    let navigate_store_category = Callback::new(move |request: BrowseRequest| {
+        navigate_guarded.run(UiV2View::Browse(request));
+    });
+    let navigate_library = Callback::new(move |_| navigate_guarded.run(UiV2View::Library));
+    let navigate_social = Callback::new(move |_| navigate_guarded.run(UiV2View::Social));
+    let navigate_publish = Callback::new(move |_| {
+        navigate_guarded.run(UiV2View::Publish(PublishViewState::Games));
+    });
+    let navigate_profile = Callback::new(move |_| navigate_guarded.run(UiV2View::Profile));
+    let navigate_achievements =
+        Callback::new(move |_| navigate_guarded.run(UiV2View::Achievements));
+    let navigate_purchases = Callback::new(move |_| navigate_guarded.run(UiV2View::Purchases));
+    let navigate_settings = Callback::new(move |_| navigate_guarded.run(UiV2View::Settings));
+
+    let on_select_listing = Callback::new(move |listing: GameListing| {
+        navigate_guarded.run(UiV2View::Detail(listing, DetailOrigin::Store));
+    });
+    let on_select_library_listing = Callback::new(move |listing: GameListing| {
+        navigate_guarded.run(UiV2View::Detail(listing, DetailOrigin::Library));
+    });
+    let on_back_from_detail = Callback::new(move |_| {
+        let origin = match current_view.get_untracked() {
+            UiV2View::Detail(_, origin) => origin,
+            _ => DetailOrigin::Store,
+        };
+        navigate_guarded.run(detail_back_destination(origin));
+    });
+    let on_open_publish_from_profile = Callback::new(move |_| {
+        navigate_guarded.run(UiV2View::Publish(PublishViewState::Games));
+    });
+    let on_open_listing_from_profile = Callback::new(move |listing: GameListing| {
+        navigate_guarded.run(UiV2View::Detail(listing, DetailOrigin::Store));
+    });
+    let on_disconnect = Callback::new(move |_| {
+        request_navigation.run(PendingNavigation::SignOut);
     });
 
     let discover_active = Signal::derive(move || {
@@ -370,7 +662,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                 on_disconnect=on_disconnect
             />
 
-            <main>
+            <main id=ROUTE_FOCUS_FALLBACK_ID tabindex="-1">
                 <PageContainer wide=true full_height=true>
                     {move || match current_view.get() {
                         UiV2View::Store => view! {
@@ -394,10 +686,11 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         UiV2View::Purchases => view! { <PurchasesView /> }.into_any(),
                         UiV2View::Publish(state) => {
                             let on_navigate = Callback::new(move |state| {
-                                current_view.set(UiV2View::Publish(state));
+                                navigate_guarded.run(UiV2View::Publish(state));
                             });
                             let on_open_listing = Callback::new(move |listing| {
-                                current_view.set(UiV2View::Detail(listing, DetailOrigin::Publisher));
+                                navigate_guarded
+                                    .run(UiV2View::Detail(listing, DetailOrigin::Publisher));
                             });
                             view! { <PublishV2View state=state on_navigate=on_navigate on_open_listing=on_open_listing /> }.into_any()
                         }
@@ -420,6 +713,12 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                     }}
                 </PageContainer>
             </main>
+
+            <UnsavedChangesDialog
+                work=Signal::derive(move || pending_work.get())
+                on_keep_editing=on_keep_editing
+                on_discard=on_discard_and_continue
+            />
         </div>
     }
 }

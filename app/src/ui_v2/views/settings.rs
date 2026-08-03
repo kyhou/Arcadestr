@@ -12,7 +12,10 @@ use crate::tauri_bridge::{
     SetPreferredBlossomServerRequest, UpdateBlossomServerRequest,
 };
 use crate::ui_v2::components::blossom_media_upload::{publisher_hex, stable_error_message};
-use crate::ui_v2::components::PageHeader;
+use crate::ui_v2::components::{
+    Dialog, DialogCloseAction, DialogClosePolicy, DialogCloseRequest, DialogDismissal,
+    DialogInitialFocus, DialogTone, DialogWidth, PageHeader,
+};
 use crate::{
     invoke_get_allow_insecure_public_ws, invoke_set_allow_insecure_public_ws, AuthContext,
     StoredAccount,
@@ -248,7 +251,7 @@ pub fn SettingsView(
     let relay_reconnecting = RwSignal::new(false);
     let insecure_setting_saving = RwSignal::new(false);
     let removal = RwSignal::new(SettingsRemoval::Idle);
-    let removal_dialog_ref = NodeRef::<leptos::html::Dialog>::new();
+    let removal_cancel_ref = NodeRef::<leptos::html::Button>::new();
     let show_export = RwSignal::new(false);
     let export_account = RwSignal::new(String::new());
     let export_status = RwSignal::new(None::<String>);
@@ -382,19 +385,6 @@ pub fn SettingsView(
             }
             blossom_health_loading.set(false);
         });
-    });
-
-    Effect::new(move |_| {
-        let Some(dialog) = removal_dialog_ref.get() else {
-            return;
-        };
-        if matches!(removal.get(), SettingsRemoval::Confirming { .. }) {
-            if !dialog.open() {
-                let _ = dialog.show_modal();
-            }
-        } else if dialog.open() {
-            dialog.close();
-        }
     });
 
     Effect::new(move |_| {
@@ -958,41 +948,66 @@ pub fn SettingsView(
                 </section>
             </div>
 
-            <dialog
-                node_ref=removal_dialog_ref
-                class="v2-confirm-backdrop"
-                aria-labelledby="settings-remove-account-title"
-                on:cancel=move |event: web_sys::Event| {
-                    event.prevent_default();
-                    removal.set(SettingsRemoval::Idle);
+            <Dialog
+                id="settings-remove-account"
+                open=Signal::derive(move || matches!(removal.get(), SettingsRemoval::Confirming { .. }))
+                title="Remove saved account?"
+                kicker="Accounts"
+                description=Signal::derive(move || match removal.get() {
+                    SettingsRemoval::Confirming { label, .. } => format!(
+                        "Remove {label} from this device? This does not delete the Nostr identity."
+                    ),
+                    SettingsRemoval::Idle => String::new(),
+                })
+                width=DialogWidth::Compact
+                tone=DialogTone::Destructive
+                policy=DialogClosePolicy::Dismissible
+                dismissal=DialogDismissal::freely_dismissible()
+                initial_focus=DialogInitialFocus::Button(removal_cancel_ref)
+                close_label="Keep this account"
+                busy=Signal::derive(move || auth_stored.get_value().is_loading.get())
+                on_close=UnsyncCallback::new(move |request: DialogCloseRequest| {
+                    // The removal state machine is unchanged: every dismissal
+                    // channel returns it to Idle, nothing else.
+                    if request.action == DialogCloseAction::Dismiss {
+                        removal.set(SettingsRemoval::Idle);
+                    }
+                })
+                actions=move || view! {
+                    <button
+                        node_ref=removal_cancel_ref
+                        type="button"
+                        class="v2-btn-ghost"
+                        on:click=move |_| removal.set(SettingsRemoval::Idle)
+                    >"Cancel"</button>
+                    <button
+                        type="button"
+                        class="v2-btn-danger"
+                        disabled=move || auth_stored.get_value().is_loading.get()
+                        on:click=move |_| {
+                            let auth = auth_stored.get_value();
+                            if auth.is_loading.get_untracked() {
+                                return;
+                            }
+                            let SettingsRemoval::Confirming { account_id, .. } =
+                                removal.get_untracked()
+                            else {
+                                return;
+                            };
+                            removal.set(SettingsRemoval::Idle);
+                            spawn_local(async move {
+                                if let Err(error) = auth.delete_account(account_id).await {
+                                    action_error.set(Some(error));
+                                }
+                            });
+                        }
+                    >"Remove account"</button>
                 }
-                on:click=move |_| removal.set(SettingsRemoval::Idle)
             >
-                <section class="v2-confirm-dialog" on:click=move |event| event.stop_propagation()>
-                    <h2 id="settings-remove-account-title">"Remove saved account?"</h2>
-                    {move || match removal.get() {
-                        SettingsRemoval::Idle => view! { <></> }.into_any(),
-                        SettingsRemoval::Confirming { account_id, label } => view! {
-                            <div>
-                                <p>{format!("Remove {label} from this device? This does not delete the Nostr identity.")}</p>
-                                <div class="v2-settings-actions">
-                                    <button class="v2-btn-ghost" autofocus on:click=move |_| removal.set(SettingsRemoval::Idle)>"Cancel"</button>
-                                    <button class="v2-btn-danger" on:click=move |_| {
-                                        let auth = auth_stored.get_value();
-                                        let account_id = account_id.clone();
-                                        removal.set(SettingsRemoval::Idle);
-                                        spawn_local(async move {
-                                            if let Err(error) = auth.delete_account(account_id).await {
-                                                action_error.set(Some(error));
-                                            }
-                                        });
-                                    }>"Remove account"</button>
-                                </div>
-                            </div>
-                        }.into_any(),
-                    }}
-                </section>
-            </dialog>
+                <p class="arc-dialog-note">
+                    "Saved credentials for this account are deleted from this device only."
+                </p>
+            </Dialog>
 
             <Nip49Modal
                 show=show_export.into()
@@ -1007,6 +1022,36 @@ pub fn SettingsView(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_destructive_removal_confirmation_focuses_the_safe_cancel() {
+        let source = include_str!("settings.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes the test module");
+        assert!(source.contains("initial_focus=DialogInitialFocus::Button(removal_cancel_ref)"));
+        // The safe action is first in the action row, the destructive one last.
+        let actions = source
+            .split("actions=move || view! {")
+            .nth(1)
+            .expect("action row should exist");
+        let cancel = actions.find("v2-btn-ghost").expect("cancel action");
+        let remove = actions.find("v2-btn-danger").expect("destructive action");
+        assert!(cancel < remove);
+    }
+
+    #[test]
+    fn removing_an_account_is_suppressed_while_another_removal_is_in_flight() {
+        let source = include_str!("settings.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes the test module");
+        let actions = source
+            .split("actions=move || view! {")
+            .nth(1)
+            .expect("action row should exist");
+        assert!(actions.contains("if auth.is_loading.get_untracked()"));
+    }
 
     #[test]
     fn web_hides_native_security_and_network_actions() {

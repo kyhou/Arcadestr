@@ -3,6 +3,10 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::models::{npub_fallback_label, Nip49ImportRequest};
 use crate::tauri_bridge::invoke_nip49_import;
+use crate::ui_v2::components::{
+    Dialog, DialogCloseAction, DialogClosePolicy, DialogCloseRequest, DialogDismissal,
+    DialogInitialFocus, DialogTone, DialogWidth,
+};
 use crate::ui_v2::theme::UI_V2_STYLES;
 use crate::{
     invoke_check_qr_connection, invoke_connect_bunker, invoke_connect_nip07, invoke_has_accounts,
@@ -132,7 +136,7 @@ pub fn LoginV2View() -> impl IntoView {
     let panel = RwSignal::new(LoginPanel::Accounts);
     let loading_accounts = RwSignal::new(true);
     let removal = RwSignal::new(RemovalConfirmation::Idle);
-    let removal_dialog_ref = NodeRef::<leptos::html::Dialog>::new();
+    let removal_cancel_ref = NodeRef::<leptos::html::Button>::new();
     let flow_status = RwSignal::new(None::<String>);
 
     let bunker_uri = RwSignal::new(String::new());
@@ -164,19 +168,6 @@ pub fn LoginV2View() -> impl IntoView {
             }
             loading_accounts.set(false);
         });
-    });
-
-    Effect::new(move |_| {
-        let Some(dialog) = removal_dialog_ref.get() else {
-            return;
-        };
-        if matches!(removal.get(), RemovalConfirmation::Confirming { .. }) {
-            if !dialog.open() {
-                let _ = dialog.show_modal();
-            }
-        } else if dialog.open() {
-            dialog.close();
-        }
     });
 
     let begin_flow = move || {
@@ -689,41 +680,68 @@ pub fn LoginV2View() -> impl IntoView {
                 }}
             </main>
 
-            <dialog
-                node_ref=removal_dialog_ref
-                class="v2-confirm-backdrop"
-                aria-labelledby="remove-account-title"
-                on:cancel=move |event: web_sys::Event| {
-                    event.prevent_default();
-                    removal.set(RemovalConfirmation::Idle);
+            <Dialog
+                id="remove-account"
+                open=Signal::derive(move || matches!(removal.get(), RemovalConfirmation::Confirming { .. }))
+                title="Remove saved account?"
+                kicker="Accounts"
+                description=Signal::derive(move || match removal.get() {
+                    RemovalConfirmation::Confirming { label, .. } => format!(
+                        "Remove {label} from this device? This does not delete the Nostr identity."
+                    ),
+                    RemovalConfirmation::Idle => String::new(),
+                })
+                width=DialogWidth::Compact
+                tone=DialogTone::Destructive
+                policy=DialogClosePolicy::Dismissible
+                dismissal=DialogDismissal::freely_dismissible()
+                initial_focus=DialogInitialFocus::Button(removal_cancel_ref)
+                close_label="Keep this account"
+                busy=Signal::derive(move || auth_stored.get_value().is_loading.get())
+                on_close=UnsyncCallback::new(move |request: DialogCloseRequest| {
+                    // Cancelling is the safe outcome, so every dismissal channel
+                    // resolves to it. Removal only happens on the explicit action.
+                    if request.action == DialogCloseAction::Dismiss {
+                        removal.set(RemovalConfirmation::Idle);
+                    }
+                })
+                actions=move || view! {
+                    <button
+                        node_ref=removal_cancel_ref
+                        type="button"
+                        class="v2-btn-ghost"
+                        on:click=move |_| removal.set(RemovalConfirmation::Idle)
+                    >"Cancel"</button>
+                    <button
+                        type="button"
+                        class="v2-btn-danger"
+                        disabled=move || auth_stored.get_value().is_loading.get()
+                        on:click=move |_| {
+                            let auth = auth_stored.get_value();
+                            // Guards a duplicate submission if the dialog is still
+                            // mounted while a previous removal is in flight.
+                            if auth.is_loading.get_untracked() {
+                                return;
+                            }
+                            let RemovalConfirmation::Confirming { account_id, .. } =
+                                removal.get_untracked()
+                            else {
+                                return;
+                            };
+                            removal.set(RemovalConfirmation::Idle);
+                            spawn_local(async move {
+                                if let Err(error) = auth.delete_account(account_id).await {
+                                    auth.error.set(Some(error));
+                                }
+                            });
+                        }
+                    >"Remove account"</button>
                 }
-                on:click=move |_| removal.set(RemovalConfirmation::Idle)
             >
-                <section class="v2-confirm-dialog" on:click=move |event| event.stop_propagation()>
-                    <h2 id="remove-account-title">"Remove saved account?"</h2>
-                    {move || match removal.get() {
-                        RemovalConfirmation::Idle => view! { <></> }.into_any(),
-                        RemovalConfirmation::Confirming { account_id, label } => view! {
-                            <div>
-                                <p>{format!("Remove {label} from this device? This does not delete the Nostr identity.")}</p>
-                                <div class="v2-auth-account-actions">
-                                    <button class="v2-btn-ghost" autofocus on:click=move |_| removal.set(RemovalConfirmation::Idle)>"Cancel"</button>
-                                    <button class="v2-btn-danger" on:click=move |_| {
-                                        let auth = auth_stored.get_value();
-                                        let account_id = account_id.clone();
-                                        removal.set(RemovalConfirmation::Idle);
-                                        spawn_local(async move {
-                                            if let Err(error) = auth.delete_account(account_id).await {
-                                                auth.error.set(Some(error));
-                                            }
-                                        });
-                                    }>"Remove account"</button>
-                                </div>
-                            </div>
-                        }.into_any(),
-                    }}
-                </section>
-            </dialog>
+                <p class="arc-dialog-note">
+                    "Saved credentials for this account are deleted from this device only."
+                </p>
+            </Dialog>
 
             <Show when=move || auth_stored.get_value().is_loading.get() || flow_status.get().is_some()>
                 <p class="v2-auth-global-status" role="status" aria-live="polite">
@@ -740,6 +758,36 @@ pub fn LoginV2View() -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_destructive_removal_confirmation_focuses_the_safe_cancel() {
+        let source = include_str!("login.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes the test module");
+        assert!(source.contains("initial_focus=DialogInitialFocus::Button(removal_cancel_ref)"));
+        // The safe action is first in the action row, the destructive one last.
+        let actions = source
+            .split("actions=move || view! {")
+            .nth(1)
+            .expect("action row should exist");
+        let cancel = actions.find("v2-btn-ghost").expect("cancel action");
+        let remove = actions.find("v2-btn-danger").expect("destructive action");
+        assert!(cancel < remove);
+    }
+
+    #[test]
+    fn removing_an_account_is_suppressed_while_another_removal_is_in_flight() {
+        let source = include_str!("login.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes the test module");
+        let actions = source
+            .split("actions=move || view! {")
+            .nth(1)
+            .expect("action row should exist");
+        assert!(actions.contains("if auth.is_loading.get_untracked()"));
+    }
 
     fn account() -> StoredAccount {
         StoredAccount {

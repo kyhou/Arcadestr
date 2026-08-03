@@ -25,8 +25,10 @@ use crate::tauri_bridge::{
     DiscoveredCampaign, UpdateCampaignPointerRequest,
 };
 use crate::ui_v2::components::{
-    artwork_state_from_url, ArtworkRole, GameArtwork, PublisherDestination, PublisherTabItem,
-    PublisherTabs, StatusChip, StatusChipSize, StatusChipVariant,
+    artwork_state_from_url, ArtworkRole, Dialog, DialogCloseAction, DialogClosePolicy,
+    DialogCloseRequest, DialogDismissal, DialogInitialFocus, DialogTone, DialogWidth, GameArtwork,
+    PublisherDestination, PublisherTabItem, PublisherTabs, StatusChip, StatusChipSize,
+    StatusChipVariant,
 };
 use crate::ui_v2::views::marketplace_loader::canonical_listing_coordinate;
 use crate::ui_v2::views::store_page_publish::{
@@ -1762,6 +1764,15 @@ impl CampaignConfirmation {
             Self::DiscardChanges => "Discard changes",
         }
     }
+
+    /// Presentation only. Dismissal policy is typed separately and is the same
+    /// for every variant.
+    fn tone(self) -> DialogTone {
+        match self {
+            Self::CancelCampaign | Self::DiscardChanges => DialogTone::Destructive,
+            Self::RemovePointer => DialogTone::Neutral,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1920,64 +1931,62 @@ impl CampaignPointerState {
     }
 }
 
+/// The declared dismissal contract for the campaign confirmation dialog.
+///
+/// Every dismissal channel means "no decision", which is exactly the signal
+/// `on_decision(None)` already carried.
+fn campaign_confirmation_contract() -> (DialogClosePolicy, DialogDismissal) {
+    (
+        DialogClosePolicy::Dismissible,
+        DialogDismissal::freely_dismissible(),
+    )
+}
+
 #[component]
 fn CampaignConfirmationDialog(
     confirmation: RwSignal<Option<CampaignConfirmation>>,
     on_decision: Callback<Option<bool>>,
 ) -> impl IntoView {
-    let dialog_ref = NodeRef::<leptos::html::Dialog>::new();
     let reject_ref = NodeRef::<leptos::html::Button>::new();
-    Effect::new(move |_| {
-        let Some(dialog) = dialog_ref.get() else {
-            return;
-        };
-        if confirmation.get().is_some() {
-            if dialog.open() {
-                dialog.close();
-            }
-            let _ = dialog.show_modal();
-            if let Some(reject) = reject_ref.get() {
-                let _ = reject.focus();
-            }
-        } else if dialog.open() {
-            dialog.close();
-        }
-    });
 
     view! {
-        <dialog
-            node_ref=dialog_ref
-            class="v2-publisher-dialog"
-            aria-label=move || confirmation.get().map(CampaignConfirmation::title).unwrap_or_default()
-            aria-description=move || confirmation.get().map(CampaignConfirmation::message).unwrap_or_default()
-            on:cancel=move |event: web_sys::Event| {
-                event.prevent_default();
-                on_decision.run(None);
+        <Dialog
+            id="campaign-confirmation"
+            open=Signal::derive(move || confirmation.get().is_some())
+            title=Signal::derive(move || confirmation.get().map(CampaignConfirmation::title).unwrap_or_default().to_string())
+            kicker="Promotion"
+            description=Signal::derive(move || confirmation.get().map(CampaignConfirmation::message).unwrap_or_default().to_string())
+            width=DialogWidth::Compact
+            tone=Signal::derive(move || confirmation.get().map(CampaignConfirmation::tone).unwrap_or_default())
+            policy=campaign_confirmation_contract().0
+            dismissal=campaign_confirmation_contract().1
+            initial_focus=DialogInitialFocus::Button(reject_ref)
+            close_label="Close without deciding"
+            on_close=UnsyncCallback::new(move |request: DialogCloseRequest| {
+                // Unchanged campaign semantics: any dismissal is the same
+                // "no decision" signal the native cancel event used to send.
+                if request.action == DialogCloseAction::Dismiss {
+                    on_decision.run(None);
+                }
+            })
+            actions=move || view! {
+                <button
+                    node_ref=reject_ref
+                    type="button"
+                    class="v2-btn-secondary"
+                    on:click=move |_| on_decision.run(Some(false))
+                >
+                    {move || confirmation.get().map(CampaignConfirmation::reject_label).unwrap_or_default()}
+                </button>
+                <button
+                    type="button"
+                    class="v2-btn-primary"
+                    on:click=move |_| on_decision.run(Some(true))
+                >
+                    {move || confirmation.get().map(CampaignConfirmation::accept_label).unwrap_or_default()}
+                </button>
             }
-            on:click=move |_| on_decision.run(None)
-        >
-            <section
-                class="v2-publisher-dialog-card"
-                on:click=move |event| event.stop_propagation()
-            >
-                <div class="v2-publisher-dialog-copy">
-                    <h2 class="v2-publisher-dialog-title">
-                        {move || confirmation.get().map(CampaignConfirmation::title).unwrap_or_default()}
-                    </h2>
-                    <p class="v2-publisher-dialog-message">
-                        {move || confirmation.get().map(CampaignConfirmation::message).unwrap_or_default()}
-                    </p>
-                </div>
-                <div class="v2-publisher-dialog-actions">
-                    <button node_ref=reject_ref class="v2-btn-secondary" on:click=move |_| on_decision.run(Some(false))>
-                        {move || confirmation.get().map(CampaignConfirmation::reject_label).unwrap_or_default()}
-                    </button>
-                    <button class="v2-btn-primary" on:click=move |_| on_decision.run(Some(true))>
-                        {move || confirmation.get().map(CampaignConfirmation::accept_label).unwrap_or_default()}
-                    </button>
-                </div>
-            </section>
-        </dialog>
+        />
     }
 }
 
@@ -2761,6 +2770,49 @@ fn timezone_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_campaign_dismissal_channel_means_no_decision() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = campaign_confirmation_contract();
+        for source in [
+            DialogCloseSource::Escape,
+            DialogCloseSource::Backdrop,
+            DialogCloseSource::CloseButton,
+        ] {
+            assert_eq!(
+                resolve_close(policy, dismissal, false, source),
+                DialogCloseAction::Dismiss,
+                "{source:?} should cancel the decision"
+            );
+        }
+        // A cancelled decision is still no decision: prior claims are never
+        // revoked and the campaign is untouched.
+        assert_eq!(
+            resolve_confirmation(CampaignConfirmation::CancelCampaign, None, true),
+            ConfirmationOutcome::Close
+        );
+    }
+
+    #[test]
+    fn the_safe_rejection_action_receives_initial_focus() {
+        let source = include_str!("publish.rs");
+        assert!(source.contains("initial_focus=DialogInitialFocus::Button(reject_ref)"));
+        // The rejection label is the safe one for every variant.
+        assert_eq!(
+            CampaignConfirmation::CancelCampaign.reject_label(),
+            "Keep Promotion"
+        );
+    }
+
+    #[test]
+    fn prospective_campaign_cancellation_wording_is_unchanged() {
+        assert_eq!(
+            CampaignConfirmation::CancelCampaign.message(),
+            "New claims stop immediately. Prior claims remain valid; campaign cancellation does not revoke prior claims."
+        );
+    }
 
     const TEST_PUBLISHER: &str = "npub1kvl9ev2wcjdecvyk0xhqacdwa505fqn6zpqwmwpd7vn4p565amyqesnwt4";
 

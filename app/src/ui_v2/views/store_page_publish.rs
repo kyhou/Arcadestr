@@ -17,7 +17,10 @@ use crate::tauri_bridge::{
     PublishStorePageResponse, PublisherStorePageListingRevision, StorePageListingMutation,
 };
 use crate::ui_v2::components::blossom_media_upload::publisher_hex as blossom_publisher_hex;
-use crate::ui_v2::components::{BlossomMediaUpload, StorePageRichDetail};
+use crate::ui_v2::components::{
+    BlossomMediaUpload, Dialog, DialogCloseAction, DialogClosePolicy, DialogCloseRequest,
+    DialogDismissal, DialogInitialFocus, DialogTone, DialogWidth, StorePageRichDetail,
+};
 
 #[derive(Clone)]
 struct CachedDraft {
@@ -191,6 +194,17 @@ fn selected_replacement_event_id(
         .and_then(|outcome| outcome.replacement_event_id.clone())
 }
 
+/// The declared dismissal contract for the Store Page discard confirmation.
+///
+/// Every dismissal channel keeps the user in the editor. The backdrop is inert
+/// so a misplaced click near a destructive confirmation does nothing at all.
+fn discard_close_contract() -> (DialogClosePolicy, DialogDismissal) {
+    (
+        DialogClosePolicy::Dismissible,
+        DialogDismissal::keyboard_and_button(),
+    )
+}
+
 fn draft_key(publisher: &str, listing_coordinate: &str) -> String {
     format!("{publisher}|{listing_coordinate}")
 }
@@ -205,6 +219,20 @@ pub(crate) fn publisher_store_page_dirty_coordinates(publisher: &str) -> Vec<Str
             .filter_map(|(key, _)| key.strip_prefix(&prefix).map(ToString::to_string))
             .collect()
     })
+}
+
+/// Drop every dirty in-memory Store Page draft for `publisher`.
+///
+/// Same operation as the editor's existing explicit Discard action, reached
+/// from the unsaved-navigation guard instead of the editor's own control.
+/// Clean cached drafts are left alone: there is nothing unsaved to discard.
+pub(crate) fn discard_publisher_store_page_drafts(publisher: &str) {
+    let prefix = format!("{publisher}|");
+    PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| {
+        drafts.borrow_mut().retain(|key, entry| {
+            !key.starts_with(&prefix) || !(entry.input_dirty || entry.draft != entry.baseline)
+        });
+    });
 }
 
 pub(crate) fn publisher_store_page_partial_coordinates(publisher: &str) -> Vec<String> {
@@ -900,7 +928,7 @@ pub fn StorePageEditorView(
     let custom_accessibility = RwSignal::new(String::new());
     let pending_removal = RwSignal::new(None::<(&'static str, usize)>);
     let validation_valid = RwSignal::new(None::<bool>);
-    let discard_dialog_ref = NodeRef::<leptos::html::Dialog>::new();
+    let discard_keep_ref = NodeRef::<leptos::html::Button>::new();
 
     Effect::new(move |_| {
         let current = draft.get();
@@ -927,19 +955,6 @@ pub fn StorePageEditorView(
         associations.track();
         preview.set(None);
         validation_valid.set(None);
-    });
-
-    Effect::new(move |_| {
-        let Some(dialog) = discard_dialog_ref.get() else {
-            return;
-        };
-        if show_discard.get() {
-            if !dialog.open() {
-                let _ = dialog.show_modal();
-            }
-        } else if dialog.open() {
-            dialog.close();
-        }
     });
 
     Effect::new({
@@ -1797,7 +1812,61 @@ pub fn StorePageEditorView(
 
             <footer class="v2-store-editor-footer"><span class="v2-store-footer-status" role="status">{move || if validating.get() { "Validating…".to_string() } else if publishing.get() { "Publishing…".to_string() } else { draft_persistence_label(!(draft.get() == baseline.get() && !input_dirty.get())).to_string() }}</span><button class="v2-btn-secondary" type="button" disabled=move || validating.get() on:click=move |_| run_validation.run(())>{move || if validating.get() { "Validating..." } else { "Preview" }}</button><button class="v2-btn-primary" type="button" disabled=move || publishing.get() on:click=move |_| publish.run(())>{move || if publishing.get() { "Publishing..." } else { "Publish" }}</button><details class="v2-store-overflow"><summary class="v2-btn-secondary">"More"</summary><div><label>"New presentation ID"<input class="v2-input" prop:value=move || clone_id.get() on:input=move |event| clone_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| clone_page.run(())>"Clone"</button><label>"Existing presentation ID"<input class="v2-input" prop:value=move || link_existing_id.get() on:input=move |event| link_existing_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| link_existing.run(())>"Link existing"</button><button type="button" on:click=move |_| show_discard.set(true)>"Reset / discard draft"</button><details><summary>"Protocol diagnostics"</summary>{move || diagnostics.get().into_iter().map(|item| view! { <p>{item}</p> }).collect_view()}</details></div></details></footer>
 
-            <dialog node_ref=discard_dialog_ref class="v2-publisher-dialog v2-store-dialog" on:cancel=move |event: web_sys::Event| { event.prevent_default(); show_discard.set(false); }><h2>"Discard Store Page draft?"</h2><p>"Unsaved changes will be removed for this game."</p><div class="v2-store-dialog-actions"><button class="v2-btn-secondary" autofocus on:click=move |_| show_discard.set(false)>"Keep editing"</button><button class="v2-btn-primary" on:click={let key = key.clone(); move |_| { if loading.get_untracked() || validating.get_untracked() || publishing.get_untracked() || partial.get_untracked().is_some() || auth.npub.get_untracked().as_deref() != Some(publisher_for_discard.get_value().as_str()) { show_discard.set(false); message.set(Some("The draft cannot be discarded while an operation is active or the publisher account is unavailable.".into())); return; } PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| { drafts.borrow_mut().remove(&key); }); on_back.run(()); }}>"Discard changes"</button></div></dialog>
+            <Dialog
+                id="store-page-discard"
+                open=Signal::derive(move || show_discard.get())
+                title="Discard Store Page draft?"
+                kicker="Store Page"
+                description="Unsaved in-memory changes to this Store Page draft will be discarded. Nothing that was already published is affected."
+                width=DialogWidth::Compact
+                tone=DialogTone::Destructive
+                policy=discard_close_contract().0
+                dismissal=discard_close_contract().1
+                initial_focus=DialogInitialFocus::Button(discard_keep_ref)
+                close_label="Keep editing"
+                on_close=UnsyncCallback::new(move |request: DialogCloseRequest| {
+                    // Escape and the close control keep the user in the editor.
+                    // Discarding stays an explicit, separate action.
+                    if request.action == DialogCloseAction::Dismiss {
+                        show_discard.set(false);
+                    }
+                })
+                actions=move || {
+                    let key = key.clone();
+                    view! {
+                        <button
+                            node_ref=discard_keep_ref
+                            type="button"
+                            class="v2-btn-secondary"
+                            on:click=move |_| show_discard.set(false)
+                        >"Keep editing"</button>
+                        <button
+                            type="button"
+                            class="v2-btn-danger"
+                            on:click={
+                                let key = key.clone();
+                                move |_| {
+                                    if loading.get_untracked()
+                                        || validating.get_untracked()
+                                        || publishing.get_untracked()
+                                        || partial.get_untracked().is_some()
+                                        || auth.npub.get_untracked().as_deref()
+                                            != Some(publisher_for_discard.get_value().as_str())
+                                    {
+                                        show_discard.set(false);
+                                        message.set(Some("The draft cannot be discarded while an operation is active or the publisher account is unavailable.".into()));
+                                        return;
+                                    }
+                                    PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| {
+                                        drafts.borrow_mut().remove(&key);
+                                    });
+                                    on_back.run(());
+                                }
+                            }
+                        >"Discard changes"</button>
+                    }
+                }
+            />
         </section>
     }
 }
@@ -1805,6 +1874,64 @@ pub fn StorePageEditorView(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dismissing_the_discard_confirmation_keeps_the_user_in_the_editor() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = discard_close_contract();
+        for source in [DialogCloseSource::Escape, DialogCloseSource::CloseButton] {
+            assert_eq!(
+                resolve_close(policy, dismissal, false, source),
+                DialogCloseAction::Dismiss,
+                "{source:?} cancels the discard, it never performs it"
+            );
+        }
+        assert_eq!(
+            resolve_close(policy, dismissal, false, DialogCloseSource::Backdrop),
+            DialogCloseAction::Ignore
+        );
+    }
+
+    #[test]
+    fn keep_editing_receives_initial_focus_on_the_discard_confirmation() {
+        let source = include_str!("store_page_publish.rs");
+        assert!(source.contains("initial_focus=DialogInitialFocus::Button(discard_keep_ref)"));
+        assert!(source.contains(r#">"Keep editing"</button>"#));
+    }
+
+    #[test]
+    fn discarding_publisher_drafts_only_removes_dirty_ones() {
+        PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| drafts.borrow_mut().clear());
+        let empty = || StorePageDraft::new("presentation".to_string(), Vec::new());
+        let clean = CachedDraft {
+            draft: empty(),
+            baseline: empty(),
+            associations: Vec::new(),
+            input_dirty: false,
+        };
+        let mut dirty = clean.clone();
+        dirty.input_dirty = true;
+        PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| {
+            let mut drafts = drafts.borrow_mut();
+            drafts.insert(draft_key("npub-a", "dirty-listing"), dirty);
+            drafts.insert(draft_key("npub-a", "clean-listing"), clean.clone());
+            drafts.insert(draft_key("npub-b", "other-listing"), clean);
+        });
+
+        discard_publisher_store_page_drafts("npub-a");
+
+        assert!(publisher_store_page_dirty_coordinates("npub-a").is_empty());
+        PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| {
+            let drafts = drafts.borrow();
+            // Clean cached drafts survive: there was nothing unsaved to lose.
+            assert!(drafts.contains_key(&draft_key("npub-a", "clean-listing")));
+            // Another publisher's drafts are never touched.
+            assert!(drafts.contains_key(&draft_key("npub-b", "other-listing")));
+            assert!(!drafts.contains_key(&draft_key("npub-a", "dirty-listing")));
+        });
+        PUBLISHER_STORE_PAGE_DRAFTS.with(|drafts| drafts.borrow_mut().clear());
+    }
     use crate::tauri_bridge::{EventPublishOutcome, ListingPointerPublishOutcome};
 
     #[test]

@@ -4,6 +4,25 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::models::Nip49ExportResult;
 use crate::tauri_bridge::invoke_nip49_export;
+use crate::ui_v2::components::{
+    Dialog, DialogCloseAction, DialogCloseButtonPolicy, DialogClosePolicy, DialogCloseRequest,
+    DialogDismissal, DialogInitialFocus, DialogSourcePolicy, DialogWidth,
+};
+
+/// The declared dismissal contract for the encrypted-key export dialog.
+///
+/// The encryption call has no cancellation path, so dismissal is refused
+/// outright while it runs rather than silently orphaning the operation.
+fn export_close_contract() -> (DialogClosePolicy, DialogDismissal) {
+    (
+        DialogClosePolicy::BlockedWhileBusy,
+        DialogDismissal {
+            escape: DialogSourcePolicy::Allowed,
+            backdrop: DialogSourcePolicy::Allowed,
+            close_button: DialogCloseButtonPolicy::DisabledWhileBusy,
+        },
+    )
+}
 
 const MIN_EXPORT_PASSWORD_CHARS: usize = 8;
 
@@ -53,7 +72,7 @@ pub fn Nip49Modal(
     let copy_status = RwSignal::new(None::<String>);
     let exporting = RwSignal::new(false);
     let request_generation = RwSignal::new(0_u64);
-    let dialog_ref = NodeRef::<leptos::html::Dialog>::new();
+    let password_ref = NodeRef::<leptos::html::Input>::new();
 
     let reset_form = move || {
         let (cleared_password, cleared_confirmation, cleared_visibility) = cleared_secret_state();
@@ -68,17 +87,15 @@ pub fn Nip49Modal(
         exporting.set(false);
     };
 
+    // The dialog primitive owns open/close; this preserves the existing
+    // secret-clearing behaviour on the open -> closed transition only.
+    let was_open = StoredValue::new(false);
     Effect::new(move |_| {
         let is_visible = show.get();
-        let Some(dialog) = dialog_ref.get() else {
-            return;
-        };
-        if is_visible && !dialog.open() {
-            let _ = dialog.show_modal();
-        } else if !is_visible && dialog.open() {
-            dialog.close();
+        if was_open.get_value() && !is_visible {
             reset_form();
         }
+        was_open.set_value(is_visible);
     });
 
     let handle_cancel = {
@@ -89,15 +106,6 @@ pub fn Nip49Modal(
             }
             reset_form();
             on_cancel.run(());
-        }
-    };
-
-    let on_keydown = {
-        let handle_cancel = handle_cancel.clone();
-        move |event: leptos::ev::KeyboardEvent| {
-            if event.key() == "Escape" {
-                handle_cancel();
-            }
         }
     };
 
@@ -177,152 +185,147 @@ pub fn Nip49Modal(
     let confirm_copy_stored = StoredValue::new(on_confirm_copy);
 
     view! {
-        <dialog
-            node_ref=dialog_ref
-            class="nip49-modal-backdrop"
-            aria-labelledby="nip49-export-title"
-            on:cancel={
+        <Dialog
+            id="nip49-export"
+            open=Signal::derive(move || show.get())
+            title="Export encrypted key"
+            kicker="Security and keys"
+            description="This creates an encrypted ncryptsec value for local-key accounts. Remote signers keep keys outside Arcadestr and cannot be exported here."
+            width=DialogWidth::Standard
+            // The encryption call cannot be cancelled, so dismissal is refused
+            // outright while it runs rather than silently orphaning it.
+            policy=export_close_contract().0
+            dismissal=export_close_contract().1
+            busy=Signal::derive(move || exporting.get())
+            initial_focus=DialogInitialFocus::Input(password_ref)
+            close_label="Cancel encrypted-key export"
+            close_blocked_hint="Encrypting the key. This dialog will remain open until the operation finishes."
+            on_close={
                 let handle_cancel = handle_cancel.clone();
-                move |event: web_sys::Event| {
-                    event.prevent_default();
-                    handle_cancel();
+                UnsyncCallback::new(move |request: DialogCloseRequest| {
+                    // Unchanged: cancelling clears the password inputs and any
+                    // revealed secret before the parent hides the dialog.
+                    if request.action == DialogCloseAction::Dismiss {
+                        handle_cancel();
+                    }
+                })
+            }
+            actions={
+                let handle_cancel = handle_cancel.clone();
+                move || view! {
+                    <button
+                        type="button"
+                        class="nip49-modal-cancel"
+                        disabled=move || exporting.get()
+                        on:click={
+                            let handle_cancel = handle_cancel.clone();
+                            move |_| handle_cancel()
+                        }
+                    >"Close"</button>
+                    <Show when=move || export_result.get().is_none()>
+                        <button
+                            type="button"
+                            class="nip49-modal-export"
+                            on:click=move |event| export_click_stored.get_value().run(event)
+                            disabled=move || exporting.get()
+                        >
+                            {move || if exporting.get() { "Encrypting..." } else { "Create encrypted export" }}
+                        </button>
+                    </Show>
                 }
             }
-            on:click={
-                let handle_cancel = handle_cancel.clone();
-                move |_| handle_cancel()
-            }
-            on:keydown=on_keydown
         >
-                <section
-                    class="nip49-modal-panel"
-                    on:click=move |event: MouseEvent| event.stop_propagation()
-                >
-                    <header class="nip49-modal-header">
-                        <div>
-                            <p class="v2-store-kicker">"Security and keys"</p>
-                            <h2 id="nip49-export-title">"Export encrypted key"</h2>
+            <p class="nip49-modal-npub">{move || format!("Account: {}", npub.get())}</p>
+
+            <Show when=move || export_result.get().is_none()>
+                <div class="nip49-modal-field">
+                    <label for="nip49-password">"New export password"</label>
+                    <input
+                        node_ref=password_ref
+                        id="nip49-password"
+                        type="password"
+                        bind:value=password
+                        autocomplete="new-password"
+                        placeholder="At least 8 characters"
+                    />
+                </div>
+                <div class="nip49-modal-field">
+                    <label for="nip49-password-confirm">"Confirm export password"</label>
+                    <input
+                        id="nip49-password-confirm"
+                        type="password"
+                        bind:value=confirm_password
+                        autocomplete="new-password"
+                        placeholder="Repeat password"
+                    />
+                </div>
+            </Show>
+
+            <Show when=move || validation_error.get().is_some()>
+                <p class="arc-dialog-alert nip49-modal-error" role="alert">
+                    {move || validation_error.get().unwrap_or_default()}
+                </p>
+            </Show>
+
+            <Show when=move || export_result.get().is_some()>
+                {move || export_result.get().map(|result| {
+                    let has_secret = !result.ncryptsec.trim().is_empty();
+                    view! {
+                        <div class="nip49-modal-result">
+                            <strong>{export_result_label(&result)}</strong>
+                            <p class="nip49-modal-result-message">{result.message}</p>
+                            {if has_secret {
+                                view! {
+                                    <div>
+                                        {move || if visibility.get() == SecretVisibility::Hidden {
+                                            view! {
+                                                <button type="button" class="nip49-modal-export" on:click=move |_| visibility.set(SecretVisibility::Revealed)>
+                                                    "Reveal sensitive encrypted key"
+                                                </button>
+                                            }.into_any()
+                                        } else {
+                                            view! {
+                                                <div>
+                                                    <label for="nip49-export-value">"Sensitive encrypted key"</label>
+                                                    <textarea
+                                                        id="nip49-export-value"
+                                                        readonly
+                                                        class="nip49-modal-result-text"
+                                                        prop:value=result.ncryptsec.clone()
+                                                        rows="4"
+                                                    />
+                                                    {move || if copy_confirmation.get() {
+                                                        view! {
+                                                            <div class="nip49-modal-copy-confirm">
+                                                                <p>"Copy this sensitive value to the system clipboard?"</p>
+                                                                <button type="button" class="nip49-modal-copy" on:click=move |event| confirm_copy_stored.get_value().run(event)>"Confirm copy"</button>
+                                                                <button type="button" class="nip49-modal-cancel" on:click=move |_| copy_confirmation.set(false)>"Cancel"</button>
+                                                            </div>
+                                                        }.into_any()
+                                                    } else {
+                                                        view! {
+                                                            <button type="button" class="nip49-modal-copy" on:click=move |_| copy_confirmation.set(true)>
+                                                                "Copy encrypted key"
+                                                            </button>
+                                                        }.into_any()
+                                                    }}
+                                                </div>
+                                            }.into_any()
+                                        }}
+                                    </div>
+                                }.into_any()
+                            } else {
+                                view! { <p class="v2-social-meta">"No secret value was returned for this account."</p> }.into_any()
+                            }}
                         </div>
-                        <button class="nip49-modal-close" aria-label="Cancel encrypted-key export" disabled=move || exporting.get() on:click={
-                            let handle_cancel = handle_cancel.clone();
-                            move |_| handle_cancel()
-                        }>
-                            <span class="material-symbols-outlined" aria-hidden="true">"close"</span>
-                        </button>
-                    </header>
+                    }
+                })}
+            </Show>
 
-                    <p class="nip49-modal-warning">
-                        "This creates an encrypted ncryptsec value for local-key accounts. Remote signers keep keys outside Arcadestr and cannot be exported here."
-                    </p>
-                    <p class="nip49-modal-npub">{move || format!("Account: {}", npub.get())}</p>
-
-                    <Show when=move || export_result.get().is_none()>
-                        <div class="nip49-modal-field">
-                            <label for="nip49-password">"New export password"</label>
-                            <input
-                                id="nip49-password"
-                                type="password"
-                                bind:value=password
-                                autocomplete="new-password"
-                                placeholder="At least 8 characters"
-                                autofocus
-                            />
-                        </div>
-                        <div class="nip49-modal-field">
-                            <label for="nip49-password-confirm">"Confirm export password"</label>
-                            <input
-                                id="nip49-password-confirm"
-                                type="password"
-                                bind:value=confirm_password
-                                autocomplete="new-password"
-                                placeholder="Repeat password"
-                            />
-                        </div>
-                    </Show>
-
-                    <Show when=move || validation_error.get().is_some()>
-                        <p class="nip49-modal-error" role="alert">
-                            {move || validation_error.get().unwrap_or_default()}
-                        </p>
-                    </Show>
-                    <Show when=move || exporting.get()>
-                        <p class="nip49-modal-copy-status" role="status" aria-live="polite">
-                            "Encrypting the key. This dialog will remain open until the operation finishes."
-                        </p>
-                    </Show>
-
-                    <Show when=move || export_result.get().is_some()>
-                        {move || export_result.get().map(|result| {
-                            let has_secret = !result.ncryptsec.trim().is_empty();
-                            view! {
-                                <div class="nip49-modal-result">
-                                    <strong>{export_result_label(&result)}</strong>
-                                    <p class="nip49-modal-result-message">{result.message}</p>
-                                    {if has_secret {
-                                        view! {
-                                            <div>
-                                                {move || if visibility.get() == SecretVisibility::Hidden {
-                                                    view! {
-                                                        <button class="nip49-modal-export" on:click=move |_| visibility.set(SecretVisibility::Revealed)>
-                                                            "Reveal sensitive encrypted key"
-                                                        </button>
-                                                    }.into_any()
-                                                } else {
-                                                    view! {
-                                                        <div>
-                                                            <label for="nip49-export-value">"Sensitive encrypted key"</label>
-                                                            <textarea
-                                                                id="nip49-export-value"
-                                                                readonly
-                                                                class="nip49-modal-result-text"
-                                                                prop:value=result.ncryptsec.clone()
-                                                                rows="4"
-                                                            />
-                                                            {move || if copy_confirmation.get() {
-                                                                view! {
-                                                                    <div class="nip49-modal-copy-confirm">
-                                                                        <p>"Copy this sensitive value to the system clipboard?"</p>
-                                                                        <button class="nip49-modal-copy" on:click=move |event| confirm_copy_stored.get_value().run(event)>"Confirm copy"</button>
-                                                                        <button class="nip49-modal-cancel" on:click=move |_| copy_confirmation.set(false)>"Cancel"</button>
-                                                                    </div>
-                                                                }.into_any()
-                                                            } else {
-                                                                view! {
-                                                                    <button class="nip49-modal-copy" on:click=move |_| copy_confirmation.set(true)>
-                                                                        "Copy encrypted key"
-                                                                    </button>
-                                                                }.into_any()
-                                                            }}
-                                                        </div>
-                                                    }.into_any()
-                                                }}
-                                            </div>
-                                        }.into_any()
-                                    } else {
-                                        view! { <p class="v2-social-meta">"No secret value was returned for this account."</p> }.into_any()
-                                    }}
-                                </div>
-                            }
-                        })}
-                    </Show>
-
-                    <Show when=move || copy_status.get().is_some()>
-                        <p class="nip49-modal-copy-status" role="status">{move || copy_status.get().unwrap_or_default()}</p>
-                    </Show>
-
-                    <div class="nip49-modal-actions">
-                        <button class="nip49-modal-cancel" disabled=move || exporting.get() on:click={
-                            let handle_cancel = handle_cancel.clone();
-                            move |_| handle_cancel()
-                        }>"Close"</button>
-                        <Show when=move || export_result.get().is_none()>
-                            <button class="nip49-modal-export" on:click=move |event| export_click_stored.get_value().run(event) disabled=move || exporting.get()>
-                                {move || if exporting.get() { "Encrypting..." } else { "Create encrypted export" }}
-                            </button>
-                        </Show>
-                    </div>
-                </section>
-        </dialog>
+            <Show when=move || copy_status.get().is_some()>
+                <p class="arc-dialog-status nip49-modal-copy-status" role="status">{move || copy_status.get().unwrap_or_default()}</p>
+            </Show>
+        </Dialog>
     }
 }
 
@@ -352,6 +355,54 @@ mod tests {
     #[test]
     fn secret_visibility_defaults_to_hidden() {
         assert_eq!(SecretVisibility::default(), SecretVisibility::Hidden);
+    }
+
+    #[test]
+    fn a_busy_export_cannot_be_dismissed_by_any_channel() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = export_close_contract();
+        for source in [
+            DialogCloseSource::Escape,
+            DialogCloseSource::Backdrop,
+            DialogCloseSource::CloseButton,
+            DialogCloseSource::Cancel,
+        ] {
+            assert_eq!(
+                resolve_close(policy, dismissal, true, source),
+                DialogCloseAction::Ignore,
+                "{source:?} must not dismiss a running export"
+            );
+        }
+    }
+
+    #[test]
+    fn an_idle_export_dialog_dismisses_normally() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = export_close_contract();
+        assert_eq!(
+            resolve_close(policy, dismissal, false, DialogCloseSource::Escape),
+            DialogCloseAction::Dismiss
+        );
+    }
+
+    #[test]
+    fn the_export_dialog_never_claims_an_unsupported_cancellation() {
+        use crate::ui_v2::components::{resolve_close, DialogCloseAction, DialogCloseSource};
+
+        let (policy, dismissal) = export_close_contract();
+        // No confirmation prompt is offered, because there is nothing to
+        // cancel: the backend export cannot be interrupted.
+        assert_ne!(
+            resolve_close(policy, dismissal, true, DialogCloseSource::Escape),
+            DialogCloseAction::RequestConfirmation
+        );
+        let source = include_str!("nip49_modal.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes the test module");
+        assert!(!source.contains(concat!("invoke_", "cancel")));
     }
 
     #[test]
