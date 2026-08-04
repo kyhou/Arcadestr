@@ -111,11 +111,13 @@ body.arc-modal-open {
   background: var(--arc-surface-lowest);
 }
 
+/* The handoff top bar is full-bleed (padding: 0 28px, no max-width) while the
+   main area caps at 1440px. Capping the bar too left the brand, nav and account
+   controls floating in the middle of a maximized window. */
 .arc-topbar-inner {
   width: 100%;
-  max-width: var(--arc-content-max);
   height: 100%;
-  margin: 0 auto;
+  margin: 0;
   padding: 0 var(--arc-page-inline);
   display: flex;
   align-items: center;
@@ -6963,6 +6965,9 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-publisher-unavailable {
   max-width: 760px;
+  /* Reset .v2-publisher-studio's auto margin: publisher surfaces share the
+     shell's left content edge instead of recentering inside it. */
+  margin: 0;
   padding: clamp(1.5rem, 5vw, 3.5rem);
   border: 1px solid var(--v2-outline-ghost);
   border-radius: var(--v2-radius-xl);
@@ -7438,6 +7443,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-publisher-release-summary {
   max-width: 760px;
+  margin: 0;
 }
 
 .v2-publisher-release-summary .v2-publisher-dashboard-header {
@@ -8307,22 +8313,29 @@ dialog.v2-confirm-backdrop::backdrop {
   line-height: 1.5;
 }
 
+/* Single left-aligned authoring rail: the handoff aligns the title, stage nav,
+   fields and actions to one left edge and leaves the right side empty. Nesting a
+   centered column inside the already-centered shell is a fidelity defect. */
 .v2-create-surface {
   display: grid;
-  gap: 14px;
+  gap: 18px;
   width: 100%;
-  max-width: 560px;
-  margin-inline: auto;
+  min-width: 0;
+  max-width: var(--arc-content-form-lg);
+  margin-inline: 0;
+  justify-self: start;
 }
 
 .v2-create-stage-panel {
   min-width: 0;
   display: grid;
   gap: 12px;
-  border: 1px solid var(--arc-border-card);
-  border-radius: var(--arc-radius-md);
-  padding: 16px;
-  background: var(--arc-surface);
+}
+
+/* Sections stack in one flat column; a rule separates them instead of a card. */
+.v2-create-stage-panel + .v2-create-stage-panel {
+  border-top: 1px solid var(--arc-border-card);
+  padding-top: 18px;
 }
 
 .v2-create-section-title {
@@ -8990,7 +9003,7 @@ dialog.v2-confirm-backdrop::backdrop {
   line-height: 1.45;
 }
 
-/* Action area */
+/* Action area: sits directly beneath the authoring column, sharing its left edge. */
 .v2-create-actions {
   display: flex;
   flex-wrap: wrap;
@@ -8998,12 +9011,11 @@ dialog.v2-confirm-backdrop::backdrop {
   justify-content: space-between;
   gap: 10px;
   width: 100%;
-  max-width: 560px;
-  margin-inline: auto;
-  border: 1px solid var(--arc-border-card);
-  border-radius: var(--arc-radius-md);
-  padding: 10px 12px;
-  background: var(--arc-surface);
+  max-width: var(--arc-content-form-lg);
+  margin-inline: 0;
+  justify-self: start;
+  border-top: 1px solid var(--arc-border-card);
+  padding-top: 12px;
 }
 
 .v2-create-actions-state {
@@ -9717,7 +9729,9 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-store-preview {
   width: 100%;
-  margin-inline: auto;
+  /* The narrow preview shrinks against the editor's left edge rather than
+     drifting to the middle of the surface. */
+  margin-inline: 0;
   padding: 1rem;
   border: 2px solid var(--v2-primary);
   border-radius: var(--v2-radius-xl);

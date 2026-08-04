@@ -32,7 +32,7 @@ Arcadestr is a **decentralized game marketplace** built on the NOSTR protocol wi
 ### Main User-Facing Features
 
 1. **Browse Listings**: View published games with metadata (title, description, price, tags, images)
-2. **Publisher Studio**: Create or replacement-edit NIP-99 kind-30402 listings, preserve unmanaged metadata, provision ADP fulfillment, upload builds, and create/update/cancel claim campaigns
+2. **Publisher Studio**: Create or replacement-edit NIP-99 kind-30402 listings, publish rich kind-30407 Store Page presentations with Blossom-hosted media, preserve unmanaged metadata, provision ADP fulfillment, upload builds, and create/update/cancel claim campaigns
 3. **Acquire Games**: Buy paid games over Lightning, claim active claim-and-keep promotions, or use explicitly public/half-open timed access; zero price alone never grants access
 4. **Ownership, History & Install**: Track durable NIP-102 receipts and provisional NIP-103-style grants, show account-scoped purchase/claim history, stream authenticated ADP downloads, verify SHA-256 hashes, quarantine corrupt artifacts, and list device installs separately from ownership
 5. **Authentication**: NIP-07 browser extensions, NIP-46 remote signers, and encrypted local nsec accounts
@@ -44,6 +44,9 @@ Arcadestr is a **decentralized game marketplace** built on the NOSTR protocol wi
 11. **Marketplace Empty States**: Graceful UI when no listings are found, with distinct messages for browse vs store front
 12. **Account & Network Settings**: Switch/remove accounts, reconnect signers and relays, export local keys, and inspect non-sensitive diagnostics
 13. **Truthful Capability States**: Unsupported web, community, profile-editing, backup, appearance, and install-lifecycle actions are hidden or presented as unavailable rather than fabricated
+14. **Store Pages**: Publisher-authored kind-30407 presentation pages (schema `io.arcadestr.store-page`, version 1) with sanitized Markdown description, feature sections, media gallery, requirements, languages, accessibility, and links, rendered against game listings with cache-first discovery and reciprocal listing pointers
+15. **Blossom Media Uploads**: Account-scoped Blossom server settings (add/remove/reorder/preferred), health probes, upload-authorization signing, and sequential multi-server media uploads with SHA-256 verification and progress events
+16. **Account Library Saves**: Bookmark games into an account-scoped `library_games` list without downloading, reconciled against device installs in the Library view
 
 ### Desktop vs Web Target
 
@@ -78,9 +81,16 @@ Both targets share UI components from the `app` crate. The desktop target delega
 | **scrypt** | 0.11 | NIP-49 KDF for ncryptsec | `core/src/storage/encryption.rs` |
 | **chacha20poly1305** | 0.10 | XChaCha20-Poly1305 for NIP-49 | `core/src/storage/encryption.rs` |
 | **Bech32 encoding** | internal | Manual NIP-49 `ncryptsec1...` encoding/decoding | `core/src/storage/encryption.rs` |
-| **reqwest** | 0.12 | HTTP, multipart upload, and streamed ADP downloads | `core/src/http_client.rs`, `core/src/adp_client.rs` |
+| **reqwest** | 0.12 | HTTP, multipart upload, streamed ADP downloads, and Blossom media uploads | `core/src/http_client.rs`, `core/src/adp_client.rs`, `desktop/src/blossom_upload.rs` |
 | **lightning-invoice** | 0.32 | Bolt11 invoice parsing for purchase receipts | `core/src/purchases.rs` |
 | **sha2** | 0.10 | Payment-proof hashing, build verification, and deterministic install paths | `core/src/purchases.rs`, `desktop/src/install.rs`, `desktop/src/main.rs` |
+| **pulldown-cmark** | 0.13 | Store Page Markdown parsing and HTML sanitization (blocklist + limit enforced) | `core/src/store_page_content_policy.rs`, `core/src/store_page.rs` |
+| **time** | 0.3 | WASM-safe date/time handling for the reusable date/time picker | `app/Cargo.toml`, `app/src/components/date_time_picker.rs` |
+| **uuid** | 1 | Selection/upload identifiers for Blossom and media operations | `desktop/src/blossom_upload.rs`, `desktop/src/blossom_commands.rs` |
+| **infer** | 0.22 | Advisory media magic-byte detection before Blossom upload | `desktop/src/blossom_upload.rs` |
+| **imagesize** | 0.15 | Image dimension extraction from the bounded inspection prefix | `desktop/src/blossom_upload.rs` |
+| **tokio-util** | 0.7 | Cancellation tokens for interrupted Blossom uploads | `desktop/src/blossom_upload.rs` |
+| **futures-util** | 0.3 | Concurrent Blossom server uploads and stream handling | `desktop/src/blossom_upload.rs`, `desktop/src/blossom_commands.rs` |
 | **wasm-bindgen** | 0.2 | WASM/JavaScript interop | `app/`, `web/` crates |
 | **web-sys** | 0.3 | Browser API bindings | `app/src/web_auth.rs` |
 | **qrcode** | 0.14 | QR code generation for NIP-46 | `app/Cargo.toml` |
@@ -214,7 +224,12 @@ arcadestr/
 │   │   ├── adp_client.rs     # ADP HTTP client: provision, upload, purchase, download
 │   │   ├── adp_discovery.rs  # Kind-30403 ADP server discovery and parsing
 │   │   ├── adp_publish.rs    # Validated kind-30402 listing and kind-30406 authorization builders
-│   │   ├── adp_storage.rs    # Provisioning, download-token, and installed-game repositories
+│   │   ├── adp_storage.rs    # Provisioning, download-token, installed-game, and library-game repositories
+│   │   ├── blossom.rs        # Blossom protocol types: server origins, upload authorizations, blob descriptors, MIME policy
+│   │   ├── store_page.rs     # Store Page (kind 30407) schema, validation, sanitized rendering, and listing pointers
+│   │   ├── store_page_content_policy.rs # Store Page Markdown sanitizer and content-size limits
+│   │   ├── store_page_discovery.rs # Cache-first Store Page lookup, enrichment, and relay fallback
+│   │   ├── store_page_repository.rs # Validated Store Page and listing-event persistence
 │   │   ├── file_hash.rs      # Streaming SHA-256 file hashing
 │   │   ├── hash_validation.rs # Shared exact SHA-256 hex validation
 │   │   ├── replaceable_event.rs # Central timestamp/event-ID replacement ordering
@@ -235,11 +250,18 @@ arcadestr/
 │   │   ├── 004_adp_provisioning.sql # ADP delegated fulfillment records
 │   │   ├── 005_download_tokens.sql # Buyer-scoped ADP download credentials
 │   │   ├── 006_installed_games.sql # Verified local install registry
-│   │   └── 007_entitlements.sql # Immutable validated entitlement-grant events
+│   │   ├── 007_entitlements.sql # Immutable validated entitlement-grant events
+│   │   ├── 008_authorization_roots.sql # Legacy provisioning audit columns for kind-30406 roots
+│   │   ├── 009_library_games.sql # Account-scoped saved-game library
+│   │   ├── 010_store_pages.sql   # Validated Store Page events and sanitized content cache
+│   │   ├── 011_store_page_listing_events.sql # Signed listings for offline Store Page reciprocity
+│   │   └── 012_blossom_server_settings.sql # Account-scoped Blossom server configuration
 │   └── tests/
 │       ├── integration.rs          # Core integration coverage
 │       ├── integration_nip05.rs    # NIP-05 HTTP integration tests
+│       ├── receipt_protocol.rs     # NIP-102 receipt parsing/persistence tests
 │       ├── adp_entitlement_protocol.rs # Campaign/grant adversarial protocol tests
+│       ├── adp_publish_protocol.rs # ADP listing/authorization publish contract tests
 │       ├── authorization.rs        # Delegated fulfillment authority tests
 │       ├── campaign_discovery.rs   # Pointer/fallback campaign discovery tests
 │       └── entitlements_repository.rs # Validated grant persistence tests
@@ -262,10 +284,24 @@ arcadestr/
 │       │   ├── theme.rs    # Theme configuration
 │       │   ├── components/ # Reusable UI components
 │       │   │   ├── mod.rs  # Component exports
+│       │   │   ├── aria.rs # Enumerated ARIA state serialization helpers
+│       │   │   ├── blossom_media_upload.rs # Blossom media selection/upload UI
+│       │   │   ├── button.rs # Button/IconButton primitives and variants
+│       │   │   ├── dialog.rs # Canonical modal dialog primitive (focus, Escape, close policy)
+│       │   │   ├── feedback.rs # Inline status/feedback presentation
+│       │   │   ├── game_artwork.rs # Artwork loading/missing/failed states
 │       │   │   ├── game_card.rs # Truthful access/campaign/action card presentation
+│       │   │   ├── logo.rs # Arcadestr logo mark + wordmark
+│       │   │   ├── modal_background.rs # Modal scrim/backdrop
 │       │   │   ├── nav_item.rs   # Navigation item component
+│       │   │   ├── page_container.rs # PageContainer + ClippedPanel layout primitives
 │       │   │   ├── page_header.rs # Shared page heading component
-│       │   │   └── topbar.rs     # Top navigation bar
+│       │   │   ├── status_chip.rs # StatusChip variants (owned, installed, gated, etc.)
+│       │   │   ├── store_page_detail.rs # Store Page rich detail rendering
+│       │   │   ├── tabs.rs # Accessible tab group primitive
+│       │   │   ├── topbar.rs     # Top navigation bar
+│       │   │   ├── transient.rs # Transient menu/popover dismissal coordination
+│       │   │   └── unsaved_changes_dialog.rs # Unsaved-navigation guard dialog
 │       │   └── views/      # Page-level views
 │       │       ├── mod.rs  # View exports
 │       │       ├── achievements.rs    # User achievements/badges view
@@ -279,7 +315,8 @@ arcadestr/
 │       │       ├── purchases.rs      # Durable purchase and promotion-claim history
 │       │       ├── settings.rs       # Account, signer, network, export, diagnostics
 │       │       ├── social.rs         # Explicit community-unavailable view
-│       │       └── store_front.rs    # Main store front view
+│       │       ├── store_front.rs    # Main store front view
+│       │       └── store_page_publish.rs # Publisher Store Page editor (8-tab studio)
 │       ├── components/     # UI components
 │       │   ├── mod.rs      # Component exports
 │       │   ├── account_selector.rs   # Login/account switching UI
@@ -287,6 +324,7 @@ arcadestr/
 │       │   ├── badge_earned_modal.rs # Badge earned celebration modal
 │       │   ├── badge_showcase.rs     # Profile badge display component
 │       │   ├── browse.rs             # Game listing grid
+│       │   ├── date_time_picker.rs   # Reusable date/time picker (publish + store page)
 │       │   ├── detail.rs             # Game detail view with buy flow
 │       │   ├── nip49_modal.rs        # NIP-49 export modal (password confirm + copy)
 │       │   ├── nip05_badge.rs        # NIP-05 status badge (unverified/verifying/verified/failed)
@@ -306,9 +344,15 @@ arcadestr/
 │   ├── src/
 │   │   ├── main.rs         # Entry point, Tauri setup, commands
 │   │   ├── adp_commands.rs # ADP discovery, publishing, purchase, and wallet commands
+│   │   ├── store_page_commands.rs # Store Page enrichment, editor, validation, and publishing commands
+│   │   ├── blossom_commands.rs # Blossom media selection, upload, and server-settings commands
+│   │   ├── blossom_settings.rs # Account-scoped Blossom server settings persistence
+│   │   ├── blossom_upload.rs   # Native Blossom upload service (inspection, auth, streaming)
 │   │   ├── install.rs      # Artifact verification, quarantine, and install recording
 │   │   ├── nip46_commands.rs # NIP-46 specific Tauri commands
 │   │   └── command_contracts.rs # Pure command logic for testability
+│   ├── examples/
+│   │   └── blossom_fixture.rs # Loopback Blossom upload fixture (axum test server)
 │   ├── capabilities/
 │   │   └── default.json    # Core, dialog, event, and debug MCP bridge permissions
 │   └── tests/              # Desktop command layer tests
