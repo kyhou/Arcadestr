@@ -699,7 +699,9 @@ pub enum FulfillmentMode {
 pub struct PublishAdpListingRequest {
     pub expected_publisher_npub: String,
     pub existing_event_id: Option<String>,
-    pub d_tag: String,
+    /// Identifier of the listing being replaced. `None` for a first
+    /// publication, where the backend mints a UUID v4 instead.
+    pub existing_d_tag: Option<String>,
     pub title: String,
     pub description: String,
     pub price_sats: u64,
@@ -748,6 +750,10 @@ pub struct PublishServerUploadResult {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PublishAdpListingResult {
     pub event_id: String,
+    /// Set only when the backend minted an identifier for this publication.
+    pub game_id: Option<uuid::Uuid>,
+    pub d_tag: String,
+    pub game_coordinate: String,
     pub acceptance_event_id: Option<String>,
     pub fulfillment_pubkey: Option<String>,
     pub file_hash: Option<String>,
@@ -1784,7 +1790,7 @@ mod tests {
         let request = PublishAdpListingRequest {
             expected_publisher_npub: "npub1expected".to_string(),
             existing_event_id: Some("existing-listing-event".to_string()),
-            d_tag: "game".to_string(),
+            existing_d_tag: Some("game".to_string()),
             title: "Game".to_string(),
             description: "Description".to_string(),
             price_sats: 0,
@@ -1814,6 +1820,11 @@ mod tests {
 
         assert_eq!(value["expected_publisher_npub"], "npub1expected");
         assert_eq!(value["existing_event_id"], "existing-listing-event");
+        assert_eq!(value["existing_d_tag"], "game");
+        assert!(
+            value.get("d_tag").is_none(),
+            "publishers no longer supply a listing identifier"
+        );
         assert_eq!(value["existing_fulfillment_pubkey"], "delegated-key");
         assert!(value.get("existing_fulfillment_valid_from").is_none());
         assert!(value.get("existing_fulfillment_revoked_at").is_none());
@@ -1821,6 +1832,44 @@ mod tests {
         assert_eq!(value["acquisition"]["TimedAccess"]["ends_at"], 200);
         assert_eq!(value["campaigns"][0]["root_event_id"], "campaign-root");
         assert_eq!(value["nip94_event_id"], "nip94-event");
+    }
+
+    #[test]
+    fn publish_result_carries_the_generated_identifier_across_the_ipc_boundary() {
+        let result: PublishAdpListingResult = serde_json::from_value(serde_json::json!({
+            "event_id": "listing-event",
+            "game_id": "2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b",
+            "d_tag": "2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b",
+            "game_coordinate": "30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b",
+            "acceptance_event_id": null,
+            "fulfillment_pubkey": null,
+            "file_hash": null,
+            "uploads": []
+        }))
+        .expect("desktop publish result should deserialize");
+
+        assert_eq!(
+            result.game_id.map(|game_id| game_id.to_string()).as_deref(),
+            Some("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b")
+        );
+        assert!(result.game_coordinate.ends_with(&result.d_tag));
+
+        // Edits of legacy listings report no generated identifier and keep a
+        // non-UUID `d` tag.
+        let legacy: PublishAdpListingResult = serde_json::from_value(serde_json::json!({
+            "event_id": "listing-event",
+            "game_id": null,
+            "d_tag": "my-game-v1",
+            "game_coordinate": "30402:publisherhex:my-game-v1",
+            "acceptance_event_id": null,
+            "fulfillment_pubkey": null,
+            "file_hash": null,
+            "uploads": []
+        }))
+        .expect("legacy publish result should deserialize");
+
+        assert_eq!(legacy.game_id, None);
+        assert_eq!(legacy.d_tag, "my-game-v1");
     }
 
     #[test]

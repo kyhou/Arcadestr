@@ -38,6 +38,7 @@ use nostr::nips::nip19::FromBech32;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
 use tauri_plugin_dialog::DialogExt;
+use uuid::Uuid;
 
 use crate::AppState;
 
@@ -53,7 +54,10 @@ pub enum FulfillmentMode {
 pub struct PublishAdpListingRequest {
     pub expected_publisher_npub: String,
     pub existing_event_id: Option<String>,
-    pub d_tag: String,
+    /// Identifier of the listing being replaced. Only meaningful for edits, and
+    /// even then it is validated against the fetched authoritative listing. New
+    /// listings must leave this empty: the backend mints the identifier.
+    pub existing_d_tag: Option<String>,
     pub title: String,
     pub description: String,
     pub price_sats: u64,
@@ -90,7 +94,15 @@ pub struct PublishServerUploadResult {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublishAdpListingResult {
+    /// Event ID of the published kind:30402 listing.
     pub event_id: String,
+    /// Set only when this publication minted a new identifier. Serde renders the
+    /// canonical lowercase hyphenated form over IPC.
+    pub game_id: Option<Uuid>,
+    /// The listing `d` tag, generated or preserved.
+    pub d_tag: String,
+    /// `30402:<publisher-hex>:<d-tag>`, the stable game coordinate.
+    pub game_coordinate: String,
     pub acceptance_event_id: Option<String>,
     pub fulfillment_pubkey: Option<String>,
     pub file_hash: Option<String>,
@@ -111,6 +123,110 @@ pub struct PublishProgressPayload {
 pub struct HashProgressPayload {
     pub bytes_hashed: u64,
     pub total_bytes: u64,
+}
+
+/// Identity of the game page a publish operation acts on.
+///
+/// Arcadestr mints a UUID v4 for every first publication and keeps it typed
+/// until an event tag or coordinate needs text. Listings that already exist —
+/// including externally published NIP-99 listings with human-readable `d` tags —
+/// keep their original identifier verbatim, so the two cases stay distinct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GameIdentifier {
+    Generated(Uuid),
+    Existing(String),
+}
+
+impl GameIdentifier {
+    /// Mint the identifier for a first publication.
+    fn generate() -> Self {
+        GameIdentifier::Generated(Uuid::new_v4())
+    }
+
+    /// Protocol boundary: the textual `d` tag.
+    fn d_tag(&self) -> String {
+        match self {
+            GameIdentifier::Generated(game_id) => game_id.to_string(),
+            GameIdentifier::Existing(d_tag) => d_tag.clone(),
+        }
+    }
+
+    /// The minted UUID, when this publication created one.
+    fn generated_game_id(&self) -> Option<Uuid> {
+        match self {
+            GameIdentifier::Generated(game_id) => Some(*game_id),
+            GameIdentifier::Existing(_) => None,
+        }
+    }
+}
+
+/// A game coordinate held as typed parts, rendered to `30402:<pubkey>:<d>` only
+/// where the protocol demands a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GameCoordinate {
+    publisher: nostr::PublicKey,
+    identifier: GameIdentifier,
+}
+
+impl GameCoordinate {
+    fn new(publisher: nostr::PublicKey, identifier: GameIdentifier) -> Self {
+        Self {
+            publisher,
+            identifier,
+        }
+    }
+
+    fn d_tag(&self) -> String {
+        self.identifier.d_tag()
+    }
+
+    fn generated_game_id(&self) -> Option<Uuid> {
+        self.identifier.generated_game_id()
+    }
+
+    /// Protocol boundary: the NIP-01 replaceable-event coordinate.
+    fn to_coordinate_string(&self) -> String {
+        format!("30402:{}:{}", self.publisher.to_hex(), self.d_tag())
+    }
+}
+
+/// Identity for a first publication. A caller-supplied identifier is rejected
+/// rather than honoured: publishers do not choose game coordinates.
+fn resolve_new_game_identifier(requested_d_tag: Option<&str>) -> Result<GameIdentifier, String> {
+    if requested_d_tag.is_some() {
+        return Err(
+            "a new Game page cannot be published with a caller-supplied identifier".to_string(),
+        );
+    }
+    Ok(GameIdentifier::generate())
+}
+
+/// Identity for a replacement edit. The authoritative value comes from the
+/// fetched listing; any claimed value must agree with it exactly.
+fn resolve_existing_game_identifier(
+    requested_d_tag: Option<&str>,
+    authoritative_d_tag: Option<&str>,
+) -> Result<GameIdentifier, String> {
+    let authoritative = authoritative_d_tag
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "the listing being replaced has no identifier".to_string())?;
+    match requested_d_tag {
+        Some(requested) if requested != authoritative => Err(
+            "a published Game page keeps its identifier; the coordinate cannot change".to_string(),
+        ),
+        _ => Ok(GameIdentifier::Existing(authoritative.to_string())),
+    }
+}
+
+/// The `d` tag carried by a fetched listing event.
+fn listing_event_d_tag(event: &nostr::Event) -> Option<&str> {
+    event
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice())
+        .find(|values| values.first().map(String::as_str) == Some("d"))
+        .and_then(|values| values.get(1))
+        .map(String::as_str)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1190,10 +1306,16 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     verify_expected_publisher(&request.expected_publisher_npub, developer_pubkey)?;
     let developer_npub = developer_pubkey.to_hex();
     let preserving_existing_listing = request.existing_event_id.is_some();
-    let preserved_listing_tags = if let Some(expected_event_id) =
+    // The identity of the game page is settled once, here, before anything that
+    // depends on the coordinate is built. Every later stage reads it from
+    // `game`; nothing downstream mints a second one.
+    let (game, preserved_listing_tags) = if let Some(expected_event_id) =
         request.existing_event_id.as_deref()
     {
-        let coordinate = format!("30402:{developer_npub}:{}", request.d_tag);
+        let claimed_d_tag = request.existing_d_tag.as_deref().ok_or_else(|| {
+            "the identifier of the Game page being replaced is required".to_string()
+        })?;
+        let coordinate = format!("30402:{developer_npub}:{claimed_d_tag}");
         let existing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
         if existing.id.to_hex() != expected_event_id {
             return Err(
@@ -1201,15 +1323,23 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                     .to_string(),
             );
         }
-        existing
+        let identifier =
+            resolve_existing_game_identifier(Some(claimed_d_tag), listing_event_d_tag(&existing))?;
+        let preserved = existing
             .tags
             .iter()
             .map(|tag| tag.clone().to_vec())
             .filter(|values| !is_publish_form_tag(values))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (GameCoordinate::new(developer_pubkey, identifier), preserved)
     } else {
-        Vec::new()
+        let identifier = resolve_new_game_identifier(request.existing_d_tag.as_deref())?;
+        (
+            GameCoordinate::new(developer_pubkey, identifier),
+            Vec::new(),
+        )
     };
+    let game_d_tag = game.d_tag();
     let now: u64 = now_unix_i64()?
         .try_into()
         .map_err(|_| "current time is negative".to_string())?;
@@ -1307,7 +1437,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
 
                 let provisioning_repo =
                     AdpProvisioningRepository::new(state.database.pool().clone());
-                let scope = request.d_tag.as_str();
+                let scope = game_d_tag.as_str();
 
                 emit_progress(&app, "provision", "pending", None)?;
                 let provisioning = resolve_provisioning(ResolveProvisioningInput {
@@ -1408,7 +1538,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                 let adp_client =
                     AdpClient::new(operator_url.to_string(), Arc::clone(&state.http_client));
                 let provision = adp_client
-                    .provision(signer.as_ref(), Some(&request.d_tag))
+                    .provision(signer.as_ref(), Some(game_d_tag.as_str()))
                     .await
                     .map_err(|error| progress_error(&app, "provision", error))?;
                 let repair = repair_existing_authorization(ExistingAuthorizationRepairInput {
@@ -1417,7 +1547,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                     developer_pubkey,
                     developer_hex: &developer_npub,
                     operator_url,
-                    scope: &request.d_tag,
+                    scope: game_d_tag.as_str(),
                     fulfillment_pubkey: existing_pubkey,
                     provision: &provision,
                 })
@@ -1442,7 +1572,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     }
 
     if let Some(expected_event_id) = request.existing_event_id.as_deref() {
-        let coordinate = format!("30402:{developer_npub}:{}", request.d_tag);
+        let coordinate = game.to_coordinate_string();
         let current = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
         if current.id.to_hex() != expected_event_id {
             return Err(
@@ -1455,7 +1585,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     emit_progress(&app, "publish-listing", "pending", None)?;
     ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey).await?;
     let listing_input = AdpListingInput {
-        d_tag: request.d_tag.clone(),
+        d_tag: game_d_tag.clone(),
         title: request.title.clone(),
         description: request.description.clone(),
         price_sats: request.price_sats,
@@ -1509,10 +1639,14 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         "ok",
         Some(listing_event.id.to_hex()),
     )?;
+    let coordinate = game.to_coordinate_string();
+    // Publication is not transactional: from here on a failure leaves a real
+    // listing behind. Hand the coordinate to the caller immediately so a retry
+    // edits that listing instead of minting a second one.
+    emit_progress(&app, "listing-coordinate", "ok", Some(coordinate.clone()))?;
 
     emit_progress(&app, "confirm-propagation", "pending", None)?;
     let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
-    let coordinate = format!("30402:{}:{}", listing_event.pubkey.to_hex(), request.d_tag);
     let propagated = confirm_nip99_listing_propagated(&relay_manager, &coordinate, 2)
         .await
         .map_err(|err| progress_error(&app, "confirm-propagation", err))?;
@@ -1604,6 +1738,9 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
 
     Ok(PublishAdpListingResult {
         event_id: listing_event.id.to_hex(),
+        game_id: game.generated_game_id(),
+        d_tag: game_d_tag,
+        game_coordinate: coordinate,
         acceptance_event_id,
         fulfillment_pubkey,
         file_hash,
@@ -2025,6 +2162,195 @@ mod tests {
             .expect_err("a changed account must be rejected");
         assert!(error.contains("Active account changed"));
         assert!(error.contains("expected publisher does not match signer pubkey"));
+    }
+
+    #[test]
+    fn new_publication_generates_a_version_4_uuid_identifier() {
+        let identifier =
+            resolve_new_game_identifier(None).expect("a first publication should mint an id");
+
+        let game_id = identifier
+            .generated_game_id()
+            .expect("a first publication is a generated identity");
+        assert_eq!(game_id.get_version(), Some(uuid::Version::Random));
+        assert_eq!(game_id.get_variant(), uuid::Variant::RFC4122);
+    }
+
+    #[test]
+    fn generated_identifier_renders_canonical_lowercase_hyphenated_text() {
+        let identifier =
+            resolve_new_game_identifier(None).expect("a first publication should mint an id");
+
+        let d_tag = identifier.d_tag();
+        assert_eq!(d_tag.len(), 36);
+        assert_eq!(
+            d_tag
+                .match_indices('-')
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+            vec![8, 13, 18, 23]
+        );
+        assert!(d_tag.chars().all(|character| character == '-'
+            || character.is_ascii_lowercase()
+            || character.is_ascii_digit()));
+        assert_eq!(
+            d_tag,
+            identifier
+                .generated_game_id()
+                .expect("generated identity")
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn independent_new_publications_generate_different_identifiers() {
+        let first = resolve_new_game_identifier(None).expect("first publication should mint an id");
+        let second =
+            resolve_new_game_identifier(None).expect("second publication should mint an id");
+
+        assert_ne!(first.d_tag(), second.d_tag());
+    }
+
+    #[test]
+    fn new_publication_rejects_a_caller_supplied_identifier() {
+        let error = resolve_new_game_identifier(Some("publisher-chosen-slug"))
+            .expect_err("a caller-supplied identifier must not be honoured");
+
+        assert!(error.contains("caller-supplied identifier"));
+    }
+
+    #[test]
+    fn listing_edits_preserve_a_legacy_non_uuid_identifier() {
+        let identifier = resolve_existing_game_identifier(Some("my-game-v1"), Some("my-game-v1"))
+            .expect("a legacy identifier must remain publishable");
+
+        assert_eq!(identifier, GameIdentifier::Existing("my-game-v1".into()));
+        assert_eq!(identifier.d_tag(), "my-game-v1");
+        assert_eq!(identifier.generated_game_id(), None);
+    }
+
+    #[test]
+    fn listing_edits_preserve_a_uuid_identifier() {
+        let existing = Uuid::new_v4().to_string();
+
+        let identifier = resolve_existing_game_identifier(Some(&existing), Some(&existing))
+            .expect("a UUID identifier must be preserved verbatim");
+
+        assert_eq!(identifier.d_tag(), existing);
+        assert_eq!(
+            identifier.generated_game_id(),
+            None,
+            "an edit must never mint a replacement identifier"
+        );
+    }
+
+    #[test]
+    fn listing_edits_reject_an_attempted_identifier_change() {
+        let error = resolve_existing_game_identifier(Some("renamed-game"), Some("my-game-v1"))
+            .expect_err("changing the coordinate of a published listing must fail");
+
+        assert!(error.contains("cannot change"));
+    }
+
+    #[test]
+    fn listing_edits_require_an_authoritative_identifier() {
+        let error = resolve_existing_game_identifier(Some("my-game-v1"), None)
+            .expect_err("an edit without an authoritative d tag must fail");
+
+        assert!(error.contains("no identifier"));
+    }
+
+    #[test]
+    fn authoritative_identifier_is_read_from_the_fetched_listing() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(30402), "")
+            .tags([nostr::Tag::identifier("my-game-v1")])
+            .sign_with_keys(&keys)
+            .expect("test listing event should sign");
+
+        assert_eq!(listing_event_d_tag(&event), Some("my-game-v1"));
+    }
+
+    #[test]
+    fn every_coordinate_dependent_input_shares_one_generated_identifier() {
+        let publisher = nostr::Keys::generate().public_key();
+        let game = GameCoordinate::new(
+            publisher,
+            resolve_new_game_identifier(None).expect("first publication should mint an id"),
+        );
+
+        // The scope handed to provisioning and authorization, the listing `d`
+        // tag, the propagation/upload coordinate and the returned result are all
+        // rendered from this one value.
+        let d_tag = game.d_tag();
+        let coordinate = game.to_coordinate_string();
+        assert_eq!(
+            coordinate,
+            format!("30402:{}:{}", publisher.to_hex(), d_tag)
+        );
+        assert_eq!(game.to_coordinate_string(), coordinate);
+        assert_eq!(game.d_tag(), d_tag);
+        assert_eq!(
+            game.generated_game_id().map(|id| id.to_string()),
+            Some(d_tag)
+        );
+
+        // No publish stage may reach past the resolved identity for its own copy.
+        let source = include_str!("adp_commands.rs");
+        assert!(!source.contains(concat!("request", ".d_tag")));
+        assert_eq!(
+            source
+                .matches(concat!("GameIdentifier::", "generate()"))
+                .count(),
+            1,
+            "exactly one place may mint a game identifier"
+        );
+    }
+
+    #[test]
+    fn a_recovered_coordinate_reuses_the_published_identifier_on_retry() {
+        let publisher = nostr::Keys::generate().public_key();
+        let published = GameCoordinate::new(
+            publisher,
+            resolve_new_game_identifier(None).expect("first publication should mint an id"),
+        );
+        let published_d_tag = published.d_tag();
+
+        // A retry after a failure that followed listing publication arrives as
+        // an edit carrying the recovered identifier.
+        let retried = GameCoordinate::new(
+            publisher,
+            resolve_existing_game_identifier(Some(&published_d_tag), Some(&published_d_tag))
+                .expect("the recovered identifier should be accepted"),
+        );
+
+        assert_eq!(retried.d_tag(), published_d_tag);
+        assert_eq!(
+            retried.to_coordinate_string(),
+            published.to_coordinate_string()
+        );
+        assert_eq!(
+            retried.generated_game_id(),
+            None,
+            "a retry must not mint a second coordinate"
+        );
+    }
+
+    #[test]
+    fn the_coordinate_is_published_before_any_step_that_can_fail_after_it() {
+        let source = include_str!("adp_commands.rs");
+        let coordinate_handoff = source
+            .find(r#"emit_progress(&app, "listing-coordinate", "ok""#)
+            .expect("the published coordinate must be handed to the caller");
+        let propagation = source
+            .find(r#"emit_progress(&app, "confirm-propagation", "pending""#)
+            .expect("propagation confirmation should follow publication");
+        let upload = source
+            .find(r#"emit_server_progress(&app, "upload", "pending""#)
+            .expect("uploads should follow publication");
+
+        assert!(coordinate_handoff < propagation);
+        assert!(coordinate_handoff < upload);
     }
 
     #[test]
@@ -2773,13 +3099,6 @@ mod tests {
 
         let app = live_test_app(relays).await;
         let file_path = write_live_test_file().await;
-        let d_tag = format!(
-            "gate3-live-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after epoch")
-                .as_nanos()
-        );
         let request = PublishAdpListingRequest {
             expected_publisher_npub: nostr::Keys::parse(
                 "0000000000000000000000000000000000000000000000000000000000000001",
@@ -2789,7 +3108,7 @@ mod tests {
             .to_bech32()
             .expect("live test npub should encode"),
             existing_event_id: None,
-            d_tag: d_tag.clone(),
+            existing_d_tag: None,
             title: "Gate 3 Live Test Binary".to_string(),
             description: "Small live ADP command-level publish test fixture".to_string(),
             price_sats,
@@ -2839,8 +3158,14 @@ mod tests {
         assert!(!fulfillment_pubkey.is_empty());
         assert!(!upload.download_url.is_empty());
         assert_eq!(&upload.file_hash, file_hash);
+        let game_id = result
+            .game_id
+            .expect("a first publication should mint a game id");
+        assert_eq!(game_id.get_version_num(), 4);
+        assert_eq!(result.d_tag, game_id.to_string());
+        assert_eq!(upload.game_coordinate, result.game_coordinate);
         assert!(
-            upload.game_coordinate.contains(&d_tag),
+            upload.game_coordinate.ends_with(&result.d_tag),
             "upload response should reference the published listing coordinate"
         );
         println!("ADP_LIVE_EVENT_ID={}", result.event_id);

@@ -37,6 +37,9 @@ send_wrapper = "0.6"
 aes-gcm = "0.10"
 base64 = "0.22"
 getrandom = { version = "0.2", features = ["js"] }
+# Game identifiers stay typed across the IPC boundary. The `v4` generator is
+# deliberately absent: only the desktop backend mints identifiers.
+uuid = { version = "1", default-features = false, features = ["std", "serde"] }
 
 # Nostr re-export for web target (needed for ToBech32 trait)
 # This is used by web_auth.rs when web feature is enabled

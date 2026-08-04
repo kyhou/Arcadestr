@@ -279,7 +279,6 @@ fn signer_requirement_message(state: PublisherSignerState) -> &'static str {
 /// Snapshot of every author-editable field, used only to tell pristine from dirty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FormSnapshot {
-    id: String,
     title: String,
     description: String,
     tags: String,
@@ -498,6 +497,55 @@ fn publication_progress(
     state
 }
 
+/// Identity of the listing this form is responsible for, once one exists.
+///
+/// Empty for a first publication: Arcadestr mints the identifier in the
+/// backend, and the form only learns it afterwards. Publication is not
+/// transactional, so this is filled in as soon as the listing event is on a
+/// relay — a retry after a later failure must replace that listing rather than
+/// create a second coordinate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PublishedIdentity {
+    event_id: Option<String>,
+    d_tag: Option<String>,
+}
+
+/// Fold a publish progress event into the published identity.
+fn publication_identity_progress(
+    mut identity: PublishedIdentity,
+    event: &PublishProgressPayload,
+) -> PublishedIdentity {
+    if event.status != "ok" {
+        return identity;
+    }
+    match event.step.as_str() {
+        "publish-listing" => {
+            if let Some(event_id) = event.message.clone() {
+                identity.event_id = Some(event_id);
+            }
+        }
+        "listing-coordinate" => {
+            if let Some(d_tag) = event.message.as_deref().and_then(d_tag_from_coordinate) {
+                identity.d_tag = Some(d_tag);
+            }
+        }
+        _ => {}
+    }
+    identity
+}
+
+/// The `d` tag inside a `30402:<publisher-hex>:<d-tag>` coordinate.
+///
+/// Legacy identifiers may contain colons, so everything after the second one
+/// belongs to the tag.
+fn d_tag_from_coordinate(coordinate: &str) -> Option<String> {
+    let mut parts = coordinate.splitn(3, ':');
+    let kind = parts.next()?;
+    let _publisher = parts.next()?;
+    let d_tag = parts.next()?;
+    (kind == "30402" && !d_tag.is_empty()).then(|| d_tag.to_string())
+}
+
 fn publication_completed(
     mut state: PublicationState,
     result: Result<(String, bool), String>,
@@ -633,7 +681,6 @@ impl ServerStatus {
 }
 
 fn validate_listing(
-    id: &str,
     title: &str,
     description: &str,
     price_sats: u64,
@@ -646,25 +693,9 @@ fn validate_listing(
     fulfillment_mode: &FulfillmentMode,
     operator_url: &str,
 ) -> Result<(), String> {
-    let id = id.trim();
     let title = title.trim();
     let description = description.trim();
     let lud16 = lud16.trim();
-    if id.is_empty() {
-        return Err("Game page identifier is required".to_string());
-    }
-    if id.len() > 64 {
-        return Err("Game page identifier must be 64 characters or less".to_string());
-    }
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        return Err(
-            "Game page identifier can only contain lowercase letters, numbers, and hyphens"
-                .to_string(),
-        );
-    }
     if title.is_empty() {
         return Err("Title is required".to_string());
     }
@@ -870,7 +901,6 @@ fn platform_summary(input: &str) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn readiness_checklist(
-    id: &str,
     title: &str,
     description: &str,
     image_input: &str,
@@ -887,7 +917,6 @@ fn readiness_checklist(
     operator_url: &str,
 ) -> ReadinessChecklist {
     let metadata = validate_listing(
-        id,
         title,
         description,
         0,
@@ -1024,7 +1053,9 @@ fn published_listing(
         .map(|listing| listing.created_at)
         .unwrap_or_else(|| (js_sys::Date::now() / 1000.0) as u64);
     GameListing {
-        id: request.d_tag.clone(),
+        // The identifier is whatever the backend actually published, never a
+        // form value: a first publication only learns it from the result.
+        id: result.d_tag.clone(),
         source: ListingSource::Nip99Listing,
         title: request.title.clone(),
         description: request.description.clone(),
@@ -1228,7 +1259,6 @@ mod tests {
     #[test]
     fn existing_fulfillment_hash_does_not_require_reselecting_build_file() {
         let result = validate_listing(
-            "managed-game",
             "Managed Game",
             "Description",
             0,
@@ -1254,7 +1284,6 @@ mod tests {
     #[test]
     fn malformed_existing_fulfillment_hash_requires_replacement_file() {
         let result = validate_listing(
-            "managed-game",
             "Managed Game",
             "Description",
             0,
@@ -1530,7 +1559,6 @@ mod tests {
             auto_operator: false,
         }];
         let checklist = readiness_checklist(
-            "game",
             "Game",
             "Description",
             "https://example.com/cover.png",
@@ -1774,6 +1802,150 @@ mod tests {
     }
 
     #[test]
+    fn the_new_game_form_has_no_editable_identifier_field() {
+        let source = include_str!("publish.rs");
+
+        assert!(!source.contains(concat!("publish", "-id")));
+        assert!(!source.contains(concat!("Game page ", "identifier")));
+        // The identifier may still be shown as a technical detail, but nothing
+        // may bind it to an input.
+        assert!(!source.contains(concat!("d_tag", ": id_val")));
+    }
+
+    #[test]
+    fn publish_readiness_no_longer_requires_user_entered_identifier_text() {
+        let checklist = readiness_checklist(
+            "Game",
+            "Description",
+            "https://example.com/cover.png",
+            AcquisitionKind::Public,
+            "0",
+            "",
+            Ok(AcquisitionPolicy::Public),
+            "linux-x86_64",
+            false,
+            &[],
+            None,
+            "",
+            &FulfillmentMode::None,
+            "",
+        );
+
+        assert!(
+            checklist.metadata,
+            "metadata readiness must not depend on an author-entered identifier"
+        );
+        assert_eq!(
+            validate_listing(
+                "Game",
+                "Description",
+                0,
+                "",
+                false,
+                &[],
+                &None,
+                &None,
+                "",
+                &FulfillmentMode::None,
+                "",
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_failure_after_listing_publication_preserves_the_published_coordinate() {
+        let identity = PublishedIdentity::default();
+        let identity = publication_identity_progress(
+            identity,
+            &PublishProgressPayload {
+                step: "publish-listing".into(),
+                status: "ok".into(),
+                server_url: None,
+                message: Some("listing-event-id".into()),
+                bytes_uploaded: None,
+                total_bytes: None,
+            },
+        );
+        let identity = publication_identity_progress(
+            identity,
+            &PublishProgressPayload {
+                step: "listing-coordinate".into(),
+                status: "ok".into(),
+                server_url: None,
+                message: Some("30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
+                bytes_uploaded: None,
+                total_bytes: None,
+            },
+        );
+        // The upload that follows fails; the identity survives it.
+        let identity = publication_identity_progress(
+            identity,
+            &PublishProgressPayload {
+                step: "upload".into(),
+                status: "error".into(),
+                server_url: Some("https://dist.example.com".into()),
+                message: Some("connection refused".into()),
+                bytes_uploaded: None,
+                total_bytes: None,
+            },
+        );
+
+        assert_eq!(identity.event_id.as_deref(), Some("listing-event-id"));
+        assert_eq!(
+            identity.d_tag.as_deref(),
+            Some("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b")
+        );
+    }
+
+    #[test]
+    fn retrying_after_partial_publication_republishes_the_same_coordinate() {
+        let recovered = PublishedIdentity {
+            event_id: Some("listing-event-id".into()),
+            d_tag: Some("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
+        };
+
+        // A retry sends both halves, which is exactly the replacement-edit
+        // contract: the backend preserves the identifier instead of minting one.
+        assert!(recovered.event_id.is_some());
+        assert!(recovered.d_tag.is_some());
+
+        // Later progress from the retry cannot change the identifier.
+        let after_retry = publication_identity_progress(
+            recovered.clone(),
+            &PublishProgressPayload {
+                step: "listing-coordinate".into(),
+                status: "ok".into(),
+                server_url: None,
+                message: Some("30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
+                bytes_uploaded: None,
+                total_bytes: None,
+            },
+        );
+        assert_eq!(after_retry, recovered);
+    }
+
+    #[test]
+    fn legacy_and_uuid_coordinates_both_yield_their_identifier() {
+        assert_eq!(
+            d_tag_from_coordinate("30402:publisherhex:my-game-v1").as_deref(),
+            Some("my-game-v1")
+        );
+        assert_eq!(
+            d_tag_from_coordinate("30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b")
+                .as_deref(),
+            Some("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b")
+        );
+        assert_eq!(
+            d_tag_from_coordinate("30402:publisherhex:legacy:with:colons").as_deref(),
+            Some("legacy:with:colons")
+        );
+        assert_eq!(d_tag_from_coordinate("30023:publisherhex:article"), None);
+        assert_eq!(d_tag_from_coordinate("30402:publisherhex:"), None);
+        assert_eq!(d_tag_from_coordinate("not-a-coordinate"), None);
+    }
+
+    #[test]
     fn signer_requirements_distinguish_every_publisher_signer_state() {
         let messages = [
             PublisherSignerState::Available,
@@ -1831,7 +2003,13 @@ pub fn PublishView(
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let editing = listing.is_some();
     let editing_publisher = listing.as_ref().map(|item| item.publisher_npub.clone());
-    let existing_event_id = listing.as_ref().and_then(|item| item.event_id.clone());
+    // Identity of the game page under edit. Both stay `None` for a first
+    // publication until the backend reports what it minted, after which a retry
+    // replaces that listing instead of creating a second coordinate.
+    let published_identity = RwSignal::new(PublishedIdentity {
+        event_id: listing.as_ref().and_then(|item| item.event_id.clone()),
+        d_tag: listing.as_ref().map(|item| item.id.clone()),
+    });
     let existing_listing_for_submit = listing.clone();
     let published_servers = listing.as_ref().map(listing_servers).unwrap_or_default();
     let published_fulfillment_mode = listing
@@ -1868,12 +2046,6 @@ pub fn PublishView(
         .and_then(|item| item.nip94_event_id.clone());
     let existing_fulfillment_locked = existing_fulfillment_pubkey.is_some();
 
-    let id = RwSignal::new(
-        listing
-            .as_ref()
-            .map(|item| item.id.clone())
-            .unwrap_or_default(),
-    );
     let title = RwSignal::new(
         listing
             .as_ref()
@@ -2336,7 +2508,6 @@ pub fn PublishView(
     let validate_stage = move |stage: PublishStage| -> Result<(), String> {
         match stage {
             PublishStage::Details => validate_listing(
-                &id.get(),
                 &title.get(),
                 &description.get(),
                 0,
@@ -2375,7 +2546,6 @@ pub fn PublishView(
                         return Ok(());
                     }
                     validate_listing(
-                        &id.get(),
                         &title.get(),
                         &description.get(),
                         0,
@@ -2428,7 +2598,6 @@ pub fn PublishView(
     let existing_nip94_for_submit = existing_nip94_event_id.clone();
     let existing_fulfillment_key_for_submit = existing_fulfillment_pubkey.clone();
     let editing_publisher_for_submit = editing_publisher.clone();
-    let existing_event_id_for_submit = existing_event_id.clone();
     let on_submit = Callback::new(move |()| {
         if is_selecting_image.get_untracked() {
             error_message.set(Some("Finish selecting the image before publishing.".into()));
@@ -2451,7 +2620,6 @@ pub fn PublishView(
             return;
         }
 
-        let id_val = id.get().trim().to_string();
         let title_val = title.get().trim().to_string();
         let description_val = description.get().trim().to_string();
         let lud16_val = lud16.get().trim().to_string();
@@ -2488,7 +2656,6 @@ pub fn PublishView(
         };
 
         if let Err(msg) = validate_listing(
-            &id_val,
             &title_val,
             &description_val,
             price_val,
@@ -2547,8 +2714,8 @@ pub fn PublishView(
 
         let mut request = PublishAdpListingRequest {
             expected_publisher_npub: initiating_npub.clone(),
-            existing_event_id: existing_event_id_for_submit.clone(),
-            d_tag: id_val,
+            existing_event_id: published_identity.get_untracked().event_id,
+            existing_d_tag: published_identity.get_untracked().d_tag,
             title: title_val,
             description: description_val,
             price_sats: price_val,
@@ -2780,6 +2947,16 @@ pub fn PublishView(
                 {
                     return;
                 }
+                // Capture the identity of the listing the moment it exists, so
+                // a retry after a later failure edits it instead of minting a
+                // second coordinate.
+                published_identity.update(|identity| {
+                    *identity = publication_identity_progress(identity.clone(), &payload)
+                });
+                if payload.step == "listing-coordinate" {
+                    // A recovery channel, not a user-visible publication step.
+                    return;
+                }
                 if payload.step == "upload" {
                     if payload.bytes_uploaded.is_some() && payload.total_bytes.is_some() {
                         upload_progress.set(Some(payload.clone()));
@@ -2853,6 +3030,10 @@ pub fn PublishView(
             }
             let published = match publish_result {
                 Ok(result) => {
+                    published_identity.set(PublishedIdentity {
+                        event_id: Some(result.event_id.clone()),
+                        d_tag: Some(result.d_tag.clone()),
+                    });
                     let uploads_failed = result.uploads.iter().any(|upload| upload.status != "ok");
                     publication_state.update(|state| {
                         *state = publication_completed(
@@ -2902,7 +3083,6 @@ pub fn PublishView(
 
     let checklist = move || {
         readiness_checklist(
-            &id.get(),
             &title.get(),
             &description.get(),
             &hosted_image_urls(&image_drafts.get())
@@ -2927,7 +3107,6 @@ pub fn PublishView(
     };
 
     let form_snapshot = move || FormSnapshot {
-        id: id.get(),
         title: title.get(),
         description: description.get(),
         tags: tag_input.get(),
@@ -3026,11 +3205,6 @@ pub fn PublishView(
                     <section class="v2-create-stage-panel" aria-labelledby="publish-details-title">
                         <h2 id="publish-details-title" class="v2-create-section-title">"Game details"</h2>
                         <div class="v2-create-fields">
-                            <div>
-                                <label for="publish-id" class="v2-create-field-label">"Game page identifier (required)"</label>
-                                <input id="publish-id" required=true aria-describedby="publish-id-help" class="v2-input" placeholder="my-game-v1" prop:value={move || id.get()} on:input:target=move |ev| id.set(ev.target().value()) readonly=editing disabled={move || is_publishing.get()} />
-                                <p id="publish-id-help" class="v2-create-help">{if editing { "This permanent identifier is locked while updating the existing Game page." } else { "This permanent identifier becomes the Game page coordinate. Protocol detail: it is the listing d tag." }}</p>
-                            </div>
                             <div>
                                 <label for="publish-title" class="v2-create-field-label">"Title (required)"</label>
                                 <input id="publish-title" required=true class="v2-input" placeholder="Neon Drifter" prop:value={move || title.get()} on:input:target=move |ev| title.set(ev.target().value()) disabled={move || is_publishing.get()} />
@@ -3446,7 +3620,9 @@ pub fn PublishView(
                         </article>
 
                         <dl class="v2-create-review-facts">
-                            <div><dt>"Identifier"</dt><dd>{move || id.get()}</dd></div>
+                            {move || published_identity.get().d_tag.map(|d_tag| view! {
+                                <div><dt>"Identifier"</dt><dd>{d_tag}</dd></div>
+                            })}
                             <div><dt>"Metadata"</dt><dd>{move || format!("{} tags · {} images", parse_csv_values(&tag_input.get()).len(), image_drafts.get().len())}</dd></div>
                             <div><dt>"Description"</dt><dd class="v2-create-review-prewrap">{move || description.get()}</dd></div>
                             <div><dt>"Pricing"</dt><dd>{move || match acquisition_kind.get() { AcquisitionKind::Gated => format!("{} sats via {}", price_input.get(), lud16.get()), AcquisitionKind::Public | AcquisitionKind::TimedAccess => "Not for sale (0 sats)".to_string() }}</dd></div>
