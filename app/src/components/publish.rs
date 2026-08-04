@@ -508,6 +508,7 @@ fn publication_progress(
 struct PublishedIdentity {
     event_id: Option<String>,
     d_tag: Option<String>,
+    coordinate: Option<String>,
 }
 
 /// Fold a publish progress event into the published identity.
@@ -525,8 +526,11 @@ fn publication_identity_progress(
             }
         }
         "listing-coordinate" => {
-            if let Some(d_tag) = event.message.as_deref().and_then(d_tag_from_coordinate) {
-                identity.d_tag = Some(d_tag);
+            if let Some(coordinate) = event.message.clone() {
+                if let Some(d_tag) = d_tag_from_coordinate(&coordinate) {
+                    identity.d_tag = Some(d_tag);
+                    identity.coordinate = Some(coordinate);
+                }
             }
         }
         _ => {}
@@ -1903,6 +1907,7 @@ mod tests {
         let recovered = PublishedIdentity {
             event_id: Some("listing-event-id".into()),
             d_tag: Some("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
+            coordinate: Some("30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
         };
 
         // A retry sends both halves, which is exactly the replacement-edit
@@ -1923,6 +1928,46 @@ mod tests {
             },
         );
         assert_eq!(after_retry, recovered);
+    }
+
+    #[test]
+    fn recovery_updates_identity_without_resetting_unsaved_form_values() {
+        let mut form = FormSnapshot {
+            title: "Renamed after the failure".into(),
+            price: "9000".into(),
+            platforms: "linux-x86_64".into(),
+            acquisition: "Public".into(),
+            ..FormSnapshot::default()
+        };
+        let untouched = form.clone();
+        let identity = publication_identity_progress(
+            PublishedIdentity::default(),
+            &PublishProgressPayload {
+                step: "listing-coordinate".into(),
+                status: "ok".into(),
+                server_url: None,
+                message: Some("30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
+                bytes_uploaded: None,
+                total_bytes: None,
+            },
+        );
+
+        // Recovery only ever touches identity: it takes the form snapshot
+        // neither as input nor as output, so no unsaved edit can be reset by it.
+        assert_eq!(form, untouched);
+        assert_eq!(
+            identity.coordinate.as_deref(),
+            Some("30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b")
+        );
+        assert_eq!(
+            identity.d_tag.as_deref(),
+            Some("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b")
+        );
+
+        // The form remains free to change afterwards; the retry sends the later
+        // value, not the half-published one.
+        form.price = "12000".into();
+        assert_ne!(form, untouched);
     }
 
     #[test]
@@ -2009,6 +2054,9 @@ pub fn PublishView(
     let published_identity = RwSignal::new(PublishedIdentity {
         event_id: listing.as_ref().and_then(|item| item.event_id.clone()),
         d_tag: listing.as_ref().map(|item| item.id.clone()),
+        coordinate: listing
+            .as_ref()
+            .map(|item| format!("30402:{}:{}", item.publisher_npub, item.id)),
     });
     let existing_listing_for_submit = listing.clone();
     let published_servers = listing.as_ref().map(listing_servers).unwrap_or_default();
@@ -3033,6 +3081,7 @@ pub fn PublishView(
                     published_identity.set(PublishedIdentity {
                         event_id: Some(result.event_id.clone()),
                         d_tag: Some(result.d_tag.clone()),
+                        coordinate: Some(result.game_coordinate.clone()),
                     });
                     let uploads_failed = result.uploads.iter().any(|upload| upload.status != "ok");
                     publication_state.update(|state| {

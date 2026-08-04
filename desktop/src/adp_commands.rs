@@ -218,6 +218,23 @@ fn resolve_existing_game_identifier(
     }
 }
 
+/// Optimistic concurrency: the authoritative listing must still be the one the
+/// caller intends to replace.
+///
+/// A retry after a partial publication uses the recovered published event ID
+/// here, so a newer remote replacement fails the same way an ordinary stale
+/// edit does rather than being silently overwritten.
+fn ensure_expected_listing_event(
+    authoritative: &nostr::Event,
+    expected_event_id: &str,
+    conflict_message: &str,
+) -> Result<(), String> {
+    if authoritative.id.to_hex() != expected_event_id {
+        return Err(conflict_message.to_string());
+    }
+    Ok(())
+}
+
 /// The `d` tag carried by a fetched listing event.
 fn listing_event_d_tag(event: &nostr::Event) -> Option<&str> {
     event
@@ -1249,23 +1266,65 @@ pub(crate) fn verify_expected_publisher(
     Ok(())
 }
 
+/// Listing tags the publish form owns end to end.
+///
+/// One definition, used by every replacement publication — ordinary edits and
+/// retries after a partial publication alike. A tag named here is dropped from
+/// the tags preserved off the authoritative listing, because the form's current
+/// values are republished in its place. Anything absent from this list is
+/// unmanaged and survives untouched, including tags Arcadestr does not know.
+const FORM_MANAGED_LISTING_TAGS: &[&str] = &[
+    "d",
+    "title",
+    "price",
+    "t",
+    "image",
+    "acquisition",
+    "server",
+    "file_hash",
+    "version",
+    "fulfillment_pubkey",
+    "lud16",
+    "platform",
+    "campaign",
+    "nip94",
+];
+
+/// Tag naming a delegated fulfillment authorization.
+///
+/// Deliberately absent from [`FORM_MANAGED_LISTING_TAGS`]: the form only owns
+/// it when this publication actually issues an authorization. An ordinary
+/// metadata edit of a delegated listing issues none and must carry the existing
+/// authorization forward rather than drop it.
+const FULFILLMENT_AUTHORIZATION_TAG: &str = "fulfillment_authorization";
+
 fn is_publish_form_tag(values: &[String]) -> bool {
-    matches!(
-        values.first().map(String::as_str),
-        Some(
-            "d" | "title"
-                | "price"
-                | "t"
-                | "image"
-                | "acquisition"
-                | "server"
-                | "file_hash"
-                | "version"
-                | "fulfillment_pubkey"
-                | "lud16"
-                | "platform"
-        )
-    )
+    values
+        .first()
+        .is_some_and(|name| FORM_MANAGED_LISTING_TAGS.contains(&name.as_str()))
+}
+
+fn is_fulfillment_authorization_tag(values: &[String]) -> bool {
+    values.first().map(String::as_str) == Some(FULFILLMENT_AUTHORIZATION_TAG)
+}
+
+/// Tags carried forward from the authoritative listing into its replacement.
+///
+/// The core builder appends these verbatim, so every tag the form republishes
+/// must already be gone: otherwise the replacement carries both the stale value
+/// and the current one.
+fn preserved_listing_tags(
+    existing_tags: &[Vec<String>],
+    replaces_fulfillment_authorizations: bool,
+) -> Vec<Vec<String>> {
+    existing_tags
+        .iter()
+        .filter(|values| !is_publish_form_tag(values))
+        .filter(|values| {
+            !(replaces_fulfillment_authorizations && is_fulfillment_authorization_tag(values))
+        })
+        .cloned()
+        .collect()
 }
 
 fn unique_operator_url(matches: &[AdpProvisioning]) -> Option<String> {
@@ -1305,11 +1364,10 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         .map_err(|err| err.to_string())?;
     verify_expected_publisher(&request.expected_publisher_npub, developer_pubkey)?;
     let developer_npub = developer_pubkey.to_hex();
-    let preserving_existing_listing = request.existing_event_id.is_some();
     // The identity of the game page is settled once, here, before anything that
     // depends on the coordinate is built. Every later stage reads it from
     // `game`; nothing downstream mints a second one.
-    let (game, preserved_listing_tags) = if let Some(expected_event_id) =
+    let (game, existing_listing_tags) = if let Some(expected_event_id) =
         request.existing_event_id.as_deref()
     {
         let claimed_d_tag = request.existing_d_tag.as_deref().ok_or_else(|| {
@@ -1317,21 +1375,27 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         })?;
         let coordinate = format!("30402:{developer_npub}:{claimed_d_tag}");
         let existing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
-        if existing.id.to_hex() != expected_event_id {
-            return Err(
-                "This Game page changed since it was opened. Reload it before publishing so newer metadata is not overwritten."
-                    .to_string(),
-            );
+        ensure_expected_listing_event(
+            &existing,
+            expected_event_id,
+            "This Game page changed since it was opened. Reload it before publishing so newer metadata is not overwritten.",
+        )?;
+        if existing.pubkey != developer_pubkey {
+            return Err("the Game page being replaced belongs to another publisher".to_string());
         }
         let identifier =
             resolve_existing_game_identifier(Some(claimed_d_tag), listing_event_d_tag(&existing))?;
-        let preserved = existing
+        // Kept whole here: which tags the form replaces is not settled until
+        // fulfillment authorization is resolved, further down.
+        let existing_tags = existing
             .tags
             .iter()
             .map(|tag| tag.clone().to_vec())
-            .filter(|values| !is_publish_form_tag(values))
             .collect::<Vec<_>>();
-        (GameCoordinate::new(developer_pubkey, identifier), preserved)
+        (
+            GameCoordinate::new(developer_pubkey, identifier),
+            existing_tags,
+        )
     } else {
         let identifier = resolve_new_game_identifier(request.existing_d_tag.as_deref())?;
         (
@@ -1574,29 +1638,17 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     if let Some(expected_event_id) = request.existing_event_id.as_deref() {
         let coordinate = game.to_coordinate_string();
         let current = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
-        if current.id.to_hex() != expected_event_id {
-            return Err(
-                "This Game page changed while publishing authorization was prepared. Reload it before publishing so newer metadata is not overwritten."
-                    .to_string(),
-            );
-        }
+        ensure_expected_listing_event(
+            &current,
+            expected_event_id,
+            "This Game page changed while publishing authorization was prepared. Reload it before publishing so newer metadata is not overwritten.",
+        )?;
     }
 
     emit_progress(&app, "publish-listing", "pending", None)?;
     ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey).await?;
-    let listing_input = AdpListingInput {
-        d_tag: game_d_tag.clone(),
-        title: request.title.clone(),
-        description: request.description.clone(),
-        price_sats: request.price_sats,
-        lud16: request.lud16.clone(),
-        tags: request.tags.clone(),
-        images: request.images.clone(),
-        servers: request.servers.clone(),
-        file_hash: file_hash.clone(),
-        version: request.version.clone(),
-        fulfillment_authorizations: if matches!(request.fulfillment_mode, FulfillmentMode::Delegate)
-        {
+    let fulfillment_authorizations =
+        if matches!(request.fulfillment_mode, FulfillmentMode::Delegate) {
             acceptance_event_id
                 .as_ref()
                 .zip(fulfillment_pubkey.as_ref())
@@ -1610,19 +1662,36 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                 .unwrap_or_default()
         } else {
             Vec::new()
-        },
+        };
+    // The authoritative listing supplies identity, concurrency and unmanaged
+    // metadata only. Every field the form owns is republished from the form's
+    // current values, so a retry after a partial publication carries the
+    // publisher's latest intent rather than the half-published state.
+    let preserved_tags = preserved_listing_tags(
+        &existing_listing_tags,
+        !fulfillment_authorizations.is_empty(),
+    );
+    let listing_input = AdpListingInput {
+        d_tag: game_d_tag.clone(),
+        title: request.title.clone(),
+        description: request.description.clone(),
+        price_sats: request.price_sats,
+        lud16: request.lud16.clone(),
+        tags: request.tags.clone(),
+        images: request.images.clone(),
+        servers: request.servers.clone(),
+        file_hash: file_hash.clone(),
+        version: request.version.clone(),
+        fulfillment_authorizations,
         acquisition: request.acquisition.clone(),
         platforms: request.platforms.clone(),
         campaigns: request
             .campaigns
             .iter()
-            .filter(|_| !preserving_existing_listing)
             .map(|pointer| (pointer.root_event_id.clone(), pointer.relay_hint.clone()))
             .collect(),
-        nip94_event_id: (!preserving_existing_listing)
-            .then(|| request.nip94_event_id.clone())
-            .flatten(),
-        preserved_tags: preserved_listing_tags,
+        nip94_event_id: request.nip94_event_id.clone(),
+        preserved_tags,
     };
     let listing_builder =
         build_adp_listing_event_builder(&listing_input).map_err(|err| err.to_string())?;
@@ -2360,12 +2429,378 @@ mod tests {
             "fulfillment_pubkey".into(),
             "key".into()
         ]));
-        assert!(!is_publish_form_tag(&["campaign".into(), "root".into()]));
         assert!(!is_publish_form_tag(&[
             "summary".into(),
             "Short description".into()
         ]));
         assert!(!is_publish_form_tag(&["status".into(), "active".into()]));
+    }
+
+    #[test]
+    fn campaign_pointers_are_owned_by_the_publish_form() {
+        // Campaign pointers are republished from the form on every replacement,
+        // so they must be filtered out of the preserved tags. Dropping them from
+        // the managed set would resurrect stale pointers alongside current ones.
+        assert!(FORM_MANAGED_LISTING_TAGS.contains(&"campaign"));
+        assert!(is_publish_form_tag(&["campaign".into(), "root".into()]));
+    }
+
+    #[test]
+    fn one_managed_tag_definition_covers_every_tag_the_form_republishes() {
+        // Every tag name the core listing builder emits from form input, paired
+        // with the field that drives it. If the builder gains a form-driven tag,
+        // this list and FORM_MANAGED_LISTING_TAGS must gain it too, or the
+        // replacement listing will carry the stale value as well.
+        let builder_emits_from_form = [
+            "d",
+            "title",
+            "price",
+            "t",
+            "image",
+            "acquisition",
+            "server",
+            "file_hash",
+            "version",
+            "lud16",
+            "platform",
+            "campaign",
+            "nip94",
+        ];
+        for tag in builder_emits_from_form {
+            assert!(
+                FORM_MANAGED_LISTING_TAGS.contains(&tag),
+                "`{tag}` is republished from form state and must be managed"
+            );
+        }
+        assert!(
+            !FORM_MANAGED_LISTING_TAGS.contains(&FULFILLMENT_AUTHORIZATION_TAG),
+            "authorizations are owned only by publications that issue one"
+        );
+
+        let source = include_str!("adp_commands.rs");
+        assert_eq!(
+            source
+                .matches(concat!("FORM_MANAGED_", "LISTING_TAGS: &[&str]"))
+                .count(),
+            1,
+            "edits and recovered retries must share one managed-tag definition"
+        );
+    }
+
+    const RETRY_TEST_SHA256: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn listing_event_tags(event: &nostr::Event, name: &str) -> Vec<Vec<String>> {
+        event
+            .tags
+            .iter()
+            .map(|tag| tag.clone().to_vec())
+            .filter(|values| values.first().map(String::as_str) == Some(name))
+            .collect()
+    }
+
+    /// Tags of a listing that was published, as the replacement path reads them
+    /// back off the relay.
+    fn published_listing_tags(campaigns: &[&str]) -> Vec<Vec<String>> {
+        let mut tags = vec![
+            vec!["d".into(), "2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()],
+            vec!["title".into(), "Half-published Game".into()],
+            vec!["price".into(), "5000".into(), "sat".into()],
+            vec!["t".into(), "game".into()],
+            vec!["acquisition".into(), "gated".into()],
+            vec!["platform".into(), "windows-x86_64".into()],
+            vec!["lud16".into(), "stale@example.com".into()],
+            vec!["nip94".into(), "a".repeat(64)],
+            // Not managed by the publish form: must survive untouched.
+            vec!["summary".into(), "Written elsewhere".into()],
+            vec!["status".into(), "active".into()],
+        ];
+        for campaign in campaigns {
+            tags.push(vec!["campaign".into(), (*campaign).to_string()]);
+        }
+        tags
+    }
+
+    fn retry_listing_input(
+        existing_tags: &[Vec<String>],
+        campaigns: Vec<(String, Option<String>)>,
+    ) -> AdpListingInput {
+        AdpListingInput {
+            d_tag: "2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into(),
+            title: "Renamed Game".into(),
+            description: "Current form description".into(),
+            price_sats: 9000,
+            lud16: Some("current@example.com".into()),
+            tags: vec!["roguelike".into()],
+            images: vec!["https://example.com/cover.png".into()],
+            servers: Vec::new(),
+            file_hash: None,
+            version: None,
+            fulfillment_authorizations: Vec::new(),
+            acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Public,
+            platforms: vec!["linux-x86_64".into()],
+            campaigns,
+            nip94_event_id: None,
+            preserved_tags: preserved_listing_tags(existing_tags, false),
+        }
+    }
+
+    fn retry_listing_event(input: &AdpListingInput) -> nostr::Event {
+        build_adp_listing_event_builder(input)
+            .expect("the replacement listing should build")
+            .sign_with_keys(&Keys::generate())
+            .expect("the replacement listing should sign")
+    }
+
+    #[test]
+    fn a_campaign_pointer_added_after_partial_failure_is_published() {
+        let existing = published_listing_tags(&[]);
+        let added = "b".repeat(64);
+
+        let event = retry_listing_event(&retry_listing_input(
+            &existing,
+            vec![(added.clone(), Some("wss://relay.example.com".into()))],
+        ));
+
+        assert_eq!(
+            listing_event_tags(&event, "campaign"),
+            vec![vec![
+                "campaign".to_string(),
+                added,
+                "wss://relay.example.com".to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_campaign_pointer_removed_after_partial_failure_is_dropped() {
+        let existing = published_listing_tags(&["b".repeat(64).as_str()]);
+
+        let event = retry_listing_event(&retry_listing_input(&existing, Vec::new()));
+
+        assert!(
+            listing_event_tags(&event, "campaign").is_empty(),
+            "a pointer removed in the form must not return through preserved tags"
+        );
+    }
+
+    #[test]
+    fn replacing_campaign_pointers_retains_no_stale_pointer() {
+        let stale = "b".repeat(64);
+        let replacement = "c".repeat(64);
+        let existing = published_listing_tags(&[stale.as_str()]);
+
+        let event = retry_listing_event(&retry_listing_input(
+            &existing,
+            vec![(replacement.clone(), None)],
+        ));
+
+        assert_eq!(
+            listing_event_tags(&event, "campaign"),
+            vec![vec!["campaign".to_string(), replacement]]
+        );
+    }
+
+    #[test]
+    fn retrying_without_campaign_changes_keeps_the_intended_pointers() {
+        let pointer = "b".repeat(64);
+        let existing = published_listing_tags(&[pointer.as_str()]);
+
+        let event = retry_listing_event(&retry_listing_input(
+            &existing,
+            vec![(pointer.clone(), None)],
+        ));
+
+        assert_eq!(
+            listing_event_tags(&event, "campaign"),
+            vec![vec!["campaign".to_string(), pointer]],
+            "an unchanged pointer must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn unknown_unmanaged_tags_survive_a_retry() {
+        let existing = published_listing_tags(&[]);
+
+        let event = retry_listing_event(&retry_listing_input(&existing, Vec::new()));
+
+        assert_eq!(
+            listing_event_tags(&event, "summary"),
+            vec![vec!["summary".to_string(), "Written elsewhere".to_string()]]
+        );
+        assert_eq!(
+            listing_event_tags(&event, "status"),
+            vec![vec!["status".to_string(), "active".to_string()]]
+        );
+    }
+
+    #[test]
+    fn form_managed_tags_are_never_duplicated_through_preserved_tags() {
+        let existing = published_listing_tags(&["b".repeat(64).as_str()]);
+
+        let event = retry_listing_event(&retry_listing_input(
+            &existing,
+            vec![("c".repeat(64), None)],
+        ));
+
+        for tag in FORM_MANAGED_LISTING_TAGS {
+            let occurrences = listing_event_tags(&event, tag);
+            match *tag {
+                // `t` legitimately repeats: the mandatory game topic plus the
+                // form's own topics.
+                "t" => assert!(occurrences.len() <= 2),
+                _ => assert!(
+                    occurrences.len() <= 1,
+                    "`{tag}` appeared {} times in the replacement listing",
+                    occurrences.len()
+                ),
+            }
+        }
+        assert!(listing_event_tags(&event, "nip94").is_empty());
+    }
+
+    #[test]
+    fn current_form_pricing_overrides_the_partially_published_listing() {
+        let existing = published_listing_tags(&[]);
+        let mut input = retry_listing_input(&existing, Vec::new());
+        input.acquisition = arcadestr_core::marketplace::AcquisitionPolicy::Gated;
+
+        let event = retry_listing_event(&input);
+
+        assert_eq!(
+            listing_event_tags(&event, "price"),
+            vec![vec![
+                "price".to_string(),
+                "9000".to_string(),
+                "sat".to_string()
+            ]]
+        );
+        assert_eq!(
+            listing_event_tags(&event, "lud16"),
+            vec![vec!["lud16".to_string(), "current@example.com".to_string()]]
+        );
+        assert_eq!(
+            listing_event_tags(&event, "title"),
+            vec![vec!["title".to_string(), "Renamed Game".to_string()]]
+        );
+    }
+
+    #[test]
+    fn current_form_acquisition_policy_overrides_the_partially_published_listing() {
+        let existing = published_listing_tags(&[]);
+
+        let event = retry_listing_event(&retry_listing_input(&existing, Vec::new()));
+
+        assert_eq!(
+            listing_event_tags(&event, "acquisition"),
+            vec![vec!["acquisition".to_string(), "public".to_string()]]
+        );
+    }
+
+    #[test]
+    fn current_form_platform_and_fulfillment_fields_override_preserved_counterparts() {
+        let existing = published_listing_tags(&[]);
+        let mut input = retry_listing_input(&existing, Vec::new());
+        input.servers = vec!["https://dist.example.com".into()];
+        input.file_hash = Some(RETRY_TEST_SHA256.into());
+        input.version = Some("1.2.3".into());
+
+        let event = retry_listing_event(&input);
+
+        assert_eq!(
+            listing_event_tags(&event, "platform"),
+            vec![vec!["platform".to_string(), "linux-x86_64".to_string()]],
+            "the stale windows platform must not survive"
+        );
+        assert_eq!(
+            listing_event_tags(&event, "server"),
+            vec![vec![
+                "server".to_string(),
+                "https://dist.example.com".to_string()
+            ]]
+        );
+        assert_eq!(
+            listing_event_tags(&event, "file_hash"),
+            vec![vec!["file_hash".to_string(), RETRY_TEST_SHA256.to_string()]]
+        );
+        assert_eq!(
+            listing_event_tags(&event, "version"),
+            vec![vec!["version".to_string(), "1.2.3".to_string()]]
+        );
+    }
+
+    #[test]
+    fn an_existing_authorization_survives_an_edit_that_issues_none() {
+        let mut existing = published_listing_tags(&[]);
+        existing.push(vec![
+            FULFILLMENT_AUTHORIZATION_TAG.to_string(),
+            "root-event".into(),
+            "delegate-key".into(),
+        ]);
+
+        let preserved = preserved_listing_tags(&existing, false);
+        assert!(preserved
+            .iter()
+            .any(|values| is_fulfillment_authorization_tag(values)));
+
+        // A publication that issues its own authorization replaces it instead.
+        let replaced = preserved_listing_tags(&existing, true);
+        assert!(!replaced
+            .iter()
+            .any(|values| is_fulfillment_authorization_tag(values)));
+    }
+
+    #[test]
+    fn a_retry_republishes_the_same_generated_identity() {
+        let existing = published_listing_tags(&[]);
+        let published_d_tag = "2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b";
+
+        let identifier =
+            resolve_existing_game_identifier(Some(published_d_tag), Some(published_d_tag))
+                .expect("the recovered identity should be accepted");
+        let event = retry_listing_event(&retry_listing_input(&existing, Vec::new()));
+
+        assert_eq!(identifier.d_tag(), published_d_tag);
+        assert_eq!(identifier.generated_game_id(), None);
+        assert_eq!(
+            listing_event_tags(&event, "d"),
+            vec![vec!["d".to_string(), published_d_tag.to_string()]]
+        );
+    }
+
+    #[test]
+    fn a_newer_authoritative_listing_still_conflicts_on_retry() {
+        let keys = Keys::generate();
+        let published = signed_listing_event(&keys, "first attempt", 1_000);
+        let newer_remote = signed_listing_event(&keys, "someone else replaced it", 2_000);
+
+        assert_eq!(
+            ensure_expected_listing_event(&published, &published.id.to_hex(), "conflict"),
+            Ok(())
+        );
+        assert_eq!(
+            ensure_expected_listing_event(&newer_remote, &published.id.to_hex(), "conflict"),
+            Err("conflict".to_string()),
+            "a newer remote replacement must not be silently overwritten"
+        );
+    }
+
+    #[test]
+    fn a_legacy_identifier_still_edits_normally() {
+        let mut existing = published_listing_tags(&[]);
+        existing[0] = vec!["d".into(), "my-game-v1".into()];
+
+        let identifier = resolve_existing_game_identifier(Some("my-game-v1"), Some("my-game-v1"))
+            .expect("legacy identifiers remain editable");
+        let mut input = retry_listing_input(&existing, Vec::new());
+        input.d_tag = identifier.d_tag();
+
+        let event = retry_listing_event(&input);
+
+        assert_eq!(
+            listing_event_tags(&event, "d"),
+            vec![vec!["d".to_string(), "my-game-v1".to_string()]]
+        );
     }
 
     #[test]
