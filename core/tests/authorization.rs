@@ -253,3 +253,62 @@ fn revoked_attestation_blocks_new_use_without_invalidating_historical_authorizat
         140,
     ));
 }
+
+fn attestation(
+    valid_from: u64,
+    revoked_at: Option<u64>,
+) -> arcadestr_core::authorization::ParsedAttestation {
+    let developer = Keys::generate();
+    let operator = Keys::generate();
+    let fulfillment = Keys::generate();
+    let d = format!(
+        "{}:{}",
+        developer.public_key().to_hex(),
+        fulfillment.public_key().to_hex()
+    );
+    let revoked_at = revoked_at.map(|at| at.to_string()).unwrap_or_default();
+    let event = EventBuilder::new(Kind::Custom(30404), "")
+        .tags([
+            tag(&["d", &d]),
+            tag(&["p", &developer.public_key().to_hex()]),
+            tag(&[
+                "fulfillment_pubkey",
+                &fulfillment.public_key().to_hex(),
+                &valid_from.to_string(),
+                &revoked_at,
+            ]),
+            tag(&["scope", "game"]),
+        ])
+        .custom_created_at(Timestamp::from_secs(valid_from))
+        .sign_with_keys(&operator)
+        .expect("attestation");
+    parse_attestation_event(&event).expect("attestation parses")
+}
+
+#[test]
+fn a_just_minted_attestation_is_usable_by_a_reader_whose_clock_trails_the_operator() {
+    // The operator stamps `valid_from` from its own clock while provisioning;
+    // the developer reads the attestation moments later, off a clock that may
+    // sit a little behind.
+    let attestation = attestation(1_000, None);
+
+    assert!(!attestation.allows_new_operations_at(999));
+    assert!(attestation.allows_new_operations_observed_at(999));
+    assert!(attestation.allows_new_operations_observed_at(1_000));
+}
+
+#[test]
+fn an_attestation_far_in_the_readers_future_stays_unusable() {
+    let attestation = attestation(10_000, None);
+
+    assert!(!attestation.allows_new_operations_observed_at(1_000));
+}
+
+#[test]
+fn clock_tolerance_never_revives_a_revoked_attestation() {
+    let attestation = attestation(100, Some(150));
+
+    assert!(!attestation.allows_new_operations_observed_at(150));
+    assert!(!attestation.allows_new_operations_observed_at(200));
+    assert!(attestation.allows_new_operations_observed_at(149));
+}

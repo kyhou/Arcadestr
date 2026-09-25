@@ -70,9 +70,26 @@ pub struct ParsedAttestation {
     pub scope: Option<String>,
 }
 
+/// How far an operator's clock may lead the clock of the party reading its
+/// attestation before the attestation is treated as not yet in force.
+pub const ATTESTATION_OBSERVER_SKEW_SECS: u64 = 300;
+
 impl ParsedAttestation {
     pub fn allows_new_operations_at(&self, at: u64) -> bool {
         self.valid_from <= at && self.revoked_at.is_none_or(|revoked| at < revoked)
+    }
+
+    /// Decides new-operation eligibility from a clock that is not the
+    /// operator's own.
+    ///
+    /// An attestation is normally read moments after the operator minted it,
+    /// so its `valid_from` can sit marginally in the reader's future without
+    /// the operator having promised anything about the future. Only that edge
+    /// is widened: a revoked key stays unusable the moment the reader's clock
+    /// passes the revocation.
+    pub fn allows_new_operations_observed_at(&self, at: u64) -> bool {
+        self.valid_from <= at.saturating_add(ATTESTATION_OBSERVER_SKEW_SECS)
+            && self.revoked_at.is_none_or(|revoked| at < revoked)
     }
 }
 
