@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "desktop", "web", "core"]
+members = ["app", "desktop", "web", "core", "xtask"]
 resolver = "2"
 
 [workspace.package]

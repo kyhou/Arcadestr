@@ -27,6 +27,7 @@
 
 # Web build output (Trunk)
 /web/dist/
+/web/.arcadestr-frontend-build.txt
 
 # SQLite database files (test artifacts)
 *.db

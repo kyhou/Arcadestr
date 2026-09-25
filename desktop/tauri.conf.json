@@ -4,8 +4,16 @@
   "version": "0.1.0",
   "identifier": "com.arcadestr.app",
   "build": {
-    "beforeDevCommand": "cd web && trunk build",
-    "beforeBuildCommand": "cd web && trunk build --release",
+    "beforeDevCommand": {
+      "script": "trunk serve",
+      "cwd": "../web",
+      "wait": false
+    },
+    "beforeBuildCommand": {
+      "script": "cargo run -p arcadestr-xtask -- frontend-build --release",
+      "cwd": ".."
+    },
+    "devUrl": "http://localhost:5173",
     "frontendDist": "../web/dist"
   },
   "app": {
