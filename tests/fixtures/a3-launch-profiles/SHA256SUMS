@@ -1,0 +1,11 @@
+5811d5cb59002b1f9b3a79c649fd8fdae66edd907e07236d749bd7d2dba7a837  ./absolute-path.zip
+6d05a0d0f306dff80d3702b9cf102917fd688862fd81a87f090667b1d6b69495  ./backslash-name.zip
+ecf42aae21c076b99b2a79982beced23801b046b0ce2f3f709f8c11d85b2d57d  ./case-collision.zip
+e29490d8e62ca673b3bee3d146c116df944772b3d5d5cf6ec23a02921d0e514c  ./escaping-symlink.zip
+b67d37aef86b68a0efae9c90709ca028e09c4b1572aa27caa60714c949db0b2e  ./large-index-5000.zip
+7c6f2269a435986f73ad10e70183b2c5a35969c67faf1d6a7a58ae5ab8677fe6  ./ratio-bomb.zip
+bcb18d6b6a374c76047bce74eee9b2644abe875ca30193aa8ee6c93c10ce1666  ./reserved-device.zip
+122863aa50c277469064359c273c3cd258aae9fd7997829bfabdc254d10ba170  ./traversal.zip
+9dc44ccc5ac5ef5dbbf62f93245b7efa733daabe2a3208ff7ed76a2d48d4e816  ./windows-nested.zip
+8745d52ab58ae64243b43d178120aa33cec567ebef5c4c5b949c306fa70bd4df  ./hardlink.tar.zst
+a85adace01edc63b405b1dce99601c97fa9542ff3af57c28a75f6610a02c9a61  ./linux-layout.tar.zst

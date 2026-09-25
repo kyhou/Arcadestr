@@ -15,17 +15,26 @@ use arcadestr_core::adp_discovery::{
 };
 use arcadestr_core::adp_publish::{
     build_adp_listing_event_builder, build_fulfillment_authorization_event_builder,
-    AdpListingInput, FulfillmentAuthorizationInput,
+    decode_authoritative_launch_tier, validate_adp_listing_unsigned_event, AdpListingInput,
+    AdpListingPublishInput, FulfillmentAuthorizationInput,
+};
+use arcadestr_core::adp_publish_contract::{
+    AdpPublishValidationViolation, AuthoritativeAdpEditMetadata, AuthoritativeAdpEditTag,
+    LoadAuthoritativeAdpEditMetadataRequest, PublishAdpListingError,
+    PublishAdpListingRequestExtension,
 };
 use arcadestr_core::adp_storage::{
     AdpProvisioning, AdpProvisioningRepository, DownloadToken, DownloadTokensRepository,
 };
+use arcadestr_core::archive_inspection_contract::BuildSelectionRef;
 use arcadestr_core::auth::AuthState;
 use arcadestr_core::authorization::{
     AuthorizationTerms, CAPABILITY_ISSUE_GRANT, CAPABILITY_ISSUE_RECEIPT, CAPABILITY_UPLOAD_BUILD,
 };
+use arcadestr_core::distribution::{LaunchProfile, ProfileId, Sha256Digest};
 use arcadestr_core::file_hash::{sha256_file, sha256_file_with_progress};
 use arcadestr_core::http_client::HttpClient;
+use arcadestr_core::is_replaceable_event_newer;
 use arcadestr_core::lnurlp::{request_invoice, resolve_lud16};
 use arcadestr_core::marketplace::confirm_nip99_listing_propagated;
 use arcadestr_core::nip46::AppSignerState;
@@ -33,13 +42,14 @@ use arcadestr_core::nwc_client::{
     load_default_nwc_connection, save_default_nwc_connection, NwcClient,
 };
 use arcadestr_core::signers::{ActiveSigner, NostrSigner, SignerError};
-use arcadestr_core::{is_replaceable_event_newer, is_sha256_hex};
 use nostr::nips::nip19::FromBech32;
+use nostr::nips::nip19::ToBech32;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
+use crate::archive_selection::{ArchiveSelectionService, LeaseUploadError, PublicationLease};
 use crate::AppState;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +68,13 @@ pub struct PublishAdpListingRequest {
     /// even then it is validated against the fetched authoritative listing. New
     /// listings must leave this empty: the backend mints the identifier.
     pub existing_d_tag: Option<String>,
+    /// Identifier minted for this publication by an earlier attempt that failed
+    /// before the listing existed. Carrying it back makes the retry resume that
+    /// publication — reusing its provisioning scope instead of stranding a
+    /// fulfillment key on the operator for a coordinate no listing will use.
+    /// Ignored once `existing_event_id` names a published listing.
+    #[serde(default)]
+    pub pending_d_tag: Option<String>,
     pub title: String,
     pub description: String,
     pub price_sats: u64,
@@ -67,7 +84,12 @@ pub struct PublishAdpListingRequest {
     pub fulfillment_mode: FulfillmentMode,
     pub operator_url: Option<String>,
     pub servers: Vec<String>,
+    /// Legacy transport field retained for request compatibility. Publication
+    /// rejects it: only a backend-issued `selected_build` may supply bytes.
     pub file_path: Option<String>,
+    /// Opaque backend-selected build. Every new artifact must use it.
+    #[serde(default)]
+    pub selected_build: Option<BuildSelectionRef>,
     pub existing_file_hash: Option<String>,
     pub existing_fulfillment_pubkey: Option<String>,
     pub version: Option<String>,
@@ -192,13 +214,213 @@ impl GameCoordinate {
 
 /// Identity for a first publication. A caller-supplied identifier is rejected
 /// rather than honoured: publishers do not choose game coordinates.
-fn resolve_new_game_identifier(requested_d_tag: Option<&str>) -> Result<GameIdentifier, String> {
+///
+/// `pending_d_tag` is not such an identifier. It is the identity this same
+/// publication minted on an earlier attempt that failed before the listing
+/// existed, handed back so the retry resumes that publication instead of
+/// starting a second one.
+fn resolve_new_game_identifier(
+    requested_d_tag: Option<&str>,
+    pending_d_tag: Option<&str>,
+) -> Result<GameIdentifier, String> {
     if requested_d_tag.is_some() {
         return Err(
             "a new Game page cannot be published with a caller-supplied identifier".to_string(),
         );
     }
-    Ok(GameIdentifier::generate())
+    match pending_d_tag.filter(|value| !value.is_empty()) {
+        Some(pending) => resume_pending_game_identifier(pending),
+        None => Ok(GameIdentifier::generate()),
+    }
+}
+
+/// Identity for a retry of a publication that never reached its listing.
+///
+/// Only a canonically rendered UUID v4 is accepted, which is precisely what
+/// this command mints. That keeps the identifier out of the publisher's hands
+/// just as firmly as minting does: a resumed publication cannot smuggle in a
+/// chosen coordinate under the name of a pending one.
+fn resume_pending_game_identifier(pending_d_tag: &str) -> Result<GameIdentifier, String> {
+    let game_id = Uuid::try_parse(pending_d_tag)
+        .ok()
+        .filter(|game_id| {
+            game_id.get_version() == Some(uuid::Version::Random)
+                && game_id.get_variant() == uuid::Variant::RFC4122
+                && game_id.to_string() == pending_d_tag
+        })
+        .ok_or_else(|| {
+            "the identifier carried over from the previous attempt is not one this app minted"
+                .to_string()
+        })?;
+    Ok(GameIdentifier::Generated(game_id))
+}
+
+/// Refusal shown when a resumed identity turns out to name a live Game page.
+///
+/// Distinct from the shape refusal in [`resume_pending_game_identifier`]: that
+/// one means the carried-over token is not a resume token at all, this one
+/// means it is, but the coordinate it names is no longer free.
+const RESUMED_COORDINATE_IS_LIVE: &str =
+    "the identifier carried over from the previous attempt already belongs to a published Game page; \
+     open it from Published games and edit it instead of publishing over it";
+
+/// What the relays report about the coordinate a retry wants to resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordinateOccupancy {
+    /// Every relay that was asked answered, and none holds a listing here.
+    ConfirmedAbsent,
+    /// A listing is live at this coordinate.
+    Occupied,
+    /// Relay coverage was incomplete, so absence cannot be concluded.
+    Indeterminate,
+}
+
+/// The identity a retry may resume, given what the relays report.
+///
+/// Shape alone does not make a pending identifier safe to resume. A kind:30402
+/// coordinate is parameterized replaceable and namespaced by publisher, so a
+/// UUID that names one of this publisher's live Game pages would resume *onto*
+/// it — republishing that page's coordinate with this form's content, and
+/// resolving to that game's fulfillment key, which looks healthy while the
+/// published listing is overwritten.
+///
+/// Only confirmed absence permits a resume. Minting a fresh identity is always
+/// safe, so incomplete relay coverage falls back to it rather than guessing.
+fn pending_d_tag_to_resume(
+    pending_d_tag: &str,
+    occupancy: CoordinateOccupancy,
+) -> Result<Option<String>, String> {
+    match occupancy {
+        CoordinateOccupancy::ConfirmedAbsent => Ok(Some(pending_d_tag.to_string())),
+        CoordinateOccupancy::Occupied => Err(RESUMED_COORDINATE_IS_LIVE.to_string()),
+        CoordinateOccupancy::Indeterminate => Ok(None),
+    }
+}
+
+/// One relay query for a coordinate, together with how completely it was
+/// answered.
+struct CoordinateQuery {
+    events: Vec<nostr::Event>,
+    /// Relays that were connected when the query began but never answered it.
+    silent_relays: usize,
+}
+
+/// Reads occupancy out of a coordinate query.
+///
+/// A single relay holding the listing settles the question, so occupancy is
+/// decided before coverage: one relay that answers "present" outranks any
+/// number that stayed silent.
+fn coordinate_occupancy(
+    developer_pubkey: nostr::PublicKey,
+    d_tag: &str,
+    query: Result<CoordinateQuery, String>,
+) -> CoordinateOccupancy {
+    let Ok(query) = query else {
+        return CoordinateOccupancy::Indeterminate;
+    };
+    let occupied = query.events.iter().any(|event| {
+        event.kind == nostr::Kind::Custom(30402)
+            && event.pubkey == developer_pubkey
+            && listing_event_d_tag(event) == Some(d_tag)
+    });
+    if occupied {
+        return CoordinateOccupancy::Occupied;
+    }
+    if query.silent_relays > 0 {
+        return CoordinateOccupancy::Indeterminate;
+    }
+    CoordinateOccupancy::ConfirmedAbsent
+}
+
+/// Asks the relays whether a pending coordinate is still free, tracking which
+/// relays actually answered.
+///
+/// Absence is only a fact about relays that replied, so the ones that stayed
+/// silent are counted and handed on: [`coordinate_occupancy`] turns an
+/// incompletely answered query into [`CoordinateOccupancy::Indeterminate`]
+/// rather than into a claim of absence.
+async fn query_coordinate(
+    state: &State<'_, AppState>,
+    developer_pubkey: nostr::PublicKey,
+    d_tag: &str,
+) -> Result<CoordinateQuery, String> {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+    let manager = relay_manager.lock().await;
+    let asked = manager
+        .get_connected_relays()
+        .await
+        .into_iter()
+        .filter(|relay| relay.connected)
+        .map(|relay| relay.url)
+        .collect::<HashSet<_>>();
+    if asked.is_empty() {
+        return Err("no relay was connected to answer for the coordinate".to_string());
+    }
+
+    let collected = Arc::new(Mutex::new(Vec::new()));
+    let answered = Arc::new(Mutex::new(HashSet::new()));
+    let events_sink = Arc::clone(&collected);
+    let answered_sink = Arc::clone(&answered);
+    manager
+        .fetch_events_streaming(
+            nostr::Filter::new()
+                .kind(nostr::Kind::Custom(30402))
+                .author(developer_pubkey)
+                .identifier(d_tag),
+            10,
+            3,
+            move |relay_url, events| {
+                answered_sink
+                    .lock()
+                    .expect("coordinate query relay set poisoned")
+                    .insert(relay_url);
+                events_sink
+                    .lock()
+                    .expect("coordinate query event sink poisoned")
+                    .extend(events);
+            },
+        )
+        .await
+        .map_err(|error| format!("coordinate query failed: {error}"))?;
+
+    let answered = answered
+        .lock()
+        .expect("coordinate query relay set poisoned")
+        .clone();
+    let events = collected
+        .lock()
+        .expect("coordinate query event sink poisoned")
+        .clone();
+    Ok(CoordinateQuery {
+        events,
+        silent_relays: asked.difference(&answered).count(),
+    })
+}
+
+/// Gate in front of the resume path: shape first, then the coordinate itself.
+///
+/// Returns the identifier to resume, or `None` when this publication should
+/// mint a fresh one instead.
+async fn resumable_pending_d_tag(
+    state: &State<'_, AppState>,
+    developer_pubkey: nostr::PublicKey,
+    pending_d_tag: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(pending) = pending_d_tag.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    // A token this app never minted is refused outright, and is not worth a
+    // relay round trip.
+    resume_pending_game_identifier(pending)?;
+    let occupancy = coordinate_occupancy(
+        developer_pubkey,
+        pending,
+        query_coordinate(state, developer_pubkey, pending).await,
+    );
+    pending_d_tag_to_resume(pending, occupancy)
 }
 
 /// Identity for a replacement edit. The authoritative value comes from the
@@ -244,6 +466,116 @@ fn listing_event_d_tag(event: &nostr::Event) -> Option<&str> {
         .find(|values| values.first().map(String::as_str) == Some("d"))
         .and_then(|values| values.get(1))
         .map(String::as_str)
+}
+
+fn decode_verified_authoritative_edit_metadata(
+    request: &LoadAuthoritativeAdpEditMetadataRequest,
+    expected_publisher: nostr::PublicKey,
+    event: &nostr::Event,
+) -> Result<AuthoritativeAdpEditMetadata, PublishAdpListingError> {
+    let event_id = event.id.to_hex();
+    if !event.verify_id() {
+        return Err(PublishAdpListingError::AuthoritativeEventIdInvalid { event_id });
+    }
+    if !event.verify_signature() {
+        return Err(PublishAdpListingError::AuthoritativeSignatureInvalid { event_id });
+    }
+    if event.pubkey != expected_publisher {
+        return Err(PublishAdpListingError::AuthoritativePublisherMismatch {
+            expected_publisher_npub: request.expected_publisher_npub.clone(),
+            actual_publisher_hex: event.pubkey.to_hex(),
+        });
+    }
+    if event.kind.as_u16() != 30402 {
+        return Err(PublishAdpListingError::AuthoritativeKindMismatch {
+            expected: 30402,
+            actual: event.kind.as_u16(),
+        });
+    }
+
+    let actual_d_tags = event
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice())
+        .filter(|values| values.first().map(String::as_str) == Some("d"))
+        .filter_map(|values| values.get(1).cloned())
+        .collect::<Vec<_>>();
+    if actual_d_tags.len() != 1
+        || actual_d_tags.first().map(String::as_str) != Some(request.d_tag.as_str())
+    {
+        return Err(PublishAdpListingError::AuthoritativeCoordinateMismatch {
+            expected_d_tag: request.d_tag.clone(),
+            actual_d_tags,
+        });
+    }
+    if event_id != request.expected_event_id {
+        return Err(PublishAdpListingError::StaleExpectedEventId {
+            expected_event_id: request.expected_event_id.clone(),
+            actual_event_id: event_id,
+        });
+    }
+
+    Ok(decode_authoritative_launch_tier(event).into())
+}
+
+/// Computes removals from the parser's valid IDs in signed-event order.
+fn removed_authoritative_profile_ids(
+    metadata: &AuthoritativeAdpEditMetadata,
+    incoming_profiles: &[LaunchProfile],
+) -> Vec<ProfileId> {
+    let AuthoritativeAdpEditMetadata::Present(metadata) = metadata else {
+        return Vec::new();
+    };
+
+    metadata
+        .tags
+        .iter()
+        .filter_map(|tag| match tag {
+            AuthoritativeAdpEditTag::Launch {
+                valid_profile_id, ..
+            } => valid_profile_id.as_ref(),
+            AuthoritativeAdpEditTag::Package { .. }
+            | AuthoritativeAdpEditTag::Platform { .. }
+            | AuthoritativeAdpEditTag::LaunchDefault { .. } => None,
+        })
+        .filter(|profile_id| {
+            !incoming_profiles
+                .iter()
+                .any(|profile| &profile.id == *profile_id)
+        })
+        .fold(Vec::new(), |mut removed, profile_id| {
+            if !removed.iter().any(|existing| existing == profile_id) {
+                removed.push(profile_id.clone());
+            }
+            removed
+        })
+}
+
+fn enforce_authoritative_profile_removals(
+    metadata: &AuthoritativeAdpEditMetadata,
+    extension: &PublishAdpListingRequestExtension,
+) -> Result<(), PublishAdpListingError> {
+    let incoming_profiles = extension
+        .launch_tier
+        .as_ref()
+        .map(|tier| tier.launch_profiles.as_slice())
+        .unwrap_or_default();
+    let removed_profile_ids = removed_authoritative_profile_ids(metadata, incoming_profiles);
+    let all_acknowledged = removed_profile_ids.iter().all(|removed| {
+        extension
+            .acknowledged_removed_profile_ids
+            .iter()
+            .any(|acknowledged| acknowledged == removed)
+    });
+
+    if !all_acknowledged {
+        return Err(
+            PublishAdpListingError::ProfileRemovalAcknowledgementRequired {
+                removed_profile_ids,
+            },
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +646,20 @@ impl NostrSigner for SdkSignerAdapter {
     }
 }
 
+/// Validates the exact final listing event and transfers it unchanged to the signer.
+async fn validate_and_sign_adp_listing(
+    signer: &dyn NostrSigner,
+    unsigned: nostr::UnsignedEvent,
+) -> Result<nostr::Event, PublishAdpListingError> {
+    validate_adp_listing_unsigned_event(&unsigned).map_err(PublishAdpListingError::from)?;
+    signer
+        .sign_event(unsigned)
+        .await
+        .map_err(|error| PublishAdpListingError::Signer {
+            message: error.to_string(),
+        })
+}
+
 pub(crate) async fn resolve_active_signer(
     signer_state: &Arc<tokio::sync::Mutex<AppSignerState>>,
     auth: &AuthState,
@@ -343,7 +689,7 @@ pub(crate) async fn ensure_publish_account_current(
         .await?
         .get_public_key()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "active publication account could not be verified".to_string())?;
     if current != expected {
         return Err("active account changed while publication was being prepared".into());
     }
@@ -752,14 +1098,14 @@ pub async fn publish_campaign(
                         .map_err(|error| error.to_string())?,
                 );
             }
-            let listing_update = signer
-                .sign_event(
-                    nostr::EventBuilder::new(nostr::Kind::Custom(30402), listing.content.clone())
-                        .tags(tags)
-                        .build(publisher),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+            let listing_update = validate_and_sign_adp_listing(
+                signer.as_ref(),
+                nostr::EventBuilder::new(nostr::Kind::Custom(30402), listing.content.clone())
+                    .tags(tags)
+                    .build(publisher),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             publish_event(&state, &listing_update).await?;
             Ok(listing_update.id.to_hex())
         }
@@ -817,14 +1163,14 @@ pub async fn update_campaign_pointer(
                 .map_err(|error| error.to_string())?,
         );
     }
-    let updated = signer
-        .sign_event(
-            nostr::EventBuilder::new(nostr::Kind::Custom(30402), listing.content)
-                .tags(tags)
-                .build(publisher),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    let updated = validate_and_sign_adp_listing(
+        signer.as_ref(),
+        nostr::EventBuilder::new(nostr::Kind::Custom(30402), listing.content)
+            .tags(tags)
+            .build(publisher),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     publish_event(&state, &updated).await?;
     Ok(updated.id.to_hex())
 }
@@ -1108,6 +1454,15 @@ pub(crate) async fn fetch_listing_event_by_coordinate(
     state: &State<'_, AppState>,
     coordinate: &str,
 ) -> Result<nostr::Event, String> {
+    fetch_replaceable_listing_event_by_coordinate(state, coordinate)
+        .await?
+        .ok_or_else(|| "listing event not found on relays".to_string())
+}
+
+async fn fetch_replaceable_listing_event_by_coordinate(
+    state: &State<'_, AppState>,
+    coordinate: &str,
+) -> Result<Option<nostr::Event>, String> {
     let mut parts = coordinate.splitn(3, ':');
     let kind = parts
         .next()
@@ -1143,7 +1498,18 @@ pub(crate) async fn fetch_listing_event_by_coordinate(
     .await
     .map_err(|_| "listing event fetch timed out".to_string())?
     .map_err(|err| err.to_string())?;
-    select_replaceable_event(events).ok_or_else(|| "listing event not found on relays".to_string())
+    Ok(select_replaceable_event(events))
+}
+
+fn map_authoritative_refetch(
+    result: Result<Option<nostr::Event>, String>,
+    coordinate: &str,
+) -> Result<nostr::Event, PublishAdpListingError> {
+    result
+        .map_err(|message| PublishAdpListingError::AuthoritativeRelayRefetchFailure { message })?
+        .ok_or_else(|| PublishAdpListingError::AuthoritativeListingNotFound {
+            coordinate: coordinate.to_owned(),
+        })
 }
 
 fn select_replaceable_event(
@@ -1163,16 +1529,6 @@ fn select_replaceable_event(
             current
         }
     })
-}
-
-fn reusable_file_hash(existing_file_hash: Option<&str>) -> Result<String, String> {
-    let hash = existing_file_hash.ok_or_else(|| {
-        "build file or existing file hash is required for fulfillment".to_string()
-    })?;
-    if !is_sha256_hex(hash) {
-        return Err("existing file hash is invalid; select a replacement build file".to_string());
-    }
-    Ok(hash.to_string())
 }
 
 async fn persist_purchase_confirmation(
@@ -1285,6 +1641,9 @@ const FORM_MANAGED_LISTING_TAGS: &[&str] = &[
     "version",
     "fulfillment_pubkey",
     "lud16",
+    "package",
+    "launch",
+    "launch_default",
     "platform",
     "campaign",
     "nip94",
@@ -1334,6 +1693,28 @@ fn unique_operator_url(matches: &[AdpProvisioning]) -> Option<String> {
     }
 }
 
+/// Refetches and decodes the signed listing revision named by edit intent.
+///
+/// The application cache is never consulted. Phase A still has a concurrent-
+/// publisher window between this refetch and later signing; a future revision
+/// check/CAS can close it without changing this intent-only request contract.
+#[tauri::command]
+pub async fn load_authoritative_adp_edit_metadata(
+    request: LoadAuthoritativeAdpEditMetadataRequest,
+    state: State<'_, AppState>,
+) -> Result<AuthoritativeAdpEditMetadata, PublishAdpListingError> {
+    let expected_publisher = nostr::PublicKey::from_bech32(&request.expected_publisher_npub)
+        .map_err(|error| PublishAdpListingError::Authority {
+            message: format!("invalid expected publisher npub: {error}"),
+        })?;
+    let coordinate = format!("30402:{}:{}", expected_publisher.to_hex(), request.d_tag);
+    let event = map_authoritative_refetch(
+        fetch_replaceable_listing_event_by_coordinate(&state, &coordinate).await,
+        &coordinate,
+    )?;
+    decode_verified_authoritative_edit_metadata(&request, expected_publisher, &event)
+}
+
 #[tauri::command]
 pub async fn resolve_adp_operator(
     request: ResolveAdpOperatorRequest,
@@ -1355,13 +1736,297 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
-) -> Result<PublishAdpListingResult, String> {
+    archive_service: State<'_, ArchiveSelectionService>,
+) -> Result<PublishAdpListingResult, PublishAdpListingError> {
+    publish_adp_listing_pipeline(
+        request,
+        PublishAdpListingRequestExtension::default(),
+        app,
+        state,
+        signer_state,
+        archive_service,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn publish_adp_listing_with_contract<R: tauri::Runtime>(
+    request: PublishAdpListingRequest,
+    extension: PublishAdpListingRequestExtension,
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+    archive_service: State<'_, ArchiveSelectionService>,
+) -> Result<PublishAdpListingResult, PublishAdpListingError> {
+    publish_adp_listing_pipeline(
+        request,
+        extension,
+        app,
+        state,
+        signer_state,
+        archive_service,
+    )
+    .await
+}
+
+async fn publish_adp_listing_pipeline<R: tauri::Runtime>(
+    mut request: PublishAdpListingRequest,
+    extension: PublishAdpListingRequestExtension,
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+    archive_service: State<'_, ArchiveSelectionService>,
+) -> Result<PublishAdpListingResult, PublishAdpListingError> {
+    validate_selected_build_requirement(&request, &extension)?;
+    let lease = if let Some(reference) = request.selected_build.as_ref() {
+        let auth = { state.auth.lock().await.clone() };
+        let active_signer = resolve_active_signer(signer_state.inner(), &auth)
+            .await
+            .map_err(|_| PublishAdpListingError::Archive { error: arcadestr_core::archive_inspection_contract::ArchiveSelectionError::Account { failure: arcadestr_core::archive_inspection_contract::ArchiveAccountFailure::NotAuthenticated } })?;
+        let active_npub = active_signer.get_public_key().await
+            .map_err(|_| PublishAdpListingError::Archive { error: arcadestr_core::archive_inspection_contract::ArchiveSelectionError::Account { failure: arcadestr_core::archive_inspection_contract::ArchiveAccountFailure::NotAuthenticated } })?
+            .to_bech32()
+            .map_err(|_| PublishAdpListingError::Archive { error: arcadestr_core::archive_inspection_contract::ArchiveSelectionError::Account { failure: arcadestr_core::archive_inspection_contract::ArchiveAccountFailure::InvalidHandle } })?;
+        let lease = archive_service
+            .publication_lease(
+                reference,
+                &request.expected_publisher_npub,
+                &active_npub,
+                crate::archive_commands::account_check(&state, &signer_state),
+            )
+            .await
+            .map_err(|error| PublishAdpListingError::Archive { error })?;
+        request.existing_file_hash = Some(lease.digest.as_str().to_owned());
+        Some(lease)
+    } else {
+        None
+    };
+    let result = publish_adp_listing_pipeline_inner(
+        request,
+        extension,
+        app,
+        state,
+        signer_state,
+        lease.as_ref(),
+    )
+    .await;
+    match result {
+        Ok(result) => {
+            if let Some(lease) = lease {
+                lease.finish().await;
+            }
+            Ok(result)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_selected_build_requirement(
+    request: &PublishAdpListingRequest,
+    extension: &PublishAdpListingRequestExtension,
+) -> Result<(), PublishAdpListingError> {
+    if request.selected_build.is_some() && request.file_path.is_some() {
+        return Err(PublishAdpListingError::Other {
+            message: "selected_build and file_path are ambiguous; publish only the backend-selected build"
+                .to_string(),
+        });
+    }
+    if request.file_path.is_some() {
+        return Err(PublishAdpListingError::Other {
+            message: "file_path is not a valid publication source; select the build through the archive workflow"
+                .to_string(),
+        });
+    }
+    if request.selected_build.is_some() && matches!(request.fulfillment_mode, FulfillmentMode::None)
+    {
+        return Err(PublishAdpListingError::Other {
+            message: "a selected build requires direct or delegated fulfillment".to_string(),
+        });
+    }
+    if request.existing_event_id.is_none() && request.existing_file_hash.is_some() {
+        return Err(PublishAdpListingError::Other {
+            message: "a new listing cannot bootstrap an artifact from a claimed file hash"
+                .to_string(),
+        });
+    }
+
+    let creates_artifact = request.existing_event_id.is_none()
+        && !matches!(request.fulfillment_mode, FulfillmentMode::None);
+    if request.selected_build.is_none()
+        && (creates_artifact
+            || (request.existing_event_id.is_none() && extension.launch_tier.is_some()))
+    {
+        return Err(PublishAdpListingError::Archive {
+            error: arcadestr_core::archive_inspection_contract::ArchiveSelectionError::SelectedBuildRequired,
+        });
+    }
+    Ok(())
+}
+
+fn authoritative_reused_file_hash(
+    request: &PublishAdpListingRequest,
+    authoritative: &nostr::Event,
+) -> Result<Option<String>, PublishAdpListingError> {
+    if request.selected_build.is_some() || matches!(request.fulfillment_mode, FulfillmentMode::None)
+    {
+        return Ok(None);
+    }
+
+    let file_hash_tags = authoritative
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice())
+        .filter(|values| values.first().map(String::as_str) == Some("file_hash"))
+        .collect::<Vec<_>>();
+    let [values] = file_hash_tags.as_slice() else {
+        return Err(PublishAdpListingError::Other {
+            message: "the authoritative listing must contain exactly one file_hash tag; select a replacement build"
+                .to_string(),
+        });
+    };
+    let [_, signed_hash] = *values else {
+        return Err(PublishAdpListingError::Other {
+            message:
+                "the authoritative listing file_hash tag is malformed; select a replacement build"
+                    .to_string(),
+        });
+    };
+    if Sha256Digest::parse(signed_hash).is_err() {
+        return Err(PublishAdpListingError::Other {
+            message: "the authoritative listing file_hash is invalid; select a replacement build"
+                .to_string(),
+        });
+    }
+    if request.existing_file_hash.as_deref() != Some(signed_hash.as_str()) {
+        return Err(PublishAdpListingError::Other {
+            message: "the requested file hash does not exactly match the signed authoritative listing; select a replacement build"
+                .to_string(),
+        });
+    }
+
+    let authoritative_servers = authoritative
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice())
+        .filter(|values| values.first().map(String::as_str) == Some("server"))
+        .filter_map(|values| match values {
+            [_, server] => Some(server.as_str()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if request
+        .servers
+        .iter()
+        .any(|server| !authoritative_servers.contains(server.as_str()))
+    {
+        return Err(PublishAdpListingError::Archive {
+            error: arcadestr_core::archive_inspection_contract::ArchiveSelectionError::SelectedBuildRequired,
+        });
+    }
+
+    Ok(Some(signed_hash.clone()))
+}
+
+fn require_launch_tier_file_hash(
+    extension: &PublishAdpListingRequestExtension,
+    resolved_file_hash: Option<&str>,
+) -> Result<(), PublishAdpListingError> {
+    if extension.launch_tier.is_some() && resolved_file_hash.is_none() {
+        return Err(PublishAdpListingError::CoreValidation {
+            violation: AdpPublishValidationViolation::InvalidFileHash,
+            message: "a launch tier requires a resolved file_hash".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Read-only capacity checks must complete for every server before publication side effects.
+async fn preflight_upload_capacity(
+    servers: &[String],
+    file_size: u64,
+    http: &Arc<dyn HttpClient>,
+) -> Result<(), PublishAdpListingError> {
+    for server in servers {
+        let info = AdpClient::new(server.clone(), Arc::clone(http))
+            .well_known()
+            .await
+            .map_err(|error| PublishAdpListingError::Upload {
+                message: format!("could not check upload capacity for {server}: {error}"),
+            })?;
+        if let Some(limit) = info.max_upload_bytes {
+            if file_size > limit {
+                return Err(PublishAdpListingError::Upload {
+                    message: format!("build is {file_size} bytes, but {server} accepts at most {limit} bytes; choose a smaller build or increase the server upload limit"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
+    request: PublishAdpListingRequest,
+    extension: PublishAdpListingRequestExtension,
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+    publication_lease: Option<&PublicationLease>,
+) -> Result<PublishAdpListingResult, PublishAdpListingError> {
+    let expected_publisher = nostr::PublicKey::from_bech32(&request.expected_publisher_npub)
+        .map_err(|error| PublishAdpListingError::Authority {
+            message: format!("invalid expected publisher npub: {error}"),
+        })?;
+    let authoritative_edit = if let Some(expected_event_id) = request.existing_event_id.as_deref() {
+        let claimed_d_tag = request.existing_d_tag.as_deref().ok_or_else(|| {
+            "the identifier of the Game page being replaced is required".to_string()
+        })?;
+        let coordinate = format!("30402:{}:{claimed_d_tag}", expected_publisher.to_hex());
+        let event = map_authoritative_refetch(
+            fetch_replaceable_listing_event_by_coordinate(&state, &coordinate).await,
+            &coordinate,
+        )?;
+        let authoritative_request = LoadAuthoritativeAdpEditMetadataRequest {
+            expected_publisher_npub: request.expected_publisher_npub.clone(),
+            d_tag: claimed_d_tag.to_owned(),
+            expected_event_id: expected_event_id.to_owned(),
+        };
+        let metadata = decode_verified_authoritative_edit_metadata(
+            &authoritative_request,
+            expected_publisher,
+            &event,
+        )?;
+        enforce_authoritative_profile_removals(&metadata, &extension)?;
+        Some((event, metadata))
+    } else {
+        None
+    };
+    let authoritative_reused_hash = match authoritative_edit.as_ref() {
+        Some((event, _)) => authoritative_reused_file_hash(&request, event)?,
+        None => None,
+    };
+    let resolved_file_hash = publication_lease
+        .map(|lease| lease.digest.as_str().to_owned())
+        .or(authoritative_reused_hash);
+    require_launch_tier_file_hash(&extension, resolved_file_hash.as_deref())?;
+    if let Some(lease) = publication_lease {
+        preflight_upload_capacity(&request.servers, lease.file_size, &state.http_client).await?;
+    }
+
+    // This authoritative Phase A check deliberately precedes every publication-
+    // side signer call, provisioning request and upload. The expected event ID
+    // detects changes before this refetch; the later relay-to-sign window remains
+    // optimistic until a separate CAS/revision-locking phase exists.
     let auth_snapshot = { state.auth.lock().await.clone() };
-    let signer = resolve_active_signer(signer_state.inner(), &auth_snapshot).await?;
-    let developer_pubkey = signer
-        .get_public_key()
+    let signer = resolve_active_signer(signer_state.inner(), &auth_snapshot)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|message| PublishAdpListingError::Authority { message })?;
+    let developer_pubkey =
+        signer
+            .get_public_key()
+            .await
+            .map_err(|error| PublishAdpListingError::Signer {
+                message: error.to_string(),
+            })?;
     verify_expected_publisher(&request.expected_publisher_npub, developer_pubkey)?;
     let developer_npub = developer_pubkey.to_hex();
     // The identity of the game page is settled once, here, before anything that
@@ -1373,18 +2038,24 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         let claimed_d_tag = request.existing_d_tag.as_deref().ok_or_else(|| {
             "the identifier of the Game page being replaced is required".to_string()
         })?;
-        let coordinate = format!("30402:{developer_npub}:{claimed_d_tag}");
-        let existing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
+        let (existing, _authoritative_launch_metadata) =
+            authoritative_edit
+                .as_ref()
+                .ok_or_else(|| PublishAdpListingError::Other {
+                    message: "authoritative edit state was not retained".to_string(),
+                })?;
         ensure_expected_listing_event(
-            &existing,
+            existing,
             expected_event_id,
             "This Game page changed since it was opened. Reload it before publishing so newer metadata is not overwritten.",
         )?;
         if existing.pubkey != developer_pubkey {
-            return Err("the Game page being replaced belongs to another publisher".to_string());
+            return Err(PublishAdpListingError::Authority {
+                message: "the Game page being replaced belongs to another publisher".to_string(),
+            });
         }
         let identifier =
-            resolve_existing_game_identifier(Some(claimed_d_tag), listing_event_d_tag(&existing))?;
+            resolve_existing_game_identifier(Some(claimed_d_tag), listing_event_d_tag(existing))?;
         // Kept whole here: which tags the form replaces is not settled until
         // fulfillment authorization is resolved, further down.
         let existing_tags = existing
@@ -1397,16 +2068,32 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
             existing_tags,
         )
     } else {
-        let identifier = resolve_new_game_identifier(request.existing_d_tag.as_deref())?;
+        // A carried-over identity is only resumable onto a coordinate the
+        // relays confirm is free; anything else falls back to a fresh one.
+        let resumable =
+            resumable_pending_d_tag(&state, developer_pubkey, request.pending_d_tag.as_deref())
+                .await?;
+        let identifier =
+            resolve_new_game_identifier(request.existing_d_tag.as_deref(), resumable.as_deref())?;
         (
             GameCoordinate::new(developer_pubkey, identifier),
             Vec::new(),
         )
     };
     let game_d_tag = game.d_tag();
-    let now: u64 = now_unix_i64()?
-        .try_into()
-        .map_err(|_| "current time is negative".to_string())?;
+    if game.generated_game_id().is_some() {
+        // The identity of a first publication is settled but nothing has been
+        // published under it yet. Hand it to the caller before any step that
+        // can fail, so a retry resumes this publication — same coordinate, same
+        // provisioning scope — instead of minting a second one and leaving this
+        // one's fulfillment key stranded on the operator.
+        emit_progress(
+            &app,
+            "pending-coordinate",
+            "ok",
+            Some(game.to_coordinate_string()),
+        )?;
+    }
     let FulfillmentMetadata {
         fulfillment_pubkey: mut fulfillment_pubkey,
         should_provision,
@@ -1424,7 +2111,9 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         FulfillmentMode::Direct => {
             if request.servers.is_empty() {
                 return Err(
-                    "at least one distribution server is required for fulfillment".to_string(),
+                    "at least one distribution server is required for fulfillment"
+                        .to_string()
+                        .into(),
                 );
             }
             let version = request
@@ -1432,25 +2121,36 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                 .as_deref()
                 .ok_or_else(|| "version is required for fulfillment".to_string())?;
             if version.trim().is_empty() {
-                return Err("version is required for fulfillment".to_string());
+                return Err("version is required for fulfillment".to_string().into());
             }
 
-            let hash = if let Some(file_path) = request.file_path.as_deref() {
-                emit_progress(&app, "hash-file", "pending", None)?;
-                let hash = sha256_file(std::path::Path::new(file_path))
+            let hash = if let Some(lease) = publication_lease {
+                lease
+                    .verify_digest()
                     .await
-                    .map_err(|err| progress_error(&app, "hash-file", err))?;
-                emit_progress(&app, "hash-file", "ok", Some(hash.clone()))?;
-                hash
+                    .map_err(|error| PublishAdpListingError::Archive { error })?;
+                resolved_file_hash.clone().ok_or_else(|| {
+                    PublishAdpListingError::CoreValidation {
+                        violation: AdpPublishValidationViolation::InvalidFileHash,
+                        message: "fulfillment requires a resolved file_hash".to_string(),
+                    }
+                })?
             } else {
-                reusable_file_hash(request.existing_file_hash.as_deref())?
+                resolved_file_hash
+                    .clone()
+                    .ok_or_else(|| PublishAdpListingError::Other {
+                        message: "an authoritative file hash is required when no build is selected"
+                            .to_string(),
+                    })?
             };
             file_hash = Some(hash);
         }
         FulfillmentMode::Delegate => {
             if request.servers.is_empty() {
                 return Err(
-                    "at least one distribution server is required for fulfillment".to_string(),
+                    "at least one distribution server is required for fulfillment"
+                        .to_string()
+                        .into(),
                 );
             }
             let version = request
@@ -1458,18 +2158,27 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                 .as_deref()
                 .ok_or_else(|| "version is required for fulfillment".to_string())?;
             if version.trim().is_empty() {
-                return Err("version is required for fulfillment".to_string());
+                return Err("version is required for fulfillment".to_string().into());
             }
 
-            let hash = if let Some(file_path) = request.file_path.as_deref() {
-                emit_progress(&app, "hash-file", "pending", None)?;
-                let hash = sha256_file(std::path::Path::new(file_path))
+            let hash = if let Some(lease) = publication_lease {
+                lease
+                    .verify_digest()
                     .await
-                    .map_err(|err| progress_error(&app, "hash-file", err))?;
-                emit_progress(&app, "hash-file", "ok", Some(hash.clone()))?;
-                hash
+                    .map_err(|error| PublishAdpListingError::Archive { error })?;
+                resolved_file_hash.clone().ok_or_else(|| {
+                    PublishAdpListingError::CoreValidation {
+                        violation: AdpPublishValidationViolation::InvalidFileHash,
+                        message: "fulfillment requires a resolved file_hash".to_string(),
+                    }
+                })?
             } else {
-                reusable_file_hash(request.existing_file_hash.as_deref())?
+                resolved_file_hash
+                    .clone()
+                    .ok_or_else(|| PublishAdpListingError::Other {
+                        message: "an authoritative file hash is required when no build is selected"
+                            .to_string(),
+                    })?
             };
             file_hash = Some(hash);
 
@@ -1478,7 +2187,9 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                     "operator URL is required for delegated fulfillment".to_string()
                 })?;
                 if operator_url.trim().is_empty() {
-                    return Err("operator URL is required for delegated fulfillment".to_string());
+                    return Err("operator URL is required for delegated fulfillment"
+                        .to_string()
+                        .into());
                 }
                 emit_progress(
                     &app,
@@ -1515,7 +2226,9 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                     server_info: &server_info,
                 })
                 .await
-                .map_err(|err| progress_error(&app, "provision", err))?;
+                .inspect_err(|error| {
+                    let _ = emit_progress(&app, "provision", "error", Some(error.to_string()));
+                })?;
 
                 match provisioning {
                     ProvisioningDecision::Reused {
@@ -1526,8 +2239,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                         attestation,
                         row,
                     } => {
-                        validate_current_attestation(&state, &row, attestation.as_deref(), now)
-                            .await?;
+                        validate_current_attestation(&state, &row, attestation.as_deref()).await?;
                         ensure_publish_account_current(
                             &state,
                             signer_state.inner(),
@@ -1558,8 +2270,7 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                         attestation,
                         row,
                     } => {
-                        validate_current_attestation(&state, &row, attestation.as_deref(), now)
-                            .await?;
+                        validate_current_attestation(&state, &row, attestation.as_deref()).await?;
                         ensure_publish_account_current(
                             &state,
                             signer_state.inner(),
@@ -1593,7 +2304,8 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                 if operator_url.trim().is_empty() {
                     return Err(
                         "operator URL is required to repair delegated fulfillment authorization"
-                            .to_string(),
+                            .to_string()
+                            .into(),
                     );
                 }
 
@@ -1616,13 +2328,8 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
                     provision: &provision,
                 })
                 .await?;
-                validate_current_attestation(
-                    &state,
-                    &repair.row,
-                    repair.attestation.as_deref(),
-                    now,
-                )
-                .await?;
+                validate_current_attestation(&state, &repair.row, repair.attestation.as_deref())
+                    .await?;
                 ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey)
                     .await?;
                 provisioning_repo
@@ -1693,15 +2400,34 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         nip94_event_id: request.nip94_event_id.clone(),
         preserved_tags,
     };
-    let listing_builder =
-        build_adp_listing_event_builder(&listing_input).map_err(|err| err.to_string())?;
-    let listing_event = signer
-        .sign_event(listing_builder.build(developer_pubkey))
+    let listing_builder = build_adp_listing_event_builder(AdpListingPublishInput {
+        listing: &listing_input,
+        launch_tier: extension.launch_tier.as_ref(),
+    })
+    .map_err(PublishAdpListingError::from)?;
+    ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey).await?;
+    if let Some(lease) = publication_lease {
+        lease
+            .verify_digest()
+            .await
+            .map_err(|error| PublishAdpListingError::Archive { error })?;
+    }
+    let listing_event =
+        validate_and_sign_adp_listing(signer.as_ref(), listing_builder.build(developer_pubkey))
+            .await
+            .inspect_err(|error| {
+                let _ = emit_progress(&app, "publish-listing", "error", Some(error.to_string()));
+            })?;
+    // Signing can involve a remote signer. Revalidate after it returns and before
+    // making the signed listing irreversible on relays.
+    ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey)
         .await
-        .map_err(|err| progress_error(&app, "publish-listing", err))?;
+        .map_err(|message| PublishAdpListingError::Authority { message })?;
     publish_event(&state, &listing_event)
         .await
-        .map_err(|err| progress_error(&app, "publish-listing", err))?;
+        .map_err(|error| PublishAdpListingError::Relay {
+            message: progress_error(&app, "publish-listing", error),
+        })?;
     emit_progress(
         &app,
         "publish-listing",
@@ -1726,61 +2452,114 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
             "error",
             Some("listing not visible on two relays".into()),
         )?;
-        return Err("listing not visible on two relays".into());
+        return Err(PublishAdpListingError::Relay {
+            message: "listing not visible on two relays".to_string(),
+        });
     }
     emit_progress(&app, "confirm-propagation", "ok", Some(coordinate.clone()))?;
 
-    let mut uploads = Vec::new();
-    if !matches!(request.fulfillment_mode, FulfillmentMode::None) && request.file_path.is_some() {
-        let file_path = request.file_path.as_deref().ok_or_else(|| {
-            "build file is required when uploading a replacement artifact".to_string()
+    let mut uploads: Vec<PublishServerUploadResult> = Vec::new();
+    if !matches!(request.fulfillment_mode, FulfillmentMode::None) && publication_lease.is_some() {
+        let lease = publication_lease.ok_or_else(|| PublishAdpListingError::Other {
+            message: "selected build lease disappeared before upload".to_string(),
         })?;
         let mut upload_errors = Vec::new();
         for server_url in &request.servers {
+            ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey)
+                .await
+                .map_err(|message| PublishAdpListingError::PartialPublication {
+                    cause: Box::new(PublishAdpListingError::Authority { message }),
+                    successful_servers: uploads
+                        .iter()
+                        .filter(|upload| upload.status == "ok")
+                        .map(|upload| upload.server_url.clone())
+                        .collect(),
+                })?;
             emit_server_progress(&app, "upload", "pending", Some(server_url.clone()), None)?;
             let adp_client = AdpClient::new(server_url.clone(), Arc::clone(&state.http_client));
             let progress_app = app.clone();
             let progress_server_url = server_url.clone();
             let last_reported_percent = Arc::new(AtomicU64::new(u64::MAX));
-            match adp_client
+            let progress = move |bytes_uploaded: u64, total_bytes: u64| {
+                let percent = if total_bytes == 0 {
+                    100
+                } else {
+                    bytes_uploaded.saturating_mul(100) / total_bytes
+                };
+                if last_reported_percent.swap(percent, Ordering::Relaxed) != percent {
+                    let _ = emit_upload_progress(
+                        &progress_app,
+                        &progress_server_url,
+                        bytes_uploaded,
+                        total_bytes,
+                    );
+                }
+            };
+            let upload = lease
                 .upload_with_progress(
+                    &adp_client,
                     signer.as_ref(),
                     &listing_event,
-                    std::path::Path::new(file_path),
-                    move |bytes_uploaded, total_bytes| {
-                        let percent = if total_bytes == 0 {
-                            100
-                        } else {
-                            bytes_uploaded.saturating_mul(100) / total_bytes
-                        };
-                        if last_reported_percent.swap(percent, Ordering::Relaxed) != percent {
-                            let _ = emit_upload_progress(
-                                &progress_app,
-                                &progress_server_url,
-                                bytes_uploaded,
-                                total_bytes,
-                            );
-                        }
-                    },
+                    &request.expected_publisher_npub,
+                    crate::archive_commands::account_check(&state, &signer_state),
+                    progress,
                 )
-                .await
+                .await;
+            if let Err(message) =
+                ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey).await
             {
+                let mut successful_servers = uploads
+                    .iter()
+                    .filter(|upload| upload.status == "ok")
+                    .map(|upload| upload.server_url.clone())
+                    .collect::<Vec<_>>();
+                if upload.is_ok() {
+                    successful_servers.push(server_url.clone());
+                }
+                return Err(PublishAdpListingError::PartialPublication {
+                    cause: Box::new(PublishAdpListingError::Authority { message }),
+                    successful_servers,
+                });
+            }
+            match upload {
                 Ok(upload) => {
-                    emit_server_progress(
-                        &app,
-                        "upload",
-                        "ok",
-                        Some(server_url.clone()),
-                        Some(upload.download_url.clone()),
-                    )?;
+                    let download_url = upload.download_url.clone();
                     uploads.push(PublishServerUploadResult {
                         server_url: server_url.clone(),
                         status: "ok".to_string(),
                         error: None,
                         upload: Some(upload),
                     });
+                    emit_server_progress(
+                        &app,
+                        "upload",
+                        "ok",
+                        Some(server_url.clone()),
+                        Some(download_url),
+                    )
+                    .map_err(|message| {
+                        PublishAdpListingError::PartialPublication {
+                            cause: Box::new(PublishAdpListingError::Other { message }),
+                            successful_servers: uploads
+                                .iter()
+                                .filter(|upload| upload.status == "ok")
+                                .map(|upload| upload.server_url.clone())
+                                .collect(),
+                        }
+                    })?;
                 }
-                Err(err) => {
+                Err(LeaseUploadError::Archive(error)) => {
+                    let error = PublishAdpListingError::Archive { error };
+                    return Err(PublishAdpListingError::PartialPublication {
+                        cause: Box::new(error),
+                        successful_servers: uploads
+                            .iter()
+                            .filter(|upload| upload.status == "ok")
+                            .map(|upload| upload.server_url.clone())
+                            .collect(),
+                    });
+                }
+                Err(LeaseUploadError::Upload(err)) => {
                     let message = err.to_string();
                     emit_server_progress(
                         &app,
@@ -1801,7 +2580,16 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         }
 
         if !upload_errors.is_empty() {
-            return Err(format!("upload failed for: {}", upload_errors.join("; ")));
+            return Err(PublishAdpListingError::PartialPublication {
+                cause: Box::new(PublishAdpListingError::Upload {
+                    message: format!("upload failed for: {}", upload_errors.join("; ")),
+                }),
+                successful_servers: uploads
+                    .iter()
+                    .filter(|upload| upload.status == "ok")
+                    .map(|upload| upload.server_url.clone())
+                    .collect(),
+            });
         }
     }
 
@@ -1821,7 +2609,6 @@ async fn validate_current_attestation(
     state: &State<'_, AppState>,
     row: &AdpProvisioning,
     provided: Option<&nostr::Event>,
-    now: u64,
 ) -> Result<(), String> {
     let operator = nostr::PublicKey::from_hex(&row.operator_pubkey)
         .map_err(|_| "operator pubkey is invalid".to_string())?;
@@ -1833,7 +2620,7 @@ async fn validate_current_attestation(
         attestation.clone()
     } else {
         let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
-        let relay_manager = relay_manager.lock().await;
+        let relay_manager = relay_manager.lock().await.clone();
         let events = relay_manager
             .fetch_events_best_effort(
                 nostr::Filter::new()
@@ -1850,14 +2637,32 @@ async fn validate_current_attestation(
         }))
         .ok_or_else(|| "operator attestation evidence unavailable".to_string())?
     };
-    let parsed = arcadestr_core::authorization::parse_attestation_event(&attestation)
+    // The clock is read here rather than when publishing began. The operator
+    // mints this attestation during provisioning, several steps after the
+    // command starts, so a timestamp captured up front predates the
+    // `valid_from` it would be compared against.
+    let now: u64 = now_unix_i64()?
+        .try_into()
+        .map_err(|_| "current time is negative".to_string())?;
+    ensure_attestation_covers_provisioning(row, operator, &attestation, now)
+}
+
+fn ensure_attestation_covers_provisioning(
+    row: &AdpProvisioning,
+    operator: nostr::PublicKey,
+    attestation: &nostr::Event,
+    now: u64,
+) -> Result<(), String> {
+    let parsed = arcadestr_core::authorization::parse_attestation_event(attestation)
         .map_err(|error| format!("invalid operator attestation: {error}"))?;
     if attestation.pubkey != operator
         || parsed.developer_pubkey.to_hex() != row.developer_npub
         || parsed.fulfillment_pubkey.to_hex() != row.fulfillment_pubkey
         || parsed.scope.as_deref() != row.scope.as_deref()
-        || !parsed.allows_new_operations_at(now)
     {
+        return Err("operator attestation does not cover this fulfillment key".into());
+    }
+    if !parsed.allows_new_operations_observed_at(now) {
         return Err("operator no longer attests possession of this fulfillment key".into());
     }
     Ok(())
@@ -1920,12 +2725,12 @@ fn existing_authorization_repair_key(
 
 async fn repair_existing_authorization(
     input: ExistingAuthorizationRepairInput<'_>,
-) -> Result<ExistingAuthorizationRepair, String> {
+) -> Result<ExistingAuthorizationRepair, PublishAdpListingError> {
     if input.provision.fulfillment_pubkey != input.fulfillment_pubkey {
-        return Err(
-            "distribution provider returned a different active fulfillment key; reload the listing before publishing"
-                .into(),
-        );
+        return Err(String::from(
+            "distribution provider returned a different active fulfillment key; reload the listing before publishing",
+        )
+        .into());
     }
     let matches = input
         .provisioning_repo
@@ -1964,13 +2769,15 @@ async fn repair_existing_authorization(
         ]),
         valid_from,
     };
-    let builder =
-        build_fulfillment_authorization_event_builder(&terms).map_err(|error| error.to_string())?;
+    let builder = build_fulfillment_authorization_event_builder(&terms)
+        .map_err(PublishAdpListingError::from)?;
     let authorization_event = input
         .signer
         .sign_event(builder.build(input.developer_pubkey))
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|error| PublishAdpListingError::Signer {
+            message: error.to_string(),
+        })?;
     let authorization_event_id = authorization_event.id.to_hex();
     row.acceptance_event_id = authorization_event_id.clone();
     row.valid_from = valid_from
@@ -1991,7 +2798,7 @@ async fn repair_existing_authorization(
 
 async fn resolve_provisioning(
     input: ResolveProvisioningInput<'_>,
-) -> Result<ProvisioningDecision, String> {
+) -> Result<ProvisioningDecision, PublishAdpListingError> {
     let listing_coordinate = format!("30402:{}:{}", input.developer_pubkey.to_hex(), input.scope);
     let provision = input
         .adp_client
@@ -2027,12 +2834,14 @@ async fn resolve_provisioning(
             valid_from,
         };
         let authorization_builder = build_fulfillment_authorization_event_builder(&terms)
-            .map_err(|error| error.to_string())?;
+            .map_err(PublishAdpListingError::from)?;
         let authorization_event = input
             .signer
             .sign_event(authorization_builder.build(input.developer_pubkey))
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(|error| PublishAdpListingError::Signer {
+                message: error.to_string(),
+            })?;
         let authorization_event_id = authorization_event.id.to_hex();
         let mut row = existing;
         row.acceptance_event_id = authorization_event_id.clone();
@@ -2067,13 +2876,15 @@ async fn resolve_provisioning(
         ]),
         valid_from,
     };
-    let authorization_builder =
-        build_fulfillment_authorization_event_builder(&terms).map_err(|error| error.to_string())?;
+    let authorization_builder = build_fulfillment_authorization_event_builder(&terms)
+        .map_err(PublishAdpListingError::from)?;
     let authorization_event = input
         .signer
         .sign_event(authorization_builder.build(input.developer_pubkey))
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|error| PublishAdpListingError::Signer {
+            message: error.to_string(),
+        })?;
     let authorization_event_id = authorization_event.id.to_hex();
     let row = AdpProvisioning {
         id: format!(
@@ -2107,7 +2918,7 @@ async fn resolve_provisioning(
 
 async fn publish_event(state: &State<'_, AppState>, event: &nostr::Event) -> Result<(), String> {
     let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
-    let manager = relay_manager.lock().await;
+    let manager = relay_manager.lock().await.clone();
     let result = manager
         .send_event(event)
         .await
@@ -2189,6 +3000,7 @@ fn now_unix_i64() -> Result<i64, String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
 
     use std::path::PathBuf;
@@ -2198,6 +3010,9 @@ mod tests {
     use arcadestr_core::adp_storage::AdpProvisioningRepository;
     use arcadestr_core::auth::AuthState;
     use arcadestr_core::authorization::{parse_authorization_event, AuthorizationTransition};
+    use arcadestr_core::distribution::{
+        resolve_install_plan, LaunchType, PackageFormat, PlatformTarget, RelativePath, WorkingDir,
+    };
     use arcadestr_core::http_client::{HttpClient, ReqwestHttpClient};
     use arcadestr_core::marketplace_cache::MarketplaceCache;
     use arcadestr_core::nip05_validator::Nip05Validator;
@@ -2213,6 +3028,159 @@ mod tests {
     use arcadestr_core::subscriptions::SubscriptionRegistry;
     use arcadestr_core::user_cache::UserCache;
     use nostr::{nips::nip19::ToBech32, EventBuilder, Keys, Kind, Tag, TagKind, Timestamp};
+
+    struct CountingSigner {
+        keys: Keys,
+        calls: AtomicUsize,
+    }
+
+    impl CountingSigner {
+        fn new() -> Self {
+            Self {
+                keys: Keys::generate(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NostrSigner for CountingSigner {
+        async fn get_public_key(&self) -> Result<nostr::PublicKey, SignerError> {
+            Ok(self.keys.public_key())
+        }
+
+        async fn sign_event(
+            &self,
+            unsigned: nostr::UnsignedEvent,
+        ) -> Result<nostr::Event, SignerError> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            unsigned
+                .sign(&self.keys)
+                .await
+                .map_err(|error| SignerError::SigningFailed(error.to_string()))
+        }
+    }
+
+    fn final_listing_unsigned(
+        signer: &CountingSigner,
+        tags: Vec<Vec<&str>>,
+    ) -> nostr::UnsignedEvent {
+        let tags = tags
+            .into_iter()
+            .map(|tag| Tag::parse(tag).expect("fixture tag should parse"))
+            .collect::<Vec<_>>();
+        EventBuilder::new(Kind::Custom(30402), "listing")
+            .tags(tags)
+            .build(signer.keys.public_key())
+    }
+
+    fn valid_final_launch(profile_id: &'static str) -> Vec<&'static str> {
+        vec!["launch", profile_id, "bin/game", ".", "[]", "game", "Play"]
+    }
+
+    async fn assert_rejected_before_signing(
+        tags: Vec<Vec<&str>>,
+        expected: arcadestr_core::adp_publish_contract::AdpPublishValidationViolation,
+    ) {
+        let signer = CountingSigner::new();
+        let error = validate_and_sign_adp_listing(&signer, final_listing_unsigned(&signer, tags))
+            .await
+            .expect_err("malformed final listing must be rejected");
+
+        assert!(matches!(
+            error,
+            PublishAdpListingError::CoreValidation { violation, .. } if violation == expected
+        ));
+        assert_eq!(signer.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_final_listing_invariants_never_reach_the_signer() {
+        use arcadestr_core::adp_publish_contract::AdpPublishValidationViolation as Violation;
+
+        assert_rejected_before_signing(
+            vec![vec!["package", "zip"]],
+            Violation::MissingGameLaunchProfile,
+        )
+        .await;
+        assert_rejected_before_signing(
+            vec![valid_final_launch("play")],
+            Violation::LaunchPackageCount { actual: 0 },
+        )
+        .await;
+        assert_rejected_before_signing(
+            vec![
+                vec!["package", "zip"],
+                valid_final_launch("play"),
+                vec!["launch_default", "play"],
+            ],
+            Violation::MissingLaunchPlatform,
+        )
+        .await;
+        assert_rejected_before_signing(
+            vec![
+                vec!["package", "zip"],
+                vec!["platform", "linux-x86_64"],
+                valid_final_launch("play"),
+                valid_final_launch("play"),
+            ],
+            Violation::DuplicateLaunchProfileId {
+                profile_id: ProfileId::parse("play").expect("valid profile ID"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn valid_three_profile_and_download_only_listings_sign_once_each() {
+        let signer = CountingSigner::new();
+        let valid = final_listing_unsigned(
+            &signer,
+            vec![
+                vec!["package", "zip"],
+                vec!["platform", "linux-x86_64"],
+                valid_final_launch("play"),
+                valid_final_launch("safe"),
+                valid_final_launch("server"),
+                vec!["launch_default", "play"],
+            ],
+        );
+        validate_and_sign_adp_listing(&signer, valid)
+            .await
+            .expect("valid launch listing should sign");
+        assert_eq!(signer.calls(), 1);
+
+        let download_only = final_listing_unsigned(
+            &signer,
+            vec![vec!["d", "download-only"], vec!["platform", "linux-x86_64"]],
+        );
+        validate_and_sign_adp_listing(&signer, download_only)
+            .await
+            .expect("download-only listing should sign");
+        assert_eq!(signer.calls(), 2);
+    }
+
+    #[test]
+    fn new_edit_and_retry_listing_publications_share_one_signing_pipeline() {
+        let source = include_str!("adp_commands.rs");
+        let pipeline = source
+            .split("async fn publish_adp_listing_pipeline_inner")
+            .nth(1)
+            .and_then(|source| source.split("async fn validate_current_attestation").next())
+            .expect("listing pipeline should have stable structural boundaries");
+
+        assert_eq!(
+            pipeline.matches("validate_and_sign_adp_listing(").count(),
+            1
+        );
+        assert!(!pipeline.contains(".sign_event("));
+        assert!(pipeline.contains("request.existing_event_id.as_deref()"));
+        assert!(pipeline.contains("request.pending_d_tag.as_deref()"));
+    }
 
     #[test]
     fn expected_publisher_must_match_resolved_signer() {
@@ -2236,7 +3204,7 @@ mod tests {
     #[test]
     fn new_publication_generates_a_version_4_uuid_identifier() {
         let identifier =
-            resolve_new_game_identifier(None).expect("a first publication should mint an id");
+            resolve_new_game_identifier(None, None).expect("a first publication should mint an id");
 
         let game_id = identifier
             .generated_game_id()
@@ -2248,7 +3216,7 @@ mod tests {
     #[test]
     fn generated_identifier_renders_canonical_lowercase_hyphenated_text() {
         let identifier =
-            resolve_new_game_identifier(None).expect("a first publication should mint an id");
+            resolve_new_game_identifier(None, None).expect("a first publication should mint an id");
 
         let d_tag = identifier.d_tag();
         assert_eq!(d_tag.len(), 36);
@@ -2273,19 +3241,206 @@ mod tests {
 
     #[test]
     fn independent_new_publications_generate_different_identifiers() {
-        let first = resolve_new_game_identifier(None).expect("first publication should mint an id");
+        let first =
+            resolve_new_game_identifier(None, None).expect("first publication should mint an id");
         let second =
-            resolve_new_game_identifier(None).expect("second publication should mint an id");
+            resolve_new_game_identifier(None, None).expect("second publication should mint an id");
 
         assert_ne!(first.d_tag(), second.d_tag());
     }
 
     #[test]
     fn new_publication_rejects_a_caller_supplied_identifier() {
-        let error = resolve_new_game_identifier(Some("publisher-chosen-slug"))
+        let error = resolve_new_game_identifier(Some("publisher-chosen-slug"), None)
             .expect_err("a caller-supplied identifier must not be honoured");
 
         assert!(error.contains("caller-supplied identifier"));
+    }
+
+    #[test]
+    fn a_retry_resumes_the_identifier_the_failed_attempt_minted() {
+        let minted = resolve_new_game_identifier(None, None)
+            .expect("the first attempt should mint an id")
+            .d_tag();
+
+        let resumed = resolve_new_game_identifier(None, Some(&minted))
+            .expect("a retry should resume the pending publication");
+
+        assert_eq!(resumed.d_tag(), minted);
+        assert_eq!(
+            resumed.generated_game_id().map(|id| id.to_string()),
+            Some(minted),
+            "a resumed publication still owns the identity it minted"
+        );
+    }
+
+    #[test]
+    fn a_pending_identifier_this_app_did_not_mint_is_refused() {
+        // The pending channel must not become a way to choose a coordinate.
+        for smuggled in [
+            "publisher-chosen-slug",
+            "not-a-uuid-at-all",
+            // A valid UUID, but not the v4 shape this command mints.
+            "000001f5-5cb4-21ef-9a00-325096b39f47",
+            // Canonical rendering only: no uppercase, braces or urn prefix.
+            "F47AC10B-58CC-4372-A567-0E02B2C3D479",
+            "{f47ac10b-58cc-4372-a567-0e02b2c3d479}",
+            "urn:uuid:f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        ] {
+            let error = resolve_new_game_identifier(None, Some(smuggled))
+                .expect_err("a pending identifier this app did not mint must be refused");
+
+            assert!(
+                error.contains("not one this app minted"),
+                "{smuggled} was refused for the wrong reason: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_pending_identifier_mints_a_fresh_one() {
+        let identifier = resolve_new_game_identifier(None, Some(""))
+            .expect("an empty carry-over should behave like a first attempt");
+
+        assert!(identifier.generated_game_id().is_some());
+    }
+
+    fn listing_event(publisher: &Keys, d_tag: &str) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(30402), "")
+            .tags([Tag::identifier(d_tag)])
+            .sign_with_keys(publisher)
+            .expect("listing event should sign")
+    }
+
+    #[test]
+    fn a_pending_coordinate_the_relays_confirm_is_free_is_resumed() {
+        let publisher = Keys::generate();
+        let pending = resolve_new_game_identifier(None, None)
+            .expect("the first attempt should mint an id")
+            .d_tag();
+        // Another game of the same publisher answers the query, but not this
+        // coordinate; every relay that was asked replied.
+        let query = Ok(CoordinateQuery {
+            events: vec![listing_event(&publisher, "a-different-game")],
+            silent_relays: 0,
+        });
+
+        let occupancy = coordinate_occupancy(publisher.public_key(), &pending, query);
+
+        assert_eq!(occupancy, CoordinateOccupancy::ConfirmedAbsent);
+        assert_eq!(
+            pending_d_tag_to_resume(&pending, occupancy),
+            Ok(Some(pending.clone()))
+        );
+    }
+
+    #[test]
+    fn a_pending_coordinate_that_is_already_live_is_refused() {
+        let publisher = Keys::generate();
+        let pending = resolve_new_game_identifier(None, None)
+            .expect("an id should mint")
+            .d_tag();
+        // The publisher's own published game sits at this coordinate. Resuming
+        // would replace it: kind:30402 is parameterized replaceable.
+        let query = Ok(CoordinateQuery {
+            events: vec![listing_event(&publisher, &pending)],
+            silent_relays: 0,
+        });
+
+        let occupancy = coordinate_occupancy(publisher.public_key(), &pending, query);
+
+        assert_eq!(occupancy, CoordinateOccupancy::Occupied);
+        let error = pending_d_tag_to_resume(&pending, occupancy)
+            .expect_err("a live coordinate must not be published over");
+        assert_eq!(error, RESUMED_COORDINATE_IS_LIVE);
+        assert_ne!(
+            error,
+            resume_pending_game_identifier("not-a-resume-token")
+                .expect_err("the shape refusal should still exist"),
+            "the frontend must be able to tell the two refusals apart"
+        );
+    }
+
+    #[test]
+    fn an_unanswered_coordinate_query_mints_instead_of_resuming() {
+        let publisher = Keys::generate();
+        let pending = resolve_new_game_identifier(None, None)
+            .expect("an id should mint")
+            .d_tag();
+
+        // Nothing came back at all.
+        assert_eq!(
+            coordinate_occupancy(
+                publisher.public_key(),
+                &pending,
+                Err("coordinate query failed".to_string()),
+            ),
+            CoordinateOccupancy::Indeterminate
+        );
+        // Some relays answered and none held the coordinate, but others never
+        // did, so absence is not established.
+        let partial = coordinate_occupancy(
+            publisher.public_key(),
+            &pending,
+            Ok(CoordinateQuery {
+                events: Vec::new(),
+                silent_relays: 1,
+            }),
+        );
+        assert_eq!(partial, CoordinateOccupancy::Indeterminate);
+
+        // Falling back to a fresh identity is the safe direction, so this is
+        // not an error: the publication proceeds under a new coordinate.
+        assert_eq!(pending_d_tag_to_resume(&pending, partial), Ok(None));
+        let identifier = resolve_new_game_identifier(None, None)
+            .expect("the fallback should mint a fresh identity");
+        assert_ne!(identifier.d_tag(), pending);
+    }
+
+    #[test]
+    fn one_relay_holding_the_coordinate_outranks_the_silent_ones() {
+        let publisher = Keys::generate();
+        let pending = resolve_new_game_identifier(None, None)
+            .expect("an id should mint")
+            .d_tag();
+
+        // Presence is positive evidence: it settles the question even though
+        // coverage was incomplete.
+        assert_eq!(
+            coordinate_occupancy(
+                publisher.public_key(),
+                &pending,
+                Ok(CoordinateQuery {
+                    events: vec![listing_event(&publisher, &pending)],
+                    silent_relays: 4,
+                }),
+            ),
+            CoordinateOccupancy::Occupied
+        );
+    }
+
+    #[test]
+    fn another_publishers_listing_never_occupies_this_publishers_coordinate() {
+        let publisher = Keys::generate();
+        let stranger = Keys::generate();
+        let pending = resolve_new_game_identifier(None, None)
+            .expect("an id should mint")
+            .d_tag();
+
+        // Coordinates are namespaced by publisher, so a relay answering with
+        // someone else's listing at the same `d` tag proves nothing about this
+        // publisher's coordinate.
+        assert_eq!(
+            coordinate_occupancy(
+                publisher.public_key(),
+                &pending,
+                Ok(CoordinateQuery {
+                    events: vec![listing_event(&stranger, &pending)],
+                    silent_relays: 0,
+                }),
+            ),
+            CoordinateOccupancy::ConfirmedAbsent
+        );
     }
 
     #[test]
@@ -2345,7 +3500,7 @@ mod tests {
         let publisher = nostr::Keys::generate().public_key();
         let game = GameCoordinate::new(
             publisher,
-            resolve_new_game_identifier(None).expect("first publication should mint an id"),
+            resolve_new_game_identifier(None, None).expect("first publication should mint an id"),
         );
 
         // The scope handed to provisioning and authorization, the listing `d`
@@ -2364,16 +3519,9 @@ mod tests {
             Some(d_tag)
         );
 
-        // No publish stage may reach past the resolved identity for its own copy.
-        let source = include_str!("adp_commands.rs");
-        assert!(!source.contains(concat!("request", ".d_tag")));
-        assert_eq!(
-            source
-                .matches(concat!("GameIdentifier::", "generate()"))
-                .count(),
-            1,
-            "exactly one place may mint a game identifier"
-        );
+        // PublishAdpListingRequest deliberately has no caller-supplied `d_tag`.
+        // Existing and pending identities cross separate, behaviorally tested gates
+        // before this single resolved coordinate reaches downstream publication.
     }
 
     #[test]
@@ -2381,7 +3529,7 @@ mod tests {
         let publisher = nostr::Keys::generate().public_key();
         let published = GameCoordinate::new(
             publisher,
-            resolve_new_game_identifier(None).expect("first publication should mint an id"),
+            resolve_new_game_identifier(None, None).expect("first publication should mint an id"),
         );
         let published_d_tag = published.d_tag();
 
@@ -2423,6 +3571,30 @@ mod tests {
     }
 
     #[test]
+    fn the_minted_identity_is_handed_over_before_any_step_that_can_fail() {
+        let source = include_str!("adp_commands.rs");
+        let pending_handoff = source
+            .find(r#""pending-coordinate","#)
+            .expect("the minted identity must be handed to the caller");
+        // Every step that provisions, hashes or publishes under this identity
+        // can fail, and each failure sends the publisher back to a retry.
+        for later in [
+            r#"emit_progress(&app, "hash-file", "pending""#,
+            r#"emit_progress(&app, "check-operator", "pending""#,
+            r#"emit_progress(&app, "provision", "pending""#,
+            r#"emit_progress(&app, "publish-listing", "pending""#,
+        ] {
+            let step = source
+                .find(later)
+                .unwrap_or_else(|| panic!("{later} should exist"));
+            assert!(
+                pending_handoff < step,
+                "{later} runs before the caller is told what identity it runs under"
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_listing_edits_preserve_unmanaged_tags() {
         assert!(is_publish_form_tag(&["title".into(), "Game".into()]));
         assert!(is_publish_form_tag(&[
@@ -2446,6 +3618,29 @@ mod tests {
     }
 
     #[test]
+    fn launch_default_is_replaced_instead_of_preserved() {
+        let existing = vec![
+            vec![
+                "launch_default".to_string(),
+                "stale-linux".to_string(),
+                "linux-x86_64".to_string(),
+            ],
+            vec![
+                "launch_default".to_string(),
+                "stale-windows".to_string(),
+                "windows-x86_64".to_string(),
+            ],
+            vec!["summary".to_string(), "Keep me".to_string()],
+        ];
+
+        assert!(FORM_MANAGED_LISTING_TAGS.contains(&"launch_default"));
+        assert_eq!(
+            preserved_listing_tags(&existing, false),
+            vec![vec!["summary".to_string(), "Keep me".to_string()]]
+        );
+    }
+
+    #[test]
     fn one_managed_tag_definition_covers_every_tag_the_form_republishes() {
         // Every tag name the core listing builder emits from form input, paired
         // with the field that drives it. If the builder gains a form-driven tag,
@@ -2462,6 +3657,9 @@ mod tests {
             "file_hash",
             "version",
             "lud16",
+            "package",
+            "launch",
+            "launch_default",
             "platform",
             "campaign",
             "nip94",
@@ -2649,6 +3847,8 @@ mod tests {
                 // `t` legitimately repeats: the mandatory game topic plus the
                 // form's own topics.
                 "t" => assert!(occurrences.len() <= 2),
+                // Target-scoped defaults legitimately repeat once per profile.
+                "launch_default" => {}
                 _ => assert!(
                     occurrences.len() <= 1,
                     "`{tag}` appeared {} times in the replacement listing",
@@ -2853,6 +4053,1158 @@ mod tests {
             .expect("listing event should sign")
     }
 
+    fn launch_tag(profile_id: &str, executable: &str, display_name: &str) -> Tag {
+        Tag::parse([
+            "launch",
+            profile_id,
+            executable,
+            ".",
+            "[]",
+            "game",
+            display_name,
+        ])
+        .expect("launch tag should parse")
+    }
+
+    fn authoritative_listing_event(
+        keys: &Keys,
+        kind: Kind,
+        d_tag: &str,
+        mut metadata_tags: Vec<Tag>,
+    ) -> nostr::Event {
+        let mut tags = vec![Tag::parse(["d", d_tag]).expect("d tag should parse")];
+        tags.append(&mut metadata_tags);
+        EventBuilder::new(kind, "authoritative listing")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("authoritative listing should sign")
+    }
+
+    fn authoritative_request(
+        keys: &Keys,
+        d_tag: &str,
+        expected_event_id: String,
+    ) -> LoadAuthoritativeAdpEditMetadataRequest {
+        LoadAuthoritativeAdpEditMetadataRequest {
+            expected_publisher_npub: keys
+                .public_key()
+                .to_bech32()
+                .expect("publisher npub should encode"),
+            d_tag: d_tag.to_owned(),
+            expected_event_id,
+        }
+    }
+
+    fn launch_profile(profile_id: &str, executable: &str) -> LaunchProfile {
+        LaunchProfile {
+            id: ProfileId::parse(profile_id).expect("profile ID should parse"),
+            display_name: profile_id.to_owned(),
+            executable: RelativePath::parse(executable).expect("executable should parse"),
+            working_dir: WorkingDir::parse(".").expect("working directory should parse"),
+            arguments: Vec::new(),
+            launch_type: LaunchType::Game,
+        }
+    }
+
+    #[test]
+    fn managed_family_filter_removes_every_package_and_launch_occurrence() {
+        let unknown_tags = vec![
+            vec!["summary".to_owned(), "unchanged\0bytes".to_owned()],
+            vec!["x-future".to_owned(), "alpha".to_owned(), "beta".to_owned()],
+        ];
+        let authoritative_tags = vec![
+            vec!["package".to_owned(), "zip".to_owned()],
+            vec!["package".to_owned(), "tar.gz".to_owned()],
+            vec!["platform".to_owned(), "linux-x86_64".to_owned()],
+            vec!["platform".to_owned()],
+            vec![
+                "launch".to_owned(),
+                "play".to_owned(),
+                "bin/game".to_owned(),
+                ".".to_owned(),
+                "[]".to_owned(),
+                "game".to_owned(),
+                "Play".to_owned(),
+            ],
+            vec![
+                "launch".to_owned(),
+                "safe".to_owned(),
+                "bin/safe".to_owned(),
+                ".".to_owned(),
+                "[]".to_owned(),
+                "game".to_owned(),
+                "Safe".to_owned(),
+            ],
+            vec![
+                "launch".to_owned(),
+                "server".to_owned(),
+                "bin/server".to_owned(),
+                ".".to_owned(),
+                "[]".to_owned(),
+                "server".to_owned(),
+                "Server".to_owned(),
+            ],
+            vec![
+                "launch".to_owned(),
+                "play".to_owned(),
+                "bin/duplicate".to_owned(),
+                ".".to_owned(),
+                "[]".to_owned(),
+                "game".to_owned(),
+                "Duplicate play".to_owned(),
+            ],
+            vec!["launch".to_owned()],
+            unknown_tags[0].clone(),
+            unknown_tags[1].clone(),
+        ];
+
+        let preserved = preserved_listing_tags(&authoritative_tags, false);
+
+        assert_eq!(preserved, unknown_tags);
+        assert!(preserved.iter().all(|tag| {
+            !matches!(
+                tag.first().map(String::as_str),
+                Some("package" | "launch" | "platform")
+            )
+        }));
+    }
+
+    #[test]
+    fn target_scoped_defaults_replace_stale_form_managed_claims() {
+        let existing = vec![
+            vec!["launch_default".to_owned(), "stale".to_owned()],
+            vec!["summary".to_owned(), "preserved".to_owned()],
+        ];
+        let mut listing = retry_listing_input(&existing, Vec::new());
+        listing.platforms.clear();
+        let linux = PlatformTarget {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+        };
+        let windows = PlatformTarget {
+            os: "windows".to_owned(),
+            arch: "x86_64".to_owned(),
+        };
+        let profiles = vec![
+            launch_profile("linux-play", "bin/linux-game"),
+            launch_profile("windows-play", "bin/windows-game.exe"),
+        ];
+        let tier = arcadestr_core::adp_publish_contract::AdpLaunchTierIntent {
+            package_format: PackageFormat::Zip,
+            platforms: vec![linux.clone(), windows.clone()],
+            launch_profiles: profiles.clone(),
+            publisher_defaults: vec![
+                arcadestr_core::adp_publish_contract::PublisherLaunchDefault {
+                    profile_id: profiles[0].id.clone(),
+                    targets: vec![linux],
+                },
+                arcadestr_core::adp_publish_contract::PublisherLaunchDefault {
+                    profile_id: profiles[1].id.clone(),
+                    targets: vec![windows],
+                },
+            ],
+        };
+
+        let event = build_adp_listing_event_builder(AdpListingPublishInput {
+            listing: &listing,
+            launch_tier: Some(&tier),
+        })
+        .expect("scoped publication should build")
+        .sign_with_keys(&Keys::generate())
+        .expect("listing should sign");
+
+        assert_eq!(
+            listing_event_tags(&event, "launch_default"),
+            vec![
+                vec![
+                    "launch_default".to_owned(),
+                    "linux-play".to_owned(),
+                    "linux-x86_64".to_owned(),
+                ],
+                vec![
+                    "launch_default".to_owned(),
+                    "windows-play".to_owned(),
+                    "windows-x86_64".to_owned(),
+                ],
+            ]
+        );
+        assert_eq!(
+            listing_event_tags(&event, "summary"),
+            vec![vec!["summary".to_owned(), "preserved".to_owned()]]
+        );
+    }
+
+    #[test]
+    fn download_only_filter_is_harmless_to_unmanaged_tags_and_emits_no_launch_tier() {
+        let unmanaged_tags = vec![
+            vec!["summary".to_owned(), "Download only".to_owned()],
+            vec!["x-preserve".to_owned(), "one".to_owned(), "two".to_owned()],
+        ];
+        let authoritative_tags = vec![
+            vec!["d".to_owned(), "download-only".to_owned()],
+            vec!["server".to_owned(), "https://old.example.com".to_owned()],
+            vec!["file_hash".to_owned(), RETRY_TEST_SHA256.to_owned()],
+            vec!["version".to_owned(), "old".to_owned()],
+            vec!["platform".to_owned(), "linux-x86_64".to_owned()],
+            unmanaged_tags[0].clone(),
+            unmanaged_tags[1].clone(),
+        ];
+        let preserved = preserved_listing_tags(&authoritative_tags, false);
+        let mut input = retry_listing_input(&authoritative_tags, Vec::new());
+        input.preserved_tags = preserved.clone();
+
+        let event = retry_listing_event(&input);
+
+        assert_eq!(preserved, unmanaged_tags);
+        assert!(listing_event_tags(&event, "package").is_empty());
+        assert!(listing_event_tags(&event, "launch").is_empty());
+        assert_eq!(
+            listing_event_tags(&event, "summary"),
+            vec![unmanaged_tags[0].clone()]
+        );
+        assert_eq!(
+            listing_event_tags(&event, "x-preserve"),
+            vec![unmanaged_tags[1].clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_three_profiles_replaces_stale_launch_tags_and_resolves_exactly() {
+        let authoritative_keys = Keys::generate();
+        let authoritative = authoritative_listing_event(
+            &authoritative_keys,
+            Kind::Custom(30402),
+            "managed-edit",
+            vec![
+                Tag::parse(["server", "https://old.example.com"]).expect("server tag should parse"),
+                Tag::parse(["file_hash", RETRY_TEST_SHA256]).expect("file hash tag should parse"),
+                Tag::parse(["version", "old-version"]).expect("version tag should parse"),
+                Tag::parse(["platform", "linux-x86_64"]).expect("platform tag should parse"),
+                Tag::parse(["package", "tar.gz"]).expect("package tag should parse"),
+                launch_tag("play", "bin/old-game", "play"),
+                launch_tag("safe", "bin/safe", "safe"),
+                launch_tag("server", "bin/server", "server"),
+                Tag::parse(["launch_default", "safe"]).expect("launch_default tag should parse"),
+                Tag::parse(["x-preserve", "opaque", "bytes"]).expect("unmanaged tag should parse"),
+            ],
+        );
+        let request = authoritative_request(
+            &authoritative_keys,
+            "managed-edit",
+            authoritative.id.to_hex(),
+        );
+        let metadata = decode_verified_authoritative_edit_metadata(
+            &request,
+            authoritative_keys.public_key(),
+            &authoritative,
+        )
+        .expect("authoritative edit metadata should decode");
+        let intended_profiles = vec![
+            launch_profile("play", "bin/new-game"),
+            launch_profile("safe", "bin/safe"),
+            launch_profile("server", "bin/server"),
+        ];
+        let extension = publish_extension(intended_profiles.clone(), &[]);
+
+        assert_eq!(
+            enforce_authoritative_profile_removals(&metadata, &extension),
+            Ok(())
+        );
+
+        let authoritative_tags = authoritative
+            .tags
+            .iter()
+            .map(|tag| tag.clone().to_vec())
+            .collect::<Vec<_>>();
+        let preserved_tags = preserved_listing_tags(&authoritative_tags, false);
+        let listing = AdpListingInput {
+            d_tag: "managed-edit".to_owned(),
+            title: "Edited Game".to_owned(),
+            description: "Current description".to_owned(),
+            price_sats: 0,
+            lud16: None,
+            tags: Vec::new(),
+            images: Vec::new(),
+            servers: vec!["https://dist.example.com".to_owned()],
+            file_hash: Some(RETRY_TEST_SHA256.to_owned()),
+            version: Some("current-version".to_owned()),
+            fulfillment_authorizations: Vec::new(),
+            acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Public,
+            platforms: Vec::new(),
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+            preserved_tags,
+        };
+        let signer = CountingSigner::new();
+        let unsigned = build_adp_listing_event_builder(AdpListingPublishInput {
+            listing: &listing,
+            launch_tier: extension.launch_tier.as_ref(),
+        })
+        .expect("edited listing should build")
+        .build(signer.keys.public_key());
+        assert_eq!(validate_adp_listing_unsigned_event(&unsigned), Ok(()));
+
+        let edited = validate_and_sign_adp_listing(&signer, unsigned)
+            .await
+            .expect("validated edit should sign");
+        let expected_launch_tags = vec![
+            vec![
+                "launch".to_owned(),
+                "play".to_owned(),
+                "bin/new-game".to_owned(),
+                ".".to_owned(),
+                "[]".to_owned(),
+                "game".to_owned(),
+                "play".to_owned(),
+            ],
+            vec![
+                "launch".to_owned(),
+                "safe".to_owned(),
+                "bin/safe".to_owned(),
+                ".".to_owned(),
+                "[]".to_owned(),
+                "game".to_owned(),
+                "safe".to_owned(),
+            ],
+            vec![
+                "launch".to_owned(),
+                "server".to_owned(),
+                "bin/server".to_owned(),
+                ".".to_owned(),
+                "[]".to_owned(),
+                "game".to_owned(),
+                "server".to_owned(),
+            ],
+        ];
+
+        assert_eq!(signer.calls(), 1);
+        assert_eq!(
+            listing_event_tags(&edited, "package"),
+            vec![vec!["package".to_owned(), "zip".to_owned()]]
+        );
+        assert_eq!(listing_event_tags(&edited, "launch"), expected_launch_tags);
+        assert_eq!(
+            listing_event_tags(&edited, "launch_default"),
+            vec![vec!["launch_default".to_owned(), "play".to_owned()]]
+        );
+        assert_eq!(
+            listing_event_tags(&edited, "x-preserve"),
+            vec![vec![
+                "x-preserve".to_owned(),
+                "opaque".to_owned(),
+                "bytes".to_owned(),
+            ]]
+        );
+        assert!(!edited.tags.iter().map(Tag::as_slice).any(|tag| {
+            tag.get(1).is_some_and(|value| {
+                value == "tar.gz" || value == "bin/old-game" || value == "old-version"
+            })
+        }));
+        assert_eq!(
+            listing_event_tags(&edited, "launch")[0],
+            vec![
+                "launch".to_owned(),
+                "play".to_owned(),
+                "bin/new-game".to_owned(),
+                ".".to_owned(),
+                "[]".to_owned(),
+                "game".to_owned(),
+                "play".to_owned(),
+            ]
+        );
+
+        let resolved = resolve_install_plan(
+            &edited,
+            &PlatformTarget {
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+            },
+        )
+        .expect("signed edited listing should resolve");
+        assert_eq!(resolved.plan.artifact.package_format, PackageFormat::Zip);
+        assert_eq!(resolved.plan.launch_profiles, intended_profiles);
+        assert_eq!(
+            resolved
+                .plan
+                .publisher_default_profile_id
+                .as_ref()
+                .map(ProfileId::as_str),
+            Some("play")
+        );
+        assert!(resolved.discarded_profiles.is_empty());
+    }
+
+    #[test]
+    fn authoritative_three_profile_event_is_present_without_loss() {
+        let keys = Keys::generate();
+        let raw_launch_tags = [
+            vec!["launch", "play", "bin/game", ".", "[]", "game", "Play"],
+            vec![
+                "launch",
+                "safe",
+                "bin/game-safe",
+                ".",
+                "[]",
+                "game",
+                "Safe mode",
+            ],
+            vec![
+                "launch",
+                "server",
+                "bin/server",
+                ".",
+                "[]",
+                "game",
+                "Server",
+            ],
+        ];
+        let event = authoritative_listing_event(
+            &keys,
+            Kind::Custom(30402),
+            "game",
+            vec![
+                Tag::parse(["package", "zip"]).expect("package tag should parse"),
+                Tag::parse(["platform", "linux-x86_64"]).expect("platform tag should parse"),
+                launch_tag("play", "bin/game", "Play"),
+                launch_tag("safe", "bin/game-safe", "Safe mode"),
+                launch_tag("server", "bin/server", "Server"),
+                Tag::parse(["launch_default", "play"]).expect("launch_default tag should parse"),
+            ],
+        );
+        let request = authoritative_request(&keys, "game", event.id.to_hex());
+
+        let metadata =
+            decode_verified_authoritative_edit_metadata(&request, keys.public_key(), &event)
+                .expect("valid authoritative metadata should decode");
+        let AuthoritativeAdpEditMetadata::Present(metadata) = metadata else {
+            panic!("three-profile launch tier should be present");
+        };
+        let launches = metadata
+            .tags
+            .iter()
+            .filter_map(|tag| match tag {
+                arcadestr_core::adp_publish_contract::AuthoritativeAdpEditTag::Launch {
+                    raw,
+                    profile,
+                    ..
+                } => Some((raw, profile)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(launches.len(), 3);
+        for (index, expected_raw) in raw_launch_tags.iter().enumerate() {
+            let expected_raw = expected_raw
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            assert_eq!(launches[index].0, &expected_raw);
+            let profile = launches[index]
+                .1
+                .as_ref()
+                .expect("valid launch tag should expose a typed profile");
+            assert_eq!(profile.id.as_str(), expected_raw[1]);
+            assert_eq!(profile.executable.as_str(), expected_raw[2]);
+            assert_eq!(profile.working_dir.as_str(), expected_raw[3]);
+            assert!(profile.arguments.is_empty());
+            assert_eq!(profile.launch_type, LaunchType::Game);
+            assert_eq!(profile.display_name, expected_raw[6]);
+        }
+        assert_eq!(
+            metadata
+                .publisher_defaults
+                .first()
+                .map(|default| default.profile_id.as_str()),
+            Some("play")
+        );
+        assert_eq!(
+            metadata.publisher_defaults[0].targets,
+            vec![PlatformTarget {
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+            }]
+        );
+        assert!(metadata.defects.is_empty());
+    }
+
+    #[test]
+    fn authoritative_download_only_event_is_successful_absent() {
+        let keys = Keys::generate();
+        let file_hash = "11".repeat(32);
+        let event = authoritative_listing_event(
+            &keys,
+            Kind::Custom(30402),
+            "download",
+            vec![Tag::parse(["file_hash", file_hash.as_str()]).expect("file hash tag should parse")],
+        );
+        let request = authoritative_request(&keys, "download", event.id.to_hex());
+
+        assert_eq!(
+            decode_verified_authoritative_edit_metadata(&request, keys.public_key(), &event),
+            Ok(AuthoritativeAdpEditMetadata::Absent)
+        );
+    }
+
+    #[test]
+    fn malformed_launch_tier_is_successful_present_with_defects() {
+        let keys = Keys::generate();
+        let event = authoritative_listing_event(
+            &keys,
+            Kind::Custom(30402),
+            "malformed",
+            vec![Tag::parse(["package", "unknown"]).expect("package tag should parse")],
+        );
+        let request = authoritative_request(&keys, "malformed", event.id.to_hex());
+
+        let result =
+            decode_verified_authoritative_edit_metadata(&request, keys.public_key(), &event);
+
+        assert!(matches!(
+            result,
+            Ok(AuthoritativeAdpEditMetadata::Present(metadata)) if !metadata.defects.is_empty()
+        ));
+    }
+
+    #[test]
+    fn refetch_failure_and_not_found_are_typed_and_never_absent() {
+        let coordinate = "30402:publisher:missing";
+
+        assert_eq!(
+            map_authoritative_refetch(Err("relay offline".to_owned()), coordinate),
+            Err(PublishAdpListingError::AuthoritativeRelayRefetchFailure {
+                message: "relay offline".to_owned(),
+            })
+        );
+        assert_eq!(
+            map_authoritative_refetch(Ok(None), coordinate),
+            Err(PublishAdpListingError::AuthoritativeListingNotFound {
+                coordinate: coordinate.to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn authoritative_identity_and_coordinate_mismatches_are_exact_typed_errors() {
+        let keys = Keys::generate();
+        let other = Keys::generate();
+        let event = authoritative_listing_event(&keys, Kind::Custom(30402), "game", Vec::new());
+        let request = authoritative_request(&keys, "game", event.id.to_hex());
+
+        let other_request = authoritative_request(&other, "game", event.id.to_hex());
+        assert_eq!(
+            decode_verified_authoritative_edit_metadata(&other_request, other.public_key(), &event,),
+            Err(PublishAdpListingError::AuthoritativePublisherMismatch {
+                expected_publisher_npub: other_request.expected_publisher_npub,
+                actual_publisher_hex: keys.public_key().to_hex(),
+            })
+        );
+
+        let wrong_d_tag = authoritative_request(&keys, "other-game", event.id.to_hex());
+        assert_eq!(
+            decode_verified_authoritative_edit_metadata(&wrong_d_tag, keys.public_key(), &event),
+            Err(PublishAdpListingError::AuthoritativeCoordinateMismatch {
+                expected_d_tag: "other-game".to_owned(),
+                actual_d_tags: vec!["game".to_owned()],
+            })
+        );
+
+        let wrong_kind = authoritative_listing_event(&keys, Kind::TextNote, "game", Vec::new());
+        let wrong_kind_request = authoritative_request(&keys, "game", wrong_kind.id.to_hex());
+        assert_eq!(
+            decode_verified_authoritative_edit_metadata(
+                &wrong_kind_request,
+                keys.public_key(),
+                &wrong_kind,
+            ),
+            Err(PublishAdpListingError::AuthoritativeKindMismatch {
+                expected: 30402,
+                actual: Kind::TextNote.as_u16(),
+            })
+        );
+
+        let stale_request = authoritative_request(&keys, "game", "00".repeat(32));
+        assert_eq!(
+            decode_verified_authoritative_edit_metadata(&stale_request, keys.public_key(), &event),
+            Err(PublishAdpListingError::StaleExpectedEventId {
+                expected_event_id: "00".repeat(32),
+                actual_event_id: event.id.to_hex(),
+            })
+        );
+
+        let invalid_id = nostr::Event::new(
+            nostr::EventId::all_zeros(),
+            event.pubkey,
+            event.created_at,
+            event.kind,
+            event.tags.iter().cloned().collect::<Vec<_>>(),
+            event.content.clone(),
+            event.sig,
+        );
+        let invalid_id_request =
+            authoritative_request(&keys, "game", nostr::EventId::all_zeros().to_hex());
+        assert_eq!(
+            decode_verified_authoritative_edit_metadata(
+                &invalid_id_request,
+                keys.public_key(),
+                &invalid_id,
+            ),
+            Err(PublishAdpListingError::AuthoritativeEventIdInvalid {
+                event_id: nostr::EventId::all_zeros().to_hex(),
+            })
+        );
+
+        let unrelated =
+            authoritative_listing_event(&other, Kind::Custom(30402), "game", Vec::new());
+        let invalid_signature = nostr::Event::new(
+            event.id,
+            event.pubkey,
+            event.created_at,
+            event.kind,
+            event.tags.iter().cloned().collect::<Vec<_>>(),
+            event.content.clone(),
+            unrelated.sig,
+        );
+        assert_eq!(
+            decode_verified_authoritative_edit_metadata(
+                &request,
+                keys.public_key(),
+                &invalid_signature,
+            ),
+            Err(PublishAdpListingError::AuthoritativeSignatureInvalid {
+                event_id: event.id.to_hex(),
+            })
+        );
+    }
+
+    fn publish_extension(
+        incoming_profiles: Vec<LaunchProfile>,
+        acknowledged: &[&str],
+    ) -> PublishAdpListingRequestExtension {
+        let publisher_default_profile_id = incoming_profiles
+            .iter()
+            .find(|profile| profile.launch_type == LaunchType::Game)
+            .map(|profile| profile.id.clone())
+            .unwrap_or_else(|| ProfileId::parse("play").expect("test default profile ID"));
+        PublishAdpListingRequestExtension {
+            launch_tier: Some(arcadestr_core::adp_publish_contract::AdpLaunchTierIntent {
+                package_format: arcadestr_core::distribution::PackageFormat::Zip,
+                platforms: vec![arcadestr_core::distribution::PlatformTarget {
+                    os: "linux".to_owned(),
+                    arch: "x86_64".to_owned(),
+                }],
+                launch_profiles: incoming_profiles,
+                publisher_defaults: vec![
+                    arcadestr_core::adp_publish_contract::PublisherLaunchDefault {
+                        profile_id: publisher_default_profile_id,
+                        targets: vec![arcadestr_core::distribution::PlatformTarget {
+                            os: "linux".to_owned(),
+                            arch: "x86_64".to_owned(),
+                        }],
+                    },
+                ],
+            }),
+            acknowledged_removed_profile_ids: acknowledged
+                .iter()
+                .map(|profile_id| ProfileId::parse(profile_id).expect("profile ID should parse"))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn selected_build_preflight_enforces_artifact_source_boundaries() {
+        let mut request = PublishAdpListingRequest {
+            expected_publisher_npub: "npub1publisher".to_owned(),
+            existing_event_id: None,
+            existing_d_tag: None,
+            pending_d_tag: None,
+            title: "Game".to_owned(),
+            description: "Description".to_owned(),
+            price_sats: 0,
+            lud16: None,
+            tags: Vec::new(),
+            images: Vec::new(),
+            fulfillment_mode: FulfillmentMode::None,
+            operator_url: None,
+            servers: Vec::new(),
+            file_path: None,
+            selected_build: None,
+            existing_file_hash: None,
+            existing_fulfillment_pubkey: None,
+            version: None,
+            acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Public,
+            platforms: Vec::new(),
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+        };
+
+        assert_eq!(
+            validate_selected_build_requirement(
+                &request,
+                &PublishAdpListingRequestExtension::default(),
+            ),
+            Ok(())
+        );
+
+        request.fulfillment_mode = FulfillmentMode::Direct;
+        assert!(matches!(
+            validate_selected_build_requirement(
+                &request,
+                &PublishAdpListingRequestExtension::default(),
+            ),
+            Err(PublishAdpListingError::Archive {
+                error: arcadestr_core::archive_inspection_contract::ArchiveSelectionError::SelectedBuildRequired,
+            })
+        ));
+
+        request.fulfillment_mode = FulfillmentMode::None;
+        assert!(matches!(
+            validate_selected_build_requirement(&request, &publish_extension(Vec::new(), &[])),
+            Err(PublishAdpListingError::Archive {
+                error: arcadestr_core::archive_inspection_contract::ArchiveSelectionError::SelectedBuildRequired,
+            })
+        ));
+
+        request.existing_file_hash = Some(RETRY_TEST_SHA256.to_string());
+        assert!(matches!(
+            validate_selected_build_requirement(
+                &request,
+                &PublishAdpListingRequestExtension::default(),
+            ),
+            Err(PublishAdpListingError::Other { .. })
+        ));
+        request.existing_file_hash = None;
+
+        request.selected_build = Some(
+            serde_json::from_value(json!({
+                "selection_id": "123e4567-e89b-42d3-a456-426614174000",
+                "sha256": RETRY_TEST_SHA256,
+            }))
+            .expect("selected build fixture should deserialize"),
+        );
+        assert!(matches!(
+            validate_selected_build_requirement(
+                &request,
+                &PublishAdpListingRequestExtension::default(),
+            ),
+            Err(PublishAdpListingError::Other { .. })
+        ));
+
+        request.fulfillment_mode = FulfillmentMode::Direct;
+        assert_eq!(
+            validate_selected_build_requirement(
+                &request,
+                &PublishAdpListingRequestExtension::default(),
+            ),
+            Ok(())
+        );
+        request.file_path = Some("/caller/controlled.zip".to_string());
+        assert!(matches!(
+            validate_selected_build_requirement(
+                &request,
+                &PublishAdpListingRequestExtension::default(),
+            ),
+            Err(PublishAdpListingError::Other { message })
+                if message.contains("ambiguous")
+        ));
+
+        request.selected_build = None;
+        assert!(matches!(
+            validate_selected_build_requirement(
+                &request,
+                &PublishAdpListingRequestExtension::default(),
+            ),
+            Err(PublishAdpListingError::Other { message })
+                if message.contains("file_path")
+        ));
+    }
+
+    #[test]
+    fn launch_tier_requires_a_resolved_file_hash_before_side_effects() {
+        let extension = publish_extension(Vec::new(), &[]);
+
+        assert_eq!(
+            require_launch_tier_file_hash(&extension, None),
+            Err(PublishAdpListingError::CoreValidation {
+                violation: AdpPublishValidationViolation::InvalidFileHash,
+                message: "a launch tier requires a resolved file_hash".to_string(),
+            })
+        );
+        assert_eq!(
+            require_launch_tier_file_hash(&extension, Some(RETRY_TEST_SHA256)),
+            Ok(())
+        );
+        assert_eq!(
+            require_launch_tier_file_hash(&PublishAdpListingRequestExtension::default(), None,),
+            Ok(())
+        );
+
+        let source = include_str!("adp_commands.rs");
+        let pipeline = source
+            .split("async fn publish_adp_listing_pipeline_inner")
+            .nth(1)
+            .and_then(|source| source.split("async fn validate_current_attestation").next())
+            .expect("publication pipeline boundaries");
+        let guard = pipeline
+            .find("require_launch_tier_file_hash(")
+            .expect("resolved file-hash invariant guard");
+        for side_effect in [
+            "resolve_active_signer(",
+            ".get_public_key()",
+            "resolve_provisioning(",
+            "publish_event(",
+            ".upload_with_progress(",
+        ] {
+            let side_effect = pipeline
+                .find(side_effect)
+                .unwrap_or_else(|| panic!("pipeline should contain {side_effect}"));
+            assert!(
+                guard < side_effect,
+                "file-hash guard must precede {side_effect}"
+            );
+        }
+    }
+
+    fn artifact_reuse_request(hash: Option<&str>, servers: &[&str]) -> PublishAdpListingRequest {
+        PublishAdpListingRequest {
+            expected_publisher_npub: "npub1publisher".to_owned(),
+            existing_event_id: Some("event-id".to_owned()),
+            existing_d_tag: Some("game".to_owned()),
+            pending_d_tag: None,
+            title: "Game".to_owned(),
+            description: "Description".to_owned(),
+            price_sats: 0,
+            lud16: None,
+            tags: Vec::new(),
+            images: Vec::new(),
+            fulfillment_mode: FulfillmentMode::Direct,
+            operator_url: None,
+            servers: servers.iter().map(|server| (*server).to_owned()).collect(),
+            file_path: None,
+            selected_build: None,
+            existing_file_hash: hash.map(str::to_owned),
+            existing_fulfillment_pubkey: None,
+            version: Some("1.0.0".to_owned()),
+            acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Public,
+            platforms: Vec::new(),
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+        }
+    }
+
+    #[test]
+    fn authoritative_artifact_reuse_requires_one_exact_hash_and_no_added_server() {
+        let keys = Keys::generate();
+        let reuse_request =
+            artifact_reuse_request(Some(RETRY_TEST_SHA256), &["https://one.example"]);
+        assert_eq!(
+            validate_selected_build_requirement(
+                &reuse_request,
+                &PublishAdpListingRequestExtension::default(),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_selected_build_requirement(
+                &reuse_request,
+                &publish_extension(Vec::new(), &[]),
+            ),
+            Ok(())
+        );
+
+        let authoritative = authoritative_listing_event(
+            &keys,
+            Kind::Custom(30402),
+            "game",
+            vec![
+                Tag::parse(["file_hash", RETRY_TEST_SHA256]).expect("file hash tag should parse"),
+                Tag::parse(["server", "https://one.example"]).expect("server tag should parse"),
+            ],
+        );
+        assert_eq!(
+            authoritative_reused_file_hash(
+                &artifact_reuse_request(Some(RETRY_TEST_SHA256), &["https://one.example"]),
+                &authoritative,
+            ),
+            Ok(Some(RETRY_TEST_SHA256.to_owned()))
+        );
+        let resolved = authoritative_reused_file_hash(
+            &artifact_reuse_request(Some(RETRY_TEST_SHA256), &["https://one.example"]),
+            &authoritative,
+        )
+        .expect("legitimate metadata-only edit should preserve artifact reuse");
+        assert_eq!(
+            require_launch_tier_file_hash(&publish_extension(Vec::new(), &[]), resolved.as_deref()),
+            Ok(())
+        );
+        assert_eq!(
+            authoritative_reused_file_hash(
+                &artifact_reuse_request(Some(RETRY_TEST_SHA256), &[]),
+                &authoritative,
+            ),
+            Ok(Some(RETRY_TEST_SHA256.to_owned()))
+        );
+
+        let changed_hash = "11".repeat(32);
+        assert!(matches!(
+            authoritative_reused_file_hash(
+                &artifact_reuse_request(Some(&changed_hash), &["https://one.example"]),
+                &authoritative,
+            ),
+            Err(PublishAdpListingError::Other { .. })
+        ));
+        assert!(matches!(
+            authoritative_reused_file_hash(
+                &artifact_reuse_request(None, &["https://one.example"]),
+                &authoritative,
+            ),
+            Err(PublishAdpListingError::Other { .. })
+        ));
+        assert!(matches!(
+            authoritative_reused_file_hash(
+                &artifact_reuse_request(Some(RETRY_TEST_SHA256), &["https://two.example"]),
+                &authoritative,
+            ),
+            Err(PublishAdpListingError::Archive {
+                error: arcadestr_core::archive_inspection_contract::ArchiveSelectionError::SelectedBuildRequired,
+            })
+        ));
+
+        for tags in [
+            Vec::new(),
+            vec![Tag::parse(["file_hash"]).expect("short tag should parse")],
+            vec![
+                Tag::parse(["file_hash", RETRY_TEST_SHA256]).expect("file hash tag should parse"),
+                Tag::parse(["file_hash", RETRY_TEST_SHA256])
+                    .expect("duplicate file hash tag should parse"),
+            ],
+            vec![Tag::parse(["file_hash", "not-a-digest"])
+                .expect("malformed digest tag should still parse")],
+        ] {
+            let malformed = authoritative_listing_event(&keys, Kind::Custom(30402), "game", tags);
+            assert!(matches!(
+                authoritative_reused_file_hash(
+                    &artifact_reuse_request(Some(RETRY_TEST_SHA256), &["https://one.example"],),
+                    &malformed,
+                ),
+                Err(PublishAdpListingError::Other { .. })
+            ));
+        }
+    }
+
+    fn authoritative_launch_metadata(
+        keys: &Keys,
+        launch_tags: Vec<Tag>,
+    ) -> AuthoritativeAdpEditMetadata {
+        let mut tags = vec![
+            Tag::parse(["package", "zip"]).expect("package tag should parse"),
+            Tag::parse(["platform", "linux-x86_64"]).expect("platform tag should parse"),
+        ];
+        tags.extend(launch_tags);
+        let event = authoritative_listing_event(keys, Kind::Custom(30402), "game", tags);
+        let request = authoritative_request(keys, "game", event.id.to_hex());
+        decode_verified_authoritative_edit_metadata(&request, keys.public_key(), &event)
+            .expect("authoritative event should verify and decode")
+    }
+
+    #[test]
+    fn one_removed_profile_without_acknowledgement_returns_exact_typed_id() {
+        let keys = Keys::generate();
+        let metadata = authoritative_launch_metadata(
+            &keys,
+            vec![launch_tag("legacy", "bin/legacy", "Legacy")],
+        );
+
+        assert_eq!(
+            enforce_authoritative_profile_removals(&metadata, &publish_extension(Vec::new(), &[]),),
+            Err(
+                PublishAdpListingError::ProfileRemovalAcknowledgementRequired {
+                    removed_profile_ids: vec![
+                        ProfileId::parse("legacy").expect("profile ID should parse")
+                    ],
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn partial_acknowledgement_returns_the_full_current_removed_set() {
+        let keys = Keys::generate();
+        let metadata = authoritative_launch_metadata(
+            &keys,
+            vec![
+                launch_tag("first", "bin/first", "First"),
+                launch_tag("second", "bin/second", "Second"),
+            ],
+        );
+
+        assert_eq!(
+            enforce_authoritative_profile_removals(
+                &metadata,
+                &publish_extension(Vec::new(), &["first"]),
+            ),
+            Err(
+                PublishAdpListingError::ProfileRemovalAcknowledgementRequired {
+                    removed_profile_ids: vec![
+                        ProfileId::parse("first").expect("profile ID should parse"),
+                        ProfileId::parse("second").expect("profile ID should parse"),
+                    ],
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn acknowledging_all_current_removals_permits_publication() {
+        let keys = Keys::generate();
+        let metadata = authoritative_launch_metadata(
+            &keys,
+            vec![
+                launch_tag("first", "bin/first", "First"),
+                launch_tag("second", "bin/second", "Second"),
+            ],
+        );
+
+        assert_eq!(
+            enforce_authoritative_profile_removals(
+                &metadata,
+                &publish_extension(Vec::new(), &["second", "first", "first"]),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn stale_acknowledgement_does_not_conceal_a_new_current_removal() {
+        let keys = Keys::generate();
+        let metadata = authoritative_launch_metadata(
+            &keys,
+            vec![launch_tag("newly-removed", "bin/old", "Old")],
+        );
+
+        assert_eq!(
+            enforce_authoritative_profile_removals(
+                &metadata,
+                &publish_extension(Vec::new(), &["stale"]),
+            ),
+            Err(
+                PublishAdpListingError::ProfileRemovalAcknowledgementRequired {
+                    removed_profile_ids: vec![
+                        ProfileId::parse("newly-removed").expect("profile ID should parse")
+                    ],
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn changed_executable_with_the_same_id_passes_live_enforcement() {
+        let keys = Keys::generate();
+        let metadata =
+            authoritative_launch_metadata(&keys, vec![launch_tag("play", "old/game", "Play")]);
+
+        assert_eq!(
+            enforce_authoritative_profile_removals(
+                &metadata,
+                &publish_extension(vec![launch_profile("play", "new/game")], &[]),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn removed_ids_use_only_valid_authoritative_ids_in_first_occurrence_order() {
+        let keys = Keys::generate();
+        let metadata = authoritative_launch_metadata(
+            &keys,
+            vec![
+                launch_tag("legacy-b", "bin/b", "B"),
+                launch_tag("INVALID", "bin/ignored", "Ignored"),
+                launch_tag("legacy-a", "bin/a", "A"),
+                launch_tag("legacy-b", "bin/b2", "B duplicate"),
+                launch_tag("kept", "bin/kept", "Kept"),
+            ],
+        );
+
+        let removed =
+            removed_authoritative_profile_ids(&metadata, &[launch_profile("kept", "bin/new-kept")]);
+
+        assert_eq!(
+            removed,
+            vec![
+                ProfileId::parse("legacy-b").expect("profile ID should parse"),
+                ProfileId::parse("legacy-a").expect("profile ID should parse"),
+            ]
+        );
+    }
+
+    #[test]
+    fn absent_authoritative_tier_has_no_removals() {
+        let keys = Keys::generate();
+        let event = authoritative_listing_event(&keys, Kind::Custom(30402), "game", Vec::new());
+        let request = authoritative_request(&keys, "game", event.id.to_hex());
+        let metadata =
+            decode_verified_authoritative_edit_metadata(&request, keys.public_key(), &event)
+                .expect("authoritative event should decode as absent");
+
+        assert_eq!(
+            enforce_authoritative_profile_removals(
+                &metadata,
+                &PublishAdpListingRequestExtension::default(),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn legacy_edit_with_default_extension_cannot_strip_authoritative_profiles() {
+        let keys = Keys::generate();
+        let metadata =
+            authoritative_launch_metadata(&keys, vec![launch_tag("play", "bin/game", "Play")]);
+
+        assert_eq!(
+            enforce_authoritative_profile_removals(
+                &metadata,
+                &PublishAdpListingRequestExtension::default(),
+            ),
+            Err(
+                PublishAdpListingError::ProfileRemovalAcknowledgementRequired {
+                    removed_profile_ids: vec![
+                        ProfileId::parse("play").expect("profile ID should parse")
+                    ],
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn removal_enforcement_precedes_all_publication_side_effect_paths() {
+        let source = include_str!("adp_commands.rs");
+        let pipeline = source
+            .split("async fn publish_adp_listing_pipeline_inner")
+            .nth(1)
+            .and_then(|source| source.split("async fn validate_current_attestation").next())
+            .expect("publication pipeline should have stable structural boundaries");
+        let enforcement = pipeline
+            .find("enforce_authoritative_profile_removals(")
+            .expect("shared pipeline must enforce removals");
+
+        for side_effect in [
+            "resolve_active_signer(",
+            "resolve_provisioning(",
+            ".provision(",
+            "validate_and_sign_adp_listing(",
+            ".upload",
+        ] {
+            let side_effect = pipeline
+                .find(side_effect)
+                .unwrap_or_else(|| panic!("pipeline should contain {side_effect}"));
+            assert!(
+                enforcement < side_effect,
+                "enforcement must precede {side_effect}"
+            );
+        }
+    }
+
     #[test]
     fn replaceable_selector_uses_lower_id_for_equal_timestamp_in_any_arrival_order() {
         let keys = Keys::generate();
@@ -2879,17 +5231,6 @@ mod tests {
             .expect("events should select a winner");
 
         assert_eq!(selected.id, newer.id);
-    }
-
-    #[test]
-    fn reusable_file_hash_rejects_malformed_metadata_and_preserves_valid_hash() {
-        let valid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-        assert_eq!(reusable_file_hash(Some(valid)), Ok(valid.to_string()));
-        assert_eq!(
-            reusable_file_hash(Some("abc123")),
-            Err("existing file hash is invalid; select a replacement build file".to_string())
-        );
     }
 
     async fn test_db() -> Database {
@@ -3059,14 +5400,59 @@ mod tests {
                 http_client,
             })
             .manage(Arc::new(AsyncMutex::new(AppSignerState::new())))
+            .manage(ArchiveSelectionService::new().expect("archive selection service"))
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("mock Tauri app should build")
     }
 
     async fn write_live_test_file() -> PathBuf {
-        let file_path = unique_test_path("arcadestr-adp-live-build", "bin");
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = u32::MAX;
+            for byte in data {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb8_8320 & (0_u32.wrapping_sub(crc & 1)));
+                }
+            }
+            !crc
+        }
+
+        let file_path = unique_test_path("arcadestr-adp-live-build", "zip");
         let bytes: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
-        tokio::fs::write(&file_path, bytes)
+        let name = "game.bin";
+        let crc = crc32(&bytes);
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+        archive.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        archive.extend_from_slice(&crc.to_le_bytes());
+        archive.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        archive.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(name.as_bytes());
+        archive.extend_from_slice(&bytes);
+        let central_offset = archive.len() as u32;
+        let mut central = Vec::new();
+        central.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+        central.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&[0; 8]);
+        central.extend_from_slice(&0_u32.to_le_bytes());
+        central.extend_from_slice(&0_u32.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+        let central_size = central.len() as u32;
+        archive.extend_from_slice(&central);
+        archive.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
+        archive.extend_from_slice(&[0; 4]);
+        archive.extend_from_slice(&1_u16.to_le_bytes());
+        archive.extend_from_slice(&1_u16.to_le_bytes());
+        archive.extend_from_slice(&central_size.to_le_bytes());
+        archive.extend_from_slice(&central_offset.to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        tokio::fs::write(&file_path, archive)
             .await
             .expect("live test binary should be written");
         file_path
@@ -3131,17 +5517,22 @@ mod tests {
             vec!["platform", "linux-x86_64"]
         );
 
-        let fulfillment_tags = tag_values(event, "fulfillment_pubkey");
-        assert_eq!(fulfillment_tags.len(), 1);
-        let fulfillment_tag = &fulfillment_tags[0];
-        assert_eq!(fulfillment_tag.len(), 4);
-        assert_eq!(fulfillment_tag[0], "fulfillment_pubkey");
-        assert_eq!(&fulfillment_tag[1], fulfillment_pubkey);
+        // Delegated fulfillment is carried by a pointer to the authorization
+        // root, not by the legacy inline `fulfillment_pubkey` tag.
+        let acceptance_event_id = result
+            .acceptance_event_id
+            .as_ref()
+            .expect("acceptance event id should be set");
         assert!(
-            fulfillment_tag[2].parse::<u64>().is_ok(),
-            "fulfillment_pubkey valid_from should be a unix timestamp"
+            tag_values(event, "fulfillment_pubkey").is_empty(),
+            "a delegated listing must not carry a legacy fulfillment_pubkey tag"
         );
-        assert_eq!(fulfillment_tag[3], "");
+        let authorization_tags = tag_values(event, "fulfillment_authorization");
+        assert_eq!(authorization_tags.len(), 1);
+        let authorization_tag = &authorization_tags[0];
+        assert_eq!(authorization_tag[0], "fulfillment_authorization");
+        assert_eq!(&authorization_tag[1], acceptance_event_id);
+        assert_eq!(&authorization_tag[2], fulfillment_pubkey);
     }
 
     #[derive(Default)]
@@ -3176,6 +5567,41 @@ mod tests {
                 .copied()
                 .unwrap_or(0)
         }
+    }
+
+    #[tokio::test]
+    async fn upload_capacity_checks_all_servers_before_side_effects() {
+        let mock = Arc::new(
+            LocalMockHttpClient::default()
+                .with_json_response(
+                    "http://large/.well-known/adp",
+                    json!({"adp_version":"0.2.0", "pubkey":"operator", "max_upload_bytes":2048}),
+                )
+                .with_json_response(
+                    "http://small/.well-known/adp",
+                    json!({"adp_version":"0.2.0", "pubkey":"operator", "max_upload_bytes":1024}),
+                )
+                .with_json_response(
+                    "http://legacy/.well-known/adp",
+                    json!({"adp_version":"0.2.0", "pubkey":"operator"}),
+                ),
+        );
+        let http: Arc<dyn HttpClient> = mock.clone();
+        let servers = vec!["http://large".into(), "http://small".into()];
+        let error = preflight_upload_capacity(&servers, 1025, &http)
+            .await
+            .expect_err("small server");
+        assert!(error.to_string().contains("http://small"));
+        assert!(error.to_string().contains("1025"));
+        assert!(error.to_string().contains("1024"));
+        preflight_upload_capacity(&servers, 1024, &http)
+            .await
+            .expect("exact cap");
+        preflight_upload_capacity(&["http://legacy".into()], u64::MAX, &http)
+            .await
+            .expect("unknown legacy cap");
+        assert_eq!(mock.post_call_count("http://small/provision"), 0);
+        assert_eq!(mock.post_call_count("http://small/upload"), 0);
     }
 
     #[async_trait::async_trait]
@@ -3268,6 +5694,7 @@ mod tests {
             .expect("public key should load");
         let developer_npub = developer_pubkey.to_hex();
         let server_info = AdpServerInfo {
+            max_upload_bytes: None,
             adp_version: "0.2.0".to_string(),
             pubkey: Keys::generate().public_key().to_hex(),
             name: Some("Test ADP".to_string()),
@@ -3462,6 +5889,51 @@ mod tests {
         assert!(error.contains("cannot be cleared"));
     }
 
+    #[tokio::test]
+    #[ignore = "requires ADP_TEST_SERVER_URL"]
+    async fn live_resuming_a_pending_scope_reuses_its_fulfillment_key() {
+        // What makes a resumed publication worth resuming: the operator keys
+        // provisioning by scope, so the retry is handed back the key the failed
+        // attempt was already given instead of stranding it and minting another.
+        let server_url = std::env::var("ADP_TEST_SERVER_URL")
+            .expect("ADP_TEST_SERVER_URL must be set for the live provisioning test");
+        let http: Arc<dyn HttpClient> = Arc::new(
+            ReqwestHttpClient::new(Duration::from_secs(10))
+                .expect("reqwest http client should initialize"),
+        );
+        let client = AdpClient::new(server_url, http);
+        let signer = LocalSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("live test key should be valid");
+
+        let minted = resolve_new_game_identifier(None, None)
+            .expect("the first attempt should mint an id")
+            .d_tag();
+        let first = client
+            .provision(&signer, Some(&minted))
+            .await
+            .expect("the first attempt should be provisioned");
+
+        // The attempt fails here, before any listing exists. The retry resumes
+        // the same identity, so it asks for the same scope.
+        let resumed = resolve_new_game_identifier(None, Some(&minted))
+            .expect("the retry should resume the pending publication")
+            .d_tag();
+        assert_eq!(resumed, minted);
+        let second = client
+            .provision(&signer, Some(&resumed))
+            .await
+            .expect("the retry should be provisioned");
+
+        assert_eq!(
+            second.fulfillment_pubkey, first.fulfillment_pubkey,
+            "a resumed scope must not strand the key the failed attempt was given"
+        );
+        assert_eq!(second.attestation_event_id, first.attestation_event_id);
+        assert_eq!(second.scope.as_deref(), Some(minted.as_str()));
+    }
+
     #[test]
     fn publisher_npub_contract_converts_to_hex() {
         let keys = Keys::generate();
@@ -3534,16 +6006,59 @@ mod tests {
 
         let app = live_test_app(relays).await;
         let file_path = write_live_test_file().await;
-        let request = PublishAdpListingRequest {
-            expected_publisher_npub: nostr::Keys::parse(
-                "0000000000000000000000000000000000000000000000000000000000000001",
+        let expected_publisher_npub =
+            nostr::Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
+                .expect("live test key should parse")
+                .public_key()
+                .to_bech32()
+                .expect("live test npub should encode");
+        let app_state = app.state::<AppState>();
+        let signer_state = app.state::<Arc<AsyncMutex<AppSignerState>>>();
+        let archive_service = app.state::<ArchiveSelectionService>();
+        let selection = archive_service
+            .stage_source(
+                file_path,
+                &expected_publisher_npub,
+                crate::archive_commands::account_check(&app_state, &signer_state),
             )
-            .expect("live test key should parse")
-            .public_key()
-            .to_bech32()
-            .expect("live test npub should encode"),
+            .await
+            .expect("live archive selection should stage");
+        let request_id = || {
+            arcadestr_core::archive_inspection_contract::ArchiveRequestId::parse(
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .expect("generated request ID")
+        };
+        archive_service
+            .inspect(
+                arcadestr_core::archive_inspection_contract::InspectArchiveRequest {
+                    request_id: request_id(),
+                    selection_id: selection.selection_id.clone(),
+                    expected_publisher_npub: expected_publisher_npub.clone(),
+                    expected_format: None,
+                },
+                &expected_publisher_npub,
+                crate::archive_commands::account_check(&app_state, &signer_state),
+            )
+            .await
+            .expect("live archive inspection should complete");
+        let hashed = archive_service
+            .hash(
+                arcadestr_core::archive_inspection_contract::HashSelectedArchiveRequest {
+                    request_id: request_id(),
+                    selection_id: selection.selection_id.clone(),
+                    expected_publisher_npub: expected_publisher_npub.clone(),
+                },
+                &expected_publisher_npub,
+                crate::archive_commands::account_check(&app_state, &signer_state),
+            )
+            .await
+            .expect("live archive hash should complete");
+        let request = PublishAdpListingRequest {
+            expected_publisher_npub,
             existing_event_id: None,
             existing_d_tag: None,
+            pending_d_tag: None,
             title: "Gate 3 Live Test Binary".to_string(),
             description: "Small live ADP command-level publish test fixture".to_string(),
             price_sats,
@@ -3553,7 +6068,11 @@ mod tests {
             fulfillment_mode: FulfillmentMode::Delegate,
             operator_url: Some(server_url.clone()),
             servers: vec![server_url.clone()],
-            file_path: Some(file_path.display().to_string()),
+            file_path: None,
+            selected_build: Some(BuildSelectionRef {
+                selection_id: hashed.selection_id,
+                sha256: hashed.sha256,
+            }),
             existing_file_hash: None,
             existing_fulfillment_pubkey: None,
             version: Some("0.0.1-live".to_string()),
@@ -3568,6 +6087,7 @@ mod tests {
             app.handle().clone(),
             app.state::<AppState>(),
             app.state::<Arc<AsyncMutex<AppSignerState>>>(),
+            app.state::<ArchiveSelectionService>(),
         )
         .await
         .expect("live ADP publish command should complete");
@@ -3945,8 +6465,9 @@ mod tests {
         };
         let app_data_dir = app
             .path()
-            .app_data_dir()
+            .app_local_data_dir()
             .expect("live test app data dir should resolve");
+        let artifact_path = crate::deterministic_artifact_path(&app_data_dir, &coordinate);
 
         eprintln!("ADP_GATE5_STAGE=manual_confirm_purchase_start");
         let response = confirm_purchase(
@@ -3990,33 +6511,35 @@ mod tests {
         )
         .await
         .expect("Path A install with cached token should succeed");
-        let installed_repo = arcadestr_core::adp_storage::InstalledGamesRepository::new(
+        let installations = arcadestr_core::adp_storage::InstallationsRepository::new(
             app.state::<AppState>().database.pool().clone(),
         );
-        let path_a_row = installed_repo
-            .get(&coordinate)
-            .await
-            .expect("Path A installed game lookup should succeed")
-            .expect("Path A installed_games row should exist");
         assert!(
-            path_a_row.file_path.exists(),
-            "Path A artifact should exist at {}",
-            path_a_row.file_path.display()
+            installations
+                .get_by_coordinate(&coordinate)
+                .await
+                .expect("Path A installation lookup should succeed")
+                .is_none(),
+            "a verified download is not an extracted installation"
         );
-        let path_a_hash = sha256_file(&path_a_row.file_path)
+        assert!(
+            artifact_path.exists(),
+            "Path A artifact should exist at {}",
+            artifact_path.display()
+        );
+        let path_a_hash = sha256_file(&artifact_path)
             .await
             .expect("Path A artifact hash should compute");
         assert_eq!(path_a_hash, expected_file_hash);
-        assert_eq!(path_a_row.file_hash, expected_file_hash);
         let installed_games = crate::get_installed_games(app.state::<AppState>())
             .await
             .expect("get_installed_games should be callable in live test");
-        assert!(installed_games
+        assert!(!installed_games
             .iter()
             .any(|game| game.game_coordinate == coordinate));
         println!(
-            "ADP_GATE5_PATH_A_INSTALL_OK=true artifact_exists=true sha256_match=true \
-             installed_games_row=true get_installed_games_includes_coordinate=true"
+            "ADP_GATE5_PATH_A_DOWNLOAD_OK=true artifact_exists=true sha256_match=true \
+             installation_row=false get_installed_games_excludes_coordinate=true"
         );
 
         token_repo
@@ -4034,7 +6557,7 @@ mod tests {
             .expect("download token lookup after delete should succeed");
         assert!(token_after_delete.is_none());
         println!("ADP_GATE5_PATH_B_LOCAL_TOKEN_DELETED=true");
-        tokio::fs::remove_file(&path_a_row.file_path)
+        tokio::fs::remove_file(&artifact_path)
             .await
             .expect("Path B should remove Path A artifact before reinstall");
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -4049,24 +6572,22 @@ mod tests {
         )
         .await
         .expect("Path B install without local token should succeed");
-        let path_b_row = installed_repo
-            .get(&coordinate)
-            .await
-            .expect("Path B installed game lookup should succeed")
-            .expect("Path B installed_games row should exist");
         assert!(
-            path_b_row.file_path.exists(),
+            artifact_path.exists(),
             "Path B artifact should exist at {}",
-            path_b_row.file_path.display()
+            artifact_path.display()
         );
-        let path_b_hash = sha256_file(&path_b_row.file_path)
+        let path_b_hash = sha256_file(&artifact_path)
             .await
             .expect("Path B artifact hash should compute");
         assert_eq!(path_b_hash, expected_file_hash);
-        assert_eq!(path_b_row.file_hash, expected_file_hash);
         assert!(
-            path_b_row.installed_at > path_a_row.installed_at,
-            "Path B should replace installed_games row after reinstall"
+            installations
+                .get_by_coordinate(&coordinate)
+                .await
+                .expect("Path B installation lookup should succeed")
+                .is_none(),
+            "a repeated verified download is still not an extracted installation"
         );
         let token_after_path_b = token_repo
             .valid_token(
@@ -4079,9 +6600,111 @@ mod tests {
             .expect("download token lookup after Path B should succeed");
         assert!(token_after_path_b.is_none());
         println!(
-            "ADP_GATE5_PATH_B_NIP98_INSTALL_OK=true artifact_exists=true sha256_match=true \
-             installed_games_row=true local_token_deleted_before_install=true \
-             local_token_absent_after_install=true"
+            "ADP_GATE5_PATH_B_NIP98_DOWNLOAD_OK=true artifact_exists=true sha256_match=true \
+             installation_row=false local_token_deleted_before_download=true \
+             local_token_absent_after_download=true"
         );
+    }
+
+    struct ProvisionedAttestation {
+        row: AdpProvisioning,
+        operator: nostr::PublicKey,
+        event: nostr::Event,
+    }
+
+    fn provisioned_attestation(scope: &str, valid_from: u64) -> ProvisionedAttestation {
+        let operator = Keys::generate();
+        let developer = Keys::generate();
+        let fulfillment = Keys::generate();
+        let developer_hex = developer.public_key().to_hex();
+        let fulfillment_hex = fulfillment.public_key().to_hex();
+        let event = EventBuilder::new(Kind::Custom(30404), "")
+            .tags([
+                Tag::parse(["d", &format!("{developer_hex}:{fulfillment_hex}")])
+                    .expect("d tag should parse"),
+                Tag::parse(["p", &developer_hex]).expect("p tag should parse"),
+                Tag::parse([
+                    "fulfillment_pubkey",
+                    &fulfillment_hex,
+                    &valid_from.to_string(),
+                    "",
+                ])
+                .expect("fulfillment tag should parse"),
+                Tag::parse(["scope", scope]).expect("scope tag should parse"),
+            ])
+            .custom_created_at(Timestamp::from_secs(valid_from))
+            .sign_with_keys(&operator)
+            .expect("attestation should sign");
+        let row = AdpProvisioning {
+            id: format!("{developer_hex}:operator:{scope}"),
+            developer_npub: developer_hex,
+            server_url: "http://localhost:9099".to_string(),
+            operator_pubkey: operator.public_key().to_hex(),
+            scope: Some(scope.to_string()),
+            fulfillment_pubkey: fulfillment_hex,
+            attestation_event_id: event.id.to_hex(),
+            acceptance_event_id: "acceptance".to_string(),
+            authorization_root_event_id: Some("acceptance".to_string()),
+            authorization_capabilities: Vec::new(),
+            authorization_profile_version: 2,
+            valid_from: valid_from as i64,
+            revoked_at: None,
+            created_at: valid_from as i64,
+        };
+        ProvisionedAttestation {
+            row,
+            operator: operator.public_key(),
+            event,
+        }
+    }
+
+    #[test]
+    fn an_attestation_minted_during_this_publish_is_not_read_as_stale() {
+        // The operator stamps `valid_from` when it provisions the key, which is
+        // after publishing began. Validating against a clock read before the
+        // build was hashed rejected every first-time provisioning.
+        let provisioned = provisioned_attestation("f47ac10b-58cc-4372-a567-0e02b2c3d479", 1_000);
+
+        assert_eq!(
+            ensure_attestation_covers_provisioning(
+                &provisioned.row,
+                provisioned.operator,
+                &provisioned.event,
+                999,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn an_attestation_for_another_scope_is_rejected_as_uncovered() {
+        let provisioned = provisioned_attestation("some-other-game", 1_000);
+        let mut row = provisioned.row.clone();
+        row.scope = Some("this-game".to_string());
+
+        let error = ensure_attestation_covers_provisioning(
+            &row,
+            provisioned.operator,
+            &provisioned.event,
+            2_000,
+        )
+        .expect_err("an attestation for a different scope must not be accepted");
+
+        assert!(error.contains("does not cover"));
+    }
+
+    #[test]
+    fn an_attestation_from_the_distant_future_is_still_rejected() {
+        let provisioned = provisioned_attestation("this-game", 10_000);
+
+        let error = ensure_attestation_covers_provisioning(
+            &provisioned.row,
+            provisioned.operator,
+            &provisioned.event,
+            1_000,
+        )
+        .expect_err("an attestation that is not yet in force must not be accepted");
+
+        assert!(error.contains("no longer attests possession"));
     }
 }

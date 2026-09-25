@@ -43,6 +43,7 @@ pub(crate) fn debug_storefront_bypass_enabled() -> bool {
 pub mod campaign_management;
 pub mod components;
 pub mod models;
+pub(crate) mod publish_state;
 pub mod qr;
 mod relay_state;
 pub mod store;

@@ -34,6 +34,12 @@ lightning-invoice = "0.32"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+tar = { version = "=0.4.46", default-features = false }
+zstd = { version = "=0.13.3", default-features = false }
+flate2 = { version = "=1.1.9", default-features = false, features = ["zlib-rs"] }
+cap-std = { version = "=4.0.3", default-features = false }
+cap-primitives = { version = "=4.0.3", default-features = false }
 # Secure storage dependencies
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }
 aes-gcm = "0.10"
@@ -60,6 +66,8 @@ native = []
 wasm = []
 
 [dev-dependencies]
+futures-util = "0.3"
+tokio-tungstenite = "0.28"
 bitcoin = "0.32"
 lightning-types = "0.1"
 tokio-test = "0.4"

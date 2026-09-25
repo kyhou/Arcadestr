@@ -240,6 +240,54 @@ where
     })
 }
 
+/// Invokes an archive command without exposing unstructured rejection text.
+pub async fn invoke_archive_typed<T>(
+    command: &str,
+    args: serde_json::Value,
+) -> Result<T, arcadestr_core::archive_inspection_contract::ArchiveSelectionError>
+where
+    T: serde::de::DeserializeOwned + 'static,
+{
+    use arcadestr_core::archive_inspection_contract::ArchiveSelectionError;
+
+    if !is_tauri_available() {
+        return Err(ArchiveSelectionError::Transport);
+    }
+    let promise = tauri_invoke(command, args).map_err(|diagnostic| {
+        web_sys::console::error_1(
+            &format!("Archive IPC transport failed for '{command}': {diagnostic}").into(),
+        );
+        ArchiveSelectionError::Transport
+    })?;
+    let value = match JsFuture::from(promise).await {
+        Ok(value) => value,
+        Err(rejection) => {
+            let serialized = rejection
+                .as_string()
+                .unwrap_or_else(|| js_value_json(&rejection));
+            return match serde_json::from_str::<ArchiveSelectionError>(&serialized) {
+                Ok(error) => Err(error),
+                Err(error) => {
+                    web_sys::console::error_1(
+                        &format!(
+                            "Archive IPC error contract mismatch for '{command}': {error}; raw rejection: {serialized}"
+                        )
+                        .into(),
+                    );
+                    Err(ArchiveSelectionError::ContractMismatch)
+                }
+            };
+        }
+    };
+    let serialized = js_value_json(&value);
+    serde_json::from_str(&serialized).map_err(|error| {
+        web_sys::console::error_1(
+            &format!("Archive IPC response contract mismatch for '{command}': {error}").into(),
+        );
+        ArchiveSelectionError::ContractMismatch
+    })
+}
+
 fn js_value_json(value: &JsValue) -> String {
     if let Some(value) = value.as_string() {
         serde_json::to_string(&value).unwrap_or_else(|_| "\"IPC failure\"".to_string())

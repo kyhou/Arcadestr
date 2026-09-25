@@ -19,6 +19,20 @@ ADP is modeled after [Blossom](https://github.com/hzrd149/blossom): servers are 
 | **Buyer** | The Nostr keypair that completed payment |
 | **LSP** | Lightning Service Provider — the operator of the LNURL-pay endpoint that signs `kind:9735` zap receipts on a developer's behalf, resolved from a listing's `lud16` tag |
 
+## Canonical Hex Encoding
+
+Every hex-encoded value defined by this specification — `file_hash`, `fulfillment_pubkey`, authorization root and attestation event IDs, payment-proof event IDs, and any other field documented as `<...-hex>` or `<hex>` — MUST be **lowercase**. SHA‑256 digests, event IDs, and x-only public keys are 64 lowercase hex characters.
+
+This matches NIP‑01, under which event IDs and public keys are already lowercase hex, and requires no change from any implementation using conventional hex encoding.
+
+**Consumers MUST reject a non-lowercase value rather than normalizing it.** Uppercase is not an alternative encoding of the same value; it is invalid input. Servers, clients, and relays MUST NOT case-fold on read, MUST NOT compare case-insensitively, and MUST NOT accept a value that differs from its canonical form.
+
+The reason is identity, not tidiness. `file_hash` keys stored artifacts and is compared byte-for-byte during upload verification, periodic re-verification, and post-download integrity checks. If two spellings of one digest are both accepted, they are two identities for one artifact: deduplication fails, one stored copy can satisfy a lookup while the other does not, and an implementation that normalizes on read interoperates inconsistently with one that does not. Rejecting is the only rule under which all participants agree on what a value *is*.
+
+Normalization belongs at the human input boundary and nowhere else. A publishing client MAY lowercase a hash pasted or typed by a person, or carried over from a prior listing revision, before validating it. Having validated, it MUST emit the canonical form. Values arriving from another participant — a signed event, an HTTP request or response, a database — are never normalized; they are accepted as canonical or rejected.
+
+This rule constrains hex-encoded values only. Bech32 identifiers (`npub`, `note`, `naddr`) have their own canonical form defined by NIP‑19, and `lud16` is an address, not an encoding.
+
 ## Listing Extensions (`kind:30402`)
 
 A developer distributing a game via ADP adds the following tags to their [NIP‑99](99.md) classified listing:
@@ -26,7 +40,7 @@ A developer distributing a game via ADP adds the following tags to their [NIP‑
 | Tag | Value | Description |
 |-----|-------|--------------|
 | `server` | `<https-url>` | Declares a server authorized to distribute this listing's file. Repeatable. |
-| `file_hash` | `<sha256-hex>` | SHA‑256 of the game archive. Servers MUST verify stored files against this hash before serving. |
+| `file_hash` | `<sha256-hex>` | SHA‑256 of the game archive, 64 lowercase hex characters — see [Canonical Hex Encoding](#canonical-hex-encoding). Servers MUST verify stored files against this hash before serving. |
 | `version` | `<semver-string>` | Build version. |
 | `platform` | `<os>-<arch>` | Optional; a listing per platform is the simplest model. |
 | `fulfillment_authorization` | `<authorization-root-event-id>`, `<fulfillment-pubkey>`, `<relay-hint>` | Enables new operations under the referenced `kind:30406` authorization. Repeatable; relay hint optional. The authorization chain, not the listing, owns validity and capabilities. |
@@ -67,6 +81,7 @@ Two tiers, since they fail differently:
 A publishing client enforcing the fulfillment tier SHOULD, before allowing submit:
 
 1. Compute `file_hash` client-side from the selected build file rather than accepting it as freeform text — a hand-typed hash is a guaranteed source of publish/upload mismatches.
+   Where a hash is nonetheless carried over from a prior revision or supplied by a person, lowercase it at capture and then validate it strictly; a listing published with a non-canonical hash will be rejected by both the upload path and the buyer's verification, having appeared valid at publish time.
 2. For direct developer signing, no fulfillment authorization is required. For delegated operation, the client calls `POST /provision`, verifies the matching operator-signed `kind:30404`, creates or reuses a coordinate-scoped `kind:30406` authorization root with explicit capabilities, publishes it, and adds the corresponding `fulfillment_authorization` listing tag.
 3. For each declared `server` URL, fetch `GET <server>/.well-known/adp` live as a basic reachability check. This confirms the URL is live and *a* server, but is not a substitute for step 2 — a server's single announced identity pubkey has no fixed relationship to any individual developer's delegated fulfillment key once an operator serves more than one developer.
 
@@ -516,6 +531,7 @@ For a server to be considered ADP‑01 compliant it SHOULD implement:
 - [ ] Serving `/.well-known/adp` and publishing a `kind:30403` announcement.
 - [ ] Verifying direct developer upload or current enabled authorization with `upload_build`.
 - [ ] Verifying file SHA‑256 against `file_hash` on upload and periodically thereafter.
+- [ ] Rejecting non-lowercase hex in every field documented as hex-encoded, rather than normalizing on read.
 - [ ] Verifying NIP‑98, listing signature, and payment proof before issuing a receipt in `/purchase/confirm`.
 - [ ] Resolving the listing's `lud16` tag (never the developer's profile) to an LSP `nostrPubkey` and confirming the zap receipt was signed by it, before accepting the zap-receipt payment path — see [LSP Verification](#lsp-verification-lud16).
 - [ ] Enforcing idempotency on `order` id and replay protection on the payment-proof event id.

@@ -15,28 +15,27 @@ use super::dialog::{
 };
 
 thread_local! {
-    /// Create Game has no draft persistence at all (`SUPPORTS_DRAFTS` is
-    /// false), so its dirty state exists only while the form is mounted. The
-    /// form publishes it here so the shell can guard navigation without
-    /// reaching into the component.
-    static CREATE_GAME_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The mounted Publish Game form publishes its dirty state here so the
+    /// shell can guard both create and edit routes without reaching into the
+    /// component.
+    static PUBLISH_GAME_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Publish the Create Game form's dirty state. Cleared when it unmounts.
-pub fn set_create_game_dirty(dirty: bool) {
-    CREATE_GAME_DIRTY.with(|flag| flag.set(dirty));
+/// Publish the mounted Publish Game form's dirty state. Cleared when it unmounts.
+pub fn set_publish_game_dirty(dirty: bool) {
+    PUBLISH_GAME_DIRTY.with(|flag| flag.set(dirty));
 }
 
-/// Whether a mounted Create Game form currently holds unsaved input.
-pub fn create_game_dirty() -> bool {
-    CREATE_GAME_DIRTY.with(std::cell::Cell::get)
+/// Whether a mounted Publish Game form currently holds unsaved input.
+pub fn publish_game_dirty() -> bool {
+    PUBLISH_GAME_DIRTY.with(std::cell::Cell::get)
 }
 
 /// An editor holding unsaved in-memory input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnsavedWork {
-    /// Create Game. No draft persistence exists for this form at all.
-    CreateGame,
+    /// The Publish Game form, used to create or edit a publication.
+    PublishGame,
     /// The Store Page editor, holding a dirty in-session draft.
     StorePage,
 }
@@ -44,17 +43,16 @@ pub enum UnsavedWork {
 impl UnsavedWork {
     pub fn title(self) -> &'static str {
         match self {
-            Self::CreateGame => "Discard unsaved game details?",
+            Self::PublishGame => "Discard unsaved game details?",
             Self::StorePage => "Discard unsaved Store Page changes?",
         }
     }
 
-    /// States precisely what is lost. Neither editor writes to disk, so both
-    /// messages talk about in-memory input only.
+    /// States precisely what is lost from the current editing session.
     pub fn message(self) -> &'static str {
         match self {
-            Self::CreateGame => {
-                "Your Create Game inputs are held in memory only and will be discarded. Arcadestr does not save Create Game drafts, and nothing has been published."
+            Self::PublishGame => {
+                "Your unsaved in-memory game details, archive selection and digest, launch mode, targets, ordered profile fields, individual arguments, removal acknowledgements, defect review, and distribution settings will be discarded if you continue."
             }
             Self::StorePage => {
                 "Your unsaved in-memory Store Page changes will be discarded. Anything already published to relays is unaffected."
@@ -173,8 +171,8 @@ mod tests {
     #[test]
     fn dirty_navigation_is_confirmed_per_editor() {
         assert_eq!(
-            guard_navigation(Some(UnsavedWork::CreateGame)),
-            NavigationGuard::Confirm(UnsavedWork::CreateGame)
+            guard_navigation(Some(UnsavedWork::PublishGame)),
+            NavigationGuard::Confirm(UnsavedWork::PublishGame)
         );
         assert_eq!(
             guard_navigation(Some(UnsavedWork::StorePage)),
@@ -193,7 +191,7 @@ mod tests {
 
     #[test]
     fn the_guard_never_offers_a_save_that_does_not_exist() {
-        for work in [UnsavedWork::CreateGame, UnsavedWork::StorePage] {
+        for work in [UnsavedWork::PublishGame, UnsavedWork::StorePage] {
             assert_eq!(work.keep_label(), "Keep editing");
             assert_eq!(work.discard_label(), "Discard and continue");
             assert!(!work.discard_label().to_lowercase().contains("save"));
@@ -203,10 +201,31 @@ mod tests {
 
     #[test]
     fn the_guard_states_that_in_memory_changes_are_discarded() {
-        for work in [UnsavedWork::CreateGame, UnsavedWork::StorePage] {
+        for work in [UnsavedWork::PublishGame, UnsavedWork::StorePage] {
             let message = work.message();
             assert!(message.contains("in memory") || message.contains("in-memory"));
             assert!(message.contains("discarded"));
+        }
+    }
+
+    #[test]
+    fn publish_guard_names_every_in_memory_publish_domain() {
+        let message = UnsavedWork::PublishGame.message();
+        for required in [
+            "game details",
+            "archive selection and digest",
+            "launch mode",
+            "targets",
+            "ordered profile fields",
+            "individual arguments",
+            "removal acknowledgements",
+            "defect review",
+            "distribution settings",
+        ] {
+            assert!(
+                message.contains(required),
+                "missing dirty domain: {required}"
+            );
         }
     }
 }

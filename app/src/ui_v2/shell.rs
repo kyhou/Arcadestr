@@ -4,7 +4,7 @@ use wasm_bindgen_futures::spawn_local;
 use crate::models::{npub_fallback_label, GameListing};
 use crate::relay_state::{apply_relay_event, merge_relay_snapshot};
 use crate::ui_v2::components::{
-    create_game_dirty, guard_navigation, set_create_game_dirty, NavigationGuard, PageContainer,
+    guard_navigation, publish_game_dirty, set_publish_game_dirty, NavigationGuard, PageContainer,
     TopBar, UnsavedChangesDialog, UnsavedWork, ROUTE_FOCUS_FALLBACK_ID,
 };
 use crate::ui_v2::theme::UI_V2_STYLES;
@@ -35,17 +35,17 @@ fn detail_back_destination(origin: DetailOrigin) -> UiV2View {
 /// Which editor, if any, the current route is showing with unsaved input.
 ///
 /// Only the editor actually on screen can have unsaved input to lose, so a
-/// dirty Store Page draft for some other listing never blocks navigation from
-/// an unrelated screen.
+/// dirty state from an editor that is not on the current route never blocks
+/// navigation from an unrelated screen.
 fn unsaved_work_for_route(
     view: &UiV2View,
-    create_game_is_dirty: bool,
+    publish_game_is_dirty: bool,
     store_page_dirty: bool,
 ) -> Option<UnsavedWork> {
     match view {
-        UiV2View::Publish(PublishViewState::NewPublication) if create_game_is_dirty => {
-            Some(UnsavedWork::CreateGame)
-        }
+        UiV2View::Publish(
+            PublishViewState::NewPublication | PublishViewState::EditPublication(_),
+        ) if publish_game_is_dirty => Some(UnsavedWork::PublishGame),
         UiV2View::Publish(PublishViewState::StorePage(_)) if store_page_dirty => {
             Some(UnsavedWork::StorePage)
         }
@@ -111,11 +111,24 @@ mod tests {
         let view = UiV2View::Publish(PublishViewState::NewPublication);
         assert_eq!(
             unsaved_work_for_route(&view, true, false),
-            Some(UnsavedWork::CreateGame)
+            Some(UnsavedWork::PublishGame)
         );
         assert_eq!(
             guard_navigation(unsaved_work_for_route(&view, true, false)),
-            NavigationGuard::Confirm(UnsavedWork::CreateGame)
+            NavigationGuard::Confirm(UnsavedWork::PublishGame)
+        );
+    }
+
+    #[test]
+    fn leaving_a_dirty_edit_game_form_is_guarded() {
+        let view = UiV2View::Publish(PublishViewState::EditPublication(listing()));
+        assert_eq!(
+            unsaved_work_for_route(&view, true, false),
+            Some(UnsavedWork::PublishGame)
+        );
+        assert_eq!(
+            guard_navigation(unsaved_work_for_route(&view, true, false)),
+            NavigationGuard::Confirm(UnsavedWork::PublishGame)
         );
     }
 
@@ -140,6 +153,14 @@ mod tests {
         );
         assert_eq!(
             unsaved_work_for_route(
+                &UiV2View::Publish(PublishViewState::EditPublication(listing())),
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            unsaved_work_for_route(
                 &UiV2View::Publish(PublishViewState::StorePage(listing())),
                 false,
                 false
@@ -151,12 +172,20 @@ mod tests {
 
     #[test]
     fn dirty_state_in_one_editor_does_not_block_navigation_from_another_screen() {
-        // A dirty Store Page draft for some other listing must not guard the
-        // Library or the Store.
+        // Dirty editor state must not guard the Library, Store, Games list, or
+        // a game's manage route.
         assert_eq!(unsaved_work_for_route(&UiV2View::Library, true, true), None);
         assert_eq!(unsaved_work_for_route(&UiV2View::Store, true, true), None);
         assert_eq!(
             unsaved_work_for_route(&UiV2View::Publish(PublishViewState::Games), true, true),
+            None
+        );
+        assert_eq!(
+            unsaved_work_for_route(
+                &UiV2View::Publish(PublishViewState::Game(listing())),
+                true,
+                true
+            ),
             None
         );
     }
@@ -174,7 +203,7 @@ mod tests {
         let view = UiV2View::Publish(PublishViewState::NewPublication);
         assert_eq!(
             guard_navigation(unsaved_work_for_route(&view, true, false)),
-            NavigationGuard::Confirm(UnsavedWork::CreateGame)
+            NavigationGuard::Confirm(UnsavedWork::PublishGame)
         );
         let source = root_source();
         assert!(source.contains("PendingNavigation::SignOut"));
@@ -184,12 +213,22 @@ mod tests {
     #[test]
     fn every_shell_navigation_callback_routes_through_the_guard() {
         let source = root_source();
-        // Only three places may set the route directly: the account-switch
-        // publisher reset, and the two guard resolutions. Every user-facing
-        // navigation callback must go through `navigate_guarded`.
-        let direct_sets = source.matches("current_view.set(").count();
-        assert_eq!(
-            direct_sets, 3,
+        // Only these exact guard-owned sites may set the route directly.
+        let mut unmatched = source.to_string();
+        for allowed in [
+            "current_view.set(UiV2View::Publish(PublishViewState::Games));",
+            "PendingNavigation::Route(target) => current_view.set(target),",
+            "Some(PendingNavigation::Route(target)) => current_view.set(target),",
+        ] {
+            assert_eq!(
+                unmatched.matches(allowed).count(),
+                1,
+                "expected one direct route set at the approved guard-owned site: {allowed}"
+            );
+            unmatched = unmatched.replacen(allowed, "", 1);
+        }
+        assert!(
+            !unmatched.contains("current_view.set("),
             "unguarded current_view.set found; route every navigation through navigate_guarded"
         );
         for callback in [
@@ -220,7 +259,7 @@ mod tests {
         let source = root_source();
         assert!(source.contains("on_discard_and_continue"));
         assert!(source.contains("discard_publisher_store_page_drafts"));
-        assert!(source.contains("set_create_game_dirty(false)"));
+        assert!(source.contains("set_publish_game_dirty(false)"));
     }
 
     #[test]
@@ -509,7 +548,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
             !publisher.is_empty() && !publisher_store_page_dirty_coordinates(&publisher).is_empty();
         unsaved_work_for_route(
             &current_view.get_untracked(),
-            create_game_dirty(),
+            publish_game_dirty(),
             store_page_dirty,
         )
     };
@@ -556,7 +595,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
         // Drop the unsaved input for the editor being left. This is the same
         // operation the editor's own Discard control performs.
         match pending_work.get_untracked() {
-            Some(UnsavedWork::CreateGame) => set_create_game_dirty(false),
+            Some(UnsavedWork::PublishGame) => set_publish_game_dirty(false),
             Some(UnsavedWork::StorePage) => {
                 if let Some(publisher) = auth_for_guard.get_value().npub.get_untracked() {
                     discard_publisher_store_page_drafts(&publisher);

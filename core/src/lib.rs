@@ -17,6 +17,14 @@ pub mod storage;
 #[cfg(feature = "native")]
 pub mod nip46;
 
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub mod archive_inspection;
+pub mod archive_inspection_contract;
+pub mod distribution;
+pub mod install_contract;
+pub mod launch_contract;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub mod package_extraction;
 pub mod saved_users;
 pub mod version;
 
@@ -82,6 +90,7 @@ pub mod adp_client;
 #[cfg(feature = "native")]
 pub mod adp_discovery;
 pub mod adp_protocol;
+pub mod adp_publish_contract;
 pub mod authorization;
 pub mod blossom;
 pub mod campaign;

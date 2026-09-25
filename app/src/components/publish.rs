@@ -3,24 +3,42 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use arcadestr_core::adp_publish_contract::{
+    PublishAdpListingError, PublishAdpListingRequestExtension,
+};
+use arcadestr_core::archive_inspection_contract::ArchiveSelectionError;
+use arcadestr_core::distribution::ProfileId;
 use arcadestr_core::is_sha256_hex;
 
 use crate::campaign_management::datetime_local_to_unix;
 use crate::models::{AcquisitionPolicy, CampaignPointer, ListingSource};
+use crate::publish_state::{
+    partial_retry_payload, prepare_publish, preserve_edited_platforms, ArchiveSelectionState,
+    AuthoritativeEditModel, AuthoritativeEditState, DefectReviewState, LaunchMode, PreparedPublish,
+    ProviderBuildFields, PublishAttempt, PublishDirtySnapshot, PublishIdentityOverlay,
+    PublishState, Transition,
+};
 use crate::tauri_bridge::{
-    invoke_add_blossom_server, invoke_check_adp_server, invoke_discard_blossom_media_selection,
-    invoke_discover_adp_servers, invoke_get_blossom_server_settings, invoke_hash_build_file,
-    invoke_publish_adp_listing, invoke_resolve_adp_operator, invoke_select_blossom_media_file,
-    invoke_select_build_file, invoke_start_blossom_upload, listen_hash_progress,
-    listen_publish_progress, AddBlossomServerRequest, AdpServerAnnouncement,
-    BlossomMediaSelectionDto, CampaignPointerInput, DiscardBlossomMediaRequest,
-    ExpectedBlossomPublisherRequest, FulfillmentMode, HashBuildFileRequest, HashProgressPayload,
+    invoke_add_blossom_server, invoke_check_adp_server, invoke_discard_archive_selection,
+    invoke_discard_blossom_media_selection, invoke_discover_adp_servers,
+    invoke_get_blossom_server_settings, invoke_hash_selected_archive, invoke_inspect_archive,
+    invoke_load_authoritative_adp_edit_metadata, invoke_publish_adp_listing_with_contract,
+    invoke_resolve_adp_operator, invoke_select_archive_build, invoke_select_blossom_media_file,
+    invoke_start_blossom_upload, listen_publish_progress, AddBlossomServerRequest,
+    AdpServerAnnouncement, ArchiveAccountFailure, ArchiveRequestId, BlossomMediaSelectionDto,
+    BuildSelectionRef, CampaignPointerInput, DiscardArchiveSelectionRequest,
+    DiscardBlossomMediaRequest, ExpectedBlossomPublisherRequest, FulfillmentMode,
+    HashSelectedArchiveRequest, InspectArchiveRequest, LoadAuthoritativeAdpEditMetadataRequest,
     PublishAdpListingRequest, PublishAdpListingResult, PublishProgressPayload,
-    ResolveAdpOperatorRequest, StartBlossomUploadRequest,
+    ResolveAdpOperatorRequest, SelectArchiveRequest, StartBlossomUploadRequest,
 };
 use crate::ui_v2::components::aria::aria_bool;
 use crate::ui_v2::components::blossom_media_upload::{
     fresh_request_id, preferred_candidate, publisher_hex, stable_error_message,
+};
+use crate::ui_v2::components::{
+    Button, ButtonVariant, Dialog, DialogCloseAction, DialogClosePolicy, DialogCloseRequest,
+    DialogDismissal, DialogInitialFocus, DialogTone, DialogWidth,
 };
 use crate::ui_v2::views::publish::{
     publisher_signer_state, signer_can_publish, PublisherSignerState,
@@ -290,8 +308,65 @@ struct FormSnapshot {
     acquisition: String,
     starts_at: String,
     ends_at: String,
-    image_count: usize,
+    images: Vec<String>,
     fulfillment_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemovalConfirmationIdentity {
+    account_npub: Option<String>,
+    publication: PublishedIdentity,
+    authoritative_state: Option<AuthoritativeEditState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRemovalConfirmation {
+    prepared: PreparedPublish,
+    removed_profile_ids: Vec<ProfileId>,
+    form: FormSnapshot,
+    dirty: PublishDirtySnapshot,
+    identity: RemovalConfirmationIdentity,
+    generation: u64,
+    abort_count: u64,
+}
+
+fn removal_confirmation_prepared(
+    frozen: &PreparedPublish,
+    removed_profile_ids: &[ProfileId],
+) -> PreparedPublish {
+    let mut confirmed = frozen.clone();
+    confirmed.extension.acknowledged_removed_profile_ids = removed_profile_ids.to_vec();
+    confirmed
+}
+
+fn removal_confirmation_is_fresh(
+    pending: &PendingRemovalConfirmation,
+    form: &FormSnapshot,
+    dirty: &PublishDirtySnapshot,
+    identity: &RemovalConfirmationIdentity,
+    generation: u64,
+) -> bool {
+    pending.form == *form
+        && pending.dirty == *dirty
+        && pending.identity == *identity
+        && pending.generation == generation
+}
+
+fn removal_confirmation_copy(ids: &[ProfileId], abort_count: u64) -> String {
+    let names = ids
+        .iter()
+        .map(|id| id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if abort_count > 1 {
+        format!(
+            "The backend rechecked the latest revision and returned a fresh complete removal set. Current profile IDs: {names}. Review every ID and confirm again."
+        )
+    } else {
+        format!(
+            "Publication would remove these launch profile IDs: {names}. Review every ID before confirming."
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,6 +584,15 @@ struct PublishedIdentity {
     event_id: Option<String>,
     d_tag: Option<String>,
     coordinate: Option<String>,
+    /// Identity the backend minted for a first publication, held from the
+    /// moment it is minted rather than from the moment a listing exists.
+    ///
+    /// A publication that fails before its listing — while provisioning a
+    /// fulfillment key, say — leaves this draft owning a coordinate nothing
+    /// was published under. Keeping it means the retry resumes that
+    /// publication under the same identity, and so under the same provisioning
+    /// scope, instead of asking the operator for a second key.
+    pending_d_tag: Option<String>,
 }
 
 /// Fold a publish progress event into the published identity.
@@ -530,6 +614,21 @@ fn publication_identity_progress(
                 if let Some(d_tag) = d_tag_from_coordinate(&coordinate) {
                     identity.d_tag = Some(d_tag);
                     identity.coordinate = Some(coordinate);
+                    // The listing exists; this identity is no longer pending.
+                    identity.pending_d_tag = None;
+                }
+            }
+        }
+        "pending-coordinate" => {
+            // Nothing is published under this identity yet, and the attempt
+            // carrying it may still fail. Hold it for the retry.
+            if identity.d_tag.is_none() {
+                if let Some(d_tag) = event
+                    .message
+                    .as_deref()
+                    .and_then(|coordinate| d_tag_from_coordinate(coordinate))
+                {
+                    identity.pending_d_tag = Some(d_tag);
                 }
             }
         }
@@ -580,6 +679,14 @@ fn publication_completed(
         }
     }
     state
+}
+
+/// Steps that hand this form the identity of what it is publishing.
+///
+/// They carry no publication outcome, so they are folded into the identity and
+/// then dropped rather than shown as stages the publisher is waiting on.
+fn is_recovery_channel(step: &str) -> bool {
+    matches!(step, "listing-coordinate" | "pending-coordinate")
 }
 
 fn progress_label(event: &PublishProgressPayload) -> String {
@@ -646,11 +753,49 @@ fn advance_stage(
         .ok_or_else(|| "Already at the review stage".to_string())
 }
 
+pub(super) fn archive_request_id() -> Result<ArchiveRequestId, ArchiveSelectionError> {
+    ArchiveRequestId::parse(&uuid::Uuid::new_v4().to_string())
+        .map_err(|_| ArchiveSelectionError::ContractMismatch)
+}
+
+#[cfg(test)]
 fn file_selection_changed(new_path: Option<String>) -> (Option<String>, Option<String>) {
     match new_path {
         Some(path) => (Some(path), None),
         None => (None, None),
     }
+}
+
+fn publish_error_message(error: &PublishAdpListingError) -> String {
+    match error {
+        PublishAdpListingError::StaleExpectedEventId { .. } => {
+            "A concurrent listing revision was detected. Your local work is preserved and publication is blocked. Leave this workflow, return to Published games, and reopen the latest revision before publishing."
+                .to_string()
+        }
+        _ => error.to_string(),
+    }
+}
+
+fn publish_archive_error(error: &PublishAdpListingError) -> Option<&ArchiveSelectionError> {
+    match error {
+        PublishAdpListingError::Archive { error } => Some(error),
+        PublishAdpListingError::PartialPublication { cause, .. } => publish_archive_error(cause),
+        _ => None,
+    }
+}
+
+fn should_rebase_edit_distribution(
+    authority_ready: bool,
+    operator_initialized: bool,
+    user_revision: u64,
+) -> bool {
+    authority_ready && operator_initialized && user_revision == 0
+}
+
+pub(super) fn archive_error_message(error: &ArchiveSelectionError) -> String {
+    publish_error_message(&PublishAdpListingError::Archive {
+        error: error.clone(),
+    })
 }
 
 fn build_capability_message() -> &'static str {
@@ -975,6 +1120,10 @@ fn listing_spec(listing: &GameListing, key: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+fn captured_file_hash(listing: &GameListing) -> Option<String> {
+    listing_spec(listing, "file_hash").map(|hash| hash.to_ascii_lowercase())
+}
+
 fn listing_servers(listing: &GameListing) -> Vec<String> {
     listing
         .specs
@@ -1133,6 +1282,157 @@ mod tests {
 
     const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    fn frozen_prepared() -> PreparedPublish {
+        PreparedPublish {
+            request: PublishAdpListingRequest {
+                expected_publisher_npub: "npub-test".into(),
+                existing_event_id: Some("event-before-check".into()),
+                existing_d_tag: Some("game".into()),
+                pending_d_tag: None,
+                title: "Frozen title".into(),
+                description: "Frozen description".into(),
+                price_sats: 0,
+                lud16: None,
+                tags: vec!["action".into()],
+                images: vec!["https://example.com/image.png".into()],
+                fulfillment_mode: FulfillmentMode::None,
+                operator_url: None,
+                servers: Vec::new(),
+                file_path: None,
+                selected_build: None,
+                existing_file_hash: None,
+                existing_fulfillment_pubkey: None,
+                version: None,
+                acquisition: AcquisitionPolicy::Public,
+                platforms: Vec::new(),
+                campaigns: Vec::new(),
+                nip94_event_id: None,
+            },
+            extension: PublishAdpListingRequestExtension::default(),
+        }
+    }
+
+    fn profile_id(value: &str) -> ProfileId {
+        ProfileId::parse(value).expect("test profile ID must be valid")
+    }
+
+    #[test]
+    fn removal_confirmation_mutates_only_exact_acknowledgement_ids() {
+        let frozen = frozen_prepared();
+        let ids = vec![profile_id("legacy"), profile_id("old-vulkan")];
+        let confirmed = removal_confirmation_prepared(&frozen, &ids);
+
+        assert_eq!(confirmed.request, frozen.request);
+        assert_eq!(
+            confirmed.extension.launch_tier,
+            frozen.extension.launch_tier
+        );
+        assert_eq!(confirmed.extension.acknowledged_removed_profile_ids, ids);
+        assert!(frozen.extension.acknowledged_removed_profile_ids.is_empty());
+    }
+
+    #[test]
+    fn removal_confirmation_freshness_covers_form_dirty_identity_and_generation() {
+        let form = FormSnapshot::default();
+        let dirty = PublishDirtySnapshot::capture(
+            &ArchiveSelectionState::new("npub-test".into()),
+            &LaunchMode::DownloadOnly,
+            ProviderBuildFields::default(),
+            Vec::new(),
+            DefectReviewState::default(),
+        );
+        let identity = RemovalConfirmationIdentity {
+            account_npub: Some("npub-test".into()),
+            publication: PublishedIdentity::default(),
+            authoritative_state: None,
+        };
+        let pending = PendingRemovalConfirmation {
+            prepared: frozen_prepared(),
+            removed_profile_ids: vec![profile_id("legacy")],
+            form: form.clone(),
+            dirty: dirty.clone(),
+            identity: identity.clone(),
+            generation: 7,
+            abort_count: 1,
+        };
+
+        assert!(removal_confirmation_is_fresh(
+            &pending, &form, &dirty, &identity, 7
+        ));
+        let mut changed = form.clone();
+        changed.title = "changed".into();
+        assert!(!removal_confirmation_is_fresh(
+            &pending, &changed, &dirty, &identity, 7
+        ));
+        let mut changed_dirty = dirty.clone();
+        changed_dirty.defect_review.reviewed = true;
+        assert!(!removal_confirmation_is_fresh(
+            &pending,
+            &form,
+            &changed_dirty,
+            &identity,
+            7
+        ));
+        let mut changed_identity = identity.clone();
+        changed_identity.account_npub = Some("npub-other".into());
+        assert!(!removal_confirmation_is_fresh(
+            &pending,
+            &form,
+            &dirty,
+            &changed_identity,
+            7
+        ));
+        let mut changed_revision = identity.clone();
+        changed_revision.publication.event_id = Some("new-revision".into());
+        assert!(!removal_confirmation_is_fresh(
+            &pending,
+            &form,
+            &dirty,
+            &changed_revision,
+            7
+        ));
+        let mut stale_authority = identity.clone();
+        stale_authority.authoritative_state = Some(AuthoritativeEditState::Stale(
+            PublishAdpListingError::StaleExpectedEventId {
+                expected_event_id: "expected".into(),
+                actual_event_id: "actual".into(),
+            },
+        ));
+        assert!(!removal_confirmation_is_fresh(
+            &pending,
+            &form,
+            &dirty,
+            &stale_authority,
+            7
+        ));
+        assert!(!removal_confirmation_is_fresh(
+            &pending, &form, &dirty, &identity, 8
+        ));
+    }
+
+    #[test]
+    fn second_removal_abort_names_every_new_id_and_requires_fresh_confirmation() {
+        let copy =
+            removal_confirmation_copy(&[profile_id("old-main"), profile_id("old-config")], 2);
+        assert!(copy.contains("backend rechecked the latest revision"));
+        assert!(copy.contains("fresh complete removal set"));
+        assert!(copy.contains("old-main"));
+        assert!(copy.contains("old-config"));
+        assert!(copy.contains("confirm again"));
+    }
+
+    #[test]
+    fn stale_revision_message_preserves_work_and_blocks_overwrite() {
+        let message = publish_error_message(&PublishAdpListingError::StaleExpectedEventId {
+            expected_event_id: "expected".into(),
+            actual_event_id: "actual".into(),
+        });
+
+        assert!(message.contains("local work is preserved"));
+        assert!(message.contains("publication is blocked"));
+        assert!(message.contains("reopen the latest revision"));
+    }
+
     #[test]
     fn format_sha256_abbreviates_valid_ascii_hex() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1195,6 +1495,20 @@ mod tests {
             #[cfg(debug_assertions)]
             nip99_raw_event_json: None,
         }
+    }
+
+    #[test]
+    fn prior_revision_file_hash_is_lowercased_at_capture() {
+        let mut listing = managed_listing("publisher".to_owned(), "fulfillment".to_owned());
+        let uppercase = VALID_SHA256.to_ascii_uppercase();
+        listing
+            .specs
+            .iter_mut()
+            .find(|(name, _)| name == "file_hash")
+            .expect("file_hash fixture exists")
+            .1 = uppercase;
+
+        assert_eq!(captured_file_hash(&listing), Some(VALID_SHA256.to_owned()));
     }
 
     #[test]
@@ -1769,6 +2083,14 @@ mod tests {
     }
 
     #[test]
+    fn edit_distribution_rebases_only_after_safe_async_initialization() {
+        assert!(should_rebase_edit_distribution(true, true, 0));
+        assert!(!should_rebase_edit_distribution(false, true, 0));
+        assert!(!should_rebase_edit_distribution(true, false, 0));
+        assert!(!should_rebase_edit_distribution(true, true, 1));
+    }
+
+    #[test]
     fn publication_phase_never_reports_success_before_an_authoritative_result() {
         assert_eq!(
             publication_phase(false, false, PublicationOutcome::Idle),
@@ -1908,6 +2230,7 @@ mod tests {
             event_id: Some("listing-event-id".into()),
             d_tag: Some("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
             coordinate: Some("30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
+            pending_d_tag: None,
         };
 
         // A retry sends both halves, which is exactly the replacement-edit
@@ -1928,6 +2251,125 @@ mod tests {
             },
         );
         assert_eq!(after_retry, recovered);
+    }
+
+    fn progress(step: &str, message: &str) -> PublishProgressPayload {
+        PublishProgressPayload {
+            step: step.into(),
+            status: "ok".into(),
+            server_url: None,
+            message: Some(message.into()),
+            bytes_uploaded: None,
+            total_bytes: None,
+        }
+    }
+
+    #[test]
+    fn a_failure_before_listing_publication_keeps_the_minted_identity_for_the_retry() {
+        // Provisioning failed: no listing exists, but a coordinate was minted
+        // and a fulfillment key was requested for it.
+        let identity = publication_identity_progress(
+            PublishedIdentity::default(),
+            &progress(
+                "pending-coordinate",
+                "30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b",
+            ),
+        );
+
+        assert_eq!(
+            identity.pending_d_tag.as_deref(),
+            Some("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b")
+        );
+        // Nothing was published, so the retry is still a first publication.
+        assert_eq!(identity.event_id, None);
+        assert_eq!(identity.d_tag, None);
+    }
+
+    #[test]
+    fn publishing_the_listing_settles_the_pending_identity() {
+        let identity = publication_identity_progress(
+            PublishedIdentity::default(),
+            &progress(
+                "pending-coordinate",
+                "30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b",
+            ),
+        );
+        let identity = publication_identity_progress(
+            identity,
+            &progress("publish-listing", "listing-event-id"),
+        );
+        let identity = publication_identity_progress(
+            identity,
+            &progress(
+                "listing-coordinate",
+                "30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b",
+            ),
+        );
+
+        assert_eq!(
+            identity.d_tag.as_deref(),
+            Some("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b")
+        );
+        assert_eq!(
+            identity.pending_d_tag, None,
+            "a published listing is edited by event id, not resumed"
+        );
+    }
+
+    #[test]
+    fn a_published_identity_is_never_downgraded_to_a_pending_one() {
+        let published = PublishedIdentity {
+            event_id: Some("listing-event-id".into()),
+            d_tag: Some("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
+            coordinate: Some("30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
+            pending_d_tag: None,
+        };
+
+        // The retry of a partial publication emits its identity too; it must
+        // not reopen the pending channel for a listing that already exists.
+        let after_retry = publication_identity_progress(
+            published.clone(),
+            &progress(
+                "pending-coordinate",
+                "30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b",
+            ),
+        );
+
+        assert_eq!(after_retry, published);
+    }
+
+    #[test]
+    fn identity_handoffs_are_never_shown_as_publication_stages() {
+        assert!(is_recovery_channel("listing-coordinate"));
+        assert!(is_recovery_channel("pending-coordinate"));
+        for step in [
+            "hash-file",
+            "check-operator",
+            "provision",
+            "publish-listing",
+            "confirm-propagation",
+            "upload",
+        ] {
+            assert!(
+                !is_recovery_channel(step),
+                "{step} is a stage the publisher is waiting on"
+            );
+            assert_ne!(
+                progress_label(&progress(step, "detail")),
+                progress_label(&progress("unmapped-step", "detail")),
+                "{step} should have its own label"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_pending_coordinate_leaves_the_identity_untouched() {
+        let identity = publication_identity_progress(
+            PublishedIdentity::default(),
+            &progress("pending-coordinate", "not-a-coordinate"),
+        );
+
+        assert_eq!(identity, PublishedIdentity::default());
     }
 
     #[test]
@@ -2057,6 +2499,7 @@ pub fn PublishView(
         coordinate: listing
             .as_ref()
             .map(|item| format!("30402:{}:{}", item.publisher_npub, item.id)),
+        pending_d_tag: None,
     });
     let existing_listing_for_submit = listing.clone();
     let published_servers = listing.as_ref().map(listing_servers).unwrap_or_default();
@@ -2068,9 +2511,10 @@ pub fn PublishView(
     let editing_delegated_listing =
         editing && matches!(published_fulfillment_mode, FulfillmentMode::Delegate);
     let use_default_provider = !has_published_fulfillment;
-    let existing_file_hash = listing
-        .as_ref()
-        .and_then(|item| listing_spec(item, "file_hash"));
+    let existing_file_hash = listing.as_ref().and_then(captured_file_hash);
+    let authoritative_file_hash = existing_file_hash.clone();
+    let authoritative_file_hash_for_account = authoritative_file_hash.clone();
+    let authoritative_file_hash_for_submit = authoritative_file_hash.clone();
     let existing_fulfillment_pubkey = listing.as_ref().and_then(listing_fulfillment_pubkey);
     let operator_resolution = listing.as_ref().and_then(operator_resolution_request);
     let initial_acquisition = listing
@@ -2145,7 +2589,6 @@ pub fn PublishView(
             .map(|item| item.platforms.join(", "))
             .unwrap_or_default(),
     );
-    let platform_choice = RwSignal::new(String::new());
     let lud16 = RwSignal::new(
         listing
             .as_ref()
@@ -2198,7 +2641,6 @@ pub fn PublishView(
     let initial_operator_url = initial_operator_url(editing_delegated_listing);
     let operator_url = RwSignal::new(initial_operator_url.clone());
     let operator_auto_added = RwSignal::new(use_default_provider.then_some(initial_operator_url));
-    let file_path = RwSignal::new(None::<String>);
     let file_hash = RwSignal::new(existing_file_hash);
     let version = RwSignal::new(
         listing
@@ -2213,13 +2655,27 @@ pub fn PublishView(
 
     let is_publishing = RwSignal::new(false);
     let is_hashing = RwSignal::new(false);
-    let hash_progress = RwSignal::new(None::<HashProgressPayload>);
     let error_message = RwSignal::new(None::<String>);
     let progress_events = RwSignal::new(Vec::<PublishProgressPayload>::new());
     let upload_progress = RwSignal::new(None::<PublishProgressPayload>);
     let publication_state = RwSignal::new(PublicationState::default());
     let initiating_account = RwSignal::new(None::<String>);
     let publication_account_stale = RwSignal::new(false);
+    let publish_draft = RwSignal::new(PublishState {
+        archive: ArchiveSelectionState::new(auth.npub.get_untracked().unwrap_or_default()),
+        launch: LaunchMode::DownloadOnly,
+    });
+    let authoritative_edit = RwSignal::new(None::<AuthoritativeEditModel>);
+    let publish_attempt = RwSignal::new(PublishAttempt::default());
+    let acknowledged_removed_profile_ids = RwSignal::new(Vec::<ProfileId>::new());
+    let pending_removal_confirmation = RwSignal::new(None::<PendingRemovalConfirmation>);
+    let removal_confirmation_generation = RwSignal::new(0_u64);
+    let removal_abort_count = RwSignal::new(0_u64);
+    let defect_review = RwSignal::new(DefectReviewState::default());
+    let surfaced_archive_warnings = RwSignal::new(Vec::<String>::new());
+    let distribution_user_revision = RwSignal::new(0_u64);
+    let platform_user_revision = RwSignal::new(0_u64);
+    let operator_initialized = RwSignal::new(operator_resolution.is_none());
 
     Effect::new(move |_| {
         if let Some(expected) = initiating_account.get() {
@@ -2228,6 +2684,58 @@ pub fn PublishView(
             }
         }
     });
+
+    Effect::new(move |_| {
+        let next_owner = auth.npub.get().unwrap_or_default();
+        let previous_owner = publish_draft.get_untracked().archive.owner_npub;
+        if previous_owner != next_owner {
+            publish_draft.update(|state| {
+                state
+                    .invalidate_account(next_owner.clone(), ArchiveAccountFailure::AccountMismatch);
+            });
+            file_hash.set(authoritative_file_hash_for_account.clone());
+        }
+    });
+
+    if let Some(edit_listing) = listing.clone() {
+        let mut model = AuthoritativeEditModel::new(
+            edit_listing.publisher_npub.clone(),
+            LaunchMode::DownloadOnly,
+        );
+        let operation = model.begin_load(edit_listing.event_id.clone());
+        authoritative_edit.set(Some(model));
+        if let Some(operation) = operation {
+            let request = LoadAuthoritativeAdpEditMetadataRequest {
+                expected_publisher_npub: edit_listing.publisher_npub.clone(),
+                d_tag: edit_listing.id.clone(),
+                expected_event_id: operation.expected_event_id.clone(),
+            };
+            spawn_local(async move {
+                let response = invoke_load_authoritative_adp_edit_metadata(request).await;
+                authoritative_edit.update(|current| {
+                    let Some(model) = current.as_mut() else {
+                        return;
+                    };
+                    if matches!(
+                        model.apply_response(&operation, response),
+                        Transition::Applied(())
+                    ) {
+                        let projected = preserve_edited_platforms(
+                            model.draft.clone(),
+                            parse_csv_values(&platforms_input.get_untracked()),
+                            platform_user_revision.get_untracked(),
+                        );
+                        if platform_user_revision.get_untracked() == 0 {
+                            if let LaunchMode::Launchable(tier) = &projected {
+                                platforms_input.set(tier.platforms.join(", "));
+                            }
+                        }
+                        publish_draft.update(|state| state.launch = projected);
+                    }
+                });
+            });
+        }
+    }
 
     let add_server = move |url: String, label: String, auto_operator: bool| {
         let trimmed = url.trim().to_string();
@@ -2246,6 +2754,7 @@ pub fn PublishView(
                 auto_operator,
             });
         });
+        distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
         let servers_for_check = servers;
         spawn_local(async move {
             let status = match invoke_check_adp_server(trimmed.clone()).await {
@@ -2262,6 +2771,7 @@ pub fn PublishView(
 
     let remove_server = move |url: String| {
         servers.update(|entries| entries.retain(|entry| entry.url != url));
+        distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
         if operator_auto_added.get_untracked().as_deref() == Some(url.as_str()) {
             operator_auto_added.set(None);
         }
@@ -2321,6 +2831,7 @@ pub fn PublishView(
                 {
                     operator_url.set(resolved);
                 }
+                operator_initialized.set(true);
             });
         });
     }
@@ -2335,30 +2846,199 @@ pub fn PublishView(
         if !can_dispatch(is_hashing.get_untracked(), is_publishing.get_untracked()) {
             return;
         }
+        let Some(expected_publisher_npub) = auth.npub.get_untracked() else {
+            error_message.set(Some("Sign in before selecting an archive.".into()));
+            return;
+        };
+        let request_id = match archive_request_id() {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                error_message.set(Some(archive_error_message(&error)));
+                return;
+            }
+        };
+        let operation = publish_draft
+            .try_update(|state| state.archive.begin_picker(request_id.clone()))
+            .unwrap_or_else(|| {
+                let mut fallback = ArchiveSelectionState::new(expected_publisher_npub.clone());
+                fallback.begin_picker(request_id.clone())
+            });
         is_hashing.set(true);
-        hash_progress.set(None);
         error_message.set(None);
         spawn_local(async move {
-            match invoke_select_build_file().await {
-                Ok(Some(path)) => {
-                    let (next_path, next_hash) = file_selection_changed(Some(path.clone()));
-                    file_path.set(next_path);
-                    file_hash.set(next_hash);
-                    match listen_hash_progress(move |payload| hash_progress.set(Some(payload))).await {
-                        Ok(listener_cleanup) => {
-                            match invoke_hash_build_file(HashBuildFileRequest { file_path: path }).await {
-                                Ok(hash) => file_hash.set(Some(hash)),
-                                Err(err) => error_message.set(Some(err)),
-                            }
-                            listener_cleanup();
-                        }
-                        Err(err) => error_message.set(Some(format!(
-                            "Hashing did not start because progress monitoring is unavailable: {err}"
-                        ))),
+            let selected = invoke_select_archive_build(SelectArchiveRequest {
+                request_id: operation.request_id.clone(),
+                expected_publisher_npub: expected_publisher_npub.clone(),
+            })
+            .await
+            .map(|response| response.selection);
+            let returned_selection = selected.as_ref().ok().and_then(Clone::clone);
+            let selected_new_archive = returned_selection.is_some();
+            if auth.npub.get_untracked().as_deref() != Some(expected_publisher_npub.as_str()) {
+                if let Some(selection) = returned_selection {
+                    if let Ok(request_id) = archive_request_id() {
+                        let _ = invoke_discard_archive_selection(DiscardArchiveSelectionRequest {
+                            request_id,
+                            selection_id: selection.selection_id,
+                            expected_publisher_npub,
+                        })
+                        .await;
                     }
                 }
-                Ok(None) => {}
-                Err(err) => error_message.set(Some(err)),
+                is_hashing.set(false);
+                return;
+            }
+            let transition = publish_draft
+                .try_update(|state| state.apply_picker(&operation, selected))
+                .unwrap_or(Transition::Stale);
+            let replaced = match transition {
+                Transition::Applied(replaced) => replaced,
+                Transition::Stale => {
+                    if let Some(selection) = returned_selection {
+                        if let Ok(request_id) = archive_request_id() {
+                            let _ =
+                                invoke_discard_archive_selection(DiscardArchiveSelectionRequest {
+                                    request_id,
+                                    selection_id: selection.selection_id,
+                                    expected_publisher_npub,
+                                })
+                                .await;
+                        }
+                    }
+                    is_hashing.set(false);
+                    return;
+                }
+            };
+            if selected_new_archive {
+                distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
+            }
+            if let Some(previous) = replaced {
+                if let Ok(request_id) = archive_request_id() {
+                    let _ = invoke_discard_archive_selection(DiscardArchiveSelectionRequest {
+                        request_id,
+                        selection_id: previous.selection_id,
+                        expected_publisher_npub: expected_publisher_npub.clone(),
+                    })
+                    .await;
+                }
+            }
+            let Some(selection_id) = publish_draft
+                .get_untracked()
+                .archive
+                .selection
+                .map(|selection| selection.selection_id)
+            else {
+                is_hashing.set(false);
+                return;
+            };
+            file_hash.set(None);
+
+            let inspect_request_id = match archive_request_id() {
+                Ok(request_id) => request_id,
+                Err(error) => {
+                    error_message.set(Some(archive_error_message(&error)));
+                    is_hashing.set(false);
+                    return;
+                }
+            };
+            let Some(inspect_operation) = publish_draft
+                .try_update(|state| {
+                    state
+                        .archive
+                        .begin_selection_operation(inspect_request_id.clone())
+                })
+                .flatten()
+            else {
+                is_hashing.set(false);
+                return;
+            };
+            let inspection = invoke_inspect_archive(InspectArchiveRequest {
+                request_id: inspect_request_id,
+                selection_id: selection_id.clone(),
+                expected_publisher_npub: expected_publisher_npub.clone(),
+                expected_format: None,
+            })
+            .await
+            .map(|response| response.summary);
+            let detected_package = inspection
+                .as_ref()
+                .ok()
+                .map(|summary| match &summary.detected_format {
+                    arcadestr_core::distribution::PackageFormat::Zip => "zip",
+                    arcadestr_core::distribution::PackageFormat::TarZstd => "tar.zst",
+                    arcadestr_core::distribution::PackageFormat::TarGz => "tar.gz",
+                })
+                .map(str::to_string);
+            let safe_to_hash = inspection
+                .as_ref()
+                .is_ok_and(|summary| !summary.blocking_hazards);
+            let inspection_error = inspection.as_ref().err().cloned();
+            let summary_transition = publish_draft
+                .try_update(|state| state.archive.apply_summary(&inspect_operation, inspection))
+                .unwrap_or(Transition::Stale);
+            if matches!(summary_transition, Transition::Stale) {
+                is_hashing.set(false);
+                return;
+            }
+            if let Some(package_format) = detected_package {
+                publish_draft.update(|state| {
+                    if let LaunchMode::Launchable(tier) = &mut state.launch {
+                        tier.package_format.text = package_format;
+                    }
+                });
+            }
+            if let Some(error) = inspection_error {
+                error_message.set(Some(archive_error_message(&error)));
+            }
+            if !safe_to_hash {
+                is_hashing.set(false);
+                return;
+            }
+
+            let hash_request_id = match archive_request_id() {
+                Ok(request_id) => request_id,
+                Err(error) => {
+                    error_message.set(Some(archive_error_message(&error)));
+                    is_hashing.set(false);
+                    return;
+                }
+            };
+            let Some(hash_operation) = publish_draft
+                .try_update(|state| {
+                    state
+                        .archive
+                        .begin_selection_operation(hash_request_id.clone())
+                })
+                .flatten()
+            else {
+                is_hashing.set(false);
+                return;
+            };
+            let hashed = invoke_hash_selected_archive(HashSelectedArchiveRequest {
+                request_id: hash_request_id,
+                selection_id: selection_id.clone(),
+                expected_publisher_npub,
+            })
+            .await
+            .map(|response| BuildSelectionRef {
+                selection_id: response.selection_id,
+                sha256: response.sha256,
+            });
+            let hash_for_display = hashed
+                .as_ref()
+                .ok()
+                .map(|build| build.sha256.as_str().to_string());
+            let hash_error = hashed.as_ref().err().cloned();
+            let transition = publish_draft
+                .try_update(|state| state.archive.apply_hash(&hash_operation, hashed))
+                .unwrap_or(Transition::Stale);
+            if matches!(transition, Transition::Applied(())) {
+                if let Some(hash) = hash_for_display {
+                    file_hash.set(Some(hash));
+                }
+                if let Some(error) = hash_error {
+                    error_message.set(Some(archive_error_message(&error)));
+                }
             }
             is_hashing.set(false);
         });
@@ -2587,36 +3267,72 @@ pub fn PublishView(
                         .map(|_| ())
                     })
             }
-            PublishStage::Builds => parse_platform_tags(&platforms_input.get())
-                .map(|_| ())
-                .and_then(|_| {
-                    if !fulfillment_enabled.get() {
-                        return Ok(());
-                    }
-                    validate_listing(
-                        &title.get(),
-                        &description.get(),
-                        0,
-                        "",
-                        true,
-                        &servers.get(),
-                        &file_path.get(),
-                        &file_hash.get(),
-                        &version.get(),
-                        &fulfillment_mode.get(),
-                        &operator_url.get(),
-                    )
-                }),
+            PublishStage::Builds => {
+                let draft = publish_draft.get();
+                if matches!(draft.launch, LaunchMode::Launchable(_)) && !fulfillment_enabled.get() {
+                    return Err(
+                        "Enable automated installation, or explicitly choose download-only."
+                            .to_string(),
+                    );
+                }
+                let selection_id = draft
+                    .archive
+                    .selected_build
+                    .as_ref()
+                    .map(|build| &build.selection_id);
+                draft
+                    .launch
+                    .to_wire_result(selection_id)
+                    .map(|_| ())
+                    .map_err(|_| {
+                        "Complete the launchable tier, or explicitly choose download-only."
+                            .to_string()
+                    })
+                    .and_then(|_| parse_platform_tags(&platforms_input.get()).map(|_| ()))
+                    .and_then(|_| {
+                        if !fulfillment_enabled.get() {
+                            return Ok(());
+                        }
+                        validate_listing(
+                            &title.get(),
+                            &description.get(),
+                            0,
+                            "",
+                            true,
+                            &servers.get(),
+                            &None,
+                            &file_hash.get(),
+                            &version.get(),
+                            &fulfillment_mode.get(),
+                            &operator_url.get(),
+                        )
+                    })
+            }
             PublishStage::Review => Err("Already at the review stage".to_string()),
         }
     };
 
     let blocking_issues = move || {
-        blocking_stage_errors(
+        let mut issues = blocking_stage_errors(
             &validate_stage(PublishStage::Details),
             &validate_stage(PublishStage::Pricing),
             &validate_stage(PublishStage::Builds),
-        )
+        );
+        if editing
+            && !authoritative_edit.get().is_some_and(|model| {
+                matches!(
+                    model.state,
+                    AuthoritativeEditState::Absent | AuthoritativeEditState::PresentValid(_)
+                ) || (matches!(model.state, AuthoritativeEditState::PresentDefective(_))
+                    && defect_review.get().reviewed)
+            })
+        {
+            issues.push((
+                PublishStage::Builds,
+                "Authoritative launch metadata must load before publishing this edit.".to_string(),
+            ));
+        }
+        issues
     };
 
     let on_next = move |_| {
@@ -2642,10 +3358,284 @@ pub fn PublishView(
         }
     };
 
+    let full_form_snapshot = move || FormSnapshot {
+        title: title.get(),
+        description: description.get(),
+        tags: tag_input.get(),
+        price: price_input.get(),
+        lud16: lud16.get(),
+        platforms: platforms_input.get(),
+        version: version.get(),
+        operator_url: operator_url.get(),
+        acquisition: format!("{:?}", acquisition_kind.get()),
+        starts_at: acquisition_starts_at.get(),
+        ends_at: acquisition_ends_at.get(),
+        images: image_drafts
+            .get()
+            .into_iter()
+            .map(|image| match image {
+                ListingImageDraft::Hosted(url) => format!("hosted:{url}"),
+                ListingImageDraft::Pending(selection) => {
+                    format!("pending:{}", selection.selection_id)
+                }
+            })
+            .collect(),
+        fulfillment_enabled: fulfillment_enabled.get(),
+    };
+    let form_snapshot = {
+        let full_form_snapshot = full_form_snapshot.clone();
+        move || {
+            let mut snapshot = full_form_snapshot();
+            // These fields have an asynchronously rebased distribution baseline.
+            snapshot.platforms.clear();
+            snapshot.version.clear();
+            snapshot.operator_url.clear();
+            snapshot
+        }
+    };
+    let fulfillment_key_for_snapshot = existing_fulfillment_pubkey.clone();
+    let nip94_for_snapshot = existing_nip94_event_id.clone();
+    let distribution_snapshot = move || {
+        let draft = publish_draft.get();
+        PublishDirtySnapshot::capture(
+            &draft.archive,
+            &draft.launch,
+            ProviderBuildFields {
+                fulfillment_mode: format!("{:?}", fulfillment_mode.get()),
+                operator_url: (!operator_url.get().trim().is_empty()).then(|| operator_url.get()),
+                servers: servers.get().into_iter().map(|server| server.url).collect(),
+                existing_file_hash: draft
+                    .archive
+                    .selected_build
+                    .is_none()
+                    .then(|| file_hash.get())
+                    .flatten(),
+                existing_fulfillment_pubkey: fulfillment_key_for_snapshot.clone(),
+                version: (!version.get().trim().is_empty()).then(|| version.get()),
+                nip94_event_id: nip94_for_snapshot.clone(),
+                platforms: parse_csv_values(&platforms_input.get()),
+            },
+            acknowledged_removed_profile_ids.get(),
+            defect_review.get(),
+        )
+    };
+
     let existing_campaigns_for_submit = existing_campaigns.clone();
     let existing_nip94_for_submit = existing_nip94_event_id.clone();
     let existing_fulfillment_key_for_submit = existing_fulfillment_pubkey.clone();
     let editing_publisher_for_submit = editing_publisher.clone();
+    let existing_listing_for_dispatch = existing_listing_for_submit.clone();
+    let form_snapshot_for_dispatch = full_form_snapshot.clone();
+    let distribution_snapshot_for_dispatch = distribution_snapshot.clone();
+    let dispatch_prepared = Callback::new(
+        move |(prepared, initiating_npub, confirmed_removed_ids): (
+            PreparedPublish,
+            String,
+            Option<Vec<ProfileId>>,
+        )| {
+            let published_request = prepared.request.clone();
+            let existing_listing = existing_listing_for_dispatch.clone();
+            is_publishing.set(true);
+            initiating_account.set(Some(initiating_npub.clone()));
+            publication_account_stale.set(false);
+            error_message.set(None);
+            progress_events.set(Vec::new());
+            upload_progress.set(None);
+            publication_state.set(PublicationState {
+                outcome: PublicationOutcome::Publishing,
+                ..PublicationState::default()
+            });
+            servers.update(|entries| {
+                for entry in entries {
+                    entry.upload = ServerStatus::Idle;
+                }
+            });
+
+            let form_at_dispatch = form_snapshot_for_dispatch.clone();
+            let dirty_at_dispatch = distribution_snapshot_for_dispatch.clone();
+            spawn_local(async move {
+                let progress_account = initiating_npub.clone();
+                let listener_cleanup = listen_publish_progress(move |payload| {
+                    if publication_account_stale.get_untracked()
+                        || !publication_account_matches(
+                            &progress_account,
+                            auth.npub.get_untracked().as_deref(),
+                        )
+                    {
+                        return;
+                    }
+                    published_identity.update(|identity| {
+                        *identity = publication_identity_progress(identity.clone(), &payload)
+                    });
+                    if is_recovery_channel(&payload.step) {
+                        return;
+                    }
+                    if payload.step == "upload" {
+                        if payload.bytes_uploaded.is_some() && payload.total_bytes.is_some() {
+                            upload_progress.set(Some(payload.clone()));
+                        }
+                        if let Some(server_url) = payload.server_url.clone() {
+                            let status = match payload.status.as_str() {
+                                "pending" | "progress" => ServerStatus::Pending,
+                                "ok" => ServerStatus::Ok,
+                                "error" => ServerStatus::Failed,
+                                _ => ServerStatus::Idle,
+                            };
+                            servers.update(|entries| {
+                                if let Some(entry) =
+                                    entries.iter_mut().find(|entry| entry.url == server_url)
+                                {
+                                    entry.upload = status;
+                                }
+                            });
+                        }
+                    }
+                    publication_state
+                        .update(|state| *state = publication_progress(state.clone(), &payload));
+                    if payload.status != "progress" {
+                        progress_events.update(|events| events.push(payload));
+                    }
+                })
+                .await;
+                let listener_cleanup = match listener_cleanup {
+                    Ok(cleanup) => cleanup,
+                    Err(error) => {
+                        publication_state.set(PublicationState {
+                            outcome: PublicationOutcome::Failed,
+                            listing_published: false,
+                            message: Some(format!(
+                                "Publication did not start because progress monitoring is unavailable: {error}"
+                            )),
+                        });
+                        is_publishing.set(false);
+                        initiating_account.set(None);
+                        return;
+                    }
+                };
+
+                if let Some(removed_profile_ids) = confirmed_removed_ids {
+                    acknowledged_removed_profile_ids.set(removed_profile_ids);
+                }
+                publish_attempt.update(|attempt| attempt.start(prepared.clone()));
+                let publish_result = invoke_publish_adp_listing_with_contract(
+                    prepared.request.clone(),
+                    prepared.extension.clone(),
+                )
+                .await;
+                listener_cleanup();
+                if publication_account_stale.get_untracked()
+                    || !publication_account_matches(
+                        &initiating_npub,
+                        auth.npub.get_untracked().as_deref(),
+                    )
+                {
+                    let current = publication_state.get_untracked();
+                    publication_state.set(PublicationState {
+                        outcome: if current.listing_published {
+                            PublicationOutcome::Partial
+                        } else {
+                            PublicationOutcome::Failed
+                        },
+                        listing_published: current.listing_published,
+                        message: Some(if current.listing_published {
+                            "The Game page was published before the active account changed, but later results were ignored. Switch to the initiating account and refresh Published games to reconcile uploads."
+                                .into()
+                        } else {
+                            "The active account changed during publication. The stale response was ignored; check Published games with the initiating account before retrying."
+                                .into()
+                        }),
+                    });
+                    is_publishing.set(false);
+                    initiating_account.set(None);
+                    return;
+                }
+                let published = match publish_result {
+                    Ok(result) => {
+                        pending_removal_confirmation.set(None);
+                        publish_attempt.update(|attempt| attempt.succeed(result.clone()));
+                        publish_draft.update(PublishState::consume_selected_archive);
+                        published_identity.set(PublishedIdentity {
+                            event_id: Some(result.event_id.clone()),
+                            d_tag: Some(result.d_tag.clone()),
+                            coordinate: Some(result.game_coordinate.clone()),
+                            pending_d_tag: None,
+                        });
+                        let uploads_failed =
+                            result.uploads.iter().any(|upload| upload.status != "ok");
+                        publication_state.update(|state| {
+                            *state = publication_completed(
+                                state.clone(),
+                                Ok((result.event_id.clone(), uploads_failed)),
+                            )
+                        });
+                        (!uploads_failed).then(|| {
+                            published_listing(existing_listing, &published_request, &result)
+                        })
+                    }
+                    Err(err) => {
+                        publish_attempt.update(|attempt| attempt.fail(err.clone()));
+                        if let PublishAdpListingError::ProfileRemovalAcknowledgementRequired {
+                            removed_profile_ids,
+                        } = &err
+                        {
+                            let Some(frozen) = publish_attempt.get_untracked().prepared else {
+                                publication_state.update(|state| {
+                                    *state = publication_completed(
+                                        state.clone(),
+                                        Err("Publication removal confirmation could not retain its frozen payload. Submit again.".into()),
+                                    )
+                                });
+                                is_publishing.set(false);
+                                initiating_account.set(None);
+                                return;
+                            };
+                            removal_confirmation_generation
+                                .update(|generation| *generation = generation.wrapping_add(1));
+                            removal_abort_count.update(|count| *count = count.wrapping_add(1));
+                            pending_removal_confirmation.set(Some(PendingRemovalConfirmation {
+                                prepared: frozen,
+                                removed_profile_ids: removed_profile_ids.clone(),
+                                form: form_at_dispatch(),
+                                dirty: dirty_at_dispatch(),
+                                identity: RemovalConfirmationIdentity {
+                                    account_npub: auth.npub.get_untracked(),
+                                    publication: published_identity.get_untracked(),
+                                    authoritative_state: authoritative_edit
+                                        .get_untracked()
+                                        .map(|model| model.state),
+                                },
+                                generation: removal_confirmation_generation.get_untracked(),
+                                abort_count: removal_abort_count.get_untracked(),
+                            }));
+                        }
+                        if let Some(archive_error) = publish_archive_error(&err).cloned() {
+                            publish_draft.update(|state| state.apply_archive_error(archive_error));
+                        }
+                        if matches!(err, PublishAdpListingError::StaleExpectedEventId { .. }) {
+                            pending_removal_confirmation.set(None);
+                            authoritative_edit.update(|state| {
+                                if let Some(state) = state {
+                                    state.state = AuthoritativeEditState::Stale(err.clone());
+                                }
+                            });
+                        }
+                        publication_state.update(|state| {
+                            *state = publication_completed(
+                                state.clone(),
+                                Err(publish_error_message(&err)),
+                            )
+                        });
+                        None
+                    }
+                };
+                is_publishing.set(false);
+                initiating_account.set(None);
+                if let (Some(on_published), Some(listing)) = (on_published, published) {
+                    on_published.run(listing);
+                }
+            });
+        },
+    );
     let on_submit = Callback::new(move |()| {
         if is_selecting_image.get_untracked() {
             error_message.set(Some("Finish selecting the image before publishing.".into()));
@@ -2681,7 +3671,6 @@ pub fn PublishView(
                 }
             };
         let servers_val = servers.get();
-        let file_path_val = file_path.get();
         let file_hash_val = file_hash.get();
         let version_val = version.get();
         let fulfillment_enabled_val = fulfillment_enabled.get();
@@ -2710,7 +3699,7 @@ pub fn PublishView(
             &lud16_val,
             fulfillment_enabled_val,
             &servers_val,
-            &file_path_val,
+            &None,
             &file_hash_val,
             &version_val,
             &fulfillment_mode_val,
@@ -2760,10 +3749,32 @@ pub fn PublishView(
             return;
         }
 
+        let draft_state = publish_draft.get_untracked();
+        let selected_build = fulfillment_enabled_val
+            .then(|| draft_state.archive.selected_build.clone())
+            .flatten();
+        let selection_id = selected_build.as_ref().map(|build| &build.selection_id);
+        let launch_tier = match draft_state.launch.to_wire_result(selection_id) {
+            Ok(launch_tier) => launch_tier,
+            Err(violation) => {
+                let error = PublishAdpListingError::CoreValidation {
+                    violation,
+                    message: "Complete every launch-tier field before publishing.".into(),
+                };
+                publish_attempt.update(|attempt| attempt.fail(error.clone()));
+                error_message.set(Some(publish_error_message(&error)));
+                return;
+            }
+        };
+        let extension = PublishAdpListingRequestExtension {
+            launch_tier,
+            acknowledged_removed_profile_ids: acknowledged_removed_profile_ids.get_untracked(),
+        };
         let mut request = PublishAdpListingRequest {
             expected_publisher_npub: initiating_npub.clone(),
             existing_event_id: published_identity.get_untracked().event_id,
             existing_d_tag: published_identity.get_untracked().d_tag,
+            pending_d_tag: published_identity.get_untracked().pending_d_tag,
             title: title_val,
             description: description_val,
             price_sats: price_val,
@@ -2781,8 +3792,10 @@ pub fn PublishView(
                 servers_val.into_iter().map(|entry| entry.url).collect(),
             )
             .unwrap_or_default(),
-            file_path: when_fulfillment_enabled(fulfillment_enabled_val, file_path_val).flatten(),
-            existing_file_hash: when_fulfillment_enabled(fulfillment_enabled_val, file_hash_val)
+            file_path: None,
+            selected_build: selected_build.clone(),
+            existing_file_hash: (fulfillment_enabled_val && selected_build.is_none())
+                .then_some(file_hash_val)
                 .flatten(),
             existing_fulfillment_pubkey: when_fulfillment_enabled(
                 fulfillment_enabled_val,
@@ -2799,7 +3812,26 @@ pub fn PublishView(
             campaigns: existing_campaigns_for_submit.clone(),
             nip94_event_id: existing_nip94_for_submit.clone(),
         };
-        let existing_listing = existing_listing_for_submit.clone();
+        let prepared = match prepare_publish(
+            request,
+            extension,
+            selected_build,
+            fulfillment_enabled_val,
+            authoritative_file_hash_for_submit.as_deref(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let typed = PublishAdpListingError::Archive { error };
+                publish_attempt.update(|attempt| attempt.fail(typed.clone()));
+                error_message.set(Some(publish_error_message(&typed)));
+                return;
+            }
+        };
+        let PreparedPublish {
+            request: next_request,
+            extension,
+        } = prepared;
+        request = next_request;
 
         is_publishing.set(true);
         initiating_account.set(Some(initiating_npub.clone()));
@@ -2984,130 +4016,107 @@ pub fn PublishView(
                 initiating_account.set(None);
                 return;
             }
-            let published_request = request.clone();
-            let progress_account = initiating_npub.clone();
-            let listener_cleanup = listen_publish_progress(move |payload| {
-                if publication_account_stale.get_untracked()
-                    || !publication_account_matches(
-                        &progress_account,
-                        auth.npub.get_untracked().as_deref(),
-                    )
-                {
-                    return;
-                }
-                // Capture the identity of the listing the moment it exists, so
-                // a retry after a later failure edits it instead of minting a
-                // second coordinate.
-                published_identity.update(|identity| {
-                    *identity = publication_identity_progress(identity.clone(), &payload)
-                });
-                if payload.step == "listing-coordinate" {
-                    // A recovery channel, not a user-visible publication step.
-                    return;
-                }
-                if payload.step == "upload" {
-                    if payload.bytes_uploaded.is_some() && payload.total_bytes.is_some() {
-                        upload_progress.set(Some(payload.clone()));
-                    }
-                    if let Some(server_url) = payload.server_url.clone() {
-                        let status = match payload.status.as_str() {
-                            "pending" | "progress" => ServerStatus::Pending,
-                            "ok" => ServerStatus::Ok,
-                            "error" => ServerStatus::Failed,
-                            _ => ServerStatus::Idle,
-                        };
-                        servers.update(|entries| {
-                            if let Some(entry) =
-                                entries.iter_mut().find(|entry| entry.url == server_url)
-                            {
-                                entry.upload = status;
-                            }
-                        });
-                    }
-                }
-                publication_state
-                    .update(|state| *state = publication_progress(state.clone(), &payload));
-                if payload.status != "progress" {
-                    progress_events.update(|events| events.push(payload));
-                }
-            })
-            .await;
-            let listener_cleanup = match listener_cleanup {
-                Ok(cleanup) => cleanup,
-                Err(error) => {
-                    publication_state.set(PublicationState {
-                        outcome: PublicationOutcome::Failed,
-                        listing_published: false,
-                        message: Some(format!(
-                            "Publication did not start because progress monitoring is unavailable: {error}"
-                        )),
-                    });
-                    is_publishing.set(false);
-                    initiating_account.set(None);
-                    return;
-                }
-            };
-
-            let publish_result = invoke_publish_adp_listing(request).await;
-            listener_cleanup();
-            if publication_account_stale.get_untracked()
-                || !publication_account_matches(
-                    &initiating_npub,
-                    auth.npub.get_untracked().as_deref(),
-                )
-            {
-                let current = publication_state.get_untracked();
-                publication_state.set(PublicationState {
-                    outcome: if current.listing_published {
-                        PublicationOutcome::Partial
-                    } else {
-                        PublicationOutcome::Failed
-                    },
-                    listing_published: current.listing_published,
-                    message: Some(if current.listing_published {
-                        "The Game page was published before the active account changed, but later results were ignored. Switch to the initiating account and refresh Published games to reconcile uploads."
-                            .into()
-                    } else {
-                        "The active account changed during publication. The stale response was ignored; check Published games with the initiating account before retrying."
-                            .into()
-                    }),
-                });
-                is_publishing.set(false);
-                initiating_account.set(None);
-                return;
-            }
-            let published = match publish_result {
-                Ok(result) => {
-                    published_identity.set(PublishedIdentity {
-                        event_id: Some(result.event_id.clone()),
-                        d_tag: Some(result.d_tag.clone()),
-                        coordinate: Some(result.game_coordinate.clone()),
-                    });
-                    let uploads_failed = result.uploads.iter().any(|upload| upload.status != "ok");
-                    publication_state.update(|state| {
-                        *state = publication_completed(
-                            state.clone(),
-                            Ok((result.event_id.clone(), uploads_failed)),
-                        )
-                    });
-                    (!uploads_failed)
-                        .then(|| published_listing(existing_listing, &published_request, &result))
-                }
-                Err(err) => {
-                    publication_state
-                        .update(|state| *state = publication_completed(state.clone(), Err(err)));
-                    None
-                }
-            };
-            is_publishing.set(false);
-            initiating_account.set(None);
-            if let (Some(on_published), Some(listing)) = (on_published, published) {
-                on_published.run(listing);
-            }
+            let current_prepared = PreparedPublish { request, extension };
+            let retry_overlay = published_identity.get_untracked();
+            let prepared = partial_retry_payload(
+                &publish_attempt.get_untracked(),
+                current_prepared,
+                PublishIdentityOverlay {
+                    existing_event_id: retry_overlay.event_id.clone(),
+                    d_tag: retry_overlay.d_tag.clone(),
+                    pending_d_tag: retry_overlay.pending_d_tag.clone(),
+                },
+            );
+            dispatch_prepared.run((prepared, initiating_npub, None));
         });
     });
 
+    let dismiss_removal_confirmation = Callback::new(move |()| {
+        removal_confirmation_generation
+            .update(|generation| *generation = generation.wrapping_add(1));
+        pending_removal_confirmation.set(None);
+    });
+    let form_snapshot_for_confirmation = full_form_snapshot.clone();
+    let distribution_snapshot_for_confirmation = distribution_snapshot.clone();
+    let form_snapshot_for_invalidation = full_form_snapshot.clone();
+    let distribution_snapshot_for_invalidation = distribution_snapshot.clone();
+    Effect::new(move |_| {
+        let Some(pending) = pending_removal_confirmation.get() else {
+            return;
+        };
+        let current_identity = RemovalConfirmationIdentity {
+            account_npub: auth.npub.get(),
+            publication: published_identity.get(),
+            authoritative_state: authoritative_edit.get().map(|model| model.state),
+        };
+        if !removal_confirmation_is_fresh(
+            &pending,
+            &form_snapshot_for_invalidation(),
+            &distribution_snapshot_for_invalidation(),
+            &current_identity,
+            removal_confirmation_generation.get(),
+        ) {
+            removal_confirmation_generation
+                .update(|generation| *generation = generation.wrapping_add(1));
+            pending_removal_confirmation.set(None);
+            error_message.set(Some(
+                "The form, archive, distribution settings, account, or authoritative revision changed after the backend check. The frozen confirmation was voided; submit again."
+                    .into(),
+            ));
+        }
+    });
+    let confirm_profile_removal = Callback::new(move |()| {
+        if is_publishing.get_untracked() {
+            return;
+        }
+        let Some(pending) = pending_removal_confirmation.get_untracked() else {
+            return;
+        };
+        let current_identity = RemovalConfirmationIdentity {
+            account_npub: auth.npub.get_untracked(),
+            publication: published_identity.get_untracked(),
+            authoritative_state: authoritative_edit.get_untracked().map(|model| model.state),
+        };
+        if !removal_confirmation_is_fresh(
+            &pending,
+            &form_snapshot_for_confirmation(),
+            &distribution_snapshot_for_confirmation(),
+            &current_identity,
+            removal_confirmation_generation.get_untracked(),
+        ) {
+            dismiss_removal_confirmation.run(());
+            error_message.set(Some(
+                "The form, archive, distribution settings, account, or authoritative revision changed after the backend check. The frozen confirmation was voided; submit again."
+                    .into(),
+            ));
+            return;
+        }
+
+        let confirmed =
+            removal_confirmation_prepared(&pending.prepared, &pending.removed_profile_ids);
+        let removed_profile_ids = pending.removed_profile_ids;
+        pending_removal_confirmation.set(None);
+        dispatch_prepared.run((
+            confirmed,
+            current_identity.account_npub.unwrap_or_default(),
+            Some(removed_profile_ids),
+        ));
+    });
+
     on_cleanup(move || {
+        if let Some(selection) = publish_draft.get_untracked().archive.selection {
+            let expected_publisher_npub = publish_draft.get_untracked().archive.owner_npub;
+            spawn_local(async move {
+                if let Ok(request_id) = archive_request_id() {
+                    let _ = invoke_discard_archive_selection(DiscardArchiveSelectionRequest {
+                        request_id,
+                        selection_id: selection.selection_id,
+                        expected_publisher_npub,
+                    })
+                    .await;
+                }
+            });
+        }
         let selections = image_drafts
             .get_untracked()
             .into_iter()
@@ -3155,31 +4164,44 @@ pub fn PublishView(
         )
     };
 
-    let form_snapshot = move || FormSnapshot {
-        title: title.get(),
-        description: description.get(),
-        tags: tag_input.get(),
-        price: price_input.get(),
-        lud16: lud16.get(),
-        platforms: platforms_input.get(),
-        version: version.get(),
-        operator_url: operator_url.get(),
-        acquisition: format!("{:?}", acquisition_kind.get()),
-        starts_at: acquisition_starts_at.get(),
-        ends_at: acquisition_ends_at.get(),
-        image_count: image_drafts.get().len(),
-        fulfillment_enabled: fulfillment_enabled.get(),
-    };
-    let initial_snapshot = StoredValue::new(form_snapshot());
-    let is_dirty = move || form_snapshot() != initial_snapshot.get_value();
-
-    // Create Game has no draft persistence, so leaving this form discards the
-    // inputs. Publish the dirty flag so the shell can guard navigation, and
-    // clear it when the form goes away.
+    let initial_form_snapshot = StoredValue::new(form_snapshot());
+    let initial_distribution_snapshot = RwSignal::new(distribution_snapshot());
+    let authority_rebased = RwSignal::new(!editing);
+    let distribution_snapshot_for_baseline = distribution_snapshot.clone();
     Effect::new(move |_| {
-        crate::ui_v2::components::set_create_game_dirty(is_dirty());
+        if authority_rebased.get() {
+            return;
+        }
+        let authority_ready = authoritative_edit.get().is_some_and(|model| {
+            matches!(
+                model.state,
+                AuthoritativeEditState::Absent
+                    | AuthoritativeEditState::PresentValid(_)
+                    | AuthoritativeEditState::PresentDefective(_)
+            )
+        });
+        if should_rebase_edit_distribution(
+            authority_ready,
+            operator_initialized.get(),
+            distribution_user_revision.get(),
+        ) {
+            initial_distribution_snapshot.set(distribution_snapshot_for_baseline());
+            authority_rebased.set(true);
+        }
     });
-    on_cleanup(|| crate::ui_v2::components::set_create_game_dirty(false));
+    let distribution_snapshot_for_dirty = distribution_snapshot.clone();
+    let is_dirty = move || {
+        form_snapshot() != initial_form_snapshot.get_value()
+            || distribution_snapshot_for_dirty() != initial_distribution_snapshot.get()
+    };
+
+    // Publish Game has no draft persistence. Share the complete create/edit
+    // dirty snapshot with the shell and clear it when this form unmounts.
+    let is_dirty_for_guard = is_dirty.clone();
+    Effect::new(move |_| {
+        crate::ui_v2::components::set_publish_game_dirty(is_dirty_for_guard());
+    });
+    on_cleanup(|| crate::ui_v2::components::set_publish_game_dirty(false));
 
     let signer_state = Signal::derive(move || {
         let publisher = auth.npub.get();
@@ -3193,7 +4215,9 @@ pub fn PublishView(
     let can_publish_now = Signal::derive(move || {
         signed_in.get() && signer_can_publish(signer_state.get()) && blocking_issues().is_empty()
     });
-    let authoring = move || authoring_state(editing, is_dirty(), blocking_issues().len());
+    let is_dirty_for_authoring = is_dirty.clone();
+    let authoring =
+        move || authoring_state(editing, is_dirty_for_authoring(), blocking_issues().len());
     let phase = move || {
         publication_phase(
             is_publishing.get(),
@@ -3248,6 +4272,53 @@ pub fn PublishView(
             {(!SUPPORTS_DRAFTS).then(|| view! {
                 <p class="v2-create-persistence-note">"Arcadestr does not store Create Game drafts. Nothing here is saved locally or on a relay until network publication succeeds; leaving this workflow discards it."</p>
             })}
+
+            <Dialog
+                id="publish-profile-removal-confirmation"
+                open=Signal::derive(move || pending_removal_confirmation.get().is_some())
+                title=Signal::derive(move || pending_removal_confirmation.get().map(|pending| {
+                    (if pending.abort_count > 1 {
+                        "Removal set changed — confirm again"
+                    } else {
+                        "Confirm removed launch profiles"
+                    })
+                    .to_string()
+                }).unwrap_or_default())
+                kicker="Publication blocked"
+                description=Signal::derive(move || pending_removal_confirmation.get().map(|pending| removal_confirmation_copy(&pending.removed_profile_ids, pending.abort_count)).unwrap_or_default())
+                width=DialogWidth::Compact
+                tone=DialogTone::Destructive
+                policy=DialogClosePolicy::Dismissible
+                dismissal=DialogDismissal::keyboard_and_button()
+                initial_focus=DialogInitialFocus::CloseButton
+                close_label="Keep editing"
+                on_close=UnsyncCallback::new(move |request: DialogCloseRequest| {
+                    if request.action == DialogCloseAction::Dismiss {
+                        dismiss_removal_confirmation.run(());
+                    }
+                })
+                actions=move || view! {
+                    <Button
+                        variant=ButtonVariant::Secondary
+                        on_click=Callback::new(move |_| dismiss_removal_confirmation.run(()))
+                    >"Keep editing"</Button>
+                    <Button
+                        variant=ButtonVariant::Danger
+                        disabled=Signal::derive(move || is_publishing.get())
+                        on_click=Callback::new(move |_| confirm_profile_removal.run(()))
+                    >"Confirm removals and publish"</Button>
+                }
+            >
+                <div role="alert" class="v2-create-alert v2-create-alert-error">
+                    <p>"The backend stopped before publication. Confirming resubmits the exact frozen review payload and only acknowledges these removals:"</p>
+                    <ul>
+                        {move || pending_removal_confirmation.get().map(|pending| pending.removed_profile_ids.into_iter().map(|id| view! {
+                            <li><strong>{id.as_str().to_string()}</strong>": installed clients may have this profile ID pinned and will fall back after publication."</li>
+                        }).collect_view())}
+                    </ul>
+                    <p>"Closing this dialog voids this confirmation. Any form, archive, profile, distribution, account, or revision change requires a new submit and backend check."</p>
+                </div>
+            </Dialog>
 
             <div class="v2-create-surface">
                     <Show when=move || current_stage.get() == PublishStage::Details>
@@ -3388,47 +4459,16 @@ pub fn PublishView(
                         <h2 id="publish-builds-title" class="v2-create-section-title">"Builds and distribution"</h2>
                         <p class="v2-create-help">"Enable automated installation only when you have a build and distribution provider. Otherwise this remains a metadata-only game page."</p>
                         <p class="v2-create-help">{build_capability_message()}</p>
-                        <div class="v2-create-field">
-                            <label for="publish-platforms" class="v2-create-field-label">"Platforms"</label>
-                            <select id="publish-platforms" aria-describedby="publish-platforms-help" class="v2-input" prop:value=move || platform_choice.get() on:change:target=move |ev| {
-                                let selected = ev.target().value();
-                                platforms_input.update(|input| *input = add_platform(input, &selected));
-                                platform_choice.set(String::new());
-                            } disabled=move || is_publishing.get()>
-                                <option value="">"Add a platform..."</option>
-                                {AVAILABLE_PLATFORMS.into_iter().map(|(tag, label)| view! {
-                                    <option value=tag disabled=move || parse_csv_values(&platforms_input.get()).iter().any(|selected| selected == tag)>{label}</option>
-                                }).collect_view()}
-                            </select>
-                            <p id="publish-platforms-help" class="v2-create-help">"Add every supported target. Leave the selection empty to publish for all platforms."</p>
-                            <div class="v2-create-chip-row">
-                                {move || {
-                                    let selected = parse_csv_values(&platforms_input.get());
-                                    if selected.is_empty() {
-                                        view! { <span class="v2-create-chip">"All platforms"</span> }.into_any()
-                                    } else {
-                                        selected.into_iter().map(|platform| {
-                                            let platform_to_remove = platform.clone();
-                                            view! {
-                                                <span class="v2-create-chip">
-                                                    {platform}
-                                                    <button type="button" class="v2-create-chip-remove" aria-label=format!("Remove {platform_to_remove}") on:click=move |_| platforms_input.update(|input| *input = remove_platform(input, &platform_to_remove)) disabled=move || is_publishing.get()>"Remove"</button>
-                                                </span>
-                                            }
-                                        }).collect_view().into_any()
-                                    }
-                                }}
-                            </div>
-                        </div>
                         <label class="v2-create-toggle">
                              <input type="checkbox" checked={move || fulfillment_enabled.get()} disabled=move || is_publishing.get() || existing_fulfillment_locked on:change:target=move |ev| {
                                  let enabled = ev.target().checked();
                                  fulfillment_enabled.set(enabled);
-                                 if enabled && fulfillment_mode.get_untracked() == FulfillmentMode::None {
+                                  if enabled && fulfillment_mode.get_untracked() == FulfillmentMode::None {
                                      fulfillment_mode.set(FulfillmentMode::Delegate);
-                                 } else if !enabled {
+                                  } else if !enabled {
                                      fulfillment_mode.set(FulfillmentMode::None);
-                                 }
+                                  }
+                                  distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
                              } />
                             <span class="v2-create-toggle-label">"Enable automated installation"</span>
                         </label>
@@ -3442,7 +4482,8 @@ pub fn PublishView(
                                     "v2-create-mode-option"
                                 } on:click=move |_| {
                                     if fulfillment_mode.get_untracked() != FulfillmentMode::Delegate {
-                                        fulfillment_mode.set(FulfillmentMode::Delegate);
+                                         fulfillment_mode.set(FulfillmentMode::Delegate);
+                                         distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
                                         if operator_auto_added.get_untracked().is_none() {
                                             sync_operator_server(operator_url.get_untracked());
                                         }
@@ -3472,7 +4513,10 @@ pub fn PublishView(
                                             "v2-create-mode-option v2-create-mode-selected"
                                         } else {
                                             "v2-create-mode-option"
-                                        } on:click=move |_| fulfillment_mode.set(FulfillmentMode::Direct)>
+                                        } on:click=move |_| {
+                                            fulfillment_mode.set(FulfillmentMode::Direct);
+                                            distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
+                                        }>
                                             <span class="v2-create-row-between">
                                                 <span class=move || if fulfillment_mode.get() == FulfillmentMode::Direct { "v2-create-mode-title v2-create-mode-title-active" } else { "v2-create-mode-title" }>"Use my active account instead"</span>
                                                 <Show when=move || fulfillment_mode.get() == FulfillmentMode::Direct>
@@ -3487,14 +4531,16 @@ pub fn PublishView(
                                                 <label for="publish-provider-url" class="v2-create-field-label">"Use a different distribution provider"</label>
                                                 <div class="v2-create-inline-row">
                                                     <input id="publish-provider-url" class="v2-input" placeholder="https://provider.example.com" prop:value={move || operator_url.get()} on:input:target=move |ev| {
-                                                        let next = ev.target().value();
-                                                        operator_url.set(next.clone());
+                                                         let next = ev.target().value();
+                                                         operator_url.set(next.clone());
+                                                         distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
                                                         if operator_auto_added.get_untracked().is_some() { sync_operator_server(next); }
                                                     } />
                                                     <select aria-label="Copy provider URL from a selected server" class="v2-input" on:change:target=move |ev| {
                                                         let selected = ev.target().value();
                                                         if !selected.is_empty() {
-                                                            operator_url.set(selected.clone());
+                                                             operator_url.set(selected.clone());
+                                                             distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
                                                             if operator_auto_added.get_untracked().is_some() { sync_operator_server(selected); }
                                                         }
                                                     }>
@@ -3511,8 +4557,9 @@ pub fn PublishView(
                                                         if ev.target().checked() {
                                                             sync_operator_server(operator_url.get());
                                                         } else if let Some(old_url) = operator_auto_added.get_untracked() {
-                                                            servers.update(|entries| entries.retain(|entry| !(entry.auto_operator && entry.url == old_url)));
-                                                            operator_auto_added.set(None);
+                                                             servers.update(|entries| entries.retain(|entry| !(entry.auto_operator && entry.url == old_url)));
+                                                             operator_auto_added.set(None);
+                                                             distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
                                                         }
                                                     } />
                                                     "Also add this provider as a distribution server"
@@ -3574,35 +4621,34 @@ pub fn PublishView(
                                     </div>
                                 </details>
 
-                                <div class="v2-create-field-pair">
+                                 <div class="v2-create-field-pair">
                                     <div>
                                         <span id="publish-build-label" class="v2-create-field-label">"Build file (required for automated installation)"</span>
                                         <button type="button" aria-labelledby="publish-build-label" aria-describedby="publish-hash-status" class="v2-create-file-button" on:click={on_select_file} disabled={move || is_hashing.get() || is_publishing.get()}>
-                                            {move || if is_hashing.get() { "Hashing…".to_string() } else { file_path.get().unwrap_or_else(|| if file_hash.get().is_some() { "Using existing build — select replacement".to_string() } else { "Select archive".to_string() }) }}
+                                            {move || if is_hashing.get() { "Inspecting and hashing…".to_string() } else { publish_draft.get().archive.selection.map(|selection| selection.safe_filename.as_str().to_string()).unwrap_or_else(|| if file_hash.get().is_some() { "Using existing build — select replacement".to_string() } else { "Select archive".to_string() }) }}
                                         </button>
-                                        {move || (is_hashing.get()).then(|| hash_progress.get()).flatten().map(|progress| {
-                                            let percent = progress_percent(progress.bytes_hashed, progress.total_bytes);
-                                            view! {
-                                                <div class="v2-create-progress" role="progressbar" aria-label="Build hashing progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>
-                                                    <div class="v2-create-progress-heading">
-                                                        <span>"Computing SHA-256"</span>
-                                                        <span>{format!("{percent}%")}</span>
-                                                    </div>
-                                                    <div class="v2-create-progress-track">
-                                                        <div class="v2-create-progress-fill" style=format!("width: {percent}%")></div>
-                                                    </div>
-                                                </div>
-                                            }
-                                        })}
-                                        <p id="publish-hash-status" aria-live="polite" class="v2-create-help">{move || if is_hashing.get() { "Computing the read-only SHA-256 hash…".to_string() } else { file_hash.get().map(|hash| format!("Read-only SHA-256: {}", format_sha256(&hash))).unwrap_or_else(|| "Hash appears after file selection.".to_string()) }}</p>
+                                        <p id="publish-hash-status" aria-live="polite" class="v2-create-help">{move || if is_hashing.get() { "Inspecting the backend-owned archive and computing SHA-256…".to_string() } else { file_hash.get().map(|hash| format!("Read-only SHA-256: {}", format_sha256(&hash))).unwrap_or_else(|| "Hash appears after archive inspection.".to_string()) }}</p>
                                     </div>
                                     <div>
                                         <label for="publish-version" class="v2-create-field-label">"Version (required)"</label>
-                                        <input id="publish-version" required=true class="v2-input" placeholder="1.0.0" prop:value={move || version.get()} on:input:target=move |ev| version.set(ev.target().value()) />
-                                    </div>
-                                </div>
+                                        <input id="publish-version" required=true class="v2-input" placeholder="1.0.0" prop:value={move || version.get()} on:input:target=move |ev| {
+                                            version.set(ev.target().value());
+                                            distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
+                                        } />
+                                 </div>
+                                 </div>
                             </div>
                         </Show>
+                        <super::publish_launch::PublishLaunchEditor
+                            state=publish_draft
+                            authoritative=authoritative_edit
+                            defect_review=defect_review
+                            platforms_input=platforms_input
+                            distribution_revision=distribution_user_revision
+                            platform_revision=platform_user_revision
+                            surfaced_warnings=surfaced_archive_warnings
+                            disabled=Signal::derive(move || is_publishing.get() || is_hashing.get() || (editing && !operator_initialized.get()))
+                        />
                     </section>
                     </Show>
 
@@ -3669,20 +4715,32 @@ pub fn PublishView(
                         </article>
 
                         <dl class="v2-create-review-facts">
-                            {move || published_identity.get().d_tag.map(|d_tag| view! {
-                                <div><dt>"Identifier"</dt><dd>{d_tag}</dd></div>
-                            })}
+                            {move || {
+                                let identity = published_identity.get();
+                                identity.d_tag.or(identity.pending_d_tag).map(|d_tag| view! {
+                                    <div><dt>"Identifier"</dt><dd>{d_tag}</dd></div>
+                                })
+                            }}
                             <div><dt>"Metadata"</dt><dd>{move || format!("{} tags · {} images", parse_csv_values(&tag_input.get()).len(), image_drafts.get().len())}</dd></div>
                             <div><dt>"Description"</dt><dd class="v2-create-review-prewrap">{move || description.get()}</dd></div>
                             <div><dt>"Pricing"</dt><dd>{move || match acquisition_kind.get() { AcquisitionKind::Gated => format!("{} sats via {}", price_input.get(), lud16.get()), AcquisitionKind::Public | AcquisitionKind::TimedAccess => "Not for sale (0 sats)".to_string() }}</dd></div>
                             <div><dt>"Current access"</dt><dd>{move || match acquisition_kind.get() { AcquisitionKind::Gated => "Paid".to_string(), AcquisitionKind::Public => "Public".to_string(), AcquisitionKind::TimedAccess => format!("Timed from {} to {} (local)", acquisition_starts_at.get(), acquisition_ends_at.get()) }}</dd></div>
                             <div><dt>"Platforms / version"</dt><dd>{move || format!("{} / {}", platform_summary(&platforms_input.get()), version.get())}</dd></div>
                             <div><dt>"Distribution provider/server"</dt><dd>{move || if fulfillment_enabled.get() { format!("{} server(s); {}", servers.get().len(), operator_url.get()) } else { "Metadata only".to_string() }}</dd></div>
-                            <div><dt>"Build file / hash"</dt><dd>{move || format!("{} / {}", file_path.get().unwrap_or_else(|| "existing or none".into()), file_hash.get().map(|hash| format_sha256(&hash)).unwrap_or_else(|| "none".into()))}</dd></div>
+                            <div><dt>"Build archive / hash"</dt><dd>{move || format!("{} / {}", publish_draft.get().archive.selection.map(|selection| selection.safe_filename.as_str().to_string()).unwrap_or_else(|| "existing or none".into()), file_hash.get().map(|hash| format_sha256(&hash)).unwrap_or_else(|| "none".into()))}</dd></div>
                             <div><dt>"Authorization"</dt><dd>{move || match fulfillment_mode.get() { FulfillmentMode::None => "Game page only", FulfillmentMode::Direct => "Active account", FulfillmentMode::Delegate => "Distribution provider" }}</dd></div>
                             <div><dt>"Promotion links"</dt><dd>{format!("{} preserved", existing_campaigns.len())}</dd></div>
                             <div><dt>"Publishing authorization key"</dt><dd>{existing_fulfillment_pubkey.clone().unwrap_or_else(|| "Prepared during publication when required".into())}</dd></div>
                         </dl>
+
+                        <super::publish_launch::PublishLaunchReview
+                            state=publish_draft
+                            artifact_enabled=Signal::derive(move || fulfillment_enabled.get())
+                            existing_artifact_digest=Signal::derive(move || {
+                                fulfillment_enabled.get().then(|| file_hash.get()).flatten()
+                            })
+                            surfaced_warnings=surfaced_archive_warnings
+                        />
 
                         <div class="v2-create-authorization">
                             <p class="v2-create-field-label">"Publishing authorization"</p>
@@ -3718,7 +4776,7 @@ pub fn PublishView(
                     <section class="v2-create-stage-panel" aria-labelledby="publication-status-title">
                         <div class="v2-create-status-heading">
                             <h2 id="publication-status-title" class="v2-create-section-title">"Publication status"</h2>
-                            <span class=move || format!("v2-create-phase {}", phase().class())>{move || phase().label()}</span>
+                            <span role="status" aria-live="polite" aria-atomic="true" class=move || format!("v2-create-phase {}", phase().class())>{move || phase().label()}</span>
                         </div>
                         <p class="v2-create-help">{move || match phase() {
                             PublicationPhase::Idle => "Nothing has been sent to the network from this workflow yet.",

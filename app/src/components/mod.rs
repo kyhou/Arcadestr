@@ -11,6 +11,7 @@ pub mod profile;
 pub mod profile_avatar;
 pub mod profile_display;
 pub mod publish;
+mod publish_launch;
 
 // Re-export components
 pub use account_selector::AccountSelector;
