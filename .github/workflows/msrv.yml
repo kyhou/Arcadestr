@@ -1,0 +1,137 @@
+name: MSRV
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: msrv-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Read workspace MSRV
+        shell: bash
+        run: |
+          version="$(python3 - <<'PY'
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              print(tomllib.load(manifest)["workspace"]["package"]["rust-version"])
+          PY
+          )"
+          echo "MSRV=$version" >> "$GITHUB_ENV"
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
+
+      - name: Install MSRV toolchain
+        run: rustup toolchain install "$MSRV" --profile minimal
+
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            wget
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: msrv-native
+
+      - name: Verify compiler floor
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check native targets at MSRV
+        run: |
+          cargo check -p arcadestr-core --features native --all-targets --locked
+          cargo check -p arcadestr-desktop --all-targets --locked
+          cargo check -p arcadestr-xtask --all-targets --locked
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Read workspace MSRV
+        shell: pwsh
+        run: |
+          $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])'
+          "MSRV=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RUSTUP_TOOLCHAIN=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install MSRV toolchain
+        run: rustup toolchain install "$env:MSRV" --profile minimal
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: msrv-windows
+
+      - name: Verify compiler floor
+        run: |
+          rustc -vV
+          cargo --version
+
+      - name: Check Windows target at MSRV
+        run: cargo "+$env:MSRV" check -p arcadestr-desktop --locked
+
+  wasm:
+    name: WASM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Read workspace MSRV
+        shell: bash
+        run: |
+          version="$(python3 - <<'PY'
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              print(tomllib.load(manifest)["workspace"]["package"]["rust-version"])
+          PY
+          )"
+          echo "MSRV=$version" >> "$GITHUB_ENV"
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
+
+      - name: Install MSRV toolchain and WASM target
+        run: rustup toolchain install "$MSRV" --profile minimal --target wasm32-unknown-unknown
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: msrv-wasm
+
+      - name: Verify compiler floor
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check web target at MSRV
+        run: cargo check -p arcadestr-web --target wasm32-unknown-unknown --features web --locked

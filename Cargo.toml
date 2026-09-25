@@ -8,7 +8,7 @@ edition = "2021"
 authors = ["Arcadestr Team"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arcadestr/arcadestr"
-rust-version = "1.75"
+rust-version = "1.89"
 
 [workspace.dependencies]
 # Core dependencies
