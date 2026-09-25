@@ -86,7 +86,7 @@ Both targets share UI components from the `app` crate. The desktop target delega
 | **sha2** | 0.10 | Payment-proof hashing, build verification, and deterministic install paths | `core/src/purchases.rs`, `desktop/src/install.rs`, `desktop/src/main.rs` |
 | **pulldown-cmark** | 0.13 | Store Page Markdown parsing and HTML sanitization (blocklist + limit enforced) | `core/src/store_page_content_policy.rs`, `core/src/store_page.rs` |
 | **time** | 0.3 | WASM-safe date/time handling for the reusable date/time picker | `app/Cargo.toml`, `app/src/components/date_time_picker.rs` |
-| **uuid** | 1 | Selection/upload identifiers for Blossom and media operations | `desktop/src/blossom_upload.rs`, `desktop/src/blossom_commands.rs` |
+| **uuid** | 1 | Backend-minted UUID v4 game identifiers for ADP kind-30402 publications, plus selection/upload identifiers for Blossom and media operations | `app/Cargo.toml`, `desktop/src/adp_commands.rs`, `desktop/src/blossom_upload.rs`, `desktop/src/blossom_commands.rs` |
 | **infer** | 0.22 | Advisory media magic-byte detection before Blossom upload | `desktop/src/blossom_upload.rs` |
 | **imagesize** | 0.15 | Image dimension extraction from the bounded inspection prefix | `desktop/src/blossom_upload.rs` |
 | **tokio-util** | 0.7 | Cancellation tokens for interrupted Blossom uploads | `desktop/src/blossom_upload.rs` |
@@ -464,7 +464,7 @@ Let's trace through the current ADP-aware flow when a user clicks "Publish":
 let request = PublishAdpListingRequest {
     expected_publisher_npub,
     existing_event_id,
-    d_tag,
+    existing_d_tag, // None on first publish: the backend mints a UUID v4 the form only learns from the result
     title,
     description,
     price_sats,
@@ -553,7 +553,9 @@ pub fn build_adp_listing_event_builder(
 - The kind-30402 listing is broadcast and must become visible on at least two relays.
 - New fulfilled listings upload the selected archive sequentially to every selected ADP server using NIP-98 authentication. An edit may reuse a validated existing hash and skip upload when no replacement file is selected.
 - Replacement edits use `expected_publisher_npub` plus two `existing_event_id` checks as optimistic concurrency control and preserve tags not managed by the form.
-- Publication and uploads are not transactional: a later upload failure does not roll back the relay event or earlier successful uploads.
+- A first publication has no publisher-chosen coordinate: the backend mints a single UUID v4 game identifier (typed `Uuid` until a tag, coordinate, or IPC field needs text) before any coordinate-dependent stage. Every stage — fulfillment provisioning scope, kind-30406 authorization, the listing event, the propagation check, build upload, and the returned result — reads that one value; nothing downstream mints a second.
+- `PublishAdpListingResult` echoes the coordinate to the caller as `game_id` (the minted UUID on first publish, `null` for an existing listing) plus the stable `30402:<publisher-hex>:<d-tag>` `game_coordinate`. Pre-existing and external NIP-99 identifiers keep their own `d` tag, so `GameIdentifier` distinguishes generated identities from arbitrary legacy tags.
+- Publication and uploads are not transactional: a later upload failure does not roll back the relay event or earlier successful uploads. A retry after a later-stage failure replaces the already-broadcast listing rather than creating a second coordinate.
 
 ### 4.3 Data Flow Diagram
 
@@ -715,7 +717,7 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `claim_entitlement` | `adp_commands.rs` | `request: ClaimEntitlementRequest` | `ClaimEntitlementResponse` | Claims a campaign grant, validates/persists it, and caches a buyer-scoped token |
 | `select_build_file` | `adp_commands.rs` | None | `Option<String>` | Opens the native archive picker; cancellation is not an error |
 | `hash_build_file` | `adp_commands.rs` | `request: HashBuildFileRequest` | `String` | Computes the selected build's SHA-256 digest |
-| `publish_adp_listing` | `adp_commands.rs` | `request: PublishAdpListingRequest` | `PublishAdpListingResult` | Publishes buy-only/direct/delegated kind-30402 listings and uploads fulfilled builds |
+| `publish_adp_listing` | `adp_commands.rs` | `request: PublishAdpListingRequest` | `PublishAdpListingResult` | Publishes buy-only/direct/delegated kind-30402 listings and uploads fulfilled builds; when `existing_d_tag` is `None` the backend mints the UUID v4 identifier, and the result carries `game_id` plus the `game_coordinate` |
 | `request_lnurl_invoice` | `adp_commands.rs` | `request: RequestLnurlInvoiceRequest` | `RequestLnurlInvoiceResponse` | Requests the listing's fixed-amount LNURL invoice |
 | `connect_nwc_wallet` | `adp_commands.rs` | `request: ConnectNwcWalletRequest` | `ConnectNwcWalletResponse` | Connects NWC and returns safe wallet metadata without exposing the secret |
 | `pay_nwc_invoice` | `adp_commands.rs` | `request: PayNwcInvoiceRequest` | `PayNwcInvoiceResponse` | Pays through NWC and returns the preimage and optional fee |
@@ -2530,6 +2532,7 @@ Marketplace streams no longer use static event names. Inspect the `requestId` ar
 | **Artifact quarantine** | Preservation of a hash-mismatched download as `.corrupt`, `.corrupt.1`, and so on, without recording an install |
 | **Local account** | Direct-signing account whose nsec is encrypted by Arcadestr rather than held by a NIP-46 signer |
 | **Acquisition policy** | Signed kind-30402 current-access policy: `Gated`, `Public`, or half-open `TimedAccess`; zero price has no authorization meaning |
+| **Game identifier** | Backend-minted UUID v4 that distinguishes generated coordinates from legacy or external NIP-99 `d` tags; rendered as `30402:<publisher-hex>:<d-tag>` |
 | **Campaign** | Publisher-controlled append-only provisional claim policy; cancellation blocks later claims but preserves prior grants |
 | **Campaign pointer** | Advisory listing tag referencing an immutable campaign root; authoritative discovery still falls back to publisher/coordinate queries |
 | **Entitlement grant** | Buyer-specific append-only provisional durable credential issued by a publisher or properly authorized fulfillment key |
