@@ -1,11 +1,33 @@
 use std::collections::{HashMap, VecDeque};
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::http_client::{HttpClient, HttpClientError, HttpDownloadOutcome};
+use crate::http_client::{HttpClient, HttpClientError, HttpDownloadOutcome, HttpRetainedDownload};
+
+fn mock_download_io_error(error: std::io::Error) -> HttpClientError {
+    let raw = error.raw_os_error();
+    #[cfg(unix)]
+    if raw == Some(28) {
+        return HttpClientError::InsufficientStorage(error.to_string());
+    }
+    #[cfg(windows)]
+    if raw == Some(112) {
+        return HttpClientError::InsufficientStorage(error.to_string());
+    }
+    #[cfg(unix)]
+    if raw == Some(27) {
+        return HttpClientError::FilesystemFileSizeLimit(error.to_string());
+    }
+    #[cfg(windows)]
+    if raw == Some(223) {
+        return HttpClientError::FilesystemFileSizeLimit(error.to_string());
+    }
+    HttpClientError::Request(error.to_string())
+}
 
 #[derive(Default)]
 struct MockState {
@@ -21,6 +43,7 @@ struct MockState {
     post_bodies: HashMap<String, Value>,
     post_headers: HashMap<String, Vec<(String, String)>>,
     download_headers: HashMap<String, Vec<(String, String)>>,
+    download_body_writes: HashMap<String, usize>,
 }
 
 /// In-memory HTTP mock for unit tests.
@@ -178,6 +201,16 @@ impl MockHttpClient {
             .requested_urls
             .last()
             .cloned()
+    }
+
+    pub fn download_body_write_count(&self, url: &str) -> usize {
+        self.state
+            .lock()
+            .expect("mock_http_client state mutex poisoned")
+            .download_body_writes
+            .get(url)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn push_response(&self, url: &str, response: Result<Value, HttpClientError>) {
@@ -375,6 +408,85 @@ impl HttpClient for MockHttpClient {
         on_progress(bytes_written, Some(bytes_written));
 
         Ok(HttpDownloadOutcome { bytes_written })
+    }
+
+    async fn download_to_retained_file_with_preflight(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        candidate: &Path,
+        on_preflight: &mut (dyn FnMut(Option<u64>) -> Result<(), HttpClientError> + Send),
+        on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> Result<HttpRetainedDownload, HttpClientError> {
+        let response = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("mock_http_client state mutex poisoned");
+
+            state.requested_urls.push(url.to_string());
+            *state.call_counts.entry(url.to_string()).or_insert(0) += 1;
+            state.download_headers.insert(url.to_string(), headers);
+
+            match state.download_responses.get_mut(url) {
+                Some(queue) if !queue.is_empty() => queue.pop_front(),
+                _ => None,
+            }
+        };
+
+        let bytes = match response {
+            Some(Ok(bytes)) => bytes,
+            Some(Err(err)) => return Err(err),
+            None => {
+                return Err(HttpClientError::Request(format!(
+                    "No mock download response configured for URL: {}",
+                    url
+                )))
+            }
+        };
+        let total = bytes.len() as u64;
+        on_preflight(Some(total))?;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(candidate).map_err(mock_download_io_error)?;
+
+        let download_result = (|| {
+            file.write_all(&bytes).map_err(mock_download_io_error)?;
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("mock_http_client state mutex poisoned");
+                *state
+                    .download_body_writes
+                    .entry(url.to_string())
+                    .or_insert(0) += 1;
+            }
+            file.flush().map_err(mock_download_io_error)?;
+            file.sync_all().map_err(mock_download_io_error)?;
+            let bytes_written = total;
+            on_progress(bytes_written, Some(total));
+
+            Ok(bytes_written)
+        })();
+
+        match download_result {
+            Ok(bytes_written) => Ok(HttpRetainedDownload {
+                file: Arc::new(file),
+                bytes_written,
+            }),
+            Err(err) => {
+                drop(file);
+                let _ = std::fs::remove_file(candidate);
+                Err(err)
+            }
+        }
     }
 }
 

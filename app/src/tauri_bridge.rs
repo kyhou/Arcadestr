@@ -8,6 +8,33 @@ use crate::models::{
     StorePageLinks, StorePageListingRef, StorePageMedia, StorePagePlatformRequirements,
     StorePageRequirementTier,
 };
+pub use arcadestr_core::adp_publish_contract::{
+    AdpLaunchTierIntent, AdpPublishValidationViolation, ArgumentRejection,
+    AuthoritativeAdpEditDefect, AuthoritativeAdpEditMetadata, AuthoritativeAdpEditMetadataPresent,
+    AuthoritativeAdpEditTag, AuthoritativeProfileRejection, DisplayNameRejection,
+    LoadAuthoritativeAdpEditMetadataRequest, PathRejection, ProfileIdRejection,
+    PublishAdpListingError, PublishAdpListingRequestExtension,
+};
+pub use arcadestr_core::archive_inspection_contract::{
+    ArchiveAccountFailure, ArchiveCancellationFailure, ArchiveCandidate,
+    ArchiveCandidateConfidence, ArchiveCandidateReason, ArchiveDetectionFailure, ArchiveEntryKind,
+    ArchiveFileSelection, ArchiveHandleFailure, ArchiveHazardCategory, ArchiveHazardCounts,
+    ArchiveHazardDetail, ArchiveIdError, ArchiveInspectionCounts, ArchiveInspectionFailure,
+    ArchiveMutationFailure, ArchivePage, ArchivePageLimitError, ArchivePageRequest,
+    ArchivePaginationFailure, ArchivePathRuleCode, ArchivePlatformFailure, ArchiveRegistryFailure,
+    ArchiveRequestId, ArchiveSearch, ArchiveSearchError, ArchiveSelectionError, ArchiveSelectionId,
+    ArchiveSelectionSummary, ArchiveStorageOperation, ArchiveWarningCategory, ArchiveWarningCounts,
+    ArchiveWarningDetail, ArchiveZipPreflightFailure, BuildSelectionRef,
+    DiscardArchiveSelectionRequest, DiscardArchiveSelectionResponse, EfsDivergenceWarningDetail,
+    ExtensionMismatchWarningDetail, HashSelectedArchiveRequest, HashSelectedArchiveResponse,
+    InspectArchiveRequest, InspectArchiveResponse, QueryArchiveCandidatesRequest,
+    QueryArchiveCandidatesResponse, QueryArchiveFilesRequest, QueryArchiveFilesResponse,
+    QueryArchiveHazardsRequest, QueryArchiveHazardsResponse, QueryArchiveWarningsRequest,
+    QueryArchiveWarningsResponse, QueryArchiveWorkingDirectoriesRequest,
+    QueryArchiveWorkingDirectoriesResponse, SafeArchiveFilename, SafeArchiveFilenameError,
+    SelectArchiveRequest, SelectArchiveResponse, SelectableArchiveFile, SelectableWorkingDirectory,
+    ARCHIVE_PAGE_SIZE_DEFAULT, ARCHIVE_PAGE_SIZE_MAX,
+};
 use arcadestr_core::store_page::{StorePageDraft, StorePageValidationDiagnostic};
 use serde::{Deserialize, Serialize};
 
@@ -520,29 +547,43 @@ pub async fn invoke_reconnect_relays() -> Result<String, String> {
 
 /// Invoke desktop `install_game` command.
 #[cfg(not(feature = "web"))]
-pub async fn invoke_install_game(listing: &GameListing) -> Result<(), String> {
-    crate::tauri_invoke::invoke("install_game", serde_json::json!({ "listing": listing })).await
+pub async fn invoke_install_game(
+    listing: &GameListing,
+) -> Result<(), arcadestr_core::install_contract::InstallCommandError> {
+    crate::tauri_invoke::invoke_typed("install_game", serde_json::json!({ "listing": listing }))
+        .await
 }
 
 /// Web fallback for `install_game`.
 #[cfg(feature = "web")]
-pub async fn invoke_install_game(_listing: &GameListing) -> Result<(), String> {
-    Err("Game installation is only available in desktop builds.".to_string())
+pub async fn invoke_install_game(
+    _listing: &GameListing,
+) -> Result<(), arcadestr_core::install_contract::InstallCommandError> {
+    Err("Game installation is only available in desktop builds.".into())
 }
 
-/// Add a game to the active account's library without downloading it.
+/// Add a game to the initiating account's library without downloading it.
 #[cfg(not(feature = "web"))]
-pub async fn invoke_add_game_to_library(game_coordinate: String) -> Result<(), String> {
+pub async fn invoke_add_game_to_library(
+    game_coordinate: String,
+    expected_buyer_npub: String,
+) -> Result<(), String> {
     crate::tauri_invoke::invoke(
         "add_game_to_library",
-        serde_json::json!({ "gameCoordinate": game_coordinate }),
+        serde_json::json!({
+            "gameCoordinate": game_coordinate,
+            "expectedBuyerNpub": expected_buyer_npub,
+        }),
     )
     .await
 }
 
 /// Account libraries are unavailable in standalone web builds.
 #[cfg(feature = "web")]
-pub async fn invoke_add_game_to_library(_game_coordinate: String) -> Result<(), String> {
+pub async fn invoke_add_game_to_library(
+    _game_coordinate: String,
+    _expected_buyer_npub: String,
+) -> Result<(), String> {
     Err("Game libraries are only available in desktop builds.".to_string())
 }
 
@@ -612,26 +653,114 @@ pub async fn invoke_get_listing_ownership(
 /// Installed ADP game returned by `get_installed_games`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct InstalledGame {
+    pub installation_id: String,
     pub game_coordinate: String,
-    pub file_path: String,
-    pub file_hash: String,
-    pub version: Option<String>,
-    pub server_url: String,
+    pub installation_root: String,
+    pub package_digest: String,
+    pub package_format: String,
+    pub state: InstallationState,
+    pub recovery_discriminator: Option<InstallationRecoveryDiscriminator>,
+    pub retained_package: bool,
+    pub launchable: bool,
     pub installed_at: i64,
 }
 
-/// Completion payload emitted after an ADP install finishes.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DownloadCompletePayload {
-    pub game_coordinate: String,
-    pub listing_id: String,
-    pub file_path: String,
+/// Persisted installation lifecycle state returned by desktop commands.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallationState {
+    Installing,
+    Ready,
+    Failed,
+    Uninstalling,
 }
 
-/// Byte progress emitted while an ADP artifact is downloading.
+/// Filesystem outcome recorded when recovery marks an installation failed.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallationRecoveryDiscriminator {
+    FinalRootAbsent,
+    FinalRootPresent,
+}
+
+/// Non-ready installation returned by `list_installation_lifecycle_issues`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DownloadProgressPayload {
+pub struct InstallationLifecycleIssue {
+    pub installation_id: String,
     pub game_coordinate: String,
+    pub installation_root: String,
+    pub state: InstallationState,
+    pub recovery_discriminator: Option<InstallationRecoveryDiscriminator>,
+    pub updated_at: i64,
+}
+
+/// Result of lazy interrupted-installation recovery.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct InstallationRecoveryReport {
+    pub examined: usize,
+    pub marked_failed: usize,
+    pub busy: usize,
+    pub deferred_errors: usize,
+    pub changed: usize,
+}
+
+/// Download retained for a later offline reinstall.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RetainedPackage {
+    pub game_coordinate: String,
+    pub package_id: String,
+    pub package_path: String,
+    pub listing_event_id: Option<String>,
+    pub size_bytes: u64,
+}
+
+/// Authoritative sizes shown before uninstall.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct UninstallSizes {
+    pub installation_size_bytes: u64,
+    pub retained_package_size_bytes: Option<u64>,
+}
+
+fn installation_id_args(installation_id: String) -> serde_json::Value {
+    serde_json::json!({ "installationId": installation_id })
+}
+
+fn uninstall_game_args(installation_id: String, retain_package: bool) -> serde_json::Value {
+    serde_json::json!({
+        "installationId": installation_id,
+        "retainPackage": retain_package,
+    })
+}
+
+fn retained_package_identity_args(
+    game_coordinate: String,
+    expected_package_id: String,
+) -> serde_json::Value {
+    serde_json::json!({
+        "gameCoordinate": game_coordinate,
+        "expectedPackageId": expected_package_id,
+    })
+}
+
+const RESUME_UNINSTALL_COMMAND: &str = "resume_uninstall";
+const REINSTALL_RETAINED_PACKAGE_COMMAND: &str = "reinstall_retained_package";
+
+/// Install phase emitted by the desktop installer.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallProgressPhase {
+    Preparing,
+    Downloading,
+    Verifying,
+    Installing,
+    Complete,
+}
+
+/// Typed progress emitted by the complete desktop installation pipeline.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct InstallProgressPayload {
+    pub game_coordinate: String,
+    pub phase: InstallProgressPhase,
     pub bytes: u64,
     pub total: Option<u64>,
 }
@@ -646,6 +775,268 @@ pub async fn invoke_get_installed_games() -> Result<Vec<InstalledGame>, String> 
 #[cfg(feature = "web")]
 pub async fn invoke_get_installed_games() -> Result<Vec<InstalledGame>, String> {
     Ok(Vec::new())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_get_launch_options(
+    installation_id: &str,
+) -> Result<
+    arcadestr_core::launch_contract::LaunchConfiguration,
+    arcadestr_core::launch_contract::LaunchError,
+> {
+    crate::tauri_invoke::invoke_typed(
+        "get_launch_options",
+        serde_json::json!({ "installationId": installation_id }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_get_launch_options(
+    _installation_id: &str,
+) -> Result<
+    arcadestr_core::launch_contract::LaunchConfiguration,
+    arcadestr_core::launch_contract::LaunchError,
+> {
+    Err(arcadestr_core::launch_contract::LaunchError::Operation(
+        "Launch profiles are available only in the desktop application".into(),
+    ))
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_set_launch_profile_preference(
+    installation_id: &str,
+    profile_id: Option<&str>,
+    preference_updated_at: i64,
+) -> Result<
+    arcadestr_core::launch_contract::LaunchConfiguration,
+    arcadestr_core::launch_contract::LaunchError,
+> {
+    crate::tauri_invoke::invoke_typed(
+        "set_launch_profile_preference",
+        serde_json::json!({
+            "installationId": installation_id,
+            "profileId": profile_id,
+            "preferenceUpdatedAt": preference_updated_at,
+        }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_set_launch_profile_preference(
+    _installation_id: &str,
+    _profile_id: Option<&str>,
+    _preference_updated_at: i64,
+) -> Result<
+    arcadestr_core::launch_contract::LaunchConfiguration,
+    arcadestr_core::launch_contract::LaunchError,
+> {
+    Err(arcadestr_core::launch_contract::LaunchError::Operation(
+        "Launch profile preferences are available only in the desktop application".into(),
+    ))
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_launch_game(
+    installation_id: &str,
+    profile_id: Option<&str>,
+) -> Result<
+    arcadestr_core::launch_contract::LaunchSession,
+    arcadestr_core::launch_contract::LaunchError,
+> {
+    crate::tauri_invoke::invoke_typed(
+        "launch_game",
+        serde_json::json!({ "installationId": installation_id, "profileId": profile_id }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_launch_game(
+    _installation_id: &str,
+    _profile_id: Option<&str>,
+) -> Result<
+    arcadestr_core::launch_contract::LaunchSession,
+    arcadestr_core::launch_contract::LaunchError,
+> {
+    Err(arcadestr_core::launch_contract::LaunchError::Operation(
+        "Launching is available only in the desktop application".into(),
+    ))
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_get_launch_status(
+    installation_id: &str,
+) -> Result<
+    Option<arcadestr_core::launch_contract::LaunchSession>,
+    arcadestr_core::launch_contract::LaunchError,
+> {
+    crate::tauri_invoke::invoke_typed(
+        "get_launch_status",
+        serde_json::json!({ "installationId": installation_id }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_get_launch_status(
+    _installation_id: &str,
+) -> Result<
+    Option<arcadestr_core::launch_contract::LaunchSession>,
+    arcadestr_core::launch_contract::LaunchError,
+> {
+    Ok(None)
+}
+
+/// Return non-ready installation lifecycle records.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_list_installation_lifecycle_issues(
+) -> Result<Vec<InstallationLifecycleIssue>, String> {
+    crate::tauri_invoke::invoke("list_installation_lifecycle_issues", serde_json::json!({})).await
+}
+
+/// Native installation lifecycle records are unavailable on web.
+#[cfg(feature = "web")]
+pub async fn invoke_list_installation_lifecycle_issues(
+) -> Result<Vec<InstallationLifecycleIssue>, String> {
+    Ok(Vec::new())
+}
+
+/// Lazily retry interrupted-installation recovery.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_retry_installation_recovery() -> Result<InstallationRecoveryReport, String> {
+    crate::tauri_invoke::invoke("retry_installation_recovery", serde_json::json!({})).await
+}
+
+/// Native installation recovery is unavailable on web.
+#[cfg(feature = "web")]
+pub async fn invoke_retry_installation_recovery() -> Result<InstallationRecoveryReport, String> {
+    Err("Installation recovery is only available in desktop builds.".to_string())
+}
+
+/// Return every retained installer package.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_list_retained_packages() -> Result<Vec<RetainedPackage>, String> {
+    crate::tauri_invoke::invoke("list_retained_packages", serde_json::json!({})).await
+}
+
+/// Native retained packages are unavailable on web.
+#[cfg(feature = "web")]
+pub async fn invoke_list_retained_packages() -> Result<Vec<RetainedPackage>, String> {
+    Ok(Vec::new())
+}
+
+/// Return installation and retained-package sizes before uninstall.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_get_uninstall_sizes(installation_id: String) -> Result<UninstallSizes, String> {
+    crate::tauri_invoke::invoke("get_uninstall_sizes", installation_id_args(installation_id)).await
+}
+
+/// Native uninstall sizing is unavailable on web.
+#[cfg(feature = "web")]
+pub async fn invoke_get_uninstall_sizes(
+    _installation_id: String,
+) -> Result<UninstallSizes, String> {
+    Err("Game uninstall is only available in desktop builds.".to_string())
+}
+
+/// Uninstall a ready installation with an explicit package-retention choice.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_uninstall_game(
+    installation_id: String,
+    retain_package: bool,
+) -> Result<(), String> {
+    crate::tauri_invoke::invoke(
+        "uninstall_game",
+        uninstall_game_args(installation_id, retain_package),
+    )
+    .await
+}
+
+/// Native uninstall is unavailable on web.
+#[cfg(feature = "web")]
+pub async fn invoke_uninstall_game(
+    _installation_id: String,
+    _retain_package: bool,
+) -> Result<(), String> {
+    Err("Game uninstall is only available in desktop builds.".to_string())
+}
+
+/// Resume an interrupted uninstall. Desktop conservatively retains its package.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_resume_uninstall(installation_id: String) -> Result<(), String> {
+    crate::tauri_invoke::invoke(
+        RESUME_UNINSTALL_COMMAND,
+        installation_id_args(installation_id),
+    )
+    .await
+}
+
+/// Native interrupted-uninstall resolution is unavailable on web.
+#[cfg(feature = "web")]
+pub async fn invoke_resume_uninstall(_installation_id: String) -> Result<(), String> {
+    Err("Interrupted uninstall resolution is only available in desktop builds.".to_string())
+}
+
+/// Remove a failed installation record and any preserved final tree.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_remove_failed_installation(installation_id: String) -> Result<(), String> {
+    crate::tauri_invoke::invoke(
+        "remove_failed_installation",
+        installation_id_args(installation_id),
+    )
+    .await
+}
+
+/// Native failed-installation cleanup is unavailable on web.
+#[cfg(feature = "web")]
+pub async fn invoke_remove_failed_installation(_installation_id: String) -> Result<(), String> {
+    Err("Installation cleanup is only available in desktop builds.".to_string())
+}
+
+/// Delete one retained package without changing installation records.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_delete_retained_package(
+    game_coordinate: String,
+    expected_package_id: String,
+) -> Result<(), String> {
+    crate::tauri_invoke::invoke(
+        "delete_retained_package",
+        retained_package_identity_args(game_coordinate, expected_package_id),
+    )
+    .await
+}
+
+/// Native retained-package deletion is unavailable on web.
+#[cfg(feature = "web")]
+pub async fn invoke_delete_retained_package(
+    _game_coordinate: String,
+    _expected_package_id: String,
+) -> Result<(), String> {
+    Err("Retained package deletion is only available in desktop builds.".to_string())
+}
+
+/// Reinstall entirely from one retained package without network or account access.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_reinstall_retained_package(
+    game_coordinate: String,
+    expected_package_id: String,
+) -> Result<(), String> {
+    crate::tauri_invoke::invoke(
+        REINSTALL_RETAINED_PACKAGE_COMMAND,
+        retained_package_identity_args(game_coordinate, expected_package_id),
+    )
+    .await
+}
+
+/// Native retained-package reinstall is unavailable on web.
+#[cfg(feature = "web")]
+pub async fn invoke_reinstall_retained_package(
+    _game_coordinate: String,
+    _expected_package_id: String,
+) -> Result<(), String> {
+    Err("Retained package reinstall is only available in desktop builds.".to_string())
 }
 
 /// Invoke desktop `ingest_receipt` command.
@@ -680,6 +1071,8 @@ pub async fn invoke_get_purchase_records() -> Result<Vec<DurableAcquisitionRecor
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AdpServerInfo {
     pub adp_version: String,
+    #[serde(default)]
+    pub max_upload_bytes: Option<u64>,
     pub pubkey: String,
     pub name: Option<String>,
     pub url: Option<String>,
@@ -702,6 +1095,10 @@ pub struct PublishAdpListingRequest {
     /// Identifier of the listing being replaced. `None` for a first
     /// publication, where the backend mints a UUID v4 instead.
     pub existing_d_tag: Option<String>,
+    /// Identifier the backend minted for this publication on an attempt that
+    /// failed before the listing existed. Sending it back resumes that
+    /// publication rather than starting a second one.
+    pub pending_d_tag: Option<String>,
     pub title: String,
     pub description: String,
     pub price_sats: u64,
@@ -712,6 +1109,9 @@ pub struct PublishAdpListingRequest {
     pub operator_url: Option<String>,
     pub servers: Vec<String>,
     pub file_path: Option<String>,
+    /// Opaque backend-selected build reference for the native publication path.
+    #[serde(default)]
+    pub selected_build: Option<BuildSelectionRef>,
     pub existing_file_hash: Option<String>,
     pub existing_fulfillment_pubkey: Option<String>,
     pub version: Option<String>,
@@ -962,6 +1362,79 @@ pub async fn invoke_discover_adp_servers() -> Result<Vec<AdpServerAnnouncement>,
     Ok(Vec::new())
 }
 
+macro_rules! archive_contract_wrapper {
+    ($name:ident, $command:literal, $request:ty, $response:ty) => {
+        #[cfg(not(feature = "web"))]
+        pub async fn $name(request: $request) -> Result<$response, ArchiveSelectionError> {
+            crate::tauri_invoke::invoke_archive_typed(
+                $command,
+                serde_json::json!({ "request": request }),
+            )
+            .await
+        }
+
+        #[cfg(feature = "web")]
+        pub async fn $name(_request: $request) -> Result<$response, ArchiveSelectionError> {
+            Err(ArchiveSelectionError::UnsupportedPlatform)
+        }
+    };
+}
+
+archive_contract_wrapper!(
+    invoke_select_archive_build,
+    "select_archive_build",
+    SelectArchiveRequest,
+    SelectArchiveResponse
+);
+archive_contract_wrapper!(
+    invoke_inspect_archive,
+    "inspect_archive",
+    InspectArchiveRequest,
+    InspectArchiveResponse
+);
+archive_contract_wrapper!(
+    invoke_hash_selected_archive,
+    "hash_selected_archive",
+    HashSelectedArchiveRequest,
+    HashSelectedArchiveResponse
+);
+archive_contract_wrapper!(
+    invoke_query_archive_candidates,
+    "query_archive_candidates",
+    QueryArchiveCandidatesRequest,
+    QueryArchiveCandidatesResponse
+);
+archive_contract_wrapper!(
+    invoke_query_archive_files,
+    "query_archive_files",
+    QueryArchiveFilesRequest,
+    QueryArchiveFilesResponse
+);
+archive_contract_wrapper!(
+    invoke_query_archive_working_directories,
+    "query_archive_working_directories",
+    QueryArchiveWorkingDirectoriesRequest,
+    QueryArchiveWorkingDirectoriesResponse
+);
+archive_contract_wrapper!(
+    invoke_query_archive_hazards,
+    "query_archive_hazards",
+    QueryArchiveHazardsRequest,
+    QueryArchiveHazardsResponse
+);
+archive_contract_wrapper!(
+    invoke_query_archive_warnings,
+    "query_archive_warnings",
+    QueryArchiveWarningsRequest,
+    QueryArchiveWarningsResponse
+);
+archive_contract_wrapper!(
+    invoke_discard_archive_selection,
+    "discard_archive_selection",
+    DiscardArchiveSelectionRequest,
+    DiscardArchiveSelectionResponse
+);
+
 /// Invoke desktop `select_build_file` command.
 #[cfg(not(feature = "web"))]
 pub async fn invoke_select_build_file() -> Result<Option<String>, String> {
@@ -1015,11 +1488,12 @@ where
 pub async fn invoke_publish_adp_listing(
     request: PublishAdpListingRequest,
 ) -> Result<PublishAdpListingResult, String> {
-    crate::tauri_invoke::invoke(
+    crate::tauri_invoke::invoke_typed::<_, PublishAdpListingError>(
         "publish_adp_listing",
         serde_json::json!({ "request": request }),
     )
     .await
+    .map_err(|error| error.to_string())
 }
 
 /// Invoke desktop `resolve_adp_operator` command.
@@ -1048,6 +1522,50 @@ pub async fn invoke_publish_adp_listing(
     _request: PublishAdpListingRequest,
 ) -> Result<PublishAdpListingResult, String> {
     Err("ADP publishing is only available in desktop builds.".to_string())
+}
+
+/// Invokes the future typed publish contract without changing the legacy wrapper.
+///
+/// Subtask 5 owns adoption of the additive `extension` command argument.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_publish_adp_listing_with_contract(
+    request: PublishAdpListingRequest,
+    extension: PublishAdpListingRequestExtension,
+) -> Result<PublishAdpListingResult, PublishAdpListingError> {
+    crate::tauri_invoke::invoke_typed(
+        "publish_adp_listing_with_contract",
+        serde_json::json!({ "request": request, "extension": extension }),
+    )
+    .await
+}
+
+/// Web fallback for the future typed publish contract.
+#[cfg(feature = "web")]
+pub async fn invoke_publish_adp_listing_with_contract(
+    _request: PublishAdpListingRequest,
+    _extension: PublishAdpListingRequestExtension,
+) -> Result<PublishAdpListingResult, PublishAdpListingError> {
+    Err(PublishAdpListingError::UnsupportedPlatform)
+}
+
+/// Loads launch metadata from the authoritative signed listing revision.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_load_authoritative_adp_edit_metadata(
+    request: LoadAuthoritativeAdpEditMetadataRequest,
+) -> Result<AuthoritativeAdpEditMetadata, PublishAdpListingError> {
+    crate::tauri_invoke::invoke_typed(
+        "load_authoritative_adp_edit_metadata",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+/// Web fallback for authoritative ADP edit metadata.
+#[cfg(feature = "web")]
+pub async fn invoke_load_authoritative_adp_edit_metadata(
+    _request: LoadAuthoritativeAdpEditMetadataRequest,
+) -> Result<AuthoritativeAdpEditMetadata, PublishAdpListingError> {
+    Err(PublishAdpListingError::UnsupportedPlatform)
 }
 
 #[cfg(not(feature = "web"))]
@@ -1232,14 +1750,14 @@ where
     Err("ADP publishing is only available in desktop builds.".to_string())
 }
 
-/// Listen for desktop `download-complete` events.
+/// Listen for desktop `install-progress` events.
 #[cfg(not(feature = "web"))]
-pub async fn listen_download_complete<F>(mut callback: F) -> Result<Box<dyn FnOnce()>, String>
+pub async fn listen_install_progress<F>(mut callback: F) -> Result<Box<dyn FnOnce()>, String>
 where
-    F: FnMut(DownloadCompletePayload) + 'static,
+    F: FnMut(InstallProgressPayload) + 'static,
 {
-    let cleanup = crate::tauri_invoke::listen("download-complete", move |value| {
-        if let Ok(payload) = serde_json::from_value::<DownloadCompletePayload>(value) {
+    let cleanup = crate::tauri_invoke::listen("install-progress", move |value| {
+        if let Ok(payload) = serde_json::from_value::<InstallProgressPayload>(value) {
             callback(payload);
         }
     })
@@ -1247,35 +1765,11 @@ where
     Ok(Box::new(cleanup))
 }
 
-/// Web fallback for `download-complete` events.
+/// Web fallback for `install-progress` events.
 #[cfg(feature = "web")]
-pub async fn listen_download_complete<F>(_callback: F) -> Result<Box<dyn FnOnce()>, String>
+pub async fn listen_install_progress<F>(_callback: F) -> Result<Box<dyn FnOnce()>, String>
 where
-    F: FnMut(DownloadCompletePayload) + 'static,
-{
-    Err("ADP installation events are only available in desktop builds.".to_string())
-}
-
-/// Listen for desktop `download-progress` events.
-#[cfg(not(feature = "web"))]
-pub async fn listen_download_progress<F>(mut callback: F) -> Result<Box<dyn FnOnce()>, String>
-where
-    F: FnMut(DownloadProgressPayload) + 'static,
-{
-    let cleanup = crate::tauri_invoke::listen("download-progress", move |value| {
-        if let Ok(payload) = serde_json::from_value::<DownloadProgressPayload>(value) {
-            callback(payload);
-        }
-    })
-    .await?;
-    Ok(Box::new(cleanup))
-}
-
-/// Web fallback for `download-progress` events.
-#[cfg(feature = "web")]
-pub async fn listen_download_progress<F>(_callback: F) -> Result<Box<dyn FnOnce()>, String>
-where
-    F: FnMut(DownloadProgressPayload) + 'static,
+    F: FnMut(InstallProgressPayload) + 'static,
 {
     Err("ADP installation events are only available in desktop builds.".to_string())
 }
@@ -1791,6 +2285,7 @@ mod tests {
             expected_publisher_npub: "npub1expected".to_string(),
             existing_event_id: Some("existing-listing-event".to_string()),
             existing_d_tag: Some("game".to_string()),
+            pending_d_tag: None,
             title: "Game".to_string(),
             description: "Description".to_string(),
             price_sats: 0,
@@ -1801,6 +2296,7 @@ mod tests {
             operator_url: Some("https://operator.example.com".to_string()),
             servers: vec!["https://dist.example.com".to_string()],
             file_path: None,
+            selected_build: None,
             existing_file_hash: Some("hash".to_string()),
             existing_fulfillment_pubkey: Some("delegated-key".to_string()),
             version: Some("1.0.0".to_string()),
@@ -1832,6 +2328,57 @@ mod tests {
         assert_eq!(value["acquisition"]["TimedAccess"]["ends_at"], 200);
         assert_eq!(value["campaigns"][0]["root_event_id"], "campaign-root");
         assert_eq!(value["nip94_event_id"], "nip94-event");
+    }
+
+    #[test]
+    fn typed_publish_ipc_preserves_selected_build_and_nested_partial_error() {
+        let selected_build: BuildSelectionRef = serde_json::from_value(serde_json::json!({
+            "selection_id": "123e4567-e89b-42d3-a456-426614174001",
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }))
+        .expect("selected build contract");
+        let selected_value = serde_json::to_value(&selected_build).expect("selected build JSON");
+        assert_eq!(
+            selected_value["selection_id"],
+            "123e4567-e89b-42d3-a456-426614174001"
+        );
+
+        let error = PublishAdpListingError::PartialPublication {
+            cause: Box::new(PublishAdpListingError::Archive {
+                error: ArchiveSelectionError::DigestMismatch {
+                    expected: selected_build.sha256.clone(),
+                    actual: arcadestr_core::distribution::Sha256Digest::parse(&"22".repeat(32))
+                        .expect("actual digest"),
+                },
+            }),
+            successful_servers: vec!["https://one.example".to_string()],
+        };
+        let round_trip: PublishAdpListingError =
+            serde_json::from_value(serde_json::to_value(&error).expect("typed publish error JSON"))
+                .expect("typed publish error round trip");
+        assert_eq!(round_trip, error);
+    }
+
+    #[test]
+    fn archive_ipc_preserves_hostile_pages_for_typed_backend_validation() {
+        let request: QueryArchiveFilesRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "123e4567-e89b-42d3-a456-426614174000",
+            "selection_id": "123e4567-e89b-42d3-a456-426614174001",
+            "expected_publisher_npub": "npub1expected",
+            "search": "",
+            "page": { "offset": 0, "limit": 201 }
+        }))
+        .expect("numeric hostile page must cross the IPC contract");
+
+        assert_eq!(
+            request.page.validate(),
+            Err(ArchivePaginationFailure::LimitExceeded {
+                requested: 201,
+                maximum: ARCHIVE_PAGE_SIZE_MAX,
+            })
+        );
+        let args = serde_json::json!({ "request": request });
+        assert_eq!(args["request"]["page"]["limit"], 201);
     }
 
     #[test]
@@ -1881,9 +2428,10 @@ mod tests {
     }
 
     #[test]
-    fn download_progress_payload_matches_the_existing_desktop_event_contract() {
-        let payload: DownloadProgressPayload = serde_json::from_value(serde_json::json!({
+    fn install_progress_payload_matches_the_desktop_event_contract() {
+        let payload: InstallProgressPayload = serde_json::from_value(serde_json::json!({
             "game_coordinate": "30402:publisher:game",
+            "phase": "installing",
             "bytes": 512,
             "total": 1024
         }))
@@ -1892,5 +2440,74 @@ mod tests {
         assert_eq!(payload.bytes, 512);
         assert_eq!(payload.total, Some(1024));
         assert_eq!(payload.game_coordinate, "30402:publisher:game");
+        assert_eq!(payload.phase, InstallProgressPhase::Installing);
+    }
+
+    #[test]
+    fn installation_lifecycle_contract_matches_desktop_serde_fields() {
+        let installed: InstalledGame = serde_json::from_value(serde_json::json!({
+            "installation_id": "install-1",
+            "game_coordinate": "30402:publisher:game",
+            "installation_root": "/managed/install-1",
+            "package_digest": "ab",
+            "package_format": "zip",
+            "state": "ready",
+            "recovery_discriminator": null,
+            "retained_package": true,
+            "launchable": false,
+            "installed_at": 42
+        }))
+        .expect("desktop installed game should deserialize");
+        assert_eq!(installed.state, InstallationState::Ready);
+        assert!(installed.retained_package);
+        assert!(!installed.launchable);
+
+        let issue: InstallationLifecycleIssue = serde_json::from_value(serde_json::json!({
+            "installation_id": "install-2",
+            "game_coordinate": "30402:publisher:game",
+            "installation_root": "/managed/install-2",
+            "state": "failed",
+            "recovery_discriminator": "final_root_present",
+            "updated_at": 43
+        }))
+        .expect("desktop lifecycle issue should deserialize");
+        assert_eq!(
+            issue.recovery_discriminator,
+            Some(InstallationRecoveryDiscriminator::FinalRootPresent)
+        );
+
+        let sizes: UninstallSizes = serde_json::from_value(serde_json::json!({
+            "installation_size_bytes": 1024,
+            "retained_package_size_bytes": 2048
+        }))
+        .expect("desktop uninstall sizes should deserialize");
+        assert_eq!(sizes.retained_package_size_bytes, Some(2048));
+    }
+
+    #[test]
+    fn installation_command_payloads_use_exact_tauri_argument_names() {
+        assert_eq!(RESUME_UNINSTALL_COMMAND, "resume_uninstall");
+        assert_eq!(
+            REINSTALL_RETAINED_PACKAGE_COMMAND,
+            "reinstall_retained_package"
+        );
+        assert_eq!(
+            installation_id_args("install-1".into()),
+            serde_json::json!({ "installationId": "install-1" })
+        );
+        assert_eq!(
+            uninstall_game_args("install-1".into(), true),
+            serde_json::json!({
+                "installationId": "install-1",
+                "retainPackage": true
+            })
+        );
+        assert_eq!(
+            retained_package_identity_args("30402:publisher:game".into(), "package-1".into(),),
+            serde_json::json!({
+                "gameCoordinate": "30402:publisher:game",
+                "expectedPackageId": "package-1"
+            })
+        );
     }
 }

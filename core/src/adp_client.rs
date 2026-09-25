@@ -1,14 +1,16 @@
 //! ADP-01 HTTP client for Arcadestr distribution servers.
 
+use std::fs::File;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
 use nostr::Event;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
 
-use crate::http_client::{HttpClient, HttpClientError};
+use crate::archive_inspection_contract::SafeArchiveFilename;
+use crate::http_client::{HttpClient, HttpClientError, HttpRetainedDownload};
 use crate::nip98_client::{build_nip98_auth_header, Nip98ClientError};
 use crate::signers::NostrSigner;
 
@@ -87,6 +89,9 @@ pub struct AdpEventKinds {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AdpServerInfo {
     pub adp_version: String,
+    /// Maximum file bytes; absent on legacy servers (unknown, not unlimited).
+    #[serde(default)]
+    pub max_upload_bytes: Option<u64>,
     pub pubkey: String,
     pub name: Option<String>,
     pub url: Option<String>,
@@ -171,10 +176,91 @@ pub struct DownloadOutcome {
     pub bytes_written: u64,
 }
 
+/// Result of a private candidate download whose written handle stays open.
+#[derive(Debug, Clone)]
+pub struct RetainedDownloadOutcome {
+    pub file: Arc<File>,
+    pub bytes_written: u64,
+}
+
+impl From<HttpRetainedDownload> for RetainedDownloadOutcome {
+    fn from(outcome: HttpRetainedDownload) -> Self {
+        Self {
+            file: outcome.file,
+            bytes_written: outcome.bytes_written,
+        }
+    }
+}
+
+const UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
+
+type UploadProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+#[cfg(unix)]
+fn read_file_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+
+    file.read_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_file_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+
+    file.seek_read(buffer, offset)
+}
+
+fn blocking_task_error(error: tokio::task::JoinError) -> io::Error {
+    io::Error::other(format!("ADP upload read task failed: {error}"))
+}
+
+fn positional_upload_stream(
+    file: Arc<File>,
+    total_bytes: u64,
+    on_progress: UploadProgressCallback,
+) -> impl futures::Stream<Item = io::Result<Vec<u8>>> + Send {
+    futures::stream::try_unfold(
+        (file, 0_u64, on_progress),
+        move |(file, uploaded, on_progress)| async move {
+            if uploaded == total_bytes {
+                return Ok(None);
+            }
+
+            let remaining = total_bytes - uploaded;
+            let requested = remaining.min(UPLOAD_CHUNK_BYTES as u64) as usize;
+            let read_file = Arc::clone(&file);
+            let chunk = tokio::task::spawn_blocking(move || {
+                let mut chunk = vec![0_u8; requested];
+                let read = read_file_at(&read_file, &mut chunk, uploaded)?;
+                chunk.truncate(read);
+                Ok::<_, io::Error>(chunk)
+            })
+            .await
+            .map_err(blocking_task_error)??;
+
+            if chunk.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("upload file ended after {uploaded} of {total_bytes} advertised bytes"),
+                ));
+            }
+
+            let uploaded = uploaded + chunk.len() as u64;
+            on_progress(uploaded, total_bytes);
+            Ok(Some((chunk, (file, uploaded, on_progress))))
+        },
+    )
+}
+
 /// Typed client for one ADP server base URL.
 pub struct AdpClient {
     base_url: String,
     http: Arc<dyn HttpClient>,
+}
+
+/// NIP-98 authorization bound to one client's upload endpoint.
+pub struct UploadAuthorization {
+    header: String,
 }
 
 impl AdpClient {
@@ -240,6 +326,9 @@ impl AdpClient {
 
     /// Uploads a build file for an already-published listing.
     ///
+    /// This path-based compatibility API opens the path once, then delegates to the handle-based
+    /// upload API. The request stream never reopens the path.
+    ///
     /// # Errors
     /// Returns an error if the file cannot be read, authentication fails, or the server rejects
     /// the upload.
@@ -253,7 +342,10 @@ impl AdpClient {
             .await
     }
 
-    /// Uploads a build file and reports file bytes as they are streamed into the request body.
+    /// Uploads a build path and reports file bytes as they are streamed into the request body.
+    ///
+    /// This path-based compatibility API opens the path once, then delegates to
+    /// [`Self::upload_file_with_progress`].
     pub async fn upload_with_progress<F>(
         &self,
         signer: &dyn NostrSigner,
@@ -264,44 +356,119 @@ impl AdpClient {
     where
         F: Fn(u64, u64) + Send + Sync + 'static,
     {
-        let url = self.url("/upload");
-        let auth_header = build_nip98_auth_header(signer, &url, "POST").await?;
-        let listing_json = serde_json::to_string(listing_event)?;
-        let file_name = file_path
+        let safe_filename = match file_path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("game-build")
-            .to_string();
-        let total_bytes = tokio::fs::metadata(file_path).await?.len();
-        let file = tokio::fs::File::open(file_path).await?;
-        let on_progress = Arc::new(on_progress);
+            .and_then(|name| SafeArchiveFilename::parse(name).ok())
+        {
+            Some(filename) => filename,
+            None => SafeArchiveFilename::parse("game-build")
+                .map_err(|error| io::Error::other(error.to_string()))?,
+        };
+        let path = file_path.to_owned();
+        let file = tokio::task::spawn_blocking(move || File::open(path))
+            .await
+            .map_err(blocking_task_error)??;
+
+        self.upload_file_with_progress(
+            signer,
+            listing_event,
+            Arc::new(file),
+            &safe_filename,
+            on_progress,
+        )
+        .await
+    }
+
+    /// Uploads an already-open build file without consulting or reopening its source path.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read, authentication fails, or the server rejects
+    /// the upload.
+    pub async fn upload_file(
+        &self,
+        signer: &dyn NostrSigner,
+        listing_event: &Event,
+        file: Arc<File>,
+        safe_filename: &SafeArchiveFilename,
+    ) -> Result<UploadResponse, AdpClientError> {
+        self.upload_file_with_progress(signer, listing_event, file, safe_filename, |_, _| {})
+            .await
+    }
+
+    /// Uploads an open file with positional reads and reports streamed file bytes.
+    ///
+    /// The length advertised to multipart is captured from the supplied handle. Streaming stops
+    /// at exactly that length and reports [`io::ErrorKind::UnexpectedEof`] if the handle becomes
+    /// shorter. Every blocking read uses an explicit offset, independent of any shared cursor.
+    pub async fn upload_file_with_progress<F>(
+        &self,
+        signer: &dyn NostrSigner,
+        listing_event: &Event,
+        file: Arc<File>,
+        safe_filename: &SafeArchiveFilename,
+        on_progress: F,
+    ) -> Result<UploadResponse, AdpClientError>
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+    {
+        let authorization = self.authorize_upload(signer).await?;
+        self.upload_authorized_file_with_progress(
+            authorization,
+            listing_event,
+            file,
+            safe_filename,
+            on_progress,
+        )
+        .await
+    }
+
+    /// Signs NIP-98 authorization for this client's upload endpoint without sending a request.
+    pub async fn authorize_upload(
+        &self,
+        signer: &dyn NostrSigner,
+    ) -> Result<UploadAuthorization, AdpClientError> {
+        let header = build_nip98_auth_header(signer, &self.url("/upload"), "POST").await?;
+        Ok(UploadAuthorization { header })
+    }
+
+    /// Uploads from an open file using previously signed endpoint authorization.
+    ///
+    /// Separating authorization from transmission lets native callers revalidate account state
+    /// after a remote signer returns and before the HTTP side effect begins.
+    pub async fn upload_authorized_file_with_progress<F>(
+        &self,
+        authorization: UploadAuthorization,
+        listing_event: &Event,
+        file: Arc<File>,
+        safe_filename: &SafeArchiveFilename,
+        on_progress: F,
+    ) -> Result<UploadResponse, AdpClientError>
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+    {
+        let url = self.url("/upload");
+        let listing_json = serde_json::to_string(listing_event)?;
+        let metadata_file = Arc::clone(&file);
+        let total_bytes = tokio::task::spawn_blocking(move || metadata_file.metadata())
+            .await
+            .map_err(blocking_task_error)??
+            .len();
+        let on_progress: UploadProgressCallback = Arc::new(on_progress);
         on_progress(0, total_bytes);
-        let stream = futures::stream::try_unfold(
-            (file, 0_u64, on_progress),
-            move |(mut file, uploaded, on_progress)| async move {
-                let mut chunk = vec![0_u8; 64 * 1024];
-                let read = file.read(&mut chunk).await?;
-                if read == 0 {
-                    return Ok::<_, std::io::Error>(None);
-                }
-                chunk.truncate(read);
-                let uploaded = uploaded.saturating_add(read as u64);
-                on_progress(uploaded, total_bytes);
-                Ok(Some((chunk, (file, uploaded, on_progress))))
-            },
-        );
+        let stream = positional_upload_stream(file, total_bytes, on_progress);
         let file_part = reqwest::multipart::Part::stream_with_length(
             reqwest::Body::wrap_stream(stream),
             total_bytes,
         )
-        .file_name(file_name);
+        .file_name(safe_filename.as_str().to_owned());
         let form = reqwest::multipart::Form::new()
             .text("listing_event", listing_json)
             .part("file", file_part);
 
         let response = reqwest::Client::new()
             .post(url)
-            .header("Authorization", auth_header)
+            .header("Authorization", authorization.header)
             .multipart(form)
             .send()
             .await?;
@@ -390,8 +557,7 @@ impl AdpClient {
             }
             DownloadAuth::Nip98 { signer } => {
                 let url = self.url(&format!("/game/{encoded_coordinate}"));
-                let auth_url = self.url(&format!("/game/{game_coordinate}"));
-                let auth_header = build_nip98_auth_header(signer, &auth_url, "GET").await?;
+                let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
                 (url, vec![("Authorization".to_string(), auth_header)])
             }
         };
@@ -407,6 +573,102 @@ impl AdpClient {
         })
     }
 
+    /// Downloads into an exclusively created private candidate and retains the
+    /// exact open handle that received the response bytes.
+    pub async fn download_retained(
+        &self,
+        game_coordinate: &str,
+        auth: DownloadAuth<'_>,
+        candidate: &Path,
+        on_progress: impl FnMut(u64, Option<u64>) + Send,
+    ) -> Result<RetainedDownloadOutcome, AdpClientError> {
+        self.download_retained_with_preflight(
+            game_coordinate,
+            auth,
+            candidate,
+            |_| Ok(()),
+            on_progress,
+        )
+        .await
+    }
+
+    /// Downloads into a retained candidate after allowing the caller to reject
+    /// the successful response's optional content length. The preflight runs
+    /// before candidate creation and response-body polling.
+    pub async fn download_retained_with_preflight(
+        &self,
+        game_coordinate: &str,
+        auth: DownloadAuth<'_>,
+        candidate: &Path,
+        mut on_preflight: impl FnMut(Option<u64>) -> Result<(), HttpClientError> + Send,
+        mut on_progress: impl FnMut(u64, Option<u64>) + Send,
+    ) -> Result<RetainedDownloadOutcome, AdpClientError> {
+        let encoded_coordinate = urlencoding::encode(game_coordinate);
+        let (url, headers) = match auth {
+            DownloadAuth::Token(token) => {
+                let encoded_token = urlencoding::encode(&token);
+                (
+                    self.url(&format!("/game/{encoded_coordinate}?token={encoded_token}")),
+                    Vec::new(),
+                )
+            }
+            DownloadAuth::Nip98 { signer } => {
+                let url = self.url(&format!("/game/{encoded_coordinate}"));
+                let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
+                (url, vec![("Authorization".to_string(), auth_header)])
+            }
+        };
+
+        self.http
+            .download_to_retained_file_with_preflight(
+                &url,
+                headers,
+                candidate,
+                &mut on_preflight,
+                &mut on_progress,
+            )
+            .await
+            .map(RetainedDownloadOutcome::from)
+            .map_err(map_download_error)
+    }
+
+    /// Downloads into a caller-created capability-owned file.
+    pub async fn download_retained_to_open_file_with_preflight(
+        &self,
+        game_coordinate: &str,
+        auth: DownloadAuth<'_>,
+        candidate: File,
+        mut on_preflight: impl FnMut(Option<u64>) -> Result<(), HttpClientError> + Send,
+        mut on_progress: impl FnMut(u64, Option<u64>) + Send,
+    ) -> Result<RetainedDownloadOutcome, AdpClientError> {
+        let encoded_coordinate = urlencoding::encode(game_coordinate);
+        let (url, headers) = match auth {
+            DownloadAuth::Token(token) => {
+                let encoded_token = urlencoding::encode(&token);
+                (
+                    self.url(&format!("/game/{encoded_coordinate}?token={encoded_token}")),
+                    Vec::new(),
+                )
+            }
+            DownloadAuth::Nip98 { signer } => {
+                let url = self.url(&format!("/game/{encoded_coordinate}"));
+                let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
+                (url, vec![("Authorization".to_string(), auth_header)])
+            }
+        };
+        self.http
+            .download_to_open_retained_file_with_preflight(
+                &url,
+                headers,
+                candidate,
+                &mut on_preflight,
+                &mut on_progress,
+            )
+            .await
+            .map(RetainedDownloadOutcome::from)
+            .map_err(map_download_error)
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
@@ -414,6 +676,9 @@ impl AdpClient {
 
 fn map_download_error(err: HttpClientError) -> AdpClientError {
     match err {
+        HttpClientError::Status(413) | HttpClientError::StatusWithBody { status: 413, .. } => {
+            AdpClientError::Http(err)
+        }
         HttpClientError::Status(403) => {
             AdpClientError::DownloadOwnership("ownership check failed".to_string())
         }
@@ -540,6 +805,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn upload_capacity_metadata_is_optional_and_exact() {
+        let mut value = json!({"adp_version":"0.2.0", "pubkey":"operator"});
+        assert_eq!(
+            serde_json::from_value::<AdpServerInfo>(value.clone())
+                .expect("legacy")
+                .max_upload_bytes,
+            None
+        );
+        value["max_upload_bytes"] = json!(8_u64 * 1024 * 1024 * 1024);
+        assert_eq!(
+            serde_json::from_value::<AdpServerInfo>(value.clone())
+                .expect("large limit")
+                .max_upload_bytes,
+            Some(8_u64 * 1024 * 1024 * 1024)
+        );
+        value["max_upload_bytes"] = json!(-1);
+        assert!(serde_json::from_value::<AdpServerInfo>(value).is_err());
+    }
+
     #[tokio::test]
     async fn download_with_token_streams_file_and_reports_progress() {
         let expected_bytes = b"downloaded artifact bytes";
@@ -573,6 +858,117 @@ mod tests {
             .any(|event| event.0 == expected_bytes.len() as u64));
 
         let _ = std::fs::remove_file(dest);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_token_download_handle_survives_candidate_replacement() {
+        use std::os::unix::fs::FileExt;
+
+        let expected_bytes = b"retained artifact bytes";
+        let url =
+            "https://dist.example.com/game/30406%3Apublisher%3Atest-game?token=download-token";
+        let http = Arc::new(MockHttpClient::new().with_download_response(url, expected_bytes));
+        let client = AdpClient::new("https://dist.example.com", http.clone());
+        let candidate = temp_download_path("retained-token");
+        let moved = temp_download_path("retained-token-moved");
+        let mut progress_events = Vec::new();
+
+        let outcome = client
+            .download_retained(
+                "30406:publisher:test-game",
+                DownloadAuth::Token("download-token".to_string()),
+                &candidate,
+                |bytes, total| progress_events.push((bytes, total)),
+            )
+            .await
+            .expect("retained download should succeed");
+
+        std::fs::rename(&candidate, &moved).expect("candidate should be renamed");
+        std::fs::write(&candidate, b"replacement path contents")
+            .expect("candidate path should be replaced");
+        let mut retained_bytes = vec![0_u8; expected_bytes.len()];
+        let read = outcome
+            .file
+            .read_at(&mut retained_bytes, 0)
+            .expect("retained handle should remain readable");
+
+        assert_eq!(read, expected_bytes.len());
+        assert_eq!(retained_bytes, expected_bytes);
+        assert_eq!(outcome.bytes_written, expected_bytes.len() as u64);
+        assert_eq!(http.call_count(url), 1);
+        assert!(progress_events
+            .iter()
+            .any(|event| event.0 == expected_bytes.len() as u64));
+
+        let _ = std::fs::remove_file(candidate);
+        let _ = std::fs::remove_file(moved);
+    }
+
+    #[tokio::test]
+    async fn retained_mock_download_preserves_an_existing_candidate() {
+        let url =
+            "https://dist.example.com/game/30406%3Apublisher%3Atest-game?token=download-token";
+        let http = Arc::new(MockHttpClient::new().with_download_response(url, b"new bytes"));
+        let client = AdpClient::new("https://dist.example.com", http.clone());
+        let candidate = temp_download_path("retained-existing");
+        std::fs::write(&candidate, b"existing bytes").expect("candidate should be seeded");
+
+        client
+            .download_retained(
+                "30406:publisher:test-game",
+                DownloadAuth::Token("download-token".to_string()),
+                &candidate,
+                |_bytes, _total| {},
+            )
+            .await
+            .expect_err("existing candidate should be rejected");
+
+        assert_eq!(
+            std::fs::read(&candidate).expect("candidate should remain readable"),
+            b"existing bytes"
+        );
+        assert_eq!(http.call_count(url), 1);
+
+        let _ = std::fs::remove_file(candidate);
+    }
+
+    #[tokio::test]
+    async fn retained_preflight_rejection_creates_no_candidate_or_body_write() {
+        let url =
+            "https://dist.example.com/game/30406%3Apublisher%3Atest-game?token=download-token";
+        let expected = b"body must not be written";
+        let http = Arc::new(MockHttpClient::new().with_download_response(url, expected));
+        let client = AdpClient::new("https://dist.example.com", http.clone());
+        let candidate = temp_download_path("retained-preflight-rejection");
+        let mut discovered_length = None;
+        let mut progress_called = false;
+
+        let error = client
+            .download_retained_with_preflight(
+                "30406:publisher:test-game",
+                DownloadAuth::Token("download-token".to_string()),
+                &candidate,
+                |length| {
+                    discovered_length = length;
+                    Err(HttpClientError::InsufficientStorage(
+                        "preflight capacity check failed".to_string(),
+                    ))
+                },
+                |_bytes, _total| progress_called = true,
+            )
+            .await
+            .expect_err("preflight should reject the retained download");
+
+        assert!(matches!(
+            error,
+            AdpClientError::Http(HttpClientError::InsufficientStorage(_))
+        ));
+        assert_eq!(discovered_length, Some(expected.len() as u64));
+        assert!(!candidate.exists());
+        assert!(!progress_called);
+        assert_eq!(http.download_body_write_count(url), 0);
+        assert_eq!(http.call_count(url), 1);
     }
 
     #[tokio::test]
@@ -645,7 +1041,7 @@ mod tests {
             json!([
                 [
                     "u",
-                    "https://dist.example.com/game/30406:publisher:test-game"
+                    "https://dist.example.com/game/30406%3Apublisher%3Atest-game"
                 ],
                 ["method", "GET"]
             ])
@@ -654,6 +1050,86 @@ mod tests {
         assert_eq!(http.last_requested_url().as_deref(), Some(url));
 
         let _ = std::fs::remove_file(dest);
+    }
+
+    #[tokio::test]
+    async fn retained_download_with_nip98_sets_authorization_header() {
+        let coordinate = "30406:publisher:test-game";
+        let url = "https://dist.example.com/game/30406%3Apublisher%3Atest-game";
+        let http = Arc::new(MockHttpClient::new().with_download_response(url, b"retained nip98"));
+        let client = AdpClient::new("https://dist.example.com", http.clone());
+        let signer = LocalSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("test signer should be valid");
+        let candidate = temp_download_path("retained-nip98-auth");
+
+        let outcome = client
+            .download_retained(
+                coordinate,
+                DownloadAuth::Nip98 { signer: &signer },
+                &candidate,
+                |_bytes, _total| {},
+            )
+            .await
+            .expect("retained download should use NIP-98 auth");
+
+        let headers = http
+            .last_download_headers(url)
+            .expect("download headers should be captured");
+        let auth = headers
+            .iter()
+            .find(|(name, _)| name == "Authorization")
+            .map(|(_, value)| value.as_str())
+            .expect("Authorization header should be set");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(
+                auth.strip_prefix("Nostr ")
+                    .expect("Authorization should use Nostr scheme"),
+            )
+            .expect("Authorization should contain base64 event JSON");
+        let event: Value = serde_json::from_slice(&decoded).expect("event JSON should decode");
+        assert_eq!(
+            event["tags"],
+            json!([
+                [
+                    "u",
+                    "https://dist.example.com/game/30406%3Apublisher%3Atest-game"
+                ],
+                ["method", "GET"]
+            ])
+        );
+        assert_eq!(outcome.bytes_written, b"retained nip98".len() as u64);
+        assert_eq!(http.call_count(url), 1);
+
+        let _ = std::fs::remove_file(candidate);
+    }
+
+    #[test]
+    fn download_archive_policy_preserves_typed_size_errors() {
+        assert!(matches!(
+            map_download_error(HttpClientError::Status(413)),
+            AdpClientError::Http(HttpClientError::Status(413))
+        ));
+        assert!(matches!(
+            map_download_error(HttpClientError::StatusWithBody {
+                status: 413,
+                body: "oversized".into(),
+            }),
+            AdpClientError::Http(HttpClientError::StatusWithBody { status: 413, .. })
+        ));
+        assert!(matches!(
+            map_download_error(HttpClientError::FilesystemFileSizeLimit("limit".into())),
+            AdpClientError::Http(HttpClientError::FilesystemFileSizeLimit(_))
+        ));
+        assert!(matches!(
+            map_download_error(HttpClientError::Request("HTTP 413".into())),
+            AdpClientError::Http(HttpClientError::Request(_))
+        ));
+        assert!(matches!(
+            map_download_error(HttpClientError::Status(503)),
+            AdpClientError::DownloadUnavailable(_)
+        ));
     }
 
     #[tokio::test]
@@ -898,6 +1374,65 @@ mod tests {
         assert_eq!(first.scope.as_deref(), Some(scope.as_str()));
         assert_eq!(second.scope.as_deref(), Some(scope.as_str()));
         assert_eq!(first.fulfillment_pubkey, second.fulfillment_pubkey);
+    }
+
+    async fn collect_positional_upload(
+        file: Arc<File>,
+        advertised_bytes: u64,
+    ) -> io::Result<Vec<u8>> {
+        use futures::TryStreamExt;
+
+        positional_upload_stream(file, advertised_bytes, Arc::new(|_, _| {}))
+            .try_fold(Vec::new(), |mut collected, chunk| async move {
+                collected.extend_from_slice(&chunk);
+                Ok(collected)
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn concurrent_upload_streams_share_handle_without_sharing_cursor() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let expected: Vec<u8> = (0..(UPLOAD_CHUNK_BYTES * 2 + 17_123))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut temporary = tempfile::NamedTempFile::new().expect("temporary upload file");
+        temporary
+            .write_all(&expected)
+            .expect("write upload fixture");
+        temporary.flush().expect("flush upload fixture");
+        let mut open_file = temporary.reopen().expect("reopen upload fixture once");
+        open_file
+            .seek(SeekFrom::End(-37))
+            .expect("set an irrelevant shared cursor position");
+        let shared_file = Arc::new(open_file);
+
+        let first = collect_positional_upload(Arc::clone(&shared_file), expected.len() as u64);
+        let second = collect_positional_upload(Arc::clone(&shared_file), expected.len() as u64);
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.expect("first stream reads exactly"), expected);
+        assert_eq!(second.expect("second stream reads exactly"), expected);
+    }
+
+    #[tokio::test]
+    async fn positional_upload_stream_rejects_shorter_than_advertised_file() {
+        use std::io::Write;
+
+        let expected = vec![7_u8; UPLOAD_CHUNK_BYTES + 29];
+        let mut temporary = tempfile::NamedTempFile::new().expect("temporary upload file");
+        temporary
+            .write_all(&expected)
+            .expect("write upload fixture");
+        temporary.flush().expect("flush upload fixture");
+        let shared_file = Arc::new(temporary.reopen().expect("open upload fixture"));
+
+        let error = collect_positional_upload(shared_file, expected.len() as u64 + 1)
+            .await
+            .expect_err("short file must not satisfy advertised length");
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]

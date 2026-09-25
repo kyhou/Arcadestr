@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use std::path::Path;
@@ -121,59 +122,150 @@ CREATE INDEX IF NOT EXISTS idx_users_expires ON users(expires_at);
 // "#;
 
 // Migration 5: NIP-58 achievement badge cache
-const MIGRATION_5_ACHIEVEMENTS: &str = include_str!("../../migrations/002_achievements.sql");
+const MIGRATION_5_ACHIEVEMENTS: &str = include_str!("../../migrations/005_achievements.sql");
 
 // Migration 6: NIP-102 purchase receipts
-const MIGRATION_6_PURCHASES: &str = include_str!("../../migrations/003_purchases.sql");
+const MIGRATION_6_PURCHASES: &str = include_str!("../../migrations/006_purchases.sql");
 
 // Migration 7: ADP provisioning relationships
 const MIGRATION_7_ADP_PROVISIONING: &str =
-    include_str!("../../migrations/004_adp_provisioning.sql");
+    include_str!("../../migrations/007_adp_provisioning.sql");
 
 // Migration 8: ADP download token cache
-const MIGRATION_8_DOWNLOAD_TOKENS: &str = include_str!("../../migrations/005_download_tokens.sql");
+const MIGRATION_8_DOWNLOAD_TOKENS: &str = include_str!("../../migrations/008_download_tokens.sql");
 
-// Migration 9: ADP installed games
-const MIGRATION_9_INSTALLED_GAMES: &str = include_str!("../../migrations/006_installed_games.sql");
+// Migration 9: installation snapshots
+const MIGRATION_9_INSTALLATIONS: &str = include_str!("../../migrations/009_installations.sql");
 
 // Migration 10: NIP-103 entitlement grant history
-const MIGRATION_10_ENTITLEMENTS: &str = include_str!("../../migrations/007_entitlements.sql");
+const MIGRATION_10_ENTITLEMENTS: &str = include_str!("../../migrations/010_entitlements.sql");
 
 // Migration 11: immutable authorization-root provisioning profile
 const MIGRATION_11_AUTHORIZATION_ROOTS: &str =
-    include_str!("../../migrations/008_authorization_roots.sql");
+    include_str!("../../migrations/011_authorization_roots.sql");
 
 // Migration 12: account-scoped user library
-const MIGRATION_12_LIBRARY_GAMES: &str = include_str!("../../migrations/009_library_games.sql");
+const MIGRATION_12_LIBRARY_GAMES: &str = include_str!("../../migrations/012_library_games.sql");
 
 // Migration 13: validated Store Page presentation cache
-const MIGRATION_13_STORE_PAGES: &str = include_str!("../../migrations/010_store_pages.sql");
+const MIGRATION_13_STORE_PAGES: &str = include_str!("../../migrations/013_store_pages.sql");
 
 // Migration 14: signed listings required for offline Store Page reciprocity checks
 const MIGRATION_14_STORE_PAGE_LISTINGS: &str =
-    include_str!("../../migrations/011_store_page_listing_events.sql");
+    include_str!("../../migrations/014_store_page_listing_events.sql");
 
 // Migration 15: account-scoped Blossom server settings
 const MIGRATION_15_BLOSSOM_SERVER_SETTINGS: &str =
-    include_str!("../../migrations/012_blossom_server_settings.sql");
+    include_str!("../../migrations/015_blossom_server_settings.sql");
 
-// List of all migrations in applied order; migration filenames currently lag user_version numbers.
-const MIGRATIONS: &[&str] = &[
-    MIGRATION_1_INITIAL,
-    MIGRATION_2_GAMES_TABLE,
-    MIGRATION_3_RELAYS_TABLE,
-    MIGRATION_4_USERS_TABLE,
-    MIGRATION_5_ACHIEVEMENTS,
-    MIGRATION_6_PURCHASES,
-    MIGRATION_7_ADP_PROVISIONING,
-    MIGRATION_8_DOWNLOAD_TOKENS,
-    MIGRATION_9_INSTALLED_GAMES,
-    MIGRATION_10_ENTITLEMENTS,
-    MIGRATION_11_AUTHORIZATION_ROOTS,
-    MIGRATION_12_LIBRARY_GAMES,
-    MIGRATION_13_STORE_PAGES,
-    MIGRATION_14_STORE_PAGE_LISTINGS,
-    MIGRATION_15_BLOSSOM_SERVER_SETTINGS,
+// Migration 16: pinned publisher defaults and device-local launch preferences
+const MIGRATION_16_LAUNCH_PROFILE_PREFERENCES: &str =
+    include_str!("../../migrations/016_launch_profile_preferences.sql");
+
+#[cfg(test)]
+const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
+    (5, "005_achievements.sql", MIGRATION_5_ACHIEVEMENTS),
+    (6, "006_purchases.sql", MIGRATION_6_PURCHASES),
+    (7, "007_adp_provisioning.sql", MIGRATION_7_ADP_PROVISIONING),
+    (8, "008_download_tokens.sql", MIGRATION_8_DOWNLOAD_TOKENS),
+    (9, "009_installations.sql", MIGRATION_9_INSTALLATIONS),
+    (10, "010_entitlements.sql", MIGRATION_10_ENTITLEMENTS),
+    (
+        11,
+        "011_authorization_roots.sql",
+        MIGRATION_11_AUTHORIZATION_ROOTS,
+    ),
+    (12, "012_library_games.sql", MIGRATION_12_LIBRARY_GAMES),
+    (13, "013_store_pages.sql", MIGRATION_13_STORE_PAGES),
+    (
+        14,
+        "014_store_page_listing_events.sql",
+        MIGRATION_14_STORE_PAGE_LISTINGS,
+    ),
+    (
+        15,
+        "015_blossom_server_settings.sql",
+        MIGRATION_15_BLOSSOM_SERVER_SETTINGS,
+    ),
+    (
+        16,
+        "016_launch_profile_preferences.sql",
+        MIGRATION_16_LAUNCH_PROFILE_PREFERENCES,
+    ),
+];
+
+#[derive(Clone, Copy)]
+struct Migration {
+    name: &'static str,
+    sql: &'static str,
+}
+
+// List of all migrations in durable applied order. Names and SQL are migration identity.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "001_initial_schema",
+        sql: MIGRATION_1_INITIAL,
+    },
+    Migration {
+        name: "002_marketplace_listings",
+        sql: MIGRATION_2_GAMES_TABLE,
+    },
+    Migration {
+        name: "003_marketplace_indexes",
+        sql: MIGRATION_3_RELAYS_TABLE,
+    },
+    Migration {
+        name: "004_users",
+        sql: MIGRATION_4_USERS_TABLE,
+    },
+    Migration {
+        name: "005_achievements.sql",
+        sql: MIGRATION_5_ACHIEVEMENTS,
+    },
+    Migration {
+        name: "006_purchases.sql",
+        sql: MIGRATION_6_PURCHASES,
+    },
+    Migration {
+        name: "007_adp_provisioning.sql",
+        sql: MIGRATION_7_ADP_PROVISIONING,
+    },
+    Migration {
+        name: "008_download_tokens.sql",
+        sql: MIGRATION_8_DOWNLOAD_TOKENS,
+    },
+    Migration {
+        name: "009_installations.sql",
+        sql: MIGRATION_9_INSTALLATIONS,
+    },
+    Migration {
+        name: "010_entitlements.sql",
+        sql: MIGRATION_10_ENTITLEMENTS,
+    },
+    Migration {
+        name: "011_authorization_roots.sql",
+        sql: MIGRATION_11_AUTHORIZATION_ROOTS,
+    },
+    Migration {
+        name: "012_library_games.sql",
+        sql: MIGRATION_12_LIBRARY_GAMES,
+    },
+    Migration {
+        name: "013_store_pages.sql",
+        sql: MIGRATION_13_STORE_PAGES,
+    },
+    Migration {
+        name: "014_store_page_listing_events.sql",
+        sql: MIGRATION_14_STORE_PAGE_LISTINGS,
+    },
+    Migration {
+        name: "015_blossom_server_settings.sql",
+        sql: MIGRATION_15_BLOSSOM_SERVER_SETTINGS,
+    },
+    Migration {
+        name: "016_launch_profile_preferences.sql",
+        sql: MIGRATION_16_LAUNCH_PROFILE_PREFERENCES,
+    },
 ];
 
 /// Database connection pool for SQLite
@@ -212,37 +304,150 @@ impl Database {
             .await?;
 
         // Run migrations
-        Self::run_migrations(&pool).await?;
+        Self::run_migrations(db_path, &pool, MIGRATIONS).await?;
 
         Ok(Self { pool })
     }
 
     /// Run database migrations
-    async fn run_migrations(pool: &SqlitePool) -> Result<(), DatabaseError> {
+    async fn run_migrations(
+        db_path: &Path,
+        pool: &SqlitePool,
+        migrations: &[Migration],
+    ) -> Result<(), DatabaseError> {
         let (current_version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(pool)
             .await
             .map_err(|e| DatabaseError::Migration(format!("Reading schema version failed: {e}")))?;
-        for (idx, migration) in MIGRATIONS.iter().enumerate().skip(current_version as usize) {
-            let migration_num = idx + 1;
-            sqlx::query(*migration).execute(pool).await.map_err(|e| {
-                DatabaseError::Migration(format!("Migration {} failed: {}", migration_num, e))
-            })?;
+        let identity_table_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            DatabaseError::Migration(format!("Reading migration identity state failed: {e}"))
+        })?;
 
-            sqlx::query(&format!("PRAGMA user_version = {}", migration_num))
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    DatabaseError::Migration(format!(
-                        "Setting schema version for migration {} failed: {}",
-                        migration_num, e
-                    ))
-                })?;
+        if current_version > 0 && !identity_table_exists {
+            return Err(DatabaseError::Migration(format!(
+                "database {} predates migration identity tracking (schema version {current_version}); this pre-release database can be deleted and recreated",
+                db_path.display()
+            )));
+        }
+
+        if !identity_table_exists {
+            sqlx::query(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    sha256 TEXT NOT NULL
+                )",
+            )
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                DatabaseError::Migration(format!("Creating migration identity table failed: {e}"))
+            })?;
+        }
+
+        Self::validate_migration_identities(pool, current_version, migrations).await?;
+        for (idx, migration) in migrations.iter().enumerate().skip(current_version as usize) {
+            Self::apply_migration(pool, idx + 1, migration).await?;
         }
 
         Self::ensure_marketplace_cache_schema(pool).await?;
         Self::ensure_download_tokens_schema(pool).await?;
 
+        Ok(())
+    }
+
+    async fn validate_migration_identities(
+        pool: &SqlitePool,
+        current_version: i64,
+        migrations: &[Migration],
+    ) -> Result<(), DatabaseError> {
+        if current_version < 0 || current_version as usize > migrations.len() {
+            return Err(DatabaseError::Migration(format!(
+                "schema version {current_version} is outside the known migration range 0..={}",
+                migrations.len()
+            )));
+        }
+
+        let applied: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT version, name, sha256 FROM schema_migrations ORDER BY version")
+                .fetch_all(pool)
+                .await
+                .map_err(|e| {
+                    DatabaseError::Migration(format!("Reading migration identities failed: {e}"))
+                })?;
+        if applied.len() != current_version as usize {
+            return Err(DatabaseError::Migration(format!(
+                "migration identity count {} does not match schema version {current_version}",
+                applied.len()
+            )));
+        }
+
+        for (index, (version, stored_name, stored_sha256)) in applied.iter().enumerate() {
+            let expected_version = index + 1;
+            let migration = &migrations[index];
+            let expected_sha256 = Self::migration_sha256(migration.sql);
+            if *version != expected_version as i64
+                || stored_name != migration.name
+                || stored_sha256 != &expected_sha256
+            {
+                return Err(DatabaseError::Migration(format!(
+                    "migration {expected_version} identity mismatch: stored name={stored_name:?} sha256={stored_sha256}, embedded name={:?} sha256={expected_sha256}",
+                    migration.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn migration_sha256(sql: &str) -> String {
+        hex::encode(Sha256::digest(sql.as_bytes()))
+    }
+
+    async fn apply_migration(
+        pool: &SqlitePool,
+        migration_num: usize,
+        migration: &Migration,
+    ) -> Result<(), DatabaseError> {
+        let mut transaction = pool.begin().await.map_err(|error| {
+            DatabaseError::Migration(format!(
+                "Starting migration {migration_num} failed: {error}"
+            ))
+        })?;
+        sqlx::query(migration.sql)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                DatabaseError::Migration(format!("Migration {migration_num} failed: {error}"))
+            })?;
+        sqlx::query("INSERT INTO schema_migrations (version, name, sha256) VALUES (?, ?, ?)")
+            .bind(migration_num as i64)
+            .bind(migration.name)
+            .bind(Self::migration_sha256(migration.sql))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                DatabaseError::Migration(format!(
+                    "Recording migration {migration_num} identity failed: {error}"
+                ))
+            })?;
+        sqlx::query(&format!("PRAGMA user_version = {migration_num}"))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                DatabaseError::Migration(format!(
+                    "Setting schema version for migration {migration_num} failed: {error}"
+                ))
+            })?;
+        transaction.commit().await.map_err(|error| {
+            DatabaseError::Migration(format!(
+                "Committing migration {migration_num} failed: {error}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -1038,6 +1243,217 @@ mod tests {
         assert_eq!(user_version as usize, MIGRATIONS.len());
     }
 
+    #[test]
+    fn migration_filenames_match_applied_numbers() {
+        assert_eq!(MIGRATIONS[0].sql, MIGRATION_1_INITIAL);
+        assert_eq!(MIGRATIONS[1].sql, MIGRATION_2_GAMES_TABLE);
+        assert_eq!(MIGRATIONS[2].sql, MIGRATION_3_RELAYS_TABLE);
+        assert_eq!(MIGRATIONS[3].sql, MIGRATION_4_USERS_TABLE);
+        for (applied_number, filename, sql) in EXTERNAL_MIGRATIONS {
+            let prefix = filename
+                .split_once('_')
+                .expect("migration filename has a numeric prefix")
+                .0
+                .parse::<usize>()
+                .expect("migration prefix is numeric");
+            assert_eq!(prefix, *applied_number, "wrong prefix for {filename}");
+            assert_eq!(MIGRATIONS[*applied_number - 1].name, *filename);
+            assert_eq!(MIGRATIONS[*applied_number - 1].sql, *sql);
+        }
+        assert_eq!(EXTERNAL_MIGRATIONS.len() + 4, MIGRATIONS.len());
+    }
+
+    #[tokio::test]
+    async fn empty_database_migration_creates_expected_schema() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db = Database::new(&temp_dir.path().join("empty-schema.db"))
+            .await
+            .expect("empty database should migrate");
+        let mut tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("schema table query should succeed");
+        let mut expected = vec![
+            "accounts",
+            "adp_provisioning",
+            "badge_awards",
+            "badge_definitions",
+            "blossom_server_settings",
+            "download_tokens",
+            "entitlement_events",
+            "installation_manifest_entries",
+            "installation_profiles",
+            "installations",
+            "library_games",
+            "launch_profile_preferences",
+            "marketplace_listings",
+            "profile_badge_entries",
+            "profile_badge_lists",
+            "purchases",
+            "relay_backups",
+            "remote_uris",
+            "schema_migrations",
+            "retained_packages",
+            "secure_storage",
+            "store_page_listing_events",
+            "store_pages",
+            "users",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        tables.sort();
+        expected.sort();
+        assert_eq!(tables, expected);
+
+        let installation_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'installations'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("installation schema query");
+        for state in ["installing", "ready", "failed", "uninstalling"] {
+            assert!(installation_sql.contains(state));
+        }
+        assert!(!installation_sql.contains("installed"));
+    }
+
+    #[tokio::test]
+    async fn launch_profile_migration_adds_nullable_defaults_and_unlinked_preferences() {
+        let temp_dir = TempDir::new().expect("temp directory");
+        let db = Database::new(&temp_dir.path().join("launch-profile-schema.db"))
+            .await
+            .expect("database migration");
+        for table in ["installations", "retained_packages"] {
+            let column: (i64, Option<String>) = sqlx::query_as(&format!(
+                "SELECT [notnull], dflt_value FROM pragma_table_info('{table}') \
+                 WHERE name = 'publisher_default_profile_id'"
+            ))
+            .fetch_one(db.pool())
+            .await
+            .expect("publisher default column");
+            assert_eq!(
+                column,
+                (0, None),
+                "legacy {table} rows must remain nullable"
+            );
+        }
+        let foreign_keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('launch_profile_preferences')",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("preference foreign keys");
+        assert_eq!(
+            foreign_keys, 0,
+            "preferences must survive installation deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_migration_rolls_back_schema_and_version() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(temp_dir.path().join("rollback.db"))
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("test pool should open");
+
+        let result = Database::apply_migration(
+            &pool,
+            1,
+            &Migration {
+                name: "001_invalid",
+                sql: "CREATE TABLE rolled_back (id INTEGER); THIS IS NOT SQL;",
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(DatabaseError::Migration(_))));
+        let table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'rolled_back'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("table lookup should succeed");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("version lookup should succeed");
+        assert_eq!(table_count, 0);
+        assert_eq!(version, 0);
+    }
+
+    #[tokio::test]
+    async fn untracked_positive_version_database_fails_with_pre_release_guidance() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("untracked.db");
+        let pool = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("untracked database should open");
+        sqlx::query("PRAGMA user_version = 15")
+            .execute(&pool)
+            .await
+            .expect("schema version should be set");
+        pool.close().await;
+
+        let error = Database::new(&db_path)
+            .await
+            .err()
+            .expect("untracked database must be rejected");
+        let message = error.to_string();
+        assert!(message.contains(db_path.to_string_lossy().as_ref()));
+        assert!(message.contains("predates migration identity tracking"));
+        assert!(message.contains("pre-release database can be deleted"));
+    }
+
+    #[tokio::test]
+    async fn rewritten_applied_migration_is_rejected() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("rewritten.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("database should initialize");
+        let pool = db.pool().clone();
+        let mut rewritten = MIGRATIONS.to_vec();
+        rewritten[8].sql = "SELECT 'rewritten migration 9'";
+
+        let error = Database::run_migrations(&db_path, &pool, &rewritten)
+            .await
+            .expect_err("rewritten migration must be rejected");
+        assert!(error.to_string().contains("migration 9 identity mismatch"));
+    }
+
+    #[tokio::test]
+    async fn tampered_migration_identity_is_rejected() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("tampered.db");
+        let db = Database::new(&db_path)
+            .await
+            .expect("database should initialize");
+        sqlx::query("UPDATE schema_migrations SET sha256 = 'tampered' WHERE version = 9")
+            .execute(db.pool())
+            .await
+            .expect("migration identity should be tampered");
+        db.close().await;
+
+        let error = Database::new(&db_path)
+            .await
+            .err()
+            .expect("tampered identity must be rejected");
+        assert!(error.to_string().contains("migration 9 identity mismatch"));
+    }
+
     #[tokio::test]
     async fn adp_gate2_and_store_page_tables_exist_after_migrations() {
         let temp_dir = TempDir::new().unwrap();
@@ -1047,7 +1463,10 @@ mod tests {
         for table in [
             "adp_provisioning",
             "download_tokens",
-            "installed_games",
+            "installations",
+            "installation_profiles",
+            "installation_manifest_entries",
+            "retained_packages",
             "library_games",
             "store_pages",
             "store_page_listing_events",

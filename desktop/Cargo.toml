@@ -32,11 +32,18 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 async-trait = "0.1"
 futures-util = "0.3"
 base64 = "0.22"
+cap-std = { version = "=4.0.3", default-features = false }
+cap-primitives = { version = "=4.0.3", default-features = false }
 infer = { version = "0.22", default-features = false }
 imagesize = { version = "0.15", default-features = false, features = ["jpeg", "png", "webp"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+sysinfo = { version = "=0.38.4", default-features = false, features = ["disk"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
+tokio-tungstenite = "0.28"
 anyhow = "1"
 axum = "0.8"
 bytes = "1"
@@ -45,6 +52,7 @@ tauri = { workspace = true, features = ["test"] }
 tempfile = "3"
 
 [build-dependencies]
+sha2 = "0.10"
 tauri-build = { version = "2", features = [] }
 
 [features]

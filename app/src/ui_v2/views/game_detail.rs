@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use arcadestr_core::install_contract::InstallCommandError;
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 use wasm_bindgen_futures::spawn_local;
@@ -15,32 +16,34 @@ use crate::tauri_bridge::{
     invoke_add_game_to_library, invoke_claim_entitlement, invoke_confirm_purchase,
     invoke_connect_nwc_wallet, invoke_discover_campaigns, invoke_enrich_store_page_detail,
     invoke_get_installed_games, invoke_get_listing_ownership, invoke_get_platform_info,
-    invoke_install_game, invoke_is_game_in_library, invoke_pay_nwc_invoice,
-    invoke_request_lnurl_invoice, listen_download_complete, listen_download_progress,
+    invoke_install_game, invoke_is_game_in_library, invoke_list_retained_packages,
+    invoke_pay_nwc_invoice, invoke_request_lnurl_invoice, listen_install_progress,
 };
 use crate::tauri_bridge::{
     CampaignPointerInput, ClaimEntitlementRequest, ConfirmPurchaseRequest, ConnectNwcWalletRequest,
-    DiscoverCampaignsRequest, DiscoveredCampaign, DownloadProgressPayload, PayNwcInvoiceRequest,
-    RequestLnurlInvoiceRequest,
+    DiscoverCampaignsRequest, DiscoveredCampaign, InstallProgressPayload, InstallProgressPhase,
+    InstalledGame, PayNwcInvoiceRequest, RequestLnurlInvoiceRequest,
 };
 use crate::ui_v2::components::{
     artwork_state_from_url, ArtworkRole, Dialog, DialogCloseAction, DialogCloseButtonPolicy,
     DialogClosePolicy, DialogCloseRequest, DialogDismissal, DialogSourcePolicy, DialogWidth,
-    GameArtwork, StatusChip, StatusChipSize, StatusChipVariant, StorePageRichDetail,
+    GameArtwork, InstallationLauncher, StatusChip, StatusChipSize, StatusChipVariant,
+    StorePageRichDetail,
 };
 use crate::ui_v2::views::browse_games::listing_categories;
 use crate::ui_v2::views::use_fallback_cover;
 use crate::{invoke_fetch_profile, AuthContext};
 
-type DownloadCompleteCleanup = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
-type DownloadProgressCleanup = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+type InstallProgressCleanup = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum InstallFlowState {
     Preparing,
     Downloading { bytes: u64, total: Option<u64> },
-    Finalizing,
-    Completed,
+    Verifying,
+    Installing,
+    Completing,
+    Installed,
     Failed(InstallFailurePresentation),
 }
 
@@ -70,10 +73,12 @@ impl InstallFlowState {
     /// Overline shown above the dialog title.
     fn kicker(&self) -> &'static str {
         match self {
-            Self::Preparing | Self::Downloading { .. } => "Verified download",
-            Self::Finalizing => "Integrity check",
-            Self::Completed => "Complete",
-            Self::Failed(_) => "Download failed",
+            Self::Preparing => "Install preparation",
+            Self::Downloading { .. } => "Package download",
+            Self::Verifying => "Integrity check",
+            Self::Installing | Self::Completing => "Local installation",
+            Self::Installed => "Installation complete",
+            Self::Failed(_) => "Installation failed",
         }
     }
 
@@ -81,24 +86,27 @@ impl InstallFlowState {
         match self {
             Self::Preparing => "Preparing download",
             Self::Downloading { .. } => "Downloading artifact",
-            Self::Finalizing => "Verifying and registering",
-            Self::Completed => "Artifact verified and registered",
+            Self::Verifying => "Verifying package integrity",
+            Self::Installing => "Installing game",
+            Self::Completing => "Completing installation",
+            Self::Installed => "Game installed",
             Self::Failed(failure) => failure.title,
         }
     }
 }
 
-fn install_flow_from_progress(payload: &DownloadProgressPayload) -> InstallFlowState {
-    if payload
-        .total
-        .is_some_and(|total| total > 0 && payload.bytes >= total)
-    {
-        InstallFlowState::Finalizing
-    } else {
-        InstallFlowState::Downloading {
+fn install_flow_from_progress(payload: &InstallProgressPayload) -> InstallFlowState {
+    match payload.phase {
+        InstallProgressPhase::Preparing => InstallFlowState::Preparing,
+        InstallProgressPhase::Downloading => InstallFlowState::Downloading {
             bytes: payload.bytes,
             total: payload.total,
-        }
+        },
+        InstallProgressPhase::Verifying => InstallFlowState::Verifying,
+        InstallProgressPhase::Installing => InstallFlowState::Installing,
+        // The command result, not this advisory event, authoritatively marks
+        // the game installed and refreshes device state.
+        InstallProgressPhase::Complete => InstallFlowState::Completing,
     }
 }
 
@@ -123,16 +131,50 @@ fn format_download_bytes(bytes: u64) -> String {
     }
 }
 
+fn install_command_failure_presentation(error: &InstallCommandError) -> InstallFailurePresentation {
+    match error {
+        InstallCommandError::CompressionRatioExceeded => InstallFailurePresentation {
+            title: "Package rejected for safety",
+            message: "The package was rejected because its decompression ratio exceeds safety limits. It was not installed.",
+            retryable: false,
+        },
+        InstallCommandError::Other { message } => install_failure_presentation(message),
+    }
+}
+
 fn install_failure_presentation(error: &str) -> InstallFailurePresentation {
     let normalized = error.to_lowercase();
-    if normalized.contains("hash")
+    if normalized.starts_with("archive_policy:") {
+        InstallFailurePresentation {
+            title: "Package exceeds safety limits",
+            message: "The package was rejected because it exceeds archive safety or size limits. It was not installed. Contact the publisher for a compatible package.",
+            retryable: false,
+        }
+    } else if normalized.contains("insufficient_storage")
+        || normalized.contains("insufficient storage")
+        || normalized.contains("no space left")
+    {
+        InstallFailurePresentation {
+            title: "Not enough storage",
+            message: "Free device storage, then retry the installation. No successful installation was recorded.",
+            retryable: true,
+        }
+    } else if normalized.contains("too many open files")
+        || normalized.contains("file descriptor limit")
+    {
+        InstallFailurePresentation {
+            title: "Installer resource limit reached",
+            message: "This Arcadestr build ran out of local file handles while unpacking the package. Update Arcadestr before retrying.",
+            retryable: false,
+        }
+    } else if normalized.contains("hash")
         || normalized.contains("integrity")
         || normalized.contains("mismatch")
         || normalized.contains("quarantine")
     {
         InstallFailurePresentation {
             title: "Integrity verification failed",
-            message: "The downloaded artifact was rejected and was not registered as installed.",
+            message: "The downloaded artifact was rejected and is not installed.",
             retryable: true,
         }
     } else if normalized.contains("auth")
@@ -141,8 +183,8 @@ fn install_failure_presentation(error: &str) -> InstallFailurePresentation {
         || normalized.contains("unauthorized")
     {
         InstallFailurePresentation {
-            title: "Download authorization failed",
-            message: "Current access could not be verified. No installation was recorded.",
+            title: "Installation authorization failed",
+            message: "Current access could not be verified, so installation did not begin.",
             retryable: true,
         }
     } else if normalized.contains("platform") || normalized.contains("unsupported") {
@@ -153,9 +195,8 @@ fn install_failure_presentation(error: &str) -> InstallFailurePresentation {
         }
     } else {
         InstallFailurePresentation {
-            title: "Download could not finish",
-            message:
-                "The artifact was not verified or registered. Retry when the source is available.",
+            title: "Installation could not finish",
+            message: "The game was not installed successfully. Retry when the source is available.",
             retryable: true,
         }
     }
@@ -180,7 +221,9 @@ enum PrimaryAction {
     CheckingInstallation,
     Buy,
     Claim,
+    Download,
     Install,
+    PlayGame,
     Installed,
     Incompatible,
     UnsupportedWeb,
@@ -191,6 +234,14 @@ enum PrimaryAction {
     Unavailable,
     LocalStateUnavailable,
     Busy(DetailOperation),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalGameState {
+    Loading,
+    Unavailable,
+    NotInstalled { exact_package_cached: bool },
+    Installed { launchable: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +263,10 @@ fn operation_blocks_dispatch(operation: DetailOperation) -> bool {
     operation != DetailOperation::Idle
 }
 
+fn install_retry_allowed(action: PrimaryAction) -> bool {
+    matches!(action, PrimaryAction::Download | PrimaryAction::Install)
+}
+
 fn account_response_is_current(active_account: Option<&str>, initiating_account: &str) -> bool {
     active_account == Some(initiating_account)
 }
@@ -226,10 +281,8 @@ fn active_campaign(campaigns: &[DiscoveredCampaign]) -> Option<DiscoveredCampaig
 fn select_primary_action(
     listing: &GameListing,
     owned: bool,
-    installed: bool,
+    local_state: LocalGameState,
     ownership_loading: bool,
-    installation_loading: bool,
-    installation_error: bool,
     campaigns: &[DiscoveredCampaign],
     campaign_pending: bool,
     compatibility: DetailCompatibility,
@@ -246,7 +299,7 @@ fn select_primary_action(
             DetailOperation::ConfirmingPurchase => "Recording ownership...",
             DetailOperation::Claiming => "Claiming access...",
             DetailOperation::AddingToLibrary => "Adding to library...",
-            DetailOperation::Installing => "Preparing download...",
+            DetailOperation::Installing => "Preparing installation...",
             DetailOperation::Idle => "Working...",
         };
         return PrimaryActionDecision {
@@ -256,35 +309,44 @@ fn select_primary_action(
             enabled: false,
         };
     }
+    if let LocalGameState::Installed { launchable } = local_state {
+        return if launchable {
+            PrimaryActionDecision {
+                action: PrimaryAction::PlayGame,
+                label: "Play Game",
+                explanation: "Launch the installed game on this device.",
+                enabled: true,
+            }
+        } else {
+            PrimaryActionDecision {
+                action: PrimaryAction::Installed,
+                label: "Installed, unavailable",
+                explanation: "No installed game launch profile is available on this device.",
+                enabled: false,
+            }
+        };
+    }
+    if local_state == LocalGameState::Loading {
+        return PrimaryActionDecision {
+            action: PrimaryAction::CheckingInstallation,
+            label: "Checking this device...",
+            explanation: "Reading local package and installation state.",
+            enabled: false,
+        };
+    }
+    if local_state == LocalGameState::Unavailable {
+        return PrimaryActionDecision {
+            action: PrimaryAction::LocalStateUnavailable,
+            label: "Installation status unavailable",
+            explanation: "Retry the local device-state lookup before continuing.",
+            enabled: false,
+        };
+    }
     if ownership_loading {
         return PrimaryActionDecision {
             action: PrimaryAction::CheckingOwnership,
             label: "Checking ownership...",
             explanation: "Checking durable access for the active account.",
-            enabled: false,
-        };
-    }
-    if installed {
-        return PrimaryActionDecision {
-            action: PrimaryAction::Installed,
-            label: "Installed",
-            explanation: "The game is installed on this device.",
-            enabled: false,
-        };
-    }
-    if installation_loading {
-        return PrimaryActionDecision {
-            action: PrimaryAction::CheckingInstallation,
-            label: "Checking this device...",
-            explanation: "Reading the local installation registry before enabling a download.",
-            enabled: false,
-        };
-    }
-    if installation_error {
-        return PrimaryActionDecision {
-            action: PrimaryAction::LocalStateUnavailable,
-            label: "Installation status unavailable",
-            explanation: "Retry the local registry lookup before downloading this artifact.",
             enabled: false,
         };
     }
@@ -334,20 +396,31 @@ fn select_primary_action(
         };
     }
 
-    let desired = if owned {
+    let exact_package_cached = matches!(
+        local_state,
+        LocalGameState::NotInstalled {
+            exact_package_cached: true
+        }
+    );
+    let acquisition_action = if exact_package_cached {
         PrimaryAction::Install
+    } else {
+        PrimaryAction::Download
+    };
+    let desired = if owned {
+        acquisition_action
     } else if active_campaign(campaigns).is_some() {
         PrimaryAction::Claim
     } else {
         match listing.acquisition {
-            AcquisitionPolicy::Public => PrimaryAction::Install,
+            AcquisitionPolicy::Public => acquisition_action,
             AcquisitionPolicy::TimedAccess { starts_at, .. } if now < starts_at => {
                 PrimaryAction::TimedUpcoming
             }
             AcquisitionPolicy::TimedAccess { ends_at, .. } if now >= ends_at => {
                 PrimaryAction::TimedExpired
             }
-            AcquisitionPolicy::TimedAccess { .. } => PrimaryAction::Install,
+            AcquisitionPolicy::TimedAccess { .. } => acquisition_action,
             AcquisitionPolicy::Gated
                 if listing.price_sats > 0 && listing.lud16.trim().is_empty() =>
             {
@@ -361,7 +434,10 @@ fn select_primary_action(
     if !authenticated
         && matches!(
             desired,
-            PrimaryAction::Buy | PrimaryAction::Claim | PrimaryAction::Install
+            PrimaryAction::Buy
+                | PrimaryAction::Claim
+                | PrimaryAction::Download
+                | PrimaryAction::Install
         )
     {
         return PrimaryActionDecision {
@@ -386,18 +462,26 @@ fn select_primary_action(
                 "Claim during the active promotion to add permanent access to this account.",
             enabled: true,
         },
-        PrimaryAction::Install => PrimaryActionDecision {
+        PrimaryAction::Download | PrimaryAction::Install => PrimaryActionDecision {
             action: desired,
             label: if matches!(listing.acquisition, AcquisitionPolicy::TimedAccess { .. }) && !owned
             {
-                "Download while available"
-            } else {
+                if desired == PrimaryAction::Download {
+                    "Download while available"
+                } else {
+                    "Install while available"
+                }
+            } else if desired == PrimaryAction::Download {
                 "Download"
+            } else {
+                "Install"
             },
-            explanation: if matches!(listing.acquisition, AcquisitionPolicy::Public) {
-                "Downloads, verifies, and registers the current artifact on this device."
+            explanation: if desired == PrimaryAction::Install {
+                "Verifies and installs the package already downloaded on this device."
+            } else if matches!(listing.acquisition, AcquisitionPolicy::Public) {
+                "Downloads, verifies, and installs the current package on this device."
             } else if owned {
-                "Ownership is confirmed before the artifact is downloaded and verified."
+                "Ownership is confirmed before the package is downloaded, verified, and installed."
             } else {
                 "Access depends on the listing's current public or timed policy."
             },
@@ -544,9 +628,17 @@ fn listing_compatibility(
     platform: Option<&PlatformInfo>,
 ) -> DetailCompatibility {
     if listing.platforms.is_empty() {
-        DetailCompatibility::Compatible
+        DetailCompatibility::Unknown
     } else if let Some(platform) = platform {
-        if listing.platforms.iter().any(|tag| tag == &platform.tag()) {
+        let host = arcadestr_core::distribution::PlatformTarget {
+            os: arcadestr_core::distribution::normalize_os(&platform.os)
+                .unwrap_or_else(|| platform.os.clone()),
+            arch: arcadestr_core::distribution::normalize_arch(&platform.arch)
+                .unwrap_or_else(|| platform.arch.clone()),
+        };
+        if listing.platforms.iter().any(|tag| {
+            arcadestr_core::distribution::parse_platform_tag(tag).as_ref() == Some(&host)
+        }) {
             DetailCompatibility::Compatible
         } else {
             DetailCompatibility::Incompatible
@@ -715,9 +807,14 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let library_added: RwSignal<bool> = RwSignal::new(false);
     let library_loading: RwSignal<bool> = RwSignal::new(!cfg!(feature = "web"));
     let install_complete: RwSignal<bool> = RwSignal::new(false);
+    let installation_launchable: RwSignal<Option<bool>> = RwSignal::new(None);
+    let installed_game = RwSignal::new(None::<InstalledGame>);
     let install_state_loading: RwSignal<bool> = RwSignal::new(!cfg!(feature = "web"));
     let install_state_error = RwSignal::new(false);
     let install_state_refresh = RwSignal::new(0_u64);
+    let exact_package_cached = RwSignal::new(false);
+    let retained_state_loading: RwSignal<bool> = RwSignal::new(!cfg!(feature = "web"));
+    let retained_state_error = RwSignal::new(false);
     let operation = RwSignal::new(DetailOperation::Idle);
     let install_flow = RwSignal::new(None::<InstallFlowState>);
     let install_attempt_active = RwSignal::new(false);
@@ -938,18 +1035,57 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     return;
                 }
                 match result {
-                    Ok(installed_games) => install_complete.set(
-                        installed_games
-                            .iter()
-                            .any(|game| game.game_coordinate == coordinate),
-                    ),
-                    Err(_) => install_state_error.set(true),
+                    Ok(installed_games) => {
+                        let installed = installed_games
+                            .into_iter()
+                            .find(|game| game.game_coordinate == coordinate);
+                        install_complete.set(installed.is_some());
+                        installation_launchable.set(installed.as_ref().map(|game| game.launchable));
+                        installed_game.set(installed);
+                    }
+                    Err(_) => {
+                        installed_game.set(None);
+                        installation_launchable.set(None);
+                        install_state_error.set(true);
+                    }
                 }
                 install_state_loading.set(false);
             });
         });
     } else {
         install_state_loading.set(false);
+    }
+
+    if let Some(coordinate) = install_game_coordinate.clone() {
+        let listing_event_id = listing.event_id.clone();
+        Effect::new(move |_| {
+            let requested_refresh = install_state_refresh.get();
+            let coordinate = coordinate.clone();
+            let listing_event_id = listing_event_id.clone();
+            retained_state_loading.set(true);
+            retained_state_error.set(false);
+            spawn_local(async move {
+                let result = invoke_list_retained_packages().await;
+                if install_state_refresh.get_untracked() != requested_refresh {
+                    return;
+                }
+                match result {
+                    Ok(packages) => exact_package_cached.set(packages.iter().any(|package| {
+                        package.game_coordinate == coordinate
+                            && listing_event_id.as_deref().is_some_and(|event_id| {
+                                package.listing_event_id.as_deref() == Some(event_id)
+                            })
+                    })),
+                    Err(_) => {
+                        exact_package_cached.set(false);
+                        retained_state_error.set(true);
+                    }
+                }
+                retained_state_loading.set(false);
+            });
+        });
+    } else {
+        retained_state_loading.set(false);
     }
 
     let on_buy = {
@@ -1215,8 +1351,8 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 if matches!(listing.acquisition, AcquisitionPolicy::Public) {
                     let Some(coordinate) = coordinate else {
                         let failure = InstallFailurePresentation {
-                            title: "Download unavailable",
-                            message: "The signed listing coordinate is invalid, so no artifact was downloaded.",
+                            title: "Installation unavailable",
+                            message: "The signed listing coordinate is invalid, so the game cannot be installed.",
                             retryable: false,
                         };
                         buy_error.set(Some(failure.message.to_string()));
@@ -1225,7 +1361,21 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                         operation.set(DetailOperation::Idle);
                         return;
                     };
-                    if let Err(error) = invoke_add_game_to_library(coordinate).await {
+                    let Some(expected_buyer_npub) = initiating_account.clone() else {
+                        let failure = InstallFailurePresentation {
+                            title: "Sign in required",
+                            message: "Sign in before adding this public game to your Library.",
+                            retryable: true,
+                        };
+                        buy_error.set(Some(failure.message.to_string()));
+                        install_flow.set(Some(InstallFlowState::Failed(failure)));
+                        install_attempt_active.set(false);
+                        operation.set(DetailOperation::Idle);
+                        return;
+                    };
+                    if let Err(error) =
+                        invoke_add_game_to_library(coordinate, expected_buyer_npub).await
+                    {
                         let failure = install_failure_presentation(&error);
                         buy_error.set(Some(failure.message.to_string()));
                         install_flow.set(Some(InstallFlowState::Failed(failure)));
@@ -1243,33 +1393,38 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 }
                 match invoke_install_game(&listing).await {
                     Ok(()) => {
+                        // The completed command is authoritative. The progress
+                        // listener only describes intermediate presentation.
                         install_complete.set(true);
+                        installation_launchable.set(None);
                         install_state_error.set(false);
                         install_state_loading.set(false);
-                        if auth_for_response.npub.get_untracked() != initiating_account {
-                            return;
-                        }
-                        if !install_attempt_active.get_untracked() {
-                            return;
-                        }
+                        install_state_refresh
+                            .update(|generation| *generation = generation.wrapping_add(1));
                         install_attempt_active.set(false);
-                        install_flow.set(Some(InstallFlowState::Completed));
-                        success_message.set(Some(
-                            "Artifact verified and registered on this device.".to_string(),
-                        ));
                         operation.set(DetailOperation::Idle);
+                        if auth_for_response.npub.get_untracked() != initiating_account {
+                            install_flow.set(None);
+                            return;
+                        }
+                        install_flow.set(Some(InstallFlowState::Installed));
+                        success_message.set(Some("Game installed on this device.".to_string()));
                     }
                     Err(err) => {
-                        if !install_attempt_active.get_untracked()
+                        let attempt_was_active = install_attempt_active.get_untracked();
+                        install_attempt_active.set(false);
+                        operation.set(DetailOperation::Idle);
+                        install_state_refresh
+                            .update(|generation| *generation = generation.wrapping_add(1));
+                        if !attempt_was_active
                             || auth_for_response.npub.get_untracked() != initiating_account
                         {
+                            install_flow.set(None);
                             return;
                         }
-                        let failure = install_failure_presentation(&err);
-                        install_attempt_active.set(false);
+                        let failure = install_command_failure_presentation(&err);
                         install_flow.set(Some(InstallFlowState::Failed(failure.clone())));
                         buy_error.set(Some(failure.message.to_string()));
-                        operation.set(DetailOperation::Idle);
                     }
                 }
             });
@@ -1294,7 +1449,14 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             success_message.set(None);
             let auth_for_response = add_auth.clone();
             spawn_local(async move {
-                let result = invoke_add_game_to_library(coordinate).await;
+                let Some(expected_buyer_npub) = initiating_account.clone() else {
+                    buy_error.set(Some(
+                        "Sign in before adding a game to your Library.".to_string(),
+                    ));
+                    operation.set(DetailOperation::Idle);
+                    return;
+                };
+                let result = invoke_add_game_to_library(coordinate, expected_buyer_npub).await;
                 if auth_for_response.npub.get_untracked() != initiating_account {
                     operation.set(DetailOperation::Idle);
                     return;
@@ -1313,55 +1475,8 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         })
     };
 
-    let expected_install_coordinate = install_game_coordinate.clone();
-    let download_complete_cleanup: DownloadCompleteCleanup = Rc::new(RefCell::new(None));
-    let download_complete_disposed = Rc::new(RefCell::new(false));
-    let download_complete_registration_started = Rc::new(RefCell::new(false));
-    let download_complete_cleanup_for_effect = Rc::clone(&download_complete_cleanup);
-    let download_complete_disposed_for_effect = Rc::clone(&download_complete_disposed);
-    let download_complete_registration_started_for_effect =
-        Rc::clone(&download_complete_registration_started);
-    Effect::new(move |_| {
-        if *download_complete_registration_started_for_effect.borrow() {
-            return;
-        }
-        *download_complete_registration_started_for_effect.borrow_mut() = true;
-
-        let expected_install_coordinate = expected_install_coordinate.clone();
-        let cleanup_handle = Rc::clone(&download_complete_cleanup_for_effect);
-        let disposed = Rc::clone(&download_complete_disposed_for_effect);
-        spawn_local(async move {
-            if let Ok(listener) = listen_download_complete(move |payload| {
-                if expected_install_coordinate.as_deref() == Some(payload.game_coordinate.as_str())
-                    && install_attempt_active.get_untracked()
-                {
-                    install_flow.set(Some(InstallFlowState::Finalizing));
-                }
-            })
-            .await
-            {
-                if *disposed.borrow() {
-                    listener();
-                } else {
-                    *cleanup_handle.borrow_mut() = Some(listener);
-                }
-            }
-        });
-    });
-
-    let download_complete_cleanup_for_teardown =
-        SendWrapper::new(Rc::clone(&download_complete_cleanup));
-    let download_complete_disposed_for_teardown =
-        SendWrapper::new(Rc::clone(&download_complete_disposed));
-    on_cleanup(move || {
-        *download_complete_disposed_for_teardown.borrow_mut() = true;
-        if let Some(cleanup) = download_complete_cleanup_for_teardown.borrow_mut().take() {
-            cleanup();
-        }
-    });
-
     let expected_progress_coordinate = install_game_coordinate.clone();
-    let download_progress_cleanup: DownloadProgressCleanup = Rc::new(RefCell::new(None));
+    let download_progress_cleanup: InstallProgressCleanup = Rc::new(RefCell::new(None));
     let download_progress_disposed = Rc::new(RefCell::new(false));
     let download_progress_registration_started = Rc::new(RefCell::new(false));
     let download_progress_cleanup_for_effect = Rc::clone(&download_progress_cleanup);
@@ -1378,7 +1493,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         let cleanup_handle = Rc::clone(&download_progress_cleanup_for_effect);
         let disposed = Rc::clone(&download_progress_disposed_for_effect);
         spawn_local(async move {
-            if let Ok(listener) = listen_download_progress(move |payload| {
+            if let Ok(listener) = listen_install_progress(move |payload| {
                 if expected_coordinate.as_deref() == Some(payload.game_coordinate.as_str())
                     && install_attempt_active.get_untracked()
                 {
@@ -1525,7 +1640,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         let decision_auth = decision_auth.clone();
         move || {
             let discovered = campaigns.get();
-            if listing_validation_error.get() {
+            if listing_validation_error.get() && installed_game.get().is_none() {
                 return PrimaryActionDecision {
                     action: PrimaryAction::Unavailable,
                     label: "Listing validation unavailable",
@@ -1533,13 +1648,24 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     enabled: false,
                 };
             }
+            let local_state = if let Some(installed) = installed_game.get() {
+                LocalGameState::Installed {
+                    launchable: installed.launchable,
+                }
+            } else if install_state_loading.get() || retained_state_loading.get() {
+                LocalGameState::Loading
+            } else if install_state_error.get() || retained_state_error.get() {
+                LocalGameState::Unavailable
+            } else {
+                LocalGameState::NotInstalled {
+                    exact_package_cached: exact_package_cached.get(),
+                }
+            };
             select_primary_action(
                 &listing,
                 purchase_confirmed.get(),
-                install_complete.get(),
+                local_state,
                 ownership_loading.get() || listing_validation_loading.get(),
-                install_state_loading.get(),
-                install_state_error.get(),
                 &discovered,
                 campaign_loading.get() || campaign_error.get().is_some(),
                 listing_compatibility(&listing, platform_info.get().as_ref()),
@@ -1556,7 +1682,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         let on_download = on_download.clone();
         Callback::new(move |()| match decision().action {
             PrimaryAction::Buy => on_buy.run(()),
-            PrimaryAction::Install => on_download.run(()),
+            PrimaryAction::Download | PrimaryAction::Install => on_download.run(()),
             PrimaryAction::Claim => {
                 let discovered = campaigns.get_untracked();
                 pending_claim.set(active_campaign(&discovered));
@@ -1564,6 +1690,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             PrimaryAction::CheckingOwnership
             | PrimaryAction::CheckingInstallation
             | PrimaryAction::Busy(_)
+            | PrimaryAction::PlayGame
             | PrimaryAction::Installed
             | PrimaryAction::Incompatible
             | PrimaryAction::UnsupportedWeb
@@ -1580,6 +1707,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let decision_for_label = primary_decision.clone();
     let decision_for_disabled = primary_decision.clone();
     let decision_for_explanation = primary_decision.clone();
+    let primary_label = Signal::derive(move || decision_for_label().label);
+    let primary_enabled = Signal::derive(move || decision_for_disabled().enabled);
+    let primary_explanation = Signal::derive(move || decision_for_explanation().explanation);
     let unowned_access_label = match &listing.acquisition {
         AcquisitionPolicy::Public => "Public access".to_string(),
         AcquisitionPolicy::TimedAccess { .. } => "Timed access".to_string(),
@@ -1799,7 +1929,11 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                             size=StatusChipSize::Standard
                         />
                         {move || if install_complete.get() {
-                            view! { <StatusChip label="Installed" variant=StatusChipVariant::Installed icon=Some("download_done") size=StatusChipSize::Compact /> }.into_any()
+                            if installation_launchable.get() == Some(false) {
+                                view! { <StatusChip label="Installed, not launchable" variant=StatusChipVariant::Warning icon=Some("warning") size=StatusChipSize::Compact /> }.into_any()
+                            } else {
+                                view! { <StatusChip label="Installed" variant=StatusChipVariant::Installed icon=Some("download_done") size=StatusChipSize::Compact /> }.into_any()
+                            }
                         } else if purchase_confirmed.get() {
                             view! { <StatusChip label="Owned" variant=StatusChipVariant::Owned icon=Some("verified_user") size=StatusChipSize::Compact /> }.into_any()
                         } else if active_campaign(&campaigns.get()).is_some() {
@@ -1808,17 +1942,31 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                             view! { <></> }.into_any()
                         }}
                     </div>
-                    <p class="v2-detail-access-note">{move || decision_for_explanation().explanation}</p>
-                    <button
-                        class="v2-btn-primary"
-                        on:click=move |_| on_primary.run(())
-                        disabled=move || !decision_for_disabled().enabled
+                    <Show when=move || install_complete.get() && installation_launchable.get() == Some(false)>
+                        <p class="v2-detail-access-note" role="status">"No recorded launch profile resolves to this installation. The verified files remain installed and can be uninstalled or reinstalled from Library."</p>
+                    </Show>
+                    <p class="v2-detail-access-note">{move || primary_explanation.get()}</p>
+                    <Show
+                        when=move || installed_game.get().is_some_and(|game| game.launchable)
+                        fallback=move || view! {
+                            <button
+                                class="v2-btn-primary"
+                                on:click=move |_| on_primary.run(())
+                                disabled=move || !primary_enabled.get()
+                            >
+                                {move || primary_label.get()}
+                            </button>
+                        }
                     >
-                        {move || decision_for_label().label}
-                    </button>
-                    <Show when=move || install_state_error.get()>
-                        <button class="v2-btn-secondary" disabled=move || install_state_loading.get() on:click=move |_| install_state_refresh.update(|generation| *generation = generation.wrapping_add(1))>
-                            {move || if install_state_loading.get() { "Checking..." } else { "Retry device status" }}
+                        {move || installed_game.get().map(|installed| view! {
+                            <InstallationLauncher
+                                installation_id=installed.installation_id
+                            />
+                        })}
+                    </Show>
+                    <Show when=move || install_state_error.get() || retained_state_error.get()>
+                        <button class="v2-btn-secondary" disabled=move || install_state_loading.get() || retained_state_loading.get() on:click=move |_| install_state_refresh.update(|generation| *generation = generation.wrapping_add(1))>
+                            {move || if install_state_loading.get() || retained_state_loading.get() { "Checking..." } else { "Retry device status" }}
                         </button>
                     </Show>
                     <Show when=move || listing_validation_error.get()>
@@ -1953,7 +2101,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 policy=install_close_contract().0
                 dismissal=install_close_contract().1
                 busy=Signal::derive(move || install_attempt_active.get())
-                close_label="Close download status"
+                close_label="Close installation status"
                 close_blocked_hint="Cancellation is unavailable in the current installer, so this window stays open until the active operation finishes."
                 on_close=UnsyncCallback::new(move |request: DialogCloseRequest| {
                     // While an attempt is active this resolves to Ignore, so
@@ -1968,16 +2116,17 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     move || view! {
                         {move || install_flow.get().map(|flow| {
                             let retry_primary = retry_primary.get_value();
-                            let retry_allowed =
-                                (decision_for_retry.get_value())().action == PrimaryAction::Install;
+                            let retry_allowed = install_retry_allowed(
+                                (decision_for_retry.get_value())().action,
+                            );
                             match flow {
-                                InstallFlowState::Completed => view! {
+                                InstallFlowState::Installed => view! {
                                     <button class="v2-btn-primary" on:click=move |_| install_flow.set(None)>"Close"</button>
                                 }.into_any(),
                                 InstallFlowState::Failed(failure) => view! {
                                     // Retry and close stay distinct actions.
                                     {(failure.retryable && retry_allowed).then(|| view! {
-                                        <button class="v2-btn-primary" disabled=move || operation_blocks_dispatch(operation.get()) on:click=move |_| retry_primary.run(())>"Retry download"</button>
+                                        <button class="v2-btn-primary" disabled=move || operation_blocks_dispatch(operation.get()) on:click=move |_| retry_primary.run(())>"Retry installation"</button>
                                     })}
                                     <button class="v2-btn-secondary" disabled=move || operation_blocks_dispatch(operation.get()) on:click=move |_| install_flow.set(None)>"Close"</button>
                                 }.into_any(),
@@ -1991,7 +2140,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     match flow {
                         InstallFlowState::Preparing => view! {
                             <p>"Resolving current access and the signed artifact source."</p>
-                            <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Preparing download"></div>
+                            <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Preparing installation"></div>
                             <p class="arc-dialog-note">"This window stays open while the active operation is running."</p>
                         }.into_any(),
                         InstallFlowState::Downloading { bytes, total } => {
@@ -2015,13 +2164,22 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                 <p class="arc-dialog-note">"Cancellation is unavailable in the current installer."</p>
                             }.into_any()
                         }
-                        InstallFlowState::Finalizing => view! {
-                            <p>"The download finished. Arcadestr is verifying the exact artifact hash before recording it on this device."</p>
+                        InstallFlowState::Verifying => view! {
+                            <p>"The download finished. Arcadestr is verifying the exact package hash."</p>
                             <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Verifying artifact integrity"></div>
-                            <p class="arc-dialog-note">"The artifact is not marked installed until verification and registry persistence finish."</p>
+                            <p class="arc-dialog-note">"Installation begins only after integrity verification succeeds."</p>
                         }.into_any(),
-                        InstallFlowState::Completed => view! {
-                            <p role="status">"The local artifact is recorded on this device. Arcadestr does not yet launch or extract game packages."</p>
+                        InstallFlowState::Installing => view! {
+                            <p>"The verified package is being extracted into Arcadestr's managed installation directory."</p>
+                            <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Installing game"></div>
+                            <p class="arc-dialog-note">"Cancellation is unavailable while installation is active."</p>
+                        }.into_any(),
+                        InstallFlowState::Completing => view! {
+                            <p>"The installer reported completion. Arcadestr is waiting for the command result and local registry commit."</p>
+                            <div class="v2-install-progress v2-install-progress-indeterminate" role="progressbar" aria-label="Completing installation"></div>
+                        }.into_any(),
+                        InstallFlowState::Installed => view! {
+                            <p role="status">"The game is installed and recorded on this device."</p>
                         }.into_any(),
                         InstallFlowState::Failed(failure) => view! {
                             <p role="alert">{failure.message}</p>
@@ -2089,7 +2247,7 @@ mod tests {
     #[test]
     fn retry_and_close_remain_distinct_install_actions() {
         let source = include_str!("game_detail.rs");
-        assert!(source.contains(r#">"Retry download"</button>"#));
+        assert!(source.contains(r#">"Retry installation"</button>"#));
         assert!(source.contains(r#">"Close"</button>"#));
     }
 
@@ -2123,6 +2281,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn installation_compatibility_requires_a_normalized_platform_claim() {
+        let mut value = listing(AcquisitionPolicy::Public);
+        let windows = PlatformInfo {
+            os: "windows".to_string(),
+            arch: "amd64".to_string(),
+        };
+        assert_eq!(
+            listing_compatibility(&value, Some(&windows)),
+            DetailCompatibility::Unknown
+        );
+        value.platforms = vec!["WIN64-X64".to_string()];
+        assert_eq!(
+            listing_compatibility(&value, Some(&windows)),
+            DetailCompatibility::Compatible
+        );
+    }
+
     fn campaign(classification: &str) -> DiscoveredCampaign {
         DiscoveredCampaign {
             root_event_id: "root".to_string(),
@@ -2150,9 +2326,13 @@ mod tests {
         select_primary_action(
             listing,
             owned,
-            installed,
-            false,
-            false,
+            if installed {
+                LocalGameState::Installed { launchable: true }
+            } else {
+                LocalGameState::NotInstalled {
+                    exact_package_cached: false,
+                }
+            },
             false,
             campaigns,
             campaign_loading,
@@ -2223,7 +2403,7 @@ mod tests {
                 100,
             )
             .action,
-            PrimaryAction::Install
+            PrimaryAction::Download
         );
     }
 
@@ -2289,13 +2469,13 @@ mod tests {
         };
 
         assert_eq!(action_at(99), PrimaryAction::TimedUpcoming);
-        assert_eq!(action_at(100), PrimaryAction::Install);
-        assert_eq!(action_at(199), PrimaryAction::Install);
+        assert_eq!(action_at(100), PrimaryAction::Download);
+        assert_eq!(action_at(199), PrimaryAction::Download);
         assert_eq!(action_at(200), PrimaryAction::TimedExpired);
     }
 
     #[test]
-    fn install_and_compatibility_states_block_other_actions() {
+    fn installed_game_precedes_compatibility_and_launches() {
         let listing = listing(AcquisitionPolicy::Public);
         assert_eq!(
             decision(
@@ -2310,7 +2490,7 @@ mod tests {
                 100,
             )
             .action,
-            PrimaryAction::Installed
+            PrimaryAction::PlayGame
         );
         assert_eq!(
             decision(
@@ -2431,9 +2611,9 @@ mod tests {
         let result = select_primary_action(
             &listing,
             false,
-            false,
-            false,
-            false,
+            LocalGameState::NotInstalled {
+                exact_package_cached: false,
+            },
             false,
             &[],
             false,
@@ -2454,9 +2634,7 @@ mod tests {
         let loading = select_primary_action(
             &listing,
             false,
-            false,
-            false,
-            true,
+            LocalGameState::Loading,
             false,
             &[],
             false,
@@ -2472,10 +2650,8 @@ mod tests {
         let failed = select_primary_action(
             &listing,
             false,
+            LocalGameState::Unavailable,
             false,
-            false,
-            false,
-            true,
             &[],
             false,
             DetailCompatibility::Compatible,
@@ -2494,9 +2670,9 @@ mod tests {
         let result = select_primary_action(
             &public,
             false,
-            false,
-            false,
-            false,
+            LocalGameState::NotInstalled {
+                exact_package_cached: false,
+            },
             false,
             &[],
             false,
@@ -2507,8 +2683,28 @@ mod tests {
             100,
         );
 
-        assert_eq!(result.action, PrimaryAction::Install);
+        assert_eq!(result.action, PrimaryAction::Download);
         assert_eq!(result.label, "Download");
+        assert!(install_retry_allowed(result.action));
+        let cached = select_primary_action(
+            &public,
+            false,
+            LocalGameState::NotInstalled {
+                exact_package_cached: true,
+            },
+            false,
+            &[],
+            false,
+            DetailCompatibility::Compatible,
+            DetailOperation::Idle,
+            false,
+            true,
+            100,
+        );
+        assert_eq!(cached.action, PrimaryAction::Install);
+        assert_eq!(cached.label, "Install");
+        assert!(cached.enabled);
+        assert!(install_retry_allowed(cached.action));
         assert!(show_add_to_library(
             &public, true, false, true, false, false, false
         ));
@@ -2532,8 +2728,9 @@ mod tests {
         assert_eq!(download_progress_percent(25, None), None);
         assert_eq!(download_progress_percent(25, Some(0)), None);
 
-        let downloading = install_flow_from_progress(&DownloadProgressPayload {
+        let downloading = install_flow_from_progress(&InstallProgressPayload {
             game_coordinate: "30402:publisher:game".into(),
+            phase: InstallProgressPhase::Downloading,
             bytes: 25,
             total: Some(100),
         });
@@ -2547,14 +2744,31 @@ mod tests {
     }
 
     #[test]
-    fn completed_download_waits_for_integrity_and_registry_completion() {
-        let phase = install_flow_from_progress(&DownloadProgressPayload {
+    fn install_progress_maps_every_authoritative_phase_without_faking_completion() {
+        let verifying = install_flow_from_progress(&InstallProgressPayload {
             game_coordinate: "30402:publisher:game".into(),
+            phase: InstallProgressPhase::Verifying,
             bytes: 100,
             total: Some(100),
         });
-        assert_eq!(phase, InstallFlowState::Finalizing);
-        assert_ne!(phase, InstallFlowState::Completed);
+        assert_eq!(verifying, InstallFlowState::Verifying);
+
+        let installing = install_flow_from_progress(&InstallProgressPayload {
+            game_coordinate: "30402:publisher:game".into(),
+            phase: InstallProgressPhase::Installing,
+            bytes: 100,
+            total: Some(100),
+        });
+        assert_eq!(installing, InstallFlowState::Installing);
+
+        let complete_event = install_flow_from_progress(&InstallProgressPayload {
+            game_coordinate: "30402:publisher:game".into(),
+            phase: InstallProgressPhase::Complete,
+            bytes: 100,
+            total: Some(100),
+        });
+        assert_eq!(complete_event, InstallFlowState::Completing);
+        assert_ne!(complete_event, InstallFlowState::Installed);
     }
 
     #[test]
@@ -2567,12 +2781,61 @@ mod tests {
         assert!(!integrity.message.contains("/private/"));
 
         let auth = install_failure_presentation("ownership authorization rejected");
-        assert_eq!(auth.title, "Download authorization failed");
+        assert_eq!(auth.title, "Installation authorization failed");
         assert!(auth.retryable);
-        assert!(auth.message.contains("No installation was recorded"));
+        assert!(auth.message.contains("installation did not begin"));
+
+        let storage = install_failure_presentation("insufficient_storage: 1024 bytes required");
+        assert_eq!(storage.title, "Not enough storage");
+        assert!(storage.retryable);
+
+        let handles = install_failure_presentation(
+            "I/O error while creating extracted file: Too many open files (os error 24)",
+        );
+        assert_eq!(handles.title, "Installer resource limit reached");
+        assert!(!handles.retryable);
+        assert!(!handles.message.contains("os error"));
 
         let unsupported = install_failure_presentation("unsupported platform");
         assert!(!unsupported.retryable);
+    }
+
+    #[test]
+    fn ratio_install_rejection_survives_typed_transport_to_modal() {
+        let error = InstallCommandError::CompressionRatioExceeded;
+        let value = serde_json::to_value(error).expect("serialize command rejection");
+        assert_eq!(
+            value,
+            serde_json::json!({"code": "compression_ratio_exceeded"})
+        );
+        let error = serde_json::from_value(value).expect("decode command rejection");
+        let failure = install_command_failure_presentation(&error);
+        assert_eq!(failure.title, "Package rejected for safety");
+        assert_eq!(failure.message, "The package was rejected because its decompression ratio exceeds safety limits. It was not installed.");
+        assert!(!failure.retryable);
+        assert_eq!(
+            InstallFlowState::Failed(failure).title(),
+            "Package rejected for safety"
+        );
+
+        let unrelated = InstallCommandError::Other {
+            message: "CompressionRatioExceeded".into(),
+        };
+        assert!(install_command_failure_presentation(&unrelated).retryable);
+    }
+
+    #[test]
+    fn archive_policy_failure_is_not_presented_as_transient() {
+        let failure = install_failure_presentation(
+            "archive_policy: package extraction failed at /private/game.zip: mismatch unsupported auth hash",
+        );
+        assert_eq!(failure.title, "Package exceeds safety limits");
+        assert_eq!(failure.message, "The package was rejected because it exceeds archive safety or size limits. It was not installed. Contact the publisher for a compatible package.");
+        assert!(!failure.retryable);
+
+        let transient = install_failure_presentation("download HTTP request failed: timeout");
+        assert_eq!(transient.title, "Installation could not finish");
+        assert!(transient.retryable);
     }
 
     #[test]

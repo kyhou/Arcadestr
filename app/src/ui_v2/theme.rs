@@ -2501,13 +2501,97 @@ select option:disabled {
 .arc-library-row-action {
   display: flex;
   justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
-.arc-library-row-action .v2-btn-primary {
+.arc-library-row-action :is(.v2-btn-primary, .v2-btn-secondary, .v2-btn-danger) {
   min-width: 96px;
   min-height: 36px;
   padding: 8px 13px;
   white-space: nowrap;
+}
+
+.arc-library-storage-section {
+  display: grid;
+  gap: 10px;
+}
+
+.arc-library-storage-section > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.arc-library-storage-section .v2-store-kicker {
+  margin: 0;
+  color: var(--arc-accent);
+}
+
+.arc-library-storage-icon {
+  width: 56px;
+  height: 56px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--arc-border-subtle);
+  border-radius: var(--arc-radius-sm);
+  background: var(--arc-surface-recessed);
+  color: var(--arc-warning);
+}
+
+.arc-library-storage-row .arc-library-row-copy small {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.arc-library-size-summary {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.arc-library-size-summary > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--arc-separator-recessed);
+  padding-bottom: 8px;
+}
+
+.arc-library-size-summary dt {
+  color: var(--arc-text-muted);
+}
+
+.arc-library-size-summary dd {
+  margin: 0;
+  color: var(--arc-text-heading);
+  font-weight: 700;
+}
+
+.arc-library-retention-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--arc-border-default);
+  padding: 12px;
+  background: var(--arc-surface-recessed);
+  cursor: pointer;
+}
+
+.arc-library-retention-choice input {
+  margin-top: 2px;
+  accent-color: var(--arc-accent);
+}
+
+.arc-library-retention-choice span,
+.arc-library-retention-choice small {
+  display: block;
+}
+
+.arc-library-retention-choice small {
+  margin-top: 4px;
+  color: var(--arc-text-muted);
+  line-height: 1.45;
 }
 
 .arc-library-action-unavailable,
@@ -2557,6 +2641,157 @@ select option:disabled {
   overflow-wrap: anywhere;
 }
 
+.arc-game-properties-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.arc-game-properties-button .material-symbols-outlined {
+  font-size: 17px;
+}
+
+.arc-game-properties {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  min-height: 330px;
+  overflow: hidden;
+  border: 1px solid var(--arc-border-subtle);
+  border-radius: var(--arc-radius-sm);
+  background: var(--arc-surface-recessed);
+}
+
+.arc-game-properties-nav {
+  padding: 12px 0;
+  border-right: 1px solid var(--arc-separator-recessed);
+  background: var(--arc-surface-raised);
+}
+
+.arc-game-properties-nav span {
+  display: block;
+  padding: 11px 16px;
+  border-left: 3px solid var(--arc-accent);
+  background: var(--arc-surface-recessed);
+  color: var(--arc-text-heading);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.arc-game-properties-content {
+  min-width: 0;
+  padding: 20px;
+}
+
+.arc-game-properties-content > section {
+  display: grid;
+  gap: 14px;
+}
+
+.arc-game-properties-content > section + section {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--arc-separator-recessed);
+}
+
+.arc-game-properties-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.arc-game-properties-heading h3,
+.arc-game-properties-heading p {
+  margin: 0;
+}
+
+.arc-game-properties-heading h3 {
+  color: var(--arc-text-heading);
+  font-size: 15px;
+}
+
+.arc-game-properties-heading p {
+  max-width: 480px;
+  margin-top: 6px;
+  color: var(--arc-text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.arc-game-properties-effective {
+  flex: 0 0 auto;
+  max-width: 180px;
+  overflow: hidden;
+  padding: 5px 8px;
+  border: 1px solid var(--arc-border-default);
+  border-radius: 999px;
+  color: var(--arc-text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.arc-game-properties-field {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(190px, 1fr);
+  align-items: center;
+  gap: 16px;
+  padding: 12px;
+  border: 1px solid var(--arc-border-subtle);
+  border-radius: var(--arc-radius-sm);
+  background: var(--arc-surface-raised);
+  color: var(--arc-text-heading);
+  font-size: 12px;
+}
+
+.arc-game-properties-field select {
+  min-width: 0;
+}
+
+.arc-game-properties-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.arc-game-properties-unavailable {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.arc-game-properties-unavailable li {
+  display: grid;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid var(--arc-border-subtle);
+  border-radius: var(--arc-radius-sm);
+  background: var(--arc-surface-raised);
+}
+
+.arc-game-properties-unavailable strong {
+  color: var(--arc-text-heading);
+  font-size: 11px;
+}
+
+.arc-game-properties-unavailable span {
+  color: var(--arc-warning);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.arc-game-properties-status {
+  margin-top: 16px;
+  color: var(--arc-text-muted);
+  font-size: 11px;
+}
+
+.arc-game-properties-status:empty {
+  display: none;
+}
+
 .arc-library-device-note {
   margin: 0;
 }
@@ -2578,6 +2813,41 @@ select option:disabled {
 }
 
 @media (max-width: 700px) {
+  .arc-game-properties {
+    grid-template-columns: 1fr;
+    min-height: 0;
+  }
+
+  .arc-game-properties-nav {
+    padding: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--arc-separator-recessed);
+  }
+
+  .arc-game-properties-nav span {
+    border-left: 0;
+    border-bottom: 3px solid var(--arc-accent);
+  }
+
+  .arc-game-properties-content {
+    padding: 16px;
+  }
+
+  .arc-game-properties-heading,
+  .arc-game-properties-field {
+    grid-template-columns: 1fr;
+  }
+
+  .arc-game-properties-heading {
+    display: grid;
+    gap: 10px;
+  }
+
+  .arc-game-properties-effective {
+    width: fit-content;
+    max-width: 100%;
+  }
+
   .arc-library-toolbar {
     align-items: stretch;
     flex-direction: column;
@@ -2600,6 +2870,10 @@ select option:disabled {
     grid-column: 1 / -1;
     grid-row: auto;
     justify-content: flex-start;
+  }
+
+  .arc-library-row-action :is(.v2-btn-primary, .v2-btn-secondary, .v2-btn-danger) {
+    width: 100%;
   }
 }
 
@@ -10029,6 +10303,103 @@ dialog.v2-confirm-backdrop::backdrop {
     transform: none;
   }
 }
+/* A3.5 launch-tier editor. These classes extend the existing Create surface
+   and deliberately consume only canonical Arcadestr aliases. */
+.v2-create-launch,
+.v2-create-profile-card,
+.v2-create-picker,
+.v2-create-archive-safety,
+.v2-create-defects {
+  display: grid;
+  gap: var(--v2-space-3);
+}
+
+.v2-create-launch {
+  padding-top: var(--v2-space-4);
+  border-top: 1px solid var(--v2-outline-ghost);
+}
+
+.v2-create-launch-mode,
+.v2-create-platform-controls {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: var(--v2-space-2);
+}
+
+.v2-create-platform-controls > label {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.v2-create-profile-card,
+.v2-create-picker,
+.v2-create-archive-safety,
+.v2-create-defects {
+  padding: var(--v2-space-4);
+  border: 1px solid var(--v2-outline-ghost);
+  border-radius: var(--v2-radius-md);
+  background: var(--v2-surface-highest);
+}
+
+.v2-create-picker-results,
+.v2-create-hazard-group,
+.v2-create-warning-group {
+  display: grid;
+  gap: var(--v2-space-2);
+}
+
+.v2-create-picker-option {
+  min-width: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--v2-space-3);
+  padding: var(--v2-space-3);
+  border: 1px solid var(--v2-outline-ghost);
+  border-radius: var(--v2-radius-sm);
+  background: var(--v2-surface);
+  color: var(--v2-on-background);
+  text-align: left;
+  cursor: pointer;
+}
+
+.v2-create-picker-option > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.v2-create-picker-option:hover,
+.v2-create-picker-option:focus-visible {
+  border-color: var(--v2-primary);
+}
+
+.v2-create-picker-root {
+  border-color: var(--v2-primary);
+}
+
+.v2-create-profile-errors,
+.v2-create-defects ul,
+.v2-create-hazard-group ul,
+.v2-create-warning-group ul {
+  margin: 0;
+  padding-left: var(--v2-space-5);
+  color: var(--v2-danger);
+}
+
+.v2-create-warning-group ul {
+  color: var(--v2-warning);
+}
+
+.v2-create-empty {
+  margin: 0;
+  padding: var(--v2-space-4);
+  border: 1px dashed var(--v2-outline);
+  border-radius: var(--v2-radius-sm);
+  color: var(--v2-on-surface-variant);
+}
+
 /* ── Canonical dialog primitive (Phase 12) ──────────────────────────────────
    One geometry and dismissal contract for every production dialog. Feature
    files must not redefine dialog geometry; add a variant here instead. */
