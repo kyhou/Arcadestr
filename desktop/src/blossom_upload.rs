@@ -101,7 +101,7 @@ pub type BlossomProgressCallback = Arc<dyn Fn(BlossomUploadProgress) + Send + Sy
 /// local request was dropped. Blossom does not provide a transactional upload abort operation.
 #[derive(Debug, Error)]
 pub enum BlossomUploadError {
-    #[error("media selection is missing or expired")]
+    #[error("media selection is no longer registered")]
     SelectionUnavailable,
     #[error("media selection belongs to another account")]
     AccountMismatch,
@@ -153,7 +153,6 @@ pub trait BlossomAccountProvider: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct BlossomUploadConfig {
-    pub selection_ttl: Duration,
     pub max_selections: usize,
     pub allow_loopback: bool,
     pub connect_timeout: Duration,
@@ -164,7 +163,6 @@ pub struct BlossomUploadConfig {
 impl Default for BlossomUploadConfig {
     fn default() -> Self {
         Self {
-            selection_ttl: Duration::from_secs(15 * 60),
             max_selections: 32,
             allow_loopback: false,
             connect_timeout: Duration::from_secs(10),
@@ -280,7 +278,6 @@ impl BlossomUploadService {
             .to_owned();
         let now = Instant::now();
         let mut registry = self.registry.lock().map_err(lock_error)?;
-        prune_registry(&mut registry, now, self.config.selection_ttl);
         if self.config.max_selections == 0 {
             return Err(BlossomUploadError::SelectionUnavailable);
         }
@@ -314,13 +311,6 @@ impl BlossomUploadService {
             filename,
             size: metadata.len(),
         })
-    }
-
-    pub fn prune(&self) -> Result<usize, BlossomUploadError> {
-        let mut registry = self.registry.lock().map_err(lock_error)?;
-        let before = registry.entries.len();
-        prune_registry(&mut registry, Instant::now(), self.config.selection_ttl);
-        Ok(before - registry.entries.len())
     }
 
     pub fn cleanup_selection(&self, selection_id: Uuid) -> Result<bool, BlossomUploadError> {
@@ -683,9 +673,7 @@ impl BlossomUploadService {
         selection_id: Uuid,
         publisher: PublicKey,
     ) -> Result<SelectionEntry, BlossomUploadError> {
-        let now = Instant::now();
-        let mut registry = self.registry.lock().map_err(lock_error)?;
-        prune_registry(&mut registry, now, self.config.selection_ttl);
+        let registry = self.registry.lock().map_err(lock_error)?;
         let entry = registry
             .entries
             .get(&selection_id)
@@ -707,12 +695,6 @@ struct UploadStreamState {
     token: CancellationToken,
     streamed_bytes: Arc<AtomicU64>,
     streamed_hasher: Arc<Mutex<Sha256>>,
-}
-
-fn prune_registry(registry: &mut SelectionRegistry, now: Instant, ttl: Duration) {
-    registry
-        .entries
-        .retain(|_, entry| now.saturating_duration_since(entry.created_at) <= ttl);
 }
 
 async fn inspect_entry(
@@ -1724,23 +1706,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blossom_upload_registry_enforces_account_expiry_and_mutation() {
+    async fn blossom_upload_registry_keeps_selection_until_cleanup() {
         let (provider, publisher) = provider();
-        let config = BlossomUploadConfig {
-            selection_ttl: Duration::ZERO,
-            ..BlossomUploadConfig::default()
-        };
-        let service = BlossomUploadService::new(provider.clone(), config);
+        let service = BlossomUploadService::new(provider, BlossomUploadConfig::default());
         let file = file_with_suffix(&png_fixture(), ".png");
         let selected = service
             .register_file(file.path(), publisher)
             .expect("register");
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        service
+            .inspect_selection(selected.selection_id)
+            .await
+            .expect("selection remains registered for the app session");
+        assert!(service
+            .cleanup_selection(selected.selection_id)
+            .expect("cleanup"));
         assert!(matches!(
             service.inspect_selection(selected.selection_id).await,
             Err(BlossomUploadError::SelectionUnavailable)
         ));
+    }
 
+    #[tokio::test]
+    async fn blossom_upload_registry_enforces_account_and_mutation() {
+        let (provider, publisher) = provider();
+        let file = file_with_suffix(&png_fixture(), ".png");
         let service = BlossomUploadService::new(provider.clone(), BlossomUploadConfig::default());
         let selected = service
             .register_file(file.path(), publisher)
