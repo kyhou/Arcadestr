@@ -7,6 +7,8 @@ pub mod dialog;
 pub mod feedback;
 pub mod game_artwork;
 pub mod game_card;
+pub mod installation_launcher;
+pub use installation_launcher::InstallationLauncher;
 pub mod logo;
 pub mod modal_background;
 pub mod nav_item;
@@ -56,6 +58,6 @@ pub use transient::{
     should_close_on_outside_pointer,
 };
 pub use unsaved_changes_dialog::{
-    create_game_dirty, guard_navigation, resolve_guard, set_create_game_dirty, GuardResolution,
+    guard_navigation, publish_game_dirty, resolve_guard, set_publish_game_dirty, GuardResolution,
     NavigationGuard, UnsavedChangesDialog, UnsavedWork,
 };
