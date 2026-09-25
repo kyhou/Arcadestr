@@ -4,6 +4,20 @@ This directory contains utility scripts for the Arcadestr project.
 
 ## Available Scripts
 
+### clear-arcadestr-data
+
+Wipes every local Arcadestr trace so the app starts from a clean state: databases and master key in `~/.local/share/arcadestr`, installed games/retained packages/webview cache in `~/.local/share/com.arcadestr.app`, archive-selection caches in `~/.cache/arcadestr`, any legacy `~/.config/arcadestr`, and the signer/NWC secrets in the OS keyring (`arcadestr-auth`, `arcadestr-nip49`, `arcadestr-nwc`). Paths honor the `XDG_*` env vars.
+
+Quit the app before running it.
+
+```bash
+./scripts/clear_arcadestr_data.sh          # show what exists, ask for confirmation, then delete
+./scripts/clear_arcadestr_data.sh --dry-run  # only list what exists
+./scripts/clear_arcadestr_data.sh --force  # skip the confirmation prompt
+```
+
+Keyring clearing requires `secret-tool` (package `libsecret-tools`). Without it, filesystem data is still removed but keyring secrets are left behind.
+
 ### analyze-patterns
 
 A powerful code analysis tool that searches the codebase for recurring patterns, similar implementations, and refactoring opportunities.

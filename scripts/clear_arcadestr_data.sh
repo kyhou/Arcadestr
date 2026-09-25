@@ -1,110 +1,171 @@
 #!/bin/bash
-# clear_arcadestr_data.sh - One-time cleanup script for Arcadestr
-# 
-# This script clears all saved profile data from the system keyring and local cache.
-# Use this when:
-# - You want to start fresh with a clean state
-# - Profile data is corrupted or inconsistent
-# - The app is restoring the wrong profile on startup
-# - You want to switch to a different Nostr account
+# clear_arcadestr_data.sh - Wipe all locally stored Arcadestr data.
+#
+# Removes databases, the encryption master key, settings, saved users,
+# installed games, retained download packages, caches, and OS-keyring
+# secrets so the app starts from a clean state.
+#
+# Quit Arcadestr before running this script.
+
+set -u
+
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/arcadestr"
+TAURI_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/com.arcadestr.app"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/arcadestr"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/arcadestr"
+
+KEYRING_SERVICES=("arcadestr-auth" "arcadestr-nip49" "arcadestr-nwc")
+
+DRY_RUN=0
+FORCE=0
+
+usage() {
+    cat <<'EOF'
+Usage: clear_arcadestr_data.sh [--dry-run] [--force]
+
+Clears all locally stored Arcadestr data. Quit the app first.
+
+What is cleared:
+  1. App data dir       ~/.local/share/arcadestr         (databases, master key, settings, caches)
+  2. Tauri local data   ~/.local/share/com.arcadestr.app (installed games, retained packages, artifacts, webview cache)
+  3. Cache dir          ~/.cache/arcadestr               (archive selections)
+  4. Config dir         ~/.config/arcadestr              (legacy, if present)
+  5. OS keyring         services arcadestr-auth / -nip49 / -nwc (signer secrets, NWC URI)
+
+Raw paths honor XDG_DATA_HOME, XDG_CACHE_HOME and XDG_CONFIG_HOME.
+
+Options:
+  --dry-run   Only list what exists; delete nothing.
+  --force     Skip the confirmation prompt.
+  --help      Show this help.
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=1 ;;
+        --force|-f) FORCE=1 ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "Unknown option: $arg"; echo; usage; exit 1 ;;
+    esac
+done
+
+show_size() {
+    du -sh "$1" 2>/dev/null | awk '{print $1}' || echo "?"
+}
+
+dir_contents() {
+    ls -A "$1" 2>/dev/null | head -n 30
+}
+
+found_any=0
+
+check_dir() {
+    local path="$1" label="$2"
+    if [ -e "$path" ]; then
+        found_any=1
+        echo "[$label] $path"
+        echo "  size: $(show_size "$path")"
+        dir_contents "$path" | sed 's/^/  /'
+    else
+        echo "[$label] $path (absent)"
+    fi
+    echo
+}
 
 echo "=========================================="
-echo "Arcadestr Data Cleanup Script"
+echo "Arcadestr Data Cleanup"
 echo "=========================================="
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "Dry run: nothing will be deleted."
+fi
 echo ""
 
-# Function to clear a secret-tool entry
-clear_keyring_entry() {
-    local key="$1"
-    if secret-tool clear arcadestr "$key" 2>/dev/null; then
-        echo "  ✓ Cleared: arcadestr/$key"
-        return 0
+echo "Step 1: App data dir (databases, master key, settings)"
+echo "-------------------------------------------------------"
+check_dir "$DATA_DIR" "app-data"
+
+echo "Step 2: Tauri local data (installed games, packages, webview cache)"
+echo "-------------------------------------------------------------------"
+check_dir "$TAURI_DIR" "tauri-local-data"
+
+echo "Step 3: Cache dir (archive selections)"
+echo "---------------------------------------"
+check_dir "$CACHE_DIR" "cache"
+
+echo "Step 4: Config dir (legacy)"
+echo "----------------------------"
+check_dir "$CONFIG_DIR" "config"
+
+echo "Step 5: OS keyring secrets"
+echo "--------------------------"
+if command -v secret-tool >/dev/null 2>&1; then
+    for service in "${KEYRING_SERVICES[@]}"; do
+        labels=$(secret-tool search --all service "$service" 2>/dev/null | grep '^label')
+        if [ -n "$labels" ]; then
+            found_any=1
+            echo "[$service]"
+            echo "$labels" | sed 's/^label = /  /'
+        else
+            echo "[$service] no entries"
+        fi
+    done
+else
+    echo "  ! 'secret-tool' not found (install libsecret-tools)."
+    echo "    Signer secrets and the NWC URI will NOT be cleared."
+fi
+echo ""
+
+if [ "$found_any" -eq 0 ]; then
+    echo "No Arcadestr data found on this system. Nothing to do."
+    exit 0
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "Dry run complete. Re-run without --dry-run to delete the above."
+    exit 0
+fi
+
+if [ "$FORCE" -eq 0 ]; then
+    printf "This will permanently delete the data listed above. Continue? [y/N] "
+    read -r answer
+    case "$answer" in
+        y|Y|yes|YES) ;;
+        *) echo "Aborted."; exit 1 ;;
+    esac
+fi
+
+delete_dir() {
+    local path="$1" label="$2"
+    if [ -e "$path" ]; then
+        rm -rf "$path"
+        echo "  ✓ Removed [$label]: $path"
     else
-        echo "  ✗ Not found or failed: arcadestr/$key"
-        return 1
+        echo "  - Skipped [$label] (absent): $path"
     fi
 }
 
-echo "Step 1: Clearing keyring entries..."
-echo "----------------------------------------"
-
-# Clear the last active profile ID
-clear_keyring_entry "last_active_profile"
-
-# Clear the profile index
-clear_keyring_entry "profile_index"
-
-# Find and clear all arcadestr entries
-if command -v secret-tool &> /dev/null; then
-    echo ""
-    echo "Searching for all arcadestr entries..."
-    
-    # Get all unique arcadestr keys
-    keys=$(secret-tool search --all arcadestr 2>/dev/null | grep -o 'arcadestr_[^=]*' | sort -u)
-    
-    if [ -n "$keys" ]; then
-        echo "Found entries to clear:"
-        for key in $keys; do
-            # Extract just the key name after "arcadestr_"
-            key_name="${key#arcadestr_}"
-            clear_keyring_entry "$key_name"
-        done
-    else
-        echo "No additional arcadestr entries found in keyring."
-    fi
-else
-    echo "WARNING: secret-tool not found. Keyring entries may not be cleared."
-    echo "Install libsecret-tools package if you want to clear keyring entries."
-fi
-
+echo "Deleting..."
 echo ""
-echo "Step 2: Clearing local cache..."
-echo "----------------------------------------"
+delete_dir "$DATA_DIR" "app-data"
+delete_dir "$TAURI_DIR" "tauri-local-data"
+delete_dir "$CACHE_DIR" "cache"
+delete_dir "$CONFIG_DIR" "config"
 
-# Clear local cache directory
-CACHE_DIR="$HOME/.local/share/arcadestr"
-if [ -d "$CACHE_DIR" ]; then
-    echo "Removing cache directory: $CACHE_DIR"
-    rm -rf "$CACHE_DIR"
-    echo "  ✓ Cache directory removed"
+if command -v secret-tool >/dev/null 2>&1; then
+    for service in "${KEYRING_SERVICES[@]}"; do
+        count=$(secret-tool search --all service "$service" 2>/dev/null | grep -c '^\[/')
+        if [ "$count" -gt 0 ]; then
+            yes 2>/dev/null | secret-tool clear service "$service" >/dev/null 2>&1 \
+                && echo "  ✓ Cleared keyring service: $service ($count entries)" \
+                || echo "  ! Failed to clear keyring service: $service"
+        fi
+    done
 else
-    echo "  ✗ Cache directory not found: $CACHE_DIR"
-fi
-
-# Also check for the old cache location (if any)
-OLD_CACHE_DIR="$HOME/.cache/arcadestr"
-if [ -d "$OLD_CACHE_DIR" ]; then
-    echo "Removing old cache directory: $OLD_CACHE_DIR"
-    rm -rf "$OLD_CACHE_DIR"
-    echo "  ✓ Old cache directory removed"
-fi
-
-echo ""
-echo "Step 3: Clearing config files..."
-echo "----------------------------------------"
-
-# Clear config directory if it exists
-CONFIG_DIR="$HOME/.config/arcadestr"
-if [ -d "$CONFIG_DIR" ]; then
-    echo "Removing config directory: $CONFIG_DIR"
-    rm -rf "$CONFIG_DIR"
-    echo "  ✓ Config directory removed"
-else
-    echo "  ✗ Config directory not found: $CONFIG_DIR"
+    echo "  ! secret-tool unavailable; keyring entries were not cleared."
 fi
 
 echo ""
 echo "=========================================="
-echo "Cleanup Complete!"
+echo "Cleanup complete. Arcadestr now starts from a clean state."
 echo "=========================================="
-echo ""
-echo "All Arcadestr data has been cleared."
-echo ""
-echo "Next steps:"
-echo "1. Restart Arcadestr"
-echo "2. Login with your bunker URI or NIP-05 identifier"
-echo "3. The app will create a fresh profile"
-echo ""
-echo "Your npub: npub1vcq8nv3lctr8ctk2dp7h3e0su4f7gklgx4dlm2375l6u69hvuh6syj3d9l"
-echo "Expected hex: 660079b23fc2c67c2eca687d78e5f0e553e45be8355bfdaa3ea7f5cd16ece5f5"
-echo ""
