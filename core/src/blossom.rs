@@ -283,9 +283,45 @@ pub fn parse_blob_descriptor(value: &str) -> Result<BlossomBlobDescriptor, Bloss
         .map_err(|error| BlossomError::InvalidDescriptorJson(error.to_string()))
 }
 
+fn validate_descriptor_url(
+    value: &str,
+    policy: BlossomServerOriginPolicy,
+) -> Result<String, BlossomError> {
+    if policy == BlossomServerOriginPolicy::AllowHttpLoopback {
+        if let Some(suffix) = value.strip_prefix("http://") {
+            // Reuse the content policy's lexical, length, and credential checks.
+            validate_store_page_url(&format!("https://{suffix}"))
+                .map_err(|_| BlossomError::InvalidDescriptorUrl)?;
+            let parsed = Url::parse(value).map_err(|_| BlossomError::InvalidDescriptorUrl)?;
+            validate_blossom_server_origin(
+                &format!("{}/", parsed.origin().ascii_serialization()),
+                policy,
+            )
+            .map_err(|_| BlossomError::InvalidDescriptorUrl)?;
+            return Ok(parsed.to_string());
+        }
+    }
+    if policy == BlossomServerOriginPolicy::HttpsOnly
+        && Url::parse(value).map_or(true, |parsed| parsed.scheme() != "https")
+    {
+        return Err(BlossomError::InvalidDescriptorUrl);
+    }
+    validate_store_page_url(value).map_err(|_| BlossomError::InvalidDescriptorUrl)
+}
+
 pub fn validate_blob_descriptor(
+    descriptor: BlossomBlobDescriptor,
+    expected: BlossomBlobExpectation<'_>,
+) -> Result<BlossomBlobDescriptor, BlossomError> {
+    validate_blob_descriptor_with_policy(descriptor, expected, BlossomServerOriginPolicy::HttpsOnly)
+}
+
+/// Validate a descriptor with an explicitly selected development URL policy.
+/// The default entry point remains HTTPS-only.
+pub fn validate_blob_descriptor_with_policy(
     mut descriptor: BlossomBlobDescriptor,
     expected: BlossomBlobExpectation<'_>,
+    policy: BlossomServerOriginPolicy,
 ) -> Result<BlossomBlobDescriptor, BlossomError> {
     if !is_lowercase_sha256_hex(&descriptor.sha256) || descriptor.sha256 != expected.sha256 {
         return Err(BlossomError::DescriptorHashMismatch);
@@ -302,8 +338,7 @@ pub fn validate_blob_descriptor(
         return Err(BlossomError::InvalidUploadedTimestamp);
     }
 
-    let url =
-        validate_store_page_url(&descriptor.url).map_err(|_| BlossomError::InvalidDescriptorUrl)?;
+    let url = validate_descriptor_url(&descriptor.url, policy)?;
     if last_lowercase_sha256_hex(&url) != Some(expected.sha256) {
         return Err(BlossomError::InvalidDescriptorUrl);
     }
@@ -478,6 +513,43 @@ mod tests {
             validate_blob_descriptor(descriptor, expectation()),
             Err(BlossomError::DescriptorMimeMismatch)
         );
+    }
+
+    #[test]
+    fn descriptor_loopback_requires_explicit_policy() {
+        for host in ["localhost:3000", "127.0.0.1:3000", "[::1]:3000"] {
+            let mut descriptor = parse_blob_descriptor(&descriptor_json("")).expect("descriptor");
+            descriptor.url = format!("http://{host}/{HASH}.webp");
+            assert_eq!(
+                validate_blob_descriptor(descriptor.clone(), expectation()),
+                Err(BlossomError::InvalidDescriptorUrl)
+            );
+            assert!(validate_blob_descriptor_with_policy(
+                descriptor,
+                expectation(),
+                BlossomServerOriginPolicy::AllowHttpLoopback
+            )
+            .is_ok());
+        }
+        for url in [
+            format!("http://example.com/{HASH}"),
+            format!("http://192.168.1.1/{HASH}"),
+            format!("http://localhost.evil.example/{HASH}"),
+            format!("http://user@localhost/{HASH}"),
+            format!("http:///localhost/{HASH}"),
+            format!("http://localhost/{}", "0".repeat(64)),
+        ] {
+            let mut descriptor = parse_blob_descriptor(&descriptor_json("")).expect("descriptor");
+            descriptor.url = url;
+            assert_eq!(
+                validate_blob_descriptor_with_policy(
+                    descriptor,
+                    expectation(),
+                    BlossomServerOriginPolicy::AllowHttpLoopback
+                ),
+                Err(BlossomError::InvalidDescriptorUrl)
+            );
+        }
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const MAX_LABEL_CHARS: usize = 100;
-const DEVELOPMENT_DEFAULT_SERVER: &str = "http://localhost:9099/";
+const DEVELOPMENT_DEFAULT_SERVER: &str = "http://localhost:3000/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredBlossomServer {

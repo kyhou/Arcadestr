@@ -2007,6 +2007,37 @@ mod tests {
     }
 
     #[test]
+    fn parser_applies_build_policy_to_loopback_http_media() {
+        let keys = Keys::generate();
+        let mut page = content("Title");
+        page.media = vec![media_item(
+            "blossom-hero",
+            "image",
+            "hero",
+            "http://localhost:3000/hero.webp",
+        )];
+        let event = signed_event(&keys, "game", vec![coordinate(&keys, "game")], page, 1);
+
+        let parsed = parse_store_page_event(&event).expect("valid Store Page");
+        let invalid_url_omitted = parsed.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic,
+                StorePageDiagnostic::OptionalFieldOmitted {
+                    field,
+                    reason: OptionalFieldReason::InvalidUrl,
+                } if field == "media[blossom-hero].url"
+            )
+        });
+        if cfg!(debug_assertions) {
+            assert_eq!(parsed.sanitized_content.media.len(), 1);
+            assert!(!invalid_url_omitted);
+        } else {
+            assert!(parsed.sanitized_content.media.is_empty());
+            assert!(invalid_url_omitted);
+        }
+    }
+
+    #[test]
     fn media_integrity_metadata_is_backward_compatible_and_preserved_when_complete() {
         let keys = Keys::generate();
         let mut without_integrity = content("Manual URL");

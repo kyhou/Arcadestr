@@ -1,7 +1,7 @@
 use pulldown_cmark::{html, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde::Serialize;
 use thiserror::Error;
-use url::Url;
+use url::{Host, Url};
 
 // These limits fit typical 128 KiB relay envelopes while leaving room for event metadata.
 pub const MAX_EVENT_BYTES: usize = 128 * 1024;
@@ -68,7 +68,14 @@ pub fn validate_store_page_url(value: &str) -> Result<String, ContentPolicyError
         return Err(ContentPolicyError::InvalidUrl);
     }
     let parsed = Url::parse(value).map_err(|_| ContentPolicyError::InvalidUrl)?;
-    if parsed.scheme() != "https"
+    let debug_loopback_http = cfg!(debug_assertions)
+        && parsed.scheme() == "http"
+        && parsed.host().is_some_and(|host| match host {
+            Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+            Host::Ipv4(address) => address.is_loopback(),
+            Host::Ipv6(address) => address.is_loopback(),
+        });
+    if (parsed.scheme() != "https" && !debug_loopback_http)
         || parsed.cannot_be_a_base()
         || parsed.host_str().map_or(true, str::is_empty)
         || !parsed.username().is_empty()
@@ -256,7 +263,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn store_page_url_policy_accepts_only_structural_credential_free_https() {
+    fn store_page_url_policy_accepts_https_and_debug_loopback_http() {
         for valid in [
             "https://example.com/image.webp",
             "HTTPS://example.com/path?q=value#fragment",
@@ -283,6 +290,24 @@ mod tests {
             "not a URL",
         ] {
             assert!(validate_store_page_url(invalid).is_err(), "{invalid}");
+        }
+        for invalid in [
+            "http://192.168.1.10/image.png",
+            "http://localhost.evil.example/image.png",
+        ] {
+            assert!(validate_store_page_url(invalid).is_err(), "{invalid}");
+        }
+
+        for loopback in [
+            "http://localhost:3000/image.png",
+            "http://127.0.0.1:3000/image.png",
+            "http://[::1]:3000/image.png",
+        ] {
+            if cfg!(debug_assertions) {
+                assert!(validate_store_page_url(loopback).is_ok(), "{loopback}");
+            } else {
+                assert!(validate_store_page_url(loopback).is_err(), "{loopback}");
+            }
         }
         assert!(validate_store_page_url(&format!(
             "https://example.com/{}",

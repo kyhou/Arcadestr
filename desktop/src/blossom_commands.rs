@@ -436,6 +436,10 @@ fn map_upload_error(error: BlossomUploadError) -> BlossomCommandError {
         PaymentRequired => {
             BlossomCommandError::new("payment_required", "The Blossom server requires payment.")
         }
+        InvalidDescriptorUrl => BlossomCommandError::new(
+            "invalid_descriptor_url",
+            "The returned media URL is unsafe or does not contain the uploaded hash.",
+        ),
         InvalidDescriptor(message)
             if ["hash", "size", "mime", "type"]
                 .iter()
@@ -1197,6 +1201,10 @@ mod tests {
     fn blossom_error_mapping_is_stable_and_does_not_expose_details() {
         let cases = [
             (BlossomUploadError::PaymentRequired, "payment_required"),
+            (
+                BlossomUploadError::InvalidDescriptorUrl,
+                "invalid_descriptor_url",
+            ),
             (BlossomUploadError::SignerTimeout, "signer_timeout"),
             (BlossomUploadError::AccountMismatch, "account_changed"),
             (

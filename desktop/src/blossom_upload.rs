@@ -10,7 +10,7 @@
 
 use arcadestr_core::blossom::{
     build_upload_authorization, encode_blossom_authorization_header, parse_blob_descriptor,
-    validate_blob_descriptor, validate_blossom_media, validate_blossom_server_origin,
+    validate_blob_descriptor_with_policy, validate_blossom_media, validate_blossom_server_origin,
     BlossomBlobDescriptor, BlossomBlobExpectation, BlossomServerOrigin, BlossomServerOriginPolicy,
     UploadAuthorizationInput, BLOSSOM_UPLOAD_AUTHORIZATION_KIND,
 };
@@ -139,6 +139,8 @@ pub enum BlossomUploadError {
     Server { status: u16, body: String },
     #[error("Blossom response exceeded 65536 bytes")]
     ResponseTooLarge,
+    #[error("Blossom descriptor URL is unsafe or does not contain the uploaded hash")]
+    InvalidDescriptorUrl,
     #[error("invalid Blossom descriptor: {0}")]
     InvalidDescriptor(String),
 }
@@ -639,16 +641,22 @@ impl BlossomUploadService {
         let body = bounded_response(response, &token).await?;
         let descriptor = parse_blob_descriptor(&body)
             .and_then(|descriptor| {
-                validate_blob_descriptor(
+                validate_blob_descriptor_with_policy(
                     descriptor,
                     BlossomBlobExpectation {
                         sha256: &sha256,
                         size: entry.len,
                         mime_type: &inspected.mime_type,
                     },
+                    policy,
                 )
             })
-            .map_err(|error| BlossomUploadError::InvalidDescriptor(error.to_string()))?;
+            .map_err(|error| match error {
+                arcadestr_core::blossom::BlossomError::InvalidDescriptorUrl => {
+                    BlossomUploadError::InvalidDescriptorUrl
+                }
+                _ => BlossomUploadError::InvalidDescriptor(error.to_string()),
+            })?;
         ensure_account(&*self.provider, publisher).await?;
         ensure_unchanged(&entry, &std::fs::metadata(&entry.path).map_err(io_error)?)?;
         self.cleanup_selection(request.selection_id)?;
@@ -1432,6 +1440,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FixtureBody {
         Valid,
+        LocalUrl,
         WrongHash,
         WrongSize,
         WrongMime,
@@ -1511,10 +1520,15 @@ mod tests {
                 };
                 let body = match body_mode {
                     FixtureBody::Valid
+                    | FixtureBody::LocalUrl
                     | FixtureBody::WrongHash
                     | FixtureBody::WrongSize
                     | FixtureBody::WrongMime => serde_json::json!({
-                        "url": format!("https://cdn.example/{descriptor_hash}"),
+                        "url": if matches!(body_mode, FixtureBody::LocalUrl) {
+                            format!("http://{address}/{descriptor_hash}.png")
+                        } else {
+                            format!("https://cdn.example/{descriptor_hash}")
+                        },
                         "sha256": descriptor_hash,
                         "size": descriptor_size,
                         "type": descriptor_mime,
@@ -2098,6 +2112,41 @@ mod tests {
             0x67, 0xff,
         ])
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn blossom_upload_local_descriptor_accepts_new_and_deduplicated_blobs() {
+        for status in [201, 200] {
+            let (provider, publisher) = provider();
+            let service = development_service(provider);
+            let file = file_with_suffix(&png_fixture(), ".png");
+            let selected = service
+                .register_file(file.path(), publisher)
+                .expect("register");
+            let (server, captured) = blossom_fixture(vec![
+                (200, FixtureBody::Empty),
+                (status, FixtureBody::LocalUrl),
+            ])
+            .await;
+            let result = service
+                .upload(
+                    BlossomUploadRequest {
+                        selection_id: selected.selection_id,
+                        server: server.clone(),
+                        upload_id: None,
+                        preflight: true,
+                    },
+                    no_progress(),
+                )
+                .await
+                .expect("local descriptor accepted in development");
+            assert_eq!(
+                result.descriptor.url,
+                format!("{server}{}.png", result.sha256)
+            );
+            assert_eq!(result.was_existing, status == 200);
+            assert_eq!(captured.await.expect("requests").len(), 2);
+        }
     }
 
     #[tokio::test]

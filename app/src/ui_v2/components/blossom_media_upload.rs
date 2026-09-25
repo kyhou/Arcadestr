@@ -186,6 +186,9 @@ pub(crate) fn stable_error_message(code: &str) -> &'static str {
         "payment_required" | "payment_failed" | "invoice_failed" => {
             "This Blossom server requires payment before upload."
         }
+        "invalid_descriptor_url" => {
+            "The returned media URL is unsafe or does not contain the uploaded hash."
+        }
         "integrity_mismatch" => "The returned hash, size, or media type did not match.",
         "body_rejected" | "invalid_response" | "response_too_large" | "malformed_descriptor" => {
             "The upload server returned a malformed response."
@@ -205,7 +208,9 @@ pub(crate) fn stable_error_message(code: &str) -> &'static str {
         "network_failure" | "request_failed" => "The upload server could not be reached.",
         "authorization_rejected" => "The server rejected the upload authorization.",
         "rate_limited" => "The server is temporarily rate limiting uploads.",
-        "selection_unavailable" => "The selected file expired or is no longer available.",
+        "selection_unavailable" => {
+            "The selected file is no longer available to Arcadestr. Select it again."
+        }
         "selection_busy" => "This file already has an active upload.",
         _ => "The Blossom operation could not be completed.",
     }
@@ -1239,8 +1244,12 @@ mod tests {
             "The returned hash, size, or media type did not match."
         );
         assert_eq!(
+            stable_error_message("invalid_descriptor_url"),
+            "The returned media URL is unsafe or does not contain the uploaded hash."
+        );
+        assert_eq!(
             stable_error_message("selection_unavailable"),
-            "The selected file expired or is no longer available."
+            "The selected file is no longer available to Arcadestr. Select it again."
         );
     }
 

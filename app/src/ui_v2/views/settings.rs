@@ -132,7 +132,7 @@ fn blossom_settings_error_message(code: &str) -> &'static str {
 }
 
 fn is_development_default_blossom_server(origin: &str) -> bool {
-    cfg!(debug_assertions) && origin.trim_end_matches('/') == "http://localhost:9099"
+    cfg!(debug_assertions) && origin.trim_end_matches('/') == "http://localhost:3000"
 }
 
 fn blossom_health_presentation(status: &str) -> (&'static str, &'static str) {
@@ -1113,7 +1113,7 @@ mod tests {
         assert!(verified_blossom_settings("publisher-b", settings).is_err());
         assert!(blossom_settings_error_message("invalid_request").contains("already configured"));
         assert_eq!(
-            is_development_default_blossom_server("http://localhost:9099/"),
+            is_development_default_blossom_server("http://localhost:3000/"),
             cfg!(debug_assertions)
         );
         assert_eq!(blossom_health_presentation("online").0, "Online");
