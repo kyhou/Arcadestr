@@ -622,28 +622,27 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                         if request_generation.get_untracked() != generation {
                             return;
                         }
+                        // A failed relay can finish before the debounce fires.
+                        // Flush valid partial listings without marking them fresh.
+                        let remaining = std::mem::take(&mut *buffer.borrow_mut());
+                        flush_queued.set(false);
                         batch(move || {
-                            if let Some(s) = &store {
-                                let cached = s.get_all();
-                                if !cached.is_empty() {
-                                    listings.set(recent_listings(cached, target_limit));
-                                    error.set(Some(e));
-                                    loading.set(false);
-                                    loading_more.set(false);
-                                    refreshing.set(false);
-                                    using_cached_data.set(true);
-                                } else {
-                                    error.set(Some(e));
-                                    loading.set(false);
-                                    loading_more.set(false);
-                                    refreshing.set(false);
-                                }
-                            } else {
-                                error.set(Some(e));
-                                loading.set(false);
-                                loading_more.set(false);
-                                refreshing.set(false);
-                            }
+                            listings.update(|items| {
+                                retain_partial_listings(
+                                    items,
+                                    store.as_ref().map(|s| s.get_all()).unwrap_or_default(),
+                                    remaining,
+                                    target_limit,
+                                );
+                            });
+                            error.set(Some(e));
+                            loading.set(false);
+                            loading_more.set(false);
+                            refreshing.set(false);
+                            using_cached_data.set(
+                                received_count.get_untracked() == 0
+                                    && !listings.get_untracked().is_empty(),
+                            );
                         });
                     }
                 }
@@ -664,6 +663,19 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
     }
 }
 
+fn retain_partial_listings(
+    listings: &mut Vec<GameListing>,
+    cached: Vec<GameListing>,
+    buffered: Vec<GameListing>,
+    limit: usize,
+) {
+    for listing in cached.into_iter().chain(buffered) {
+        let _ = upsert_latest_listing(listings, listing);
+    }
+    listings.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at));
+    listings.truncate(limit);
+}
+
 fn recent_listings(mut listings: Vec<GameListing>, limit: usize) -> Vec<GameListing> {
     listings.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     listings.truncate(limit);
@@ -674,7 +686,7 @@ fn mark_received_coordinate(seen: &mut HashSet<(String, String)>, listing: &Game
     seen.insert((listing.publisher_npub.clone(), listing.id.clone()))
 }
 
-fn upsert_latest_listing(listings: &mut Vec<GameListing>, listing: GameListing) -> bool {
+pub(super) fn upsert_latest_listing(listings: &mut Vec<GameListing>, listing: GameListing) -> bool {
     match listings.iter_mut().find(|current| {
         current.publisher_npub == listing.publisher_npub && current.id == listing.id
     }) {
@@ -885,6 +897,27 @@ mod tests {
         assert!(!upsert_latest_listing(&mut listings, stale));
 
         assert_eq!(listings, vec![newer]);
+    }
+
+    #[test]
+    fn failed_or_timed_out_refresh_preserves_buffer_and_newer_existing_results() {
+        let mut stale = listing_with_sats(0);
+        stale.created_at = 10;
+        let mut newer = stale.clone();
+        newer.created_at = 20;
+        let mut buffered = stale.clone();
+        buffered.id = "partial-new-game".into();
+        buffered.created_at = 30;
+        let mut listings = vec![newer.clone()];
+        super::retain_partial_listings(&mut listings, vec![stale], vec![buffered.clone()], 10);
+        assert_eq!(listings, vec![buffered, newer]);
+    }
+
+    #[test]
+    fn failed_empty_refresh_does_not_fabricate_results() {
+        let mut listings = Vec::new();
+        super::retain_partial_listings(&mut listings, Vec::new(), Vec::new(), 10);
+        assert!(listings.is_empty());
     }
 
     #[test]

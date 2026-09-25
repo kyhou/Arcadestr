@@ -514,6 +514,9 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                 </div>
             </Show>
 
+            {move || marketplace.error.get().map(|message| view! {
+                <p class="arc-browse-enrichment-warning" role="alert">{message}</p>
+            })}
             {move || browse_partial_result_kind(
                 listings.get().len(),
                 marketplace.refreshing.get(),

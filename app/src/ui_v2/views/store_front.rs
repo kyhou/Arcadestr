@@ -291,6 +291,9 @@ pub fn StoreFrontView(
             }}
 
             <div class="arc-store-content">
+                {move || marketplace.error.get().map(|message| view! {
+                    <p class="arc-store-enrichment-warning" role="alert">{message}</p>
+                })}
                 {move || store_partial_result_kind(
                     listings.get().len(),
                     marketplace.refreshing.get(),

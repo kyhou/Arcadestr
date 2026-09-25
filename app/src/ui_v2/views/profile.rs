@@ -465,6 +465,9 @@ pub fn ProfileV2View(
                         </section>
 
                         <section class="arc-profile-section" aria-labelledby="profile-games-title">
+                            {move || marketplace_state.error.get().map(|message| view! {
+                                <p class="arc-profile-notice" role="alert">{message}</p>
+                            })}
                             <div class="arc-profile-section-header"><div><p class="v2-store-kicker">"Publisher catalog"</p><h2 id="profile-games-title">"Published games"</h2></div></div>
                             {move || if marketplace_state.loading.get() && my_listings.get().is_empty() {
                                 view! { <LoadingState title="Loading published listings" description="The profile remains available while authored listing events load.".to_string() layout=FeedbackLayout::Compact /> }.into_any()

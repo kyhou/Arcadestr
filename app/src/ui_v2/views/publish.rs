@@ -1,3 +1,4 @@
+use arcadestr_core::distribution::Sha256Digest;
 use leptos::prelude::*;
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
@@ -212,7 +213,7 @@ enum ListingValidityState {
 }
 
 fn is_valid_sha256(value: &str) -> bool {
-    value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+    Sha256Digest::parse(value).is_ok()
 }
 
 fn listing_validity(listing: &GameListing) -> ListingValidityState {
@@ -778,6 +779,7 @@ fn PublishedGamesView(
     let loading = RwSignal::new(true);
     let refreshing = RwSignal::new(false);
     let load_error = RwSignal::new(false);
+    let load_error_message = RwSignal::new(None::<String>);
     let loaded_publisher = RwSignal::new(None::<String>);
     let listing_generation = RwSignal::new(0_u64);
     let listing_request = RwSignal::new(None::<(String, u64)>);
@@ -832,6 +834,7 @@ fn PublishedGamesView(
         loading.set(initial_load);
         refreshing.set(!initial_load);
         load_error.set(false);
+        load_error_message.set(None);
         let listings_signal = listings;
         let auth_for_request = auth_for_refresh.clone();
         spawn_local(async move {
@@ -892,6 +895,14 @@ fn PublishedGamesView(
                         return;
                     }
                     warn!("publisher listing refresh failed: {}", fetch_error);
+                    // Retain listings received before another relay failed.
+                    let partial = current_user_listings(received.get_untracked(), &publisher);
+                    listings_signal.update(|items| {
+                        for listing in partial {
+                            super::marketplace_loader::upsert_latest_listing(items, listing);
+                        }
+                    });
+                    load_error_message.set(Some(fetch_error));
                     load_error.set(true);
                     loading.set(false);
                     refreshing.set(false);
@@ -1204,11 +1215,11 @@ fn PublishedGamesView(
             {move || match dashboard_state.get() {
                 PublisherDashboardState::SignedOut => view! { <section class="v2-publisher-feedback" role="status"><span class="material-symbols-outlined" aria-hidden="true">"person_off"</span><div><h2>"Sign in to open the publisher dashboard"</h2><p>"Publisher listings and in-session authoring state are bound to the active account."</p></div></section> }.into_any(),
                 PublisherDashboardState::Loading => view! { <section class="v2-publisher-feedback" role="status"><span class="material-symbols-outlined" aria-hidden="true">"progress_activity"</span><div><h2>"Loading publisher state"</h2><p>"Checking authored NIP-99 listings before resolving independent Store Page and campaign state."</p></div></section> }.into_any(),
-                PublisherDashboardState::Error => view! { <section class="v2-publisher-feedback v2-publisher-feedback-error" role="alert"><span class="material-symbols-outlined" aria-hidden="true">"cloud_off"</span><div><h2>"Publisher listings unavailable"</h2><p>"No authored listings could be loaded. Retry without changing the active account."</p></div></section> }.into_any(),
+                PublisherDashboardState::Error => view! { <section class="v2-publisher-feedback v2-publisher-feedback-error" role="alert"><span class="material-symbols-outlined" aria-hidden="true">"cloud_off"</span><div><h2>"Publisher listings unavailable"</h2><p>{load_error_message.get().unwrap_or_default()}</p></div></section> }.into_any(),
                 PublisherDashboardState::Empty => view! { <section class="v2-publisher-feedback"><span class="material-symbols-outlined" aria-hidden="true">"sports_esports"</span><div><h2>"No authored listings in the loaded relay window"</h2><p>"Create Game starts the existing publication workflow. Unfinished Create Game state is not saved as a draft."</p>{signer_can_publish(signer_state.get()).then(|| view! { <button type="button" class="v2-btn-primary" on:click=move |_| on_navigate.run(PublishViewState::NewPublication)>"Create Game"</button> })}</div></section> }.into_any(),
                 PublisherDashboardState::Partial | PublisherDashboardState::Ready => view! {
                     <div class="v2-publisher-dashboard-content" aria-live="polite" aria-busy=move || refreshing.get() || store_page_loading.get()>
-                        {(dashboard_state.get() == PublisherDashboardState::Partial).then(|| view! { <div class="v2-publisher-scope-warning" role="status"><strong>"Partial publisher results"</strong><span>"Previously loaded authored listings remain available after the latest refresh failed."</span></div> })}
+                        {(dashboard_state.get() == PublisherDashboardState::Partial).then(|| view! { <div class="v2-publisher-scope-warning" role="status"><strong>"Partial publisher results"</strong><span>{load_error_message.get().unwrap_or_default()}</span></div> })}
                         <dl class="v2-publisher-facts" aria-label="Resolved publisher counts">
                             <div><dt>"Authored listings loaded"</dt><dd>{counts.get().loaded_listings}</dd></div>
                             <div><dt>"Store Page drafts this session"</dt><dd>{counts.get().local_store_page_drafts}</dd></div>
@@ -3126,6 +3137,16 @@ mod tests {
                 version: "1.2.3".into()
             }
         );
+        configured
+            .specs
+            .iter_mut()
+            .find(|(key, _)| key == "file_hash")
+            .expect("file_hash fixture exists")
+            .1 = "A".repeat(64);
+        assert!(matches!(
+            release_summary_state(&configured),
+            ReleaseSummaryState::Invalid(_)
+        ));
         configured.specs.retain(|(key, _)| key != "file_hash");
         assert!(matches!(
             release_summary_state(&configured),

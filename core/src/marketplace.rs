@@ -702,7 +702,7 @@ where
         since_days
     );
 
-    let manager = relay_manager.lock().await;
+    let manager = relay_manager.lock().await.clone();
 
     // Track seen product IDs for deduplication
     let seen_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -748,17 +748,8 @@ where
         )
         .await;
 
-    let count = match result {
-        Ok(_) => {
-            let count = *product_count.lock().await;
-            tracing::info!("Streaming fetch complete: {} unique products", count);
-            count
-        }
-        Err(e) => {
-            tracing::warn!("Streaming fetch ended with error: {}", e);
-            *product_count.lock().await
-        }
-    };
+    result.map_err(|error| error.to_string())?;
+    let count = *product_count.lock().await;
 
     Ok(count)
 }
@@ -1104,7 +1095,7 @@ pub async fn confirm_nip99_listing_propagated(
     let relay_events: StdArc<StdMutex<RelayEventsByUrl>> = StdArc::new(StdMutex::new(Vec::new()));
     let relay_events_clone = StdArc::clone(&relay_events);
 
-    let manager = relay_manager.lock().await;
+    let manager = relay_manager.lock().await.clone();
     manager
         .fetch_events_streaming(filter, 5, 5, move |relay_url, events| {
             if let Ok(mut collected) = relay_events_clone.lock() {
@@ -1265,8 +1256,7 @@ where
         until_secs
     );
 
-    let manager = relay_manager.lock().await;
-
+    let manager = relay_manager.lock().await.clone();
     let seen_coordinates: Arc<Mutex<HashMap<String, (u64, String)>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let product_count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
@@ -1310,18 +1300,11 @@ where
         })
         .await;
 
-    let count = match result {
-        Ok(_) => {
-            let count = *product_count.lock().await;
-            tracing::info!("Streaming fetch complete: {} unique listings", count);
-            count
-        }
-        Err(e) => {
-            tracing::warn!("Streaming fetch ended with error: {}", e);
-            *product_count.lock().await
-        }
-    };
-
+    // Callbacks have already delivered valid partial results. Do not turn a
+    // failed refresh into a successful empty page or mark the cache fresh.
+    result.map_err(|error| error.to_string())?;
+    let count = *product_count.lock().await;
+    tracing::info!("Streaming fetch complete: {} unique listings", count);
     Ok(count)
 }
 

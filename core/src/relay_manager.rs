@@ -6,7 +6,7 @@
 use crate::nostr::{DEFAULT_RELAYS, DISCOVERY_RELAYS, INDEXER_RELAYS};
 use crate::relay_events::{RelayConnectionEvent, RelayStatus};
 use crate::relay_pool::{RelayPool, RelaySource};
-use futures::future;
+use futures::{stream::FuturesUnordered, StreamExt};
 use nostr_sdk::{Client, Event, Filter, Url};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -16,6 +16,87 @@ use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, error, info, warn};
+
+/// Fetch completion requires an explicit EOSE for this subscription. Even the
+/// SDK's per-relay fetch helper can end with Ok(empty) when its activity channel
+/// closes on timeout/disconnect, so consume relay notifications directly.
+async fn query_relay(
+    relay: nostr_sdk::Relay,
+    id: nostr_sdk::SubscriptionId,
+    filter: Filter,
+    deadline: Duration,
+    events: Arc<std::sync::Mutex<Vec<Event>>>,
+) -> Result<(), RelayManagerError> {
+    use nostr_sdk::pool::relay::RelayNotification;
+    use nostr_sdk::{RelayMessage, SubscribeAutoCloseOptions, SubscribeOptions};
+
+    let mut notifications = relay.notifications();
+    let result = timeout(deadline, async {
+        relay
+            .subscribe_with_id(
+                id.clone(),
+                filter.clone(),
+                SubscribeOptions::default().close_on(Some(
+                    SubscribeAutoCloseOptions::default().timeout(Some(deadline)),
+                )),
+            )
+            .await
+            .map_err(|error| RelayManagerError::Connection(error.to_string()))?;
+        loop {
+            let notification = notifications
+                .recv()
+                .await
+                .map_err(|error| RelayManagerError::Connection(error.to_string()))?;
+            match notification {
+                RelayNotification::Message { message } => match message {
+                    RelayMessage::Event {
+                        subscription_id,
+                        event,
+                    } if subscription_id.as_ref() == &id => {
+                        // Keep validation explicit before delivery or persistence.
+                        if event.verify().is_ok() && filter.match_event(&event, Default::default())
+                        {
+                            events
+                                .lock()
+                                .map_err(|_| RelayManagerError::Lock)?
+                                .push(event.into_owned());
+                        }
+                    }
+                    RelayMessage::EndOfStoredEvents(subscription_id)
+                        if subscription_id.as_ref() == &id =>
+                    {
+                        return Ok(())
+                    }
+                    RelayMessage::Closed {
+                        subscription_id,
+                        message,
+                    } if subscription_id.as_ref() == &id => {
+                        return Err(RelayManagerError::Connection(message.into_owned()));
+                    }
+                    _ => {}
+                },
+                RelayNotification::RelayStatus { status }
+                    if status != nostr_sdk::RelayStatus::Connected =>
+                {
+                    return Err(RelayManagerError::Connection(
+                        "relay disconnected before EOSE".into(),
+                    ));
+                }
+                RelayNotification::Shutdown | RelayNotification::AuthenticationFailed => {
+                    return Err(RelayManagerError::Connection(
+                        "relay stopped before EOSE".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    if let Err(error) = relay.unsubscribe(&id).await {
+        debug!("Relay subscription cleanup failed: {error}");
+    }
+    result.map_err(|_| RelayManagerError::QueryTimeout)?
+}
 
 /// Configuration for relay manager
 #[derive(Debug, Clone)]
@@ -54,6 +135,13 @@ pub enum RelayManagerError {
     Connection(String),
     #[error("Query timeout")]
     QueryTimeout,
+    #[error("Relay fetch incomplete: {succeeded} succeeded, {failed} failed, {timed_out} timed out; {events} events retained (partial results)")]
+    FetchIncomplete {
+        succeeded: usize,
+        failed: usize,
+        timed_out: usize,
+        events: usize,
+    },
     #[error("Pool at capacity")]
     PoolAtCapacity,
     #[error("Lock error")]
@@ -377,17 +465,18 @@ impl RelayManager {
         let relay_responded = Arc::new(AtomicBool::new(false));
         let response_seen = Arc::clone(&relay_responded);
 
-        self.fetch_events_streaming(
-            filter,
-            self.config.query_timeout_secs,
-            3,
-            move |_relay_url, events| {
-                response_seen.store(true, Ordering::Relaxed);
-                let mut guard = sink.lock().expect("best_effort_events mutex poisoned");
-                guard.extend(events);
-            },
-        )
-        .await?;
+        let result = self
+            .fetch_events_streaming(
+                filter,
+                self.config.query_timeout_secs,
+                3,
+                move |_relay_url, events| {
+                    response_seen.store(true, Ordering::Relaxed);
+                    let mut guard = sink.lock().expect("best_effort_events mutex poisoned");
+                    guard.extend(events);
+                },
+            )
+            .await;
 
         let events = collected
             .lock()
@@ -397,6 +486,7 @@ impl RelayManager {
         if relay_responded.load(Ordering::Relaxed) {
             Ok(events)
         } else {
+            result?;
             Err(RelayManagerError::QueryTimeout)
         }
     }
@@ -459,7 +549,8 @@ impl RelayManager {
     /// * `on_events` - Callback invoked with (relay_url, events) as each relay responds
     ///
     /// # Returns
-    /// Returns total event count from all relays.
+    /// Returns total event count only if every queried relay completed successfully.
+    /// On failure, already delivered events remain valid partial results.
     pub async fn fetch_events_streaming<F>(
         &self,
         filter: Filter,
@@ -484,115 +575,88 @@ impl RelayManager {
             ));
         }
 
-        let client = self.client.clone();
         let filter = Arc::new(filter);
         let timeout_duration = Duration::from_secs(timeout_secs);
         let inactivity_duration = Duration::from_secs(inactivity_timeout_secs);
 
-        // Spawn tasks for each relay
-        let mut handles = Vec::new();
-        for (relay_url, _) in connected_relays {
-            let client = client.clone();
+        // Own the futures directly: dropping the collection on inactivity cancels
+        // all outstanding work, rather than detaching spawned JoinHandles.
+        let mut queries = FuturesUnordered::new();
+        let mut pending = std::collections::HashMap::new();
+        for (relay_url, relay) in connected_relays {
             let filter = Arc::clone(&filter);
-            let url = relay_url.clone();
-
-            let handle = tokio::spawn(async move {
-                match Url::parse(&url) {
-                    Ok(url_parsed) => {
-                        let result = timeout(
-                            timeout_duration,
-                            client.fetch_events_from(
-                                vec![url_parsed],
-                                (*filter).clone(),
-                                timeout_duration,
-                            ),
-                        )
-                        .await;
-
-                        match result {
-                            Ok(Ok(events)) => {
-                                let events_vec: Vec<Event> = events.into_iter().collect();
-                                debug!("Relay {} returned {} events", url, events_vec.len());
-                                Some((url, events_vec))
-                            }
-                            Ok(Err(e)) => {
-                                debug!("Relay {} fetch failed: {}", url, e);
-                                None
-                            }
-                            Err(_) => {
-                                debug!("Relay {} timed out after {}s", url, timeout_secs);
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug!("Failed to parse relay URL {}: {}", url, e);
-                        None
-                    }
-                }
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let id = nostr_sdk::SubscriptionId::generate();
+            pending.insert(
+                relay_url.clone(),
+                (relay.clone(), id.clone(), Arc::clone(&events)),
+            );
+            queries.push(async move {
+                let result =
+                    query_relay(relay, id, (*filter).clone(), timeout_duration, events).await;
+                (relay_url, result)
             });
-            handles.push(handle);
         }
 
-        // Collect results with inactivity timeout
-        let total_relays = handles.len();
-        let mut completed = 0;
+        let mut succeeded = 0;
+        let mut failed = 0;
+        let mut timed_out = 0;
         let mut total_events = 0;
-        let mut _last_result_time = tokio::time::Instant::now();
-
-        loop {
-            // Take ownership of handles for this iteration
-            let current_handles = std::mem::take(&mut handles);
-
-            if current_handles.is_empty() {
-                break;
-            }
-
-            let timeout_future =
-                tokio::time::timeout(inactivity_duration, future::select_all(current_handles));
-
-            match timeout_future.await {
-                Ok((result, _index, remaining)) => {
-                    handles = remaining;
-                    completed += 1;
-
-                    if let Ok(Some((relay_url, events))) = result {
-                        let count = events.len();
-                        total_events += count;
-                        _last_result_time = tokio::time::Instant::now();
-                        on_events(relay_url, events);
-                        debug!(
-                            "Processed {}/{} relays, {} events so far",
-                            completed, total_relays, total_events
+        while !queries.is_empty() {
+            match timeout(inactivity_duration, queries.next()).await {
+                Ok(Some((relay_url, result))) => {
+                    if let Some((_, _, events)) = pending.remove(&relay_url) {
+                        let events = std::mem::take(
+                            &mut *events.lock().map_err(|_| RelayManagerError::Lock)?,
                         );
+                        total_events += events.len();
+                        // Successful empty responses still acknowledge the relay.
+                        if result.is_ok() || !events.is_empty() {
+                            on_events(relay_url.clone(), events);
+                        }
                     }
-
-                    if handles.is_empty() {
-                        break;
+                    match result {
+                        Ok(()) => {
+                            succeeded += 1;
+                        }
+                        Err(RelayManagerError::QueryTimeout) => {
+                            timed_out += 1;
+                            warn!("Relay {} fetch timed out", relay_url);
+                        }
+                        Err(error) => {
+                            failed += 1;
+                            warn!("Relay {} fetch failed: {}", relay_url, error);
+                        }
                     }
                 }
+                Ok(None) => break,
                 Err(_) => {
-                    // Inactivity timeout
-                    warn!(
-                        "Streaming fetch inactivity timeout after {}s ({} of {} relays completed, {} events)",
-                        inactivity_timeout_secs, completed, total_relays, total_events
-                    );
+                    timed_out += queries.len();
                     break;
                 }
             }
         }
-
-        // Cancel remaining tasks
-        for handle in handles {
-            handle.abort();
+        drop(queries);
+        for (relay_url, (relay, id, events)) in pending {
+            if let Err(error) = relay.unsubscribe(&id).await {
+                debug!("Relay subscription cleanup after inactivity failed: {error}");
+            }
+            let events = std::mem::take(&mut *events.lock().map_err(|_| RelayManagerError::Lock)?);
+            total_events += events.len();
+            if !events.is_empty() {
+                on_events(relay_url, events);
+            }
         }
-
-        info!(
-            "Streaming fetch complete: {} of {} relays responded, {} total events",
-            completed, total_relays, total_events
-        );
-
-        Ok(total_events)
+        if failed > 0 || timed_out > 0 {
+            Err(RelayManagerError::FetchIncomplete {
+                succeeded,
+                failed,
+                timed_out,
+                events: total_events,
+            })
+        } else {
+            Ok(total_events)
+        }
     }
 
     /// Fetch events from a specific subset of relays.

@@ -111,6 +111,7 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                     }
                     Err(e) => {
                         batch(move || {
+                            error.set(Some(e.clone()));
                             // If fetch fails but we have cached data, use it as fallback
                             if let Some(s) = &store {
                                 let cached = s.get_all();
@@ -161,10 +162,10 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                             </p>
                         </div>
                     }.into_any()
-                } else if let Some(err) = error.get() {
+                } else if listings.get().is_empty() && error.get().is_some() {
                     view! {
                         <div class="error-state">
-                            <p>{format!("Error: {}", err)}</p>
+                            <p>{error.get().unwrap_or_default()}</p>
                         </div>
                     }.into_any()
                 } else if listings.get().is_empty() {
@@ -175,6 +176,9 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                     }.into_any()
                 } else {
                     view! {
+                        {move || error.get().map(|err| view! {
+                            <p class="error-state" role="alert">{format!("Showing partial or cached listings. {err}")}</p>
+                        })}
                         <div class="listings-grid">
                             {listings.get().into_iter().map(|listing| {
                                 view! {

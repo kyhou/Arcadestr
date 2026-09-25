@@ -231,6 +231,18 @@ The authorization is active at time `T` when `valid_from <= T` and no valid canc
 
 A verifier MUST distinguish invalid authorization from insufficient evidence. An invalid, mismatched, or cancelled chain is rejected. Incomplete relay coverage or a missing required predecessor produces an indeterminate/unavailable result, not a declaration that the credential is cryptographically unauthorized.
 
+#### Positive and negative evidence are not symmetric
+
+**Positive evidence is self-validating.** A signature-verified event from any single relay establishes what it attests. It does not become more true because a second relay also returned it, and a relay that did not answer cannot make it false. A verifier that has received a valid, signature-verified event satisfying a query MUST NOT treat the result as unavailable because fewer relays responded than some threshold.
+
+**Negative evidence requires corroboration.** Absence proves nothing from one relay: a relay may not carry the event, may have dropped it, or may be selectively withholding it. Concluding that something does not exist requires coverage a verifier can justify, and a deployment MAY set a minimum for it.
+
+Therefore a verifier MUST select from valid candidates found among completed responses **before** applying any completeness threshold. The threshold governs whether an absence is conclusive, never whether a present event counts.
+
+This is a deliberate availability trade, and its cost should be stated: a relay that did not answer may hold a newer revision of a replaceable event, so a verifier acting on the best evidence it received may act on a superseded revision. That is the better failure. An installation pins the snapshot it resolved and a superseded revision is recoverable by updating; an install blocked because one of several relays was unreachable is not recoverable at all, and it makes availability depend on the least available relay rather than the most available one — inverting the redundancy relays exist to provide.
+
+Where multiple valid candidates are found, replaceable-event ordering applies as normal. Selecting available positive evidence does not mean accepting the first response without considering others that completed.
+
 ## LSP Verification (`lud16`)
 
 Confirming a `kind:9735` zap receipt's signature and its `p`/`a` tag references is not sufficient proof of payment on its own — those checks alone accept any self-signed event with the right shape. A server MUST additionally confirm the receipt was signed by the listing's actual Lightning Service Provider (LSP), resolved as follows:
