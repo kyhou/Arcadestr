@@ -214,6 +214,7 @@ arcadestr/
 │   │   ├── lightning.rs      # NIP-57 zap payments
 │   │   ├── saved_users.rs    # Legacy saved users (JSON file)
 │   │   ├── purchases.rs      # NIP-102 purchase receipt persistence and verification
+│   │   ├── adp_settlement.rs # Pure experimental fee/terms/quote/leg/recovery invariants
 │   │   ├── adp_protocol.rs   # Shared provisional campaign/grant kinds and tags
 │   │   ├── ownership.rs      # Unified receipt/grant ownership and durable acquisition history
 │   │   ├── campaign.rs       # Implementation-local provisional campaign chain validation
@@ -225,6 +226,7 @@ arcadestr/
 │   │   ├── adp_discovery.rs  # Kind-30403 ADP server discovery and parsing
 │   │   ├── adp_publish.rs    # Validated kind-30402 listing and kind-30406 authorization builders
 │   │   ├── adp_storage.rs    # Provisioning, download-token, installed-game, and library-game repositories
+│   │   ├── settlement_repository.rs # Account-scoped resumable quote/leg/attempt persistence
 │   │   ├── blossom.rs        # Blossom protocol types: server origins, upload authorizations, blob descriptors, MIME policy
 │   │   ├── store_page.rs     # Store Page (kind 30407) schema, validation, sanitized rendering, and listing pointers
 │   │   ├── store_page_content_policy.rs # Store Page Markdown sanitizer and content-size limits
@@ -255,7 +257,8 @@ arcadestr/
 │   │   ├── 009_library_games.sql # Account-scoped saved-game library
 │   │   ├── 010_store_pages.sql   # Validated Store Page events and sanitized content cache
 │   │   ├── 011_store_page_listing_events.sql # Signed listings for offline Store Page reciprocity
-│   │   └── 012_blossom_server_settings.sql # Account-scoped Blossom server configuration
+│   │   ├── 012_blossom_server_settings.sql # Account-scoped Blossom server configuration
+│   │   └── 017_split_settlement.sql # Account-scoped quote, leg, encrypted attempt, and recovery state
 │   └── tests/
 │       ├── integration.rs          # Core integration coverage
 │       ├── integration_nip05.rs    # NIP-05 HTTP integration tests
@@ -722,6 +725,13 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `connect_nwc_wallet` | `adp_commands.rs` | `request: ConnectNwcWalletRequest` | `ConnectNwcWalletResponse` | Connects NWC and returns safe wallet metadata without exposing the secret |
 | `pay_nwc_invoice` | `adp_commands.rs` | `request: PayNwcInvoiceRequest` | `PayNwcInvoiceResponse` | Pays through NWC and returns the preimage and optional fee |
 | `confirm_purchase` | `adp_commands.rs` | `request: ConfirmPurchaseRequest` | `ConfirmPurchaseResponse` | Refetches the listing, confirms proof with ADP, validates/persists the receipt, and caches its token |
+| `start_split_purchase` | `adp_commands.rs` | `request: StartSplitPurchaseRequest` | `StartSplitPurchaseResponse` | Refetches listing/terms, validates refund LNURL bounds, creates and decrypts the all-leg-preflighted private quote, then persists it under the active account |
+| `next_split_invoice` | `adp_commands.rs` | `request: SplitQuoteRequest` | `SplitInvoiceResponse` | Requests only the next committed leg and stores the invoice attempt NIP-44 encrypted to the active account |
+| `submit_split_payment` | `adp_commands.rs` | `request: SubmitSplitPaymentRequest` | `SplitSettlementResponse` | Submits one proof, persists leg state, and validates/persists the aggregate receipt and token after the final leg |
+| `settlement_history` / `refresh_settlement` | `adp_commands.rs` | None / `SplitQuoteRequest` | Account-scoped history / status | Lists durable quote and recovery state or refreshes one quote from its processor with account-switch rejection |
+| `replace_split_refund_destination` | `adp_commands.rs` | `ReplaceSplitRefundDestinationRequest` | JSON acknowledgement | Resolves and authorizes a replacement refund destination without resetting failure/deadline state |
+| `prepare_split_recovery` | `adp_commands.rs` | `SplitQuoteRequest` | `RecoveryPreparationResponse` | Obtains processor evidence or signs/encrypts buyer fallback kind-1034 evidence and persists every paid-leg obligation |
+| `prepare_split_refund` / `confirm_split_refund` | `adp_commands.rs` | Leg request / attempt and preimage | Refund invoice / acknowledgement | Drives exact principal refund invoicing and durable initiated/verified recovery states |
 | `fetch_profile_badges` | `main.rs` | `profile_pubkey: String` | `Vec<ProfileBadgeEntry>` | Fetch NIP-58 badges for a profile (desktop only) |
 | `fetch_earned_badges` | `main.rs` | `profile_pubkey: String` | `Vec<EarnedBadgeSummary>` | Fetch earned badges with definitions (desktop only) |
 | `publish_game_score` | `nip46_commands.rs` | `score: u64` | `String` | Placeholder command; requires NIP-46 session but does not yet publish an event |
@@ -904,14 +914,15 @@ UiV2Root (app/src/ui_v2/shell.rs) - Active authenticated Noir interface
 ├── GameDetailView (app/src/ui_v2/views/game_detail.rs)
 │   ├── Rechecks active-account durable ownership and campaign availability
 │   ├── Selects buy, claim, install, timed-state, incompatible, sign-in, or unavailable action
-│   ├── LNURL/NWC/manual-preimage purchase and campaign-claim flows
+│   ├── Retains legacy LNURL purchases and adds account-scoped split quote resume, sequential NWC/manual-preimage legs, and refund-address preflight
 │   └── Scoped download listener, seller profile, specs, gallery, and debug raw event data
 │
 ├── LibraryView (app/src/ui_v2/views/library.rs)
 │   └── Reconciles device installs by stable coordinate without presenting install as ownership
 │
 ├── PurchasesView (app/src/ui_v2/views/purchases.rs)
-│   └── Account-scoped purchase/claim history with active/refunded/revoked/unverified states
+│   ├── Account-scoped purchase/claim history with active/refunded/revoked/unverified states
+│   └── Durable split status, partial-payment refresh, recovery evidence, destination replacement, and per-leg refund obligation status
 │
 ├── LoginV2View (app/src/ui_v2/views/login.rs)
 │   ├── Desktop bunker/QR/local-nsec and web NIP-07/local-nsec capabilities
@@ -2631,6 +2642,13 @@ New purchase ownership system with NIP-102 kind-1020 receipts:
 - **Tauri commands**: `ingest_receipt` persists external receipts; `confirm_purchase` validates an ADP response and stores both receipt and token; `install_game` consumes ownership/token state
 - **Bridge functions**: `invoke_ingest_receipt`, `invoke_confirm_purchase`, `invoke_install_game`, and `invoke_get_platform_info` in `app/src/tauri_bridge.rs`
 - **Dependencies**: `lightning-invoice`, `sha2` for Bolt11 parsing and payment proof hashing
+
+### Experimental ADP Split Settlement
+- **Protocol and persistence**: `adp_settlement.rs` validates version-1 fee math, exact SAT/SATS or BTC conversion, terms coverage, leg ordering, quote activation, deadlines, signed kinds 1032-1034, and aggregate commitments. `017_split_settlement.sql` plus `SettlementRepository` retain account-scoped quotes, ordered legs, signer-encrypted attempts, destination revisions, and recovery obligations.
+- **Desktop orchestration**: `desktop/src/adp_commands.rs` creates/preflights quotes, discloses one invoice at a time, stores attempts encrypted with signer NIP-44, submits proofs, persists aggregate receipts, refreshes status, and drives recovery/destination/refund endpoints. Every continuation rechecks the active account.
+- **Publisher Studio**: paid listings show operator fee economics and require explicit acceptance of exact terms roots; edits and retries preserve those references, while publication rejects uncovered operators or malformed terms.
+- **Buyer UI**: `GameDetailView` resumes active account/listing/processor quotes and advances NWC or manual-preimage legs without replacing legacy checkout. `PurchasesView` presents active/failed/settled states, partial-payment refresh, immutable recovery deadlines, destination replacement, and per-leg refund status; it does not misrepresent recipient-owned refund payment/confirmation as a buyer action.
+- **Boundary**: split execution and recovery are desktop-only. Legacy single-payment, free/public/timed/claim, install, and web behavior remain available.
 
 ### Marketplace Incremental Refresh
 Cache-aware streaming reduces relay load and startup time:

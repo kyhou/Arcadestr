@@ -155,6 +155,8 @@ pub struct PurchaseConfirmRequest {
     pub bolt11: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preimage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_id: Option<String>,
 }
 
 /// Response returned by `POST /purchase/confirm` in a later gate.
@@ -163,6 +165,88 @@ pub struct PurchaseConfirmResponse {
     pub receipt: Event,
     pub download_token: String,
     pub token_expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateSettlementQuoteRequest {
+    pub purchase_id: String,
+    pub listing_event: Event,
+    pub terms_events: Vec<Event>,
+    pub refund_destination: crate::adp_settlement::RefundDestination,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub zap_requests: std::collections::HashMap<String, Event>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SettlementQuoteResponse {
+    pub quote: Event,
+    pub state: crate::adp_settlement::QuoteState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettlementStatusResponse {
+    pub quote_id: String,
+    pub state: crate::adp_settlement::QuoteState,
+    pub total_legs: u64,
+    pub disclosed_legs: u64,
+    pub settled_legs: u64,
+    pub failure_at: Option<u64>,
+    pub refund_due_at: Option<u64>,
+    pub receipt_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettlementInvoiceResponse {
+    pub quote_id: String,
+    pub attempt_id: String,
+    pub leg_id: String,
+    pub amount_msat: u64,
+    pub payment_hash: String,
+    pub bolt11: String,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SettlementProofRequest {
+    pub attempt_id: String,
+    pub preimage: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SettlementProofResponse {
+    pub state: String,
+    pub settled_leg: Option<String>,
+    pub receipt: Option<Event>,
+    pub download_token: Option<String>,
+    pub token_expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplaceRefundDestinationRequest {
+    pub destination: crate::adp_settlement::RefundDestination,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryPreparationResponse {
+    pub claimant: String,
+    pub event: Option<Event>,
+    pub plaintext: Option<String>,
+    pub evidence: crate::adp_settlement::RecoveryEvidence,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubmitRecoveryRequest {
+    pub event: Event,
+    pub plaintext: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundInvoiceResponse {
+    pub attempt_id: String,
+    pub leg_id: String,
+    pub amount_msat: u64,
+    pub bolt11: String,
+    pub expires_at: u64,
 }
 
 /// Request sent to `POST /entitlement/claim`.
@@ -525,6 +609,179 @@ impl AdpClient {
             .map_err(map_purchase_error)?;
 
         Ok(serde_json::from_value(value)?)
+    }
+
+    pub async fn create_settlement_quote(
+        &self,
+        signer: &dyn NostrSigner,
+        req: CreateSettlementQuoteRequest,
+    ) -> Result<SettlementQuoteResponse, AdpClientError> {
+        let url = self.url("/settlement/quote");
+        let auth = build_nip98_auth_header(signer, &url, "POST").await?;
+        let value = self
+            .http
+            .post_json(
+                &url,
+                serde_json::to_value(req)?,
+                vec![("Authorization".into(), auth)],
+            )
+            .await
+            .map_err(map_purchase_error)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub async fn settlement_status(
+        &self,
+        signer: &dyn NostrSigner,
+        quote_id: &str,
+    ) -> Result<SettlementStatusResponse, AdpClientError> {
+        let url = self.url(&format!("/settlement/{quote_id}/status"));
+        let auth = build_nip98_auth_header(signer, &url, "POST").await?;
+        let value = self
+            .http
+            .post_json(
+                &url,
+                serde_json::json!({}),
+                vec![("Authorization".into(), auth)],
+            )
+            .await
+            .map_err(map_purchase_error)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub async fn settlement_next_invoice(
+        &self,
+        signer: &dyn NostrSigner,
+        quote_id: &str,
+    ) -> Result<SettlementInvoiceResponse, AdpClientError> {
+        let url = self.url(&format!("/settlement/{quote_id}/next"));
+        let auth = build_nip98_auth_header(signer, &url, "POST").await?;
+        let value = self
+            .http
+            .post_json(
+                &url,
+                serde_json::json!({}),
+                vec![("Authorization".into(), auth)],
+            )
+            .await
+            .map_err(map_purchase_error)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub async fn submit_settlement_proof(
+        &self,
+        signer: &dyn NostrSigner,
+        quote_id: &str,
+        req: SettlementProofRequest,
+    ) -> Result<SettlementProofResponse, AdpClientError> {
+        let url = self.url(&format!("/settlement/{quote_id}/proof"));
+        let auth = build_nip98_auth_header(signer, &url, "POST").await?;
+        let value = self
+            .http
+            .post_json(
+                &url,
+                serde_json::to_value(req)?,
+                vec![("Authorization".into(), auth)],
+            )
+            .await
+            .map_err(map_purchase_error)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub async fn replace_refund_destination(
+        &self,
+        signer: &dyn NostrSigner,
+        quote_id: &str,
+        destination: crate::adp_settlement::RefundDestination,
+    ) -> Result<serde_json::Value, AdpClientError> {
+        let url = self.url(&format!("/settlement/{quote_id}/refund-destination"));
+        let auth = build_nip98_auth_header(signer, &url, "POST").await?;
+        self.http
+            .post_json(
+                &url,
+                serde_json::to_value(ReplaceRefundDestinationRequest { destination })?,
+                vec![("Authorization".into(), auth)],
+            )
+            .await
+            .map_err(map_purchase_error)
+    }
+
+    pub async fn prepare_recovery(
+        &self,
+        signer: &dyn NostrSigner,
+        quote_id: &str,
+    ) -> Result<RecoveryPreparationResponse, AdpClientError> {
+        let url = self.url(&format!("/settlement/{quote_id}/recovery"));
+        let auth = build_nip98_auth_header(signer, &url, "POST").await?;
+        let value = self
+            .http
+            .post_json(
+                &url,
+                serde_json::json!({}),
+                vec![("Authorization".into(), auth)],
+            )
+            .await
+            .map_err(map_purchase_error)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub async fn submit_recovery(
+        &self,
+        signer: &dyn NostrSigner,
+        quote_id: &str,
+        event: Event,
+        plaintext: String,
+    ) -> Result<serde_json::Value, AdpClientError> {
+        let url = self.url(&format!("/settlement/{quote_id}/recovery/submit"));
+        let auth = build_nip98_auth_header(signer, &url, "POST").await?;
+        self.http
+            .post_json(
+                &url,
+                serde_json::to_value(SubmitRecoveryRequest { event, plaintext })?,
+                vec![("Authorization".into(), auth)],
+            )
+            .await
+            .map_err(map_purchase_error)
+    }
+
+    pub async fn prepare_refund(
+        &self,
+        signer: &dyn NostrSigner,
+        quote_id: &str,
+        leg_id: &str,
+    ) -> Result<RefundInvoiceResponse, AdpClientError> {
+        let url = self.url(&format!("/settlement/{quote_id}/refund/{leg_id}/prepare"));
+        let auth = build_nip98_auth_header(signer, &url, "POST").await?;
+        let value = self
+            .http
+            .post_json(
+                &url,
+                serde_json::json!({}),
+                vec![("Authorization".into(), auth)],
+            )
+            .await
+            .map_err(map_purchase_error)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub async fn confirm_refund(
+        &self,
+        signer: &dyn NostrSigner,
+        quote_id: &str,
+        leg_id: &str,
+        attempt_id: &str,
+        preimage: &str,
+    ) -> Result<serde_json::Value, AdpClientError> {
+        let url = self.url(&format!("/settlement/{quote_id}/refund/{leg_id}/confirm"));
+        let auth = build_nip98_auth_header(signer, &url, "POST").await?;
+        self.http
+            .post_json(
+                &url,
+                serde_json::json!({ "attempt_id": attempt_id, "preimage": preimage }),
+                vec![("Authorization".into(), auth)],
+            )
+            .await
+            .map_err(map_purchase_error)
     }
 
     /// Claims an active publisher campaign using NIP-98 bound to this exact endpoint.
@@ -1327,6 +1584,7 @@ mod tests {
                     zap_receipt_event: None,
                     bolt11: Some("lnbc1fixedamountinvoice".to_string()),
                     preimage: Some("feedface".to_string()),
+                    quote_id: None,
                 },
             )
             .await

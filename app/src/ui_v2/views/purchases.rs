@@ -2,7 +2,11 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::models::{DurableAcquisitionKind, DurableAcquisitionRecord, DurableCredentialStatus};
-use crate::tauri_bridge::invoke_get_purchase_records;
+use crate::tauri_bridge::{
+    invoke_get_purchase_records, invoke_prepare_split_recovery, invoke_refresh_settlement,
+    invoke_replace_split_refund_destination, invoke_settlement_history,
+    ReplaceSplitRefundDestinationRequest, SettlementHistoryItem, SplitQuoteRequest,
+};
 use crate::ui_v2::components::{
     EmptyState, ErrorSeverity, ErrorState, FeedbackLayout, LoadingState, PageTabItem,
     PageTabSemantics, PageTabs, StatusChip, StatusChipSize, StatusChipVariant,
@@ -16,6 +20,16 @@ enum PurchasesState {
     Empty,
     Error,
     Ready(Vec<DurableAcquisitionRecord>),
+    WebUnavailable,
+}
+
+#[derive(Debug, Clone)]
+enum SettlementHistoryState {
+    Loading,
+    AccountRequired,
+    Empty,
+    Error,
+    Ready(Vec<SettlementHistoryItem>),
     WebUnavailable,
 }
 
@@ -183,57 +197,284 @@ fn record_verification_label(record: &DurableAcquisitionRecord) -> &'static str 
     }
 }
 
+fn settlement_state_color(state: &str) -> &'static str {
+    match state {
+        "settled" | "verified" => "oklch(0.8 0.14 195)",
+        "failed" | "overdue" | "disputed" => "oklch(0.65 0.18 25)",
+        _ => "oklch(0.78 0.16 60)",
+    }
+}
+
+#[component]
+fn SettlementRecordCard(
+    record: SettlementHistoryItem,
+    account: String,
+    on_changed: Callback<()>,
+) -> impl IntoView {
+    let auth = use_context::<AuthContext>().expect("AuthContext not provided");
+    let quote_id = record.quote_id.clone();
+    let server_url = record.processor_url.clone();
+    let state_name = record.state.clone();
+    let recovery = record.recovery.clone();
+    let refund_lud16 = RwSignal::new(String::new());
+    let operation = RwSignal::new(None::<String>);
+    let error = RwSignal::new(None::<String>);
+    let success = RwSignal::new(None::<String>);
+
+    let on_refresh = {
+        let auth = auth.clone();
+        let account = account.clone();
+        let quote_id = quote_id.clone();
+        let server_url = server_url.clone();
+        Callback::new(move |()| {
+            operation.set(Some("Refreshing settlement".into()));
+            error.set(None);
+            let auth = auth.clone();
+            let account = account.clone();
+            let quote_id = quote_id.clone();
+            let server_url = server_url.clone();
+            spawn_local(async move {
+                let result = invoke_refresh_settlement(SplitQuoteRequest {
+                    server_url,
+                    quote_id,
+                })
+                .await;
+                if auth.npub.get_untracked().as_deref() != Some(account.as_str()) {
+                    return;
+                }
+                operation.set(None);
+                match result {
+                    Ok(_) => on_changed.run(()),
+                    Err(message) => error.set(Some(message)),
+                }
+            });
+        })
+    };
+
+    let on_recover = {
+        let auth = auth.clone();
+        let account = account.clone();
+        let quote_id = quote_id.clone();
+        let server_url = server_url.clone();
+        Callback::new(move |()| {
+            operation.set(Some("Preparing recovery evidence".into()));
+            error.set(None);
+            let auth = auth.clone();
+            let account = account.clone();
+            let quote_id = quote_id.clone();
+            let server_url = server_url.clone();
+            spawn_local(async move {
+                let result = invoke_prepare_split_recovery(SplitQuoteRequest {
+                    server_url,
+                    quote_id,
+                })
+                .await;
+                if auth.npub.get_untracked().as_deref() != Some(account.as_str()) {
+                    return;
+                }
+                operation.set(None);
+                match result {
+                    Ok(_) => {
+                        success.set(Some(
+                            "Recovery evidence retained for every paid leg.".into(),
+                        ));
+                        on_changed.run(());
+                    }
+                    Err(message) => error.set(Some(message)),
+                }
+            });
+        })
+    };
+
+    let on_replace_destination = {
+        let auth = auth.clone();
+        let account = account.clone();
+        let quote_id = quote_id.clone();
+        let server_url = server_url.clone();
+        Callback::new(move |()| {
+            let destination = refund_lud16.get();
+            if destination.trim().is_empty() {
+                error.set(Some("Enter a Lightning address for refunds.".into()));
+                return;
+            }
+            operation.set(Some("Replacing refund destination".into()));
+            error.set(None);
+            let auth = auth.clone();
+            let account = account.clone();
+            let quote_id = quote_id.clone();
+            let server_url = server_url.clone();
+            spawn_local(async move {
+                let result =
+                    invoke_replace_split_refund_destination(ReplaceSplitRefundDestinationRequest {
+                        server_url,
+                        quote_id,
+                        refund_lud16: destination,
+                    })
+                    .await;
+                if auth.npub.get_untracked().as_deref() != Some(account.as_str()) {
+                    return;
+                }
+                operation.set(None);
+                match result {
+                    Ok(_) => success.set(Some(
+                        "Refund destination replaced without changing the recovery deadline."
+                            .into(),
+                    )),
+                    Err(message) => error.set(Some(message)),
+                }
+            });
+        })
+    };
+
+    let recover_visible_state = state_name.clone();
+    let destination_visible_state = state_name.clone();
+    view! {
+        <article style="clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));border:1px solid oklch(0.32 0.01 60);background:#121215;padding:20px;display:grid;gap:14px;font-family:ui-monospace,monospace">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap">
+                <div style="display:grid;gap:5px;min-width:0">
+                    <span style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">"SPLIT SETTLEMENT"</span>
+                    <strong style="font:800 16px/1.15 ui-monospace,monospace;color:#fff;overflow-wrap:anywhere">{record.listing_event_id}</strong>
+                    <span style="font:600 10.5px ui-monospace,monospace;color:oklch(0.55 0.01 60);overflow-wrap:anywhere">{format!("QUOTE {}", quote_id)}</span>
+                </div>
+                <span style=format!("padding:4px 11px;border:1px solid {};color:{};background:#141417;font:700 11px ui-monospace,monospace;border-radius:4px;text-transform:uppercase", settlement_state_color(&state_name), settlement_state_color(&state_name))>{state_name.clone()}</span>
+            </div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap">
+                <button style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" on:click=move |_| on_refresh.run(()) disabled=move || operation.get().is_some()>"REFRESH STATUS"</button>
+                <Show when=move || recover_visible_state == "failed">
+                    <button style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" on:click=move |_| on_recover.run(()) disabled=move || operation.get().is_some()>"PREPARE RECOVERY"</button>
+                </Show>
+            </div>
+            <Show when=move || destination_visible_state == "failed">
+                <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px">
+                    <input style="min-width:0;padding:10px 12px;border:1px solid oklch(0.32 0.01 60);background:#141417;color:#fff;font:600 12px ui-monospace,monospace;border-radius:4px" type="text" placeholder="replacement@example.com" prop:value=move || refund_lud16.get() on:input:target=move |event| refund_lud16.set(event.target().value()) />
+                    <button style="padding:9px 14px;border:1px solid rgba(255,255,255,.22);background:transparent;color:oklch(0.68 0.01 60);font:800 11px ui-monospace,monospace;border-radius:4px" on:click=move |_| on_replace_destination.run(()) disabled=move || operation.get().is_some()>"REPLACE REFUND ADDRESS"</button>
+                </div>
+            </Show>
+            {recovery.into_iter().map(|obligation| {
+                view! {
+                    <div style="border-top:1px solid oklch(0.4 0.03 60 / .3);padding-top:14px;display:grid;gap:7px">
+                        <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap">
+                            <span style="font:700 11px ui-monospace,monospace;color:#fff">{format!("LEG {} · {} msat", obligation.leg_id, obligation.principal_msat)}</span>
+                            <span style=format!("font:700 11px ui-monospace,monospace;color:{};text-transform:uppercase", settlement_state_color(&obligation.state))>{format!("{} · DUE {}", obligation.state, obligation.due_at)}</span>
+                        </div>
+                        <p style="margin:0;color:oklch(0.6 0.01 60);font:400 10.5px/1.5 ui-monospace,monospace">"The obligated recipient must pay and confirm this principal refund. Refresh status to retain late evidence."</p>
+                    </div>
+                }
+            }).collect::<Vec<_>>()}
+            <Show when=move || operation.get().is_some()><p style="margin:0;color:oklch(0.8 0.14 195);font:600 11px ui-monospace,monospace">{move || operation.get().unwrap_or_default()}</p></Show>
+            <Show when=move || success.get().is_some()><p style="margin:0;color:oklch(0.8 0.14 195);font:600 11px ui-monospace,monospace">{move || success.get().unwrap_or_default()}</p></Show>
+            <Show when=move || error.get().is_some()><p role="alert" style="margin:0;color:oklch(0.65 0.18 25);font:600 11px ui-monospace,monospace">{move || error.get().unwrap_or_default()}</p></Show>
+        </article>
+    }
+}
+
+fn settlement_history_view(
+    state: SettlementHistoryState,
+    account: String,
+    on_changed: Callback<()>,
+) -> AnyView {
+    let body = match state {
+        SettlementHistoryState::Loading => view! { <p style="color:oklch(0.6 0.01 60);font:600 11px ui-monospace,monospace">"Loading active settlement and recovery records..."</p> }.into_any(),
+        SettlementHistoryState::AccountRequired => view! { <p style="color:oklch(0.6 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace">"Connect an account to view resumable settlement records."</p> }.into_any(),
+        SettlementHistoryState::Empty => view! { <div style="padding:36px 28px;text-align:center;border:1px solid oklch(0.32 0.01 60);background:#121215"><strong style="display:block;color:#fff;font:800 16px ui-monospace,monospace">"No split settlements yet"</strong><p style="color:oklch(0.6 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace">"Multi-recipient purchases, partial payments, and refund recovery will appear here."</p></div> }.into_any(),
+        SettlementHistoryState::Error => view! { <p role="alert" style="color:oklch(0.65 0.18 25);font:600 11px ui-monospace,monospace">"Settlement records could not be loaded. Durable purchase records remain available below."</p> }.into_any(),
+        SettlementHistoryState::WebUnavailable => view! { <p style="color:oklch(0.6 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace">"Settlement recovery is available in the desktop app."</p> }.into_any(),
+        SettlementHistoryState::Ready(records) => view! { <div style="display:grid;gap:18px">{records.into_iter().map(|record| view! { <SettlementRecordCard record=record account=account.clone() on_changed=on_changed /> }).collect::<Vec<_>>()}</div> }.into_any(),
+    };
+    view! {
+        <section style="margin:24px 0;display:grid;gap:16px">
+            <div style="display:flex;align-items:center;gap:10px"><span style="font:800 12px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">"◆ SETTLEMENT & RECOVERY"</span><span style="flex:1;height:1px;background:repeating-linear-gradient(90deg,oklch(0.4 0.03 60 / .6) 0 4px,transparent 4px 8px)"></span></div>
+            {body}
+        </section>
+    }.into_any()
+}
+
 #[component]
 pub fn PurchasesView() -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let state = RwSignal::new(PurchasesState::Loading);
+    let settlement_state = RwSignal::new(SettlementHistoryState::Loading);
     let filter = RwSignal::new(PurchaseFilter::All);
     let request_generation = RwSignal::new(0_u64);
+    let history_refresh = RwSignal::new(0_u64);
     let selected_filter = Signal::derive(move || purchase_filter_id(filter.get()).to_string());
     let select_filter = Callback::new(move |id: String| {
         if let Some(next) = purchase_filter_from_id(&id) {
             filter.set(next);
         }
     });
+    let refresh_settlements = Callback::new(move |()| {
+        history_refresh.update(|generation| *generation = generation.wrapping_add(1));
+    });
 
     #[cfg(feature = "web")]
-    state.set(PurchasesState::WebUnavailable);
+    {
+        state.set(PurchasesState::WebUnavailable);
+        settlement_state.set(SettlementHistoryState::WebUnavailable);
+    }
 
     #[cfg(not(feature = "web"))]
-    Effect::new(move |_| {
-        let account = auth.npub.get().unwrap_or_default();
-        let generation = request_generation.get_untracked().wrapping_add(1);
-        request_generation.set(generation);
+    {
+        let load_auth = auth.clone();
+        Effect::new(move |_| {
+            let _ = history_refresh.get();
+            let account = load_auth.npub.get().unwrap_or_default();
+            let generation = request_generation.get_untracked().wrapping_add(1);
+            request_generation.set(generation);
 
-        match initial_availability(false, !account.is_empty()) {
-            InitialAvailability::AccountRequired => {
-                state.set(PurchasesState::AccountRequired);
-                return;
+            match initial_availability(false, !account.is_empty()) {
+                InitialAvailability::AccountRequired => {
+                    state.set(PurchasesState::AccountRequired);
+                    settlement_state.set(SettlementHistoryState::AccountRequired);
+                    return;
+                }
+                InitialAvailability::Load => {
+                    state.set(PurchasesState::Loading);
+                    settlement_state.set(SettlementHistoryState::Loading);
+                }
+                InitialAvailability::WebUnavailable => return,
             }
-            InitialAvailability::Load => state.set(PurchasesState::Loading),
-            InitialAvailability::WebUnavailable => return,
-        }
 
-        spawn_local(async move {
-            let result = invoke_get_purchase_records().await;
-            if !should_apply_response(generation, request_generation.get_untracked()) {
-                return;
-            }
-            match result {
-                Ok(records) if records.is_empty() => state.set(PurchasesState::Empty),
-                Ok(records) => state.set(PurchasesState::Ready(records)),
-                Err(_) => state.set(PurchasesState::Error),
-            }
+            spawn_local(async move {
+                let result = invoke_get_purchase_records().await;
+                if !should_apply_response(generation, request_generation.get_untracked()) {
+                    return;
+                }
+                match result {
+                    Ok(records) if records.is_empty() => state.set(PurchasesState::Empty),
+                    Ok(records) => state.set(PurchasesState::Ready(records)),
+                    Err(_) => state.set(PurchasesState::Error),
+                }
+            });
+            spawn_local(async move {
+                let result = invoke_settlement_history().await;
+                if !should_apply_response(generation, request_generation.get_untracked()) {
+                    return;
+                }
+                match result {
+                    Ok(records) if records.is_empty() => {
+                        settlement_state.set(SettlementHistoryState::Empty)
+                    }
+                    Ok(records) => settlement_state.set(SettlementHistoryState::Ready(records)),
+                    Err(_) => settlement_state.set(SettlementHistoryState::Error),
+                }
+            });
         });
-    });
+    }
 
     view! {
         <section class="v2-purchases">
             <header class="v2-purchases-hero v2-panel-glass">
                 <p class="v2-store-kicker">"Account records"</p>
                 <h1 class="v2-display">"Purchases and access"</h1>
-                <p>"Durable purchases and promotion claims recorded for your active account."</p>
+                <p>"Durable acquisitions, resumable split payments, and account-scoped recovery records."</p>
             </header>
+
+            {move || settlement_history_view(
+                settlement_state.get(),
+                auth.npub.get().unwrap_or_default(),
+                refresh_settlements,
+            )}
 
             {move || match state.get() {
                 PurchasesState::Loading => view! {

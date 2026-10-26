@@ -612,6 +612,18 @@ impl GameListing {
                     .to_string(),
             ));
         }
+        for accepted in &listing.accepted_terms {
+            specs.push((
+                format!("adp_terms:{}", accepted.operator_pubkey),
+                accepted.terms_event_id.clone(),
+            ));
+        }
+        if !listing.malformed_accepted_terms_tags.is_empty() {
+            specs.push((
+                "malformed_adp_terms".into(),
+                listing.malformed_accepted_terms_tags.len().to_string(),
+            ));
+        }
 
         GameListing {
             id: listing.id,

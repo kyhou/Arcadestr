@@ -1108,6 +1108,8 @@ pub struct PublishAdpListingRequest {
     pub fulfillment_mode: FulfillmentMode,
     pub operator_url: Option<String>,
     pub servers: Vec<String>,
+    #[serde(default)]
+    pub accepted_terms: Vec<arcadestr_core::adp_settlement::AcceptedTermsRef>,
     pub file_path: Option<String>,
     /// Opaque backend-selected build reference for the native publication path.
     #[serde(default)]
@@ -1186,6 +1188,14 @@ pub struct AdpServerAnnouncement {
     pub name: Option<String>,
     pub supported_adp: Option<String>,
     pub contact: Option<String>,
+    #[serde(default)]
+    pub settlement_version: Option<u16>,
+    #[serde(default)]
+    pub split_enabled: bool,
+    #[serde(default)]
+    pub terms_event_id: Option<String>,
+    #[serde(default)]
+    pub legacy_paid_sales: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1241,6 +1251,108 @@ pub struct ConfirmPurchaseResponse {
     pub receipt: serde_json::Value,
     pub download_token: String,
     pub token_expires_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct StartSplitPurchaseRequest {
+    pub publisher_npub: String,
+    pub listing_id: String,
+    pub server_url: String,
+    pub refund_lud16: String,
+    pub purchase_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StartSplitPurchaseResponse {
+    pub quote_id: String,
+    pub quote_event: serde_json::Value,
+    pub quote: arcadestr_core::adp_settlement::SignedQuote,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SplitQuoteRequest {
+    pub server_url: String,
+    pub quote_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SplitInvoiceResponse {
+    pub quote_id: String,
+    pub attempt_id: String,
+    pub leg_id: String,
+    pub amount_msat: u64,
+    pub payment_hash: String,
+    pub bolt11: String,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SubmitSplitPaymentRequest {
+    pub server_url: String,
+    pub quote_id: String,
+    pub attempt_id: String,
+    pub preimage: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SplitSettlementResponse {
+    pub state: String,
+    pub settled_leg: Option<String>,
+    pub receipt: Option<serde_json::Value>,
+    pub download_token: Option<String>,
+    pub token_expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SettlementHistoryItem {
+    pub quote_id: String,
+    pub processor_url: String,
+    pub listing_event_id: String,
+    pub state: String,
+    pub failure_at: Option<u64>,
+    pub receipt: Option<serde_json::Value>,
+    #[serde(default)]
+    pub recovery: Vec<RecoveryHistoryItem>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RecoveryHistoryItem {
+    pub leg_id: String,
+    pub state: String,
+    pub principal_msat: u64,
+    pub due_at: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ReplaceSplitRefundDestinationRequest {
+    pub server_url: String,
+    pub quote_id: String,
+    pub refund_lud16: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SplitRefundRequest {
+    pub server_url: String,
+    pub quote_id: String,
+    pub leg_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ConfirmSplitRefundRequest {
+    pub server_url: String,
+    pub quote_id: String,
+    pub leg_id: String,
+    pub attempt_id: String,
+    pub preimage: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SplitRefundInvoiceResponse {
+    pub attempt_id: String,
+    pub leg_id: String,
+    pub amount_msat: u64,
+    pub bolt11: String,
+    pub expires_at: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1634,6 +1746,160 @@ pub async fn invoke_confirm_purchase(
     _request: ConfirmPurchaseRequest,
 ) -> Result<ConfirmPurchaseResponse, String> {
     Err("ADP purchase confirmation is only available in desktop builds.".to_string())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_start_split_purchase(
+    request: StartSplitPurchaseRequest,
+) -> Result<StartSplitPurchaseResponse, String> {
+    crate::tauri_invoke::invoke(
+        "start_split_purchase",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_start_split_purchase(
+    _request: StartSplitPurchaseRequest,
+) -> Result<StartSplitPurchaseResponse, String> {
+    Err("Split settlement is only available in desktop builds.".to_string())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_next_split_invoice(
+    request: SplitQuoteRequest,
+) -> Result<SplitInvoiceResponse, String> {
+    crate::tauri_invoke::invoke(
+        "next_split_invoice",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_next_split_invoice(
+    _request: SplitQuoteRequest,
+) -> Result<SplitInvoiceResponse, String> {
+    Err("Split settlement is only available in desktop builds.".to_string())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_submit_split_payment(
+    request: SubmitSplitPaymentRequest,
+) -> Result<SplitSettlementResponse, String> {
+    crate::tauri_invoke::invoke(
+        "submit_split_payment",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_submit_split_payment(
+    _request: SubmitSplitPaymentRequest,
+) -> Result<SplitSettlementResponse, String> {
+    Err("Split settlement is only available in desktop builds.".to_string())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_settlement_history() -> Result<Vec<SettlementHistoryItem>, String> {
+    crate::tauri_invoke::invoke("settlement_history", serde_json::json!({})).await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_settlement_history() -> Result<Vec<SettlementHistoryItem>, String> {
+    Err("Settlement history is only available in desktop builds.".to_string())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_refresh_settlement(
+    request: SplitQuoteRequest,
+) -> Result<serde_json::Value, String> {
+    crate::tauri_invoke::invoke(
+        "refresh_settlement",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_refresh_settlement(
+    _request: SplitQuoteRequest,
+) -> Result<serde_json::Value, String> {
+    Err("Settlement recovery is only available in desktop builds.".to_string())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_replace_split_refund_destination(
+    request: ReplaceSplitRefundDestinationRequest,
+) -> Result<serde_json::Value, String> {
+    crate::tauri_invoke::invoke(
+        "replace_split_refund_destination",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_replace_split_refund_destination(
+    _request: ReplaceSplitRefundDestinationRequest,
+) -> Result<serde_json::Value, String> {
+    Err("Settlement recovery is only available in desktop builds.".to_string())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_prepare_split_recovery(
+    request: SplitQuoteRequest,
+) -> Result<serde_json::Value, String> {
+    crate::tauri_invoke::invoke(
+        "prepare_split_recovery",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_prepare_split_recovery(
+    _request: SplitQuoteRequest,
+) -> Result<serde_json::Value, String> {
+    Err("Settlement recovery is only available in desktop builds.".to_string())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_prepare_split_refund(
+    request: SplitRefundRequest,
+) -> Result<SplitRefundInvoiceResponse, String> {
+    crate::tauri_invoke::invoke(
+        "prepare_split_refund",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_prepare_split_refund(
+    _request: SplitRefundRequest,
+) -> Result<SplitRefundInvoiceResponse, String> {
+    Err("Settlement recovery is only available in desktop builds.".to_string())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_confirm_split_refund(
+    request: ConfirmSplitRefundRequest,
+) -> Result<serde_json::Value, String> {
+    crate::tauri_invoke::invoke(
+        "confirm_split_refund",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_confirm_split_refund(
+    _request: ConfirmSplitRefundRequest,
+) -> Result<serde_json::Value, String> {
+    Err("Settlement recovery is only available in desktop builds.".to_string())
 }
 
 #[cfg(not(feature = "web"))]
@@ -2295,6 +2561,7 @@ mod tests {
             fulfillment_mode: FulfillmentMode::Delegate,
             operator_url: Some("https://operator.example.com".to_string()),
             servers: vec!["https://dist.example.com".to_string()],
+            accepted_terms: Vec::new(),
             file_path: None,
             selected_build: None,
             existing_file_hash: Some("hash".to_string()),

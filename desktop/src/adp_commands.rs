@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arcadestr_core::adp_client::{
-    AdpClient, AdpServerInfo, EntitlementClaimRequest as CoreEntitlementClaimRequest,
-    ProvisionResponse, PurchaseConfirmRequest as CorePurchaseConfirmRequest,
-    PurchaseConfirmResponse as CorePurchaseConfirmResponse, UploadResponse,
+    AdpClient, AdpServerInfo, CreateSettlementQuoteRequest as CoreCreateSettlementQuoteRequest,
+    EntitlementClaimRequest as CoreEntitlementClaimRequest, ProvisionResponse,
+    PurchaseConfirmRequest as CorePurchaseConfirmRequest,
+    PurchaseConfirmResponse as CorePurchaseConfirmResponse, SettlementProofRequest, UploadResponse,
 };
 use arcadestr_core::adp_discovery::{
     discover_adp_servers as discover_adp_servers_core, AdpServerAnnouncement,
@@ -84,6 +85,8 @@ pub struct PublishAdpListingRequest {
     pub fulfillment_mode: FulfillmentMode,
     pub operator_url: Option<String>,
     pub servers: Vec<String>,
+    #[serde(default)]
+    pub accepted_terms: Vec<arcadestr_core::adp_settlement::AcceptedTermsRef>,
     /// Legacy transport field retained for request compatibility. Publication
     /// rejects it: only a backend-issued `selected_build` may supply bytes.
     pub file_path: Option<String>,
@@ -747,6 +750,98 @@ pub struct ConfirmPurchaseResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct StartSplitPurchaseRequest {
+    pub publisher_npub: String,
+    pub listing_id: String,
+    pub server_url: String,
+    pub refund_lud16: String,
+    pub purchase_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StartSplitPurchaseResponse {
+    pub quote_id: String,
+    pub quote_event: nostr::Event,
+    pub quote: arcadestr_core::adp_settlement::SignedQuote,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SplitQuoteRequest {
+    pub server_url: String,
+    pub quote_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SplitInvoiceResponse {
+    pub quote_id: String,
+    pub attempt_id: String,
+    pub leg_id: String,
+    pub amount_msat: u64,
+    pub payment_hash: String,
+    pub bolt11: String,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubmitSplitPaymentRequest {
+    pub server_url: String,
+    pub quote_id: String,
+    pub attempt_id: String,
+    pub preimage: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SplitSettlementResponse {
+    pub state: String,
+    pub settled_leg: Option<String>,
+    pub receipt: Option<nostr::Event>,
+    pub download_token: Option<String>,
+    pub token_expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryHistoryItem {
+    pub leg_id: String,
+    pub state: String,
+    pub principal_msat: u64,
+    pub due_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SettlementHistoryItem {
+    pub quote_id: String,
+    pub processor_url: String,
+    pub listing_event_id: String,
+    pub state: String,
+    pub failure_at: Option<u64>,
+    pub receipt: Option<nostr::Event>,
+    pub recovery: Vec<RecoveryHistoryItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplaceSplitRefundDestinationRequest {
+    pub server_url: String,
+    pub quote_id: String,
+    pub refund_lud16: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SplitRefundRequest {
+    pub server_url: String,
+    pub quote_id: String,
+    pub leg_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfirmSplitRefundRequest {
+    pub server_url: String,
+    pub quote_id: String,
+    pub leg_id: String,
+    pub attempt_id: String,
+    pub preimage: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ClaimEntitlementRequest {
     pub publisher_npub: String,
     pub listing_id: String,
@@ -1281,6 +1376,7 @@ pub async fn confirm_purchase(
                 zap_receipt_event: None,
                 bolt11: Some(request.bolt11),
                 preimage: Some(request.preimage),
+                quote_id: None,
             },
         )
         .await
@@ -1296,6 +1392,574 @@ pub async fn confirm_purchase(
         &preimage,
     )
     .await
+}
+
+async fn ensure_purchase_account_current(
+    state: &State<'_, AppState>,
+    expected: nostr::PublicKey,
+) -> Result<(), String> {
+    let auth = { state.auth.lock().await.clone() };
+    let signer = auth
+        .signer()
+        .ok_or_else(|| "not authenticated".to_string())?;
+    let current = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    if current != expected {
+        return Err("active account changed while settlement was in progress".into());
+    }
+    Ok(())
+}
+
+async fn fetch_terms_events(
+    state: &State<'_, AppState>,
+    listing: &nostr::Event,
+) -> Result<Vec<nostr::Event>, String> {
+    let mut ids = Vec::new();
+    let mut operators = BTreeSet::new();
+    for tag in listing.tags.iter() {
+        let values = tag.clone().to_vec();
+        if values.first().is_none_or(|name| name != "adp_terms") {
+            continue;
+        }
+        let [_, operator, event_id] = values.as_slice() else {
+            return Err("listing contains a malformed adp_terms reference".into());
+        };
+        if !operators.insert(operator.clone()) {
+            return Err("listing accepts conflicting terms for one operator".into());
+        }
+        ids.push(
+            nostr::EventId::from_hex(event_id).map_err(|_| "invalid terms event id".to_string())?,
+        );
+    }
+    if ids.is_empty() {
+        return Err("listing does not opt into split settlement".into());
+    }
+    let relay_client = {
+        let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+        let manager = relay_manager.lock().await;
+        manager.get_client_arc()
+    };
+    let timeout = std::time::Duration::from_secs(10);
+    let mut events = Vec::new();
+    for id in ids {
+        let fetched = tokio::time::timeout(
+            timeout,
+            relay_client.fetch_events(nostr::Filter::new().id(id), timeout),
+        )
+        .await
+        .map_err(|_| "terms lookup timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+        let event = fetched
+            .into_iter()
+            .find(|event| event.id == id)
+            .ok_or_else(|| format!("accepted terms event {id} is unavailable"))?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+#[tauri::command]
+pub async fn start_split_purchase(
+    request: StartSplitPurchaseRequest,
+    state: State<'_, AppState>,
+) -> Result<StartSplitPurchaseResponse, String> {
+    let auth = { state.auth.lock().await.clone() };
+    let signer = auth
+        .signer()
+        .ok_or_else(|| "not authenticated".to_string())?;
+    let buyer = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let coordinate = listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
+    let listing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
+    let terms_events = fetch_terms_events(&state, &listing).await?;
+    let endpoint = resolve_lud16(state.http_client.as_ref(), &request.refund_lud16)
+        .await
+        .map_err(|error| error.to_string())?;
+    let purchase_id = request
+        .purchase_id
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let client = AdpClient::new(request.server_url.clone(), Arc::clone(&state.http_client));
+    let response = client
+        .create_settlement_quote(
+            signer,
+            CoreCreateSettlementQuoteRequest {
+                purchase_id: purchase_id.clone(),
+                listing_event: listing.clone(),
+                terms_events,
+                refund_destination: arcadestr_core::adp_settlement::RefundDestination {
+                    endpoint: request.refund_lud16,
+                    min_sendable_msat: endpoint.min_sendable_msat,
+                    max_sendable_msat: endpoint.max_sendable_msat,
+                },
+                zap_requests: std::collections::HashMap::new(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let plaintext = signer
+        .nip44_decrypt(&response.quote.pubkey, &response.quote.content)
+        .await
+        .map_err(|error| format!("quote decryption failed: {error}"))?;
+    let quote = arcadestr_core::adp_settlement::verify_quote_event(&response.quote, &plaintext)
+        .map_err(|error| error.to_string())?;
+    if quote.quote_id != purchase_id
+        || quote.buyer_pubkey != buyer.to_hex()
+        || quote.listing_event_id != listing.id.to_hex()
+        || quote.state != arcadestr_core::adp_settlement::QuoteState::Active
+    {
+        return Err("processor quote does not match purchase request".into());
+    }
+    ensure_purchase_account_current(&state, buyer).await?;
+    let repository = arcadestr_core::settlement_repository::SettlementRepository::new(
+        state.database.pool().clone(),
+    );
+    repository
+        .save_quote(
+            &buyer.to_hex(),
+            &request.server_url,
+            &serde_json::to_string(&response.quote).map_err(|error| error.to_string())?,
+            &quote,
+            u64::try_from(now_unix_i64()?).map_err(|_| "system clock before epoch".to_string())?,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(StartSplitPurchaseResponse {
+        quote_id: purchase_id,
+        quote_event: response.quote,
+        quote,
+    })
+}
+
+#[tauri::command]
+pub async fn next_split_invoice(
+    request: SplitQuoteRequest,
+    state: State<'_, AppState>,
+) -> Result<SplitInvoiceResponse, String> {
+    let auth = { state.auth.lock().await.clone() };
+    let signer = auth
+        .signer()
+        .ok_or_else(|| "not authenticated".to_string())?;
+    let buyer = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let repository = arcadestr_core::settlement_repository::SettlementRepository::new(
+        state.database.pool().clone(),
+    );
+    let stored = repository
+        .load(&buyer.to_hex(), &request.quote_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "settlement is not stored for this account".to_string())?;
+    if !arcadestr_core::settlement_repository::account_can_continue(
+        &stored.account_pubkey,
+        Some(&buyer.to_hex()),
+    ) {
+        return Err("active account cannot continue this settlement".into());
+    }
+    let client = AdpClient::new(request.server_url, Arc::clone(&state.http_client));
+    let invoice = client
+        .settlement_next_invoice(signer, &request.quote_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    ensure_purchase_account_current(&state, buyer).await?;
+    let encrypted = signer
+        .nip44_encrypt(
+            &buyer,
+            &serde_json::to_string(&invoice).map_err(|error| error.to_string())?,
+        )
+        .await
+        .map_err(|error| format!("invoice persistence encryption failed: {error}"))?;
+    repository
+        .record_invoice_attempt(
+            &buyer.to_hex(),
+            &request.quote_id,
+            &invoice.leg_id,
+            &invoice.attempt_id,
+            encrypted.as_bytes(),
+            &invoice.payment_hash,
+            "disclosed",
+            u64::try_from(now_unix_i64()?).map_err(|_| "system clock before epoch".to_string())?,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(SplitInvoiceResponse {
+        quote_id: invoice.quote_id,
+        attempt_id: invoice.attempt_id,
+        leg_id: invoice.leg_id,
+        amount_msat: invoice.amount_msat,
+        payment_hash: invoice.payment_hash,
+        bolt11: invoice.bolt11,
+        expires_at: invoice.expires_at,
+    })
+}
+
+#[tauri::command]
+pub async fn submit_split_payment(
+    request: SubmitSplitPaymentRequest,
+    state: State<'_, AppState>,
+) -> Result<SplitSettlementResponse, String> {
+    let auth = { state.auth.lock().await.clone() };
+    let signer = auth
+        .signer()
+        .ok_or_else(|| "not authenticated".to_string())?;
+    let buyer = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let repository = arcadestr_core::settlement_repository::SettlementRepository::new(
+        state.database.pool().clone(),
+    );
+    let stored = repository
+        .load(&buyer.to_hex(), &request.quote_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "settlement is not stored for this account".to_string())?;
+    if !arcadestr_core::settlement_repository::account_can_continue(
+        &stored.account_pubkey,
+        Some(&buyer.to_hex()),
+    ) {
+        return Err("active account cannot continue this settlement".into());
+    }
+    let client = AdpClient::new(request.server_url.clone(), Arc::clone(&state.http_client));
+    let response = client
+        .submit_settlement_proof(
+            signer,
+            &request.quote_id,
+            SettlementProofRequest {
+                attempt_id: request.attempt_id.clone(),
+                preimage: request.preimage,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    ensure_purchase_account_current(&state, buyer).await?;
+    repository
+        .update_invoice_state(
+            &buyer.to_hex(),
+            &request.attempt_id,
+            "settled",
+            u64::try_from(now_unix_i64()?).map_err(|_| "system clock before epoch".to_string())?,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(receipt) = &response.receipt {
+        persist_split_receipt(
+            &state,
+            signer,
+            buyer,
+            &stored,
+            receipt,
+            response
+                .download_token
+                .as_deref()
+                .ok_or_else(|| "settled response omitted download token".to_string())?,
+            response
+                .token_expires_at
+                .ok_or_else(|| "settled response omitted token expiry".to_string())?,
+        )
+        .await?;
+        repository
+            .mark_receipt(
+                &buyer.to_hex(),
+                &request.quote_id,
+                &serde_json::to_string(receipt).map_err(|error| error.to_string())?,
+                u64::try_from(now_unix_i64()?)
+                    .map_err(|_| "system clock before epoch".to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(SplitSettlementResponse {
+        state: response.state,
+        settled_leg: response.settled_leg,
+        receipt: response.receipt,
+        download_token: response.download_token,
+        token_expires_at: response.token_expires_at,
+    })
+}
+
+#[tauri::command]
+pub async fn settlement_history(
+    state: State<'_, AppState>,
+) -> Result<Vec<SettlementHistoryItem>, String> {
+    let auth = { state.auth.lock().await.clone() };
+    let signer = auth
+        .signer()
+        .ok_or_else(|| "not authenticated".to_string())?;
+    let buyer = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let account = buyer.to_hex();
+    let repository = arcadestr_core::settlement_repository::SettlementRepository::new(
+        state.database.pool().clone(),
+    );
+    let settlements = repository
+        .list_for_account(&account)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut history = Vec::with_capacity(settlements.len());
+    for item in settlements {
+        let recovery = repository
+            .list_recovery_for_quote(&account, &item.quote_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|obligation| RecoveryHistoryItem {
+                leg_id: obligation.leg_id,
+                state: obligation.state,
+                principal_msat: obligation.principal_msat,
+                due_at: obligation.due_at,
+            })
+            .collect();
+        history.push(SettlementHistoryItem {
+            quote_id: item.quote_id,
+            processor_url: item.processor_url,
+            listing_event_id: item.listing_event_id,
+            state: item.state,
+            failure_at: item.failure_at,
+            receipt: item
+                .receipt_event_json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|error| error.to_string())?,
+            recovery,
+        });
+    }
+    Ok(history)
+}
+
+#[tauri::command]
+pub async fn refresh_settlement(
+    request: SplitQuoteRequest,
+    state: State<'_, AppState>,
+) -> Result<arcadestr_core::adp_client::SettlementStatusResponse, String> {
+    let auth = { state.auth.lock().await.clone() };
+    let signer = auth
+        .signer()
+        .ok_or_else(|| "not authenticated".to_string())?;
+    let buyer = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let client = AdpClient::new(request.server_url, Arc::clone(&state.http_client));
+    let status = client
+        .settlement_status(signer, &request.quote_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    ensure_purchase_account_current(&state, buyer).await?;
+    arcadestr_core::settlement_repository::SettlementRepository::new(state.database.pool().clone())
+        .update_status(
+            &buyer.to_hex(),
+            &request.quote_id,
+            status.state,
+            status.failure_at,
+            u64::try_from(now_unix_i64()?).map_err(|_| "system clock before epoch".to_string())?,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn replace_split_refund_destination(
+    request: ReplaceSplitRefundDestinationRequest,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let auth = { state.auth.lock().await.clone() };
+    let signer = auth
+        .signer()
+        .ok_or_else(|| "not authenticated".to_string())?;
+    let buyer = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let endpoint = resolve_lud16(state.http_client.as_ref(), &request.refund_lud16)
+        .await
+        .map_err(|error| error.to_string())?;
+    let client = AdpClient::new(request.server_url, Arc::clone(&state.http_client));
+    let response = client
+        .replace_refund_destination(
+            signer,
+            &request.quote_id,
+            arcadestr_core::adp_settlement::RefundDestination {
+                endpoint: request.refund_lud16,
+                min_sendable_msat: endpoint.min_sendable_msat,
+                max_sendable_msat: endpoint.max_sendable_msat,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    ensure_purchase_account_current(&state, buyer).await?;
+    Ok(response)
+}
+
+#[tauri::command]
+pub async fn prepare_split_recovery(
+    request: SplitQuoteRequest,
+    state: State<'_, AppState>,
+) -> Result<arcadestr_core::adp_client::RecoveryPreparationResponse, String> {
+    let auth = { state.auth.lock().await.clone() };
+    let signer = auth
+        .signer()
+        .ok_or_else(|| "not authenticated".to_string())?;
+    let buyer = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let client = AdpClient::new(request.server_url, Arc::clone(&state.http_client));
+    let mut response = client
+        .prepare_recovery(signer, &request.quote_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.claimant == "buyer" {
+        let plaintext = response
+            .plaintext
+            .clone()
+            .ok_or_else(|| "fallback recovery omitted plaintext".to_string())?;
+        let processor = nostr::PublicKey::from_hex(&response.evidence.processor_pubkey)
+            .map_err(|_| "recovery evidence has invalid processor".to_string())?;
+        let encrypted = signer
+            .nip44_encrypt(&processor, &plaintext)
+            .await
+            .map_err(|error| format!("recovery encryption failed: {error}"))?;
+        let event = signer
+            .sign_event(
+                nostr::EventBuilder::new(
+                    nostr::Kind::Custom(arcadestr_core::adp_settlement::RECOVERY_KIND),
+                    encrypted,
+                )
+                .build(buyer),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        client
+            .submit_recovery(signer, &request.quote_id, event.clone(), plaintext)
+            .await
+            .map_err(|error| error.to_string())?;
+        response.event = Some(event);
+    }
+    ensure_purchase_account_current(&state, buyer).await?;
+    let event_json = response
+        .event
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let due_at = response
+        .evidence
+        .failure_at
+        .checked_add(arcadestr_core::adp_settlement::REFUND_DUE_SECS)
+        .ok_or_else(|| "refund deadline overflow".to_string())?;
+    let stored = arcadestr_core::settlement_repository::SettlementRepository::new(
+        state.database.pool().clone(),
+    );
+    let quote_record = stored
+        .load(&buyer.to_hex(), &request.quote_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "settlement is not stored".to_string())?;
+    let quote_event: nostr::Event =
+        serde_json::from_str(&quote_record.quote_event_json).map_err(|error| error.to_string())?;
+    let quote_plaintext = signer
+        .nip44_decrypt(&quote_event.pubkey, &quote_event.content)
+        .await
+        .map_err(|error| error.to_string())?;
+    let quote = arcadestr_core::adp_settlement::verify_quote_event(&quote_event, &quote_plaintext)
+        .map_err(|error| error.to_string())?;
+    for leg_id in &response.evidence.paid_leg_ids {
+        let leg = quote
+            .legs
+            .iter()
+            .find(|leg| &leg.leg_id == leg_id)
+            .ok_or_else(|| "recovery names an unknown paid leg".to_string())?;
+        stored
+            .save_recovery_obligation(
+                &buyer.to_hex(),
+                &request.quote_id,
+                leg_id,
+                leg.amount_msat,
+                due_at,
+                event_json.as_deref(),
+                "refund_owed",
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(response)
+}
+
+#[tauri::command]
+pub async fn prepare_split_refund(
+    request: SplitRefundRequest,
+    state: State<'_, AppState>,
+) -> Result<arcadestr_core::adp_client::RefundInvoiceResponse, String> {
+    let auth = { state.auth.lock().await.clone() };
+    let signer = auth
+        .signer()
+        .ok_or_else(|| "not authenticated".to_string())?;
+    let account = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let client = AdpClient::new(request.server_url, Arc::clone(&state.http_client));
+    let response = client
+        .prepare_refund(signer, &request.quote_id, &request.leg_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    ensure_purchase_account_current(&state, account).await?;
+    arcadestr_core::settlement_repository::SettlementRepository::new(state.database.pool().clone())
+        .update_recovery_state(
+            &account.to_hex(),
+            &request.quote_id,
+            &request.leg_id,
+            "initiated",
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(response)
+}
+
+#[tauri::command]
+pub async fn confirm_split_refund(
+    request: ConfirmSplitRefundRequest,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let auth = { state.auth.lock().await.clone() };
+    let signer = auth
+        .signer()
+        .ok_or_else(|| "not authenticated".to_string())?;
+    let account = signer
+        .get_public_key()
+        .await
+        .map_err(|error| error.to_string())?;
+    let client = AdpClient::new(request.server_url, Arc::clone(&state.http_client));
+    let response = client
+        .confirm_refund(
+            signer,
+            &request.quote_id,
+            &request.leg_id,
+            &request.attempt_id,
+            &request.preimage,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    ensure_purchase_account_current(&state, account).await?;
+    arcadestr_core::settlement_repository::SettlementRepository::new(state.database.pool().clone())
+        .update_recovery_state(
+            &account.to_hex(),
+            &request.quote_id,
+            &request.leg_id,
+            "verified",
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(response)
 }
 
 #[tauri::command]
@@ -1599,6 +2263,100 @@ async fn persist_purchase_confirmation(
         download_token: response.download_token,
         token_expires_at: response.token_expires_at,
     })
+}
+
+async fn persist_split_receipt(
+    state: &State<'_, AppState>,
+    signer: &dyn NostrSigner,
+    buyer: nostr::PublicKey,
+    stored: &arcadestr_core::settlement_repository::StoredSettlement,
+    receipt_event: &nostr::Event,
+    download_token: &str,
+    token_expires_at: i64,
+) -> Result<(), String> {
+    let quote_event: nostr::Event = serde_json::from_str(&stored.quote_event_json)
+        .map_err(|error| format!("stored quote event is corrupt: {error}"))?;
+    let plaintext = signer
+        .nip44_decrypt(&quote_event.pubkey, &quote_event.content)
+        .await
+        .map_err(|error| format!("quote decryption failed: {error}"))?;
+    let quote = arcadestr_core::adp_settlement::verify_quote_event(&quote_event, &plaintext)
+        .map_err(|error| error.to_string())?;
+    let parsed = arcadestr_core::purchases::parse_receipt_event(receipt_event)
+        .map_err(|error| error.to_string())?;
+    let aggregate = parsed
+        .aggregate
+        .as_ref()
+        .ok_or_else(|| "split settlement returned a legacy receipt".to_string())?;
+    if aggregate.quote_event_id != quote_event.id
+        || aggregate.listing_event_id.to_hex() != quote.listing_event_id
+        || aggregate.processor_pubkey.to_hex() != quote.processor_pubkey
+        || aggregate.gross_msat != quote.gross_msat
+        || aggregate.legs.len() != quote.legs.len()
+    {
+        return Err("aggregate receipt does not match the stored quote".into());
+    }
+    for (proof, leg) in aggregate.legs.iter().zip(&quote.legs) {
+        if proof.leg_id != leg.leg_id
+            || proof.role != leg.role
+            || proof.recipient_pubkey != leg.recipient_pubkey
+            || proof.amount_msat != leg.amount_msat
+            || proof.accepted_terms_id != leg.accepted_terms_id
+        {
+            return Err("aggregate receipt leg differs from signed quote".into());
+        }
+    }
+    let listing_event = fetch_listing_event_by_coordinate(state, &quote.listing_coordinate).await?;
+    if listing_event.id.to_hex() != quote.listing_event_id {
+        return Err("current listing differs from settlement snapshot".into());
+    }
+    let authorization = if receipt_event.pubkey == listing_event.pubkey {
+        None
+    } else {
+        let root = parsed
+            .authorization
+            .ok_or_else(|| "delegated receipt is missing authorization".to_string())?;
+        let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+        let relay_manager = relay_manager.lock().await;
+        Some(
+            arcadestr_core::authorization::discover_authorization(
+                &relay_manager,
+                root,
+                listing_event.pubkey,
+            )
+            .await
+            .map_err(|error| format!("receipt authorization unavailable or invalid: {error}"))?,
+        )
+    };
+    let receipt = arcadestr_core::purchases::parse_and_validate_receipt_with_authorization(
+        receipt_event,
+        &buyer.to_hex(),
+        authorization.as_ref(),
+        arcadestr_core::purchases::ReceiptEvidence {
+            bolt11: None,
+            preimage: None,
+            zap_receipts: &[],
+            lsp_pubkey: None,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    ensure_purchase_account_current(state, buyer).await?;
+    state
+        .purchases
+        .upsert_receipt(&receipt)
+        .await
+        .map_err(|error| error.to_string())?;
+    DownloadTokensRepository::new(state.database.pool().clone())
+        .upsert(&DownloadToken {
+            buyer_pubkey: buyer.to_hex(),
+            game_coordinate: quote.listing_coordinate,
+            server_url: stored.processor_url.clone(),
+            token: download_token.to_string(),
+            expires_at: token_expires_at,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn publisher_hex_from_npub(publisher_npub: &str) -> Result<String, String> {
@@ -2378,7 +3136,7 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
         &existing_listing_tags,
         !fulfillment_authorizations.is_empty(),
     );
-    let listing_input = AdpListingInput {
+    let mut listing_input = AdpListingInput {
         d_tag: game_d_tag.clone(),
         title: request.title.clone(),
         description: request.description.clone(),
@@ -2400,6 +3158,29 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
         nip94_event_id: request.nip94_event_id.clone(),
         preserved_tags,
     };
+    if !request.accepted_terms.is_empty() {
+        let mut operators = Vec::new();
+        for server in &request.servers {
+            let info = AdpClient::new(server.clone(), Arc::clone(&state.http_client))
+                .well_known()
+                .await
+                .map_err(|error| PublishAdpListingError::Other {
+                    message: error.to_string(),
+                })?;
+            operators.push(arcadestr_core::adp_settlement::ServerOperator {
+                url: server.clone(),
+                operator_pubkey: info.pubkey,
+            });
+        }
+        arcadestr_core::adp_publish::apply_managed_adp_terms(
+            &mut listing_input,
+            &operators,
+            &request.accepted_terms,
+        )
+        .map_err(|error| PublishAdpListingError::Other {
+            message: error.to_string(),
+        })?;
+    }
     let listing_builder = build_adp_listing_event_builder(AdpListingPublishInput {
         listing: &listing_input,
         launch_tier: extension.launch_tier.as_ref(),
@@ -4726,6 +5507,7 @@ mod tests {
             fulfillment_mode: FulfillmentMode::None,
             operator_url: None,
             servers: Vec::new(),
+            accepted_terms: Vec::new(),
             file_path: None,
             selected_build: None,
             existing_file_hash: None,
@@ -4879,6 +5661,7 @@ mod tests {
             fulfillment_mode: FulfillmentMode::Direct,
             operator_url: None,
             servers: servers.iter().map(|server| (*server).to_owned()).collect(),
+            accepted_terms: Vec::new(),
             file_path: None,
             selected_build: None,
             existing_file_hash: hash.map(str::to_owned),
@@ -6069,6 +6852,7 @@ mod tests {
             fulfillment_mode: FulfillmentMode::Delegate,
             operator_url: Some(server_url.clone()),
             servers: vec![server_url.clone()],
+            accepted_terms: Vec::new(),
             file_path: None,
             selected_build: Some(BuildSelectionRef {
                 selection_id: hashed.selection_id,

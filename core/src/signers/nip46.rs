@@ -11,6 +11,9 @@ use tracing::{debug, error, info};
 #[cfg(not(target_arch = "wasm32"))]
 use nostr::nips::nip46::NostrConnectURI;
 
+#[cfg(not(target_arch = "wasm32"))]
+use nostr::signer::NostrSigner as SdkNostrSigner;
+
 /// Directory for storing NIP-46 client keys.
 /// This is set dynamically at runtime via `set_keys_dir()`.
 static KEYS_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -149,22 +152,44 @@ impl From<nostr::signer::SignerError> for SignerError {
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 pub trait NostrSigner: Send + Sync {
-    /// Returns the signer's public key.
     async fn get_public_key(&self) -> Result<PublicKey, SignerError>;
-
-    /// Signs an unsigned event and returns the signed event.
     async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SignerError>;
+    async fn nip44_encrypt(
+        &self,
+        _public_key: &PublicKey,
+        _plaintext: &str,
+    ) -> Result<String, SignerError> {
+        Err(SignerError::RemoteNotImplemented)
+    }
+    async fn nip44_decrypt(
+        &self,
+        _public_key: &PublicKey,
+        _ciphertext: &str,
+    ) -> Result<String, SignerError> {
+        Err(SignerError::RemoteNotImplemented)
+    }
 }
 
 // WASM: drop Send + Sync — JS futures are !Send
 #[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
 pub trait NostrSigner {
-    /// Returns the signer's public key.
     async fn get_public_key(&self) -> Result<PublicKey, SignerError>;
-
-    /// Signs an unsigned event and returns the signed event.
     async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SignerError>;
+    async fn nip44_encrypt(
+        &self,
+        _public_key: &PublicKey,
+        _plaintext: &str,
+    ) -> Result<String, SignerError> {
+        Err(SignerError::RemoteNotImplemented)
+    }
+    async fn nip44_decrypt(
+        &self,
+        _public_key: &PublicKey,
+        _ciphertext: &str,
+    ) -> Result<String, SignerError> {
+        Err(SignerError::RemoteNotImplemented)
+    }
 }
 
 /// NIP-46 remote signer implementation using nostr-connect.
@@ -671,6 +696,55 @@ impl NostrSigner for ActiveSigner {
             ActiveSigner::Nip46(signer) => signer.sign_event(unsigned).await,
             ActiveSigner::DirectKey(signer) => signer.sign_event(unsigned).await,
             ActiveSigner::Sdk(signer) => signer.sign_event(unsigned).await,
+        }
+    }
+
+    async fn nip44_encrypt(
+        &self,
+        public_key: &PublicKey,
+        plaintext: &str,
+    ) -> Result<String, SignerError> {
+        match self {
+            ActiveSigner::Nip46(signer) => signer
+                .inner
+                .nip44_encrypt(public_key, plaintext)
+                .await
+                .map_err(SignerError::from),
+            ActiveSigner::DirectKey(signer) => nostr::nips::nip44::encrypt(
+                signer.keys.secret_key(),
+                public_key,
+                plaintext,
+                nostr::nips::nip44::Version::V2,
+            )
+            .map_err(|error| SignerError::SigningFailed(error.to_string())),
+            ActiveSigner::Sdk(signer) => signer
+                .0
+                .nip44_encrypt(public_key, plaintext)
+                .await
+                .map_err(SignerError::from),
+        }
+    }
+
+    async fn nip44_decrypt(
+        &self,
+        public_key: &PublicKey,
+        ciphertext: &str,
+    ) -> Result<String, SignerError> {
+        match self {
+            ActiveSigner::Nip46(signer) => signer
+                .inner
+                .nip44_decrypt(public_key, ciphertext)
+                .await
+                .map_err(SignerError::from),
+            ActiveSigner::DirectKey(signer) => {
+                nostr::nips::nip44::decrypt(signer.keys.secret_key(), public_key, ciphertext)
+                    .map_err(|error| SignerError::SigningFailed(error.to_string()))
+            }
+            ActiveSigner::Sdk(signer) => signer
+                .0
+                .nip44_decrypt(public_key, ciphertext)
+                .await
+                .map_err(SignerError::from),
         }
     }
 }

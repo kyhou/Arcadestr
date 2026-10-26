@@ -17,12 +17,15 @@ use crate::tauri_bridge::{
     invoke_connect_nwc_wallet, invoke_discover_campaigns, invoke_enrich_store_page_detail,
     invoke_get_installed_games, invoke_get_listing_ownership, invoke_get_platform_info,
     invoke_install_game, invoke_is_game_in_library, invoke_list_retained_packages,
-    invoke_pay_nwc_invoice, invoke_request_lnurl_invoice, listen_install_progress,
+    invoke_next_split_invoice, invoke_pay_nwc_invoice, invoke_request_lnurl_invoice,
+    invoke_settlement_history, invoke_start_split_purchase, invoke_submit_split_payment,
+    listen_install_progress,
 };
 use crate::tauri_bridge::{
     CampaignPointerInput, ClaimEntitlementRequest, ConfirmPurchaseRequest, ConnectNwcWalletRequest,
     DiscoverCampaignsRequest, DiscoveredCampaign, InstallProgressPayload, InstallProgressPhase,
-    InstalledGame, PayNwcInvoiceRequest, RequestLnurlInvoiceRequest,
+    InstalledGame, PayNwcInvoiceRequest, RequestLnurlInvoiceRequest, SplitQuoteRequest,
+    StartSplitPurchaseRequest, SubmitSplitPaymentRequest,
 };
 use crate::ui_v2::components::{
     artwork_state_from_url, ArtworkRole, Dialog, DialogCloseAction, DialogCloseButtonPolicy,
@@ -794,6 +797,8 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let title = listing.title.clone();
     let description = listing.description.clone();
 
+    let auth = use_context::<AuthContext>().expect("AuthContext not provided");
+
     // Buy flow state.
     let invoice: RwSignal<Option<String>> = RwSignal::new(None);
     let buy_error: RwSignal<Option<String>> = RwSignal::new(None);
@@ -802,6 +807,55 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let nwc_connection_input = RwSignal::new(String::new());
     let nwc_connected: RwSignal<bool> = RwSignal::new(false);
     let manual_preimage = RwSignal::new(String::new());
+    let split_enabled = listing
+        .specs
+        .iter()
+        .any(|(key, _)| key.starts_with("adp_terms:"));
+    let refund_lud16 = RwSignal::new(String::new());
+    let split_quote_id = RwSignal::new(None::<String>);
+    let split_attempt_id = RwSignal::new(None::<String>);
+    let split_leg_label = RwSignal::new(None::<String>);
+
+    if split_enabled {
+        let resume_auth = auth.clone();
+        let listing_event_id = listing.event_id.clone();
+        let expected_server = adp_server_url(&listing.specs, &listing.download_url);
+        Effect::new(move |_| {
+            let Some(initiating_account) = resume_auth.npub.get() else {
+                split_quote_id.set(None);
+                split_attempt_id.set(None);
+                return;
+            };
+            split_quote_id.set(None);
+            split_attempt_id.set(None);
+            invoice.set(None);
+            show_invoice.set(false);
+            let resume_auth = resume_auth.clone();
+            let listing_event_id = listing_event_id.clone();
+            let expected_server = expected_server.clone();
+            spawn_local(async move {
+                let Ok(records) = invoke_settlement_history().await else {
+                    return;
+                };
+                if !account_response_is_current(
+                    resume_auth.npub.get_untracked().as_deref(),
+                    &initiating_account,
+                ) {
+                    return;
+                }
+                if let Some(record) = records.into_iter().find(|record| {
+                    record.state == "active"
+                        && listing_event_id.as_deref() == Some(record.listing_event_id.as_str())
+                        && expected_server.as_deref() == Some(record.processor_url.as_str())
+                }) {
+                    split_quote_id.set(Some(record.quote_id));
+                    success_message.set(Some(
+                        "Resumable split settlement found for this account.".into(),
+                    ));
+                }
+            });
+        });
+    }
     let purchase_confirmed: RwSignal<bool> = RwSignal::new(listing.is_owned);
     let ownership_loading: RwSignal<bool> = RwSignal::new(!cfg!(feature = "web"));
     let library_added: RwSignal<bool> = RwSignal::new(false);
@@ -843,7 +897,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let profile_loading: RwSignal<bool> = RwSignal::new(true);
     let profile_error: RwSignal<bool> = RwSignal::new(false);
 
-    let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let detail_presentation = RwSignal::new(None::<GameDetailPresentation>);
     let detail_generation = RwSignal::new(0_u64);
     let listing_event_current = RwSignal::new(cfg!(feature = "web"));
@@ -1090,15 +1143,16 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
 
     let on_buy = {
         let listing = listing.clone();
+        let buy_auth = auth.clone();
 
         Callback::new(move |()| {
             if operation_blocks_dispatch(operation.get_untracked()) {
                 return;
             }
-            if auth.npub.get().is_none() {
+            let Some(initiating_account) = buy_auth.npub.get() else {
                 buy_error.set(Some("Not authenticated".to_string()));
                 return;
-            }
+            };
             if listing.price_sats == 0 {
                 buy_error.set(Some("Free downloads are handled by Install.".to_string()));
                 return;
@@ -1115,20 +1169,85 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
 
             let lud16 = listing.lud16.clone();
             let amount_sats = listing.price_sats;
+            let publisher_npub = listing.publisher_npub.clone();
+            let listing_id = listing.id.clone();
+            let server_url = adp_server_url(&listing.specs, &listing.download_url);
+            let refund_address = refund_lud16.get();
+            let auth_for_response = buy_auth.clone();
             spawn_local(async move {
-                match invoke_request_lnurl_invoice(RequestLnurlInvoiceRequest {
-                    lud16,
-                    amount_sats,
-                })
-                .await
-                {
-                    Ok(response) => {
-                        invoice.set(Some(response.bolt11));
+                let result = if split_enabled {
+                    let server_url = server_url
+                        .ok_or_else(|| "Listing does not include an ADP server URL".to_string());
+                    match server_url {
+                        Ok(server_url) => {
+                            if let Some(quote_id) = split_quote_id.get_untracked() {
+                                invoke_next_split_invoice(SplitQuoteRequest {
+                                    server_url,
+                                    quote_id,
+                                })
+                                .await
+                                .map(|next| {
+                                    split_attempt_id.set(Some(next.attempt_id));
+                                    split_leg_label.set(Some(format!(
+                                        "{} · {} msat",
+                                        next.leg_id, next.amount_msat
+                                    )));
+                                    next.bolt11
+                                })
+                            } else if refund_address.trim().is_empty() {
+                                Err("Enter a Lightning address for principal refunds before creating the quote.".to_string())
+                            } else {
+                                match invoke_start_split_purchase(StartSplitPurchaseRequest {
+                                    publisher_npub,
+                                    listing_id,
+                                    server_url: server_url.clone(),
+                                    refund_lud16: refund_address,
+                                    purchase_id: None,
+                                })
+                                .await
+                                {
+                                    Ok(started) => {
+                                        split_quote_id.set(Some(started.quote_id.clone()));
+                                        invoke_next_split_invoice(SplitQuoteRequest {
+                                            server_url,
+                                            quote_id: started.quote_id,
+                                        })
+                                        .await
+                                        .map(|next| {
+                                            split_attempt_id.set(Some(next.attempt_id));
+                                            split_leg_label.set(Some(format!(
+                                                "{} · {} msat",
+                                                next.leg_id, next.amount_msat
+                                            )));
+                                            next.bolt11
+                                        })
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    invoke_request_lnurl_invoice(RequestLnurlInvoiceRequest { lud16, amount_sats })
+                        .await
+                        .map(|response| response.bolt11)
+                };
+                if !account_response_is_current(
+                    auth_for_response.npub.get_untracked().as_deref(),
+                    &initiating_account,
+                ) {
+                    operation.set(DetailOperation::Idle);
+                    return;
+                }
+                match result {
+                    Ok(bolt11) => {
+                        invoice.set(Some(bolt11));
                         show_invoice.set(true);
                         operation.set(DetailOperation::Idle);
                     }
-                    Err(e) => {
-                        buy_error.set(Some(e));
+                    Err(error) => {
+                        buy_error.set(Some(error));
                         operation.set(DetailOperation::Idle);
                     }
                 }
@@ -1200,6 +1319,71 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             buy_error.set(None);
             success_message.set(None);
             let auth_for_response = confirm_auth.clone();
+            if let (Some(quote_id), Some(attempt_id)) = (
+                split_quote_id.get_untracked(),
+                split_attempt_id.get_untracked(),
+            ) {
+                spawn_local(async move {
+                    let result = invoke_submit_split_payment(SubmitSplitPaymentRequest {
+                        server_url: server_url.clone(),
+                        quote_id: quote_id.clone(),
+                        attempt_id,
+                        preimage,
+                    })
+                    .await;
+                    if !account_response_is_current(
+                        auth_for_response.npub.get_untracked().as_deref(),
+                        &initiating_account,
+                    ) {
+                        operation.set(DetailOperation::Idle);
+                        return;
+                    }
+                    match result {
+                        Ok(response) if response.state == "settled" => {
+                            purchase_confirmed.set(true);
+                            show_invoice.set(false);
+                            success_message.set(Some("All payment legs settled. Durable ownership is ready for installation.".into()));
+                            operation.set(DetailOperation::Idle);
+                        }
+                        Ok(_) => match invoke_next_split_invoice(SplitQuoteRequest {
+                            server_url,
+                            quote_id,
+                        })
+                        .await
+                        {
+                            Ok(next) => {
+                                if !account_response_is_current(
+                                    auth_for_response.npub.get_untracked().as_deref(),
+                                    &initiating_account,
+                                ) {
+                                    operation.set(DetailOperation::Idle);
+                                    return;
+                                }
+                                invoice.set(Some(next.bolt11));
+                                split_attempt_id.set(Some(next.attempt_id));
+                                split_leg_label.set(Some(format!(
+                                    "{} · {} msat",
+                                    next.leg_id, next.amount_msat
+                                )));
+                                manual_preimage.set(String::new());
+                                success_message.set(Some(
+                                    "Payment leg verified. Pay the next committed invoice.".into(),
+                                ));
+                                operation.set(DetailOperation::Idle);
+                            }
+                            Err(error) => {
+                                buy_error.set(Some(error));
+                                operation.set(DetailOperation::Idle);
+                            }
+                        },
+                        Err(error) => {
+                            buy_error.set(Some(error));
+                            operation.set(DetailOperation::Idle);
+                        }
+                    }
+                });
+                return;
+            }
             spawn_local(async move {
                 let request = ConfirmPurchaseRequest {
                     publisher_npub,
@@ -1949,6 +2133,13 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     <Show
                         when=move || installed_game.get().is_some_and(|game| game.launchable)
                         fallback=move || view! {
+                            <Show when=move || split_enabled && !purchase_confirmed.get()>
+                                <div style="display:grid;gap:8px;margin-bottom:12px;font-family:ui-monospace,monospace">
+                                    <label for="split-refund-lud16" style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">"REFUND LIGHTNING ADDRESS"</label>
+                                    <input id="split-refund-lud16" class="v2-input" type="text" placeholder="you@example.com" prop:value=move || refund_lud16.get() on:input:target=move |event| refund_lud16.set(event.target().value()) />
+                                    <span style="color:oklch(0.55 0.01 60);font:600 10.5px/1.5 ui-monospace,monospace">"Required before quote activation. The processor checks every possible principal refund against this destination."</span>
+                                </div>
+                            </Show>
                             <button
                                 class="v2-btn-primary"
                                 on:click=move |_| on_primary.run(())
@@ -2032,7 +2223,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     {move || if show_invoice.get() && !purchase_confirmed.get() {
                         view! {
                             <div class="v2-detail-invoice">
-                                <p class="v2-social-meta">"Lightning invoice"</p>
+                                <p class="v2-social-meta">{move || split_leg_label.get().map(|leg| format!("Committed payment leg · {leg}")).unwrap_or_else(|| "Lightning invoice".into())}</p>
                                 <code>{move || invoice.get().unwrap_or_default()}</code>
                                 <div class="v2-detail-action-row">
                                     <button class="v2-btn-secondary" on:click=move |_| on_copy_invoice.run(())>"Copy"</button>
@@ -2054,7 +2245,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                     on:click=move |_| on_pay_nwc.run(())
                                     disabled=move || !nwc_connected.get() || operation_blocks_dispatch(operation.get())
                                 >
-                                    "Pay and confirm"
+                                    {move || if split_quote_id.get().is_some() { "Pay this leg" } else { "Pay and confirm" }}
                                 </button>
                                 <input
                                     class="v2-input"

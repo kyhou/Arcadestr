@@ -1298,6 +1298,7 @@ mod tests {
                 fulfillment_mode: FulfillmentMode::None,
                 operator_url: None,
                 servers: Vec::new(),
+                accepted_terms: Vec::new(),
                 file_path: None,
                 selected_build: None,
                 existing_file_hash: None,
@@ -2610,6 +2611,12 @@ pub fn PublishView(
     } else {
         FulfillmentMode::Delegate
     });
+    let accept_service_fees = RwSignal::new(listing.as_ref().is_some_and(|listing| {
+        listing
+            .specs
+            .iter()
+            .any(|(key, _)| key.starts_with("adp_terms:"))
+    }));
     let discovered_servers = RwSignal::new(Vec::<AdpServerAnnouncement>::new());
     let discovery_error = RwSignal::new(None::<String>);
     let initial_servers = if use_default_provider {
@@ -3770,6 +3777,57 @@ pub fn PublishView(
             launch_tier,
             acknowledged_removed_profile_ids: acknowledged_removed_profile_ids.get_untracked(),
         };
+        let accepted_terms = if accept_service_fees.get_untracked() {
+            let selected = servers_val
+                .iter()
+                .map(|server| server.url.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let mut by_operator = std::collections::BTreeMap::new();
+            for server in discovered_servers
+                .get_untracked()
+                .into_iter()
+                .filter(|server| selected.contains(server.url.as_str()))
+            {
+                let Some(terms_event_id) = server.terms_event_id else {
+                    error_message.set(Some(format!(
+                        "{} does not advertise immutable service terms.",
+                        server.url
+                    )));
+                    return;
+                };
+                if !server.split_enabled {
+                    error_message.set(Some(format!(
+                        "{} does not support split settlement.",
+                        server.url
+                    )));
+                    return;
+                }
+                if by_operator
+                    .insert(server.pubkey.clone(), terms_event_id)
+                    .is_some()
+                {
+                    continue;
+                }
+            }
+            if by_operator.is_empty() {
+                error_message.set(Some(
+                    "Resolve every selected distribution provider before accepting service fees."
+                        .into(),
+                ));
+                return;
+            }
+            by_operator
+                .into_iter()
+                .map(|(operator_pubkey, terms_event_id)| {
+                    arcadestr_core::adp_settlement::AcceptedTermsRef {
+                        operator_pubkey,
+                        terms_event_id,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut request = PublishAdpListingRequest {
             expected_publisher_npub: initiating_npub.clone(),
             existing_event_id: published_identity.get_untracked().event_id,
@@ -3792,6 +3850,7 @@ pub fn PublishView(
                 servers_val.into_iter().map(|entry| entry.url).collect(),
             )
             .unwrap_or_default(),
+            accepted_terms,
             file_path: None,
             selected_build: selected_build.clone(),
             existing_file_hash: (fulfillment_enabled_val && selected_build.is_none())
@@ -4616,6 +4675,28 @@ pub fn PublishView(
                                                 </div>
                                             }
                                         }).collect_view()}
+                                    </div>
+                                    <div style="clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));border:1px solid oklch(0.32 0.01 60);background:#121215;padding:18px;display:grid;gap:12px;font-family:ui-monospace,monospace">
+                                        <div style="display:flex;align-items:center;gap:10px">
+                                            <span style="font:800 12px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">"◆ SERVICE FEE CONSENT"</span>
+                                            <span style="flex:1;height:1px;background:repeating-linear-gradient(90deg,oklch(0.4 0.03 60 / .6) 0 4px,transparent 4px 8px)"></span>
+                                        </div>
+                                        <label style="display:flex;align-items:flex-start;gap:10px;color:#fff;font:600 12.5px/1.6 ui-monospace,monospace">
+                                            <input type="checkbox" checked=move || accept_service_fees.get() on:change:target=move |event| accept_service_fees.set(event.target().checked()) />
+                                            <span>"Accept each selected provider's immutable ADP service terms and enable split settlement."</span>
+                                        </label>
+                                        <p style="margin:0;color:oklch(0.68 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace">
+                                            {move || {
+                                                let selected = servers.get();
+                                                let announcements = discovered_servers.get();
+                                                let covered = announcements.iter().filter(|announcement| {
+                                                    announcement.split_enabled && announcement.terms_event_id.is_some()
+                                                        && selected.iter().any(|server| server.url == announcement.url)
+                                                }).map(|announcement| announcement.pubkey.as_str()).collect::<std::collections::BTreeSet<_>>().len();
+                                                format!("ECONOMIC PREVIEW · gross {} sats · {} operator fee leg(s) · developer receives the exact remainder after the signed fee policies are applied.", price_input.get(), covered)
+                                            }}
+                                        </p>
+                                        <p style="margin:0;color:oklch(0.55 0.01 60);font:600 10.5px/1.5 ui-monospace,monospace">"Terms roots are copied into the signed listing. Missing or unresolved coverage blocks publication when consent is enabled."</p>
                                     </div>
                                 </div>
                                     </div>

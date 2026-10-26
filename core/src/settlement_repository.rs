@@ -16,10 +16,21 @@ pub enum SettlementRepositoryError {
 pub struct StoredSettlement {
     pub account_pubkey: String,
     pub quote_id: String,
+    pub processor_url: String,
+    pub quote_event_json: String,
     pub listing_event_id: String,
     pub state: String,
     pub failure_at: Option<u64>,
     pub receipt_event_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRecoveryObligation {
+    pub quote_id: String,
+    pub leg_id: String,
+    pub state: String,
+    pub principal_msat: u64,
+    pub due_at: u64,
 }
 
 #[derive(Clone)]
@@ -57,12 +68,14 @@ impl SettlementRepository {
         account_pubkey: &str,
         quote_id: &str,
     ) -> Result<Option<StoredSettlement>, SettlementRepositoryError> {
-        let row = sqlx::query("SELECT listing_event_id, state, failure_at, receipt_event_json FROM settlement_quotes WHERE account_pubkey=? AND quote_id=?")
+        let row = sqlx::query("SELECT processor_url, quote_event_json, listing_event_id, state, failure_at, receipt_event_json FROM settlement_quotes WHERE account_pubkey=? AND quote_id=?")
             .bind(account_pubkey).bind(quote_id).fetch_optional(&self.pool).await?;
         row.map(|row| {
             Ok(StoredSettlement {
                 account_pubkey: account_pubkey.to_string(),
                 quote_id: quote_id.to_string(),
+                processor_url: row.try_get("processor_url")?,
+                quote_event_json: row.try_get("quote_event_json")?,
                 listing_event_id: row.try_get("listing_event_id")?,
                 state: row.try_get("state")?,
                 failure_at: row
@@ -101,6 +114,121 @@ impl SettlementRepository {
     ) -> Result<bool, SettlementRepositoryError> {
         let result = sqlx::query("UPDATE settlement_quotes SET state='settled', receipt_event_json=?, updated_at=? WHERE account_pubkey=? AND quote_id=? AND state='active'")
             .bind(receipt_event_json).bind(to_i64(updated_at)?).bind(account_pubkey).bind(quote_id).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn update_status(
+        &self,
+        account_pubkey: &str,
+        quote_id: &str,
+        state: QuoteState,
+        failure_at: Option<u64>,
+        updated_at: u64,
+    ) -> Result<bool, SettlementRepositoryError> {
+        let result = sqlx::query("UPDATE settlement_quotes SET state=?, failure_at=?, updated_at=? WHERE account_pubkey=? AND quote_id=?")
+            .bind(state_text(state)).bind(to_i64_opt(failure_at)?).bind(to_i64(updated_at)?)
+            .bind(account_pubkey).bind(quote_id).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn update_invoice_state(
+        &self,
+        account_pubkey: &str,
+        attempt_id: &str,
+        state: &str,
+        updated_at: u64,
+    ) -> Result<bool, SettlementRepositoryError> {
+        let result = sqlx::query("UPDATE settlement_invoice_attempts SET state=?, updated_at=? WHERE account_pubkey=? AND attempt_id=?")
+            .bind(state).bind(to_i64(updated_at)?).bind(account_pubkey).bind(attempt_id)
+            .execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn list_for_account(
+        &self,
+        account_pubkey: &str,
+    ) -> Result<Vec<StoredSettlement>, SettlementRepositoryError> {
+        let rows = sqlx::query("SELECT quote_id, processor_url, quote_event_json, listing_event_id, state, failure_at, receipt_event_json FROM settlement_quotes WHERE account_pubkey=? ORDER BY updated_at DESC")
+            .bind(account_pubkey).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(StoredSettlement {
+                    account_pubkey: account_pubkey.to_string(),
+                    quote_id: row.try_get("quote_id")?,
+                    processor_url: row.try_get("processor_url")?,
+                    quote_event_json: row.try_get("quote_event_json")?,
+                    listing_event_id: row.try_get("listing_event_id")?,
+                    state: row.try_get("state")?,
+                    failure_at: row
+                        .try_get::<Option<i64>, _>("failure_at")?
+                        .map(|value| {
+                            u64::try_from(value)
+                                .map_err(|_| SettlementRepositoryError::NumericRange)
+                        })
+                        .transpose()?,
+                    receipt_event_json: row.try_get("receipt_event_json")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_recovery_for_quote(
+        &self,
+        account_pubkey: &str,
+        quote_id: &str,
+    ) -> Result<Vec<StoredRecoveryObligation>, SettlementRepositoryError> {
+        let rows = sqlx::query(
+            "SELECT quote_id, leg_id, state, principal_msat, due_at \
+             FROM settlement_recovery WHERE account_pubkey=? AND quote_id=? \
+             ORDER BY due_at, leg_id",
+        )
+        .bind(account_pubkey)
+        .bind(quote_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(StoredRecoveryObligation {
+                    quote_id: row.try_get("quote_id")?,
+                    leg_id: row.try_get("leg_id")?,
+                    state: row.try_get("state")?,
+                    principal_msat: u64::try_from(row.try_get::<i64, _>("principal_msat")?)
+                        .map_err(|_| SettlementRepositoryError::NumericRange)?,
+                    due_at: u64::try_from(row.try_get::<i64, _>("due_at")?)
+                        .map_err(|_| SettlementRepositoryError::NumericRange)?,
+                })
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_recovery_obligation(
+        &self,
+        account_pubkey: &str,
+        quote_id: &str,
+        leg_id: &str,
+        principal_msat: u64,
+        due_at: u64,
+        evidence_event_json: Option<&str>,
+        state: &str,
+    ) -> Result<(), SettlementRepositoryError> {
+        sqlx::query("INSERT INTO settlement_recovery (account_pubkey, quote_id, leg_id, state, principal_msat, due_at, evidence_event_json) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_pubkey, quote_id, leg_id) DO UPDATE SET state=excluded.state, evidence_event_json=COALESCE(excluded.evidence_event_json, settlement_recovery.evidence_event_json)")
+            .bind(account_pubkey).bind(quote_id).bind(leg_id).bind(state)
+            .bind(to_i64(principal_msat)?).bind(to_i64(due_at)?).bind(evidence_event_json)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn update_recovery_state(
+        &self,
+        account_pubkey: &str,
+        quote_id: &str,
+        leg_id: &str,
+        state: &str,
+    ) -> Result<bool, SettlementRepositoryError> {
+        let result = sqlx::query("UPDATE settlement_recovery SET state=? WHERE account_pubkey=? AND quote_id=? AND leg_id=?")
+            .bind(state).bind(account_pubkey).bind(quote_id).bind(leg_id)
+            .execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
     }
 }

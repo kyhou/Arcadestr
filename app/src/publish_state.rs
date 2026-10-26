@@ -1669,6 +1669,7 @@ mod tests {
             fulfillment_mode: crate::tauri_bridge::FulfillmentMode::None,
             operator_url: None,
             servers: Vec::new(),
+            accepted_terms: Vec::new(),
             file_path: Some("must-not-cross-boundary".to_string()),
             selected_build: None,
             existing_file_hash: None,
