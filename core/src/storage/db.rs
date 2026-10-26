@@ -161,6 +161,8 @@ const MIGRATION_15_BLOSSOM_SERVER_SETTINGS: &str =
 // Migration 16: pinned publisher defaults and device-local launch preferences
 const MIGRATION_16_LAUNCH_PROFILE_PREFERENCES: &str =
     include_str!("../../migrations/016_launch_profile_preferences.sql");
+const MIGRATION_17_SPLIT_SETTLEMENT: &str =
+    include_str!("../../migrations/017_split_settlement.sql");
 
 #[cfg(test)]
 const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
@@ -191,6 +193,11 @@ const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
         16,
         "016_launch_profile_preferences.sql",
         MIGRATION_16_LAUNCH_PROFILE_PREFERENCES,
+    ),
+    (
+        17,
+        "017_split_settlement.sql",
+        MIGRATION_17_SPLIT_SETTLEMENT,
     ),
 ];
 
@@ -265,6 +272,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "016_launch_profile_preferences.sql",
         sql: MIGRATION_16_LAUNCH_PROFILE_PREFERENCES,
+    },
+    Migration {
+        name: "017_split_settlement.sql",
+        sql: MIGRATION_17_SPLIT_SETTLEMENT,
     },
 ];
 
@@ -1297,6 +1308,11 @@ mod tests {
             "schema_migrations",
             "retained_packages",
             "secure_storage",
+            "settlement_invoice_attempts",
+            "settlement_legs",
+            "settlement_quotes",
+            "settlement_recovery",
+            "settlement_refund_destinations",
             "store_page_listing_events",
             "store_pages",
             "users",
