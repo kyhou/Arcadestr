@@ -91,6 +91,7 @@ pub mod adp_client;
 pub mod adp_discovery;
 pub mod adp_protocol;
 pub mod adp_publish_contract;
+pub mod adp_settlement;
 pub mod authorization;
 pub mod blossom;
 pub mod campaign;
@@ -114,6 +115,8 @@ pub mod file_hash;
 
 #[cfg(feature = "native")]
 pub mod adp_storage;
+#[cfg(feature = "native")]
+pub mod settlement_repository;
 
 #[cfg(feature = "native")]
 pub mod adp_publish;

@@ -5701,6 +5701,7 @@ mod tests {
             url: Some("https://dist.example.com".to_string()),
             event_kinds: None,
             event_kind_status: None,
+            settlement: None,
         };
 
         let first = resolve_provisioning(ResolveProvisioningInput {

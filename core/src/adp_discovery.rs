@@ -16,6 +16,14 @@ pub struct AdpServerAnnouncement {
     pub name: Option<String>,
     pub supported_adp: Option<String>,
     pub contact: Option<String>,
+    #[serde(default)]
+    pub settlement_version: Option<u16>,
+    #[serde(default)]
+    pub split_enabled: bool,
+    #[serde(default)]
+    pub terms_event_id: Option<String>,
+    #[serde(default)]
+    pub legacy_paid_sales: Option<String>,
 }
 
 /// Discovers ADP servers announced on currently connected relays.
@@ -43,7 +51,7 @@ pub fn parse_adp_server_announcements(events: Vec<Event>) -> Vec<AdpServerAnnoun
     let mut announcements = Vec::new();
 
     for event in events {
-        if event.kind != Kind::Custom(30403) {
+        if event.kind != Kind::Custom(30403) || event.verify().is_err() {
             continue;
         }
 
@@ -60,6 +68,19 @@ pub fn parse_adp_server_announcements(events: Vec<Event>) -> Vec<AdpServerAnnoun
             name: tag_value(&event, "name"),
             supported_adp: tag_value(&event, "supported_adp"),
             contact: tag_value(&event, "contact"),
+            settlement_version: event.tags.iter().find_map(|tag| {
+                let values = tag.clone().to_vec();
+                (values.first().is_some_and(|name| name == "settlement"))
+                    .then(|| values.get(1).and_then(|value| value.parse().ok()))
+                    .flatten()
+            }),
+            split_enabled: event.tags.iter().any(|tag| {
+                let values = tag.clone().to_vec();
+                values.first().is_some_and(|name| name == "settlement")
+                    && values.get(2).is_some_and(|mode| mode == "split")
+            }),
+            terms_event_id: tag_value(&event, "terms"),
+            legacy_paid_sales: tag_value(&event, "legacy_paid_sales"),
         });
     }
 

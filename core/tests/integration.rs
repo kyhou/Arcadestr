@@ -1116,6 +1116,8 @@ fn test_nip99_listing(id: &str, merchant_npub: &str, created_at: u64) -> Nip99Li
         platforms: vec![],
         nip94_event_id: None,
         servers: Vec::new(),
+        accepted_terms: Vec::new(),
+        malformed_accepted_terms_tags: Vec::new(),
         file_hash: None,
         version: None,
         fulfillment_authorizations: Vec::new(),

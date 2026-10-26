@@ -300,6 +300,11 @@ pub struct Nip99Listing {
     /// ADP distribution server URLs.
     #[serde(default)]
     pub servers: Vec<String>,
+    /// Exact experimental commercial terms accepted by this listing.
+    #[serde(default)]
+    pub accepted_terms: Vec<crate::adp_settlement::AcceptedTermsRef>,
+    #[serde(default)]
+    pub malformed_accepted_terms_tags: Vec<Vec<String>>,
     /// SHA-256 artifact hash advertised by ADP fulfillment.
     #[serde(default)]
     pub file_hash: Option<String>,
@@ -864,6 +869,8 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
     let mut platforms: Vec<String> = Vec::new();
     let mut nip94_event_id: Option<String> = None;
     let mut servers = Vec::new();
+    let mut accepted_terms = Vec::new();
+    let mut malformed_accepted_terms_tags = Vec::new();
     let mut file_hash = None;
     let mut version = None;
     let mut fulfillment_authorizations = Vec::new();
@@ -947,6 +954,18 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
                     servers.push(server.clone());
                 }
             }
+            Some("adp_terms") => match v.as_slice() {
+                [_, operator, root]
+                    if nostr::PublicKey::from_hex(operator).is_ok()
+                        && nostr::EventId::from_hex(root).is_ok() =>
+                {
+                    accepted_terms.push(crate::adp_settlement::AcceptedTermsRef {
+                        operator_pubkey: operator.clone(),
+                        terms_event_id: root.clone(),
+                    });
+                }
+                _ => malformed_accepted_terms_tags.push(v),
+            },
             Some("file_hash") => {
                 if file_hash.is_none() {
                     file_hash = v.get(1).filter(|hash| !hash.is_empty()).cloned();
@@ -1047,6 +1066,8 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
         platforms,
         nip94_event_id,
         servers,
+        accepted_terms,
+        malformed_accepted_terms_tags,
         file_hash,
         version,
         fulfillment_authorizations,
@@ -1362,6 +1383,8 @@ mod tests {
                 .collect(),
             nip94_event_id: None,
             servers: Vec::new(),
+            accepted_terms: Vec::new(),
+            malformed_accepted_terms_tags: Vec::new(),
             file_hash: None,
             version: None,
             fulfillment_authorizations: Vec::new(),

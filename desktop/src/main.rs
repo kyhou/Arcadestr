@@ -5681,6 +5681,8 @@ mod task4_tests {
             platforms: Vec::new(),
             nip94_event_id: None,
             servers: Vec::new(),
+            accepted_terms: Vec::new(),
+            malformed_accepted_terms_tags: Vec::new(),
             file_hash: None,
             version: None,
             fulfillment_authorizations: Vec::new(),

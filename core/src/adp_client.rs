@@ -83,6 +83,22 @@ pub enum AdpClientError {
 pub struct AdpEventKinds {
     pub entitlement_grant: u16,
     pub adp_campaign: u16,
+    #[serde(default)]
+    pub commercial_terms: Option<u16>,
+    #[serde(default)]
+    pub private_quote: Option<u16>,
+    #[serde(default)]
+    pub recovery_evidence: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AdpSettlementInfo {
+    pub version: u16,
+    pub split_enabled: bool,
+    #[serde(default)]
+    pub terms_event_id: Option<String>,
+    pub fee: crate::adp_settlement::FeePolicy,
+    pub legacy_paid_sales: String,
 }
 
 /// Public metadata returned by `GET /.well-known/adp`.
@@ -99,6 +115,8 @@ pub struct AdpServerInfo {
     pub event_kinds: Option<AdpEventKinds>,
     #[serde(default)]
     pub event_kind_status: Option<String>,
+    #[serde(default)]
+    pub settlement: Option<AdpSettlementInfo>,
 }
 
 /// Response returned by `POST /provision`.

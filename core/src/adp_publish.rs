@@ -1676,6 +1676,38 @@ fn validate_final_platform_tag(tag: &[String]) -> Result<PlatformTarget, AdpPubl
     Ok(target)
 }
 
+/// Replaces only managed `adp_terms` tags after explicit publisher acceptance.
+/// Unrelated extension tags are retained across authoritative replacements/retries.
+pub fn apply_managed_adp_terms(
+    input: &mut AdpListingInput,
+    servers: &[crate::adp_settlement::ServerOperator],
+    accepted: &[crate::adp_settlement::AcceptedTermsRef],
+) -> Result<(), crate::adp_settlement::SettlementError> {
+    let accepted = crate::adp_settlement::validate_terms_coverage(servers, accepted)?;
+    for reference in &accepted {
+        if nostr::PublicKey::from_hex(&reference.operator_pubkey).is_err()
+            || nostr::EventId::from_hex(&reference.terms_event_id).is_err()
+        {
+            return Err(crate::adp_settlement::SettlementError::TermsCoverage(
+                reference.operator_pubkey.clone(),
+            ));
+        }
+    }
+    input
+        .preserved_tags
+        .retain(|tag| !tag.first().is_some_and(|name| name == "adp_terms"));
+    input
+        .preserved_tags
+        .extend(accepted.into_iter().map(|reference| {
+            vec![
+                "adp_terms".to_string(),
+                reference.operator_pubkey,
+                reference.terms_event_id,
+            ]
+        }));
+    Ok(())
+}
+
 /// Builds the developer-signed `kind:30402` listing event.
 ///
 /// # Errors
