@@ -72,8 +72,8 @@ mod install;
 mod launcher;
 mod marketplace_stream;
 mod nip46_commands;
-mod settlement_ui;
 mod receipt_commands;
+mod settlement_ui;
 mod startup_runtime;
 mod store_page_commands;
 
@@ -1577,6 +1577,13 @@ async fn delete_retained_package(
         .app_local_data_dir()
         .map_err(|error| format!("failed to resolve app data directory: {error}"))?;
     let _coordinate_lock = acquire_coordinate_lifecycle_lock(&app_data, &game_coordinate).await?;
+    install::recover_updates(
+        &repository,
+        &app_data,
+        now_unix_i64()?,
+        Some(&game_coordinate),
+    )
+    .await?;
     let package = repository
         .get_retained_package(&game_coordinate)
         .await
@@ -1601,6 +1608,13 @@ async fn reinstall_retained_package_with_id<R: tauri::Runtime>(
         .app_local_data_dir()
         .map_err(|error| format!("failed to resolve app data directory: {error}"))?;
     let _coordinate_lock = acquire_coordinate_lifecycle_lock(&app_data, &game_coordinate).await?;
+    install::recover_updates(
+        &repository,
+        &app_data,
+        now_unix_i64()?,
+        Some(&game_coordinate),
+    )
+    .await?;
     let package = repository
         .get_retained_package(&game_coordinate)
         .await
@@ -1787,6 +1801,13 @@ async fn uninstall_game(
         .ok_or_else(|| "installation not found".to_string())?;
     let _coordinate_lock =
         acquire_coordinate_lifecycle_lock(&app_data, &initial.installation.game_coordinate).await?;
+    install::recover_updates(
+        &repository,
+        &app_data,
+        now_unix_i64()?,
+        Some(&initial.installation.game_coordinate),
+    )
+    .await?;
     let managed = app_data.join("installations");
     uninstall_game_owned(
         &repository,
@@ -1818,6 +1839,13 @@ async fn remove_failed_installation(
         .ok_or_else(|| "installation not found".to_string())?;
     let _coordinate_lock =
         acquire_coordinate_lifecycle_lock(&app_data, &initial.installation.game_coordinate).await?;
+    install::recover_updates(
+        &repository,
+        &app_data,
+        now_unix_i64()?,
+        Some(&initial.installation.game_coordinate),
+    )
+    .await?;
     remove_failed_installation_owned(&repository, &app_data.join("installations"), &id).await
 }
 
@@ -1840,6 +1868,13 @@ async fn resume_uninstall(
         .ok_or_else(|| "installation not found".to_string())?;
     let _coordinate_lock =
         acquire_coordinate_lifecycle_lock(&app_data, &initial.installation.game_coordinate).await?;
+    install::recover_updates(
+        &repository,
+        &app_data,
+        now_unix_i64()?,
+        Some(&initial.installation.game_coordinate),
+    )
+    .await?;
     resume_uninstall_owned(&repository, &app_data.join("installations"), &id).await
 }
 
@@ -2290,21 +2325,18 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
         return Err("resolved fresh listing coordinate mismatch".into());
     }
     let tokens = DownloadTokensRepository::new(state.database.pool().clone());
-    let mut cached_token = None;
+    let mut cached_tokens = Vec::new();
     for server_url in &metadata.server_urls {
         if let Some(token) = tokens
             .valid_token(&buyer_pubkey_hex, &coordinate, server_url, now_unix_i64()?)
             .await
             .map_err(|error| error.to_string())?
         {
-            cached_token = Some((server_url.clone(), token.token));
-            break;
+            cached_tokens.push((server_url.clone(), token.token));
         }
     }
 
-    let has_durable_ownership = if cached_token.is_some() {
-        true
-    } else {
+    let has_durable_ownership = {
         let ownership = arcadestr_core::ownership::OwnershipService::new(
             arcadestr_core::purchases::PurchasesRepository::new(state.database.pool().clone()),
             arcadestr_core::entitlements_repository::EntitlementsRepository::new(
@@ -2316,7 +2348,8 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
             .await
             .map_err(|error| error.to_string())?
     };
-    if !has_durable_ownership
+    if cached_tokens.is_empty()
+        && !has_durable_ownership
         && !metadata
             .acquisition
             .allows_access_at(now_unix_i64()? as u64)
@@ -2324,23 +2357,19 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
         return Err("ownership or explicit current access not found".into());
     }
 
-    let (server_url, auth) = match cached_token {
-        Some((server_url, token)) => (server_url, DownloadAuth::Token(token)),
-        None => (
-            metadata
-                .server_urls
-                .first()
-                .cloned()
-                .ok_or_else(|| "fresh listing has no authorized server".to_string())?,
-            DownloadAuth::Nip98 {
-                signer: signer.as_ref(),
-            },
-        ),
-    };
-    if !plan.artifact.sources.iter().any(|source| {
+    let authorized_servers = metadata.server_urls.iter().filter(|server_url| plan.artifact.sources.iter().any(|source| {
         matches!(source, ArtifactSource::Adp { base_url } if base_url.trim_end_matches('/') == server_url.trim_end_matches('/'))
-    }) {
-        return Err("selected server is absent from the resolved install plan".into());
+    })).cloned().collect::<Vec<_>>();
+    let candidates = arcadestr_core::adp_download::download_candidates(
+        &authorized_servers,
+        &cached_tokens,
+        has_durable_ownership
+            || metadata
+                .acquisition
+                .allows_access_at(now_unix_i64()? as u64),
+    );
+    if candidates.is_empty() {
+        return Err("fresh listing has no eligible authorized server".into());
     }
 
     let _coordinate_lock = acquire_coordinate_lifecycle_lock(&app_data_dir, &coordinate).await?;
@@ -2348,22 +2377,34 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
     let repository = InstallationsRepository::new(state.database.pool().clone());
     let installations_directory = app_data_dir.join("installations");
     let retained_directory = app_data_dir.join("retained-packages");
+    install::recover_updates(
+        &repository,
+        &app_data_dir,
+        now_unix_i64()?,
+        Some(&coordinate),
+    )
+    .await?;
     let existing_retained = repository
         .get_retained_package(&coordinate)
         .await
         .map_err(|error| error.to_string())?;
-    if existing_retained.as_ref().is_some_and(|package| {
+    let retained_matches = !existing_retained.as_ref().is_some_and(|package| {
         package.package_digest != plan.artifact.digest
             || package.package_format != plan.artifact.package_format
             || package.reinstall.raw_event_json != plan.source_event_json
             || package.reinstall.resolved_target != host
             || package.reinstall.launch_profiles != plan.launch_profiles
-    }) {
-        return Err(
-            "a retained package exists for a different build revision; replacing or updating retained builds is deferred to A7"
-                .into(),
-        );
+    });
+    if repository
+        .pending_updates()
+        .await
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|update| update.candidate.game_coordinate == coordinate)
+    {
+        return Err("an interrupted update requires recovery before retrying".into());
     }
+    let mut update_from = None;
     let failed_installation_id = if let Some(existing) = repository
         .get_by_coordinate(&coordinate)
         .await
@@ -2386,10 +2427,8 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
                 {
                     return Ok(());
                 }
-                return Err(
-                    "a different build is already installed; automatic updates are not available"
-                        .into(),
-                );
+                update_from = Some(existing);
+                None
             }
             InstallationState::Installing => {
                 return Err("an installation for this game is already in progress".into());
@@ -2401,7 +2440,13 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
     } else {
         None
     };
-    let verified_retained = if let Some(package) = existing_retained {
+    if !retained_matches && update_from.is_none() {
+        return Err("remove the retained older build before installing a different revision without a ready installation".into());
+    }
+    // Never reuse a retained archive from a different signed revision.
+    let verified_retained = if let Some(package) =
+        existing_retained.filter(|_| retained_matches && update_from.is_none())
+    {
         install::require_managed_direct_child(&retained_directory, &package.package_path)
             .map_err(|error| format!("retained package path is untrusted: {error}"))?;
         emit_install_progress(
@@ -2477,7 +2522,10 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
         })
         .collect::<Vec<_>>();
     let installation = InstallationRecord {
-        id: installation_id.clone(),
+        id: update_from
+            .as_ref()
+            .map(|old| old.installation.id.clone())
+            .unwrap_or_else(|| installation_id.clone()),
         game_coordinate: coordinate.clone(),
         installation_root: final_root.clone(),
         package_digest: plan.artifact.digest.clone(),
@@ -2491,10 +2539,21 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
         created_at,
         updated_at: created_at,
     };
-    repository
-        .begin(&installation, &initial_profiles)
-        .await
-        .map_err(|error| error.to_string())?;
+    let installation_id = installation.id.clone();
+    let update_id = if let Some(old) = &update_from {
+        Some(
+            repository
+                .begin_update(old, &installation, &initial_profiles, &package_path)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        repository
+            .begin(&installation, &initial_profiles)
+            .await
+            .map_err(|error| error.to_string())?;
+        None
+    };
 
     if let Some((retained_package, verified)) = verified_retained {
         let retained_result = async {
@@ -2604,7 +2663,6 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
                 "active account changed while installation was being prepared",
             ));
         }
-        let adp_client = AdpClient::new(server_url, Arc::clone(&state.http_client));
         emit_install_progress(app, &coordinate, "downloading", 0, None);
         let preflight_root = final_root.clone();
         let progress_coordinate = coordinate.clone();
@@ -2620,44 +2678,37 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
             .ok_or_else(|| "retained package candidate lease is unavailable".to_string())?
             .download_file()
             .map_err(|error| error.to_string())?;
-        let download = adp_client
-            .download_retained_to_open_file_with_preflight(
-                &coordinate,
-                auth,
-                download_file,
-                move |length| download_storage_preflight(&preflight_root, length),
-                |bytes, total| {
-                    emit_install_progress(app, &progress_coordinate, "downloading", bytes, total);
-                },
-            )
-            .await
-            .map_err(desktop_download_error)?;
-
-        emit_install_progress(
-            app,
+        let verified_download = arcadestr_core::adp_download::download_verified(
+            Arc::clone(&state.http_client),
             &coordinate,
-            "verifying",
-            download.bytes_written,
-            Some(download.bytes_written),
-        );
-        let verify_file = Arc::clone(&download.file);
-        let expected_digest = plan.artifact.digest.clone();
-        let expected_format = plan.artifact.package_format.clone();
-        let verified = tokio::task::spawn_blocking(move || {
-            arcadestr_core::package_extraction::VerifiedPackage::verify(
-                verify_file,
-                expected_digest,
-                expected_format,
-            )
-        })
+            &buyer_pubkey_hex,
+            signer.as_ref(),
+            candidates,
+            download_file,
+            plan.artifact.digest.clone(),
+            plan.artifact.package_format.clone(),
+            move |length| download_storage_preflight(&preflight_root, length),
+            |bytes, total| {
+                emit_install_progress(app, &progress_coordinate, "downloading", bytes, total);
+            },
+            |bytes| emit_install_progress(app, &coordinate, "verifying", bytes, Some(bytes)),
+        )
         .await
-        .map_err(|error| format!("package verification task failed: {error}"))?
-        .map_err(|error| match InstallCommandError::from_extraction(&error) {
-            InstallCommandError::CompressionRatioExceeded => {
-                InstallCommandError::CompressionRatioExceeded
+        .map_err(|error| match error {
+            arcadestr_core::adp_download::DownloadFailure::Adp(error) => {
+                InstallCommandError::from(desktop_download_error(error))
             }
-            _ => format!("package verification failed: {error}").into(),
+            arcadestr_core::adp_download::DownloadFailure::Package(error) => {
+                match InstallCommandError::from_extraction(&error) {
+                    InstallCommandError::CompressionRatioExceeded => {
+                        InstallCommandError::CompressionRatioExceeded
+                    }
+                    _ => format!("package verification failed: {error}").into(),
+                }
+            }
         })?;
+        let download = verified_download.download;
+        let verified = verified_download.package;
         extraction_storage_preflight(
             installation_disk(&final_root).map(|(available, _)| available),
             verified.declared_regular_file_size_bytes(),
@@ -2679,11 +2730,13 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
             created_at,
             updated_at: now_unix_i64()?,
         };
-        repository
-            .retain_and_attach_installing(&installation_id, &retained_package)
-            .await
-            .map_err(|error| error.to_string())?;
-        package_persisted = true;
+        if update_id.is_none() {
+            repository
+                .retain_and_attach_installing(&installation_id, &retained_package)
+                .await
+                .map_err(|error| error.to_string())?;
+            package_persisted = true;
+        }
         emit_install_progress(
             app,
             &coordinate,
@@ -2715,9 +2768,37 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
                 error.to_string()
             })
         })?;
-        install::commit_placed_installation(&repository, &installation_id, placed, now_unix_i64()?)
+        if let Some(id) = &update_id {
+            install::commit_placed_update(
+                &repository,
+                id,
+                &retained_package,
+                placed,
+                now_unix_i64()?,
+            )
+            .await?;
+            package_persisted = true;
+            // Cleanup is recoverable and never makes a committed replacement fail.
+            if let Err(error) = install::recover_updates(
+                &repository,
+                &app_data_dir,
+                now_unix_i64()?,
+                Some(&coordinate),
+            )
+            .await
+            {
+                tracing::warn!(%error,"update cleanup deferred to recovery");
+            }
+        } else {
+            install::commit_placed_installation(
+                &repository,
+                &installation_id,
+                placed,
+                now_unix_i64()?,
+            )
             .await
             .map_err(|error| error.to_string())?;
+        }
         emit_install_progress(
             app,
             &coordinate,
@@ -2730,6 +2811,19 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
     .await;
 
     if let Err(mut error) = install_result {
+        if update_id.is_some() {
+            drop(outer_lock);
+            // The ready version was never modified. Journal-driven cleanup is
+            // restart-safe; retain intent if any capability cleanup fails.
+            let _ = install::recover_updates(
+                &repository,
+                &app_data_dir,
+                now_unix_i64()?,
+                Some(&coordinate),
+            )
+            .await;
+            return Err(error);
+        }
         if !package_persisted {
             if let Some(lease) = candidate_lease.take() {
                 let cleanup_result = tokio::task::spawn_blocking(move || lease.remove_if_owned())
@@ -2849,9 +2943,16 @@ async fn ingest_receipt(
         let auth = state.auth.lock().await;
         auth.public_key().ok_or("not authenticated")?
     };
-    let report=receipt_commands::import_for_account(buyer,&raw_event_json,&state).await?;
-    let _=app.emit("receipt-ownership-updated",serde_json::json!({"account":buyer.to_hex()}));
-    if report.rejected_events>0 || report.chains.iter().any(|c|c.verification!=arcadestr_core::receipt_sync_contract::ReceiptVerification::Verified) {
+    let report = receipt_commands::import_for_account(buyer, &raw_event_json, &state).await?;
+    let _ = app.emit(
+        "receipt-ownership-updated",
+        serde_json::json!({"account":buyer.to_hex()}),
+    );
+    if report.rejected_events > 0
+        || report.chains.iter().any(|c| {
+            c.verification != arcadestr_core::receipt_sync_contract::ReceiptVerification::Verified
+        })
+    {
         return Err("Receipt import contains invalid or indeterminate evidence; inspect Purchase History verification results".into());
     }
     Ok(())
@@ -3202,8 +3303,11 @@ mod install_game_tests {
         state: Arc<Mutex<MockHttpState>>,
     }
 
+    include!("gate5_tests.rs");
+
     #[derive(Default)]
     struct MockHttpState {
+        download_errors: HashMap<String, HttpClientError>,
         download_responses: HashMap<String, VecDeque<Vec<u8>>>,
         download_headers: HashMap<String, Vec<(String, String)>>,
         requested_urls: Vec<String>,
@@ -3211,6 +3315,24 @@ mod install_game_tests {
     }
 
     impl MockHttpClient {
+        fn with_error(self, url: &str, error: HttpClientError) -> Self {
+            self.state
+                .lock()
+                .expect("mock state")
+                .download_errors
+                .insert(url.to_string(), error);
+            self
+        }
+        fn with_exact_bytes(self, url: &str, bytes: Vec<u8>) -> Self {
+            self.state
+                .lock()
+                .expect("mock state")
+                .download_responses
+                .entry(url.to_string())
+                .or_default()
+                .push_back(bytes);
+            self
+        }
         fn new() -> Self {
             Self::default()
         }
@@ -3370,6 +3492,9 @@ mod install_game_tests {
                 state.requested_urls.push(url.to_string());
                 *state.call_counts.entry(url.to_string()).or_insert(0) += 1;
                 state.download_headers.insert(url.to_string(), headers);
+                if let Some(error) = state.download_errors.get(url) {
+                    return Err(error.clone());
+                }
                 state
                     .download_responses
                     .get_mut(url)
@@ -4229,7 +4354,7 @@ mod install_game_tests {
     }
 
     #[tokio::test]
-    async fn mismatched_retained_build_defers_to_a7_without_http_or_mutation() {
+    async fn mismatched_retained_build_without_ready_installation_requires_explicit_removal() {
         let buyer = Keys::generate();
         let merchant = Keys::generate();
         let listing_id = "retained-mismatch";
@@ -4317,7 +4442,7 @@ mod install_game_tests {
         .await
         .expect_err("different retained revision must be deferred");
 
-        assert!(error.contains("A7"));
+        assert!(error.contains("remove the retained older build"));
         assert!(http.last_requested_url().is_none());
         assert!(repository
             .get_by_id(&failed_id)

@@ -381,6 +381,157 @@ pub(crate) async fn commit_placed_installation(
     })
 }
 
+/// Reuse extraction output and the repository's manifest validation for updates.
+pub(crate) async fn commit_placed_update(
+    repository: &InstallationsRepository,
+    id: &str,
+    package: &arcadestr_core::adp_storage::RetainedPackage,
+    placed: PlacedInstallation,
+    updated_at: i64,
+) -> Result<(), String> {
+    repository
+        .commit_update(
+            id,
+            package,
+            &placed.extraction.profiles,
+            &placed.extraction.manifest,
+            updated_at,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Before commit: discard only the candidate. After commit: discard only the
+/// retired version. Active snapshot and retained-package reference are checked
+/// before deletion. Failed cleanup retains intent for the next startup/retry.
+pub(crate) async fn recover_updates(
+    repository: &InstallationsRepository,
+    app_data: &Path,
+    _updated_at: i64,
+    locked_coordinate: Option<&str>,
+) -> Result<(), String> {
+    let mut first_error = None;
+    for update in repository
+        .pending_updates()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let coordinate = &update.candidate.game_coordinate;
+        if locked_coordinate.is_some_and(|locked| locked != coordinate) {
+            continue;
+        }
+        let _coordinate_guard = if locked_coordinate.is_none() {
+            match super::acquire_coordinate_lifecycle_lock(app_data, coordinate).await {
+                Ok(lock) => Some(lock),
+                Err(_) => continue,
+            }
+        } else {
+            None
+        };
+        let result = async {
+            let current = repository
+                .get_by_coordinate(coordinate)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "update recovery has no active installation".to_string())?;
+            let retained = repository
+                .get_retained_package(coordinate)
+                .await
+                .map_err(|error| error.to_string())?;
+            let (root, package) = if update.committed {
+                if current.installation.id != update.candidate.id
+                    || current.installation.state != InstallationState::Ready
+                    || current.installation.installation_root != update.candidate.installation_root
+                    || current.installation.package_digest != update.candidate.package_digest
+                    || retained
+                        .as_ref()
+                        .is_none_or(|p| p.package_path != update.candidate_package_path)
+                {
+                    return Err("committed update recovery snapshot mismatch".into());
+                }
+                (
+                    update.old.installation.installation_root.clone(),
+                    update.old_retained.as_ref().map(|p| p.package_path.clone()),
+                )
+            } else {
+                if current != update.old || retained != update.old_retained {
+                    return Err("update rollback snapshot mismatch".into());
+                }
+                (
+                    update.candidate.installation_root.clone(),
+                    Some(update.candidate_package_path.clone()),
+                )
+            };
+            if root == current.installation.installation_root
+                || package
+                    .as_ref()
+                    .is_some_and(|path| retained.as_ref().is_some_and(|p| &p.package_path == path))
+            {
+                return Err("update cleanup would remove active files".into());
+            }
+            require_managed_direct_child(&app_data.join("installations"), &root)
+                .map_err(|error| error.to_string())?;
+            if let Some(path) = &package {
+                require_managed_direct_child(&app_data.join("retained-packages"), path)
+                    .map_err(|error| error.to_string())?;
+            }
+            let cleanup = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                // The stable root lock also excludes legacy recovery/uninstall.
+                let lock = OperationLock::acquire_existing_for_recovery(&root)
+                    .map_err(|error| error.to_string())?;
+                cleanup_owned_staging_roots(&root, &lock).map_err(|error| error.to_string())?;
+                lock.remove_root_no_follow()
+                    .map_err(|error| error.to_string())?;
+                if let Some(path) = package {
+                    let parent = path
+                        .parent()
+                        .ok_or_else(|| "missing package parent".to_string())?;
+                    remove_managed_direct_child_no_follow(parent, &path)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            cleanup?;
+            repository
+                .finish_update(&update.id)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(%error,"update recovery deferred; other games remain independent");
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn cleanup_owned_staging_roots(root: &Path, lock: &OperationLock) -> Result<(), std::io::Error> {
+    lock.require_root(root).map_err(std::io::Error::other)?;
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("invalid update root"))?;
+    let prefix = format!(".{name}.");
+    for entry in lock.managed_directory.entries()? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        if let Some(suffix) = filename
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .and_then(|name| name.strip_suffix(".tmp"))
+        {
+            if Uuid::parse_str(suffix).is_ok() {
+                remove_managed_child_no_follow(&lock.managed_directory, &filename)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn manifests_match(
     stored: &[arcadestr_core::adp_storage::InstallationManifestEntry],
     extracted: &[arcadestr_core::adp_storage::InstallationManifestEntry],
@@ -992,9 +1143,31 @@ pub(crate) async fn recover_interrupted_installations(
     managed_installations: &Path,
     updated_at: i64,
 ) -> Result<RecoveryReport, AdpStorageError> {
-    let snapshots = repository.list_installing().await?;
     let mut report = RecoveryReport::default();
+    if let Some(app_data) = managed_installations.parent() {
+        if let Err(error) = recover_updates(repository, app_data, updated_at, None).await {
+            tracing::warn!(%error,"installation update recovery deferred");
+            report.deferred_errors += 1;
+        }
+    }
+    let snapshots = repository.list_installing().await?;
     for snapshot in snapshots {
+        let _coordinate_guard = if let Some(app_data) = managed_installations.parent() {
+            match super::acquire_coordinate_lifecycle_lock(
+                app_data,
+                &snapshot.installation.game_coordinate,
+            )
+            .await
+            {
+                Ok(lock) => Some(lock),
+                Err(_) => {
+                    report.busy += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         report.examined += 1;
         let recorded = snapshot.installation;
         if require_managed_direct_child(managed_installations, &recorded.installation_root).is_err()

@@ -173,7 +173,8 @@ const MIGRATION_21_PURCHASE_EXECUTION: &str =
     include_str!("../../migrations/021_purchase_execution.sql");
 const MIGRATION_22_PURCHASE_VERIFICATION: &str =
     include_str!("../../migrations/022_purchase_verification.sql");
-const MIGRATION_23_RECEIPT_PORTABILITY: &str = include_str!("../../migrations/023_receipt_portability.sql");
+const MIGRATION_23_RECEIPT_PORTABILITY: &str =
+    include_str!("../../migrations/023_receipt_portability.sql");
 
 #[cfg(test)]
 const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
@@ -235,7 +236,11 @@ const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
         "022_purchase_verification.sql",
         MIGRATION_22_PURCHASE_VERIFICATION,
     ),
-    (23, "023_receipt_portability.sql", MIGRATION_23_RECEIPT_PORTABILITY),
+    (
+        23,
+        "023_receipt_portability.sql",
+        MIGRATION_23_RECEIPT_PORTABILITY,
+    ),
 ];
 
 #[derive(Clone, Copy)]
@@ -334,7 +339,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "022_purchase_verification.sql",
         sql: MIGRATION_22_PURCHASE_VERIFICATION,
     },
-    Migration { name: "023_receipt_portability.sql", sql: MIGRATION_23_RECEIPT_PORTABILITY },
+    Migration {
+        name: "023_receipt_portability.sql",
+        sql: MIGRATION_23_RECEIPT_PORTABILITY,
+    },
 ];
 
 /// Database connection pool for SQLite
@@ -1358,6 +1366,7 @@ mod tests {
             "entitlement_events",
             "installation_manifest_entries",
             "installation_profiles",
+            "installation_updates",
             "installations",
             "library_games",
             "launch_profile_preferences",

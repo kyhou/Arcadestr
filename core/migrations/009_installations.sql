@@ -1,5 +1,16 @@
 -- Validated installation snapshots. This replaces the pre-release installed_games cache;
 -- migration 9 was never shipped, so deliberately no legacy data migration exists.
+-- Side-by-side update intent; ready snapshots remain active until atomic commit.
+CREATE TABLE installation_updates (
+    id TEXT PRIMARY KEY,
+    game_coordinate TEXT NOT NULL UNIQUE,
+    old_snapshot_json TEXT NOT NULL,
+    old_retained_json TEXT,
+    candidate_record_json TEXT NOT NULL,
+    candidate_package_path TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('preparing','committed'))
+);
+
 CREATE TABLE retained_packages (
     game_coordinate TEXT PRIMARY KEY,
     package_id TEXT NOT NULL UNIQUE,

@@ -834,8 +834,11 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let split_plan = RwSignal::new(None::<crate::tauri_bridge::PurchasePlanReview>);
     let plan_refresh = RwSignal::new(0_u64);
     let ownership_refresh = RwSignal::new(0_u64);
-    if let Some(receipts)=use_context::<crate::ui_v2::receipt_sync::ReceiptSyncContext>() {
-        Effect::new(move |_|{let _=receipts.revision.get();ownership_refresh.update(|v|*v=v.wrapping_add(1));});
+    if let Some(receipts) = use_context::<crate::ui_v2::receipt_sync::ReceiptSyncContext>() {
+        Effect::new(move |_| {
+            let _ = receipts.revision.get();
+            ownership_refresh.update(|v| *v = v.wrapping_add(1));
+        });
     }
 
     if split_enabled {
@@ -2315,6 +2318,14 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                 installation_id=installed.installation_id
                             />
                         })}
+                    </Show>
+                    <Show when=move || installed_game.get().is_some() && !cfg!(all(target_arch = "wasm32", feature = "web"))>
+                        <button
+                            style="margin-top:10px;padding:11px 20px;background:transparent;border:1px solid oklch(0.5 0.13 210);color:oklch(0.8 0.13 210);font:800 13px ui-monospace,monospace;border-radius:5px"
+                            disabled=move || operation_blocks_dispatch(operation.get()) || listing_validation_loading.get() || listing_validation_error.get() || auth.npub.get().is_none()
+                            on:click=move |_| on_download.run(())
+                        >"CHECK & UPDATE"</button>
+                        <p style="color:oklch(0.68 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace">"Installs the latest signed build if it changed. Your current version stays intact until the replacement is verified and installed."</p>
                     </Show>
                     <Show when=move || install_state_error.get() || retained_state_error.get()>
                         <button class="v2-btn-secondary" disabled=move || install_state_loading.get() || retained_state_loading.get() on:click=move |_| install_state_refresh.update(|generation| *generation = generation.wrapping_add(1))>

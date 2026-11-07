@@ -89,6 +89,8 @@ pub mod nip98_client;
 pub mod adp_client;
 #[cfg(feature = "native")]
 pub mod adp_discovery;
+#[cfg(feature = "native")]
+pub mod adp_download;
 pub mod adp_protocol;
 pub mod adp_publish_contract;
 pub mod adp_settlement;
@@ -101,9 +103,9 @@ pub mod entitlements;
 #[cfg(feature = "native")]
 pub mod entitlements_repository;
 pub mod purchase_contract;
-pub mod receipt_sync_contract;
 #[cfg(feature = "native")]
 pub mod receipt_portability;
+pub mod receipt_sync_contract;
 pub mod store_page;
 pub mod store_page_content_policy;
 #[cfg(feature = "native")]

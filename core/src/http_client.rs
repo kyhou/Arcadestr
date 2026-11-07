@@ -44,6 +44,8 @@ pub enum HttpClientError {
     InsufficientStorage(String),
     #[error("filesystem file-size limit reached while downloading: {0}")]
     FilesystemFileSizeLimit(String),
+    #[error("local download file operation failed: {0}")]
+    DownloadIo(String),
 }
 
 /// Minimal HTTP client contract used by protocol validators.
@@ -219,7 +221,7 @@ pub(crate) fn download_io_error(error: std::io::Error) -> HttpClientError {
     if raw == Some(223) {
         return HttpClientError::FilesystemFileSizeLimit(error.to_string());
     }
-    HttpClientError::Request(error.to_string())
+    HttpClientError::DownloadIo(error.to_string())
 }
 
 fn add_cleanup_failure(
@@ -236,6 +238,7 @@ fn add_cleanup_failure(
         HttpClientError::FilesystemFileSizeLimit(_) => {
             HttpClientError::FilesystemFileSizeLimit(detail)
         }
+        HttpClientError::DownloadIo(_) => HttpClientError::DownloadIo(detail),
         _ => HttpClientError::Request(detail),
     }
 }
@@ -264,6 +267,10 @@ mod tests {
 
     #[test]
     fn download_io_errors_map_storage_categories() {
+        assert!(matches!(
+            download_io_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            HttpClientError::DownloadIo(_)
+        ));
         #[cfg(unix)]
         assert!(matches!(
             download_io_error(std::io::Error::from_raw_os_error(28)),

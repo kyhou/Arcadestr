@@ -5,8 +5,11 @@ use std::path::{Component, Path, PathBuf};
 
 use nostr::Event;
 use serde::{Deserialize, Deserializer, Serialize};
+#[path = "installation_updates.rs"]
+mod updates;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use unicode_normalization::UnicodeNormalization;
+pub use updates::InstallationUpdate;
 use uuid::{Uuid, Version};
 
 use crate::distribution::{
@@ -177,7 +180,7 @@ pub struct InstallationProfile {
 }
 
 /// Installation metadata persisted together with ordered profiles and a manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallationRecord {
     pub id: InstallationId,
     pub game_coordinate: String,
@@ -194,7 +197,7 @@ pub struct InstallationRecord {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallationSnapshot {
     pub installation: InstallationRecord,
     pub profiles: Vec<InstallationProfile>,
@@ -219,7 +222,7 @@ pub struct RetainedPackageReinstallSnapshot {
     pub publisher_default_profile_id: Option<ProfileId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedPackage {
     pub game_coordinate: String,
     pub package_id: RetainedPackageId,
@@ -755,6 +758,33 @@ impl InstallationsRepository {
         entries: &[InstallationManifestEntry],
         updated_at: i64,
     ) -> Result<(), AdpStorageError> {
+        let mut transaction = self.pool.begin().await?;
+        self.commit_extraction_in(
+            &mut transaction,
+            id,
+            installation_root,
+            package_digest,
+            package_format,
+            profiles,
+            entries,
+            updated_at,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn commit_extraction_in(
+        &self,
+        transaction: &mut sqlx::SqliteConnection,
+        id: &InstallationId,
+        installation_root: &Path,
+        package_digest: &Sha256Digest,
+        package_format: &PackageFormat,
+        profiles: &[InstallationProfile],
+        entries: &[InstallationManifestEntry],
+        updated_at: i64,
+    ) -> Result<(), AdpStorageError> {
         validate_absolute_path(installation_root, "installation root")?;
         for entry in entries {
             validate_manifest_entry(entry)?;
@@ -769,7 +799,6 @@ impl InstallationsRepository {
             ));
         }
 
-        let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(&format!("{INSTALLATION_SELECT} WHERE id = ?"))
             .bind(id.as_str())
             .fetch_optional(&mut *transaction)
@@ -851,7 +880,6 @@ impl InstallationsRepository {
         if result.rows_affected() != 1 {
             return Err(AdpStorageError::InvalidTransition);
         }
-        transaction.commit().await?;
         Ok(())
     }
 
