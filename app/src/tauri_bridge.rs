@@ -35,8 +35,44 @@ pub use arcadestr_core::archive_inspection_contract::{
     SelectArchiveRequest, SelectArchiveResponse, SelectableArchiveFile, SelectableWorkingDirectory,
     ARCHIVE_PAGE_SIZE_DEFAULT, ARCHIVE_PAGE_SIZE_MAX,
 };
+pub use arcadestr_core::purchase_contract::{
+    ApprovePurchasePlanRequest, InvoiceNetwork, LegProgress, PurchasePlanRequest,
+    PurchasePlanReview,
+};
 use arcadestr_core::store_page::{StorePageDraft, StorePageValidationDiagnostic};
 use serde::{Deserialize, Serialize};
+
+pub async fn invoke_get_purchase_plan(
+    request: PurchasePlanRequest,
+) -> Result<PurchasePlanReview, String> {
+    #[cfg(not(feature = "web"))]
+    {
+        crate::tauri_invoke::invoke("get_purchase_plan", serde_json::json!({"request":request}))
+            .await
+    }
+    #[cfg(feature = "web")]
+    {
+        let _ = request;
+        Err("Purchase execution is available in the desktop application only".into())
+    }
+}
+pub async fn invoke_approve_purchase_plan(
+    request: ApprovePurchasePlanRequest,
+) -> Result<PurchasePlanReview, String> {
+    #[cfg(not(feature = "web"))]
+    {
+        crate::tauri_invoke::invoke(
+            "approve_purchase_plan",
+            serde_json::json!({"request":request}),
+        )
+        .await
+    }
+    #[cfg(feature = "web")]
+    {
+        let _ = request;
+        Err("Purchase approval is available in the desktop application only".into())
+    }
+}
 
 #[cfg(not(feature = "web"))]
 pub async fn invoke_enrich_store_pages(
@@ -1214,8 +1250,9 @@ pub struct RequestLnurlInvoiceResponse {
     pub bolt11: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ConnectNwcWalletRequest {
+    pub expected_account_pubkey: String,
     pub connection_string: String,
 }
 
@@ -1228,6 +1265,7 @@ pub struct ConnectNwcWalletResponse {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PayNwcInvoiceRequest {
+    pub expected_account_pubkey: String,
     pub bolt11: String,
 }
 
@@ -1303,6 +1341,14 @@ pub struct SplitSettlementResponse {
     pub token_expires_at: Option<i64>,
 }
 
+impl SplitSettlementResponse {
+    /// Desktop returns receipt material only after its validation/persistence
+    /// path succeeds. A server status or conflict error alone is not ownership.
+    pub fn acquisition_complete(&self) -> bool {
+        self.state == "settled" && self.receipt.as_ref().is_some_and(|r| r.is_object())
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SettlementHistoryItem {
     pub quote_id: String,
@@ -1313,6 +1359,105 @@ pub struct SettlementHistoryItem {
     pub receipt: Option<serde_json::Value>,
     #[serde(default)]
     pub recovery: Vec<RecoveryHistoryItem>,
+    #[serde(default)]
+    pub attempts: Vec<RecoveryAttemptView>,
+    #[serde(default)]
+    pub recovery_state: Option<String>,
+    #[serde(default)]
+    pub recovery_message: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RecoveryAttemptView {
+    pub quote_id: String,
+    pub processor_url: String,
+    pub attempt_id: String,
+    pub leg_id: String,
+    pub state: String,
+    pub has_intent: bool,
+    pub has_proof: bool,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ResumeSplitPaymentRequest {
+    pub server_url: String,
+    pub quote_id: String,
+    pub attempt_id: String,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RecoveryReport {
+    pub recovered: u64,
+    pub blocked: u64,
+    pub skipped: u64,
+    pub message: String,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RefundHistoryItem {
+    pub quote_id: String,
+    pub leg_id: String,
+    pub recipient_pubkey: String,
+    pub principal_msat: u64,
+    pub due_at: u64,
+    pub state: String,
+    pub attempt_id: Option<String>,
+    pub invoice: Option<String>,
+    pub payment_state: String,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RefundPaymentRequest {
+    pub server_url: String,
+    pub quote_id: String,
+    pub leg_id: String,
+    pub confirm_payment: bool,
+}
+
+async fn recovery_invoke<T: serde::de::DeserializeOwned + 'static>(
+    command: &str,
+    args: serde_json::Value,
+) -> Result<T, String> {
+    #[cfg(not(feature = "web"))]
+    {
+        crate::tauri_invoke::invoke(command, args).await
+    }
+    #[cfg(feature = "web")]
+    {
+        let _ = (command, args);
+        Err("Settlement recovery is available in the desktop app".into())
+    }
+}
+pub async fn invoke_resume_split_payment(
+    request: ResumeSplitPaymentRequest,
+) -> Result<SplitSettlementResponse, String> {
+    recovery_invoke(
+        "resume_split_payment",
+        serde_json::json!({"request":request}),
+    )
+    .await
+}
+pub async fn invoke_reconcile_pending_settlements() -> Result<RecoveryReport, String> {
+    recovery_invoke("reconcile_pending_settlements", serde_json::json!({})).await
+}
+pub async fn invoke_recipient_refund_history(
+    server_url: String,
+) -> Result<Vec<RefundHistoryItem>, String> {
+    recovery_invoke(
+        "recipient_refund_history",
+        serde_json::json!({"request":{"server_url":server_url}}),
+    )
+    .await
+}
+pub async fn invoke_pay_split_refund(
+    request: RefundPaymentRequest,
+) -> Result<serde_json::Value, String> {
+    recovery_invoke("pay_split_refund", serde_json::json!({"request":request})).await
+}
+pub async fn invoke_resume_split_refund(
+    request: RefundPaymentRequest,
+) -> Result<serde_json::Value, String> {
+    recovery_invoke(
+        "resume_split_refund",
+        serde_json::json!({"request":request}),
+    )
+    .await
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1678,6 +1823,47 @@ pub async fn invoke_load_authoritative_adp_edit_metadata(
     _request: LoadAuthoritativeAdpEditMetadataRequest,
 ) -> Result<AuthoritativeAdpEditMetadata, PublishAdpListingError> {
     Err(PublishAdpListingError::UnsupportedPlatform)
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn invoke_get_nwc_wallet(
+    expected_account_pubkey: String,
+) -> Result<Option<ConnectNwcWalletResponse>, String> {
+    crate::tauri_invoke::invoke(
+        "get_nwc_wallet",
+        serde_json::json!({ "expectedAccountPubkey": expected_account_pubkey }),
+    )
+    .await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_get_nwc_wallet(
+    _expected_account_pubkey: String,
+) -> Result<Option<ConnectNwcWalletResponse>, String> {
+    Ok(None)
+}
+#[cfg(not(feature = "web"))]
+pub async fn invoke_disconnect_nwc_wallet(expected_account_pubkey: String) -> Result<(), String> {
+    crate::tauri_invoke::invoke(
+        "disconnect_nwc_wallet",
+        serde_json::json!({ "expectedAccountPubkey": expected_account_pubkey }),
+    )
+    .await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_disconnect_nwc_wallet(_expected_account_pubkey: String) -> Result<(), String> {
+    Err("NWC is only available on desktop.".into())
+}
+#[cfg(not(feature = "web"))]
+pub async fn invoke_verify_nwc_wallet(expected_account_pubkey: String) -> Result<String, String> {
+    crate::tauri_invoke::invoke(
+        "verify_nwc_wallet",
+        serde_json::json!({ "expectedAccountPubkey": expected_account_pubkey }),
+    )
+    .await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_verify_nwc_wallet(_expected_account_pubkey: String) -> Result<String, String> {
+    Err("NWC is only available on desktop.".into())
 }
 
 #[cfg(not(feature = "web"))]
@@ -2494,6 +2680,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_status_or_null_receipt_is_never_completed_acquisition() {
+        let mut response = SplitSettlementResponse {
+            state: "settled".into(),
+            settled_leg: Some("operator".into()),
+            receipt: None,
+            download_token: None,
+            token_expires_at: None,
+        };
+        assert!(!response.acquisition_complete());
+        response.receipt = Some(serde_json::Value::Null);
+        assert!(!response.acquisition_complete());
+        response.receipt = Some(serde_json::json!({"id":"validated-by-desktop"}));
+        assert!(response.acquisition_complete());
+        response.state = "active".into();
+        assert!(!response.acquisition_complete());
+    }
 
     #[test]
     fn blossom_tauri_bridge_request_response_and_progress_are_safe() {

@@ -9,6 +9,7 @@ pub mod marketplace_loader;
 pub mod profile;
 pub mod publish;
 pub mod purchases;
+pub mod recipient_refunds;
 pub mod settings;
 pub mod social;
 pub mod store_front;

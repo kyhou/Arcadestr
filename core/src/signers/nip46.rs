@@ -108,6 +108,10 @@ pub enum SignerError {
     #[error("Signing failed: {0}")]
     SigningFailed(String),
 
+    /// The remote signer explicitly refused the operation, rather than timing out.
+    #[error("Remote signer denied authorization")]
+    AuthorizationDenied,
+
     /// Public key is unavailable.
     #[error("Public key unavailable")]
     PublicKeyUnavailable,
@@ -144,7 +148,24 @@ pub enum SignerError {
 
 impl From<nostr::signer::SignerError> for SignerError {
     fn from(e: nostr::signer::SignerError) -> Self {
-        SignerError::SigningFailed(e.to_string())
+        // The SDK erases backend error types into strings. Recognize ncli's
+        // explicit denial prefix or exact refusal responses, never an arbitrary
+        // substring of a transport error. Do not expose the signer's raw reason.
+        let message = e.to_string();
+        let normalized = message.trim().to_ascii_lowercase();
+        if normalized
+            .strip_prefix("denied: ")
+            .is_some_and(|reason| !reason.is_empty())
+        {
+            return Self::AuthorizationDenied;
+        }
+        match normalized.as_str() {
+            "rejected" | "user rejected" | "permission denied" | "authorization denied" => {
+                Self::AuthorizationDenied
+            }
+            "timeout" => Self::ConnectionTimeout,
+            _ => Self::SigningFailed(message),
+        }
     }
 }
 
@@ -649,17 +670,11 @@ impl std::fmt::Debug for SdkSignerAdapter {
 #[async_trait::async_trait]
 impl NostrSigner for SdkSignerAdapter {
     async fn get_public_key(&self) -> Result<PublicKey, SignerError> {
-        self.0
-            .get_public_key()
-            .await
-            .map_err(|error| SignerError::SigningFailed(error.to_string()))
+        self.0.get_public_key().await.map_err(SignerError::from)
     }
 
     async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SignerError> {
-        self.0
-            .sign_event(unsigned)
-            .await
-            .map_err(|error| SignerError::SigningFailed(error.to_string()))
+        self.0.sign_event(unsigned).await.map_err(SignerError::from)
     }
 }
 
@@ -767,6 +782,18 @@ impl NostrSigner for ActiveSigner {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_refusal_is_not_a_transport_failure() {
+        let refused =
+            super::SignerError::from(nostr::signer::SignerError::from("denied: rejected"));
+        assert_eq!(refused.to_string(), "Remote signer denied authorization");
+        let timeout = super::SignerError::from(nostr::signer::SignerError::from("timeout"));
+        assert_eq!(timeout.to_string(), "Connection timeout");
+        let unrelated = super::SignerError::from(nostr::signer::SignerError::from(
+            "timeout mentioning rejected",
+        ));
+        assert!(matches!(unrelated, super::SignerError::SigningFailed(_)));
+    }
     use super::*;
     use std::sync::{Mutex, Once};
 

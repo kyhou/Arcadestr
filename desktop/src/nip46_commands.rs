@@ -74,6 +74,9 @@ async fn activate_remote_account(
     let mut auth = app_state.auth.lock().await;
     auth.set_signer(ActiveSigner::Sdk(SdkSignerAdapter::new(signer)));
     auth.set_public_key(public_key);
+    app_state
+        .settlement_recovery
+        .observe(Some(public_key.to_hex()));
     Ok(public_key)
 }
 
@@ -86,6 +89,7 @@ pub async fn login_with_nsec(
     app_state: State<'_, crate::AppState>,
     signer_state: State<'_, Arc<Mutex<AppSignerState>>>,
 ) -> Result<serde_json::Value, String> {
+    app_state.settlement_recovery.activate(None);
     let account = account_manager
         .login_with_nsec(&nsec)
         .await
@@ -110,6 +114,9 @@ pub async fn login_with_nsec(
     {
         let mut auth = app_state.auth.lock().await;
         activate_local_account(account_manager.inner(), &account, &mut auth).await?;
+        app_state
+            .settlement_recovery
+            .observe(Some(account.pubkey.clone()));
     }
 
     Ok(local_account_login_json(&account, name))
@@ -340,6 +347,65 @@ async fn resolve_nip05_to_uri_and_pubkey(
 
 /// Get the current NIP-46 connection status
 /// Called by frontend to poll for connection state changes
+fn regtest_probe_allowed(debug: bool, opt_in: Option<&str>) -> bool {
+    debug && opt_in == Some("true")
+}
+
+#[cfg(test)]
+mod probe_tests {
+    #[test]
+    fn probe_requires_debug_and_explicit_opt_in() {
+        assert!(!super::regtest_probe_allowed(false, Some("true")));
+        assert!(!super::regtest_probe_allowed(true, None));
+        assert!(!super::regtest_probe_allowed(true, Some("TRUE")));
+        assert!(super::regtest_probe_allowed(true, Some("true")));
+    }
+}
+
+/// Non-paying debug probe. Never accepts user payloads, persists data, or publishes events.
+#[tauri::command]
+pub async fn regtest_nip44_probe(app_state: State<'_, crate::AppState>) -> Result<String, String> {
+    use arcadestr_core::signers::NostrSigner as _;
+    if !regtest_probe_allowed(
+        cfg!(debug_assertions),
+        std::env::var("ARCADESTR_REGTEST_NIP46_PROBE")
+            .ok()
+            .as_deref(),
+    ) {
+        return Err("Regtest signer probe is disabled".into());
+    }
+    let auth = app_state.auth.lock().await.clone();
+    let buyer = auth.public_key().ok_or("Connect a remote signer first")?;
+    let signer = auth.signer().ok_or("Connect a remote signer first")?;
+    if !matches!(signer, ActiveSigner::Sdk(_) | ActiveSigner::Nip46(_)) {
+        return Err("Remote signer required for the regtest probe".into());
+    }
+    let peer = nostr::Keys::generate();
+    let expected = "Arcadestr non-paying Gate 3 NIP-44 challenge";
+    let ciphertext = nostr::nips::nip44::encrypt(
+        peer.secret_key(),
+        &buyer,
+        expected,
+        nostr::nips::nip44::Version::V2,
+    )
+    .map_err(|_| "Unable to prepare the local challenge")?;
+    let plaintext = signer.nip44_decrypt(&peer.public_key(), &ciphertext).await
+        .map_err(|error| match error {
+            arcadestr_core::signers::SignerError::AuthorizationDenied =>
+                "Remote signer denied authorization. Grant permission in the signer and retry; no payment was sent.",
+            arcadestr_core::signers::SignerError::ConnectionTimeout =>
+                "Remote signer timed out. Check its connection and retry; no payment was sent.",
+            _ => "Remote signer decryption failed; no payment was sent.",
+        })?;
+    if app_state.auth.lock().await.public_key() != Some(buyer) {
+        return Err("Active account changed; probe result ignored".into());
+    }
+    if plaintext != expected {
+        return Err("Signer returned an invalid challenge result".into());
+    }
+    Ok("NIP-44 decryption verified. No payment or storage changes.".into())
+}
+
 #[tauri::command]
 pub async fn get_connection_status(
     state: State<'_, Arc<Mutex<AppSignerState>>>,
@@ -616,6 +682,7 @@ pub async fn switch_profile(
     app_state: State<'_, crate::AppState>,
     account_manager: State<'_, Arc<AccountManager>>,
 ) -> Result<serde_json::Value, String> {
+    app_state.settlement_recovery.activate(None);
     info!("switch_profile called: profile_id={}", profile_id);
 
     // STEP 1: Cancel any existing bunker retry task
@@ -640,6 +707,9 @@ pub async fn switch_profile(
         {
             let mut auth = app_state.auth.lock().await;
             activate_local_account(account_manager.inner(), &account, &mut auth).await?;
+            app_state
+                .settlement_recovery
+                .observe(Some(account.pubkey.clone()));
         }
         let npub = account.npub.clone();
         let _ = app_handle.emit("auth_success", npub);
@@ -834,6 +904,8 @@ pub async fn delete_profile(
             .map_err(|err| err.to_string())?;
         let mut auth = app_state.auth.lock().await;
         auth.disconnect();
+        app_state.settlement_recovery.activate(None);
+        drop(auth);
         let mut signer_guard = state.lock().await;
         signer_guard.active_client = None;
         signer_guard.active_profile_id = None;
@@ -966,6 +1038,7 @@ pub async fn logout_nip46(
         .await
         .map_err(|err| err.to_string())?;
     app_state.auth.lock().await.disconnect();
+    app_state.settlement_recovery.activate(None);
 
     // Emit logout event to notify frontend
     let _ = app_handle.emit("auth_logout", ());
@@ -1038,6 +1111,9 @@ pub async fn load_active_account(
     {
         let mut auth = app_state.auth.lock().await;
         activate_local_account(account_manager.inner(), &account, &mut auth).await?;
+        app_state
+            .settlement_recovery
+            .observe(Some(account.pubkey.clone()));
         return Ok(local_account_login_json(
             &account,
             account.display_name.clone(),

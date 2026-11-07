@@ -3,9 +3,11 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::models::{DurableAcquisitionKind, DurableAcquisitionRecord, DurableCredentialStatus};
 use crate::tauri_bridge::{
-    invoke_get_purchase_records, invoke_prepare_split_recovery, invoke_refresh_settlement,
-    invoke_replace_split_refund_destination, invoke_settlement_history,
-    ReplaceSplitRefundDestinationRequest, SettlementHistoryItem, SplitQuoteRequest,
+    invoke_get_purchase_records, invoke_prepare_split_recovery,
+    invoke_reconcile_pending_settlements, invoke_refresh_settlement,
+    invoke_replace_split_refund_destination, invoke_resume_split_payment,
+    invoke_settlement_history, ReplaceSplitRefundDestinationRequest, ResumeSplitPaymentRequest,
+    SettlementHistoryItem, SplitQuoteRequest,
 };
 use crate::ui_v2::components::{
     EmptyState, ErrorSeverity, ErrorState, FeedbackLayout, LoadingState, PageTabItem,
@@ -205,6 +207,34 @@ fn settlement_state_color(state: &str) -> &'static str {
     }
 }
 
+fn settlement_display_state(record: &SettlementHistoryItem) -> &'static str {
+    if record.state == "settled" && record.receipt.is_some() {
+        "Purchase completed"
+    } else if record.state == "settled" {
+        "Recovery available"
+    } else if record.recovery_state.as_deref() == Some("recovering") {
+        "Recovery in progress"
+    } else if record
+        .attempts
+        .iter()
+        .any(|a| a.state != "settled" && a.has_intent && !a.has_proof)
+    {
+        "Payment outcome uncertain"
+    } else if record
+        .attempts
+        .iter()
+        .any(|a| a.state != "settled" && a.has_proof)
+    {
+        "Recovery available"
+    } else if record.state == "failed" {
+        "Purchase failed"
+    } else if record.attempts.iter().any(|a| a.state == "settled") {
+        "Partially settled"
+    } else {
+        "Awaiting payment"
+    }
+}
+
 #[component]
 fn SettlementRecordCard(
     record: SettlementHistoryItem,
@@ -216,10 +246,63 @@ fn SettlementRecordCard(
     let server_url = record.processor_url.clone();
     let state_name = record.state.clone();
     let recovery = record.recovery.clone();
+    let display_state = settlement_display_state(&record);
+    let attempts = record.attempts.clone();
+    let can_reconcile =
+        record.receipt.is_none() && attempts.iter().any(|a| a.has_intent || a.has_proof);
     let refund_lud16 = RwSignal::new(String::new());
     let operation = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     let success = RwSignal::new(None::<String>);
+    let on_reconcile = {
+        let auth = auth.clone();
+        let account = account.clone();
+        let attempts = attempts.clone();
+        Callback::new(move |()| {
+            operation.set(Some(
+                "Recovery in progress — read-only wallet lookup; no payment".into(),
+            ));
+            error.set(None);
+            let auth = auth.clone();
+            let account = account.clone();
+            let attempts = attempts.clone();
+            spawn_local(async move {
+                let mut result = Ok(());
+                for attempt in attempts.into_iter().filter(|a| a.has_intent || a.has_proof) {
+                    if auth.npub.get_untracked().as_deref() != Some(account.as_str()) {
+                        return;
+                    }
+                    match invoke_resume_split_payment(ResumeSplitPaymentRequest {
+                        server_url: attempt.processor_url,
+                        quote_id: attempt.quote_id,
+                        attempt_id: attempt.attempt_id,
+                    })
+                    .await
+                    {
+                        Ok(response) if response.state == "settled" => break,
+                        Ok(_) => {}
+                        Err(message) => {
+                            result = Err(message);
+                            break;
+                        }
+                    }
+                }
+                if auth.npub.get_untracked().as_deref() != Some(account.as_str()) {
+                    return;
+                }
+                operation.set(None);
+                match result {
+                    Ok(()) => {
+                        success.set(Some(
+                            "Original payment/proof checked. No payment was dispatched.".into(),
+                        ));
+                        on_changed.run(());
+                    }
+                    Err(message) => error.set(Some(message)),
+                }
+            });
+        })
+    };
 
     let on_refresh = {
         let auth = auth.clone();
@@ -336,10 +419,12 @@ fn SettlementRecordCard(
                     <strong style="font:800 16px/1.15 ui-monospace,monospace;color:#fff;overflow-wrap:anywhere">{record.listing_event_id}</strong>
                     <span style="font:600 10.5px ui-monospace,monospace;color:oklch(0.55 0.01 60);overflow-wrap:anywhere">{format!("QUOTE {}", quote_id)}</span>
                 </div>
-                <span style=format!("padding:4px 11px;border:1px solid {};color:{};background:#141417;font:700 11px ui-monospace,monospace;border-radius:4px;text-transform:uppercase", settlement_state_color(&state_name), settlement_state_color(&state_name))>{state_name.clone()}</span>
+                <span data-testid="settlement-state" style=format!("padding:4px 11px;border:1px solid {};color:{};background:#141417;font:700 11px ui-monospace,monospace;border-radius:4px;text-transform:uppercase", settlement_state_color(&state_name), settlement_state_color(&state_name))>{display_state}</span>
             </div>
+            <crate::ui_v2::components::PurchasePlanPanel quote_id=quote_id.clone() server_url=server_url.clone() on_recovered=on_changed/>
             <div style="display:flex;gap:10px;flex-wrap:wrap">
                 <button style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" on:click=move |_| on_refresh.run(()) disabled=move || operation.get().is_some()>"REFRESH STATUS"</button>
+                <Show when=move||can_reconcile><button data-testid="recover-purchase" style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.14 195);font:800 11px ui-monospace,monospace;border-radius:4px" disabled=move||operation.get().is_some() on:click=move |_|on_reconcile.run(())>"CHECK ORIGINAL PAYMENT — NO PAYMENT"</button></Show>
                 <Show when=move || recover_visible_state == "failed">
                     <button style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" on:click=move |_| on_recover.run(()) disabled=move || operation.get().is_some()>"PREPARE RECOVERY"</button>
                 </Show>
@@ -447,6 +532,7 @@ pub fn PurchasesView() -> impl IntoView {
                 }
             });
             spawn_local(async move {
+                let _ = invoke_reconcile_pending_settlements().await;
                 let result = invoke_settlement_history().await;
                 if !should_apply_response(generation, request_generation.get_untracked()) {
                     return;
@@ -475,6 +561,7 @@ pub fn PurchasesView() -> impl IntoView {
                 auth.npub.get().unwrap_or_default(),
                 refresh_settlements,
             )}
+            <super::recipient_refunds::RecipientRefunds />
 
             {move || match state.get() {
                 PurchasesState::Loading => view! {
@@ -635,6 +722,55 @@ fn purchase_record_view(record: DurableAcquisitionRecord) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settlement_labels_preserve_uncertainty_and_receipt_precedence() {
+        let mut record:crate::tauri_bridge::SettlementHistoryItem=serde_json::from_value(serde_json::json!({"quote_id":"q","processor_url":"https://processor","listing_event_id":"listing","state":"active"})).expect("history fixture");
+        assert_eq!(super::settlement_display_state(&record), "Awaiting payment");
+        record
+            .attempts
+            .push(crate::tauri_bridge::RecoveryAttemptView {
+                quote_id: "q".into(),
+                processor_url: "https://processor".into(),
+                attempt_id: "original".into(),
+                leg_id: "developer".into(),
+                state: "disclosed".into(),
+                has_intent: true,
+                has_proof: false,
+            });
+        assert_eq!(
+            super::settlement_display_state(&record),
+            "Payment outcome uncertain"
+        );
+        record.recovery_state = Some("recovering".into());
+        assert_eq!(
+            super::settlement_display_state(&record),
+            "Recovery in progress"
+        );
+        record.recovery_state = None;
+        record.attempts[0].has_proof = true;
+        assert_eq!(
+            super::settlement_display_state(&record),
+            "Recovery available"
+        );
+        record.attempts[0].state = "settled".into();
+        assert_eq!(
+            super::settlement_display_state(&record),
+            "Partially settled"
+        );
+        record.state = "failed".into();
+        assert_eq!(super::settlement_display_state(&record), "Purchase failed");
+        record.state = "settled".into();
+        assert_eq!(
+            super::settlement_display_state(&record),
+            "Recovery available"
+        );
+        record.receipt = Some(serde_json::json!({"id":"persisted-validated-receipt"}));
+        record.recovery_state = Some("recovering".into());
+        assert_eq!(
+            super::settlement_display_state(&record),
+            "Purchase completed"
+        );
+    }
     use super::*;
 
     fn record(

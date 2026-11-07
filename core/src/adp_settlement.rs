@@ -281,6 +281,132 @@ pub fn verify_quote_event(
     Ok(quote)
 }
 
+/// Compare a processor quote with the developer's signed listing and exact
+/// accepted term roots. A valid processor signature alone is not consent.
+pub fn verify_quote_listing_terms(
+    quote: &SignedQuote,
+    listing: &Event,
+    term_events: &[Event],
+) -> Result<(), SettlementError> {
+    if listing.verify().is_err() || listing.kind.as_u16() != 30402 {
+        return Err(SettlementError::Quote("invalid source listing".into()));
+    }
+    let one = |name: &str| -> Result<Vec<String>, SettlementError> {
+        let values: Vec<_> = listing
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().map(String::as_str) == Some(name))
+            .collect();
+        if values.len() != 1 {
+            return Err(SettlementError::Quote(format!(
+                "ambiguous or missing {name}"
+            )));
+        }
+        Ok(values[0].as_slice().to_vec())
+    };
+    let identifier = one("d")?;
+    let destination = one("lud16")?;
+    let price = one("price")?;
+    if identifier.len() != 2
+        || identifier[1].is_empty()
+        || destination.len() != 2
+        || destination[1].trim().is_empty()
+        || price.len() != 3
+    {
+        return Err(SettlementError::Quote(
+            "malformed or unsupported listing policy".into(),
+        ));
+    }
+    let mut accepted = BTreeMap::new();
+    for tag in listing
+        .tags
+        .iter()
+        .filter(|t| t.as_slice().first().map(String::as_str) == Some("adp_terms"))
+    {
+        let v = tag.as_slice();
+        if v.len() != 3 || accepted.insert(v[1].clone(), v[2].clone()).is_some() {
+            return Err(SettlementError::TermsCoverage(
+                "ambiguous accepted roots".into(),
+            ));
+        }
+    }
+    if accepted.is_empty()
+        || accepted.len() != term_events.len()
+        || !accepted.contains_key(&quote.processor_pubkey)
+    {
+        return Err(SettlementError::TermsCoverage(
+            "processor or accepted roots missing".into(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut operators = Vec::new();
+    for event in term_events {
+        let TermsPayload::Offer { terms } = parse_terms_event(event)? else {
+            return Err(SettlementError::TermsCoverage(
+                "withdrawal is not an offer".into(),
+            ));
+        };
+        let id = event.id.to_hex();
+        if accepted.get(&terms.operator_pubkey) != Some(&id)
+            || !seen.insert(terms.operator_pubkey.clone())
+        {
+            return Err(SettlementError::TermsCoverage(
+                "unaccepted or duplicate terms".into(),
+            ));
+        }
+        operators.push((terms, id));
+    }
+    let gross = parse_gross_msat(&price[1], &price[2])?;
+    let legs = build_payment_legs(gross, &listing.pubkey.to_hex(), &destination[1], &operators)?;
+    if quote.listing_event_id != listing.id.to_hex()
+        || quote.listing_coordinate
+            != format!("30402:{}:{}", listing.pubkey.to_hex(), identifier[1])
+        || quote.gross_msat != gross
+        || quote.legs != legs
+    {
+        return Err(SettlementError::Quote(
+            "quote differs from developer-accepted split".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the existing ADP invoice response against its immutable plan. This
+/// checks the BOLT11 signature/hash/amount and disclosed expiry, not an invented
+/// signed preflight protocol. Expired originals may still be reconciled.
+#[cfg(feature = "native")]
+pub fn verify_original_invoice(
+    quote: &SignedQuote,
+    invoice: &crate::adp_client::SettlementInvoiceResponse,
+) -> Result<(), SettlementError> {
+    let parsed = invoice
+        .bolt11
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .map_err(|_| SettlementError::Preflight("invalid BOLT11".into()))?;
+    let leg = quote
+        .legs
+        .iter()
+        .find(|leg| leg.leg_id == invoice.leg_id)
+        .ok_or_else(|| SettlementError::Preflight("unknown leg".into()))?;
+    if invoice.quote_id != quote.quote_id
+        || invoice.attempt_id.is_empty()
+        || invoice.amount_msat != leg.amount_msat
+        || parsed.amount_milli_satoshis() != Some(leg.amount_msat)
+        || parsed.payment_hash().to_string() != invoice.payment_hash
+        || parsed
+            .duration_since_epoch()
+            .as_secs()
+            .checked_add(parsed.expiry_time().as_secs())
+            != Some(invoice.expires_at)
+        || invoice.expires_at > quote.confirmation_expires_at
+    {
+        return Err(SettlementError::Preflight(
+            "original invoice differs from quote or BOLT11".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn verify_recovery_event(
     event: &Event,
     decrypted_evidence_json: &str,

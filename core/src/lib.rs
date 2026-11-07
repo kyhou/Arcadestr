@@ -100,6 +100,7 @@ pub mod campaign_discovery;
 pub mod entitlements;
 #[cfg(feature = "native")]
 pub mod entitlements_repository;
+pub mod purchase_contract;
 pub mod store_page;
 pub mod store_page_content_policy;
 #[cfg(feature = "native")]
@@ -123,6 +124,13 @@ pub mod adp_publish;
 
 #[cfg(feature = "native")]
 pub mod nwc_client;
+
+#[cfg(feature = "native")]
+pub mod durable_payments;
+#[cfg(feature = "native")]
+pub mod purchase_execution;
+#[cfg(feature = "native")]
+pub mod settlement_recovery;
 
 #[cfg(all(test, feature = "native"))]
 mod nwc_client_contract_tests {

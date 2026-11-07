@@ -1152,6 +1152,11 @@ impl AuthContext {
     pub fn is_current_auth_flow(&self, generation: u64) -> bool {
         should_apply_auth_response(generation, self.flow_generation.get_untracked())
     }
+
+    /// Tracked epoch for account-scoped views, including A -> B -> A switches.
+    pub fn current_auth_flow(&self) -> u64 {
+        self.flow_generation.get()
+    }
 }
 
 impl Default for AuthContext {
@@ -5394,6 +5399,27 @@ fn DebugOverlay() -> impl IntoView {
     let show_debug = RwSignal::new(false);
     let version_info = RwSignal::new(None::<VersionInfo>);
     let error_msg = RwSignal::new(None::<String>);
+    let signer_probe_busy = RwSignal::new(false);
+    let signer_probe_result = RwSignal::new(None::<String>);
+    let on_signer_probe = move |_| {
+        if signer_probe_busy.get_untracked() {
+            return;
+        }
+        signer_probe_busy.set(true);
+        signer_probe_result.set(None);
+        spawn_local(async move {
+            let result = crate::tauri_invoke::invoke::<String>(
+                "regtest_nip44_probe",
+                serde_json::json!(null),
+            )
+            .await;
+            signer_probe_result.set(Some(match result {
+                Ok(message) => message,
+                Err(error) => format!("{error:?}"),
+            }));
+            signer_probe_busy.set(false);
+        });
+    };
 
     // Fetch version info on mount
     #[cfg(not(feature = "web"))]
@@ -5455,6 +5481,15 @@ fn DebugOverlay() -> impl IntoView {
                         })}
                         <hr style="border-color: #333; margin: 5px 0;" />
                         <p style="color: #888;">Press Ctrl+Shift+I for DevTools</p>
+                        <button data-testid="regtest-nip44-probe"
+                            style="margin-top:10px;padding:8px 10px;background:transparent;border:1px solid oklch(0.5 0.13 210);color:oklch(0.8 0.14 195);font:800 11px ui-monospace,monospace;border-radius:4px;cursor:pointer"
+                            disabled=move || signer_probe_busy.get() on:click=on_signer_probe>
+                            {move || if signer_probe_busy.get() { "WAITING FOR SIGNER" } else { "REGTEST NIP-44 CHECK — NO PAYMENT" }}
+                        </button>
+                        <p data-testid="regtest-nip44-result" aria-live="polite"
+                            style="font:400 12px/1.6 ui-monospace,monospace;color:oklch(0.68 0.01 60)">
+                            {move || signer_probe_result.get().unwrap_or_default()}
+                        </p>
                     </div>
                 })
             } else {

@@ -163,6 +163,16 @@ const MIGRATION_16_LAUNCH_PROFILE_PREFERENCES: &str =
     include_str!("../../migrations/016_launch_profile_preferences.sql");
 const MIGRATION_17_SPLIT_SETTLEMENT: &str =
     include_str!("../../migrations/017_split_settlement.sql");
+const MIGRATION_18_PAYMENT_DURABILITY: &str =
+    include_str!("../../migrations/018_payment_durability.sql");
+const MIGRATION_19_SETTLEMENT_LEG_PROJECTION: &str =
+    include_str!("../../migrations/019_settlement_leg_projection.sql");
+const MIGRATION_20_CLIENT_REFUND_RECOVERY: &str =
+    include_str!("../../migrations/020_client_refund_recovery.sql");
+const MIGRATION_21_PURCHASE_EXECUTION: &str =
+    include_str!("../../migrations/021_purchase_execution.sql");
+const MIGRATION_22_PURCHASE_VERIFICATION: &str =
+    include_str!("../../migrations/022_purchase_verification.sql");
 
 #[cfg(test)]
 const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
@@ -198,6 +208,31 @@ const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
         17,
         "017_split_settlement.sql",
         MIGRATION_17_SPLIT_SETTLEMENT,
+    ),
+    (
+        18,
+        "018_payment_durability.sql",
+        MIGRATION_18_PAYMENT_DURABILITY,
+    ),
+    (
+        19,
+        "019_settlement_leg_projection.sql",
+        MIGRATION_19_SETTLEMENT_LEG_PROJECTION,
+    ),
+    (
+        20,
+        "020_client_refund_recovery.sql",
+        MIGRATION_20_CLIENT_REFUND_RECOVERY,
+    ),
+    (
+        21,
+        "021_purchase_execution.sql",
+        MIGRATION_21_PURCHASE_EXECUTION,
+    ),
+    (
+        22,
+        "022_purchase_verification.sql",
+        MIGRATION_22_PURCHASE_VERIFICATION,
     ),
 ];
 
@@ -277,6 +312,26 @@ const MIGRATIONS: &[Migration] = &[
         name: "017_split_settlement.sql",
         sql: MIGRATION_17_SPLIT_SETTLEMENT,
     },
+    Migration {
+        name: "018_payment_durability.sql",
+        sql: MIGRATION_18_PAYMENT_DURABILITY,
+    },
+    Migration {
+        name: "019_settlement_leg_projection.sql",
+        sql: MIGRATION_19_SETTLEMENT_LEG_PROJECTION,
+    },
+    Migration {
+        name: "020_client_refund_recovery.sql",
+        sql: MIGRATION_20_CLIENT_REFUND_RECOVERY,
+    },
+    Migration {
+        name: "021_purchase_execution.sql",
+        sql: MIGRATION_21_PURCHASE_EXECUTION,
+    },
+    Migration {
+        name: "022_purchase_verification.sql",
+        sql: MIGRATION_22_PURCHASE_VERIFICATION,
+    },
 ];
 
 /// Database connection pool for SQLite
@@ -305,7 +360,9 @@ impl Database {
         let connect_options = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // A successful intent/proof commit must survive process/power interruption.
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Full);
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -1292,6 +1349,8 @@ mod tests {
             "badge_awards",
             "badge_definitions",
             "blossom_server_settings",
+            "client_refund_attempts",
+            "client_settlement_progress",
             "download_tokens",
             "entitlement_events",
             "installation_manifest_entries",
@@ -1300,8 +1359,12 @@ mod tests {
             "library_games",
             "launch_profile_preferences",
             "marketplace_listings",
+            "nwc_payment_journal",
             "profile_badge_entries",
             "profile_badge_lists",
+            "purchase_execution_admissions",
+            "purchase_execution_approvals",
+            "purchase_quote_verification",
             "purchases",
             "relay_backups",
             "remote_uris",
@@ -1366,6 +1429,108 @@ mod tests {
             foreign_keys, 0,
             "preferences must survive installation deletion"
         );
+    }
+
+    #[tokio::test]
+    async fn payment_durability_upgrade_preserves_existing_account_and_invoice_bytes() {
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("upgrade-17.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true)
+                    .foreign_keys(true),
+            )
+            .await
+            .expect("old db");
+        Database::run_migrations(&path, &pool, &MIGRATIONS[..17])
+            .await
+            .expect("version 17");
+        sqlx::query("INSERT INTO accounts (id,pubkey,npub,signing_mode,encrypted_nsec,created_at,last_used,is_active) VALUES ('existing','pub','npub','Local',X'0708',1,1,1)")
+            .execute(&pool).await.expect("existing account");
+        sqlx::query("INSERT INTO settlement_quotes (account_pubkey,quote_id,processor_url,quote_event_json,listing_event_id,state,updated_at) VALUES ('pub','q','https://processor','{}','listing','active',1)")
+            .execute(&pool).await.expect("existing quote");
+        sqlx::query("INSERT INTO settlement_legs (account_pubkey,quote_id,leg_id,leg_order,recipient_pubkey,amount_msat,state) VALUES ('pub','q','dev',0,'dev',1000,'pending')")
+            .execute(&pool).await.expect("existing leg");
+        sqlx::query("INSERT INTO settlement_invoice_attempts (account_pubkey,quote_id,leg_id,attempt_id,encrypted_attempt,payment_hash,state,updated_at) VALUES ('pub','q','dev','attempt',X'CAFE','hash','disclosed',1)")
+            .execute(&pool).await.expect("existing invoice");
+        pool.close().await;
+        let upgraded = Database::new(&path).await.expect("non-destructive upgrade");
+        let row:(Vec<u8>,Vec<u8>,Option<Vec<u8>>,i64)=sqlx::query_as("SELECT a.encrypted_nsec,i.encrypted_attempt,i.encrypted_proof,a.is_active FROM accounts a JOIN settlement_invoice_attempts i ON i.account_pubkey=a.pubkey WHERE a.id='existing'")
+            .fetch_one(upgraded.pool()).await.expect("preserved data");
+        assert_eq!(row, (vec![7, 8], vec![0xCA, 0xFE], None, 1));
+    }
+
+    #[tokio::test]
+    async fn leg_projection_upgrade_preserves_evidence_and_never_promotes_unpaid_quotes() {
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("upgrade-18.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true)
+                    .foreign_keys(true),
+            )
+            .await
+            .expect("old db");
+        Database::run_migrations(&path, &pool, &MIGRATIONS[..18])
+            .await
+            .expect("version 18");
+        for (id, state, receipt) in [
+            ("paid", "settled", Some("unchanged-signed-receipt")),
+            ("partial", "failed", None),
+            ("unpaid", "active", None),
+        ] {
+            sqlx::query("INSERT INTO settlement_quotes (account_pubkey,quote_id,processor_url,quote_event_json,listing_event_id,state,receipt_event_json,updated_at) VALUES ('alice',?,'https://processor','unchanged-signed-quote','listing',?,?,1)").bind(id).bind(state).bind(receipt).execute(&pool).await.expect("quote");
+            sqlx::query("INSERT INTO settlement_legs (account_pubkey,quote_id,leg_id,leg_order,recipient_pubkey,amount_msat,state) VALUES ('alice',?,'dev',0,'dev',1000,'pending')").bind(id).execute(&pool).await.expect("leg");
+        }
+        sqlx::query("INSERT INTO settlement_invoice_attempts (account_pubkey,quote_id,leg_id,attempt_id,encrypted_attempt,payment_hash,state,updated_at,encrypted_proof) VALUES ('alice','partial','dev','original',X'CAFE','original-hash','settled',1,X'0708')").execute(&pool).await.expect("proof");
+        pool.close().await;
+        let db = Database::new(&path).await.expect("additive upgrade");
+        let states: Vec<(String, String)> =
+            sqlx::query_as("SELECT quote_id,state FROM settlement_legs ORDER BY quote_id")
+                .fetch_all(db.pool())
+                .await
+                .expect("states");
+        assert_eq!(
+            states,
+            vec![
+                ("paid".into(), "settled".into()),
+                ("partial".into(), "settled".into()),
+                ("unpaid".into(), "pending".into())
+            ]
+        );
+        let quotes: Vec<(String, String)> =
+            sqlx::query_as("SELECT quote_id,state FROM settlement_quotes ORDER BY quote_id")
+                .fetch_all(db.pool())
+                .await
+                .expect("quotes");
+        assert_eq!(
+            quotes,
+            vec![
+                ("paid".into(), "settled".into()),
+                ("partial".into(), "failed".into()),
+                ("unpaid".into(), "active".into())
+            ]
+        );
+        let evidence:(Vec<u8>,Vec<u8>)=sqlx::query_as("SELECT encrypted_attempt,encrypted_proof FROM settlement_invoice_attempts WHERE attempt_id='original'").fetch_one(db.pool()).await.expect("evidence");
+        assert_eq!(evidence, (vec![0xca, 0xfe], vec![7, 8]));
+        let receipt: String = sqlx::query_scalar(
+            "SELECT receipt_event_json FROM settlement_quotes WHERE quote_id='paid'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("receipt");
+        assert_eq!(receipt, "unchanged-signed-receipt");
+        let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nwc_payment_journal")
+            .fetch_one(db.pool())
+            .await
+            .expect("journal");
+        assert_eq!(intents, 0);
     }
 
     #[tokio::test]

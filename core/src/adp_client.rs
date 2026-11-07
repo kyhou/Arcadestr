@@ -221,6 +221,24 @@ pub struct SettlementProofResponse {
     pub token_expires_at: Option<i64>,
 }
 
+impl SettlementProofResponse {
+    /// Shape consistency only; receipt signature, buyer, quote and issuer
+    /// authorization must still pass the existing receipt persistence path.
+    pub fn validate_completion_fields(&self) -> Result<(), AdpClientError> {
+        if self.state == "settled" && self.receipt.is_none() {
+            return Err(AdpClientError::PurchaseProtocol("Payments settled, but the receipt is unavailable. Recover the original proof; do not pay again.".into()));
+        }
+        if self.receipt.is_some()
+            && (self.state != "settled"
+                || self.download_token.as_deref().is_none_or(str::is_empty)
+                || self.token_expires_at.is_none())
+        {
+            return Err(AdpClientError::PurchaseProtocol("Inconsistent settlement receipt response. Recover the original purchase; do not pay again.".into()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplaceRefundDestinationRequest {
     pub destination: crate::adp_settlement::RefundDestination,
@@ -247,6 +265,20 @@ pub struct RefundInvoiceResponse {
     pub amount_msat: u64,
     pub bolt11: String,
     pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundObligationView {
+    pub quote_id: String,
+    pub leg_id: String,
+    pub recipient_pubkey: String,
+    pub principal_msat: u64,
+    pub due_at: u64,
+    pub state: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundObligationsResponse {
+    pub obligations: Vec<RefundObligationView>,
 }
 
 /// Request sent to `POST /entitlement/claim`.
@@ -366,6 +398,27 @@ pub struct UploadAuthorization {
 }
 
 impl AdpClient {
+    pub async fn refund_obligations(
+        &self,
+        signer: &dyn NostrSigner,
+        quote_id: Option<&str>,
+    ) -> Result<RefundObligationsResponse, AdpClientError> {
+        let path = quote_id
+            .map(|q| format!("/settlement/{q}/refunds"))
+            .unwrap_or_else(|| "/settlement/refunds".into());
+        let url = self.url(&path);
+        let auth = build_nip98_auth_header(signer, &url, "POST").await?;
+        let value = self
+            .http
+            .post_json(
+                &url,
+                serde_json::json!({}),
+                vec![("Authorization".into(), auth)],
+            )
+            .await
+            .map_err(map_purchase_error)?;
+        Ok(serde_json::from_value(value)?)
+    }
     /// Creates an ADP client for `base_url`.
     pub fn new(base_url: impl Into<String>, http: Arc<dyn HttpClient>) -> Self {
         Self {
@@ -1034,6 +1087,33 @@ fn normalize_base_url(mut base_url: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settled_acknowledgment_without_receipt_does_not_complete_purchase() {
+        let mut response = SettlementProofResponse {
+            state: "settled".into(),
+            settled_leg: Some("developer".into()),
+            receipt: None,
+            download_token: None,
+            token_expires_at: None,
+        };
+        assert!(response.validate_completion_fields().is_err());
+        response.state = "active".into();
+        assert!(response.validate_completion_fields().is_ok());
+        let keys = nostr::Keys::generate();
+        response.receipt = Some(
+            nostr::EventBuilder::new(nostr::Kind::Custom(1020), "shape fixture only")
+                .sign_with_keys(&keys)
+                .expect("event"),
+        );
+        response.download_token = Some("mock-token".into());
+        response.token_expires_at = Some(2000);
+        assert!(response.validate_completion_fields().is_err());
+        response.state = "settled".into();
+        assert!(response.validate_completion_fields().is_ok());
+        response.download_token = Some(String::new());
+        assert!(response.validate_completion_fields().is_err());
+    }
     use std::sync::Arc;
 
     use base64::Engine;

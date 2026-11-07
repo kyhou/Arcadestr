@@ -788,6 +788,10 @@ pub fn SettingsView(
                     </div>
                 </section>
 
+                <Show when=move || !standalone_web>
+                    <crate::ui_v2::nwc_wallet::NwcWalletPanel />
+                </Show>
+
                 <Show when=move || availability.security_and_keys>
                     <section class="v2-settings-card">
                         <header class="v2-settings-card-header">

@@ -72,6 +72,7 @@ mod install;
 mod launcher;
 mod marketplace_stream;
 mod nip46_commands;
+mod settlement_ui;
 mod startup_runtime;
 mod store_page_commands;
 
@@ -85,6 +86,7 @@ const MARKETPLACE_REFRESH_OVERLAP_SECS: u64 = 86_400;
 
 /// Application state shared across Tauri commands.
 pub struct AppState {
+    pub settlement_recovery: arcadestr_core::settlement_recovery::RecoveryCoordinator,
     /// Authentication state wrapped in Arc<Mutex<>> for thread-safe access.
     pub auth: Arc<Mutex<AuthState>>,
     /// NOSTR client for relay communication.
@@ -533,6 +535,7 @@ async fn connect_nip46(
 
     let mut auth = state.auth.lock().await;
 
+    state.settlement_recovery.activate(None);
     match auth.connect_nip46(&uri, &relay).await {
         Ok(_) => {
             info!("NIP-46 connection successful");
@@ -549,6 +552,7 @@ async fn connect_nip46(
         .ok_or_else(|| "Public key not available after connection".to_string())?;
 
     let npub = pubkey.to_bech32().map_err(|e| e.to_string())?;
+    state.settlement_recovery.observe(Some(pubkey.to_hex()));
 
     info!("NIP-46 connection successful, npub: {}", npub);
     Ok(npub)
@@ -589,6 +593,9 @@ async fn connect_with_key(
     };
 
     let _ = app_handle.emit(result.event_name, result.npub.clone());
+    state
+        .settlement_recovery
+        .activate(auth.public_key().map(|key| key.to_hex()));
     Ok(result.npub)
 }
 
@@ -629,6 +636,7 @@ async fn wait_for_nostrconnect_signer(
     );
 
     // Wait for the signer to connect (returns both signer and public key)
+    state.settlement_recovery.activate(None);
     let (signer, public_key) =
         Nip46Signer::wait_for_nostrconnect_signer(uri, client_keys, timeout_secs)
             .await
@@ -637,6 +645,7 @@ async fn wait_for_nostrconnect_signer(
     // Store the signer and public key
     auth.set_nip46_signer(signer);
     auth.set_public_key(public_key);
+    state.settlement_recovery.observe(Some(public_key.to_hex()));
 
     // Return the npub
     auth.public_key()
@@ -759,6 +768,7 @@ async fn verify_nip05(
 async fn disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let mut auth = state.auth.lock().await;
     auth.disconnect();
+    state.settlement_recovery.activate(None);
     Ok(())
 }
 
@@ -1125,11 +1135,20 @@ async fn is_game_in_library(
 #[tauri::command]
 async fn get_library_games(state: tauri::State<'_, AppState>) -> Result<Vec<LibraryGame>, String> {
     let buyer_pubkey = active_library_pubkey(&state).await?;
-    LibraryGamesRepository::new(state.database.pool().clone())
+    let saved = LibraryGamesRepository::new(state.database.pool().clone())
         .list(&buyer_pubkey)
         .await
-        .map(|games| games.into_iter().map(LibraryGame::from).collect())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    arcadestr_core::ownership::OwnershipService::new(
+        arcadestr_core::purchases::PurchasesRepository::new(state.database.pool().clone()),
+        arcadestr_core::entitlements_repository::EntitlementsRepository::new(
+            state.database.pool().clone(),
+        ),
+    )
+    .library_entries_for(&buyer_pubkey, saved)
+    .await
+    .map(|games| games.into_iter().map(LibraryGame::from).collect())
+    .map_err(|error| error.to_string())
 }
 
 impl From<InstallationSnapshot> for InstalledGame {
@@ -3482,6 +3501,7 @@ mod install_game_tests {
         });
 
         AppState {
+            settlement_recovery: Default::default(),
             auth: Arc::new(AsyncMutex::new(auth)),
             nostr: Arc::new(AsyncMutex::new(nostr)),
             database: Arc::new(database),
@@ -7718,6 +7738,7 @@ fn main() {
                 .expect("archive staging service should initialize"),
         )
         .manage(AppState {
+            settlement_recovery: Default::default(),
             auth,
             nostr: nostr_client.clone(),
             database,
@@ -7739,6 +7760,7 @@ fn main() {
         .manage(blossom_state)
         .manage(Arc::new(account_manager))
         .setup(move |app| {
+            settlement_ui::spawn_startup_recovery(app.handle().clone());
             // Recovery completes synchronously before the first window is shown,
             // so stale installing rows cannot be presented to the frontend.
             let recovery_app_data = app
@@ -8131,12 +8153,22 @@ fn main() {
             adp_commands::hash_build_file,
             adp_commands::select_build_file,
             adp_commands::connect_nwc_wallet,
+            adp_commands::get_nwc_wallet,
+            adp_commands::disconnect_nwc_wallet,
+            adp_commands::verify_nwc_wallet,
             adp_commands::request_lnurl_invoice,
             adp_commands::pay_nwc_invoice,
+            adp_commands::get_purchase_plan,
+            adp_commands::approve_purchase_plan,
             adp_commands::confirm_purchase,
             adp_commands::start_split_purchase,
             adp_commands::next_split_invoice,
             adp_commands::submit_split_payment,
+            adp_commands::resume_split_payment,
+            settlement_ui::reconcile_pending_settlements,
+            settlement_ui::recipient_refund_history,
+            settlement_ui::pay_split_refund,
+            settlement_ui::resume_split_refund,
             adp_commands::settlement_history,
             adp_commands::refresh_settlement,
             adp_commands::replace_split_refund_destination,
@@ -8217,6 +8249,7 @@ fn main() {
             // New NIP-46 commands from nip46_commands module
             nip46_commands::connect_bunker,
             nip46_commands::get_connection_status,
+            nip46_commands::regtest_nip44_probe,
             nip46_commands::start_qr_login,
             nip46_commands::check_qr_connection,
             nip46_commands::list_saved_profiles,

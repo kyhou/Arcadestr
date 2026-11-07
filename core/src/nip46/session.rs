@@ -66,15 +66,15 @@ pub async fn activate_profile(
         "Creating LazyNip46Signer for bunker pubkey {}...",
         bunker_pubkey
     );
-    let lazy_signer = LazyNip46Signer::new(
+    let lazy_signer = Arc::new(LazyNip46Signer::new(
         profile.bunker_uri.clone(),
         profile.app_keys.clone(),
         profile.user_pubkey,
-    );
+    ));
 
     // STEP 4: Build nostr-sdk Client with lazy signer
     info!("Building nostr-sdk Client with LazyNip46Signer (deferred connection)...");
-    let client = Client::new(Arc::new(lazy_signer) as Arc<dyn nostr::NostrSigner>);
+    let client = Client::new(lazy_signer.clone() as Arc<dyn nostr::NostrSigner>);
     info!("Client built successfully (deferred connection)");
 
     // STEP 5: Update AppSignerState immediately
@@ -88,31 +88,19 @@ pub async fn activate_profile(
     // STEP 6: Trigger connection in background
     // This ensures the NIP-46 handshake happens without blocking the UI
     let state_clone = state.clone();
+    let verifying_profile = bunker_pubkey.to_owned();
     tokio::spawn(async move {
         info!("Triggering deferred NIP-46 connection in background...");
-        // Get the signer from client and trigger connection by calling get_public_key
-        match client.signer().await {
-            Ok(signer) => {
-                match signer.get_public_key().await {
-                    Ok(_) => {
-                        info!("NIP-46 connection established successfully in background");
-                        // Update state to connected
-                        let mut state_guard = state_clone.lock().await;
-                        state_guard.connection_state = ConnectionState::Connected;
-                    }
-                    Err(e) => {
-                        error!("Failed to establish NIP-46 connection: {}", e);
-                        let mut state_guard = state_clone.lock().await;
-                        state_guard.connection_state = ConnectionState::Failed(e.to_string());
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to get signer from client: {}", e);
-                let mut state_guard = state_clone.lock().await;
-                state_guard.connection_state = ConnectionState::Failed(e.to_string());
-            }
+        // A cached public key proves identity selection, not signer availability.
+        let result = lazy_signer.verify_saved_session().await;
+        let mut state_guard = state_clone.lock().await;
+        if state_guard.active_profile_id.as_deref() != Some(verifying_profile.as_str()) {
+            return;
         }
+        state_guard.connection_state = match result {
+            Ok(()) => ConnectionState::Connected,
+            Err(error) => ConnectionState::Failed(error.to_string()),
+        };
     });
 
     info!(

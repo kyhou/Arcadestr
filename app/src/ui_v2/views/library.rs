@@ -1428,8 +1428,8 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
                         } else {
                             let saved_rows = visible_saved_entries.get().into_iter().map(|(saved, listing)| {
                                 let fallback = parse_game_coordinate(&saved.game_coordinate)
-                                    .map(|(_, listing_id)| format!("Saved game: {listing_id}"))
-                                    .unwrap_or_else(|| "Saved game".to_string());
+                                    .map(|(_, listing_id)| format!("Library game: {listing_id}"))
+                                    .unwrap_or_else(|| "Library game".to_string());
                                 let title = listing.as_ref().map(|item| item.title.clone()).unwrap_or(fallback);
                                 let publisher = listing.as_ref().map(|item| item.stall_name.clone().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| npub_fallback_label(&item.publisher_npub))).unwrap_or_else(|| "Publisher unavailable".to_string());
                                 let artwork = artwork_state_from_url(listing.as_ref().and_then(|item| valid_cover_url(&item.images)));
@@ -1444,7 +1444,7 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
                                 view! {
                                     <article class="arc-library-row">
                                         <div class="arc-library-art"><GameArtwork title=title.clone() state=artwork role=ArtworkRole::Thumbnail /></div>
-                                        <div class="arc-library-row-copy"><h2>{title}</h2><p>{publisher}</p><small>{if saved_is_installed { "Saved to the active account · Installed on this device" } else { "Saved to the active account · Not installed on this device" }}</small></div>
+                                        <div class="arc-library-row-copy"><h2>{title}</h2><p>{publisher}</p><small>{if saved_is_installed { "In account Library · Installed on this device" } else { "In account Library · Not installed on this device" }}</small></div>
                                         <div class="arc-library-row-states" aria-label="Game states">
                                             {listing.as_ref().map(|listing| { let (label, variant) = access_chip(listing, library_now.get()); view! { <StatusChip label=label variant=variant icon=None size=StatusChipSize::Compact /> } })}
                                             {if durable_owned {
@@ -1454,7 +1454,7 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
                                             } else if ownership_failed {
                                                 view! { <StatusChip label="Ownership unknown" variant=StatusChipVariant::Warning icon=None size=StatusChipSize::Compact /> }.into_any()
                                             } else { view! { <></> }.into_any() }}
-                                            <StatusChip label="Saved" variant=StatusChipVariant::Neutral icon=Some("bookmark") size=StatusChipSize::Compact />
+                                            <StatusChip label="Library" variant=StatusChipVariant::Neutral icon=Some("bookmark") size=StatusChipSize::Compact />
                                             {saved_is_installed.then(|| view! { <StatusChip label="Installed" variant=StatusChipVariant::Installed icon=Some("download_done") size=StatusChipSize::Compact /> })}
                                             <StatusChip label=compatibility_state.0 variant=compatibility_state.1 icon=None size=StatusChipSize::Compact />
                                         </div>

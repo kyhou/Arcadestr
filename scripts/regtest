@@ -1,0 +1,1272 @@
+#!/usr/bin/env python3
+"""Local-only regtest supervisor. Never creates identities or resets data."""
+import argparse
+import base64
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import secrets
+import socket
+import sqlite3
+import struct
+import string
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+HOME = Path.home()
+CONFIG = HOME / '.config/arcadestr-regtest'
+STATE = Path(os.environ.get('XDG_STATE_HOME', HOME / '.local/state')) / 'arcadestr-regtest'
+NODES = ('alice', 'bob', 'carol', 'dave')
+PORTS = {'strfry1': 7777, 'strfry2': 7778, 'nak1': 10547, 'nak2': 10548,
+         'lnurl': 18080, 'adp': 9099, 'adp-dave': 19100, 'frontend': 5173}
+HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+class Blocked(Exception):
+    pass
+
+
+def run(args, cwd=None, env=None, timeout=30):
+    """Never echo command arguments, stderr, or authenticated response bodies."""
+    try:
+        result = subprocess.run([str(a) for a in args], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Blocked(f'{Path(args[0]).name}: unavailable or timed out') from exc
+    if result.returncode:
+        raise Blocked(f'{Path(args[0]).name}: command failed (exit {result.returncode}); inspect locally')
+    return result.stdout.decode()
+
+
+def settings():
+    values = {'adp_repo': str(ROOT.parent / 'adp-server'),
+              'polar_dir': str(HOME / '.polar/networks/1'),
+              'strfry': str(HOME / 'Downloads/strfry/strfry'),
+              'relay_dir': str(HOME / 'strfry-relays')}
+    path = CONFIG / 'settings.json'
+    if path.exists():
+        values.update(json.loads(path.read_text()))
+    return values
+
+
+def save(path, data):
+    tmp = path.with_suffix('.tmp')
+    with open(tmp, 'w', encoding='utf8') as out:
+        os.chmod(tmp, 0o600)
+        json.dump(data, out, indent=2)
+        out.flush()
+        os.fsync(out.fileno())
+    tmp.replace(path)
+
+
+def read_state():
+    path = STATE / 'processes.json'
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def process_identity(pid):
+    try:
+        # Parenthesized comm may contain spaces. Field 22 is starttime.
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        if fields[0] == 'Z':
+            return None
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        return [boot, fields[19]]
+    except (OSError, IndexError):
+        return None
+
+
+def owned(entry):
+    return bool(entry and process_identity(entry['pid']) == entry['identity'])
+
+
+def listening(port):
+    with socket.socket() as sock:
+        sock.settimeout(.3)
+        return sock.connect_ex(('127.0.0.1', port)) == 0
+
+
+def local_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        loopback = ipaddress.ip_address(parsed.hostname or '').is_loopback
+    except ValueError:
+        loopback = parsed.hostname == 'localhost'
+    if (parsed.scheme not in ('http', 'https', 'ws') or not loopback
+            or parsed.username or parsed.password or parsed.fragment):
+        raise Blocked('non-loopback or credential-bearing service URL rejected')
+    return parsed
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise Blocked('HTTP redirect rejected')
+
+
+HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+
+def request(url, body=None, headers=None):
+    local_url(url)
+    req = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode(),
+                                 headers={'Content-Type': 'application/json', **(headers or {})})
+    try:
+        with HTTP.open(req, timeout=10) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+    except (OSError, ValueError) as exc:
+        raise Blocked('local HTTP request failed or returned invalid JSON') from exc
+
+
+def ws_query(port):
+    """NIP-01 REQ/EOSE probe, no signing, writes, or external connections."""
+    with socket.create_connection(('127.0.0.1', port), timeout=3) as sock:
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall((f'GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n'
+                      f'Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n'
+                      'Sec-WebSocket-Version: 13\r\n\r\n').encode())
+        stream = sock.makefile('rb')
+        header = stream.readline()
+        headers = {}
+        while True:
+            line = stream.readline()
+            if line == b'\r\n' or not line:
+                break
+            k, v = line.decode().split(':', 1)
+            headers[k.lower()] = v.strip()
+        expected = base64.b64encode(hashlib.sha1(
+            (key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
+        if b' 101 ' not in header or headers.get('sec-websocket-accept') != expected:
+            raise Blocked('relay WebSocket handshake failed')
+        data = json.dumps(['REQ', 'regtest-readiness', {'ids': ['0' * 64]}]).encode()
+        mask = os.urandom(4)
+        sock.sendall(bytes([0x81, 0x80 | len(data)]) + mask +
+                     bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+        for _ in range(10):
+            prefix = stream.read(2)
+            if len(prefix) != 2:
+                break
+            length = prefix[1] & 127
+            if length == 126:
+                length = struct.unpack('!H', stream.read(2))[0]
+            elif length == 127:
+                length = struct.unpack('!Q', stream.read(8))[0]
+            if length > 1_000_000 or prefix[1] & 128:
+                raise Blocked('invalid relay frame')
+            payload = stream.read(length)
+            if prefix[0] & 15 == 1:
+                message = json.loads(payload)
+                if message[:2] == ['EOSE', 'regtest-readiness']:
+                    return
+        raise Blocked('relay did not answer REQ with EOSE')
+
+
+def lncli(node, *args):
+    if node not in NODES:
+        raise Blocked('unknown local LND node')
+    return json.loads(run(['docker', 'exec', 'polar-n1-' + node, 'lncli',
+                           '--lnddir=/home/lnd/.lnd', '--network=regtest', *args]))
+
+
+def verify_nodes():
+    infos = {}
+    for node in NODES:
+        info = lncli(node, 'getinfo')
+        if info.get('chains') != [{'chain': 'bitcoin', 'network': 'regtest'}]:
+            raise Blocked(f'{node}: not exclusively Bitcoin regtest; payments prohibited')
+        if not info.get('synced_to_chain'):
+            raise Blocked(f'{node}: not chain synced')
+        infos[node] = info
+    keys = {info['identity_pubkey'] for info in infos.values()}
+    for node in NODES:
+        channels = lncli(node, 'listchannels')['channels']
+        active = [c for c in channels if c['active'] and c['remote_pubkey'] in keys]
+        # Readiness floor only, not a claim that a route is guaranteed.
+        if (sum(int(c['local_balance']) for c in active) < 10_000 or
+                sum(int(c['remote_balance']) for c in active) < 10_000):
+            raise Blocked(f'{node}: insufficient local regtest liquidity (10,000 sats each direction)')
+    return infos
+
+
+def verify_bitcoin():
+    # Polar supplies these development RPC credentials; never print argv.
+    result = json.loads(run(['docker', 'exec', 'polar-n1-backend1', 'bitcoin-cli',
+                             '-regtest', '-rpcuser=polaruser', '-rpcpassword=polarpass',
+                             'getblockchaininfo']))
+    if result.get('chain') != 'regtest' or result.get('initialblockdownload'):
+        raise Blocked('Bitcoin Core is not ready on regtest')
+
+
+def fixture_env(infos):
+    path = CONFIG / 'lnurl-fixture.env'
+    if not path.exists() or path.stat().st_mode & 0o077:
+        raise Blocked('fixture env missing or not owner-only (chmod 600)')
+    env = os.environ.copy()
+    # Deliberately data, not shell code. No source/eval or command substitution.
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('export '):
+            line = line[7:]
+        key, sep, value = line.partition('=')
+        if not sep or not key.startswith('POLAR_') or not key.replace('_', '').isalnum():
+            raise Blocked('fixture env must contain literal POLAR_* assignments')
+        words = shlex.split(value, comments=True)
+        if len(words) != 1 or '`' in words[0]:
+            raise Blocked('fixture env must use data assignments, never executable shell')
+        try:
+            allowed = {k:v for k,v in env.items() if k == 'HOME' or k.startswith('POLAR_')}
+            env[key] = string.Template(words[0]).substitute(allowed)
+        except (KeyError, ValueError) as exc:
+            raise Blocked('fixture env allows only HOME/POLAR_* variable references, never commands') from exc
+    volume = Path(env.get('POLAR_LND_ROOT', str(Path(settings()['polar_dir']) / 'volumes/lnd')))
+    for node in NODES:
+        prefix = 'POLAR_' + node.upper()
+        env.setdefault(prefix + '_TLS_CERT', str(volume / node / 'tls.cert'))
+        env.setdefault(prefix + '_INVOICE_MACAROON', str(volume / node / 'lnurl-fixture.macaroon'))
+        env[prefix + '_NODE_PUBKEY'] = infos[node]['identity_pubkey']
+        value = env.get(prefix + '_NOSTR_PUBKEY', '')
+        if len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
+            raise Blocked(f'fixture: missing existing {node} Nostr pubkey in {path}; no identity generated')
+    return env
+
+
+def adp_env(adp):
+    path = Path(settings().get('adp_env', str(adp / '.env')))
+    env = os.environ.copy()
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        key, sep, value = line.removeprefix('export ').partition('=')
+        if not sep or not key.startswith('ADP_'):
+            raise Blocked('ADP env must contain literal ADP_* assignments')
+        # dotenv values are not shell code; preserve unquoted JSON fee policies.
+        value = value.strip()
+        if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+            value = value[1:-1]
+        if '$' in value or '`' in value:
+            raise Blocked('ADP env shell expansion is not supported')
+        env[key] = value
+    for key in ['ADP_OPERATOR_NSEC', 'ADP_MASTER_KEY', 'ADP_DB_PATH', 'ADP_FILES_DIR', 'ADP_SERVER_URL', 'ADP_RELAYS']:
+        if not env.get(key):
+            raise Blocked(f'{key} missing; refusing ADP defaults or a new database')
+    local_url(env['ADP_SERVER_URL'])
+    for relay in env['ADP_RELAYS'].split(','):
+        local_url(relay.strip())
+    db = Path(env['ADP_DB_PATH'])
+    if not (db if db.is_absolute() else adp / db).is_file():
+        raise Blocked('existing ADP database missing; refusing to create one')
+    env['ADP_BIND_ADDR'] = '127.0.0.1:9099'
+    overlay = STATE / 'settlement-env.json'
+    if overlay.exists():
+        values = json.loads(overlay.read_text())
+        if (set(values) != {'ADP_PAYMENT_DESTINATION','ADP_TERMS_EVENT_ID','ADP_FEE_POLICY'} or
+                values['ADP_PAYMENT_DESTINATION'] != 'carol@127.0.0.1:18080' or
+                json.loads(values['ADP_FEE_POLICY']) != {'type':'fixed','amount_msat':100000} or
+                len(values['ADP_TERMS_EVENT_ID']) != 64 or
+                any(c not in '0123456789abcdef' for c in values['ADP_TERMS_EVENT_ID'])):
+            raise Blocked('invalid private single-operator settlement overlay')
+        env.update(values)
+    return env
+
+
+def dave_env(adp):
+    path = Path(settings().get('dave_adp_env',str(CONFIG/'dave-adp.env')))
+    if not path.is_file() or path.stat().st_mode & 0o077:
+        raise Blocked('Dave external ADP configuration must exist and be owner-only')
+    env = {k:v for k,v in os.environ.items() if not k.startswith('ADP_')}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'): continue
+        key,sep,value = line.partition('=')
+        if not sep or not key.startswith('ADP_') or '$' in value or '`' in value:
+            raise Blocked('Dave config requires literal ADP_* assignments')
+        env[key] = value.strip()
+    for key in ('ADP_OPERATOR_NSEC','ADP_MASTER_KEY','ADP_DB_PATH','ADP_FILES_DIR','ADP_TERMS_EVENT_ID'):
+        if not env.get(key): raise Blocked('Dave ADP configuration incomplete')
+    carol = adp_env(adp)
+    signer_reference = settings().get('dave_signer_file')
+    if signer_reference:
+        signer = Path(signer_reference)
+        if not signer.is_file() or signer.stat().st_mode & 0o077 or signer.read_text().strip() != env['ADP_OPERATOR_NSEC']:
+            raise Blocked('Dave persisted signer reference and private ADP configuration differ')
+    if (env['ADP_OPERATOR_NSEC'] == carol['ADP_OPERATOR_NSEC'] or
+            env['ADP_MASTER_KEY'] == carol['ADP_MASTER_KEY'] or
+            Path(env['ADP_DB_PATH']).resolve() == (adp/Path(carol['ADP_DB_PATH'])).resolve() or
+            env.get('ADP_SERVER_URL') != 'http://127.0.0.1:19100' or
+            env.get('ADP_BIND_ADDR') != '127.0.0.1:19100'):
+        raise Blocked('Dave must have independent operator credentials, encryption key, database and port')
+    for relay in env['ADP_RELAYS'].split(','): local_url(relay)
+    if not Path(env['ADP_DB_PATH']).is_absolute() or not Path(env['ADP_FILES_DIR']).is_absolute():
+        raise Blocked('Dave persistent database/files require absolute external paths')
+    return env
+
+
+def stop_owned_service(name):
+    state = read_state()
+    entry = state.get(name)
+    if not owned(entry): raise Blocked(f'{name} is not supervisor-owned; not stopping another process')
+    os.kill(entry['pid'],signal.SIGTERM)
+    deadline = time.monotonic()+20
+    while owned(entry) and time.monotonic()<deadline: time.sleep(.2)
+    if owned(entry): raise Blocked(f'{name} did not stop gracefully; not force-killed')
+    state.pop(name)
+    save(STATE/'processes.json',state)
+    deadline = time.monotonic()+5
+    while name in PORTS and listening(PORTS[name]) and time.monotonic()<deadline:
+        time.sleep(.1)
+    if name in PORTS and listening(PORTS[name]):
+        raise Blocked(f'{name} stopped but its port is still occupied; not killing another listener')
+
+
+def probe(name):
+    if name == 'frontend':
+        try:
+            with HTTP.open('http://127.0.0.1:5173/', timeout=3) as response:
+                html = response.read(1_000_000).decode()
+                if response.status != 200 or 'Arcadestr' not in html:
+                    raise Blocked('port 5173 is not the Arcadestr frontend')
+        except OSError as exc:
+            raise Blocked('Arcadestr frontend not ready') from exc
+    elif name.startswith(('strfry', 'nak')):
+        ws_query(PORTS[name])
+    elif name == 'adp-dave':
+        code, data = request('http://127.0.0.1:19100/.well-known/adp')
+        identities = fixture_env(verify_nodes())
+        if code != 200 or data.get('pubkey') != identities['POLAR_DAVE_NOSTR_PUBKEY']:
+            raise Blocked('Dave independent ADP identity is not ready')
+    elif name == 'adp':
+        status, data = request('http://localhost:9099/health')
+        if status != 200 or not isinstance(data, dict):
+            raise Blocked('ADP health check failed')
+        status, data = request('http://localhost:9099/.well-known/adp')
+        if status != 200 or not isinstance(data, dict):
+            raise Blocked('ADP protocol discovery failed')
+    elif name == 'lnurl':
+        for node in NODES:
+            status, data = request(f'http://127.0.0.1:18080/.well-known/lnurlp/{node}')
+            if status != 200 or data.get('tag') != 'payRequest':
+                raise Blocked(f'fixture {node}: metadata unavailable')
+            callback = local_url(data['callback'])
+            if callback.port != 18080 or callback.scheme != 'http':
+                raise Blocked('fixture callback is not the local fixture')
+
+
+def start(name, argv, cwd, env=None, readiness_timeout=60):
+    state = read_state()
+    entry = state.get(name)
+    if listening(PORTS[name]):
+        probe(name)
+        print(f'OK {name}: ready ({"owned" if owned(entry) else "pre-existing; not managed"})')
+        return
+    if owned(entry):
+        raise Blocked(f'{name}: owned process exists but is not ready')
+    log = STATE / (name + '.log')
+    with open(log, 'ab') as output:
+        os.chmod(log, 0o600)
+        process = subprocess.Popen([str(a) for a in argv], cwd=cwd, env=env,
+                                   stdout=output, stderr=output, stdin=subprocess.DEVNULL,
+                                   start_new_session=True)
+    identity = process_identity(process.pid)
+    if identity is None:
+        raise Blocked(f'{name}: process exited at startup; inspect private {log}')
+    state[name] = {'pid': process.pid, 'identity': identity, 'group':process.pid}
+    save(STATE / 'processes.json', state)
+    deadline = time.monotonic() + readiness_timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise Blocked(f'{name}: exited; inspect private {log}')
+        try:
+            probe(name)
+            print(f'OK {name}: started and ready')
+            return
+        except (Blocked, OSError, ValueError):
+            time.sleep(.5)
+    raise Blocked(f'{name}: readiness timeout; inspect private {log}')
+
+
+def start_desktop_process(name, executable, env):
+    if not os.environ.get('DISPLAY') and not os.environ.get('WAYLAND_DISPLAY'):
+        raise Blocked(f'{name}: no graphical session; open/unlock manually')
+    state = read_state()
+    if owned(state.get(name)):
+        print('OK', name, 'owned desktop process already running')
+        return
+    if not Path(executable).is_file():
+        raise Blocked(f'{name}: configured local executable missing')
+    with open(STATE / (name + '.log'), 'ab') as output:
+        process = subprocess.Popen([str(executable)], env=env, cwd=ROOT,
+                                   stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                   start_new_session=True)
+    identity = process_identity(process.pid)
+    if identity is None:
+        raise Blocked(f'{name}: desktop process exited')
+    state[name] = {'pid':process.pid, 'identity':identity, 'group':process.pid}
+    save(STATE / 'processes.json', state)
+    time.sleep(.5)
+    if process.poll() is not None:
+        raise Blocked(f'{name}: desktop startup failed; inspect its private log')
+    print('OK', name, 'process launched; GUI unlock/readiness requires the existing profile')
+
+
+def start_alby():
+    if any(p.strip() == 'Alby Hub' for p in run(['ps', '-eo', 'comm']).splitlines()):
+        return
+    work = HOME / '.local/share/arcadestr-albyhub-regtest'
+    if not (work / 'nwc.db').exists():
+        raise Blocked('existing Alby Hub regtest database missing; refusing a new profile')
+    env = os.environ.copy()
+    env['WORK_DIR'] = str(work)
+    env['RELAY'] = 'ws://127.0.0.1:7778'
+    executable = settings().get('alby_executable', str(HOME / 'Applications/albyhub-regtest/albyhub-Desktop-Linux/bin/Alby Hub'))
+    start_desktop_process('alby', executable, env)
+
+
+def start_arcadestr():
+    if any(p.strip() == 'arcadestr-deskt' for p in run(['ps', '-eo', 'comm']).splitlines()):
+        print('OK Arcadestr desktop already running (not managed)')
+        return
+    print('Building current local Arcadestr desktop (private build log)…', flush=True)
+    with open(STATE / 'desktop-build.log', 'ab') as output:
+        result = subprocess.run(['cargo', 'build', '--locked', '-p', 'arcadestr-desktop'],
+                                cwd=ROOT, stdout=output, stderr=output)
+    if result.returncode:
+        raise Blocked('Arcadestr build failed; inspect private desktop-build.log')
+    # Keep generated assets outside web/dist: that file already has user changes.
+    start('frontend', ['trunk', 'serve', '--locked', '--address', '127.0.0.1',
+                      '--port', '5173', '--dist', str(STATE / 'frontend')], ROOT / 'web',
+          readiness_timeout=300)
+    env = os.environ.copy()
+    env['ARCADESTR_REGTEST_ALLOW_LOOPBACK_HTTP'] = 'true'
+    start_desktop_process('arcadestr', ROOT / 'target/debug/arcadestr-desktop', env)
+
+
+def hub_status():
+    path = HOME / '.local/share/arcadestr-albyhub-regtest/nwc.db'
+    if not path.exists():
+        raise Blocked('existing Alby Hub database not found')
+    with sqlite3.connect(f'file:{path}?mode=ro', uri=True) as db:
+        apps = db.execute("SELECT id FROM apps WHERE name IN (?, ?)",
+                          ('Arcadestr Regtest Buyer', 'Alice Arcadestr Regtest Buyer')).fetchall()
+        if len(apps) != 1:
+            raise Blocked('existing buyer NWC app not uniquely identifiable; no connection created')
+        permissions = db.execute('SELECT scope,expires_at FROM app_permissions WHERE app_id=?', apps[0]).fetchall()
+        if not any(scope == 'pay_invoice' and (expiry is None or str(expiry) > time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime()))
+                   for scope, expiry in permissions):
+            raise Blocked('existing NWC pay permission missing or expired')
+    processes = run(['ps', '-eo', 'comm']).splitlines()
+    if not any(p.strip() == 'Alby Hub' for p in processes):
+        raise Blocked('Alby Hub is not running; open and unlock the existing profile')
+    print('OK Alby Hub: process and existing buyer app/permission found; live NWC not yet verified')
+
+
+def verify_nwc():
+    path = HOME / '.local/share/arcadestr/accounts.db'
+    if not path.exists():
+        raise Blocked('existing Arcadestr account database unavailable')
+    with sqlite3.connect(f'file:{path}?mode=ro', uri=True) as db:
+        configured = settings().get('buyer_pubkey')
+        accounts = (db.execute('SELECT pubkey FROM accounts WHERE pubkey=?', (configured,)).fetchall()
+                    if configured else db.execute("SELECT pubkey FROM accounts WHERE display_name='Buyer'").fetchall())
+    if len(accounts) != 1:
+        raise Blocked('existing buyer account is ambiguous; no identity selected')
+    env = os.environ.copy()
+    env['ARCADESTR_REGTEST_BUYER_PUBKEY'] = accounts[0][0]
+    binary = ROOT / 'target/debug/examples/regtest_nwc'
+    if not binary.exists():
+        raise Blocked('build the local regtest_nwc example with --features native first')
+    try:
+        result = subprocess.run([binary], cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=20)
+        data = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        raise Blocked('NWC helper failed/timed out; no connection modified') from exc
+    if result.returncode or data.get('status') != 'verified':
+        reasons = {
+            'not_configured':'existing account-scoped NWC credential is not visible to this process',
+            'keyring_locked_or_unavailable':'unlock the existing OS keyring',
+            'wallet_timeout':'unlock Alby Hub and verify its existing relay connection',
+            'relay_unavailable':'existing NWC relay is unavailable',
+            'verification_unsupported':'existing wallet does not support get_info',
+            'wallet_rejected_request':'existing wallet rejected the read-only verification',
+        }
+        raise Blocked('NWC: ' + reasons.get(data.get('reason'), 'invalid connection/response; inspect existing setup'))
+    print('OK existing buyer NWC: live read-only verification')
+
+
+def build(adp):
+    print('Building current local ADP sources (private build log)…', flush=True)
+    path = STATE / 'build.log'
+    with open(path, 'ab') as output:
+        os.chmod(path, 0o600)
+        result = subprocess.run(['cargo', 'build', '--locked', '-p', 'adp-server',
+                                 '--bin', 'adp-server', '--example', 'polar_lnurl_fixture'],
+                                cwd=adp, stdout=output, stderr=output)
+    if result.returncode:
+        raise Blocked(f'local build failed; inspect {path}')
+    with open(path, 'ab') as output:
+        result = subprocess.run(['cargo', 'build', '--locked', '-p', 'arcadestr-core',
+                                 '--features', 'native', '--example', 'regtest_nwc', '--example', 'regtest_split_purchase'],
+                                cwd=ROOT, stdout=output, stderr=output)
+    if result.returncode:
+        raise Blocked(f'local NWC helper build failed; inspect {path}')
+
+
+def up(args):
+    cfg = settings()
+    run(['docker', 'info', '--format', '{{.ServerVersion}}'])
+    # docker start cannot recreate containers, volumes, wallets or identities.
+    for node in ('backend1', *NODES):
+        name = 'polar-n1-' + node
+        running = run(['docker', 'inspect', '--format', '{{.State.Running}}', name]).strip()
+        if running != 'true':
+            run(['docker', 'start', name], timeout=120)
+    deadline = time.monotonic() + 90
+    while True:
+        try:
+            verify_bitcoin()
+            infos = verify_nodes()
+            break
+        except Blocked:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
+    print('OK Polar: existing Bitcoin Core and four funded LND nodes ready on regtest')
+    adp = Path(cfg['adp_repo'])
+    if not args.no_build:
+        build(adp)
+    failures = []
+    for i in (1, 2):
+        try:
+            start(f'strfry{i}', [cfg['strfry'], '--config=' + str(Path(cfg['relay_dir']) / f'relay{i}/strfry.conf'), 'relay'], cfg['relay_dir'])
+        except (Blocked, OSError) as exc:
+            failures.append(str(exc))
+        try:
+            start(f'nak{i}', ['nak', 'serve', '--hostname', '127.0.0.1', '--port', str(10546 + i)], ROOT)
+        except (Blocked, OSError) as exc:
+            failures.append(str(exc))
+    try:
+        env = fixture_env(infos)
+        if listening(18080):
+            code, current = request('http://127.0.0.1:18080/.well-known/lnurlp/dave')
+            if code == 200 and current.get('nostrPubkey') != env['POLAR_DAVE_NOSTR_PUBKEY']:
+                stop_owned_service('lnurl')
+        # Fixture is the existing implementation, with stricter per-invoice bounds.
+        config = json.loads((adp / 'adp-server/examples/polar_lnurl_fixture/config.example.json').read_text())
+        for recipient in config['recipients'].values():
+            recipient['max_sendable_msat'] = 10_000_000
+        save(STATE / 'fixture.json', config)
+        start('lnurl', [adp / 'target/debug/examples/polar_lnurl_fixture', STATE / 'fixture.json'], adp, env)
+    except (Blocked, OSError) as exc:
+        failures.append(str(exc))
+    try:
+        # The binary reads environment variables, not dotenv files.
+        env = adp_env(adp)
+        start('adp', [adp / 'target/debug/adp-server'], adp, env)
+        if Path(cfg.get('dave_adp_env', str(CONFIG/'dave-adp.env'))).exists():
+            start('adp-dave',[adp/'target/debug/adp-server'],adp,dave_env(adp))
+    except (Blocked, OSError) as exc:
+        failures.append(str(exc))
+    try:
+        start_alby()
+        hub_status()
+        verify_nwc()
+    except Blocked as exc:
+        failures.append(str(exc))
+    if args.gui:
+        try:
+            start_arcadestr()
+        except (Blocked, OSError) as exc:
+            failures.append(str(exc))
+    for failure in failures:
+        print('BLOCKED', failure)
+    return bool(failures)
+
+
+def status(_args):
+    failures = []
+    checks = [('Docker', lambda: run(['docker', 'info', '--format', '{{.ServerVersion}}'])),
+              ('Bitcoin regtest', verify_bitcoin), ('LND regtest/liquidity', verify_nodes)]
+    polar_gui = 'polar' in run(['ps', '-eo', 'comm']).splitlines()
+    print('INFO Polar GUI:', 'running' if polar_gui else 'not running (not required for existing containers)')
+    checks += [(name, lambda n=name: probe(n)) for name in PORTS
+               if (name != 'frontend' or _args.gui) and
+               (name != 'adp-dave' or Path(settings().get('dave_adp_env',str(CONFIG/'dave-adp.env'))).exists())]
+    checks.append(('Alby Hub', hub_status))
+    checks.append(('existing buyer NWC', verify_nwc))
+    for name, check in checks:
+        try:
+            check()
+            print('PASS', name)
+        except (Blocked, OSError, ValueError, KeyError) as exc:
+            print('FAIL', name, str(exc) if isinstance(exc, Blocked) else 'probe failed')
+            failures.append(name)
+    return bool(failures)
+
+
+def down(_args):
+    state = read_state()
+    failed = False
+    for name in reversed(list(state)):
+        entry = state[name]
+        if not owned(entry):
+            state.pop(name)
+            continue
+        # Only the recorded process, never pkill, fuser -k, or a reused PID.
+        if entry.get('group') == entry['pid'] and os.getpgid(entry['pid']) == entry['pid']:
+            os.killpg(entry['pid'], signal.SIGTERM)
+        else:
+            os.kill(entry['pid'], signal.SIGTERM)
+        deadline = time.monotonic() + 20
+        while owned(entry) and time.monotonic() < deadline:
+            time.sleep(.2)
+        if owned(entry):
+            print('BLOCKED', name, 'did not stop gracefully; left running, not force-killed')
+            failed = True
+        else:
+            state.pop(name)
+            print('OK stopped', name)
+    save(STATE / 'processes.json', state)
+    print('Existing Polar containers, Alby Hub, wallets, databases and unowned services preserved')
+    return failed
+
+
+class PaymentBudget:
+    """Reserve before submitting; failed/ambiguous attempts still consume budget."""
+    def __init__(self):
+        self.total = 0
+        self.purchases = {}
+
+    def reserve(self, purchase, amount_msat):
+        if type(amount_msat) is not int or amount_msat <= 0:
+            raise Blocked('payment must have an exact positive msat amount')
+        amount = self.purchases.get(purchase, 0) + amount_msat
+        if amount > 10_000_000 or self.total + amount_msat > 50_000_000:
+            raise Blocked('regtest spending limit exceeded')
+        self.purchases[purchase] = amount
+        self.total += amount_msat
+
+
+def validate_invoice(invoice, decoded, expected_pubkey, amount_msat, now=None):
+    if not invoice.lower().startswith('lnbcrt1'):
+        # Amountful regtest HRPs are lnbcrt<amount><unit>1, not lnbcrt1.
+        if not invoice.lower().startswith('lnbcrt'):
+            raise Blocked('non-regtest invoice rejected')
+    if (decoded.get('destination') != expected_pubkey or
+            int(decoded.get('num_msat', 0)) != amount_msat or
+            int(decoded.get('timestamp', 0)) + int(decoded.get('expiry', 0)) <= (time.time() if now is None else now)):
+        raise Blocked('invoice destination, amount or expiry mismatch')
+
+
+def lightning_smoke(budget, ledger, payer, recipient, purchase):
+    """Wallet-level test, not evidence that an ADP purchase/refund succeeded."""
+    verify_bitcoin()
+    infos = verify_nodes()  # Recheck *all* nodes immediately before each payment.
+    if payer not in infos or recipient not in infos or payer == recipient:
+        raise Blocked('only distinct verified local Polar participants may pay')
+    amount = 100_000  # 100 sats; six smoke payments including returns = 600 sats.
+    invoice = lncli(recipient, 'addinvoice', '--amt=100', '--expiry=120')['payment_request']
+    decoded = lncli(payer, 'decodepayreq', '--pay_req=' + invoice)
+    validate_invoice(invoice, decoded, infos[recipient]['identity_pubkey'], amount)
+    # Reserve maximum routing fees as well, before the irreversible call.
+    budget.reserve(purchase, amount + 10_000)
+    ledger['reserved_msat'] = budget.total
+    record = {'payer':payer, 'recipient':recipient, 'principal_msat':amount,
+              'maximum_fee_msat':10000, 'payment_hash':decoded['payment_hash'], 'state':'reserved'}
+    ledger['payments'].append(record)
+    save(STATE / 'payment-run.json', ledger)
+    payment = lncli(payer, 'payinvoice', '--force', '--json', '--fee_limit=10',
+                    '--timeout=20s', '--pay_req=' + invoice)
+    if payment.get('status') != 'SUCCEEDED':
+        raise Blocked('local Lightning payment failed/ambiguous; reservation retained, not retried')
+    preimage = payment.get('payment_preimage', '')
+    if hashlib.sha256(bytes.fromhex(preimage)).hexdigest() != decoded['payment_hash']:
+        raise Blocked('wallet preimage does not match invoice')
+    settled = lncli(recipient, 'lookupinvoice', decoded['payment_hash'])
+    if not settled.get('settled') or int(settled.get('amt_paid_msat', 0)) != amount:
+        raise Blocked('recipient invoice not settled for exact principal')
+    record['state'] = 'settled'
+    save(STATE / 'payment-run.json', ledger)
+
+
+def split_purchase(budget, verification_only=False, crash_recovery=False):
+    """One real paid ADP purchase. Wallet smoke transfers are a separate scenario."""
+    verify_bitcoin()
+    infos = verify_nodes()
+    probe('lnurl')
+    verify_nwc()
+    adp = Path(settings()['adp_repo'])
+    env = fixture_env(infos)
+    env['NO_PROXY'] = env['no_proxy'] = '127.0.0.1,localhost,::1'
+    env['ADP_OPERATOR_NSEC'] = adp_env(adp)['ADP_OPERATOR_NSEC']
+    data = Path(settings().get('arcadestr_data_dir', str(HOME / '.local/share/arcadestr')))
+    hub = HOME / '.local/share/arcadestr-albyhub-regtest/nwc.db'
+    config = adp_env(adp)
+    database = Path(config['ADP_DB_PATH'])
+    prefix = 'durability' if crash_recovery else 'split'
+    last_result = STATE/('last-payment-durability.json' if crash_recovery else 'last-split-purchase.json')
+    env.update({
+        'ARCADESTR_REGTEST_DATA_DIR':str(data),
+        'ARCADESTR_REGTEST_HUB_DB':str(hub),
+        'ARCADESTR_REGTEST_ADP_DB':str(database if database.is_absolute() else adp/database),
+        'ARCADESTR_REGTEST_MANIFEST':str(STATE/(prefix+'-manifest.json')),
+        'ARCADESTR_REGTEST_PAYLOAD':str(adp/'testgame.bin'),
+    })
+    if crash_recovery:
+        env['ARCADESTR_REGTEST_SCENARIO']='crash-durability'
+        env['ARCADESTR_REGTEST_CRASH_STAGE']='after_wallet_settlement'
+    log = STATE / 'split-build.log'
+    with open(log, 'wb') as out:
+        os.chmod(log, 0o600)
+        result = subprocess.run(['cargo','build','--locked','-p','arcadestr-core','--features','native',
+                                 '--example','regtest_split_purchase'],cwd=ROOT,stdout=out,stderr=out)
+    if result.returncode:
+        raise Blocked(f'current local split driver build failed; inspect private {log}')
+    binary = ROOT/'target/debug/examples/regtest_split_purchase'
+    def driver(action, expect_crash=False):
+        try:
+            result = subprocess.run([binary,action],cwd=ROOT,env=env,stdin=subprocess.DEVNULL,
+                                    capture_output=True,timeout=180)
+        except subprocess.TimeoutExpired as exc:
+            raise Blocked('split driver timed out; payment may be ambiguous: inspect private evidence, do not retry blindly') from exc
+        path = STATE/'split-driver.log'
+        with open(path,'ab') as out:
+            os.chmod(path,0o600)
+            out.write(result.stderr)
+        if expect_crash and result.returncode == 86:
+            return {'expected_crash':True}
+        if result.returncode:
+            raise Blocked(f'ADP split {action} failed; inspect private {path}; no automatic payment retry')
+        return json.loads(result.stdout)
+    reservation = STATE/(prefix+'-reservation.json')
+    if reservation.exists():
+        previous = json.loads(reservation.read_text())
+        previous_report = Path(previous['report'])
+        if previous_report.exists():
+            checkpoint = json.loads(previous_report.read_text())
+            if crash_recovery and not verification_only and checkpoint.get('state') != 'complete':
+                env['ARCADESTR_REGTEST_REPORT']=str(previous_report)
+                env['ARCADESTR_REGTEST_WALLET_AUDIT']=str(previous_report.with_suffix('.wallet.json'))
+                env['ARCADESTR_REGTEST_PAYMENT_BUDGET_MSAT']=str(50000000-budget.total)
+                budget.reserve('payment-durability',1020000)
+                result=driver('resume-purchase')
+                if result.get('state') != 'complete':raise Blocked('crashed purchase remains unresolved; no automatic redispatch')
+                save(last_result,result)
+                print('ADP CRASH RECOVERY COMPLETE: existing payment reconciled, each invoice dispatched once')
+                return
+            if checkpoint.get('state') != 'complete' or verification_only:
+                payments = checkpoint.get('payments',[])
+                if len(payments) != 2 or not all(p.get('state') == 'settled_and_proof_accepted' for p in payments):
+                    raise Blocked('previous ADP payment run is incomplete/ambiguous; inspect its evidence; no automatic new payment')
+                env['ARCADESTR_REGTEST_REPORT'] = str(previous_report)
+                if crash_recovery:
+                    env['ARCADESTR_REGTEST_WALLET_AUDIT']=str(previous_report.with_suffix('.wallet.json'))
+                result = driver('verify-paid')
+                if result.get('state') != 'complete':
+                    raise Blocked('already-paid purchase verification incomplete')
+                save(last_result,result)
+                print('ADP PURCHASE COMPLETE: reverified the existing paid order; no additional payment')
+                print('Sanitized purchase evidence:',previous_report)
+                return
+    if verification_only:
+        raise Blocked('no existing paid scenario evidence; verification-only mode cannot create a purchase')
+    prepared = driver('prepare')
+    if prepared.get('gross_msat') != 1000000 or prepared.get('fee_msat') != 100000:
+        raise Blocked('unexpected prepared scenario amounts')
+    save(STATE/'settlement-env.json', {
+        'ADP_PAYMENT_DESTINATION':'carol@127.0.0.1:18080',
+        'ADP_TERMS_EVENT_ID':prepared['terms_event_id'],
+        'ADP_FEE_POLICY':json.dumps({'type':'fixed','amount_msat':100000}),
+    })
+    # Reload only the ADP process owned by this supervisor, never an unrelated listener.
+    state = read_state()
+    entry = state.get('adp')
+    if not owned(entry):
+        raise Blocked('ADP is not supervisor-owned; restart it manually with the private settlement overlay')
+    os.kill(entry['pid'], signal.SIGTERM)
+    deadline = time.monotonic()+20
+    while owned(entry) and time.monotonic() < deadline:
+        time.sleep(.2)
+    if owned(entry):
+        raise Blocked('ADP did not stop gracefully; not force-killed')
+    state.pop('adp')
+    save(STATE/'processes.json',state)
+    start('adp',[adp/'target/debug/adp-server'],adp,adp_env(adp))
+    runs = STATE/'split-runs'
+    runs.mkdir(mode=0o700,exist_ok=True)
+    report = runs/f'{time.time_ns()}.json'
+    env['ARCADESTR_REGTEST_REPORT'] = str(report)
+    remaining = 50000000-budget.total
+    budget.reserve('single-operator-adp-purchase',1020000)  # principal plus conservative fee allowance
+    env['ARCADESTR_REGTEST_PAYMENT_BUDGET_MSAT'] = str(remaining)
+    save(reservation,{'reserved_msat':1020000,'run_reserved_msat':budget.total,
+                                      'report':str(report),'state':'reserved_before_payment'})
+    if crash_recovery:
+        env['ARCADESTR_REGTEST_WALLET_AUDIT']=str(report.with_suffix('.wallet.json'))
+        if driver('purchase',True).get('expected_crash') != True:
+            raise Blocked('durability process did not stop at the expected crash point')
+        checkpoint=json.loads(report.read_text())
+        payments=checkpoint.get('payments',[])
+        if len(payments)!=1 or payments[0]['state']!='reserved':raise Blocked('unexpected crash checkpoint')
+        payment=payments[0]
+        manifest=json.loads(Path(env['ARCADESTR_REGTEST_MANIFEST']).read_text())
+        with sqlite3.connect(f'file:{data/"arcadestr.db"}?mode=ro',uri=True) as db:
+            row=db.execute('SELECT encrypted_payment IS NULL FROM nwc_payment_journal WHERE account_pubkey=? AND payment_hash=?',
+                           (manifest['buyer'],payment['payment_hash'])).fetchone()
+        if row != (1,):raise Blocked('crash did not occur before the durable proof checkpoint')
+        invoice=lncli(payment['recipient_node'],'lookupinvoice',payment['payment_hash'])
+        if not invoice.get('settled'):raise Blocked('expected crash-point Lightning invoice is not settled')
+        with sqlite3.connect(f'file:{env["ARCADESTR_REGTEST_ADP_DB"]}?mode=ro',uri=True) as db:
+            row=db.execute('SELECT settled_at FROM invoice_attempts WHERE attempt_id=?',(payment['attempt_id'],)).fetchone()
+        if row != (None,):raise Blocked('ADP unexpectedly received a proof before the crash')
+        checkpoint['crash_observation']={'process_exit_code':86,'lightning_settled':True,
+            'local_proof_checkpoint_missing':True,'adp_proof_missing':True}
+        save(report,checkpoint)
+        print('PASS crash point: Lightning settled; process exited; no local preimage checkpoint or ADP proof')
+        result=driver('resume-purchase')
+    else:
+        result = driver('purchase')
+    if result.get('state') != 'complete':
+        raise Blocked('ADP split purchase verification incomplete')
+    save(last_result,result)
+    print('ADP CRASH RECOVERY COMPLETE: wallet lookup restored the lost proof; one dispatch per invoice' if crash_recovery
+          else 'ADP PURCHASE COMPLETE: 1,000 sats gross; Bob 900; Carol 100; Alice paid through existing NWC')
+    print('Sanitized purchase evidence:',report)
+
+
+def refund_scenarios(budget):
+    """Isolated HTTP/DB cases; preserve the main ADP and existing paid orders."""
+    verify_bitcoin()
+    infos = verify_nodes()
+    probe('lnurl')
+    verify_nwc()
+    reservation = STATE/'refund-reservation.json'
+    if reservation.exists():
+        previous = json.loads(reservation.read_text())
+        report = Path(previous['report'])
+        if not report.exists() or json.loads(report.read_text()).get('status') != 'pass':
+            raise Blocked('previous refund suite incomplete; inspect private evidence before authorizing any new run')
+    adp = Path(settings()['adp_repo'])
+    config = adp_env(adp)
+    env = fixture_env(infos)
+    env.update({
+        'NO_PROXY':'127.0.0.1,localhost,::1', 'no_proxy':'127.0.0.1,localhost,::1',
+        'ADP_OPERATOR_NSEC':config['ADP_OPERATOR_NSEC'], 'ADP_MASTER_KEY':config['ADP_MASTER_KEY'],
+        'ARCADESTR_REGTEST_DATA_DIR':str(Path(settings().get('arcadestr_data_dir', str(HOME/'.local/share/arcadestr')))),
+        'ARCADESTR_REGTEST_HUB_DB':str(HOME/'.local/share/arcadestr-albyhub-regtest/nwc.db'),
+        'ARCADESTR_REGTEST_PAYLOAD':str(adp/'testgame.bin'),
+    })
+    log = STATE/'refund-build.log'
+    with open(log, 'wb') as out:
+        os.chmod(log, 0o600)
+        result = subprocess.run(['cargo','build','--locked','-p','arcadestr-core','--features','native',
+                                 '--example','regtest_refunds'], cwd=ROOT, stdout=out, stderr=out)
+    if result.returncode:
+        raise Blocked(f'refund driver build failed; inspect private {log}')
+    root = STATE/'refund-runs'/str(time.time_ns())
+    root.mkdir(parents=True, mode=0o700)
+    env['ARCADESTR_REGTEST_REFUND_RUN_DIR'] = str(root)
+    env['ARCADESTR_REGTEST_PAYMENT_BUDGET_MSAT'] = str(50000000-budget.total)
+    budget.reserve('isolated-partial-settlements-and-refunds',1980000)
+    save(reservation, {'reserved_msat':1980000, 'run_reserved_msat':budget.total,
+                       'report':str(root/'report.json'), 'state':'reserved_before_payment'})
+    with open(root/'driver.log', 'wb') as out:
+        os.chmod(root/'driver.log', 0o600)
+        try:
+            result = subprocess.run([ROOT/'target/debug/examples/regtest_refunds','run'], cwd=ROOT,
+                                    env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=out, timeout=600)
+        except subprocess.TimeoutExpired as exc:
+            raise Blocked(f'refund suite timed out; inspect {root}; never blindly retry') from exc
+    if result.returncode:
+        raise Blocked(f'refund suite failed; inspect private {root}; no automatic payment retry')
+    report = json.loads((root/'report.json').read_text())
+    if report.get('status') != 'pass' or len(report.get('cases', [])) != 6:
+        raise Blocked('refund suite report incomplete')
+    save(STATE/'last-refunds.json', report)
+    print('REFUNDS: six isolated cases passed; real Lightning, controlled relay/deadline clock')
+    print('Private evidence:',root)
+
+
+def verify_refunds():
+    """Recheck all six completed refund baselines without HTTP mutations/payments."""
+    previous = json.loads((STATE/'refund-reservation.json').read_text())
+    report_path = Path(previous['report'])
+    report = json.loads(report_path.read_text())
+    if report.get('status') != 'pass' or len(report.get('cases', [])) != 6:
+        raise Blocked('refund baseline incomplete; read-only verification cannot resume payments')
+    outgoing = lncli('bob','listpayments','--include_incomplete')['payments']
+    verified = []
+    for result in report['cases']:
+        root = report_path.parent/result['case']
+        with sqlite3.connect(f'file:{root / "adp.db"}?mode=ro',uri=True) as server, \
+             sqlite3.connect(f'file:{root / "client.db"}?mode=ro',uri=True) as client:
+            quote = result['quote_id']
+            buyer = server.execute('SELECT buyer_pubkey FROM purchase_quotes WHERE quote_id=?',(quote,)).fetchone()[0]
+            expected = result['settled_purchase_legs']
+            assert server.execute('SELECT COUNT(*) FROM invoice_attempts WHERE quote_id=? AND settled_at IS NOT NULL AND proof_encrypted IS NOT NULL',(quote,)).fetchone()[0] == expected
+            assert client.execute('SELECT COUNT(*) FROM nwc_payment_journal WHERE account_pubkey=? AND encrypted_payment IS NOT NULL',(buyer,)).fetchone()[0] == expected
+            for table in ('purchases','download_tokens'):
+                assert server.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] == 0
+            for role,hash_,settled in server.execute('SELECT l.role,a.payment_hash,a.settled_at FROM invoice_attempts a JOIN payment_legs l ON l.quote_id=a.quote_id AND l.leg_id=a.leg_id WHERE a.quote_id=?',(quote,)):
+                invoice = lncli('bob' if role == 'developer' else 'carol','lookupinvoice',hash_)
+                assert invoice['settled'] == (settled is not None)
+            refunds = server.execute('SELECT a.payment_hash,l.recipient_pubkey,a.proof_encrypted,a.verified_at FROM refund_attempts a JOIN payment_legs l ON l.quote_id=a.quote_id AND l.leg_id=a.leg_id WHERE a.quote_id=?',(quote,)).fetchall()
+            assert len(refunds) == expected
+            if expected:
+                hash_,bob,proof,at = refunds[0]
+                assert proof and at
+                matching = [p for p in outgoing if p['payment_hash'] == hash_]
+                assert len(matching) == 1 and matching[0]['status'] == 'SUCCEEDED' and int(matching[0]['value_msat']) == 100000
+                assert lncli('alice','lookupinvoice',hash_)['settled']
+                assert client.execute('SELECT COUNT(*) FROM nwc_payment_journal WHERE account_pubkey=? AND payment_hash=? AND encrypted_payment IS NOT NULL',(bob,hash_)).fetchone()[0] == 1
+                assert result['refund_dispatch_audit']['pay_calls'] == 1
+            assert result['balances_before_msat'] == result['balances_after_msat']
+            verified.append({'case':result['case'],'status':'pass'})
+    save(STATE/'last-refunds-verification.json',{'status':'pass','cases':verified,'new_payments':0,'baseline_report':str(report_path)})
+    print('REFUND BASELINES: six cases reverified read-only; no payment/resume dispatch')
+
+
+def gate1_scenarios(budget, continuation=False, verification=False):
+    verify_bitcoin()
+    infos = verify_nodes()
+    probe('lnurl')
+    verify_nwc()
+    reservation = STATE/'gate1-reservation.json'
+    if reservation.exists():
+        previous = json.loads(reservation.read_text())
+        path = Path(previous['report'])
+        if not continuation and (not path.exists() or json.loads(path.read_text()).get('status') != 'pass'):
+            raise Blocked('Gate 1 reservation unresolved; retain it and inspect exact payment intents; no new run')
+    elif continuation or verification:
+        raise Blocked('no original Gate 1 reservation to continue')
+    adp = Path(settings()['adp_repo'])
+    config = adp_env(adp)
+    env = fixture_env(infos)
+    env.update({'NO_PROXY':'127.0.0.1,localhost,::1','no_proxy':'127.0.0.1,localhost,::1',
+        'ADP_OPERATOR_NSEC':config['ADP_OPERATOR_NSEC'],'ADP_MASTER_KEY':config['ADP_MASTER_KEY'],
+        'ARCADESTR_REGTEST_DATA_DIR':str(Path(settings().get('arcadestr_data_dir',str(HOME/'.local/share/arcadestr')))),
+        'ARCADESTR_REGTEST_HUB_DB':str(HOME/'.local/share/arcadestr-albyhub-regtest/nwc.db'),
+        'ARCADESTR_REGTEST_PAYLOAD':str(adp/'testgame.bin')})
+    log = STATE/'gate1-build.log'
+    with open(log,'wb') as out:
+        os.chmod(log,0o600)
+        result = subprocess.run(['cargo','build','--locked','-p','arcadestr-core','--features','native','--example','regtest_gate1'],cwd=ROOT,stdout=out,stderr=out)
+    if result.returncode:
+        raise Blocked(f'Gate 1 build failed; inspect private {log}')
+    root = Path(previous['report']).parent if continuation or verification else STATE/'gate1-runs'/str(time.time_ns())
+    root.mkdir(parents=True,mode=0o700,exist_ok=continuation or verification)
+    env['ARCADESTR_REGTEST_GATE1_DIR'] = str(root)
+    env['ARCADESTR_REGTEST_PAYMENT_BUDGET_MSAT'] = str(50000000-budget.total)
+    if not verification:
+        budget.reserve('settlement-verification-gate1',990000)
+    if not continuation and not verification:
+        save(reservation,{'report':str(root/'report.json'),'reserved_msat':990000,'run_reserved_msat':budget.total,'state':'reserved_before_payment'})
+    with open(root/('verification.log' if verification else 'continuation.log' if continuation else 'driver.log'),'wb') as out:
+        os.chmod(out.fileno(),0o600)
+        try:
+            result = subprocess.run([ROOT/'target/debug/examples/regtest_gate1','verify' if verification else 'continue' if continuation else 'run'],cwd=ROOT,env=env,
+                                    stdin=subprocess.DEVNULL,stdout=out,stderr=out,timeout=900)
+        except subprocess.TimeoutExpired as exc:
+            raise Blocked(f'Gate 1 timeout; retain reservation and inspect {root}; never blindly retry') from exc
+    if result.returncode:
+        raise Blocked(f'Gate 1 failed; retain reservation and inspect private {root}; no automatic new payment')
+    report = json.loads((root/'report.json').read_text())
+    if report.get('status') != 'pass':
+        raise Blocked('Gate 1 report incomplete')
+    save(STATE/'last-gate1.json',report)
+    print('GATE 1 READ-ONLY VERIFICATION PASS; no new payment' if verification else 'GATE 1 PASS: real strfry/NAK; simulated ADP deadlines; interrupted real refunds reconciled once')
+    print('Private evidence:',root)
+
+
+def gate2_environment():
+    infos = verify_nodes()
+    adp = Path(settings()['adp_repo'])
+    config = adp_env(adp)
+    env = fixture_env(infos)
+    env.update({k:v for k,v in config.items() if k.startswith('ADP_')})
+    db = Path(config['ADP_DB_PATH'])
+    env.update({'NO_PROXY':'127.0.0.1,localhost,::1','no_proxy':'127.0.0.1,localhost,::1',
+        'ARCADESTR_REGTEST_DATA_DIR':str(Path(settings().get('arcadestr_data_dir',str(HOME/'.local/share/arcadestr')))),
+        'ARCADESTR_REGTEST_HUB_DB':str(HOME/'.local/share/arcadestr-albyhub-regtest/nwc.db'),
+        'ARCADESTR_REGTEST_PAYLOAD':str(adp/'testgame.bin'),
+        'ARCADESTR_REGTEST_ADP_DB':str(db if db.is_absolute() else adp/db),
+        'ARCADESTR_REGTEST_DAVE_SIGNER_FILE':settings().get('dave_signer_file',str(CONFIG/'dave-operator.key')),
+        'ARCADESTR_REGTEST_OPERATOR_DIR':str(STATE/'operator-dave'),
+        'ARCADESTR_REGTEST_CAROL_MANIFEST':str(STATE/'split-manifest.json'),
+        'ARCADESTR_REGTEST_DAVE_DB':str(STATE/'operator-dave/adp.db')})
+    return env
+
+
+def gate2_scenarios(budget, verification=False, continuation=False):
+    verify_bitcoin()
+    verify_nodes()
+    reservation = STATE/'gate2-reservation.json'
+    if reservation.exists():
+        previous = json.loads(reservation.read_text())
+        report = Path(previous['report'])
+        if not continuation and (not report.exists() or json.loads(report.read_text()).get('status') != 'pass'):
+            raise Blocked('Gate 2 reservation incomplete; inspect original intents, never clear or blindly retry')
+        if continuation:
+            stage = report.parent/'success'
+            if not stage.is_dir() or any(stage.iterdir()):
+                raise Blocked('Gate 2 continuation is only for an inspected empty pre-payment stage; never recreate an order with payment evidence')
+    elif verification or continuation:
+        raise Blocked('no completed Gate 2 purchase to verify; verification cannot create payments')
+    log = STATE/'gate2-build.log'
+    with open(log,'wb') as out:
+        os.chmod(log,0o600)
+        result = subprocess.run(['cargo','build','--locked','-p','arcadestr-core','--features','native',
+                                 '--example','regtest_gate2','--example','regtest_gate2_preflight'],cwd=ROOT,stdout=out,stderr=out)
+    if result.returncode: raise Blocked(f'Gate 2 build failed; inspect private {log}')
+    env = gate2_environment()
+    binary = ROOT/'target/debug/examples/regtest_gate2'
+    def driver(action, root=None):
+        if root: env['ARCADESTR_REGTEST_GATE2_DIR'] = str(root)
+        try:
+            result = subprocess.run([binary,action],cwd=ROOT,env=env,stdin=subprocess.DEVNULL,capture_output=True,timeout=600)
+        except subprocess.TimeoutExpired as exc:
+            raise Blocked('Gate 2 timed out; retain reservation and inspect exact intents; never blindly retry') from exc
+        path = (root/'driver.log') if root else STATE/'gate2-prepare.log'
+        with open(path,'ab') as out:
+            os.chmod(path,0o600)
+            out.write(result.stderr)
+        return result
+    if verification:
+        root = Path(previous['report']).parent
+        result = driver('verify',root)
+        if result.returncode: raise Blocked(f'Gate 2 verification failed; inspect private {root}')
+        save(STATE/'last-gate2.json',json.loads((root/'report.json').read_text()))
+        save(STATE/'last-gate2-verification.json',{'status':'pass','new_payments':0,'report':str(root/'report.json')})
+        print('GATE 2 VERIFIED: original receipt/ownership/download, no new payments')
+        return
+    # Focused source tests use synthetic identities and no real payments.
+    for cwd,options in [(Path(settings()['adp_repo']),['-p','adp-server','--test','multi_operator_tests']),
+                        (ROOT,['-p','arcadestr-core','--features','native','--test','multi_operator_gate2'])]:
+        with open(STATE/'gate2-source.log','ab') as out:
+            os.chmod(out.fileno(),0o600)
+            result = subprocess.run(['cargo','test','--locked',*options],cwd=cwd,stdout=out,stderr=out)
+        if result.returncode: raise Blocked('Gate 2 negative source suite failed; no payment permitted')
+    checked = subprocess.run([ROOT/'target/debug/examples/regtest_gate2_preflight'],cwd=ROOT,env=env,capture_output=True)
+    if checked.returncode or json.loads(checked.stdout).get('status') != 'signer_verified':
+        raise Blocked('Dave protected signer unavailable or does not match configured identity; no identity generated/payment sent')
+    prepared = driver('prepare')
+    if prepared.returncode: raise Blocked('Gate 2 operator preparation failed; inspect private preparation log')
+    public = json.loads(prepared.stdout)
+    config_path = Path(settings().get('dave_adp_env',str(CONFIG/'dave-adp.env')))
+    key_path = Path(env['ARCADESTR_REGTEST_DAVE_SIGNER_FILE'])
+    if key_path.stat().st_mode & 0o077: raise Blocked('Dave signer must remain owner-only')
+    if not config_path.exists():
+        directory = STATE/'operator-dave'; directory.mkdir(mode=0o700,exist_ok=True)
+        values = {'ADP_OPERATOR_NSEC':key_path.read_text().strip(),'ADP_MASTER_KEY':secrets.token_hex(32),
+            'ADP_SERVER_URL':'http://127.0.0.1:19100','ADP_BIND_ADDR':'127.0.0.1:19100',
+            'ADP_DB_PATH':str(directory/'adp.db'),'ADP_FILES_DIR':str(directory/'files'),
+            'ADP_RELAYS':'ws://127.0.0.1:7777,ws://127.0.0.1:7778,ws://127.0.0.1:10547,ws://127.0.0.1:10548',
+            'ADP_ALLOW_INSECURE_LNURL':'true','ADP_PAYMENT_DESTINATION':'dave@127.0.0.1:18080',
+            'ADP_FEE_POLICY':json.dumps({'type':'fixed','amount_msat':150000}),
+            'ADP_TERMS_EVENT_ID':public['dave_terms_event_id'],'ADP_LEGACY_PAID_SALES':'decline'}
+        fd = os.open(config_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,'w') as out:
+            out.write(''.join(f'{key}={value}\n' for key,value in values.items()));out.flush();os.fsync(out.fileno())
+    dave = dave_env(Path(settings()['adp_repo']))
+    if dave['ADP_TERMS_EVENT_ID'] != public['dave_terms_event_id']:
+        raise Blocked('Dave persisted terms/config differ; not silently overwriting an operator profile')
+    build(Path(settings()['adp_repo']))
+    if up(argparse.Namespace(no_build=True,gui=False)):
+        raise Blocked('Gate 2 independent operator startup blocked; no purchase started')
+    probe('adp-dave');verify_nwc()
+    root = Path(previous['report']).parent if continuation else STATE/'gate2-runs'/str(time.time_ns())
+    root.mkdir(parents=True,mode=0o700,exist_ok=continuation)
+    env['ARCADESTR_REGTEST_PAYMENT_BUDGET_MSAT'] = str(50000000-budget.total)
+    budget.reserve('gate2-three-recipient-purchase-and-isolated-failure',2400000)
+    if not continuation:
+        save(reservation,{'report':str(root/'report.json'),'reserved_msat':2400000,'run_reserved_msat':budget.total,'state':'reserved_before_payment'})
+    first = driver('run',root)
+    if first.returncode != 86:
+        raise Blocked(f'Gate 2 did not stop at its expected first-proof checkpoint; inspect {root}; no automatic new payment')
+    checkpoint = json.loads((root/'success/purchase.json').read_text())
+    if checkpoint.get('state') != 'crash_after_first_proof_checkpoint' or len(checkpoint.get('payments',[])) != 1:
+        raise Blocked('Gate 2 crash checkpoint is not the expected single original intent')
+    # Only this planned, securely checkpointed interruption permits continuation.
+    resumed = driver('resume',root)
+    if resumed.returncode: raise Blocked(f'Gate 2 continuation failed; inspect private {root}; retain reservation')
+    stop_owned_service('adp-dave')
+    start('adp-dave',[Path(settings()['adp_repo'])/'target/debug/adp-server'],Path(settings()['adp_repo']),dave_env(Path(settings()['adp_repo'])))
+    for _ in range(2):
+        if driver('verify',root).returncode: raise Blocked(f'Gate 2 restart verification failed; inspect private {root}')
+    report = json.loads((root/'report.json').read_text())
+    if report.get('status') != 'pass': raise Blocked('Gate 2 report incomplete')
+    save(STATE/'last-gate2.json',report)
+    print('GATE 2 PASS: Bob 750 sats, Carol 100, Dave 150; three one-time NWC dispatches')
+    print('Private evidence:',root)
+
+
+def test(args):
+    results = []
+    def case(name, fn):
+        try:
+            fn()
+            print('PASS', name, flush=True)
+            results.append({'test': name, 'result': 'pass'})
+        except (Blocked, OSError, ValueError, KeyError, AssertionError) as exc:
+            reason = str(exc) if isinstance(exc, Blocked) else 'assertion/probe failed'
+            print('BLOCKED/FAIL', name, reason, flush=True)
+            results.append({'test': name, 'result': 'blocked_or_failed', 'reason':reason})
+    case('supervisor safety regressions', lambda: run(
+        [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_regtest.py'], cwd=ROOT))
+    case('readiness', lambda: status(args) == 0 or (_ for _ in ()).throw(Blocked('environment not ready')))
+    for node in NODES:
+        def invoice_test(node=node):
+            infos = verify_nodes()
+            code, data = request(f'http://127.0.0.1:18080/lnurlp/{node}/callback?amount=12001')
+            if code != 200 or not data or 'pr' not in data:
+                raise Blocked('fixture invoice unavailable')
+            decoded = lncli(node, 'decodepayreq', '--pay_req=' + data['pr'])
+            validate_invoice(data['pr'], decoded, infos[node]['identity_pubkey'], 12001)
+        case(f'real unpaid LNURL invoice: {node}', invoice_test)
+    def auth_rejected():
+        code, _ = request('http://localhost:9099/settlement/regtest-connectivity')
+        if code != 401:
+            raise Blocked(f'expected unauthenticated quote to return 401, got {code}')
+    case('NIP-98 missing auth rejected', auth_rejected)
+    def auth_accepted():
+        url = 'http://localhost:9099/settlement/regtest-connectivity'
+        env = os.environ.copy()
+        env['NOSTR_SECRET_KEY'] = adp_env(Path(settings()['adp_repo']))['ADP_OPERATOR_NSEC']
+        # Reuse NAK's signing implementation with the existing operator identity.
+        event = json.loads(run(['nak', 'event', '-k', '27235', '-t', 'u=' + url,
+                                '-t', 'method=GET', '-c', ''], env=env))
+        authorization = 'Nostr ' + base64.b64encode(json.dumps(event).encode()).decode()
+        code, _ = request(url, headers={'Authorization':authorization})
+        if code != 404:
+            raise Blocked(f'valid existing-identity NIP-98 expected authenticated 404, got {code}')
+    case('NIP-98 signed authentication accepted', auth_accepted)
+    for amount in ['0', '1.5', '1000&amount=1000', '10000001']:
+        def invalid_test(amount=amount):
+            code, _ = request(f'http://127.0.0.1:18080/lnurlp/bob/callback?amount={amount}')
+            if code != 400:
+                raise Blocked('malformed/out-of-budget amount not rejected')
+        case('invalid fixture amount: ' + amount, invalid_test)
+    budget = PaymentBudget()
+    if args.wallet_smoke:
+        ledger = {'started_at':int(time.time()), 'reserved_msat':0, 'payments':[]}
+        for node in ('bob', 'carol', 'dave'):
+            case(f'wallet-only real payment Alice to {node}',
+                 lambda node=node: lightning_smoke(budget, ledger, 'alice', node, 'wallet-' + node))
+            # Only return funds if the forward transfer was confirmed successful.
+            if ledger['payments'] and ledger['payments'][-1]['recipient'] == node and ledger['payments'][-1]['state'] == 'settled':
+                case(f'wallet-only real return {node} to Alice (not ADP refund)',
+                     lambda node=node: lightning_smoke(budget, ledger, node, 'alice', 'return-' + node))
+    if args.payments:
+        case('complete single-operator ADP purchase through existing NWC', lambda: split_purchase(budget))
+    if args.verify_paid:
+        case('existing paid ADP purchase assertions (no new payments)', lambda: split_purchase(budget,True))
+    if args.crash_recovery:
+        case('payment durability: real process crash and restart without duplicate payment',lambda:split_purchase(budget,crash_recovery=True))
+    if args.verify_durability:
+        case('existing crash-recovered purchase assertions (no new payments)',lambda:split_purchase(budget,True,True))
+    if args.refunds:
+        case('isolated failed/partial settlements and refunds',lambda:refund_scenarios(budget))
+    if args.verify_refunds:
+        case('six existing refund baselines (read-only, no new payments)',verify_refunds)
+    if args.gate1:
+        case('settlement verification Gate 1',lambda:gate1_scenarios(budget))
+    if args.resume_gate1:
+        case('continue original Gate 1 reservation without a new purchase',lambda:gate1_scenarios(budget,True))
+    if args.verify_gate1:
+        case('existing Gate 1 signatures/chains/persistence (read-only)',lambda:gate1_scenarios(budget,verification=True))
+    if args.gate2:
+        case('Gate 2 independent multi-operator settlement',lambda:gate2_scenarios(budget))
+    if args.verify_gate2:
+        case('Gate 2 non-paying verification',lambda:gate2_scenarios(budget,True))
+    if args.continue_gate2:
+        case('continue inspected original Gate 2 pre-payment reservation',lambda:gate2_scenarios(budget,continuation=True))
+    if args.source:
+        suites = [
+            ('ADP core protocols', Path(settings()['adp_repo']), ['-p', 'adp-core']),
+            ('ADP integration/storage/relay', Path(settings()['adp_repo']), ['-p', 'adp-server', '--lib', '--tests']),
+            ('LNURL fixture regressions', Path(settings()['adp_repo']), ['-p', 'adp-server', '--example', 'polar_lnurl_fixture']),
+            ('Arcadestr split domain', ROOT, ['-p', 'arcadestr-core', '--test', 'adp_settlement']),
+            ('Arcadestr restart persistence', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--test', 'settlement_repository']),
+            ('Arcadestr aggregate ownership', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--test', 'aggregate_ownership']),
+            ('Arcadestr receipt protocol', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--test', 'receipt_protocol']),
+            ('ADP live driver safety', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--example', 'regtest_split_purchase']),
+            ('Refund driver compilation', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--example', 'regtest_refunds']),
+            ('Gate 1 driver compilation', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--example', 'regtest_gate1']),
+            ('Gate 2 domain negatives', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--test', 'multi_operator_gate2']),
+            ('Gate 2 drivers', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--example', 'regtest_gate2', '--example', 'regtest_gate2_preflight']),
+            ('Payment durability', ROOT, ['-p','arcadestr-core','--features','native','--test','payment_durability']),
+            ('Arcadestr LNURL policy', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--lib', 'lnurlp::tests']),
+        ]
+        for name, cwd, options in suites:
+            def source_test(name=name, cwd=cwd, options=options):
+                log = STATE / (name.replace(' ', '_').replace('/', '_') + '.log')
+                with open(log, 'wb') as out:
+                    os.chmod(log, 0o600)
+                    result = subprocess.run(['cargo', 'test', '--locked', *options], cwd=cwd, stdout=out, stderr=out)
+                if result.returncode:
+                    raise Blocked(f'source suite failed; inspect private {log}')
+            case(name + ' (not live E2E)', source_test)
+    if not any((args.payments,args.verify_paid,args.crash_recovery,args.verify_durability,args.refunds,args.verify_refunds,args.gate1,args.resume_gate1,args.verify_gate1,args.gate2,args.verify_gate2,args.continue_gate2)):
+        print('INFO paid ADP purchase not requested; use test --payments (wallet smoke is --wallet-smoke)')
+    save(STATE / 'last-test.json', results)
+    print('Sanitized results:', STATE / 'last-test.json')
+    return any(r['result'] != 'pass' for r in results)
+
+
+def main():
+    os.umask(0o077)
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    p = sub.add_parser('up')
+    p.add_argument('--no-build', action='store_true', help='reuse previously built local binaries')
+    p.add_argument('--gui', action='store_true')
+    p = sub.add_parser('status')
+    p.add_argument('--gui', action='store_true', help='also require frontend readiness')
+    sub.add_parser('down')
+    p = sub.add_parser('test')
+    p.add_argument('--source', action='store_true', help='also run existing source regression suites')
+    payment_mode = p.add_mutually_exclusive_group()
+    payment_mode.add_argument('--payments', action='store_true', help='one genuine 1,000-sat Bob/Carol split purchase paid by existing buyer NWC')
+    payment_mode.add_argument('--verify-paid', action='store_true', help='recheck the already-settled test purchase; never send another payment')
+    payment_mode.add_argument('--crash-recovery',action='store_true',help='isolated 1,000-sat purchase; crash after settlement before saving proof; reconcile and resume once')
+    payment_mode.add_argument('--verify-durability',action='store_true',help='verify the existing crash-recovered order without any new payment')
+    payment_mode.add_argument('--refunds',action='store_true',help='six isolated 200-sat failed/partial settlement and refund scenarios')
+    payment_mode.add_argument('--verify-refunds',action='store_true',help='read-only recheck of six existing refund scenarios; never dispatch')
+    payment_mode.add_argument('--gate1',action='store_true',help='live-relay deadline/late-proof and interrupted real-Lightning refund gate')
+    payment_mode.add_argument('--resume-gate1',action='store_true',help='continue inspected original Gate 1 order; no new purchase or cleared reservation')
+    payment_mode.add_argument('--verify-gate1',action='store_true',help='read-only verify Gate 1 signatures, chains and payment persistence')
+    payment_mode.add_argument('--gate2',action='store_true',help='independent Carol/Dave operators; real 1,000-sat three-recipient purchase and isolated failed third leg')
+    payment_mode.add_argument('--verify-gate2',action='store_true',help='reverify completed Gate 2 without any new payment')
+    payment_mode.add_argument('--continue-gate2',action='store_true',help='continue inspected original Gate 2 reservation only before any order/payment evidence exists')
+    p.add_argument('--wallet-smoke', action='store_true', help='separate six wallet-only 100-sat transfers; NOT ADP purchases')
+    p.add_argument('--gui', action='store_true', help='also require frontend readiness')
+    args = parser.parse_args()
+    with open(STATE / 'lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('BLOCKED another regtest command is running')
+            return 1
+        try:
+            return int(bool(globals()[args.command](args)))
+        except (Blocked, OSError, ValueError, KeyError) as exc:
+            print('BLOCKED', str(exc) if isinstance(exc, Blocked) else 'configuration/system error; inspect local settings')
+            return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -163,9 +163,23 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
     let promise = tauri_invoke(command, args)?;
 
     // Convert the Promise to a Future that returns Result<JsValue, JsValue>
-    let js_value = JsFuture::from(promise)
-        .await
-        .map_err(|e| format!("JS error: {:?}", e))?;
+    let js_value = JsFuture::from(promise).await.map_err(|e| {
+        if matches!(
+            command,
+            "connect_nwc_wallet"
+                | "get_nwc_wallet"
+                | "disconnect_nwc_wallet"
+                | "verify_nwc_wallet"
+                | "pay_nwc_invoice"
+        ) {
+            // These commands return sanitized, user-facing backend errors.
+            e.as_string().unwrap_or_else(|| {
+                "NWC operation failed. Retry or refresh the saved wallet.".into()
+            })
+        } else {
+            format!("JS error: {:?}", e)
+        }
+    })?;
 
     // Convert the response to a string - it could be a string or an object
     let response_str = if let Some(s) = js_value.as_string() {
@@ -329,5 +343,12 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 
     js_sys::eval(&js_code)
         .map(|v| v.unchecked_into::<js_sys::Promise>())
-        .map_err(|e| format!("Failed to invoke Tauri command: {:?}", e))
+        .map_err(|e| {
+            if command == "connect_nwc_wallet" {
+                // An eval exception can include source text containing the submitted URI.
+                "Failed to submit NWC credentials to the desktop backend.".to_string()
+            } else {
+                format!("Failed to invoke Tauri command: {:?}", e)
+            }
+        })
 }

@@ -227,6 +227,16 @@ pub(crate) fn stored_receipt_validation_error(receipt: &StoredReceipt) -> Option
     let Ok(event) = serde_json::from_str::<Event>(&receipt.raw_event) else {
         return Some("Stored purchase receipt could not be verified.");
     };
+    // Aggregate receipts deliberately have no singular bolt11/preimage tags.
+    // Use the same parser/root completeness checks as persisted ownership.
+    let aggregate = match parse_aggregate(&event) {
+        Ok(Some(_)) => match parse_receipt_event(&event) {
+            Ok(parsed) if is_paid_receipt_root(&parsed) => true,
+            _ => return Some("Stored purchase receipt could not be verified."),
+        },
+        Ok(None) => false,
+        Err(_) => return Some("Stored purchase receipt could not be verified."),
+    };
     if event.verify().is_err()
         || event.kind.as_u16() != KIND_PURCHASE_RECEIPT
         || event.id.to_string() != receipt.event_id
@@ -235,7 +245,7 @@ pub(crate) fn stored_receipt_validation_error(receipt: &StoredReceipt) -> Option
         || tag_value(&event, "a").as_deref() != Some(receipt.listing_coordinate.as_str())
         || tag_value(&event, "order").as_deref() != Some(receipt.order_id.as_str())
         || tag_value(&event, "status").unwrap_or_else(|| STATUS_PAID.to_string()) != receipt.status
-        || validate_payment_proof(&event).is_err()
+        || (!aggregate && validate_payment_proof(&event).is_err())
     {
         return Some("Stored purchase receipt could not be verified.");
     }
@@ -249,8 +259,12 @@ pub(crate) fn stored_receipt_validation_error(receipt: &StoredReceipt) -> Option
 
 pub(crate) fn stored_receipt_amount(receipt: &StoredReceipt) -> Option<(u64, &'static str)> {
     let event = serde_json::from_str::<Event>(&receipt.raw_event).ok()?;
-    let invoice = Bolt11Invoice::from_str(&tag_value(&event, "bolt11")?).ok()?;
-    let millisats = invoice.amount_milli_satoshis()?;
+    let millisats = if let Some(aggregate) = parse_aggregate(&event).ok()? {
+        aggregate.gross_msat
+    } else {
+        let invoice = Bolt11Invoice::from_str(&tag_value(&event, "bolt11")?).ok()?;
+        invoice.amount_milli_satoshis()?
+    };
     if millisats % 1_000 == 0 {
         Some((millisats / 1_000, "SATS"))
     } else {
@@ -283,19 +297,28 @@ pub fn parse_and_validate_receipt_with_listing(
     buyer_pubkey_hex: &str,
     listing_event: &Event,
 ) -> Result<StoredReceipt, PurchaseError> {
-    listing_event.verify().map_err(|error| {
-        PurchaseError::ProofInvalid(format!("invalid listing signature: {error}"))
-    })?;
     let parsed = parse_receipt_event(event)?;
     validate_receipt_buyer(&parsed, buyer_pubkey_hex)?;
-    let coordinate = listing_coordinate_from_listing(listing_event)?;
-    if parsed.coordinate != coordinate {
+    validate_receipt_listing_binding(&parsed, listing_event)?;
+    validate_adp_receipt_root(&parsed, listing_event.pubkey, None)?;
+    stored_receipt(&parsed)
+}
+
+/// Bind a response receipt to the requested signed listing before resolving
+/// issuer authority. A valid receipt for another coordinate is not this purchase.
+pub fn validate_receipt_listing_binding(
+    parsed: &ParsedReceipt,
+    listing_event: &Event,
+) -> Result<(), PurchaseError> {
+    listing_event
+        .verify()
+        .map_err(|_| PurchaseError::ProofInvalid("invalid listing signature".into()))?;
+    if parsed.coordinate != listing_coordinate_from_listing(listing_event)? {
         return Err(PurchaseError::ProofInvalid(
             "receipt listing coordinate does not match listing event".into(),
         ));
     }
-    validate_adp_receipt_root(&parsed, listing_event.pubkey, None)?;
-    stored_receipt(&parsed)
+    Ok(())
 }
 
 pub fn parse_and_validate_receipt_with_authorization(
@@ -636,14 +659,7 @@ pub fn resolve_receipt_chain<'a>(
         .collect::<Vec<_>>();
     let roots = parsed
         .iter()
-        .filter(|(_, receipt)| {
-            receipt.predecessor.is_none()
-                && receipt.status == STATUS_PAID
-                && receipt.payment_hash.is_some()
-                && receipt.amount_msat.is_some()
-                && receipt.settled_at.is_some()
-                && !receipt.proofs.is_empty()
-        })
+        .filter(|(_, receipt)| is_paid_receipt_root(receipt))
         .collect::<Vec<_>>();
     if roots.len() != 1 {
         return Err(PurchaseError::ProofInvalid(
@@ -810,7 +826,18 @@ fn stored_receipt(parsed: &ParsedReceipt) -> Result<StoredReceipt, PurchaseError
     })
 }
 
-fn resolve_persisted_receipt_tip(events: &[Event]) -> Option<&Event> {
+fn is_paid_receipt_root(receipt: &ParsedReceipt) -> bool {
+    receipt.predecessor.is_none()
+        && receipt.status == STATUS_PAID
+        && receipt.settled_at.is_some()
+        // Split receipts have a validated aggregate, not legacy singular proof fields.
+        && (receipt.aggregate.is_some()
+            || (receipt.payment_hash.is_some()
+                && receipt.amount_msat.is_some()
+                && !receipt.proofs.is_empty()))
+}
+
+pub(crate) fn resolve_persisted_receipt_tip(events: &[Event]) -> Option<&Event> {
     let parsed = events
         .iter()
         .filter_map(|event| {
@@ -821,14 +848,7 @@ fn resolve_persisted_receipt_tip(events: &[Event]) -> Option<&Event> {
         .collect::<Vec<_>>();
     let roots = parsed
         .iter()
-        .filter(|(_, receipt)| {
-            receipt.predecessor.is_none()
-                && receipt.status == STATUS_PAID
-                && receipt.payment_hash.is_some()
-                && receipt.amount_msat.is_some()
-                && receipt.settled_at.is_some()
-                && !receipt.proofs.is_empty()
-        })
+        .filter(|(_, receipt)| is_paid_receipt_root(receipt))
         .collect::<Vec<_>>();
     if roots.len() != 1 {
         return None;

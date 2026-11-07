@@ -6,7 +6,8 @@ use sqlx::Row;
 use crate::entitlements::GrantStatus;
 use crate::entitlements_repository::{EntitlementsRepository, EntitlementsRepositoryError};
 use crate::purchases::{
-    stored_receipt_amount, stored_receipt_validation_error, PurchaseError, PurchasesRepository,
+    resolve_persisted_receipt_tip, stored_receipt_amount, stored_receipt_validation_error,
+    PurchaseError, PurchasesRepository,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,46 @@ impl OwnershipService {
         Ok(self.source_for(buyer_pubkey, game_coordinate).await? != OwnershipSource::None)
     }
 
+    /// Project validated account acquisitions into Library without mutating the
+    /// user's saved rows or confusing saved/public access with durable ownership.
+    pub async fn library_entries_for(
+        &self,
+        buyer_pubkey: &str,
+        saved: Vec<crate::adp_storage::LibraryGame>,
+    ) -> Result<Vec<crate::adp_storage::LibraryGame>, OwnershipError> {
+        let mut entries = saved
+            .into_iter()
+            .filter(|e| e.buyer_pubkey == buyer_pubkey)
+            .map(|e| (e.game_coordinate.clone(), e))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for record in self.durable_records_for(buyer_pubkey).await? {
+            if record.status != DurableCredentialStatus::Active
+                || entries.contains_key(&record.game_coordinate)
+                || !self.is_owned(buyer_pubkey, &record.game_coordinate).await?
+            {
+                continue;
+            }
+            let Ok(added_at) = i64::try_from(record.acquired_at) else {
+                continue;
+            };
+            entries.insert(
+                record.game_coordinate.clone(),
+                crate::adp_storage::LibraryGame {
+                    buyer_pubkey: buyer_pubkey.into(),
+                    game_coordinate: record.game_coordinate,
+                    added_at,
+                },
+            );
+        }
+        let mut entries = entries.into_values().collect::<Vec<_>>();
+        entries.sort_by(|a, b| {
+            b.added_at
+                .cmp(&a.added_at)
+                .then_with(|| a.game_coordinate.cmp(&b.game_coordinate))
+        });
+        Ok(entries)
+    }
+
     pub async fn durable_records_for(
         &self,
         buyer_pubkey: &str,
@@ -126,6 +167,25 @@ impl OwnershipService {
                 .iter()
                 .find_map(stored_receipt_validation_error)
                 .map(str::to_string);
+            let events = chain
+                .iter()
+                .filter_map(|stored| serde_json::from_str::<nostr::Event>(&stored.raw_event).ok())
+                .collect::<Vec<_>>();
+            if validation_error.is_none()
+                && events.iter().any(|event| {
+                    event.tags.iter().any(|tag| {
+                        tag.as_slice()
+                            .first()
+                            .is_some_and(|name| name == "payment_set")
+                    })
+                })
+                && resolve_persisted_receipt_tip(&events)
+                    .is_none_or(|tip| tip.id.to_hex() != receipt.event_id)
+            {
+                validation_error = Some(
+                    "Stored aggregate purchase status chain is incomplete or inconsistent.".into(),
+                );
+            }
             if matches!(receipt.status.as_str(), "refunded" | "refund" | "disputed")
                 && !chain
                     .iter()
@@ -422,6 +482,103 @@ mod tests {
             record.status == DurableCredentialStatus::Active
                 && record.record_id == separate.event_id
         }));
+    }
+
+    #[tokio::test]
+    async fn library_projects_owned_purchases_and_claims_without_duplicate_or_cross_account_rows() {
+        use crate::adp_storage::{LibraryGame, LibraryGamesRepository};
+        let (temp, database, service, purchases) = setup("acquired-library").await;
+        let buyer = Keys::generate();
+        let other = Keys::generate();
+        let merchant = Keys::generate();
+        let account = buyer.public_key().to_hex();
+        for (who, id, status, at) in [
+            (&buyer, "paid", "paid", 10),
+            (&buyer, "returned", "paid", 11),
+            (&buyer, "returned", "refunded", 12),
+            (&other, "other", "paid", 13),
+        ] {
+            purchases
+                .upsert_receipt(&receipt(who, &merchant, id, id, status, at))
+                .await
+                .expect("receipt");
+        }
+        let grant = grant_event(&buyer, &merchant, "grant", "claimed", "granted", None, 20);
+        insert_grant(&database, &grant).await;
+        let saved = vec![
+            LibraryGame {
+                buyer_pubkey: account.clone(),
+                game_coordinate: coordinate(&merchant, "paid"),
+                added_at: 1,
+            },
+            LibraryGame {
+                buyer_pubkey: account.clone(),
+                game_coordinate: coordinate(&merchant, "public-saved"),
+                added_at: 2,
+            },
+        ];
+        let rows = service
+            .library_entries_for(&account, saved.clone())
+            .await
+            .expect("project");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.game_coordinate == coordinate(&merchant, "paid"))
+                .count(),
+            1
+        );
+        assert!(rows
+            .iter()
+            .any(|r| r.game_coordinate == coordinate(&merchant, "claimed")));
+        assert!(!service
+            .is_owned(&account, &coordinate(&merchant, "public-saved"))
+            .await
+            .expect("saved is not ownership"));
+        assert!(LibraryGamesRepository::new(database.pool().clone())
+            .list(&account)
+            .await
+            .expect("no mutation")
+            .is_empty());
+        let reopened = Database::new(&temp.path().join("acquired-library.sqlite"))
+            .await
+            .expect("reopen");
+        let service = OwnershipService::new(
+            PurchasesRepository::new(reopened.pool().clone()),
+            EntitlementsRepository::new(reopened.pool().clone()),
+        );
+        assert_eq!(
+            service
+                .library_entries_for(&account, saved.clone())
+                .await
+                .expect("restart")
+                .len(),
+            3
+        );
+        assert_eq!(
+            service
+                .library_entries_for(&other.public_key().to_hex(), saved)
+                .await
+                .expect("other account")
+                .len(),
+            1
+        );
+        let revoked = grant_event(
+            &buyer,
+            &merchant,
+            "grant",
+            "claimed",
+            "revoked",
+            Some(grant.id),
+            30,
+        );
+        insert_grant(&database, &revoked).await;
+        let rows = service
+            .library_entries_for(&account, Vec::new())
+            .await
+            .expect("revocation");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].game_coordinate, coordinate(&merchant, "paid"));
     }
 
     #[tokio::test]

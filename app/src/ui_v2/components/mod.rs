@@ -14,6 +14,8 @@ pub mod modal_background;
 pub mod nav_item;
 pub mod page_container;
 pub mod page_header;
+pub mod purchase_plan;
+pub use purchase_plan::PurchasePlanPanel;
 pub mod status_chip;
 pub mod store_page_detail;
 pub mod tabs;

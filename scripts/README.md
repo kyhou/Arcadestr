@@ -4,6 +4,31 @@ This directory contains utility scripts for the Arcadestr project.
 
 ## Available Scripts
 
+### regtest (non-destructive)
+
+```zsh
+./scripts/regtest up
+./scripts/regtest status
+./scripts/regtest test --source
+./scripts/regtest down
+```
+
+See [the regtest runbook](regtest.md) for prerequisites, guarded payment
+smoke tests, known blockers, and the distinction between source tests and live E2E.
+The [single-operator purchase runbook](regtest-split.md) documents the genuine
+`test --payments` scenario; wallet-only transfers use the separate `--wallet-smoke` flag.
+The [payment-durability runbook](regtest-durability.md) documents
+`test --crash-recovery`, including the real settlement-before-checkpoint crash test.
+The [refund runbook](regtest-refunds.md) documents `test --refunds`: six isolated
+failed/partial settlement cases, including refund crash reconciliation.
+The [Gate 1 runbook](regtest-gate1.md) covers live local relays, injected deadline
+boundaries, late proofs and genuinely in-flight refund reconciliation.
+The [Gate 2 runbook](regtest-gate2.md) documents Dave's protected persistent
+operator profile, the real three-recipient purchase and third-leg failure/refunds.
+The [corrected Gate 3 scope](regtest-gate3-arcadestr-scope.md) owns purchase safety
+in Arcadestr, abandons the wallet fork, and keeps all live spending/configuration paused.
+Do **not** use the data-clearing script below to repair this environment.
+
 ### clear-arcadestr-data
 
 Wipes every local Arcadestr trace so the app starts from a clean state: databases and master key in `~/.local/share/arcadestr`, installed games/retained packages/webview cache in `~/.local/share/com.arcadestr.app`, archive-selection caches in `~/.cache/arcadestr`, any legacy `~/.config/arcadestr`, and the signer/NWC secrets in the OS keyring (`arcadestr-auth`, `arcadestr-nip49`, `arcadestr-nwc`). Paths honor the `XDG_*` env vars.

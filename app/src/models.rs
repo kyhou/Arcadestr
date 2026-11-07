@@ -502,6 +502,19 @@ impl GameListing {
             ));
         }
 
+        for accepted in &listing.accepted_terms {
+            specs.push((
+                format!("adp_terms:{}", accepted.operator_pubkey),
+                accepted.terms_event_id.clone(),
+            ));
+        }
+        if !listing.malformed_accepted_terms_tags.is_empty() {
+            specs.push((
+                "malformed_adp_terms".into(),
+                listing.malformed_accepted_terms_tags.len().to_string(),
+            ));
+        }
+
         let parsed_amount = listing
             .price_amount
             .as_deref()
@@ -860,6 +873,8 @@ mod tests {
                 platforms: Vec::new(),
                 nip94_event_id: None,
                 servers: vec!["https://dist.example.com".to_string()],
+                accepted_terms: Vec::new(),
+                malformed_accepted_terms_tags: Vec::new(),
                 file_hash: Some("abc123".to_string()),
                 version: Some("1.4.2".to_string()),
                 fulfillment_authorizations: Vec::new(),
@@ -888,5 +903,25 @@ mod tests {
         assert!(frontend_listing
             .specs
             .contains(&("server".to_string(), "https://dist.example.com".to_string())));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn native_listing_mapping_preserves_split_terms() {
+        let operator = "a".repeat(64);
+        let terms = "b".repeat(64);
+        let source:arcadestr_core::marketplace::Nip99Listing=serde_json::from_value(serde_json::json!({
+            "event_id":"event","id":"split","title":"Split checkout","content":"", "images":[],"tags":[],
+            "merchant_npub":"npub1seller","created_at":100,
+            "accepted_terms":[{"operator_pubkey":operator,"terms_event_id":terms}],
+            "malformed_accepted_terms_tags":[["adp_terms","invalid"]]
+        })).expect("test listing");
+        let mapped = GameListing::from_listing(source);
+        assert!(mapped
+            .specs
+            .contains(&(format!("adp_terms:{}", operator), terms)));
+        assert!(mapped
+            .specs
+            .contains(&("malformed_adp_terms".into(), "1".into())));
     }
 }

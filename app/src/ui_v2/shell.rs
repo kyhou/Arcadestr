@@ -403,6 +403,24 @@ mod tests {
 #[component]
 pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
+    let wallet = crate::ui_v2::nwc_wallet::NwcWalletContext::new();
+    provide_context(wallet);
+    if !cfg!(feature = "web") {
+        let wallet_auth = auth.clone();
+        Effect::new(move |_| {
+            let account = wallet_auth
+                .npub
+                .get()
+                .as_deref()
+                .and_then(crate::ui_v2::components::blossom_media_upload::publisher_hex);
+            let generation = wallet.select_account(account.clone());
+            if let Some(account) = account {
+                spawn_local(async move {
+                    wallet.load_account(generation, account).await;
+                });
+            }
+        });
+    }
     let current_view = RwSignal::new(UiV2View::Store);
     let connected_relays = RwSignal::new(Vec::<String>::new());
     let relay_snapshot_loaded = RwSignal::new(false);

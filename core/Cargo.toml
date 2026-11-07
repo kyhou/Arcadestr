@@ -65,7 +65,33 @@ default = []
 native = []
 wasm = []
 
+[[example]]
+name = "regtest_nwc"
+required-features = ["native"]
+
+[[example]]
+name = "regtest_split_purchase"
+required-features = ["native"]
+
+[[example]]
+name = "regtest_refunds"
+required-features = ["native"]
+
+[[example]]
+name = "regtest_gate1"
+required-features = ["native"]
+
+[[example]]
+name = "regtest_gate2_preflight"
+required-features = ["native"]
+
+[[example]]
+name = "regtest_gate2"
+required-features = ["native"]
+
 [dev-dependencies]
+adp-server = { path = "../../adp-server/adp-server" }
+axum = "0.7"
 futures-util = "0.3"
 tokio-tungstenite = "0.28"
 bitcoin = "0.32"
@@ -73,3 +99,8 @@ lightning-types = "0.1"
 tokio-test = "0.4"
 tempfile = "3"
 sha2 = "0.10"
+
+# Match tauri-plugin-keyring's Linux backend when running the standalone helper.
+# Without a platform backend, keyring's fallback is not the desktop credential store.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+keyring = { version = "3.6", features = ["sync-secret-service"] }

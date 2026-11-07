@@ -1,6 +1,7 @@
 //! UI v2 module for Stitch-based Arcadestr interface.
 
 pub mod components;
+pub mod nwc_wallet;
 pub mod shell;
 pub mod theme;
 pub mod views;
