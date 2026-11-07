@@ -73,6 +73,7 @@ mod launcher;
 mod marketplace_stream;
 mod nip46_commands;
 mod settlement_ui;
+mod receipt_commands;
 mod startup_runtime;
 mod store_page_commands;
 
@@ -2840,21 +2841,20 @@ async fn install_game(
 
 #[tauri::command]
 async fn ingest_receipt(
+    app: tauri::AppHandle,
     raw_event_json: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let event: nostr::Event = serde_json::from_str(&raw_event_json).map_err(|e| e.to_string())?;
-    let buyer_pubkey_hex = {
+    let buyer = {
         let auth = state.auth.lock().await;
-        auth.public_key().ok_or("not authenticated")?.to_hex()
+        auth.public_key().ok_or("not authenticated")?
     };
-    let receipt = arcadestr_core::purchases::parse_and_validate_receipt(&event, &buyer_pubkey_hex)
-        .map_err(|e| e.to_string())?;
-    state
-        .purchases
-        .upsert_receipt(&receipt)
-        .await
-        .map_err(|e| e.to_string())
+    let report=receipt_commands::import_for_account(buyer,&raw_event_json,&state).await?;
+    let _=app.emit("receipt-ownership-updated",serde_json::json!({"account":buyer.to_hex()}));
+    if report.rejected_events>0 || report.chains.iter().any(|c|c.verification!=arcadestr_core::receipt_sync_contract::ReceiptVerification::Verified) {
+        return Err("Receipt import contains invalid or indeterminate evidence; inspect Purchase History verification results".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -8221,6 +8221,8 @@ fn main() {
             get_library_games,
             install_game,
             ingest_receipt,
+            receipt_commands::sync_purchase_receipts,
+            receipt_commands::import_purchase_receipts,
             get_purchase_records,
             fetch_profile,
             get_cached_earned_badges,

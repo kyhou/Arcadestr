@@ -834,6 +834,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let split_plan = RwSignal::new(None::<crate::tauri_bridge::PurchasePlanReview>);
     let plan_refresh = RwSignal::new(0_u64);
     let ownership_refresh = RwSignal::new(0_u64);
+    if let Some(receipts)=use_context::<crate::ui_v2::receipt_sync::ReceiptSyncContext>() {
+        Effect::new(move |_|{let _=receipts.revision.get();ownership_refresh.update(|v|*v=v.wrapping_add(1));});
+    }
 
     if split_enabled {
         let resume_auth = auth.clone();

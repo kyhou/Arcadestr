@@ -187,9 +187,14 @@ fn acquired_at_label(acquired_at: u64) -> String {
 /// is no per-event receipt chain to render, so the detail surface says so rather
 /// than inventing a timeline.
 const RECEIPT_TIMELINE_UNAVAILABLE: &str =
-    "A per-event receipt timeline is not available. Arcadestr stores one validated durable record per acquisition; individual invoice, proof, and fulfillment events are not retained locally.";
+    "A per-event receipt timeline is not available here. The acquisition list shows one validated durable record per verified purchase; signed receipt chains and verification references are retained locally, without exposing encrypted private evidence.";
 
 fn record_verification_label(record: &DurableAcquisitionRecord) -> &'static str {
+    if let Some(verification)=record.verification {return match verification {
+        crate::tauri_bridge::ReceiptVerification::Verified=>"VERIFIED",
+        crate::tauri_bridge::ReceiptVerification::Indeterminate=>"INDETERMINATE",
+        crate::tauri_bridge::ReceiptVerification::Invalid=>"INVALID",
+    };}
     if record.validation_error.is_some() {
         "Not verified"
     } else if record.status == DurableCredentialStatus::Unverified {
@@ -481,7 +486,9 @@ pub fn PurchasesView() -> impl IntoView {
     let settlement_state = RwSignal::new(SettlementHistoryState::Loading);
     let filter = RwSignal::new(PurchaseFilter::All);
     let request_generation = RwSignal::new(0_u64);
+    let settlement_generation = RwSignal::new(0_u64);
     let history_refresh = RwSignal::new(0_u64);
+    let receipt_sync=use_context::<crate::ui_v2::receipt_sync::ReceiptSyncContext>();
     let selected_filter = Signal::derive(move || purchase_filter_id(filter.get()).to_string());
     let select_filter = Callback::new(move |id: String| {
         if let Some(next) = purchase_filter_from_id(&id) {
@@ -503,6 +510,8 @@ pub fn PurchasesView() -> impl IntoView {
         let load_auth = auth.clone();
         Effect::new(move |_| {
             let _ = history_refresh.get();
+            if let Some(receipts)=receipt_sync {let _=receipts.revision.get();}
+            let _epoch=load_auth.current_auth_flow();
             let account = load_auth.npub.get().unwrap_or_default();
             let generation = request_generation.get_untracked().wrapping_add(1);
             request_generation.set(generation);
@@ -510,12 +519,10 @@ pub fn PurchasesView() -> impl IntoView {
             match initial_availability(false, !account.is_empty()) {
                 InitialAvailability::AccountRequired => {
                     state.set(PurchasesState::AccountRequired);
-                    settlement_state.set(SettlementHistoryState::AccountRequired);
                     return;
                 }
                 InitialAvailability::Load => {
                     state.set(PurchasesState::Loading);
-                    settlement_state.set(SettlementHistoryState::Loading);
                 }
                 InitialAvailability::WebUnavailable => return,
             }
@@ -531,19 +538,21 @@ pub fn PurchasesView() -> impl IntoView {
                     Err(_) => state.set(PurchasesState::Error),
                 }
             });
-            spawn_local(async move {
-                let _ = invoke_reconcile_pending_settlements().await;
-                let result = invoke_settlement_history().await;
-                if !should_apply_response(generation, request_generation.get_untracked()) {
-                    return;
-                }
-                match result {
-                    Ok(records) if records.is_empty() => {
-                        settlement_state.set(SettlementHistoryState::Empty)
-                    }
-                    Ok(records) => settlement_state.set(SettlementHistoryState::Ready(records)),
-                    Err(_) => settlement_state.set(SettlementHistoryState::Error),
-                }
+        });
+        // Receipt discovery/import refreshes ownership only. Do not turn a
+        // receipt synchronization notification into ADP proof submission.
+        let settlement_auth=auth.clone();
+        Effect::new(move |_|{
+            let _=history_refresh.get();let _=settlement_auth.current_auth_flow();
+            let account=settlement_auth.npub.get();
+            settlement_generation.update(|v|*v=v.wrapping_add(1));let generation=settlement_generation.get_untracked();
+            if account.is_none(){settlement_state.set(SettlementHistoryState::AccountRequired);return}
+            settlement_state.set(SettlementHistoryState::Loading);
+            spawn_local(async move{
+                let _=invoke_reconcile_pending_settlements().await;
+                let result=invoke_settlement_history().await;
+                if !should_apply_response(generation,settlement_generation.get_untracked()){return}
+                match result {Ok(records) if records.is_empty()=>settlement_state.set(SettlementHistoryState::Empty),Ok(records)=>settlement_state.set(SettlementHistoryState::Ready(records)),Err(_)=>settlement_state.set(SettlementHistoryState::Error)}
             });
         });
     }
@@ -555,6 +564,7 @@ pub fn PurchasesView() -> impl IntoView {
                 <h1 class="v2-display">"Purchases and access"</h1>
                 <p>"Durable acquisitions, resumable split payments, and account-scoped recovery records."</p>
             </header>
+            <crate::ui_v2::receipt_sync::ReceiptPortabilityPanel/>
 
             {move || settlement_history_view(
                 settlement_state.get(),
@@ -788,6 +798,7 @@ mod tests {
             record_id: "record".to_string(),
             validation_error: None,
             campaign_id: None,
+            verification: None,
         }
     }
 
@@ -916,6 +927,14 @@ mod tests {
             ["Order", " timeline"].concat(),
         ] {
             assert!(!source.contains(&fabricated), "fabricated receipt event");
+        }
+    }
+
+    #[test]
+    fn portable_verification_states_are_explicit_not_implied_ownership(){
+        let mut record=record(DurableAcquisitionKind::Purchase,DurableCredentialStatus::Unverified);
+        for (state,label) in [(crate::tauri_bridge::ReceiptVerification::Verified,"VERIFIED"),(crate::tauri_bridge::ReceiptVerification::Indeterminate,"INDETERMINATE"),(crate::tauri_bridge::ReceiptVerification::Invalid,"INVALID")] {
+            record.verification=Some(state);assert_eq!(record_verification_label(&record),label);
         }
     }
 

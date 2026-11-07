@@ -146,6 +146,11 @@ where
 }
 
 /// Invoke a Tauri command via direct JavaScript interop
+fn receipt_private_command(command:&str)->bool {
+    matches!(command,"sync_purchase_receipts"|"import_purchase_receipts"|"ingest_receipt")
+}
+
+/// Invoke a Tauri command via direct JavaScript interop
 /// Uses window.__TAURI__.core.invoke which is the Tauri v2 API
 #[allow(dead_code)]
 pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
@@ -171,9 +176,13 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
                 | "disconnect_nwc_wallet"
                 | "verify_nwc_wallet"
                 | "pay_nwc_invoice"
+                | "sync_purchase_receipts"
+                | "import_purchase_receipts"
+                | "ingest_receipt"
         ) {
             // These commands return sanitized, user-facing backend errors.
             e.as_string().unwrap_or_else(|| {
+                if receipt_private_command(command) {return "Receipt verification operation failed. Retry synchronization or import.".into();}
                 "NWC operation failed. Retry or refresh the saved wallet.".into()
             })
         } else {
@@ -194,7 +203,11 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
     };
 
     // Debug: print what we received
-    web_sys::console::log_1(&format!("Tauri response for '{}': {}", command, response_str).into());
+    if !receipt_private_command(command) {
+        // Other commands can also return invoices/preimages. Log the command,
+        // never the response body, even outside receipt portability.
+        web_sys::console::log_1(&format!("Tauri response received for '{}'", command).into());
+    }
 
     // Try to parse as JSON first, then as plain string
     // Some commands return JSON, others return plain strings (like npub)
@@ -203,6 +216,7 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
     match result {
         Ok(value) => Ok(value),
         Err(_) => {
+            if receipt_private_command(command) {return Err("Invalid receipt verification response".into());}
             // If JSON parsing fails, try to deserialize as a plain string
             // This handles commands that return plain strings like "npub1..."
             // We need to properly escape the string for JSON
@@ -347,8 +361,19 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
             if command == "connect_nwc_wallet" {
                 // An eval exception can include source text containing the submitted URI.
                 "Failed to submit NWC credentials to the desktop backend.".to_string()
+            } else if receipt_private_command(command) {
+                "Failed to submit receipt evidence to the desktop backend.".to_string()
             } else {
                 format!("Failed to invoke Tauri command: {:?}", e)
             }
         })
+}
+
+#[cfg(test)]
+mod receipt_privacy_tests {
+    #[test]
+    fn receipt_commands_do_not_echo_request_or_response_payloads(){
+        for command in ["sync_purchase_receipts","import_purchase_receipts","ingest_receipt"] {assert!(super::receipt_private_command(command));}
+        assert!(!super::receipt_private_command("get_platform_info"));
+    }
 }

@@ -405,6 +405,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let wallet = crate::ui_v2::nwc_wallet::NwcWalletContext::new();
     provide_context(wallet);
+    let receipts = super::receipt_sync::provide_receipt_sync(auth.clone());
     if !cfg!(feature = "web") {
         let wallet_auth = auth.clone();
         Effect::new(move |_| {
@@ -455,6 +456,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         .get("type")
                         .and_then(|value| value.as_str())
                         .unwrap_or_default();
+                    if event_type == "connected" { receipts.synchronize(false); }
                     let url = payload
                         .get("url")
                         .and_then(|value| value.as_str())

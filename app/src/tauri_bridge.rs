@@ -41,6 +41,13 @@ pub use arcadestr_core::purchase_contract::{
 };
 use arcadestr_core::store_page::{StorePageDraft, StorePageValidationDiagnostic};
 use serde::{Deserialize, Serialize};
+pub use arcadestr_core::receipt_sync_contract::{ReceiptSyncRequest,ReceiptImportRequest,ReceiptSyncReport,ReceiptVerification};
+pub async fn invoke_sync_purchase_receipts(request:ReceiptSyncRequest)->Result<ReceiptSyncReport,String>{
+    recovery_invoke("sync_purchase_receipts",serde_json::json!({"request":request})).await
+}
+pub async fn invoke_import_purchase_receipts(request:ReceiptImportRequest)->Result<ReceiptSyncReport,String>{
+    recovery_invoke("import_purchase_receipts",serde_json::json!({"request":request})).await
+}
 
 pub async fn invoke_get_purchase_plan(
     request: PurchasePlanRequest,

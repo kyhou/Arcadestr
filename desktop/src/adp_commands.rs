@@ -2789,7 +2789,7 @@ async fn persist_purchase_confirmation(
             .map_err(|error| format!("receipt authorization unavailable or invalid: {error}"))?,
         )
     };
-    let receipt = arcadestr_core::purchases::parse_and_validate_receipt_with_authorization(
+    let _receipt = arcadestr_core::purchases::parse_and_validate_receipt_with_authorization(
         &response.receipt,
         buyer_pubkey,
         authorization.as_ref(),
@@ -2805,11 +2805,7 @@ async fn persist_purchase_confirmation(
     if current_buyer.as_deref() != Some(buyer_pubkey) {
         return Err("active account changed while receipt authorization was being verified".into());
     }
-    state
-        .purchases
-        .upsert_receipt(&receipt)
-        .await
-        .map_err(|err| err.to_string())?;
+    crate::receipt_commands::archive_confirmation(state,nostr::PublicKey::from_hex(buyer_pubkey).map_err(|_|"Invalid receipt buyer")?,&response.receipt,authorization.as_ref()).await?;
     let tokens = DownloadTokensRepository::new(state.database.pool().clone());
     tokens
         .upsert(&DownloadToken {
@@ -2910,7 +2906,7 @@ async fn persist_split_receipt(
             .map_err(|error| format!("receipt authorization unavailable or invalid: {error}"))?,
         )
     };
-    let receipt = arcadestr_core::purchases::parse_and_validate_receipt_with_authorization(
+    let _receipt = arcadestr_core::purchases::parse_and_validate_receipt_with_authorization(
         receipt_event,
         &buyer.to_hex(),
         authorization.as_ref(),
@@ -2923,11 +2919,7 @@ async fn persist_split_receipt(
     )
     .map_err(|error| error.to_string())?;
     ensure_purchase_account_current(state, buyer).await?;
-    state
-        .purchases
-        .upsert_receipt(&receipt)
-        .await
-        .map_err(|error| error.to_string())?;
+    crate::receipt_commands::archive_confirmation(state,buyer,receipt_event,authorization.as_ref()).await?;
     DownloadTokensRepository::new(state.database.pool().clone())
         .upsert(&DownloadToken {
             buyer_pubkey: buyer.to_hex(),

@@ -101,6 +101,9 @@ pub mod entitlements;
 #[cfg(feature = "native")]
 pub mod entitlements_repository;
 pub mod purchase_contract;
+pub mod receipt_sync_contract;
+#[cfg(feature = "native")]
+pub mod receipt_portability;
 pub mod store_page;
 pub mod store_page_content_policy;
 #[cfg(feature = "native")]

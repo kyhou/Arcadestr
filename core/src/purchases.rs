@@ -149,9 +149,10 @@ impl PurchasesRepository {
     ) -> Result<bool, PurchaseError> {
         let rows = sqlx::query(
             r#"
-            SELECT order_id, raw_event
-            FROM purchases
-            WHERE buyer_pubkey = ? AND listing_coordinate = ?
+            SELECT p.order_id, p.raw_event
+            FROM purchases p
+            WHERE p.buyer_pubkey = ? AND p.listing_coordinate = ?
+              AND NOT EXISTS (SELECT 1 FROM receipt_chain_verifications v WHERE v.buyer_pubkey=p.buyer_pubkey AND v.listing_coordinate=p.listing_coordinate AND v.order_id=p.order_id AND v.verification!='verified')
             ORDER BY created_at DESC, event_id DESC
             "#,
         )
@@ -227,6 +228,7 @@ pub(crate) fn stored_receipt_validation_error(receipt: &StoredReceipt) -> Option
     let Ok(event) = serde_json::from_str::<Event>(&receipt.raw_event) else {
         return Some("Stored purchase receipt could not be verified.");
     };
+    let is_update=parse_receipt_event(&event).is_ok_and(|r|r.predecessor.is_some() && r.status!=STATUS_PAID && r.payment_hash.is_none() && r.amount_msat.is_none() && r.settled_at.is_none() && r.proofs.is_empty() && r.aggregate.is_none());
     // Aggregate receipts deliberately have no singular bolt11/preimage tags.
     // Use the same parser/root completeness checks as persisted ownership.
     let aggregate = match parse_aggregate(&event) {
@@ -245,12 +247,12 @@ pub(crate) fn stored_receipt_validation_error(receipt: &StoredReceipt) -> Option
         || tag_value(&event, "a").as_deref() != Some(receipt.listing_coordinate.as_str())
         || tag_value(&event, "order").as_deref() != Some(receipt.order_id.as_str())
         || tag_value(&event, "status").unwrap_or_else(|| STATUS_PAID.to_string()) != receipt.status
-        || (!aggregate && validate_payment_proof(&event).is_err())
+        || (!aggregate && !is_update && validate_payment_proof(&event).is_err())
     {
         return Some("Stored purchase receipt could not be verified.");
     }
 
-    if tag_value(&event, "e").is_some() && tag_value(&event, "bolt11").is_none() {
+    if !is_update && tag_value(&event, "e").is_some() && tag_value(&event, "bolt11").is_none() {
         return Some("Referenced payment proof is not available for local verification.");
     }
 
@@ -477,6 +479,12 @@ fn parse_aggregate(event: &Event) -> Result<Option<AggregateReceipt>, PurchaseEr
                 .map_err(|_| PurchaseError::ProofInvalid("malformed accepted terms".into()))?;
             Some(terms.clone())
         };
+        let canonical_hash=|value:&str|value.len()==64 && value.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b));
+        if !canonical_hash(payment_hash) || !canonical_hash(proof_reference)
+            || !matches!(proof_type.as_str(),"bolt11-preimage"|"zap")
+            || (proof_type=="bolt11-preimage" && proof_reference!=payment_hash) {
+            return Err(PurchaseError::ProofInvalid("invalid aggregate proof declaration or public binding".into()));
+        }
         legs.push(crate::adp_settlement::AggregateProofLeg {
             leg_id: leg_id.clone(),
             role,
@@ -492,6 +500,9 @@ fn parse_aggregate(event: &Event) -> Result<Option<AggregateReceipt>, PurchaseEr
     }
     let calculated = crate::adp_settlement::aggregate_commitment(gross_msat, &legs)
         .map_err(|error| PurchaseError::ProofInvalid(error.to_string()))?;
+    if legs.is_empty() || legs.windows(2).any(|p|(&p[0].amount_msat,&p[0].role,&p[0].recipient_pubkey)>(&p[1].amount_msat,&p[1].role,&p[1].recipient_pubkey)) {
+        return Err(PurchaseError::ProofInvalid("empty or unordered aggregate payment legs".into()));
+    }
     if &calculated != commitment {
         return Err(PurchaseError::ProofInvalid(
             "aggregate commitment mismatch".into(),
@@ -599,7 +610,7 @@ pub fn validate_adp_receipt_root(
     authorization: Option<&ResolvedAuthorization>,
 ) -> Result<(), PurchaseError> {
     let legacy_complete = receipt.payment_hash.is_some()
-        && receipt.amount_msat.is_some()
+        && receipt.amount_msat.is_some_and(|amount|amount>0)
         && !receipt.proofs.is_empty()
         && receipt.aggregate.is_none();
     let aggregate_complete = receipt.aggregate.is_some()
@@ -649,6 +660,15 @@ pub fn resolve_receipt_chain<'a>(
     developer: PublicKey,
     authorization: Option<&ResolvedAuthorization>,
 ) -> Result<&'a Event, PurchaseError> {
+    let tip = resolve_receipt_structure(events, developer)?;
+    let root = events.iter().filter_map(|event|parse_receipt_event(event).ok())
+        .find(is_paid_receipt_root).ok_or_else(||PurchaseError::ProofInvalid("missing paid root".into()))?;
+    validate_adp_receipt_root(&root, developer, authorization)?;
+    validate_receipt_evidence(&root, ReceiptEvidence::default())?;
+    Ok(tip)
+}
+
+fn resolve_receipt_structure(events: &[Event], developer: PublicKey) -> Result<&Event, PurchaseError> {
     let parsed = events
         .iter()
         .filter_map(|event| {
@@ -657,6 +677,9 @@ pub fn resolve_receipt_chain<'a>(
                 .map(|parsed| (event, parsed))
         })
         .collect::<Vec<_>>();
+    if parsed.len() != events.len() {
+        return Err(PurchaseError::ProofInvalid("malformed receipt chain member".into()));
+    }
     let roots = parsed
         .iter()
         .filter(|(_, receipt)| is_paid_receipt_root(receipt))
@@ -667,7 +690,10 @@ pub fn resolve_receipt_chain<'a>(
         ));
     }
     let (root_event, root) = roots[0];
-    validate_adp_receipt_root(root, developer, authorization)?;
+    if (root_event.pubkey != developer && root.authorization.is_none())
+        || (root_event.pubkey == developer && root.authorization.is_some()) {
+        return Err(PurchaseError::ProofInvalid("invalid root authorization binding".into()));
+    }
     let delegated = root_event.pubkey != developer;
     let mut current_event = *root_event;
     let mut current = root.clone();
@@ -686,6 +712,7 @@ pub fn resolve_receipt_chain<'a>(
                     && candidate.amount_msat.is_none()
                     && candidate.settled_at.is_none()
                     && candidate.proofs.is_empty()
+                    && candidate.aggregate.is_none()
                     && (event.pubkey == developer
                         || (delegated && event.pubkey == root_event.pubkey))
                     && current.status != "refunded"
@@ -709,6 +736,9 @@ pub fn resolve_receipt_chain<'a>(
         }
         current_event = next_event;
         current = next.clone();
+    }
+    if visited.len() != parsed.len() {
+        return Err(PurchaseError::ProofInvalid("receipt chain has unreachable or contradictory members".into()));
     }
     Ok(current_event)
 }
@@ -838,59 +868,8 @@ fn is_paid_receipt_root(receipt: &ParsedReceipt) -> bool {
 }
 
 pub(crate) fn resolve_persisted_receipt_tip(events: &[Event]) -> Option<&Event> {
-    let parsed = events
-        .iter()
-        .filter_map(|event| {
-            parse_receipt_event(event)
-                .ok()
-                .map(|parsed| (event, parsed))
-        })
-        .collect::<Vec<_>>();
-    let roots = parsed
-        .iter()
-        .filter(|(_, receipt)| is_paid_receipt_root(receipt))
-        .collect::<Vec<_>>();
-    if roots.len() != 1 {
-        return None;
-    }
-    let (root_event, root) = roots[0];
-    let developer = coordinate_publisher(&root.coordinate)?;
-    let delegated = root_event.pubkey != developer;
-    if (delegated && root.authorization.is_none()) || (!delegated && root.authorization.is_some()) {
-        return None;
-    }
-    let mut current_event = *root_event;
-    let mut current = root.clone();
-    loop {
-        let mut valid = parsed
-            .iter()
-            .filter(|(_, candidate)| candidate.predecessor == Some(current_event.id))
-            .filter(|(event, candidate)| {
-                event.created_at > current_event.created_at
-                    && candidate.order_id == root.order_id
-                    && candidate.buyer_pubkey == root.buyer_pubkey
-                    && candidate.coordinate == root.coordinate
-                    && candidate.authorization == root.authorization
-                    && candidate.payment_hash.is_none()
-                    && candidate.amount_msat.is_none()
-                    && candidate.settled_at.is_none()
-                    && candidate.proofs.is_empty()
-                    && (event.pubkey == developer
-                        || (delegated && event.pubkey == root_event.pubkey))
-                    && current.status != "refunded"
-                    && candidate.status != STATUS_PAID
-            })
-            .collect::<Vec<_>>();
-        if valid.len() > 1 {
-            return None;
-        }
-        let Some((next_event, next)) = valid.pop() else {
-            break;
-        };
-        current_event = next_event;
-        current = next.clone();
-    }
-    Some(current_event)
+    let root = events.iter().filter_map(|event|parse_receipt_event(event).ok()).find(is_paid_receipt_root)?;
+    resolve_receipt_structure(events, coordinate_publisher(&root.coordinate)?).ok()
 }
 
 fn validate_payment_proof(event: &Event) -> Result<Option<String>, PurchaseError> {

@@ -37,3 +37,18 @@ replacement or commits are authorized by development completion.
 Arcadestr receipt/listing binding, false completion, stale-account callback and
 Library synchronization defects found in Gate 4 are fixed in Arcadestr and are
 **not** external dependencies. See `regtest-gate4-buy-flow-audit.md` for evidence.
+
+## Receipt portability additions (Gate 3/4 remain complete)
+
+Public receipt discovery is best effort, never guaranteed recovery of every
+historical receipt. Relay retention/availability, capped timestamp pages and
+omitted updates are disclosed; bounded overlap/backfill and manual signed-event
+import provide complementary recovery paths. NIP-59 transport and multi-character
+`#order` SDK filtering remain optional improvements; current discovery uses the
+standard `#p` fallback without a parallel client. Missing verification evidence
+stays INDETERMINATE rather than owned or automatically invalid.
+
+Local imported ownership does not mint tokens or guarantee an ADP server can
+retrieve the same receipt or serve the build. Existing independent server and
+distribution authorization remain in effect. Details and practical mitigations:
+`scripts/receipt-portability.md`.

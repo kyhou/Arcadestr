@@ -2,6 +2,7 @@
 
 pub mod components;
 pub mod nwc_wallet;
+pub mod receipt_sync;
 pub mod shell;
 pub mod theme;
 pub mod views;

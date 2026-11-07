@@ -78,6 +78,8 @@ pub struct DurableAcquisitionRecord {
     pub record_id: String,
     pub validation_error: Option<String>,
     pub campaign_id: Option<String>,
+    #[serde(default)]
+    pub verification: Option<arcadestr_core::receipt_sync_contract::ReceiptVerification>,
 }
 
 impl AcquisitionPolicy {
