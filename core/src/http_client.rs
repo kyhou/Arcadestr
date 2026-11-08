@@ -51,6 +51,17 @@ pub enum HttpClientError {
 /// Minimal HTTP client contract used by protocol validators.
 #[async_trait]
 pub trait HttpClient: Send + Sync {
+    /// Native streamed upload boundary. Never follow redirects or reflect server errors.
+    async fn post_multipart(
+        &self,
+        _url: &str,
+        _authorization: String,
+        _form: reqwest::multipart::Form,
+    ) -> Result<Value, HttpClientError> {
+        Err(HttpClientError::Request(
+            "streamed uploads unsupported".into(),
+        ))
+    }
     /// Fetch URL and decode JSON payload.
     async fn get_json(&self, url: &str) -> Result<Value, HttpClientError>;
 
@@ -135,6 +146,29 @@ fn temp_sibling_path(dest: &Path) -> PathBuf {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     dest.with_file_name(format!(".{filename}.{}.{nonce}.tmp", std::process::id()))
+}
+
+/// Publication endpoints require TLS, except explicitly addressed development loopback.
+/// Reject credentials, queries and fragments before signing or sending anything.
+pub fn validate_publication_endpoint(endpoint: &str) -> Result<(), HttpClientError> {
+    let invalid = || HttpClientError::Request("unsafe publication endpoint".into());
+    let url = url::Url::parse(endpoint).map_err(|_| invalid())?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host().is_none()
+        || !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 struct RetainedCandidateFile {
@@ -246,11 +280,128 @@ fn add_cleanup_failure(
 /// Production HTTP client backed by `reqwest`.
 pub struct ReqwestHttpClient {
     client: reqwest::Client,
+    upload_client: reqwest::Client,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_endpoints_reject_secrets_and_insecure_remote_hosts() {
+        for endpoint in [
+            "http://example.com/upload",
+            "ftp://example.com/upload",
+            "https://user:secret@example.com/upload",
+            "https://example.com/?secret=token",
+            "https://example.com/#secret",
+            "file:///tmp/build",
+        ] {
+            let error = validate_publication_endpoint(endpoint).expect_err("unsafe endpoint");
+            assert_eq!(
+                error.to_string(),
+                "HTTP request failed: unsafe publication endpoint"
+            );
+        }
+        for endpoint in [
+            "https://example.com/upload",
+            "http://127.0.0.1:8080/upload",
+            "http://[::1]:8080/upload",
+            "http://localhost:8080/upload",
+        ] {
+            validate_publication_endpoint(endpoint).expect("TLS or explicit development loopback");
+        }
+    }
+
+    async fn upload_fixture(response: Vec<u8>, stall: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await;
+            if stall {
+                let _ = socket.write_all(&response).await;
+                std::future::pending::<()>().await;
+            }
+            let _ = socket.write_all(&response).await;
+        });
+        format!("http://{address}/upload")
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_blocks_redirects_and_never_reflects_error_bodies() {
+        let client = ReqwestHttpClient::new(Duration::from_secs(2)).expect("client");
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("target");
+        let location = target.local_addr().expect("address");
+        let url = upload_fixture(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{location}/stolen\r\nContent-Length: 0\r\n\r\n").into_bytes(), false).await;
+        let error = client
+            .post_multipart(
+                &url,
+                "Nostr secret-header".into(),
+                reqwest::multipart::Form::new().text("file", "bytes"),
+            )
+            .await
+            .expect_err("redirect blocked");
+        assert!(matches!(error, HttpClientError::RedirectBlocked(_)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), target.accept())
+                .await
+                .is_err()
+        );
+        let url = upload_fixture(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 999999999\r\n\r\nNostr secret-header user:password".to_vec(), false).await;
+        let error = client
+            .post_multipart(
+                &url,
+                "Nostr secret-header".into(),
+                reqwest::multipart::Form::new(),
+            )
+            .await
+            .expect_err("status");
+        assert_eq!(error.to_string(), "HTTP status not successful: 500");
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_bounds_success_bodies_and_times_out_stalls() {
+        let body = "x".repeat(65537);
+        let url = upload_fixture(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+            false,
+        )
+        .await;
+        let client = ReqwestHttpClient::new(Duration::from_secs(2)).expect("client");
+        let error = client
+            .post_multipart(&url, "secret".into(), reqwest::multipart::Form::new())
+            .await
+            .expect_err("bounded");
+        assert!(error.to_string().contains("exceeds limit"));
+        let url = upload_fixture(Vec::new(), true).await;
+        let client = ReqwestHttpClient::new(Duration::from_millis(40)).expect("client");
+        let error = client
+            .post_multipart(&url, "secret".into(), reqwest::multipart::Form::new())
+            .await
+            .expect_err("timeout");
+        assert_eq!(error.to_string(), "HTTP request failed: upload timed out");
+        let url = upload_fixture(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{}".to_vec(),
+            true,
+        )
+        .await;
+        let error = client
+            .post_multipart(&url, "secret".into(), reqwest::multipart::Form::new())
+            .await
+            .expect_err("response body stall");
+        assert_eq!(error.to_string(), "HTTP request failed: upload timed out");
+    }
 
     #[test]
     fn status_error_displays_response_body_when_available() {
@@ -644,12 +795,73 @@ impl ReqwestHttpClient {
             .build()
             .map_err(|e| HttpClientError::Build(e.to_string()))?;
 
-        Ok(Self { client })
+        // Large streamed builds need a longer total deadline than metadata requests,
+        // while connect/read stalls retain the caller's configured short timeout.
+        let upload_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30 * 60))
+            .connect_timeout(timeout.min(Duration::from_secs(30)))
+            .read_timeout(timeout.min(Duration::from_secs(30)))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .map_err(|_| HttpClientError::Build("upload client unavailable".into()))?;
+        Ok(Self {
+            client,
+            upload_client,
+        })
     }
 }
 
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
+    async fn post_multipart(
+        &self,
+        url: &str,
+        authorization: String,
+        form: reqwest::multipart::Form,
+    ) -> Result<Value, HttpClientError> {
+        validate_publication_endpoint(url)?;
+        let sanitized = |error: reqwest::Error| {
+            HttpClientError::Request(
+                if error.is_timeout() {
+                    "upload timed out"
+                } else {
+                    "upload transport failed"
+                }
+                .into(),
+            )
+        };
+        let response = self
+            .upload_client
+            .post(url)
+            .header("Authorization", authorization)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(sanitized)?;
+        if response.status().is_redirection() {
+            return Err(HttpClientError::RedirectBlocked(
+                "upload redirect refused".into(),
+            ));
+        }
+        if !response.status().is_success() {
+            return Err(HttpClientError::Status(response.status().as_u16()));
+        }
+        const MAX_UPLOAD_RESPONSE: usize = 64 * 1024;
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(sanitized)?;
+            if chunk.len() > MAX_UPLOAD_RESPONSE.saturating_sub(body.len()) {
+                return Err(HttpClientError::Json(
+                    "upload response exceeds limit".into(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&body)
+            .map_err(|_| HttpClientError::Json("invalid upload response".into()))
+    }
     async fn get_json(&self, url: &str) -> Result<Value, HttpClientError> {
         let response = self.client.get(url).send().await.map_err(request_error)?;
 

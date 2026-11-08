@@ -36,7 +36,7 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, price_amount, price_currency, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status, campaigns_json
                     FROM marketplace_listings
                     WHERE acquisition_json IS NOT NULL AND created_at >= ? AND created_at <= ?
                     ORDER BY created_at DESC
@@ -54,7 +54,7 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, price_amount, price_currency, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status, campaigns_json
                     FROM marketplace_listings
                     WHERE acquisition_json IS NOT NULL AND created_at >= ?
                     ORDER BY created_at DESC
@@ -71,7 +71,7 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, price_amount, price_currency, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status, campaigns_json
                     FROM marketplace_listings
                     WHERE acquisition_json IS NOT NULL AND created_at <= ?
                     ORDER BY created_at DESC
@@ -88,7 +88,7 @@ impl MarketplaceCache {
                     r#"
                     SELECT product_id, title, description, price_sats, price_amount, price_currency, download_url,
                            publisher_npub, created_at, tags_json, lud16,
-                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status
+                           images_json, platforms_json, nip94_event_id, specs_json, acquisition_json, source_event_id, summary, published_at, location, geohash, status, campaigns_json
                     FROM marketplace_listings
                     WHERE acquisition_json IS NOT NULL
                     ORDER BY created_at DESC
@@ -135,7 +135,9 @@ impl MarketplaceCache {
                     platforms,
                     nip94_event_id: row.get("nip94_event_id"),
                     acquisition,
-                    campaigns: Vec::new(),
+                    campaigns: crate::marketplace::cached_campaign_pointers(
+                        &row.get::<String, _>("campaigns_json"),
+                    ),
                     images,
                     summary: row.get("summary"),
                     published_at: row
@@ -193,6 +195,8 @@ impl MarketplaceCache {
             serde_json::to_string(&listing.platforms).unwrap_or_else(|_| "[]".to_string());
         let acquisition_json =
             serde_json::to_string(&listing.acquisition).unwrap_or_else(|_| "\"Gated\"".to_string());
+        let campaigns_json = serde_json::to_string(&listing.campaigns)
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
         let now = now_secs();
 
         let result = sqlx::query(
@@ -200,9 +204,9 @@ impl MarketplaceCache {
             INSERT INTO marketplace_listings (
                 publisher_npub, product_id, title, description, price_sats, price_amount, price_currency,
                 download_url, tags_json, specs_json, lud16, created_at, updated_at, source_event_id,
-                images_json, platforms_json, nip94_event_id, acquisition_json, summary, published_at, location, geohash, status
+                images_json, platforms_json, nip94_event_id, acquisition_json, summary, published_at, location, geohash, status, campaigns_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(publisher_npub, product_id) DO UPDATE SET
                 title = excluded.title,
                 description = excluded.description,
@@ -224,11 +228,18 @@ impl MarketplaceCache {
                 published_at = excluded.published_at,
                 location = excluded.location,
                 geohash = excluded.geohash,
-                status = excluded.status
+                status = excluded.status,
+                campaigns_json = excluded.campaigns_json
             WHERE
                 (
                     marketplace_listings.acquisition_json IS NULL OR
                     excluded.created_at > marketplace_listings.created_at OR
+                    (
+                        excluded.created_at = marketplace_listings.created_at AND
+                        excluded.source_event_id IS NOT NULL AND
+                        excluded.source_event_id = marketplace_listings.source_event_id AND
+                        excluded.campaigns_json <> marketplace_listings.campaigns_json
+                    ) OR
                     (
                         excluded.created_at = marketplace_listings.created_at AND
                         excluded.source_event_id IS NOT NULL AND
@@ -239,6 +250,7 @@ impl MarketplaceCache {
                     )
                 ) AND
                 (
+                    marketplace_listings.campaigns_json <> excluded.campaigns_json OR
                     marketplace_listings.title <> excluded.title OR
                     marketplace_listings.description <> excluded.description OR
                     marketplace_listings.price_sats <> excluded.price_sats OR
@@ -285,6 +297,7 @@ impl MarketplaceCache {
         .bind(&listing.location)
         .bind(&listing.geohash)
         .bind(&listing.status)
+        .bind(campaigns_json)
         .execute(&self.db)
         .await?;
 

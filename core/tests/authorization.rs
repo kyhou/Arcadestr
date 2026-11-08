@@ -122,6 +122,131 @@ fn credentials_before_cancellation_remain_authorized_but_equality_is_denied() {
 }
 
 #[test]
+fn imported_metadata_preserves_sibling_roots_hints_and_subset_capabilities_without_local_rows() {
+    use arcadestr_core::authorization::{
+        select_reusable_authorization, validate_listing_authorization_references,
+    };
+    let developer = Keys::generate();
+    let first_operator = Keys::generate();
+    let second_operator = Keys::generate();
+    let first_key = Keys::generate();
+    let second_key = Keys::generate();
+    let mut first_terms = terms(&developer, &first_operator, &first_key);
+    first_terms.capabilities = BTreeSet::from([CAPABILITY_ISSUE_RECEIPT.into()]);
+    let first = root(&developer, &first_terms);
+    let mut second_terms = terms(&developer, &second_operator, &second_key);
+    second_terms.authorization_id = "independent-sibling".into();
+    let second = root(&developer, &second_terms);
+    let cancellation = cancel(&developer, &first_terms, &first, 200);
+    let authorizations = vec![
+        resolve_authorization(first.id, &[first.clone(), cancellation]).expect("historical root"),
+        resolve_authorization(second.id, &[second.clone()]).expect("current sibling"),
+    ];
+    let listing = EventBuilder::new(Kind::Custom(30402), "imported metadata")
+        .tags([
+            tag(&["d", "game"]),
+            tag(&["title", "Imported"]),
+            tag(&["t", "game"]),
+            tag(&[
+                "fulfillment_authorization",
+                &first.id.to_hex(),
+                &first_key.public_key().to_hex(),
+                "wss://first.example",
+            ]),
+            tag(&[
+                "fulfillment_authorization",
+                &second.id.to_hex(),
+                &second_key.public_key().to_hex(),
+                "wss://second.example",
+            ]),
+        ])
+        .sign_with_keys(&developer)
+        .expect("listing");
+    let references = validate_listing_authorization_references(&listing, &authorizations)
+        .expect("no local database relationship required");
+    assert_eq!(references.len(), 2);
+    assert_eq!(references[0].root_event_id, first.id);
+    assert_eq!(
+        references[0].relay_hint.as_deref(),
+        Some("wss://first.example")
+    );
+    assert_eq!(references[1].root_event_id, second.id);
+    assert_eq!(
+        authorizations[0].terms.capabilities,
+        first_terms.capabilities
+    );
+    assert!(authorizations[0].authorizes(
+        &first_key.public_key(),
+        &coordinate(&developer),
+        CAPABILITY_ISSUE_RECEIPT,
+        199
+    ));
+    assert!(!authorizations[0].authorizes(
+        &first_key.public_key(),
+        &coordinate(&developer),
+        CAPABILITY_ISSUE_RECEIPT,
+        201
+    ));
+    let candidates = [first_key.public_key(), second_key.public_key()]
+        .into_iter()
+        .collect();
+    assert!(select_reusable_authorization(
+        &authorizations,
+        &references,
+        &candidates,
+        first_operator.public_key(),
+        &coordinate(&developer),
+        &BTreeSet::from([CAPABILITY_UPLOAD_BUILD.into()]),
+        201
+    )
+    .is_none());
+    assert_eq!(
+        select_reusable_authorization(
+            &authorizations,
+            &references,
+            &candidates,
+            second_operator.public_key(),
+            &coordinate(&developer),
+            &BTreeSet::from([CAPABILITY_UPLOAD_BUILD.into()]),
+            201
+        )
+        .expect("independent sibling remains usable")
+        .root_event_id,
+        second.id
+    );
+    assert!(validate_listing_authorization_references(&listing, &authorizations[1..]).is_err());
+}
+
+#[test]
+fn metadata_authority_rejects_malformed_or_misbound_siblings_instead_of_discarding_them() {
+    use arcadestr_core::authorization::validate_listing_authorization_references;
+    let developer = Keys::generate();
+    let operator = Keys::generate();
+    let fulfillment = Keys::generate();
+    let terms = terms(&developer, &operator, &fulfillment);
+    let root = root(&developer, &terms);
+    let resolved = resolve_authorization(root.id, &[root.clone()]).expect("root");
+    for reference in [
+        vec!["fulfillment_authorization".to_string(), "broken".into()],
+        vec![
+            "fulfillment_authorization".into(),
+            root.id.to_hex(),
+            Keys::generate().public_key().to_hex(),
+        ],
+    ] {
+        let listing = EventBuilder::new(Kind::Custom(30402), "listing")
+            .tags([
+                tag(&["d", "game"]),
+                tag(&["title", "Imported"]),
+                Tag::parse(reference).expect("tag"),
+            ])
+            .sign_with_keys(&developer)
+            .expect("listing");
+        assert!(validate_listing_authorization_references(&listing, &[resolved.clone()]).is_err());
+    }
+}
+
+#[test]
 fn malformed_successor_does_not_block_valid_sibling_recovery() {
     let developer = Keys::generate();
     let operator = Keys::generate();

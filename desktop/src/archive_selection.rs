@@ -171,6 +171,7 @@ impl PublicationLease {
         listing: &nostr::Event,
         expected_publisher: &str,
         account_check: AccountCheck,
+        session: &arcadestr_core::settlement_recovery::SessionFence,
         progress: F,
     ) -> Result<arcadestr_core::adp_client::UploadResponse, LeaseUploadError>
     where
@@ -189,10 +190,18 @@ impl PublicationLease {
             .map_err(LeaseUploadError::Upload)?;
         let active = (account_check)().await.map_err(LeaseUploadError::Archive)?;
         require_account(expected_publisher, &active).map_err(LeaseUploadError::Archive)?;
-        client
+        let authorization = authorization.with_session(session.clone());
+        let response = client
             .upload_authorized_file_with_progress(authorization, listing, file, &filename, progress)
             .await
-            .map_err(LeaseUploadError::Upload)
+            .map_err(LeaseUploadError::Upload)?;
+        arcadestr_core::adp_client::validate_upload_acknowledgement(
+            listing,
+            &self.digest,
+            &response,
+        )
+        .map_err(LeaseUploadError::Upload)?;
+        Ok(response)
     }
 
     pub(crate) async fn finish(mut self) {

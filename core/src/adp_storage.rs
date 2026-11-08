@@ -2075,13 +2075,8 @@ mod tests {
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
     async fn test_db() -> Database {
-        let path = std::env::temp_dir().join(format!(
-            "arcadestr-adp-storage-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after epoch")
-                .as_nanos()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("arcadestr-adp-storage-{}.db", uuid::Uuid::new_v4()));
         Database::new(&path)
             .await
             .expect("test database should open")

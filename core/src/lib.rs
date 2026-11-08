@@ -102,6 +102,8 @@ pub mod campaign_discovery;
 pub mod entitlements;
 #[cfg(feature = "native")]
 pub mod entitlements_repository;
+pub mod publisher_management;
+pub mod publisher_recovery;
 pub mod purchase_contract;
 #[cfg(feature = "native")]
 pub mod receipt_portability;

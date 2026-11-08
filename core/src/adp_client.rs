@@ -17,6 +17,8 @@ use crate::signers::NostrSigner;
 /// Errors returned by ADP HTTP client operations.
 #[derive(Debug, Error)]
 pub enum AdpClientError {
+    #[error("upload acknowledgement does not match the signed listing/build or has an unsafe download URL")]
+    UploadAcknowledgement,
     /// The HTTP layer failed.
     #[error("ADP HTTP request failed: {0}")]
     Http(#[from] HttpClientError),
@@ -120,7 +122,7 @@ pub struct AdpServerInfo {
 }
 
 /// Response returned by `POST /provision`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvisionResponse {
     pub fulfillment_pubkey: String,
     pub attestation_event_id: String,
@@ -142,6 +144,66 @@ pub struct UploadResponse {
     pub game_coordinate: String,
     pub file_hash: String,
     pub download_url: String,
+}
+
+/// Validate an acknowledgement, never a new source of distribution authority.
+pub fn validate_upload_acknowledgement(
+    listing: &Event,
+    digest: &crate::distribution::Sha256Digest,
+    response: &UploadResponse,
+) -> Result<(), AdpClientError> {
+    let invalid = || AdpClientError::UploadAcknowledgement;
+    listing.verify().map_err(|_| invalid())?;
+    if listing.kind.as_u16() != 30402 {
+        return Err(invalid());
+    }
+    let identifiers = listing
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("d"))
+        .collect::<Vec<_>>();
+    let hashes = listing
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("file_hash"))
+        .collect::<Vec<_>>();
+    let [identifier] = identifiers.as_slice() else {
+        return Err(invalid());
+    };
+    let [hash] = hashes.as_slice() else {
+        return Err(invalid());
+    };
+    let [_, d] = identifier.as_slice() else {
+        return Err(invalid());
+    };
+    let [_, signed_hash] = hash.as_slice() else {
+        return Err(invalid());
+    };
+    if d.is_empty()
+        || signed_hash != digest.as_str()
+        || response.file_hash != digest.as_str()
+        || response.game_coordinate != format!("30402:{}:{d}", listing.pubkey.to_hex())
+    {
+        return Err(invalid());
+    }
+    crate::http_client::validate_publication_endpoint(&response.download_url)
+        .map_err(|_| invalid())?;
+    let url = url::Url::parse(&response.download_url).map_err(|_| invalid())?;
+    if url.as_str() != response.download_url {
+        return Err(invalid());
+    }
+    let signed_origin = listing
+        .tags
+        .iter()
+        .filter_map(|tag| match tag.as_slice() {
+            [name, server] if name == "server" => url::Url::parse(server).ok(),
+            _ => None,
+        })
+        .any(|server| server.origin() == url.origin());
+    if !signed_origin {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// Request sent to `POST /purchase/confirm` in a later gate.
@@ -395,6 +457,16 @@ pub struct AdpClient {
 /// NIP-98 authorization bound to one client's upload endpoint.
 pub struct UploadAuthorization {
     header: String,
+    endpoint: String,
+    session: Option<crate::settlement_recovery::SessionFence>,
+}
+
+impl UploadAuthorization {
+    /// Native publication adds its initiating session, checked at the last await boundary.
+    pub fn with_session(mut self, session: crate::settlement_recovery::SessionFence) -> Self {
+        self.session = Some(session);
+        self
+    }
 }
 
 impl AdpClient {
@@ -432,6 +504,7 @@ impl AdpClient {
     /// # Errors
     /// Returns [`AdpClientError`] if the server cannot be reached or decoded.
     pub async fn well_known(&self) -> Result<AdpServerInfo, AdpClientError> {
+        crate::http_client::validate_publication_endpoint(&self.base_url)?;
         let value = self.http.get_json(&self.url("/.well-known/adp")).await?;
         Ok(serde_json::from_value(value)?)
     }
@@ -446,6 +519,7 @@ impl AdpClient {
         scope: Option<&str>,
     ) -> Result<ProvisionResponse, AdpClientError> {
         let url = self.url("/provision");
+        crate::http_client::validate_publication_endpoint(&url)?;
         let auth_header = build_nip98_auth_header(signer, &url, "POST").await?;
         let body = match scope {
             Some(scope) => serde_json::json!({ "scope": scope }),
@@ -583,8 +657,13 @@ impl AdpClient {
         &self,
         signer: &dyn NostrSigner,
     ) -> Result<UploadAuthorization, AdpClientError> {
+        crate::http_client::validate_publication_endpoint(&self.url("/upload"))?;
         let header = build_nip98_auth_header(signer, &self.url("/upload"), "POST").await?;
-        Ok(UploadAuthorization { header })
+        Ok(UploadAuthorization {
+            header,
+            endpoint: self.url("/upload"),
+            session: None,
+        })
     }
 
     /// Uploads from an open file using previously signed endpoint authorization.
@@ -603,6 +682,7 @@ impl AdpClient {
         F: Fn(u64, u64) + Send + Sync + 'static,
     {
         let url = self.url("/upload");
+        crate::http_client::validate_publication_endpoint(&url)?;
         let listing_json = serde_json::to_string(listing_event)?;
         let metadata_file = Arc::clone(&file);
         let total_bytes = tokio::task::spawn_blocking(move || metadata_file.metadata())
@@ -621,26 +701,35 @@ impl AdpClient {
             .text("listing_event", listing_json)
             .part("file", file_part);
 
-        let response = reqwest::Client::new()
-            .post(url)
-            .header("Authorization", authorization.header)
-            .multipart(form)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|err| format!("<failed to read error body: {err}>"));
-            return Err(AdpClientError::Http(HttpClientError::StatusWithBody {
-                status,
-                body,
-            }));
+        if authorization.endpoint != url {
+            return Err(
+                HttpClientError::Request("upload authorization endpoint mismatch".into()).into(),
+            );
         }
-
-        Ok(response.json::<UploadResponse>().await?)
+        if let Some(session) = authorization.session {
+            session.ensure_current().map_err(HttpClientError::Request)?;
+        }
+        let value = self
+            .http
+            .post_multipart(&url, authorization.header, form)
+            .await?;
+        let response: UploadResponse = serde_json::from_value(value).map_err(|_| {
+            AdpClientError::Http(HttpClientError::Json(
+                "invalid upload response schema".into(),
+            ))
+        })?;
+        let hash = listing_event
+            .tags
+            .iter()
+            .find_map(|tag| match tag.as_slice() {
+                [name, hash] if name == "file_hash" => Some(hash.as_str()),
+                _ => None,
+            })
+            .ok_or(AdpClientError::UploadAcknowledgement)?;
+        let digest = crate::distribution::Sha256Digest::parse(hash)
+            .map_err(|_| AdpClientError::UploadAcknowledgement)?;
+        validate_upload_acknowledgement(listing_event, &digest, &response)?;
+        Ok(response)
     }
 
     /// Confirms a purchase and returns receipt/token data.
@@ -1089,6 +1178,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upload_acknowledgement_is_exact_canonical_safe_and_idempotent() {
+        let keys = nostr::Keys::generate();
+        let hash = "ab".repeat(32);
+        let digest = crate::distribution::Sha256Digest::parse(&hash).expect("digest");
+        let listing = nostr::EventBuilder::new(nostr::Kind::Custom(30402), "build")
+            .tags([
+                nostr::Tag::parse(["d", "game"]).expect("d"),
+                nostr::Tag::parse(["file_hash", &hash]).expect("hash"),
+                nostr::Tag::parse(["server", "https://dist.example"]).expect("server"),
+            ])
+            .sign_with_keys(&keys)
+            .expect("listing");
+        let valid = UploadResponse {
+            game_coordinate: format!("30402:{}:game", keys.public_key().to_hex()),
+            file_hash: hash.clone(),
+            download_url: "https://dist.example/game/build".into(),
+        };
+        for _ in 0..2 {
+            validate_upload_acknowledgement(&listing, &digest, &valid)
+                .expect("idempotent acknowledgement");
+        }
+        let mut invalid = valid.clone();
+        for value in [
+            hash.to_uppercase(),
+            "ab".repeat(31),
+            "ff".repeat(32),
+            format!(" {hash}"),
+        ] {
+            invalid.file_hash = value;
+            assert!(validate_upload_acknowledgement(&listing, &digest, &invalid).is_err());
+        }
+        invalid = valid.clone();
+        invalid.game_coordinate = format!("30402:{}:other", keys.public_key().to_hex());
+        assert!(validate_upload_acknowledgement(&listing, &digest, &invalid).is_err());
+        invalid.game_coordinate = valid.game_coordinate.to_uppercase();
+        assert!(validate_upload_acknowledgement(&listing, &digest, &invalid).is_err());
+        for url in [
+            "javascript:alert(1)",
+            "http://remote.example/game",
+            "https://user:secret@dist.example/game",
+            "https://foreign.example/game",
+            "https://dist.example/game#fragment",
+            "https://dist.example/game?secret=token",
+        ] {
+            invalid = valid.clone();
+            invalid.download_url = url.into();
+            assert!(
+                validate_upload_acknowledgement(&listing, &digest, &invalid).is_err(),
+                "unsafe/advisory URL {url}"
+            );
+        }
+        let other_digest =
+            crate::distribution::Sha256Digest::parse(&"ff".repeat(32)).expect("digest");
+        assert!(
+            validate_upload_acknowledgement(&listing, &other_digest, &valid).is_err(),
+            "lease digest is independently pinned"
+        );
+    }
+
+    #[test]
     fn settled_acknowledgment_without_receipt_does_not_complete_purchase() {
         let mut response = SettlementProofResponse {
             state: "settled".into(),
@@ -1122,6 +1271,78 @@ mod tests {
 
     use crate::signers::LocalSigner;
     use crate::test_helpers::http_mocks::MockHttpClient;
+
+    struct NeverPublicationSigner;
+    #[async_trait::async_trait]
+    impl NostrSigner for NeverPublicationSigner {
+        async fn get_public_key(&self) -> Result<nostr::PublicKey, crate::signers::SignerError> {
+            panic!("unsafe endpoint must be rejected before contacting signer")
+        }
+        async fn sign_event(
+            &self,
+            _: nostr::UnsignedEvent,
+        ) -> Result<Event, crate::signers::SignerError> {
+            panic!("unsafe endpoint must not be signed")
+        }
+    }
+
+    #[tokio::test]
+    async fn unsafe_publication_urls_rejected_before_signer_and_network() {
+        for endpoint in [
+            "http://remote.example",
+            "https://user:password@example.com",
+            "https://example.com?token=secret",
+            "file:///tmp/build",
+        ] {
+            let http = Arc::new(MockHttpClient::new());
+            let client = AdpClient::new(endpoint, http.clone());
+            assert!(client
+                .authorize_upload(&NeverPublicationSigner)
+                .await
+                .is_err());
+            assert!(client
+                .provision(&NeverPublicationSigner, Some("game"))
+                .await
+                .is_err());
+            assert!(client.well_known().await.is_err());
+            assert_eq!(http.call_count(&client.url("/.well-known/adp")), 0);
+            assert_eq!(http.call_count(&client.url("/provision")), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_session_checked_after_metadata_await_before_transport() {
+        let http = Arc::new(MockHttpClient::new());
+        let client = AdpClient::new("https://example.com", http);
+        let keys = nostr::Keys::generate();
+        let listing = nostr::EventBuilder::new(nostr::Kind::Custom(30402), "offline fixture")
+            .sign_with_keys(&keys)
+            .expect("event");
+        let file = Arc::new(tempfile::tempfile().expect("file"));
+        let coordinator = crate::settlement_recovery::RecoveryCoordinator::default();
+        coordinator.activate(Some(keys.public_key().to_hex()));
+        let session = coordinator.session_fence().expect("session");
+        let authorization = UploadAuthorization {
+            header: "secret".into(),
+            endpoint: client.url("/upload"),
+            session: Some(session),
+        };
+        let error = client
+            .upload_authorized_file_with_progress(
+                authorization,
+                &listing,
+                file,
+                &SafeArchiveFilename::parse("game.zip").expect("filename"),
+                move |_, _| coordinator.activate(None),
+            )
+            .await
+            .expect_err("session replaced while preparing upload");
+        assert!(error.to_string().contains("session changed"));
+        assert!(
+            !error.to_string().contains("unsupported"),
+            "must fail before entering transport"
+        );
+    }
 
     #[tokio::test]
     async fn well_known_fetches_server_info_from_normalized_base_url() {

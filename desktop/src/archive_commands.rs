@@ -20,17 +20,24 @@ pub(crate) fn account_check(
 ) -> crate::archive_selection::AccountCheck {
     let auth = Arc::clone(&state.auth);
     let signer_state = Arc::clone(signer_state.inner());
+    let session = state.settlement_recovery.session_fence();
     Arc::new(move || {
         let auth = Arc::clone(&auth);
         let signer_state = Arc::clone(&signer_state);
+        let session = session.clone();
         Box::pin(async move {
+            let stale = || ArchiveSelectionError::Account {
+                failure: ArchiveAccountFailure::AccountMismatch,
+            };
+            let session = session.map_err(|_| stale())?;
+            session.ensure_current().map_err(|_| stale())?;
             let snapshot = { auth.lock().await.clone() };
             let signer = resolve_active_signer(&signer_state, &snapshot)
                 .await
                 .map_err(|_| ArchiveSelectionError::Account {
                     failure: ArchiveAccountFailure::NotAuthenticated,
                 })?;
-            signer
+            let publisher = signer
                 .get_public_key()
                 .await
                 .map_err(|_| ArchiveSelectionError::Account {
@@ -39,7 +46,9 @@ pub(crate) fn account_check(
                 .to_bech32()
                 .map_err(|_| ArchiveSelectionError::Account {
                     failure: ArchiveAccountFailure::InvalidHandle,
-                })
+                })?;
+            session.ensure_current().map_err(|_| stale())?;
+            Ok(publisher)
         })
     })
 }

@@ -95,8 +95,10 @@ pub struct StorePageListingMutation {
     pub published_event_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishStorePageRequest {
+    #[serde(default)]
+    pub operation_id: Option<String>,
     pub expected_publisher_npub: String,
     pub draft: StorePageDraft,
     pub listing_mutations: Vec<StorePageListingMutation>,
@@ -108,7 +110,7 @@ pub struct CloneStorePageRequest {
     pub presentation_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryStorePagePointersRequest {
     pub expected_publisher_npub: String,
     pub store_page_coordinate: String,
@@ -417,13 +419,135 @@ pub async fn publish_store_page(
     signer_state: tauri::State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
     request: PublishStorePageRequest,
 ) -> Result<PublishStorePageResponse, String> {
+    publish_store_page_recoverable(state, signer_state, request, false).await
+}
+
+pub(crate) async fn publish_store_page_recoverable(
+    state: tauri::State<'_, AppState>,
+    signer_state: tauri::State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+    mut request: PublishStorePageRequest,
+    resume: bool,
+) -> Result<PublishStorePageResponse, String> {
+    use arcadestr_core::publisher_recovery::{repository::PublisherRepository, PublisherOperation};
+    let (publisher, session) =
+        crate::publisher_commands::account(&state, &request.expected_publisher_npub).await?;
+    let repo = PublisherRepository::new(state.database.pool().clone());
+    let id = request
+        .operation_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    uuid::Uuid::parse_str(&id).map_err(|_| "Invalid Store Page operation ID")?;
+    request.operation_id = Some(id.clone());
+    let journal = crate::publisher_commands::PublisherJournal {
+        repo: repo.clone(),
+        publisher: publisher.clone(),
+        operation_id: id.clone(),
+        allow_uncertain: false,
+    };
+    let coordinate = store_page_coordinate(
+        PublicKey::from_hex(&publisher).map_err(|_| "Invalid publisher")?,
+        &request.draft.presentation_id,
+    );
+    if !resume {
+        repo.begin(
+            &publisher,
+            &PublisherOperation {
+                operation_id: id.clone(),
+                kind: "store_page".into(),
+                coordinate,
+                intent: serde_json::to_value(&request).map_err(|_| "Invalid Store Page intent")?,
+                artifact_hash: None,
+                state: "incomplete".into(),
+                result: None,
+            },
+        )
+        .await?;
+    } else {
+        let manager = relay_manager(&state).await;
+        let pages = StorePageRepository::new(state.database.pool().clone());
+        let retained = repo.steps(&publisher, &id).await?;
+        for step in retained
+            .into_iter()
+            .filter(|step| step.kind == "signed_event")
+        {
+            let event: Event = serde_json::from_value(step.intent)
+                .map_err(|_| "Invalid retained publisher event")?;
+            event
+                .verify()
+                .map_err(|_| "Retained signature is invalid")?;
+            if event.kind.as_u16() == EXPERIMENTAL_STORE_PAGE_KIND {
+                let current = fetch_current_store_page(
+                    &manager,
+                    &pages,
+                    event.pubkey,
+                    &request.draft.presentation_id,
+                )
+                .await?;
+                if current
+                    .as_ref()
+                    .is_some_and(|page| page.event.id == event.id)
+                {
+                    request.draft.loaded_event_id = Some(event.id.to_hex());
+                }
+            } else if event.kind.as_u16() == 30402 {
+                let coordinate =
+                    listing_coordinate(&event).map_err(|_| "Invalid retained pointer")?;
+                let current = fetch_current_listing(&manager, &pages, &coordinate).await?;
+                if current.id == event.id {
+                    if let Some(mutation) = request
+                        .listing_mutations
+                        .iter_mut()
+                        .find(|mutation| mutation.listing_coordinate == coordinate)
+                    {
+                        mutation.expected_event_id = event.id.to_hex();
+                        mutation.published_event_id = Some(event.id.to_hex());
+                    }
+                }
+            }
+        }
+    }
+    session.ensure_current()?;
+    let result = crate::publisher_commands::JOURNAL
+        .scope(
+            journal,
+            publish_store_page_inner(state, signer_state, request),
+        )
+        .await?;
+    if result.complete {
+        repo.complete(
+            &publisher,
+            &id,
+            &serde_json::to_value(&result).map_err(|_| "Invalid publication result")?,
+        )
+        .await?;
+    }
+    session.ensure_current()?;
+    Ok(result)
+}
+
+async fn publish_store_page_inner(
+    state: tauri::State<'_, AppState>,
+    signer_state: tauri::State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+    request: PublishStorePageRequest,
+) -> Result<PublishStorePageResponse, String> {
+    let session = state.settlement_recovery.session_fence()?;
     let auth = { state.auth.lock().await.clone() };
-    let signer = resolve_active_signer(signer_state.inner(), &auth).await?;
+    let signer = Arc::new(crate::adp_commands::PublicationSigner {
+        signer: resolve_active_signer(signer_state.inner(), &auth).await?,
+        session: session.clone(),
+    });
     let publisher = signer
         .get_public_key()
         .await
         .map_err(|error| error.to_string())?;
     verify_expected_publisher(&request.expected_publisher_npub, publisher)?;
+    let _coordinate_lease = state.settlement_recovery.claim(
+        &publisher.to_hex(),
+        &format!(
+            "publish:{}",
+            store_page_coordinate(publisher, &request.draft.presentation_id)
+        ),
+    )?;
     validate_publish_request(publisher, &request)?;
     let relay_manager = relay_manager(&state).await;
     let repository = StorePageRepository::new(state.database.pool().clone());
@@ -461,24 +585,90 @@ pub async fn publish_store_page(
         )
         .map_err(|error| error.to_string())?;
     }
-    ensure_publish_account_current(&state, signer_state.inner(), publisher).await?;
+    ensure_publish_account_current(&state, signer_state.inner(), publisher, &session).await?;
 
+    let retained_timestamp = if let Some(journal) = crate::publisher_commands::journal() {
+        journal
+            .step(&format!("signed:30407:{}", request.draft.presentation_id))
+            .await?
+            .map(|step| serde_json::from_value::<Event>(step.intent))
+            .transpose()
+            .map_err(|_| "Invalid retained Store Page")?
+            .map(|event| event.created_at)
+    } else {
+        None
+    };
     let signed_page = signer
         .sign_event(
             build_store_page_event_builder(&request.draft.build_params(publisher))
                 .map_err(|error| error.to_string())?
+                .custom_created_at(match (retained_timestamp, current_page.as_ref()) {
+                    (Some(timestamp), _) => timestamp,
+                    (None, Some(page)) => {
+                        arcadestr_core::marketplace::listing_replacement_timestamp(
+                            &page.event,
+                            nostr::Timestamp::now(),
+                        )?
+                    }
+                    (None, None) => nostr::Timestamp::now(),
+                })
                 .build(publisher),
         )
         .await
         .map_err(|error| error.to_string())?;
     let parsed_page = parse_store_page_event(&signed_page).map_err(|error| error.to_string())?;
-    let send = relay_manager
-        .send_event(&signed_page)
-        .await
-        .map_err(|error| error.to_string())?;
-    if send.success_count == 0 {
-        return Err("no relay accepted the Store Page event".to_string());
-    }
+    let latest_page = fetch_current_store_page(
+        &relay_manager,
+        &repository,
+        publisher,
+        &request.draft.presentation_id,
+    )
+    .await?;
+    validate_store_page_revision(
+        current_page
+            .as_ref()
+            .map(|page| page.event.id.to_hex())
+            .as_deref(),
+        latest_page
+            .as_ref()
+            .map(|page| page.event.id.to_hex())
+            .as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    session.ensure_current()?;
+    let (success_count, failure_count) = if latest_page
+        .as_ref()
+        .is_some_and(|page| page.event.id == signed_page.id)
+    {
+        if let Some(journal) = crate::publisher_commands::before_publish(&signed_page).await? {
+            journal
+                .ack(
+                    &format!("relay:{}", signed_page.id),
+                    serde_json::json!({"accepted":true}),
+                )
+                .await?;
+        }
+        (0, 0)
+    } else {
+        let journal = crate::publisher_commands::before_publish(&signed_page).await?;
+        session.ensure_current()?;
+        let send = relay_manager
+            .send_event(&signed_page)
+            .await
+            .map_err(|error| error.to_string())?;
+        if send.success_count == 0 {
+            return Err("no relay accepted the Store Page event".to_string());
+        }
+        if let Some(journal) = journal {
+            journal
+                .ack(
+                    &format!("relay:{}", signed_page.id),
+                    serde_json::json!({"accepted":true}),
+                )
+                .await?;
+        }
+        (send.success_count, send.failure_count)
+    };
     let page_confirmed = confirm_exact_event(
         &relay_manager,
         store_page_filter(publisher, &request.draft.presentation_id),
@@ -512,12 +702,13 @@ pub async fn publish_store_page(
             .iter()
             .all(|outcome| outcome.published && outcome.propagation_confirmed);
     let retryable = !complete;
+    session.ensure_current()?;
     Ok(PublishStorePageResponse {
         store_page_coordinate: store_page_coordinate(publisher, &request.draft.presentation_id),
         store_page: Some(EventPublishOutcome {
             event_id: signed_page.id.to_hex(),
-            success_count: send.success_count,
-            failure_count: send.failure_count,
+            success_count,
+            failure_count,
             propagation_confirmed: page_confirmed,
         }),
         listing_updates,
@@ -534,8 +725,97 @@ pub async fn retry_store_page_pointer_sync(
     signer_state: tauri::State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
     request: RetryStorePagePointersRequest,
 ) -> Result<PublishStorePageResponse, String> {
+    retry_store_page_pointer_sync_recoverable(state, signer_state, request, None).await
+}
+
+pub(crate) async fn retry_store_page_pointer_sync_recoverable(
+    state: tauri::State<'_, AppState>,
+    signer_state: tauri::State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+    mut request: RetryStorePagePointersRequest,
+    resume_id: Option<String>,
+) -> Result<PublishStorePageResponse, String> {
+    use arcadestr_core::publisher_recovery::{repository::PublisherRepository, PublisherOperation};
+    let (publisher, session) =
+        crate::publisher_commands::account(&state, &request.expected_publisher_npub).await?;
+    let repo = PublisherRepository::new(state.database.pool().clone());
+    let resume = resume_id.is_some();
+    let id = resume_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if !resume {
+        repo.begin(
+            &publisher,
+            &PublisherOperation {
+                operation_id: id.clone(),
+                kind: "store_page_pointers".into(),
+                coordinate: request.store_page_coordinate.clone(),
+                intent: serde_json::to_value(&request).map_err(|_| "Invalid pointer intent")?,
+                artifact_hash: None,
+                state: "incomplete".into(),
+                result: None,
+            },
+        )
+        .await?;
+    } else {
+        for step in repo
+            .steps(&publisher, &id)
+            .await?
+            .into_iter()
+            .filter(|step| step.kind == "signed_event")
+        {
+            let event: Event =
+                serde_json::from_value(step.intent).map_err(|_| "Invalid retained pointer")?;
+            let coordinate =
+                listing_coordinate(&event).map_err(|_| "Invalid pointer coordinate")?;
+            let current =
+                crate::adp_commands::recovery_current_listing(&state, &coordinate).await?;
+            if current
+                .as_ref()
+                .is_some_and(|current| current.id == event.id)
+            {
+                if let Some(mutation) = request
+                    .listing_mutations
+                    .iter_mut()
+                    .find(|mutation| mutation.listing_coordinate == coordinate)
+                {
+                    mutation.published_event_id = Some(event.id.to_hex());
+                }
+            }
+        }
+    }
+    let journal = crate::publisher_commands::PublisherJournal {
+        repo: repo.clone(),
+        publisher: publisher.clone(),
+        operation_id: id.clone(),
+        allow_uncertain: false,
+    };
+    let result = crate::publisher_commands::JOURNAL
+        .scope(
+            journal,
+            retry_store_page_pointer_sync_inner(state, signer_state, request),
+        )
+        .await?;
+    if result.retry_scope_complete {
+        repo.complete(
+            &publisher,
+            &id,
+            &serde_json::to_value(&result).map_err(|_| "Invalid pointer result")?,
+        )
+        .await?;
+    }
+    session.ensure_current()?;
+    Ok(result)
+}
+
+async fn retry_store_page_pointer_sync_inner(
+    state: tauri::State<'_, AppState>,
+    signer_state: tauri::State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+    request: RetryStorePagePointersRequest,
+) -> Result<PublishStorePageResponse, String> {
+    let session = state.settlement_recovery.session_fence()?;
     let auth = { state.auth.lock().await.clone() };
-    let signer = resolve_active_signer(signer_state.inner(), &auth).await?;
+    let signer = Arc::new(crate::adp_commands::PublicationSigner {
+        signer: resolve_active_signer(signer_state.inner(), &auth).await?,
+        session: session.clone(),
+    });
     let publisher = signer
         .get_public_key()
         .await
@@ -543,6 +823,10 @@ pub async fn retry_store_page_pointer_sync(
     verify_expected_publisher(&request.expected_publisher_npub, publisher)?;
     let (_, coordinate_publisher, presentation_id) =
         parse_coordinate(&request.store_page_coordinate, EXPERIMENTAL_STORE_PAGE_KIND)?;
+    let _coordinate_lease = state.settlement_recovery.claim(
+        &publisher.to_hex(),
+        &format!("publish:{}", request.store_page_coordinate),
+    )?;
     if coordinate_publisher != publisher {
         return Err("the Store Page is not owned by the active publisher".to_string());
     }
@@ -583,6 +867,7 @@ pub async fn retry_store_page_pointer_sync(
         &request.listing_mutations,
     )
     .await;
+    session.ensure_current()?;
     let retry_scope_complete = page_confirmed
         && cache_error.is_none()
         && listing_updates
@@ -650,7 +935,10 @@ async fn fetch_current_listing(
             Filter::new()
                 .kind(Kind::Custom(30402))
                 .author(publisher)
-                .custom_tags(SingleLetterTag::lowercase(Alphabet::D), [identifier]),
+                .custom_tags(
+                    SingleLetterTag::lowercase(Alphabet::D),
+                    [identifier.clone()],
+                ),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -666,27 +954,9 @@ async fn fetch_current_listing(
     {
         events.push(cached);
     }
-    let current = events
-        .into_iter()
-        .filter(|event| {
-            event.verify().is_ok()
-                && event.kind.as_u16() == 30402
-                && event.pubkey == publisher
-                && listing_coordinate(event).as_deref() == Ok(coordinate)
-        })
-        .reduce(|current, candidate| {
-            if arcadestr_core::is_replaceable_event_newer(
-                candidate.created_at.as_secs(),
-                Some(candidate.id.to_hex().as_str()),
-                current.created_at.as_secs(),
-                Some(current.id.to_hex().as_str()),
-            ) {
-                candidate
-            } else {
-                current
-            }
-        })
-        .ok_or_else(|| format!("current listing was not found: {coordinate}"))?;
+    let current =
+        arcadestr_core::marketplace::current_listing_revision(&events, publisher, &identifier)
+            .ok_or_else(|| format!("current listing was not found: {coordinate}"))?;
     let _ = repository
         .upsert_listing_event(&current)
         .await
@@ -893,7 +1163,7 @@ async fn publish_pointer_updates(
     signer_state: &Arc<tokio::sync::Mutex<AppSignerState>>,
     relay_manager: &arcadestr_core::relay_manager::RelayManager,
     repository: &StorePageRepository,
-    signer: &dyn NostrSigner,
+    signer: &crate::adp_commands::PublicationSigner,
     publisher: PublicKey,
     page: &ParsedStorePage,
     mutations: &[StorePageListingMutation],
@@ -938,11 +1208,16 @@ async fn publish_pointer_update(
     signer_state: &Arc<tokio::sync::Mutex<AppSignerState>>,
     relay_manager: &arcadestr_core::relay_manager::RelayManager,
     repository: &StorePageRepository,
-    signer: &dyn NostrSigner,
+    signer: &crate::adp_commands::PublicationSigner,
     publisher: PublicKey,
     page: &ParsedStorePage,
     mutation: &StorePageListingMutation,
 ) -> Result<(String, bool), String> {
+    signer.session.ensure_current()?;
+    let _coordinate_lease = state.settlement_recovery.claim(
+        &publisher.to_hex(),
+        &format!("publish:{}", mutation.listing_coordinate),
+    )?;
     let listing =
         fetch_current_listing(relay_manager, repository, &mutation.listing_coordinate).await?;
     if listing.pubkey != publisher {
@@ -954,6 +1229,14 @@ async fn publish_pointer_update(
             return Err(
                 "the listing changed after its pointer replacement was published".to_string(),
             );
+        }
+        if let Some(journal) = crate::publisher_commands::before_publish(&listing).await? {
+            journal
+                .ack(
+                    &format!("relay:{}", listing.id),
+                    serde_json::json!({"accepted":true}),
+                )
+                .await?;
         }
         match mutation.action {
             ListingPointerMutation::Link => {
@@ -1014,9 +1297,9 @@ async fn publish_pointer_update(
             return Ok((listing.id.to_hex(), confirmed));
         }
     }
-    ensure_publish_account_current(state, signer_state, publisher).await?;
+    ensure_publish_account_current(state, signer_state, publisher, &signer.session).await?;
     ensure_store_page_current(relay_manager, repository, publisher, page).await?;
-    ensure_publish_account_current(state, signer_state, publisher).await?;
+    ensure_publish_account_current(state, signer_state, publisher, &signer.session).await?;
     let action = match mutation.action {
         ListingPointerMutation::Link => StorePagePointerAction::Link {
             store_page_coordinate: store_page_coordinate(publisher, &page.presentation_id),
@@ -1031,6 +1314,10 @@ async fn publish_pointer_update(
         .sign_event(
             build_listing_store_page_replacement(&listing, publisher, &action)
                 .map_err(|error| error.to_string())?
+                .custom_created_at(arcadestr_core::marketplace::listing_replacement_timestamp(
+                    &listing,
+                    nostr::Timestamp::now(),
+                )?)
                 .build(publisher),
         )
         .await
@@ -1038,12 +1325,32 @@ async fn publish_pointer_update(
     if mutation.action == ListingPointerMutation::Link {
         validate_store_page_association(&replacement, page).map_err(|error| error.to_string())?;
     }
+    let latest_listing =
+        fetch_current_listing(relay_manager, repository, &mutation.listing_coordinate).await?;
+    validate_listing_revision(
+        &mutation.listing_coordinate,
+        &listing.id.to_hex(),
+        &latest_listing.id.to_hex(),
+    )
+    .map_err(|error| error.to_string())?;
+    ensure_store_page_current(relay_manager, repository, publisher, page).await?;
+    signer.session.ensure_current()?;
+    let journal = crate::publisher_commands::before_publish(&replacement).await?;
+    signer.session.ensure_current()?;
     let send = relay_manager
         .send_event(&replacement)
         .await
         .map_err(|error| error.to_string())?;
     if send.success_count == 0 {
         return Err("no relay accepted the listing pointer replacement".to_string());
+    }
+    if let Some(journal) = journal {
+        journal
+            .ack(
+                &format!("relay:{}", replacement.id),
+                serde_json::json!({"accepted":true}),
+            )
+            .await?;
     }
     let (_, author, identifier) = parse_coordinate(&mutation.listing_coordinate, 30402)?;
     let confirmed = confirm_exact_event(
@@ -1081,23 +1388,27 @@ async fn confirm_exact_event(
     event_id: &str,
 ) -> bool {
     let expected = event_id.to_string();
-    let seen = Arc::new(Mutex::new(HashSet::new()));
+    let seen = Arc::new(Mutex::new(
+        std::collections::HashMap::<String, Vec<Event>>::new(),
+    ));
     let callback_seen = Arc::clone(&seen);
     let result = relay_manager
         .fetch_events_streaming(filter, 10, 5, move |relay, events| {
-            if current_valid_replacement_id(&events, &expected).as_deref()
-                == Some(expected.as_str())
-            {
-                if let Ok(mut seen) = callback_seen.lock() {
-                    seen.insert(relay);
-                }
+            if let Ok(mut seen) = callback_seen.lock() {
+                seen.entry(relay.to_string()).or_default().extend(events);
             }
         })
         .await;
     result.is_ok()
-        && seen
-            .lock()
-            .is_ok_and(|seen| seen.len() >= STORE_PAGE_PROPAGATION_THRESHOLD)
+        && seen.lock().is_ok_and(|seen| {
+            seen.values()
+                .filter(|events| {
+                    current_valid_replacement_id(events, &expected).as_deref()
+                        == Some(expected.as_str())
+                })
+                .count()
+                >= STORE_PAGE_PROPAGATION_THRESHOLD
+        })
 }
 
 fn current_valid_replacement_id(events: &[Event], expected_event_id: &str) -> Option<String> {
@@ -1105,6 +1416,14 @@ fn current_valid_replacement_id(events: &[Event], expected_event_id: &str) -> Op
         .iter()
         .find(|event| event.id.to_hex() == expected_event_id)
         .and_then(event_identity)?;
+    if expected_identity.0 == 30402 {
+        return arcadestr_core::marketplace::current_listing_revision(
+            events,
+            expected_identity.1,
+            &expected_identity.2,
+        )
+        .map(|event| event.id.to_hex());
+    }
     events
         .iter()
         .filter(|event| {
@@ -1194,6 +1513,7 @@ mod tests {
         let coordinate = format!("30402:{}:game", keys.public_key().to_hex());
         let draft = StorePageDraft::new("page".to_string(), vec![coordinate.clone()]);
         let request = PublishStorePageRequest {
+            operation_id: None,
             expected_publisher_npub: "unused".to_string(),
             draft,
             listing_mutations: vec![StorePageListingMutation {
@@ -1247,12 +1567,18 @@ mod tests {
     fn propagation_requires_expected_event_to_be_current_replacement() {
         let keys = Keys::generate();
         let older = EventBuilder::new(Kind::Custom(30402), "older")
-            .tags([Tag::parse(["d", "game"]).expect("d tag")])
+            .tags([
+                Tag::parse(["d", "game"]).expect("d tag"),
+                Tag::parse(["title", "Game"]).expect("title"),
+            ])
             .custom_created_at(Timestamp::from(10))
             .sign_with_keys(&keys)
             .expect("older");
         let newer = EventBuilder::new(Kind::Custom(30402), "newer")
-            .tags([Tag::parse(["d", "game"]).expect("d tag")])
+            .tags([
+                Tag::parse(["d", "game"]).expect("d tag"),
+                Tag::parse(["title", "Game"]).expect("title"),
+            ])
             .custom_created_at(Timestamp::from(20))
             .sign_with_keys(&keys)
             .expect("newer");

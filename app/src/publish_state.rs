@@ -293,7 +293,7 @@ pub(crate) fn archive_error_is_terminal(error: &ArchiveSelectionError) -> bool {
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DraftRowId(u64);
 
 impl DraftRowId {
@@ -302,7 +302,7 @@ impl DraftRowId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PackageFormatDraft {
     pub text: String,
 }
@@ -324,10 +324,13 @@ pub(crate) struct ArchiveBoundChoice<T> {
     pub value: T,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub(crate) struct ArchivePathDraft<T> {
     pub text: String,
+    #[serde(skip)]
     pub confirmed: Option<ArchiveBoundChoice<T>>,
+    #[serde(skip)]
     pub authoritative_value: Option<T>,
     pub stale: bool,
 }
@@ -369,7 +372,7 @@ impl<T: Clone> ArchivePathDraft<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LaunchProfileDraft {
     /// Stable UI identity: live edits to `profile_id` must never change which
     /// row is reordered or removed.
@@ -492,7 +495,7 @@ pub(crate) struct ProfileValidation {
     pub errors: Vec<ProfileDraftError>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LaunchTierDraft {
     pub package_format: PackageFormatDraft,
     pub platforms: Vec<String>,
@@ -507,7 +510,7 @@ pub(crate) struct LaunchTierDraft {
     candidate_generation: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PublisherDefaultAssignmentDraft {
     pub target: String,
     pub row_id: DraftRowId,
@@ -884,7 +887,7 @@ impl LaunchTierDraft {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum LaunchMode {
     DownloadOnly,
     Launchable(LaunchTierDraft),
@@ -2300,6 +2303,10 @@ mod tests {
         let prepared = prepare_publish(
             request(),
             PublishAdpListingRequestExtension {
+                authorize_operators: false,
+                server_roles: Vec::new(),
+                commercial_intent: Default::default(),
+                operation_id: None,
                 launch_tier: valid_tier(SELECTION_A).to_intent(Some(&selection_id(SELECTION_A))),
                 acknowledged_removed_profile_ids: vec![
                     ProfileId::parse("removed").expect("profile id")
@@ -2366,6 +2373,30 @@ mod tests {
                 .map(|prepared| prepared.extension.clone())
                 .expect("prepared extension")
         );
+    }
+
+    #[test]
+    fn durable_launch_drafts_preserve_text_but_never_restore_archive_capabilities() {
+        let original = valid_tier(SELECTION_A);
+        let encoded = serde_json::to_value(&original).expect("draft JSON");
+        arcadestr_core::publisher_recovery::validate_durable_payload(&encoded)
+            .expect("no native handles");
+        let restored: LaunchTierDraft = serde_json::from_value(encoded).expect("restore draft");
+        assert_eq!(restored.package_format, original.package_format);
+        assert_eq!(
+            restored.publisher_default_assignments,
+            original.publisher_default_assignments
+        );
+        assert_eq!(
+            restored.profiles[0].executable.text,
+            original.profiles[0].executable.text
+        );
+        assert!(restored.profiles[0].executable.confirmed.is_none());
+        assert!(restored.profiles[0]
+            .executable
+            .authoritative_value
+            .is_none());
+        assert!(restored.to_intent(None).is_none());
     }
 
     #[test]

@@ -359,6 +359,35 @@ impl ResolvedAuthorization {
     }
 }
 
+/// Metadata preservation validates identity/chain evidence, not current issuance power.
+/// A cancelled root remains historical evidence and is never replaced here.
+#[cfg(feature = "native")]
+pub fn validate_listing_authorization_references(
+    listing: &Event,
+    authorizations: &[ResolvedAuthorization],
+) -> Result<Vec<crate::marketplace::FulfillmentAuthorizationReference>, String> {
+    listing.verify().map_err(|_| "Invalid signed listing")?;
+    if listing.kind.as_u16() != 30402 {
+        return Err("Expected a signed kind:30402 listing".into());
+    }
+    let parsed = crate::marketplace::parse_listing(listing.clone())?;
+    if !parsed.malformed_fulfillment_authorization_tags.is_empty() {
+        return Err("The signed listing has malformed authorization references. Review authority explicitly; metadata edits cannot discard or repair them.".into());
+    }
+    let coordinate = format!("30402:{}:{}", listing.pubkey.to_hex(), parsed.id);
+    for reference in &parsed.fulfillment_authorizations {
+        let authorization = authorizations.iter().find(|authorization| authorization.root_event_id == reference.root_event_id)
+            .ok_or("Authorization chain evidence is incomplete. Restore relay visibility and reload; no authority was issued.")?;
+        if authorization.developer_pubkey != listing.pubkey
+            || authorization.terms.coordinate != coordinate
+            || authorization.terms.fulfillment_pubkey != reference.fulfillment_pubkey
+        {
+            return Err("Signed authorization reference does not match its publisher, coordinate or key. Review authority explicitly.".into());
+        }
+    }
+    Ok(parsed.fulfillment_authorizations)
+}
+
 /// Selects the lowest typed root ID among currently reusable authorizations.
 #[cfg(feature = "native")]
 pub fn select_reusable_authorization<'a>(

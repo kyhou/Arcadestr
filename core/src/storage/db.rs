@@ -175,6 +175,10 @@ const MIGRATION_22_PURCHASE_VERIFICATION: &str =
     include_str!("../../migrations/022_purchase_verification.sql");
 const MIGRATION_23_RECEIPT_PORTABILITY: &str =
     include_str!("../../migrations/023_receipt_portability.sql");
+const MIGRATION_24_PUBLISHER_RECOVERY: &str =
+    include_str!("../../migrations/024_publisher_recovery.sql");
+const MIGRATION_25_MARKETPLACE_CAMPAIGNS: &str =
+    include_str!("../../migrations/025_marketplace_campaign_pointers.sql");
 
 #[cfg(test)]
 const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
@@ -240,6 +244,16 @@ const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
         23,
         "023_receipt_portability.sql",
         MIGRATION_23_RECEIPT_PORTABILITY,
+    ),
+    (
+        24,
+        "024_publisher_recovery.sql",
+        MIGRATION_24_PUBLISHER_RECOVERY,
+    ),
+    (
+        25,
+        "025_marketplace_campaign_pointers.sql",
+        MIGRATION_25_MARKETPLACE_CAMPAIGNS,
     ),
 ];
 
@@ -342,6 +356,14 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "023_receipt_portability.sql",
         sql: MIGRATION_23_RECEIPT_PORTABILITY,
+    },
+    Migration {
+        name: "024_publisher_recovery.sql",
+        sql: MIGRATION_24_PUBLISHER_RECOVERY,
+    },
+    Migration {
+        name: "025_marketplace_campaign_pointers.sql",
+        sql: MIGRATION_25_MARKETPLACE_CAMPAIGNS,
     },
 ];
 
@@ -1374,6 +1396,9 @@ mod tests {
             "nwc_payment_journal",
             "profile_badge_entries",
             "profile_badge_lists",
+            "publisher_checkpoints",
+            "publisher_drafts",
+            "publisher_operations",
             "purchase_execution_admissions",
             "purchase_execution_approvals",
             "purchase_quote_verification",

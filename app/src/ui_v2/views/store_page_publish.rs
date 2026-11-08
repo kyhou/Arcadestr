@@ -23,7 +23,7 @@ use crate::ui_v2::components::{
     DialogDismissal, DialogInitialFocus, DialogTone, DialogWidth, StorePageRichDetail,
 };
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CachedDraft {
     draft: StorePageDraft,
     baseline: StorePageDraft,
@@ -31,7 +31,7 @@ struct CachedDraft {
     input_dirty: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct AssociationRow {
     listing_coordinate: String,
     event_id: String,
@@ -929,6 +929,140 @@ pub fn StorePageEditorView(
     let custom_accessibility = RwSignal::new(String::new());
     let pending_removal = RwSignal::new(None::<(&'static str, usize)>);
     let validation_valid = RwSignal::new(None::<bool>);
+    let durable_revision = RwSignal::new(None::<u64>);
+    let durable_busy = RwSignal::new(false);
+    let durable_message = RwSignal::new(None::<String>);
+    let durable_saved = RwSignal::new(None::<(StorePageDraft, Vec<AssociationRow>)>);
+    let durable_key = StoredValue::new(format!("store_page:{coordinate}"));
+    let durable_publisher = StoredValue::new(publisher.clone());
+    let durable_epoch_auth = auth.clone();
+    Effect::new(move |_| {
+        durable_epoch_auth.current_auth_flow();
+        durable_busy.set(false);
+        durable_revision.set(None);
+        durable_message.set(None);
+        durable_saved.set(None);
+    });
+    let draft_auth = auth.clone();
+    let save_durable = Callback::new(move |_: ()| {
+        if draft_auth.npub.get_untracked().as_deref()
+            != Some(durable_publisher.get_value().as_str())
+            || publishing.get_untracked()
+            || durable_busy.get_untracked()
+        {
+            return;
+        }
+        let epoch = draft_auth.current_auth_flow();
+        let response_auth = draft_auth.clone();
+        let cached = CachedDraft {
+            draft: draft.get_untracked(),
+            baseline: baseline.get_untracked(),
+            associations: associations.get_untracked(),
+            input_dirty: input_dirty.get_untracked(),
+        };
+        let saved_snapshot = (cached.draft.clone(), cached.associations.clone());
+        let payload = match serde_json::to_value(cached) {
+            Ok(payload) => payload,
+            Err(_) => {
+                durable_message.set(Some("Draft encoding failed".into()));
+                return;
+            }
+        };
+        let saved = arcadestr_core::publisher_recovery::PublisherDraft {
+            draft_id: durable_key.get_value(),
+            kind: "store_page".into(),
+            payload,
+            revision: durable_revision.get_untracked().unwrap_or(0),
+        };
+        durable_busy.set(true);
+        spawn_local(async move {
+            let result = crate::tauri_bridge::invoke_save_publisher_draft(
+                durable_publisher.get_value(),
+                saved,
+                durable_revision.get_untracked(),
+            )
+            .await;
+            if !response_auth.is_current_auth_flow(epoch) {
+                return;
+            }
+            durable_busy.set(false);
+            match result {
+                Ok(revision) => {
+                    durable_saved.set(Some(saved_snapshot));
+                    durable_revision.set(Some(revision));
+                    durable_message.set(Some(
+                        "Store Page draft saved locally for this publisher; no event was published"
+                            .into(),
+                    ));
+                }
+                Err(error) => durable_message.set(Some(error)),
+            }
+        });
+    });
+    let restore_auth = auth.clone();
+    let restore_durable = Callback::new(move |_: ()| {
+        if restore_auth.npub.get_untracked().as_deref()
+            != Some(durable_publisher.get_value().as_str())
+            || publishing.get_untracked()
+            || loading.get_untracked()
+            || durable_busy.get_untracked()
+        {
+            return;
+        }
+        let epoch = restore_auth.current_auth_flow();
+        let response_auth = restore_auth.clone();
+        durable_busy.set(true);
+        spawn_local(async move {
+            let state =
+                crate::tauri_bridge::invoke_publisher_recovery_state(durable_publisher.get_value())
+                    .await;
+            if !response_auth.is_current_auth_flow(epoch) {
+                return;
+            }
+            durable_busy.set(false);
+            match state {
+                Ok(state) => {
+                    if let Some(saved) = state
+                        .drafts
+                        .into_iter()
+                        .find(|draft| draft.draft_id == durable_key.get_value())
+                    {
+                        match serde_json::from_value::<CachedDraft>(saved.payload) {
+                            Ok(saved_draft) => {
+                                durable_saved.set(Some((
+                                    saved_draft.draft.clone(),
+                                    saved_draft.associations.clone(),
+                                )));
+                                draft.set(saved_draft.draft);
+                                baseline.set(saved_draft.baseline);
+                                associations.set(saved_draft.associations);
+                                input_dirty.set(true);
+                                durable_revision.set(Some(saved.revision));
+                                durable_message.set(Some("Saved draft restored. Validate current associations before publishing; incomplete publication is recovered from Publisher recovery.".into()));
+                            }
+                            Err(_) => durable_message
+                                .set(Some("Saved Store Page draft is invalid".into())),
+                        }
+                    } else {
+                        durable_message
+                            .set(Some("No saved Store Page draft for this account".into()));
+                    }
+                }
+                Err(error) => durable_message.set(Some(error)),
+            }
+        });
+    });
+    let persistence_label = move || {
+        if durable_saved
+            .get()
+            .as_ref()
+            .is_some_and(|(saved, rows)| saved == &draft.get() && rows == &associations.get())
+        {
+            "Saved local draft — not published"
+        } else {
+            draft_persistence_label(!(draft.get() == baseline.get() && !input_dirty.get()))
+        }
+    };
     let discard_keep_ref = NodeRef::<leptos::html::Button>::new();
 
     Effect::new(move |_| {
@@ -974,11 +1108,17 @@ pub fn StorePageEditorView(
         }
     });
 
+    let publication_session_epoch = RwSignal::new(auth.current_auth_flow());
     Effect::new({
         let publisher = publisher.clone();
+        let session_auth = auth.clone();
         move |_| {
             let current = auth.npub.get();
-            if current.as_deref() != Some(publisher.as_str()) {
+            let epoch = session_auth.current_auth_flow();
+            if current.as_deref() != Some(publisher.as_str())
+                || epoch != publication_session_epoch.get_untracked()
+            {
+                publication_session_epoch.set(epoch);
                 operation_generation.update(|value| *value = value.wrapping_add(1));
                 upload_context_generation.update(|value| *value = value.wrapping_add(1));
                 operation_account.set(current.clone());
@@ -1241,6 +1381,7 @@ pub fn StorePageEditorView(
     });
 
     let publish = Callback::new({
+        let session_auth = auth.clone();
         let publisher = publisher.clone();
         let listing_for_saved = listing.clone();
         let selected_coordinate = coordinate.clone();
@@ -1280,6 +1421,8 @@ pub fn StorePageEditorView(
             operation_generation.update(|value| *value = value.wrapping_add(1));
             let generation = operation_generation.get_untracked();
             publishing.set(true);
+            let auth_epoch = session_auth.current_auth_flow();
+            let response_auth = session_auth.clone();
             partial.set(None);
             transaction_selected_listing_event_id.set(listing_for_saved.event_id.clone());
             transaction_mutations.set(mutations.clone());
@@ -1292,6 +1435,12 @@ pub fn StorePageEditorView(
                 let result =
                     invoke_publish_store_page(publisher, request_draft.clone(), mutations.clone())
                         .await;
+                if operation_generation.try_get_untracked().is_none() {
+                    return;
+                }
+                if !response_auth.is_current_auth_flow(auth_epoch) {
+                    return;
+                }
                 if !accepts_account_response(
                     auth.npub.get_untracked().as_deref(),
                     &initiating_account,
@@ -1361,6 +1510,7 @@ pub fn StorePageEditorView(
     });
 
     let retry = Callback::new({
+        let session_auth = auth.clone();
         let publisher = publisher.clone();
         let listing_for_saved = listing.clone();
         let selected_coordinate = coordinate.clone();
@@ -1409,6 +1559,8 @@ pub fn StorePageEditorView(
                 .unwrap_or_else(|| draft.get_untracked());
             let recovery_selected_listing_event_id =
                 transaction_selected_listing_event_id.get_untracked();
+            let auth_epoch = session_auth.current_auth_flow();
+            let response_auth = session_auth.clone();
             spawn_local(async move {
                 let result = invoke_retry_store_page_pointer_sync(
                     publisher,
@@ -1417,6 +1569,12 @@ pub fn StorePageEditorView(
                     retry_mutations,
                 )
                 .await;
+                if operation_generation.try_get_untracked().is_none() {
+                    return;
+                }
+                if !response_auth.is_current_auth_flow(auth_epoch) {
+                    return;
+                }
                 if !accepts_account_response(
                     auth.npub.get_untracked().as_deref(),
                     &initiating_account,
@@ -1674,6 +1832,11 @@ pub fn StorePageEditorView(
 
     view! {
         <section class="v2-publisher-studio v2-store-page-editor">
+            <section style="padding:14px;background:#121215;border:1px solid oklch(0.32 0.01 60);color:#fff;font:400 12.5px/1.6 ui-monospace,monospace">
+                <button type="button" style="padding:10px;background:transparent;color:oklch(0.8 0.13 210);border:1px solid oklch(0.5 0.13 210);font-family:ui-monospace,monospace" disabled=move || durable_busy.get() || publishing.get() on:click=move |_| save_durable.run(())>"SAVE STORE PAGE DRAFT"</button>
+                <button type="button" style="padding:10px;background:transparent;color:oklch(0.8 0.13 210);border:1px solid oklch(0.5 0.13 210);font-family:ui-monospace,monospace" disabled=move || durable_busy.get() || publishing.get() || loading.get() on:click=move |_| restore_durable.run(())>"RESTORE SAVED DRAFT (REPLACES EDITOR)"</button>
+                {move || durable_message.get().map(|message| view! { <p role="status">{message}</p> })}
+            </section>
             <button class="v2-btn-secondary v2-publisher-back" on:click=on_back_click>"Back to game management"</button>
             <header class="v2-publisher-game-hero">
                 <div><p class="v2-publisher-kicker">"Store Page editor"</p><h1>{listing.title.clone()}</h1><p class="v2-store-help">"Drafts stay local until Publish is selected."</p></div>
@@ -1808,10 +1971,10 @@ pub fn StorePageEditorView(
                     </section>
                 })}
             </main>
-            <aside class="v2-publisher-panel v2-publisher-sidebar v2-store-readiness" class:v2-store-readiness-open=move || readiness_open.get()><h2>"Readiness"</h2>{move || { let platforms = linked_platforms(&listing_for_preview.platforms, &associations.get(), &coordinate_for_readiness.get_value()); let state = readiness(&draft.get(), &associations.get(), &platforms, &diagnostics.get()); view! { <div><p class="v2-store-persistence">{draft_persistence_label(!(draft.get() == baseline.get() && !input_dirty.get()))}</p><p class="v2-store-revision">{revision_label(draft.get().loaded_event_id.as_deref())}</p><p class="v2-store-persistence-note">"Editor changes live only in this session. Closing Arcadestr discards them; publication is the only durable action."</p><h3>"Blocking issues"</h3>{if state.blockers.is_empty() { view! { <p class="v2-store-ok">"No known blockers"</p> }.into_any() } else { let target = first_blocker_target(&state.blockers); view! { <div><ul>{state.blockers.iter().cloned().map(|item| { let tab = diagnostic_tab(&item); view! { <li><button type="button" class="v2-store-blocker-link" on:click=move |_| { active_tab.set(tab); focus_editor_tab(tab); }>{item}</button></li> } }).collect_view()}</ul>{target.map(|target| { let tab = target.tab; let element_id = target.element_id.clone(); view! { <button type="button" class="v2-btn-secondary v2-store-first-blocker" on:click=move |_| { active_tab.set(tab); if !element_id.as_deref().is_some_and(focus_editor_element) { focus_editor_tab(tab); } }>{format!("Go to first blocker: {}", target.message)}</button> } })}</div> }.into_any() }}<h3>"Association warnings"</h3><ul>{state.warnings.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul><h3>"Recommendations"</h3><ul>{state.recommendations.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul></div> } }}<p class="v2-store-help">"Preview uses the core sanitizer and buyer renderer."</p></aside>
+            <aside class="v2-publisher-panel v2-publisher-sidebar v2-store-readiness" class:v2-store-readiness-open=move || readiness_open.get()><h2>"Readiness"</h2>{move || { let platforms = linked_platforms(&listing_for_preview.platforms, &associations.get(), &coordinate_for_readiness.get_value()); let state = readiness(&draft.get(), &associations.get(), &platforms, &diagnostics.get()); view! { <div><p class="v2-store-persistence">{persistence_label()}</p><p class="v2-store-revision">{revision_label(draft.get().loaded_event_id.as_deref())}</p><p class="v2-store-persistence-note">"Use Save Store Page draft to retain editor changes across restart. Saving a draft does not publish it. Pending publications are retained separately in Publisher recovery."</p><h3>"Blocking issues"</h3>{if state.blockers.is_empty() { view! { <p class="v2-store-ok">"No known blockers"</p> }.into_any() } else { let target = first_blocker_target(&state.blockers); view! { <div><ul>{state.blockers.iter().cloned().map(|item| { let tab = diagnostic_tab(&item); view! { <li><button type="button" class="v2-store-blocker-link" on:click=move |_| { active_tab.set(tab); focus_editor_tab(tab); }>{item}</button></li> } }).collect_view()}</ul>{target.map(|target| { let tab = target.tab; let element_id = target.element_id.clone(); view! { <button type="button" class="v2-btn-secondary v2-store-first-blocker" on:click=move |_| { active_tab.set(tab); if !element_id.as_deref().is_some_and(focus_editor_element) { focus_editor_tab(tab); } }>{format!("Go to first blocker: {}", target.message)}</button> } })}</div> }.into_any() }}<h3>"Association warnings"</h3><ul>{state.warnings.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul><h3>"Recommendations"</h3><ul>{state.recommendations.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul></div> } }}<p class="v2-store-help">"Preview uses the core sanitizer and buyer renderer."</p></aside>
             </div>
 
-            <footer class="v2-store-editor-footer"><span class="v2-store-footer-status" role="status">{move || if validating.get() { "Validating…".to_string() } else if publishing.get() { "Publishing…".to_string() } else { draft_persistence_label(!(draft.get() == baseline.get() && !input_dirty.get())).to_string() }}</span><button class="v2-btn-secondary" type="button" disabled=move || validating.get() on:click=move |_| run_validation.run(())>{move || if validating.get() { "Validating..." } else { "Preview" }}</button><button class="v2-btn-primary" type="button" disabled=move || publishing.get() on:click=move |_| publish.run(())>{move || if publishing.get() { "Publishing..." } else { "Publish" }}</button><details class="v2-store-overflow"><summary class="v2-btn-secondary">"More"</summary><div><label>"New presentation ID"<input class="v2-input" prop:value=move || clone_id.get() on:input=move |event| clone_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| clone_page.run(())>"Clone"</button><label>"Existing presentation ID"<input class="v2-input" prop:value=move || link_existing_id.get() on:input=move |event| link_existing_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| link_existing.run(())>"Link existing"</button><button type="button" on:click=move |_| show_discard.set(true)>"Reset / discard draft"</button><details><summary>"Protocol diagnostics"</summary>{move || diagnostics.get().into_iter().map(|item| view! { <p>{item}</p> }).collect_view()}</details></div></details></footer>
+            <footer class="v2-store-editor-footer"><span class="v2-store-footer-status" role="status">{move || if validating.get() { "Validating…".to_string() } else if publishing.get() { "Publishing…".to_string() } else { persistence_label().to_string() }}</span><button class="v2-btn-secondary" type="button" disabled=move || validating.get() on:click=move |_| run_validation.run(())>{move || if validating.get() { "Validating..." } else { "Preview" }}</button><button class="v2-btn-primary" type="button" disabled=move || publishing.get() on:click=move |_| publish.run(())>{move || if publishing.get() { "Publishing..." } else { "Publish" }}</button><details class="v2-store-overflow"><summary class="v2-btn-secondary">"More"</summary><div><label>"New presentation ID"<input class="v2-input" prop:value=move || clone_id.get() on:input=move |event| clone_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| clone_page.run(())>"Clone"</button><label>"Existing presentation ID"<input class="v2-input" prop:value=move || link_existing_id.get() on:input=move |event| link_existing_id.set(event_target_value(&event)) /></label><button type="button" on:click=move |_| link_existing.run(())>"Link existing"</button><button type="button" on:click=move |_| show_discard.set(true)>"Reset / discard draft"</button><details><summary>"Protocol diagnostics"</summary>{move || diagnostics.get().into_iter().map(|item| view! { <p>{item}</p> }).collect_view()}</details></div></details></footer>
 
             <Dialog
                 id="store-page-discard"

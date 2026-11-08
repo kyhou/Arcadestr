@@ -3,11 +3,11 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arcadestr_core::adp_client::{
     AdpClient, AdpServerInfo, CreateSettlementQuoteRequest as CoreCreateSettlementQuoteRequest,
-    EntitlementClaimRequest as CoreEntitlementClaimRequest, ProvisionResponse,
+    EntitlementClaimRequest as CoreEntitlementClaimRequest,
     PurchaseConfirmRequest as CorePurchaseConfirmRequest,
     PurchaseConfirmResponse as CorePurchaseConfirmResponse, SettlementProofRequest, UploadResponse,
 };
@@ -65,7 +65,7 @@ async fn resolve_lud16(
     resolve_lud16_with_policy(http, address, allow_local).await
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FulfillmentMode {
     None,
@@ -73,7 +73,7 @@ pub enum FulfillmentMode {
     Delegate,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishAdpListingRequest {
     pub expected_publisher_npub: String,
     pub existing_event_id: Option<String>,
@@ -121,7 +121,7 @@ pub struct ResolveAdpOperatorRequest {
     pub scope: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishServerUploadResult {
     pub server_url: String,
     pub status: String,
@@ -129,8 +129,9 @@ pub struct PublishServerUploadResult {
     pub upload: Option<UploadResponse>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishAdpListingResult {
+    pub operation_id: String,
     /// Event ID of the published kind:30402 listing.
     pub event_id: String,
     /// Set only when this publication minted a new identifier. Serde renders the
@@ -148,6 +149,9 @@ pub struct PublishAdpListingResult {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublishProgressPayload {
+    pub operation_id: String,
+    pub publisher_npub: String,
+    pub game_coordinate: String,
     pub step: String,
     pub status: String,
     pub server_url: Option<String>,
@@ -641,6 +645,93 @@ fn resolve_existing_fulfillment_metadata(
 
 struct SdkSignerAdapter(Arc<dyn nostr::signer::NostrSigner>);
 
+/// Remote signing must not authorize a later action in a replaced session.
+pub(crate) struct PublicationSigner {
+    pub(crate) signer: Arc<dyn NostrSigner>,
+    pub(crate) session: arcadestr_core::settlement_recovery::SessionFence,
+}
+impl PublicationSigner {
+    async fn sign_with_timeout(
+        &self,
+        unsigned: nostr::UnsignedEvent,
+        timeout: Duration,
+    ) -> Result<nostr::Event, SignerError> {
+        self.session
+            .ensure_current()
+            .map_err(SignerError::SigningFailed)?;
+        if let Some(event) = crate::publisher_commands::retained_signature(&unsigned)
+            .await
+            .map_err(SignerError::SigningFailed)?
+        {
+            self.session
+                .ensure_current()
+                .map_err(SignerError::SigningFailed)?;
+            return Ok(event);
+        }
+        let mut unsigned = unsigned;
+        if let (Some(journal), Some(key)) = (
+            crate::publisher_commands::journal(),
+            crate::publisher_commands::signing_key(&unsigned),
+        ) {
+            let key = format!("intent:{key}");
+            if let Some(saved) = journal
+                .step(&key)
+                .await
+                .map_err(SignerError::SigningFailed)?
+            {
+                unsigned = serde_json::from_value(saved.intent).map_err(|_| {
+                    SignerError::SigningFailed("Invalid retained signing intent".into())
+                })?;
+            } else {
+                journal
+                    .prepare(
+                        &key,
+                        "signing",
+                        &key,
+                        serde_json::to_value(&unsigned).map_err(|_| {
+                            SignerError::SigningFailed("Invalid signing intent".into())
+                        })?,
+                    )
+                    .await
+                    .map_err(SignerError::SigningFailed)?;
+            }
+        }
+        let result = tokio::time::timeout(timeout, self.signer.sign_event(unsigned))
+            .await
+            .map_err(|_| SignerError::SigningFailed("publication signer timed out".into()))?;
+        self.session
+            .ensure_current()
+            .map_err(SignerError::SigningFailed)?;
+        let event = result?;
+        crate::publisher_commands::retain_signature(&event)
+            .await
+            .map_err(SignerError::SigningFailed)?;
+        Ok(event)
+    }
+}
+#[async_trait::async_trait]
+impl NostrSigner for PublicationSigner {
+    async fn get_public_key(&self) -> Result<nostr::PublicKey, SignerError> {
+        self.session
+            .ensure_current()
+            .map_err(SignerError::SigningFailed)?;
+        let result = tokio::time::timeout(Duration::from_secs(30), self.signer.get_public_key())
+            .await
+            .map_err(|_| SignerError::SigningFailed("publication signer unavailable".into()))?;
+        self.session
+            .ensure_current()
+            .map_err(SignerError::SigningFailed)?;
+        result
+    }
+    async fn sign_event(
+        &self,
+        unsigned: nostr::UnsignedEvent,
+    ) -> Result<nostr::Event, SignerError> {
+        self.sign_with_timeout(unsigned, Duration::from_secs(120))
+            .await
+    }
+}
+
 #[async_trait::async_trait]
 impl NostrSigner for SdkSignerAdapter {
     async fn get_public_key(&self) -> Result<nostr::PublicKey, SignerError> {
@@ -698,7 +789,9 @@ pub(crate) async fn ensure_publish_account_current(
     state: &State<'_, AppState>,
     signer_state: &Arc<tokio::sync::Mutex<AppSignerState>>,
     expected: nostr::PublicKey,
+    session: &arcadestr_core::settlement_recovery::SessionFence,
 ) -> Result<(), String> {
+    session.ensure_current()?;
     let auth = { state.auth.lock().await.clone() };
     let current = resolve_active_signer(signer_state, &auth)
         .await?
@@ -708,7 +801,7 @@ pub(crate) async fn ensure_publish_account_current(
     if current != expected {
         return Err("active account changed while publication was being prepared".into());
     }
-    Ok(())
+    session.ensure_current()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -888,7 +981,7 @@ pub struct DiscoverCampaignsRequest {
     pub pointers: Vec<CampaignPointerInput>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignPointerInput {
     pub root_event_id: String,
     pub relay_hint: Option<String>,
@@ -924,7 +1017,7 @@ pub struct DiscoveredCampaign {
     pub mode: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishCampaignRequest {
     pub publisher_npub: String,
     pub listing_id: String,
@@ -944,7 +1037,7 @@ pub struct PublishCampaignResponse {
     pub pointer_update_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateCampaignPointerRequest {
     pub publisher_npub: String,
     pub listing_id: String,
@@ -1110,8 +1203,55 @@ pub async fn publish_campaign(
     state: State<'_, AppState>,
     signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
 ) -> Result<PublishCampaignResponse, String> {
+    publish_campaign_recoverable(request, state, signer_state, None).await
+}
+
+pub(crate) async fn publish_campaign_recoverable(
+    request: PublishCampaignRequest,
+    state: State<'_, AppState>,
+    signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+    resume_id: Option<String>,
+) -> Result<PublishCampaignResponse, String> {
+    let coordinate = listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
+    let journal = crate::publisher_commands::begin_simple_operation(
+        &state,
+        &request.publisher_npub,
+        "campaign",
+        coordinate,
+        serde_json::to_value(&request).map_err(|_| "Invalid campaign intent")?,
+        resume_id,
+    )
+    .await?;
+    let result = crate::publisher_commands::JOURNAL
+        .scope(
+            journal.clone(),
+            publish_campaign_inner(request, state, signer_state),
+        )
+        .await?;
+    if result.pointer_update_error.is_none() {
+        journal
+            .repo
+            .complete(
+                &journal.publisher,
+                &journal.operation_id,
+                &serde_json::to_value(&result).map_err(|_| "Invalid campaign result")?,
+            )
+            .await?;
+    }
+    Ok(result)
+}
+
+async fn publish_campaign_inner(
+    request: PublishCampaignRequest,
+    state: State<'_, AppState>,
+    signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+) -> Result<PublishCampaignResponse, String> {
+    let session = state.settlement_recovery.session_fence()?;
     let auth_snapshot = { state.auth.lock().await.clone() };
-    let signer = resolve_active_signer(signer_state.inner(), &auth_snapshot).await?;
+    let signer = PublicationSigner {
+        signer: resolve_active_signer(signer_state.inner(), &auth_snapshot).await?,
+        session: session.clone(),
+    };
     let publisher = signer
         .get_public_key()
         .await
@@ -1122,6 +1262,9 @@ pub async fn publish_campaign(
         return Err("active signer is not the listing publisher".into());
     }
     let coordinate = listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
+    let _coordinate_lease = state
+        .settlement_recovery
+        .claim(&publisher.to_hex(), &format!("publish:{coordinate}"))?;
     // Confirm the managed listing exists before publishing a campaign.
     fetch_listing_event_by_coordinate(&state, &coordinate).await?;
     let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
@@ -1163,7 +1306,26 @@ pub async fn publish_campaign(
             predecessor,
         )
     };
-    if predecessor.is_none() && existing.is_some() {
+    let retained_campaign = if let Some(journal) = crate::publisher_commands::journal() {
+        journal
+            .step(&format!("signed:1031:{}", request.campaign_id))
+            .await?
+            .map(|step| serde_json::from_value::<nostr::Event>(step.intent))
+            .transpose()
+            .map_err(|_| "Invalid retained campaign")?
+    } else {
+        None
+    };
+    let already_seen = retained_campaign.as_ref().is_some_and(|saved| {
+        existing.as_ref().is_some_and(|existing| {
+            existing
+                .campaign
+                .events
+                .iter()
+                .any(|node| node.event.id == saved.id)
+        })
+    });
+    if predecessor.is_none() && existing.is_some() && !already_seen {
         return Err("campaign id already exists".into());
     }
     let builder = arcadestr_core::campaign::build_campaign_event_builder(&params)
@@ -1180,26 +1342,37 @@ pub async fn publish_campaign(
             .last()
             .map(|node| node.event.id)
             .ok_or_else(|| "campaign chain is empty".to_string())?;
-        if predecessor != Some(expected_tip) {
+        if already_seen && expected_tip != event.id {
+            return Err("Campaign changed after this operation; recovery does not replay an obsolete transition".into());
+        }
+        if !already_seen && predecessor != Some(expected_tip) {
             return Err("predecessor is not the current campaign tip".into());
         }
         (existing.campaign.root_event_id, existing.campaign.events)
     } else {
         (event.id, Vec::new())
     };
-    prospective.push(
-        arcadestr_core::campaign::parse_campaign_event(&event)
-            .map_err(|error| error.to_string())?,
-    );
+    if !already_seen {
+        prospective.push(
+            arcadestr_core::campaign::parse_campaign_event(&event)
+                .map_err(|error| error.to_string())?,
+        );
+    }
     arcadestr_core::campaign::resolve_campaign(&prospective, publisher, &coordinate)
         .map_err(|error| error.to_string())?;
-    publish_event(&state, &event).await?;
+    session.ensure_current()?;
+    if !already_seen {
+        publish_event(&state, &event, &session).await?;
+    }
 
     let (listing_event_id, pointer_update_error) = if request.update_listing_pointer {
         let pointer_result: Result<String, String> = async {
             // Campaign publication can involve several relay and signing awaits. Merge the
             // pointer into the latest listing instead of overwriting a concurrent edit.
             let listing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
+            if let Some(retained) = crate::publisher_commands::pointer_source(&listing).await? {
+                return Ok(retained.id.to_hex());
+            }
             let mut tags = listing
                 .tags
                 .iter()
@@ -1218,14 +1391,20 @@ pub async fn publish_campaign(
                 );
             }
             let listing_update = validate_and_sign_adp_listing(
-                signer.as_ref(),
+                &signer,
                 nostr::EventBuilder::new(nostr::Kind::Custom(30402), listing.content.clone())
                     .tags(tags)
+                    .custom_created_at(arcadestr_core::marketplace::listing_replacement_timestamp(
+                        &listing,
+                        nostr::Timestamp::now(),
+                    )?)
                     .build(publisher),
             )
             .await
             .map_err(|error| error.to_string())?;
-            publish_event(&state, &listing_update).await?;
+            ensure_listing_revision_current(&state, &coordinate, Some(&listing)).await?;
+            session.ensure_current()?;
+            publish_event(&state, &listing_update, &session).await?;
             Ok(listing_update.id.to_hex())
         }
         .await;
@@ -1237,6 +1416,7 @@ pub async fn publish_campaign(
         (None, None)
     };
 
+    session.ensure_current()?;
     Ok(PublishCampaignResponse {
         event_id: event.id.to_hex(),
         root_event_id: root_event_id.to_hex(),
@@ -1251,8 +1431,53 @@ pub async fn update_campaign_pointer(
     state: State<'_, AppState>,
     signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
 ) -> Result<String, String> {
+    update_campaign_pointer_recoverable(request, state, signer_state, None).await
+}
+
+pub(crate) async fn update_campaign_pointer_recoverable(
+    request: UpdateCampaignPointerRequest,
+    state: State<'_, AppState>,
+    signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+    resume_id: Option<String>,
+) -> Result<String, String> {
+    let coordinate = listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
+    let journal = crate::publisher_commands::begin_simple_operation(
+        &state,
+        &request.publisher_npub,
+        "campaign_pointer",
+        coordinate,
+        serde_json::to_value(&request).map_err(|_| "Invalid campaign pointer intent")?,
+        resume_id,
+    )
+    .await?;
+    let result = crate::publisher_commands::JOURNAL
+        .scope(
+            journal.clone(),
+            update_campaign_pointer_inner(request, state, signer_state),
+        )
+        .await?;
+    journal
+        .repo
+        .complete(
+            &journal.publisher,
+            &journal.operation_id,
+            &serde_json::json!(result),
+        )
+        .await?;
+    Ok(result)
+}
+
+async fn update_campaign_pointer_inner(
+    request: UpdateCampaignPointerRequest,
+    state: State<'_, AppState>,
+    signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
+) -> Result<String, String> {
+    let session = state.settlement_recovery.session_fence()?;
     let auth_snapshot = { state.auth.lock().await.clone() };
-    let signer = resolve_active_signer(signer_state.inner(), &auth_snapshot).await?;
+    let signer = PublicationSigner {
+        signer: resolve_active_signer(signer_state.inner(), &auth_snapshot).await?,
+        session: session.clone(),
+    };
     let publisher = signer
         .get_public_key()
         .await
@@ -1263,7 +1488,13 @@ pub async fn update_campaign_pointer(
         return Err("active signer is not the listing publisher".into());
     }
     let coordinate = listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
+    let _coordinate_lease = state
+        .settlement_recovery
+        .claim(&publisher.to_hex(), &format!("publish:{coordinate}"))?;
     let listing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
+    if let Some(retained) = crate::publisher_commands::pointer_source(&listing).await? {
+        return Ok(retained.id.to_hex());
+    }
     let root = nostr::EventId::from_hex(&request.campaign_root_id)
         .map_err(|_| "invalid campaign root event id".to_string())?;
     let mut tags = listing
@@ -1283,14 +1514,21 @@ pub async fn update_campaign_pointer(
         );
     }
     let updated = validate_and_sign_adp_listing(
-        signer.as_ref(),
-        nostr::EventBuilder::new(nostr::Kind::Custom(30402), listing.content)
+        &signer,
+        nostr::EventBuilder::new(nostr::Kind::Custom(30402), listing.content.clone())
             .tags(tags)
+            .custom_created_at(arcadestr_core::marketplace::listing_replacement_timestamp(
+                &listing,
+                nostr::Timestamp::now(),
+            )?)
             .build(publisher),
     )
     .await
     .map_err(|error| error.to_string())?;
-    publish_event(&state, &updated).await?;
+    ensure_listing_revision_current(&state, &coordinate, Some(&listing)).await?;
+    session.ensure_current()?;
+    publish_event(&state, &updated, &session).await?;
+    session.ensure_current()?;
     Ok(updated.id.to_hex())
 }
 
@@ -1691,6 +1929,208 @@ async fn ensure_purchase_account_current(
         return Err("active account changed while settlement was in progress".into());
     }
     Ok(())
+}
+
+/// Read-only publisher review. No invoice, quote, or signing request is made.
+#[tauri::command]
+pub async fn preview_publisher_terms(
+    request: arcadestr_core::adp_settlement::PublisherTermsContext,
+    state: State<'_, AppState>,
+) -> Result<arcadestr_core::adp_settlement::PublisherTermsReview, String> {
+    let session = state.settlement_recovery.session_fence()?;
+    let publisher = { state.auth.lock().await.public_key() }
+        .ok_or("Authenticate as the publisher before reviewing commercial terms")?;
+    if request.publisher_pubkey != publisher.to_hex() {
+        return Err("Commercial review belongs to another publisher".into());
+    }
+    let review = load_publisher_terms_review(&state, &request, None).await?;
+    session.ensure_current()?;
+    Ok(review)
+}
+
+async fn load_publisher_terms_review(
+    state: &State<'_, AppState>,
+    context: &arcadestr_core::adp_settlement::PublisherTermsContext,
+    preserved: Option<&[arcadestr_core::adp_settlement::AcceptedTermsRef]>,
+) -> Result<arcadestr_core::adp_settlement::PublisherTermsReview, String> {
+    use arcadestr_core::adp_settlement::{AcceptedTermsRef, TERMS_KIND};
+    let mut servers = Vec::new();
+    let mut advertised = std::collections::BTreeMap::new();
+    for url in &context.servers {
+        let info = AdpClient::new(url.clone(), Arc::clone(&state.http_client))
+            .well_known()
+            .await
+            .map_err(|_| "Commercial endpoint capabilities are unavailable")?;
+        let server = publisher_terms_server(url, info)?;
+        if preserved.is_none() {
+            let root = server
+                .advertised_terms
+                .clone()
+                .ok_or("Operator terms root is unavailable")?;
+            if advertised
+                .insert(server.operator_pubkey.clone(), root.clone())
+                .is_some_and(|previous| previous != root)
+            {
+                return Err(
+                    "Operator endpoints advertise conflicting terms; review is unavailable".into(),
+                );
+            }
+        }
+        servers.push(server);
+    }
+    let references = preserved.map(<[_]>::to_vec).unwrap_or_else(|| {
+        advertised
+            .into_iter()
+            .map(|(operator_pubkey, terms_event_id)| AcceptedTermsRef {
+                operator_pubkey,
+                terms_event_id,
+            })
+            .collect()
+    });
+    let manager = { state.nostr.lock().await.get_relay_manager().clone() };
+    let manager = { manager.lock().await.clone() };
+    let mut events = Vec::new();
+    let now = nostr::Timestamp::now();
+    for reference in &references {
+        let id = nostr::EventId::from_hex(&reference.terms_event_id)
+            .map_err(|_| "Invalid commercial terms root")?;
+        let author = nostr::PublicKey::from_hex(&reference.operator_pubkey)
+            .map_err(|_| "Invalid terms operator")?;
+        events.extend(
+            fetch_publisher_commercial_events(&manager, nostr::Filter::new().id(id)).await?,
+        );
+        // Withdrawals use JSON content, not an indexed root tag. Query the existing
+        // kind/author history; refuse saturated results rather than claiming absence.
+        let history = fetch_publisher_commercial_events(
+            &manager,
+            nostr::Filter::new()
+                .kind(nostr::Kind::Custom(TERMS_KIND))
+                .author(author)
+                .until(now)
+                .limit(513),
+        )
+        .await?;
+        if history.len() >= 512 {
+            return Err("Terms history query is incomplete; publication is blocked".into());
+        }
+        events.extend(history);
+    }
+    arcadestr_core::adp_settlement::review_publisher_terms(
+        context,
+        &servers,
+        &references,
+        &events,
+        preserved.is_none(),
+        now.as_secs(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn publisher_terms_server(
+    url: &str,
+    info: AdpServerInfo,
+) -> Result<arcadestr_core::adp_settlement::PublisherTermsServer, String> {
+    use arcadestr_core::adp_settlement::{
+        PublisherTermsServer, QUOTE_KIND, RECOVERY_KIND, SETTLEMENT_VERSION, TERMS_KIND,
+    };
+    let settlement = info
+        .settlement
+        .ok_or("Operator does not advertise settlement support")?;
+    let kinds = info
+        .event_kinds
+        .ok_or("Operator settlement event kinds are unavailable")?;
+    if settlement.version != SETTLEMENT_VERSION
+        || !settlement.split_enabled
+        || kinds.commercial_terms != Some(TERMS_KIND)
+        || kinds.private_quote != Some(QUOTE_KIND)
+        || kinds.recovery_evidence != Some(RECOVERY_KIND)
+    {
+        return Err("Operator advertises incompatible settlement capabilities".into());
+    }
+    if nostr::PublicKey::from_hex(&info.pubkey)
+        .map_err(|_| "Invalid operator identity")?
+        .to_hex()
+        != info.pubkey
+    {
+        return Err("Noncanonical operator identity".into());
+    }
+    Ok(PublisherTermsServer {
+        url: url.into(),
+        operator_pubkey: info.pubkey,
+        version: settlement.version,
+        split_enabled: settlement.split_enabled,
+        advertised_terms: settlement.terms_event_id,
+    })
+}
+
+async fn fetch_publisher_commercial_events(
+    manager: &arcadestr_core::relay_manager::RelayManager,
+    filter: nostr::Filter,
+) -> Result<Vec<nostr::Event>, String> {
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    // Reuse the existing EOSE-aware transport. Unlike SDK aggregate fetches,
+    // incomplete selected-relay replies must not establish withdrawal absence.
+    manager
+        .fetch_events_streaming(filter, 10, 10, move |_, batch| {
+            if let Ok(mut sink) = sink.lock() {
+                sink.extend(batch);
+            }
+        })
+        .await
+        .map_err(|_| {
+            "Commercial evidence query is incomplete or unavailable; retry without changing consent"
+        })?;
+    let mut events = events
+        .lock()
+        .map_err(|_| "Commercial evidence collection failed")?;
+    Ok(std::mem::take(&mut *events))
+}
+
+async fn validate_publisher_commercial_intent(
+    state: &State<'_, AppState>,
+    request: &PublishAdpListingRequest,
+    extension: &PublishAdpListingRequestExtension,
+    source: Option<&nostr::Event>,
+) -> Result<Vec<arcadestr_core::adp_settlement::AcceptedTermsRef>, String> {
+    use arcadestr_core::adp_settlement::{
+        publisher_commercial_references, PublisherCommercialIntent, PublisherTermsContext,
+    };
+    if !request.accepted_terms.is_empty() {
+        return Err(
+            "Unreviewed commercial acceptance is not supported; review exact signed terms first"
+                .into(),
+        );
+    }
+    let context = PublisherTermsContext {
+        publisher_pubkey: nostr::PublicKey::from_bech32(&request.expected_publisher_npub)
+            .map_err(|_| "Invalid publisher")?
+            .to_hex(),
+        servers: request.servers.clone(),
+        price_sats: request.price_sats,
+        developer_destination: request.lud16.clone().unwrap_or_default(),
+    };
+    match &extension.commercial_intent {
+        PublisherCommercialIntent::Preserve => {
+            let accepted =
+                publisher_commercial_references(&extension.commercial_intent, source, None)
+                    .map_err(|e| e.to_string())?;
+            if !accepted.is_empty() {
+                load_publisher_terms_review(state, &context, Some(&accepted)).await?;
+            }
+            Ok(accepted)
+        }
+        PublisherCommercialIntent::ReplaceAfterReview { review } => {
+            let fresh = load_publisher_terms_review(state, &context, None).await?;
+            let _ = review;
+            publisher_commercial_references(&extension.commercial_intent, source, Some(&fresh))
+                .map_err(|e| e.to_string())
+        }
+        PublisherCommercialIntent::Retire => {
+            publisher_commercial_references(&extension.commercial_intent, source, None)
+                .map_err(|e| e.to_string())
+        }
+    }
 }
 
 async fn fetch_terms_events(
@@ -2721,7 +3161,12 @@ async fn fetch_replaceable_listing_event_by_coordinate(
     .await
     .map_err(|_| "listing event fetch timed out".to_string())?
     .map_err(|err| err.to_string())?;
-    Ok(select_replaceable_event(events))
+    let events = events.into_iter().collect::<Vec<_>>();
+    Ok(arcadestr_core::marketplace::current_listing_revision(
+        &events,
+        developer_pubkey,
+        d_tag,
+    ))
 }
 
 fn map_authoritative_refetch(
@@ -2752,6 +3197,31 @@ fn select_replaceable_event(
             current
         }
     })
+}
+
+pub(crate) async fn recovery_current_listing(
+    state: &State<'_, AppState>,
+    coordinate: &str,
+) -> Result<Option<nostr::Event>, String> {
+    let mut parts = coordinate.splitn(3, ':');
+    if parts.next() != Some("30402") {
+        return Err("Invalid listing coordinate".into());
+    }
+    let publisher = nostr::PublicKey::from_hex(parts.next().ok_or("Missing publisher")?)
+        .map_err(|_| "Invalid publisher")?;
+    let d = parts.next().ok_or("Missing identifier")?;
+    let query = query_coordinate(state, publisher, d).await?;
+    if query.silent_relays != 0 {
+        return Err("Recovery lookup is incomplete; no external action was retried".into());
+    }
+    Ok(select_replaceable_event(query.events.into_iter().filter(
+        |event| {
+            event.verify().is_ok()
+                && event.pubkey == publisher
+                && event.kind.as_u16() == 30402
+                && listing_event_d_tag(event) == Some(d)
+        },
+    )))
 }
 
 async fn persist_purchase_confirmation(
@@ -2805,7 +3275,13 @@ async fn persist_purchase_confirmation(
     if current_buyer.as_deref() != Some(buyer_pubkey) {
         return Err("active account changed while receipt authorization was being verified".into());
     }
-    crate::receipt_commands::archive_confirmation(state,nostr::PublicKey::from_hex(buyer_pubkey).map_err(|_|"Invalid receipt buyer")?,&response.receipt,authorization.as_ref()).await?;
+    crate::receipt_commands::archive_confirmation(
+        state,
+        nostr::PublicKey::from_hex(buyer_pubkey).map_err(|_| "Invalid receipt buyer")?,
+        &response.receipt,
+        authorization.as_ref(),
+    )
+    .await?;
     let tokens = DownloadTokensRepository::new(state.database.pool().clone());
     tokens
         .upsert(&DownloadToken {
@@ -2919,7 +3395,13 @@ async fn persist_split_receipt(
     )
     .map_err(|error| error.to_string())?;
     ensure_purchase_account_current(state, buyer).await?;
-    crate::receipt_commands::archive_confirmation(state,buyer,receipt_event,authorization.as_ref()).await?;
+    crate::receipt_commands::archive_confirmation(
+        state,
+        buyer,
+        receipt_event,
+        authorization.as_ref(),
+    )
+    .await?;
     DownloadTokensRepository::new(state.database.pool().clone())
         .upsert(&DownloadToken {
             buyer_pubkey: buyer.to_hex(),
@@ -2983,10 +3465,9 @@ const FORM_MANAGED_LISTING_TAGS: &[&str] = &[
 
 /// Tag naming a delegated fulfillment authorization.
 ///
-/// Deliberately absent from [`FORM_MANAGED_LISTING_TAGS`]: the form only owns
-/// it when this publication actually issues an authorization. An ordinary
-/// metadata edit of a delegated listing issues none and must carry the existing
-/// authorization forward rather than drop it.
+/// Deliberately absent from [`FORM_MANAGED_LISTING_TAGS`]: metadata edits preserve
+/// every reference verbatim. Adding a new root never removes sibling/history tags.
+#[cfg(test)]
 const FULFILLMENT_AUTHORIZATION_TAG: &str = "fulfillment_authorization";
 
 fn is_publish_form_tag(values: &[String]) -> bool {
@@ -2995,6 +3476,7 @@ fn is_publish_form_tag(values: &[String]) -> bool {
         .is_some_and(|name| FORM_MANAGED_LISTING_TAGS.contains(&name.as_str()))
 }
 
+#[cfg(test)]
 fn is_fulfillment_authorization_tag(values: &[String]) -> bool {
     values.first().map(String::as_str) == Some(FULFILLMENT_AUTHORIZATION_TAG)
 }
@@ -3004,16 +3486,10 @@ fn is_fulfillment_authorization_tag(values: &[String]) -> bool {
 /// The core builder appends these verbatim, so every tag the form republishes
 /// must already be gone: otherwise the replacement carries both the stale value
 /// and the current one.
-fn preserved_listing_tags(
-    existing_tags: &[Vec<String>],
-    replaces_fulfillment_authorizations: bool,
-) -> Vec<Vec<String>> {
+fn preserved_listing_tags(existing_tags: &[Vec<String>]) -> Vec<Vec<String>> {
     existing_tags
         .iter()
         .filter(|values| !is_publish_form_tag(values))
-        .filter(|values| {
-            !(replaces_fulfillment_authorizations && is_fulfillment_authorization_tag(values))
-        })
         .cloned()
         .collect()
 }
@@ -3029,7 +3505,7 @@ fn unique_operator_url(matches: &[AdpProvisioning]) -> Option<String> {
 ///
 /// The application cache is never consulted. Phase A still has a concurrent-
 /// publisher window between this refetch and later signing; a future revision
-/// check/CAS can close it without changing this intent-only request contract.
+/// check can narrow it, but selected-relay observations never provide distributed CAS.
 #[tauri::command]
 pub async fn load_authoritative_adp_edit_metadata(
     request: LoadAuthoritativeAdpEditMetadataRequest,
@@ -3077,6 +3553,8 @@ pub async fn publish_adp_listing<R: tauri::Runtime>(
         state,
         signer_state,
         archive_service,
+        false,
+        false,
     )
     .await
 }
@@ -3097,19 +3575,61 @@ pub async fn publish_adp_listing_with_contract<R: tauri::Runtime>(
         state,
         signer_state,
         archive_service,
+        false,
+        false,
     )
     .await
 }
 
-async fn publish_adp_listing_pipeline<R: tauri::Runtime>(
+pub(crate) async fn publish_adp_listing_pipeline<R: tauri::Runtime>(
     mut request: PublishAdpListingRequest,
-    extension: PublishAdpListingRequestExtension,
+    mut extension: PublishAdpListingRequestExtension,
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
     archive_service: State<'_, ArchiveSelectionService>,
+    resume: bool,
+    allow_uncertain: bool,
 ) -> Result<PublishAdpListingResult, PublishAdpListingError> {
+    let session = state.settlement_recovery.session_fence()?;
+    session.ensure_current()?;
+    let expected = nostr::PublicKey::from_bech32(&request.expected_publisher_npub)
+        .map_err(|_| "invalid expected publisher".to_string())?;
+    if resume {
+        let auth = { state.auth.lock().await.clone() };
+        let signer = PublicationSigner {
+            signer: resolve_active_signer(signer_state.inner(), &auth).await?,
+            session: session.clone(),
+        };
+        let active = signer
+            .get_public_key()
+            .await
+            .map_err(|_| "Publisher signer is unavailable for recovery".to_string())?;
+        verify_expected_publisher(&request.expected_publisher_npub, active)?;
+    }
+    let operation_id = extension
+        .operation_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| "invalid publication operation ID".to_string())?
+        .unwrap_or_else(Uuid::new_v4);
+    extension.operation_id = Some(operation_id.to_string());
+    let _operation_lease = state.settlement_recovery.claim(
+        &expected.to_hex(),
+        &format!("publish-operation:{operation_id}"),
+    )?;
+    if request.existing_event_id.is_none() && request.pending_d_tag.is_none() {
+        request.pending_d_tag = Some(Uuid::new_v4().to_string());
+    }
     validate_selected_build_requirement(&request, &extension)?;
+    for endpoint in request.servers.iter().chain(request.operator_url.iter()) {
+        arcadestr_core::http_client::validate_publication_endpoint(endpoint).map_err(|_| {
+            PublishAdpListingError::Upload {
+                message: "unsafe publication endpoint".into(),
+            }
+        })?;
+    }
     let lease = if let Some(reference) = request.selected_build.as_ref() {
         let auth = { state.auth.lock().await.clone() };
         let active_signer = resolve_active_signer(signer_state.inner(), &auth)
@@ -3133,20 +3653,105 @@ async fn publish_adp_listing_pipeline<R: tauri::Runtime>(
     } else {
         None
     };
-    let result = publish_adp_listing_pipeline_inner(
-        request,
-        extension,
-        app,
-        state,
-        signer_state,
-        lease.as_ref(),
-    )
-    .await;
+    let repo = arcadestr_core::publisher_recovery::repository::PublisherRepository::new(
+        state.database.pool().clone(),
+    );
+    let publisher = expected.to_hex();
+    let journal = crate::publisher_commands::PublisherJournal {
+        repo: repo.clone(),
+        publisher: publisher.clone(),
+        operation_id: operation_id.to_string(),
+        allow_uncertain,
+    };
+    if !resume {
+        repo.begin(&publisher, &arcadestr_core::publisher_recovery::PublisherOperation {
+            operation_id: operation_id.to_string(), kind: "listing".into(),
+            coordinate: format!("30402:{}:{}", publisher, request.existing_d_tag.as_deref().or(request.pending_d_tag.as_deref()).unwrap_or_default()),
+            intent: serde_json::json!({"request":crate::publisher_commands::durable_request(&request)?, "extension":&extension, "requires_archive":lease.is_some()}),
+            artifact_hash: lease.as_ref().map(|lease| lease.digest.as_str().to_owned()), state: "incomplete".into(), result: None,
+        }).await?;
+    } else {
+        let original = repo
+            .operation(&publisher, &operation_id.to_string())
+            .await?;
+        if let Some(expected_hash) = &original.artifact_hash {
+            let retained_steps = repo.steps(&publisher, &operation_id.to_string()).await?;
+            if let Some(saved) = retained_steps.iter().find(|step| {
+                step.kind == "signed_event" && step.step_id.starts_with("signed:30402:")
+            }) {
+                let signed: nostr::Event = serde_json::from_value(saved.intent.clone())
+                    .map_err(|_| "Invalid retained signed artifact".to_string())?;
+                signed
+                    .verify()
+                    .map_err(|_| "Invalid retained artifact signature".to_string())?;
+                let hashes = signed
+                    .tags
+                    .iter()
+                    .filter_map(|tag| match tag.as_slice() {
+                        [name, hash] if name == "file_hash" => Some(hash.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if signed.pubkey != expected || hashes.as_slice() != [expected_hash.as_str()] {
+                    return Err("Retained signed listing and original artifact pin disagree; no external recovery action was taken".to_string().into());
+                }
+            }
+            if let Some(lease) = &lease {
+                arcadestr_core::publisher_recovery::verify_reselected_artifact(
+                    expected_hash,
+                    lease.digest.as_str(),
+                )?;
+            } else {
+                let steps = repo.steps(&publisher, &operation_id.to_string()).await?;
+                if request.servers.iter().any(|server| {
+                    !steps.iter().any(|step| {
+                        step.step_id == format!("upload:{server}") && step.state == "acknowledged"
+                    })
+                }) {
+                    return Err("Reselect the original archive before resuming; expired handles are never restored".to_string().into());
+                }
+            }
+        } else if lease.is_some() {
+            return Err(
+                "Recovery cannot introduce an archive into a metadata-only operation"
+                    .to_string()
+                    .into(),
+            );
+        }
+    }
+    let result = crate::publisher_commands::JOURNAL
+        .scope(journal.clone(), async {
+            if resume {
+                crate::publisher_commands::reconcile_authorizations(&state, &journal, &session)
+                    .await?;
+            }
+            publish_adp_listing_pipeline_inner(
+                request,
+                extension,
+                app,
+                state,
+                signer_state,
+                lease.as_ref(),
+                &session,
+            )
+            .await
+        })
+        .await;
+    if let Ok(result) = &result {
+        repo.complete(
+            &publisher,
+            &operation_id.to_string(),
+            &serde_json::to_value(result).map_err(|_| "Invalid publisher result".to_string())?,
+        )
+        .await?;
+    }
+    session.ensure_current()?;
     match result {
         Ok(result) => {
             if let Some(lease) = lease {
                 lease.finish().await;
             }
+            session.ensure_current()?;
             Ok(result)
         }
         Err(error) => Err(error),
@@ -3279,6 +3884,11 @@ async fn preflight_upload_capacity(
     http: &Arc<dyn HttpClient>,
 ) -> Result<(), PublishAdpListingError> {
     for server in servers {
+        arcadestr_core::http_client::validate_publication_endpoint(server).map_err(|_| {
+            PublishAdpListingError::Upload {
+                message: "unsafe publication endpoint".into(),
+            }
+        })?;
         let info = AdpClient::new(server.clone(), Arc::clone(http))
             .well_known()
             .await
@@ -3296,6 +3906,47 @@ async fn preflight_upload_capacity(
     Ok(())
 }
 
+async fn discover_listing_authorizations(
+    state: &State<'_, AppState>,
+    listing: &nostr::Event,
+) -> Result<Vec<arcadestr_core::authorization::ResolvedAuthorization>, String> {
+    let parsed = arcadestr_core::marketplace::parse_listing(listing.clone())?;
+    if !parsed.malformed_fulfillment_authorization_tags.is_empty() {
+        return Err("Malformed signed authority references require explicit review; metadata edits cannot discard them.".into());
+    }
+    let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
+    let manager = relay_manager.lock().await.clone();
+    let mut resolved = Vec::new();
+    for reference in parsed.fulfillment_authorizations {
+        if resolved.iter().any(
+            |authorization: &arcadestr_core::authorization::ResolvedAuthorization| {
+                authorization.root_event_id == reference.root_event_id
+            },
+        ) {
+            continue;
+        }
+        resolved.push(arcadestr_core::authorization::discover_authorization(&manager, reference.root_event_id, listing.pubkey).await
+            .map_err(|_| "Authorization evidence is unavailable, incomplete or invalid. Restore relay visibility and reload; no authority was renewed.".to_string())?);
+    }
+    arcadestr_core::authorization::validate_listing_authorization_references(listing, &resolved)?;
+    Ok(resolved)
+}
+
+async fn ensure_listing_revision_current(
+    state: &State<'_, AppState>,
+    coordinate: &str,
+    expected: Option<&nostr::Event>,
+) -> Result<(), String> {
+    let current = fetch_replaceable_listing_event_by_coordinate(state, coordinate).await?;
+    if current.is_none() && expected.is_some() {
+        return Err("The expected revision is not visible on the selected relays. Visibility is incomplete; restore relay access and reload before retrying.".into());
+    }
+    if current.as_ref().map(|event| event.id) != expected.map(|event| event.id) {
+        return Err("The selected relays show a concurrent Game page replacement. Reload before retrying; publication uses optimistic checks, not distributed CAS.".into());
+    }
+    Ok(())
+}
+
 async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
     request: PublishAdpListingRequest,
     extension: PublishAdpListingRequestExtension,
@@ -3303,7 +3954,9 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
     state: State<'_, AppState>,
     signer_state: State<'_, Arc<tokio::sync::Mutex<AppSignerState>>>,
     publication_lease: Option<&PublicationLease>,
+    session: &arcadestr_core::settlement_recovery::SessionFence,
 ) -> Result<PublishAdpListingResult, PublishAdpListingError> {
+    session.ensure_current()?;
     let expected_publisher = nostr::PublicKey::from_bech32(&request.expected_publisher_npub)
         .map_err(|error| PublishAdpListingError::Authority {
             message: format!("invalid expected publisher npub: {error}"),
@@ -3336,10 +3989,55 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
         Some((event, _)) => authoritative_reused_file_hash(&request, event)?,
         None => None,
     };
+    if let (Some(journal), Some((event, _))) = (
+        crate::publisher_commands::journal(),
+        authoritative_edit.as_ref(),
+    ) {
+        let key = "original-listing-revision";
+        if journal.step(key).await?.is_none() {
+            journal
+                .prepare(
+                    key,
+                    "source_listing",
+                    &event.id.to_hex(),
+                    serde_json::to_value(event)
+                        .map_err(|_| "Invalid source listing".to_string())?,
+                )
+                .await?;
+            journal
+                .ack(key, serde_json::json!({"event_id":event.id}))
+                .await?;
+        }
+    }
+    let existing_authorizations = if let Some((event, _)) = authoritative_edit.as_ref() {
+        discover_listing_authorizations(&state, event).await?
+    } else {
+        Vec::new()
+    };
+    let campaign_references = arcadestr_core::marketplace::merge_campaign_references(
+        authoritative_edit.as_ref().map(|(event, _)| event),
+        &request
+            .campaigns
+            .iter()
+            .map(|pointer| (pointer.root_event_id.clone(), pointer.relay_hint.clone()))
+            .collect::<Vec<_>>(),
+    )?;
+    let commercial_refs = validate_publisher_commercial_intent(
+        &state,
+        &request,
+        &extension,
+        authoritative_edit.as_ref().map(|(event, _)| event),
+    )
+    .await?;
+    session.ensure_current()?;
     let resolved_file_hash = publication_lease
         .map(|lease| lease.digest.as_str().to_owned())
         .or(authoritative_reused_hash);
     require_launch_tier_file_hash(&extension, resolved_file_hash.as_deref())?;
+    for server in &request.servers {
+        arcadestr_core::http_client::validate_publication_endpoint(server)
+            .map_err(|_| "Unsafe distribution endpoint".to_string())?;
+    }
     if let Some(lease) = publication_lease {
         preflight_upload_capacity(&request.servers, lease.file_size, &state.http_client).await?;
     }
@@ -3349,9 +4047,13 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
     // detects changes before this refetch; the later relay-to-sign window remains
     // optimistic until a separate CAS/revision-locking phase exists.
     let auth_snapshot = { state.auth.lock().await.clone() };
-    let signer = resolve_active_signer(signer_state.inner(), &auth_snapshot)
+    let active_signer = resolve_active_signer(signer_state.inner(), &auth_snapshot)
         .await
         .map_err(|message| PublishAdpListingError::Authority { message })?;
+    let signer: Arc<dyn NostrSigner> = Arc::new(PublicationSigner {
+        signer: active_signer,
+        session: session.clone(),
+    });
     let developer_pubkey =
         signer
             .get_public_key()
@@ -3413,6 +4115,21 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
         )
     };
     let game_d_tag = game.d_tag();
+    session.ensure_current()?;
+    let _coordinate_lease = state.settlement_recovery.claim(
+        &developer_npub,
+        &format!("publish:{}", game.to_coordinate_string()),
+    )?;
+    let app = Arc::new(PublicationProgress {
+        app,
+        operation_id: extension
+            .operation_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        publisher_npub: request.expected_publisher_npub.clone(),
+        game_coordinate: game.to_coordinate_string(),
+        session: session.clone(),
+    });
     if game.generated_game_id().is_some() {
         // The identity of a first publication is settled but nothing has been
         // published under it yet. Hand it to the caller before any step that
@@ -3429,14 +4146,99 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
     let FulfillmentMetadata {
         fulfillment_pubkey: mut fulfillment_pubkey,
         should_provision,
-    } = resolve_existing_fulfillment_metadata(
-        &request.fulfillment_mode,
-        &developer_npub,
-        request.existing_fulfillment_pubkey.as_deref(),
+    } = if authoritative_edit.is_some() {
+        if matches!(request.fulfillment_mode, FulfillmentMode::Delegate)
+            && existing_authorizations.is_empty()
+            && !extension.authorize_operators
+        {
+            return Err("This listing has no verified delegated authority. Set up authority explicitly before selecting delegated fulfillment; metadata edits never issue it.".to_string().into());
+        }
+        FulfillmentMetadata {
+            fulfillment_pubkey: None,
+            should_provision: extension.authorize_operators,
+        }
+    } else {
+        if request.existing_fulfillment_pubkey.is_some() {
+            return Err(
+                "A claimed fulfillment key cannot bootstrap a new listing's authority."
+                    .to_string()
+                    .into(),
+            );
+        }
+        resolve_existing_fulfillment_metadata(&request.fulfillment_mode, &developer_npub, None)?
+    };
+    let mut resolved_servers = Vec::new();
+    for server in &request.servers {
+        session.ensure_current()?;
+        let info = AdpClient::new(server.clone(), Arc::clone(&state.http_client))
+            .well_known()
+            .await
+            .map_err(|e| e.to_string())?;
+        resolved_servers.push((server.clone(), info.pubkey));
+    }
+    let operator_plans = arcadestr_core::publisher_management::operator_plans(
+        &resolved_servers,
+        &extension.server_roles,
+        request.operator_url.as_deref(),
     )?;
+    if let Some(journal) = crate::publisher_commands::journal() {
+        let upload_expected = journal
+            .repo
+            .operation(&journal.publisher, &journal.operation_id)
+            .await?
+            .artifact_hash
+            .is_some();
+        for plan in &operator_plans {
+            for url in &plan.urls {
+                journal.prepare(&format!("distribution:{url}"), "distribution", url, serde_json::json!({"operator":plan.operator.to_hex(),"capabilities":plan.capabilities,"upload_expected":upload_expected,"provision_url":plan.urls.first()})).await?;
+            }
+        }
+    }
+    if publication_lease.is_some()
+        && !existing_authorizations.is_empty()
+        && !extension.authorize_operators
+    {
+        let (listing, _) = authoritative_edit
+            .as_ref()
+            .ok_or_else(|| "Missing authoritative listing".to_string())?;
+        let references = arcadestr_core::authorization::validate_listing_authorization_references(
+            listing,
+            &existing_authorizations,
+        )?;
+        let listed_candidates = references
+            .iter()
+            .map(|reference| reference.fulfillment_pubkey)
+            .collect();
+        let required = BTreeSet::from([CAPABILITY_UPLOAD_BUILD.to_string()]);
+        for server in &request.servers {
+            let info = AdpClient::new(server.clone(), Arc::clone(&state.http_client))
+                .well_known()
+                .await
+                .map_err(|e| e.to_string())?;
+            let operator = nostr::PublicKey::from_hex(&info.pubkey)
+                .map_err(|_| "Invalid operator key".to_string())?;
+            // Selection establishes a listed, currently authorized candidate only.
+            // Key availability remains the server's responsibility; an acknowledgement
+            // is not cryptographic evidence or a new source of distribution authority.
+            if arcadestr_core::authorization::select_reusable_authorization(
+                &existing_authorizations,
+                &references,
+                &listed_candidates,
+                operator,
+                &game.to_coordinate_string(),
+                &required,
+                nostr::Timestamp::now().as_secs(),
+            )
+            .is_none()
+            {
+                return Err("No existing current upload-build capability matches a selected operator. Review authority explicitly; no root was renewed or capability expanded.".to_string().into());
+            }
+        }
+    }
 
     let mut file_hash = None;
     let mut acceptance_event_id = None;
+    let mut new_authorizations = Vec::new();
 
     match request.fulfillment_mode {
         FulfillmentMode::None => {}
@@ -3515,161 +4317,168 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
             file_hash = Some(hash);
 
             if should_provision {
-                let operator_url = request.operator_url.as_deref().ok_or_else(|| {
-                    "operator URL is required for delegated fulfillment".to_string()
-                })?;
-                if operator_url.trim().is_empty() {
-                    return Err("operator URL is required for delegated fulfillment"
-                        .to_string()
-                        .into());
-                }
-                emit_progress(
-                    &app,
-                    "check-operator",
-                    "pending",
-                    Some(operator_url.to_string()),
-                )?;
-                let adp_client =
-                    AdpClient::new(operator_url.to_string(), Arc::clone(&state.http_client));
-                let server_info = adp_client
-                    .well_known()
-                    .await
-                    .map_err(|err| progress_error(&app, "check-operator", err))?;
-                emit_progress(
-                    &app,
-                    "check-operator",
-                    "ok",
-                    Some(server_info.pubkey.clone()),
-                )?;
-
-                let provisioning_repo =
-                    AdpProvisioningRepository::new(state.database.pool().clone());
-                let scope = game_d_tag.as_str();
-
-                emit_progress(&app, "provision", "pending", None)?;
-                let provisioning = resolve_provisioning(ResolveProvisioningInput {
-                    provisioning_repo: &provisioning_repo,
-                    adp_client: &adp_client,
-                    signer: signer.as_ref(),
-                    developer_pubkey,
-                    developer_npub: &developer_npub,
-                    server_url: operator_url,
-                    scope,
-                    server_info: &server_info,
-                })
-                .await
-                .inspect_err(|error| {
-                    let _ = emit_progress(&app, "provision", "error", Some(error.to_string()));
-                })?;
-
-                match provisioning {
-                    ProvisioningDecision::Reused {
-                        fulfillment_pubkey: reused_pubkey,
-                        authorization_event_id,
-                        valid_from: _,
-                        authorization_event,
-                        attestation,
-                        row,
-                    } => {
-                        validate_current_attestation(&state, &row, attestation.as_deref()).await?;
-                        ensure_publish_account_current(
-                            &state,
-                            signer_state.inner(),
-                            developer_pubkey,
-                        )
-                        .await?;
-                        provisioning_repo
-                            .upsert(&row)
-                            .await
-                            .map_err(|err| progress_error(&app, "provision", err))?;
-                        publish_event(&state, &authorization_event)
-                            .await
-                            .map_err(|err| progress_error(&app, "provision", err))?;
-                        emit_progress(
-                            &app,
-                            "provision",
-                            "ok",
-                            Some("reused existing provisioning".into()),
-                        )?;
-                        fulfillment_pubkey = Some(reused_pubkey);
-                        acceptance_event_id = Some(authorization_event_id);
+                for plan in &operator_plans {
+                    let operator_url = plan
+                        .urls
+                        .first()
+                        .ok_or("Missing operator endpoint".to_string())?
+                        .as_str();
+                    let matching = existing_authorizations
+                        .iter()
+                        .filter(|authority| authority.terms.operator_pubkey == plan.operator)
+                        .collect::<Vec<_>>();
+                    if !matching.is_empty() {
+                        if matching.iter().any(|authority| {
+                            authority.cancelled_at.is_none()
+                                && plan.capabilities.is_subset(&authority.terms.capabilities)
+                                && authority.terms.valid_from <= nostr::Timestamp::now().as_secs()
+                        }) {
+                            continue; // Preserve the already-listed authority verbatim; no POST or new root.
+                        }
+                        return Err("Existing operator authority is cancelled, stale or lacks the requested capabilities. Setup never silently renews or expands it".to_string().into());
                     }
-                    ProvisioningDecision::Created {
-                        fulfillment_pubkey: created_pubkey,
-                        authorization_event_id,
-                        valid_from: _,
-                        authorization_event,
-                        attestation,
-                        row,
-                    } => {
-                        validate_current_attestation(&state, &row, attestation.as_deref()).await?;
-                        ensure_publish_account_current(
-                            &state,
-                            signer_state.inner(),
-                            developer_pubkey,
-                        )
-                        .await?;
-                        provisioning_repo
-                            .upsert(&row)
-                            .await
-                            .map_err(|err| progress_error(&app, "provision", err))?;
-                        publish_event(&state, &authorization_event)
-                            .await
-                            .map_err(|err| progress_error(&app, "provision", err))?;
-                        emit_progress(
-                            &app,
-                            "provision",
-                            "ok",
-                            Some("created provisioning".into()),
-                        )?;
-                        fulfillment_pubkey = Some(created_pubkey);
-                        acceptance_event_id = Some(authorization_event_id);
-                    }
-                }
-            } else if let Some(existing_pubkey) =
-                existing_authorization_repair_key(should_provision, fulfillment_pubkey.as_deref())
-            {
-                let operator_url = request.operator_url.as_deref().ok_or_else(|| {
-                    "operator URL is required to repair delegated fulfillment authorization"
-                        .to_string()
-                })?;
-                if operator_url.trim().is_empty() {
-                    return Err(
-                        "operator URL is required to repair delegated fulfillment authorization"
+                    emit_progress(
+                        &app,
+                        "check-operator",
+                        "pending",
+                        Some(operator_url.to_string()),
+                    )?;
+                    let adp_client =
+                        AdpClient::new(operator_url.to_string(), Arc::clone(&state.http_client));
+                    let server_info = adp_client
+                        .well_known()
+                        .await
+                        .map_err(|err| progress_error(&app, "check-operator", err))?;
+                    if server_info.pubkey != plan.operator.to_hex() {
+                        return Err("Operator identity changed during provisioning"
                             .to_string()
-                            .into(),
-                    );
-                }
+                            .into());
+                    }
+                    emit_progress(
+                        &app,
+                        "check-operator",
+                        "ok",
+                        Some(server_info.pubkey.clone()),
+                    )?;
 
-                let provisioning_repo =
-                    AdpProvisioningRepository::new(state.database.pool().clone());
-                let adp_client =
-                    AdpClient::new(operator_url.to_string(), Arc::clone(&state.http_client));
-                let provision = adp_client
-                    .provision(signer.as_ref(), Some(game_d_tag.as_str()))
+                    let provisioning_repo =
+                        AdpProvisioningRepository::new(state.database.pool().clone());
+                    let scope = game_d_tag.as_str();
+
+                    emit_progress(&app, "provision", "pending", None)?;
+                    let pending_row = provisioning_repo
+                        .active_for_scope(&developer_npub, operator_url, Some(scope))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let reusable_authorization = if let Some(row) = &pending_row {
+                        let root = row.authorization_root_event_id.as_deref().ok_or_else(|| "Pending authority has no exact root; review it explicitly before retrying.".to_string())?;
+                        let root = nostr::EventId::from_hex(root)
+                            .map_err(|_| "Invalid pending authority root".to_string())?;
+                        let relay_manager =
+                            { state.nostr.lock().await.get_relay_manager().clone() };
+                        let manager = relay_manager.lock().await.clone();
+                        Some(arcadestr_core::authorization::discover_authorization(&manager, root, developer_pubkey).await
+                        .map_err(|_| "Pending authority evidence is incomplete; restore relay visibility before retrying.".to_string())?)
+                    } else {
+                        None
+                    };
+                    let provisioning = resolve_provisioning(ResolveProvisioningInput {
+                        provisioning_repo: &provisioning_repo,
+                        adp_client: &adp_client,
+                        signer: signer.as_ref(),
+                        developer_pubkey,
+                        developer_npub: &developer_npub,
+                        server_url: operator_url,
+                        scope,
+                        server_info: &server_info,
+                        reusable_authorization: reusable_authorization.as_ref(),
+                        required_capabilities: plan.capabilities.clone(),
+                    })
                     .await
-                    .map_err(|error| progress_error(&app, "provision", error))?;
-                let repair = repair_existing_authorization(ExistingAuthorizationRepairInput {
-                    provisioning_repo: &provisioning_repo,
-                    signer: signer.as_ref(),
-                    developer_pubkey,
-                    developer_hex: &developer_npub,
-                    operator_url,
-                    scope: game_d_tag.as_str(),
-                    fulfillment_pubkey: existing_pubkey,
-                    provision: &provision,
-                })
-                .await?;
-                validate_current_attestation(&state, &repair.row, repair.attestation.as_deref())
-                    .await?;
-                ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey)
-                    .await?;
-                provisioning_repo
-                    .upsert(&repair.row)
-                    .await
-                    .map_err(|err| err.to_string())?;
-                publish_event(&state, &repair.authorization_event).await?;
-                acceptance_event_id = Some(repair.authorization_event_id);
+                    .inspect_err(|error| {
+                        let _ = emit_progress(&app, "provision", "error", Some(error.to_string()));
+                    })?;
+
+                    match provisioning {
+                        ProvisioningDecision::Reused {
+                            fulfillment_pubkey: reused_pubkey,
+                            authorization_event_id,
+                            valid_from: _,
+                            authorization_event,
+                            attestation,
+                            row,
+                        } => {
+                            validate_current_attestation(&state, &row, attestation.as_deref())
+                                .await?;
+                            ensure_publish_account_current(
+                                &state,
+                                signer_state.inner(),
+                                developer_pubkey,
+                                session,
+                            )
+                            .await?;
+                            provisioning_repo
+                                .upsert(&row)
+                                .await
+                                .map_err(|err| progress_error(&app, "provision", err))?;
+                            session.ensure_current()?;
+                            publish_authorization_once(&state, &authorization_event, session)
+                                .await
+                                .map_err(|err| progress_error(&app, "provision", err))?;
+                            emit_progress(
+                                &app,
+                                "provision",
+                                "ok",
+                                Some("reused existing provisioning".into()),
+                            )?;
+                            fulfillment_pubkey = Some(reused_pubkey);
+                            acceptance_event_id = Some(authorization_event_id);
+                        }
+                        ProvisioningDecision::Created {
+                            fulfillment_pubkey: created_pubkey,
+                            authorization_event_id,
+                            valid_from: _,
+                            authorization_event,
+                            attestation,
+                            row,
+                        } => {
+                            validate_current_attestation(&state, &row, attestation.as_deref())
+                                .await?;
+                            ensure_publish_account_current(
+                                &state,
+                                signer_state.inner(),
+                                developer_pubkey,
+                                session,
+                            )
+                            .await?;
+                            provisioning_repo
+                                .upsert(&row)
+                                .await
+                                .map_err(|err| progress_error(&app, "provision", err))?;
+                            session.ensure_current()?;
+                            publish_authorization_once(&state, &authorization_event, session)
+                                .await
+                                .map_err(|err| progress_error(&app, "provision", err))?;
+                            emit_progress(
+                                &app,
+                                "provision",
+                                "ok",
+                                Some("created provisioning".into()),
+                            )?;
+                            fulfillment_pubkey = Some(created_pubkey);
+                            acceptance_event_id = Some(authorization_event_id);
+                        }
+                    }
+                    new_authorizations.push(FulfillmentAuthorizationInput {
+                        root_event_id: acceptance_event_id
+                            .clone()
+                            .ok_or("Missing authorization root".to_string())?,
+                        fulfillment_pubkey: fulfillment_pubkey
+                            .clone()
+                            .ok_or("Missing provisioned key".to_string())?,
+                        relay_hint: None,
+                    });
+                }
             }
         }
     }
@@ -3685,31 +4494,13 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
     }
 
     emit_progress(&app, "publish-listing", "pending", None)?;
-    ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey).await?;
-    let fulfillment_authorizations =
-        if matches!(request.fulfillment_mode, FulfillmentMode::Delegate) {
-            acceptance_event_id
-                .as_ref()
-                .zip(fulfillment_pubkey.as_ref())
-                .map(|(root_event_id, fulfillment_pubkey)| {
-                    vec![FulfillmentAuthorizationInput {
-                        root_event_id: root_event_id.clone(),
-                        fulfillment_pubkey: fulfillment_pubkey.clone(),
-                        relay_hint: None,
-                    }]
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+    ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey, session).await?;
+    let fulfillment_authorizations = new_authorizations;
     // The authoritative listing supplies identity, concurrency and unmanaged
     // metadata only. Every field the form owns is republished from the form's
     // current values, so a retry after a partial publication carries the
     // publisher's latest intent rather than the half-published state.
-    let preserved_tags = preserved_listing_tags(
-        &existing_listing_tags,
-        !fulfillment_authorizations.is_empty(),
-    );
+    let preserved_tags = preserved_listing_tags(&existing_listing_tags);
     let mut listing_input = AdpListingInput {
         d_tag: game_d_tag.clone(),
         title: request.title.clone(),
@@ -3724,15 +4515,14 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
         fulfillment_authorizations,
         acquisition: request.acquisition.clone(),
         platforms: request.platforms.clone(),
-        campaigns: request
-            .campaigns
-            .iter()
-            .map(|pointer| (pointer.root_event_id.clone(), pointer.relay_hint.clone()))
-            .collect(),
+        campaigns: campaign_references,
         nip94_event_id: request.nip94_event_id.clone(),
         preserved_tags,
     };
-    if !request.accepted_terms.is_empty() {
+    if matches!(
+        extension.commercial_intent,
+        arcadestr_core::adp_settlement::PublisherCommercialIntent::ReplaceAfterReview { .. }
+    ) {
         let mut operators = Vec::new();
         for server in &request.servers {
             let info = AdpClient::new(server.clone(), Arc::clone(&state.http_client))
@@ -3749,23 +4539,42 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
         arcadestr_core::adp_publish::apply_managed_adp_terms(
             &mut listing_input,
             &operators,
-            &request.accepted_terms,
+            &commercial_refs,
         )
         .map_err(|error| PublishAdpListingError::Other {
             message: error.to_string(),
         })?;
     }
-    let listing_builder = build_adp_listing_event_builder(AdpListingPublishInput {
+    let mut listing_builder = build_adp_listing_event_builder(AdpListingPublishInput {
         listing: &listing_input,
         launch_tier: extension.launch_tier.as_ref(),
     })
     .map_err(PublishAdpListingError::from)?;
-    ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey).await?;
+    ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey, session).await?;
     if let Some(lease) = publication_lease {
         lease
             .verify_digest()
             .await
             .map_err(|error| PublishAdpListingError::Archive { error })?;
+    }
+    let predecessor = authoritative_edit.as_ref().map(|(event, _)| event);
+    ensure_listing_revision_current(&state, &game.to_coordinate_string(), predecessor).await?;
+    session.ensure_current()?;
+    let retained_listing = if let Some(journal) = crate::publisher_commands::journal() {
+        journal
+            .step(&format!("signed:30402:{}", game_d_tag))
+            .await?
+            .is_some()
+    } else {
+        false
+    };
+    if let Some(predecessor) = predecessor.filter(|_| !retained_listing) {
+        listing_builder = listing_builder.custom_created_at(
+            arcadestr_core::marketplace::listing_replacement_timestamp(
+                predecessor,
+                nostr::Timestamp::now(),
+            )?,
+        );
     }
     let listing_event =
         validate_and_sign_adp_listing(signer.as_ref(), listing_builder.build(developer_pubkey))
@@ -3775,14 +4584,34 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
             })?;
     // Signing can involve a remote signer. Revalidate after it returns and before
     // making the signed listing irreversible on relays.
-    ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey)
+    validate_publisher_commercial_intent(
+        &state,
+        &request,
+        &extension,
+        authoritative_edit.as_ref().map(|(event, _)| event),
+    )
+    .await?;
+    ensure_listing_revision_current(&state, &game.to_coordinate_string(), predecessor).await?;
+    ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey, session)
         .await
         .map_err(|message| PublishAdpListingError::Authority { message })?;
-    publish_event(&state, &listing_event)
-        .await
-        .map_err(|error| PublishAdpListingError::Relay {
-            message: progress_error(&app, "publish-listing", error),
-        })?;
+    session.ensure_current()?;
+    if predecessor.is_some_and(|event| event.id == listing_event.id) {
+        if let Some(journal) = crate::publisher_commands::before_publish(&listing_event).await? {
+            journal
+                .ack(
+                    &format!("relay:{}", listing_event.id),
+                    serde_json::json!({"accepted":true}),
+                )
+                .await?;
+        }
+    } else {
+        publish_event(&state, &listing_event, session)
+            .await
+            .map_err(|error| PublishAdpListingError::Relay {
+                message: progress_error(&app, "publish-listing", error),
+            })?;
+    }
     emit_progress(
         &app,
         "publish-listing",
@@ -3797,19 +4626,24 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
 
     emit_progress(&app, "confirm-propagation", "pending", None)?;
     let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
-    let propagated = confirm_nip99_listing_propagated(&relay_manager, &coordinate, 2)
+    let propagated = confirm_nip99_listing_propagated(&relay_manager, &listing_event, 2)
         .await
-        .map_err(|err| progress_error(&app, "confirm-propagation", err))?;
+        .map_err(|err| PublishAdpListingError::PartialPublication {
+            cause: Box::new(PublishAdpListingError::Relay {
+                message: progress_error(&app, "confirm-propagation", err),
+            }),
+            successful_servers: Vec::new(),
+        })?;
     if !propagated {
         emit_progress(
             &app,
             "confirm-propagation",
             "error",
-            Some("listing not visible on two relays".into()),
+            Some("exact current listing revision not confirmed on two selected relays; visibility may be incomplete".into()),
         )?;
-        return Err(PublishAdpListingError::Relay {
-            message: "listing not visible on two relays".to_string(),
-        });
+        return Err(PublishAdpListingError::PartialPublication { cause: Box::new(PublishAdpListingError::Relay {
+            message: "Exact current listing revision not confirmed on two selected relays; refresh before retrying (this is not global consensus).".to_string(),
+        }), successful_servers: Vec::new() });
     }
     emit_progress(&app, "confirm-propagation", "ok", Some(coordinate.clone()))?;
 
@@ -3820,7 +4654,46 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
         })?;
         let mut upload_errors = Vec::new();
         for server_url in &request.servers {
-            ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey)
+            if matches!(request.fulfillment_mode, FulfillmentMode::Delegate)
+                || !existing_authorizations.is_empty()
+            {
+                let authority_check: Result<(), String> = async {
+                    let current_authorizations = discover_listing_authorizations(&state, &listing_event).await?;
+                    let references = arcadestr_core::authorization::validate_listing_authorization_references(&listing_event, &current_authorizations)?;
+                    let candidates = references.iter().map(|reference| reference.fulfillment_pubkey).collect();
+                    let info = AdpClient::new(server_url.clone(), Arc::clone(&state.http_client)).well_known().await.map_err(|e| e.to_string())?;
+                    let operator = nostr::PublicKey::from_hex(&info.pubkey).map_err(|_| "Invalid operator".to_string())?;
+                    if arcadestr_core::authorization::select_reusable_authorization(&current_authorizations, &references, &candidates, operator, &coordinate, &BTreeSet::from([CAPABILITY_UPLOAD_BUILD.into()]), nostr::Timestamp::now().as_secs()).is_none() {
+                        return Err("Upload authority changed or is unavailable; review it explicitly. No root was renewed.".into());
+                    }
+                    Ok(())
+                }.await;
+                if authority_check.is_err() {
+                    if let Some(journal) = crate::publisher_commands::journal() {
+                        journal.failed(&format!("distribution:{server_url}"),"Current upload authority could not be verified; this upload attempt did not start").await?;
+                    }
+                }
+                authority_check.map_err(|message| PublishAdpListingError::PartialPublication {
+                    cause: Box::new(PublishAdpListingError::Authority { message }),
+                    successful_servers: uploads
+                        .iter()
+                        .filter(|upload| upload.status == "ok")
+                        .map(|upload| upload.server_url.clone())
+                        .collect(),
+                })?;
+            }
+            ensure_listing_revision_current(&state, &coordinate, Some(&listing_event))
+                .await
+                .map_err(|message| PublishAdpListingError::PartialPublication {
+                    cause: Box::new(PublishAdpListingError::Relay { message }),
+                    successful_servers: uploads
+                        .iter()
+                        .filter(|upload| upload.status == "ok")
+                        .map(|upload| upload.server_url.clone())
+                        .collect(),
+                })?;
+            session.ensure_current()?;
+            ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey, session)
                 .await
                 .map_err(|message| PublishAdpListingError::PartialPublication {
                     cause: Box::new(PublishAdpListingError::Authority { message }),
@@ -3850,6 +4723,30 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
                     );
                 }
             };
+            let upload_step = format!("upload:{server_url}");
+            let journal = crate::publisher_commands::journal();
+            let retained = if let Some(journal) = &journal {
+                journal.external_checkpoint(&upload_step, "upload", server_url, serde_json::json!({"event_id":listing_event.id,"file_hash":lease.digest.as_str(),"coordinate":coordinate})).await?
+            } else {
+                None
+            };
+            if let Some(outcome) = retained {
+                let upload: UploadResponse = serde_json::from_value(outcome)
+                    .map_err(|_| "Invalid retained upload acknowledgement".to_string())?;
+                arcadestr_core::adp_client::validate_upload_acknowledgement(
+                    &listing_event,
+                    &lease.digest,
+                    &upload,
+                )
+                .map_err(|_| "Retained upload does not match the pinned artifact".to_string())?;
+                uploads.push(PublishServerUploadResult {
+                    server_url: server_url.clone(),
+                    status: "ok".into(),
+                    error: None,
+                    upload: Some(upload),
+                });
+                continue;
+            }
             let upload = lease
                 .upload_with_progress(
                     &adp_client,
@@ -3857,11 +4754,31 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
                     &listing_event,
                     &request.expected_publisher_npub,
                     crate::archive_commands::account_check(&state, &signer_state),
+                    session,
                     progress,
                 )
                 .await;
-            if let Err(message) =
-                ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey).await
+            if let Some(journal) = &journal {
+                if upload.is_err() {
+                    journal.failed(&upload_step, "Upload response failed or was interrupted; the remote outcome remains unacknowledged").await?;
+                }
+            }
+            if let (Some(journal), Ok(response)) = (&journal, &upload) {
+                journal
+                    .ack(
+                        &upload_step,
+                        serde_json::to_value(response)
+                            .map_err(|_| "Invalid upload acknowledgement".to_string())?,
+                    )
+                    .await?;
+            }
+            if let Err(message) = ensure_publish_account_current(
+                &state,
+                signer_state.inner(),
+                developer_pubkey,
+                session,
+            )
+            .await
             {
                 let mut successful_servers = uploads
                     .iter()
@@ -3948,7 +4865,43 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
         }
     }
 
+    if publication_lease.is_none() {
+        if let Some(journal) = crate::publisher_commands::journal() {
+            for step in journal
+                .repo
+                .steps(&journal.publisher, &journal.operation_id)
+                .await?
+                .into_iter()
+                .filter(|step| step.kind == "upload" && step.state == "acknowledged")
+            {
+                let response: UploadResponse = serde_json::from_value(
+                    step.outcome
+                        .ok_or_else(|| "Missing retained upload acknowledgement".to_string())?,
+                )
+                .map_err(|_| "Invalid retained upload acknowledgement".to_string())?;
+                let digest = arcadestr_core::distribution::Sha256Digest::parse(
+                    file_hash
+                        .as_deref()
+                        .ok_or_else(|| "Missing pinned artifact hash".to_string())?,
+                )
+                .map_err(|_| "Invalid pinned artifact hash".to_string())?;
+                arcadestr_core::adp_client::validate_upload_acknowledgement(
+                    &listing_event,
+                    &digest,
+                    &response,
+                )
+                .map_err(|_| "Retained upload acknowledgement mismatch".to_string())?;
+                uploads.push(PublishServerUploadResult {
+                    server_url: step.target,
+                    status: "ok".into(),
+                    error: None,
+                    upload: Some(response),
+                });
+            }
+        }
+    }
     Ok(PublishAdpListingResult {
+        operation_id: app.operation_id.clone(),
         event_id: listing_event.id.to_hex(),
         game_id: game.generated_game_id(),
         d_tag: game_d_tag,
@@ -4051,158 +5004,121 @@ struct ResolveProvisioningInput<'a> {
     server_url: &'a str,
     scope: &'a str,
     server_info: &'a AdpServerInfo,
-}
-
-struct ExistingAuthorizationRepairInput<'a> {
-    provisioning_repo: &'a AdpProvisioningRepository,
-    signer: &'a dyn NostrSigner,
-    developer_pubkey: nostr::PublicKey,
-    developer_hex: &'a str,
-    operator_url: &'a str,
-    scope: &'a str,
-    fulfillment_pubkey: &'a str,
-    provision: &'a ProvisionResponse,
-}
-
-struct ExistingAuthorizationRepair {
-    authorization_event_id: String,
-    authorization_event: nostr::Event,
-    attestation: Option<Box<nostr::Event>>,
-    row: AdpProvisioning,
-}
-
-fn existing_authorization_repair_key(
-    should_provision: bool,
-    fulfillment_pubkey: Option<&str>,
-) -> Option<&str> {
-    (!should_provision).then_some(fulfillment_pubkey).flatten()
-}
-
-async fn repair_existing_authorization(
-    input: ExistingAuthorizationRepairInput<'_>,
-) -> Result<ExistingAuthorizationRepair, PublishAdpListingError> {
-    if input.provision.fulfillment_pubkey != input.fulfillment_pubkey {
-        return Err(String::from(
-            "distribution provider returned a different active fulfillment key; reload the listing before publishing",
-        )
-        .into());
-    }
-    let matches = input
-        .provisioning_repo
-        .for_fulfillment_scope(input.developer_hex, input.fulfillment_pubkey, input.scope)
-        .await
-        .map_err(|err| err.to_string())?
-        .into_iter()
-        .filter(|row| {
-            row.revoked_at.is_none()
-                && row.server_url == input.operator_url
-                && row.authorization_profile_version >= 2
-                && row.authorization_root_event_id.is_some()
-        })
-        .collect::<Vec<_>>();
-    let [mut row] = matches.try_into().map_err(|matches: Vec<AdpProvisioning>| {
-        format!(
-            "expected exactly one active provisioning row for delegated authorization repair, found {}",
-            matches.len()
-        )
-    })?;
-    let valid_from: u64 = now_unix_i64()?
-        .try_into()
-        .map_err(|_| "current time is negative".to_string())?;
-    let coordinate = format!("30402:{}:{}", input.developer_pubkey.to_hex(), input.scope);
-    let terms = AuthorizationTerms {
-        authorization_id: uuid::Uuid::new_v4().to_string(),
-        coordinate,
-        operator_pubkey: nostr::PublicKey::from_hex(&row.operator_pubkey)
-            .map_err(|_| "stored operator pubkey is invalid".to_string())?,
-        fulfillment_pubkey: nostr::PublicKey::from_hex(input.fulfillment_pubkey)
-            .map_err(|_| "stored fulfillment pubkey is invalid".to_string())?,
-        capabilities: BTreeSet::from([
-            CAPABILITY_ISSUE_RECEIPT.into(),
-            CAPABILITY_ISSUE_GRANT.into(),
-            CAPABILITY_UPLOAD_BUILD.into(),
-        ]),
-        valid_from,
-    };
-    let builder = build_fulfillment_authorization_event_builder(&terms)
-        .map_err(PublishAdpListingError::from)?;
-    let authorization_event = input
-        .signer
-        .sign_event(builder.build(input.developer_pubkey))
-        .await
-        .map_err(|error| PublishAdpListingError::Signer {
-            message: error.to_string(),
-        })?;
-    let authorization_event_id = authorization_event.id.to_hex();
-    row.acceptance_event_id = authorization_event_id.clone();
-    row.valid_from = valid_from
-        .try_into()
-        .map_err(|_| "authorization valid_from exceeds storage range".to_string())?;
-    row.authorization_root_event_id = Some(authorization_event_id.clone());
-    row.authorization_capabilities = terms.capabilities.into_iter().collect();
-    row.authorization_profile_version = 2;
-    row.attestation_event_id = input.provision.attestation_event_id.clone();
-
-    Ok(ExistingAuthorizationRepair {
-        authorization_event_id,
-        authorization_event,
-        attestation: input.provision.attestation.clone().map(Box::new),
-        row,
-    })
+    reusable_authorization: Option<&'a arcadestr_core::authorization::ResolvedAuthorization>,
+    required_capabilities: BTreeSet<String>,
 }
 
 async fn resolve_provisioning(
     input: ResolveProvisioningInput<'_>,
 ) -> Result<ProvisioningDecision, PublishAdpListingError> {
     let listing_coordinate = format!("30402:{}:{}", input.developer_pubkey.to_hex(), input.scope);
-    let provision = input
-        .adp_client
-        .provision(input.signer, Some(input.scope))
-        .await
-        .map_err(|err| err.to_string())?;
-
-    if let Some(existing) = input
+    let existing = input
         .provisioning_repo
         .active_for_scope(input.developer_npub, input.server_url, Some(input.scope))
         .await
-        .map_err(|err| err.to_string())?
-        .filter(|existing| {
-            existing.fulfillment_pubkey == provision.fulfillment_pubkey
-                && existing.attestation_event_id == provision.attestation_event_id
-        })
-    {
-        let valid_from: u64 = now_unix_i64()?
-            .try_into()
-            .map_err(|_| "current time is negative".to_string())?;
-        let terms = AuthorizationTerms {
-            authorization_id: uuid::Uuid::new_v4().to_string(),
-            coordinate: listing_coordinate.clone(),
-            operator_pubkey: nostr::PublicKey::from_hex(&existing.operator_pubkey)
-                .map_err(|_| "stored operator pubkey is invalid".to_string())?,
-            fulfillment_pubkey: nostr::PublicKey::from_hex(&existing.fulfillment_pubkey)
-                .map_err(|_| "stored fulfillment pubkey is invalid".to_string())?,
-            capabilities: BTreeSet::from([
-                CAPABILITY_ISSUE_RECEIPT.into(),
-                CAPABILITY_ISSUE_GRANT.into(),
-                CAPABILITY_UPLOAD_BUILD.into(),
-            ]),
-            valid_from,
+        .map_err(|e| e.to_string())?;
+    if let Some(existing) = &existing {
+        let authorization = input.reusable_authorization.ok_or_else(|| "Existing pending authority requires exact chain evidence; no replacement root was issued.".to_string())?;
+        let operator = nostr::PublicKey::from_hex(&input.server_info.pubkey)
+            .map_err(|_| "Invalid operator".to_string())?;
+        let key = nostr::PublicKey::from_hex(&existing.fulfillment_pubkey)
+            .map_err(|_| "Invalid pending key".to_string())?;
+        let references = [
+            arcadestr_core::marketplace::FulfillmentAuthorizationReference {
+                root_event_id: authorization.root_event_id,
+                fulfillment_pubkey: key,
+                relay_hint: None,
+            },
+        ];
+        if authorization.developer_pubkey != input.developer_pubkey
+            || existing.authorization_root_event_id.as_deref()
+                != Some(authorization.root_event_id.to_hex().as_str())
+            || arcadestr_core::authorization::select_reusable_authorization(
+                std::slice::from_ref(authorization),
+                &references,
+                &[key].into_iter().collect(),
+                operator,
+                &listing_coordinate,
+                &input.required_capabilities,
+                nostr::Timestamp::now().as_secs(),
+            )
+            .is_none()
+        {
+            return Err("Pending authority is cancelled, incomplete, misbound or lacks upload-build. Review authority explicitly; retry does not renew or expand it.".to_string().into());
+        }
+    }
+    let provision_step = format!("provision:{}:{}", input.server_url, input.scope);
+    let journal = crate::publisher_commands::journal();
+    let retained = if let Some(journal) = &journal {
+        journal
+            .external_checkpoint(
+                &provision_step,
+                "provision",
+                input.server_url,
+                serde_json::json!({"scope":input.scope,"operator":input.server_info.pubkey}),
+            )
+            .await?
+    } else {
+        None
+    };
+    let provision = if let Some(outcome) = retained {
+        let mut response =
+            serde_json::from_value::<arcadestr_core::adp_client::ProvisionResponse>(outcome)
+                .map_err(|_| "Invalid retained provisioning response".to_string())?;
+        // The POST acknowledgement is historical. Never mistake its embedded
+        // attestation for the current operator state during recovery.
+        response.attestation = None;
+        response
+    } else {
+        let provision_result = input
+            .adp_client
+            .provision(input.signer, Some(input.scope))
+            .await;
+        let provision = match provision_result {
+            Ok(provision) => provision,
+            Err(error) => {
+                if let Some(journal) = &journal {
+                    journal.failed(&provision_step, "Provisioning response failed; the remote outcome remains unacknowledged").await?;
+                }
+                return Err(error.to_string().into());
+            }
         };
-        let authorization_builder = build_fulfillment_authorization_event_builder(&terms)
-            .map_err(PublishAdpListingError::from)?;
-        let authorization_event = input
-            .signer
-            .sign_event(authorization_builder.build(input.developer_pubkey))
-            .await
-            .map_err(|error| PublishAdpListingError::Signer {
-                message: error.to_string(),
-            })?;
+        if let Some(journal) = &journal {
+            journal
+                .ack(
+                    &provision_step,
+                    serde_json::to_value(&provision)
+                        .map_err(|_| "Invalid provisioning response".to_string())?,
+                )
+                .await?;
+        }
+        provision
+    };
+
+    if provision.scope.as_deref() != Some(input.scope) {
+        return Err(
+            "Provisioning response does not match the original game scope"
+                .to_string()
+                .into(),
+        );
+    }
+
+    if let Some(existing) = existing {
+        if existing.fulfillment_pubkey != provision.fulfillment_pubkey {
+            return Err("Operator changed the pending fulfillment key. Review authority explicitly before retrying.".to_string().into());
+        }
+        let authorization = input
+            .reusable_authorization
+            .ok_or_else(|| "Missing pending authority evidence".to_string())?;
+        let authorization_event = authorization
+            .events
+            .first()
+            .ok_or_else(|| "Missing authorization root".to_string())?
+            .event
+            .clone();
         let authorization_event_id = authorization_event.id.to_hex();
         let mut row = existing;
-        row.acceptance_event_id = authorization_event_id.clone();
-        row.authorization_root_event_id = Some(authorization_event_id.clone());
-        row.authorization_capabilities = terms.capabilities.into_iter().collect();
-        row.authorization_profile_version = 2;
+        row.attestation_event_id = provision.attestation_event_id.clone();
 
         return Ok(ProvisioningDecision::Reused {
             fulfillment_pubkey: row.fulfillment_pubkey.clone(),
@@ -4224,11 +5140,7 @@ async fn resolve_provisioning(
             .map_err(|_| "operator pubkey is invalid".to_string())?,
         fulfillment_pubkey: nostr::PublicKey::from_hex(&provision.fulfillment_pubkey)
             .map_err(|_| "provisioned fulfillment pubkey is invalid".to_string())?,
-        capabilities: BTreeSet::from([
-            CAPABILITY_ISSUE_RECEIPT.into(),
-            CAPABILITY_ISSUE_GRANT.into(),
-            CAPABILITY_UPLOAD_BUILD.into(),
-        ]),
+        capabilities: input.required_capabilities.clone(),
         valid_from,
     };
     let authorization_builder = build_fulfillment_authorization_event_builder(&terms)
@@ -4241,6 +5153,20 @@ async fn resolve_provisioning(
             message: error.to_string(),
         })?;
     let authorization_event_id = authorization_event.id.to_hex();
+    let signed_authority =
+        arcadestr_core::authorization::parse_authorization_event(&authorization_event)
+            .map_err(|_| "Invalid retained authorization".to_string())?;
+    if signed_authority.terms.coordinate != terms.coordinate
+        || signed_authority.terms.operator_pubkey != terms.operator_pubkey
+        || signed_authority.terms.fulfillment_pubkey != terms.fulfillment_pubkey
+        || signed_authority.terms.capabilities != terms.capabilities
+        || !matches!(
+            signed_authority.transition,
+            arcadestr_core::authorization::AuthorizationTransition::ActiveRoot
+        )
+    {
+        return Err("Retained authorization does not match the original operator, scope, key and capabilities; recovery did not renew it".to_string().into());
+    }
     let row = AdpProvisioning {
         id: format!(
             "{}:{}:{}",
@@ -4256,7 +5182,12 @@ async fn resolve_provisioning(
         authorization_root_event_id: Some(authorization_event_id.clone()),
         authorization_capabilities: terms.capabilities.into_iter().collect(),
         authorization_profile_version: 2,
-        valid_from: now,
+        valid_from: arcadestr_core::authorization::parse_authorization_event(&authorization_event)
+            .map_err(|_| "Invalid retained authorization".to_string())?
+            .terms
+            .valid_from
+            .try_into()
+            .map_err(|_| "Authorization time overflow".to_string())?,
         revoked_at: None,
         created_at: now,
     };
@@ -4271,21 +5202,74 @@ async fn resolve_provisioning(
     })
 }
 
-async fn publish_event(state: &State<'_, AppState>, event: &nostr::Event) -> Result<(), String> {
+async fn publish_authorization_once(
+    state: &State<'_, AppState>,
+    event: &nostr::Event,
+    session: &arcadestr_core::settlement_recovery::SessionFence,
+) -> Result<(), String> {
+    if let Some(journal) = crate::publisher_commands::journal() {
+        if journal
+            .step(&format!("relay:{}", event.id))
+            .await?
+            .is_some_and(|step| step.state == "acknowledged")
+        {
+            session.ensure_current()?;
+            return Ok(());
+        }
+    }
+    publish_event(state, event, session).await
+}
+
+pub(crate) async fn publish_event(
+    state: &State<'_, AppState>,
+    event: &nostr::Event,
+    session: &arcadestr_core::settlement_recovery::SessionFence,
+) -> Result<(), String> {
     let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
     let manager = relay_manager.lock().await.clone();
-    let result = manager
-        .send_event(event)
-        .await
-        .map_err(|err| err.to_string())?;
+    let journal = crate::publisher_commands::before_publish(event).await?;
+    session.ensure_current()?;
+    let result = match manager.send_event(event).await {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(journal) = &journal {
+                journal.failed(&format!("relay:{}", event.id), "Relay publication response unavailable; reconcile this exact event before retry").await?;
+            }
+            return Err(error.to_string());
+        }
+    };
     if result.success_count == 0 {
+        if let Some(journal) = &journal {
+            journal
+                .failed(
+                    &format!("relay:{}", event.id),
+                    "No selected relay acknowledged this event",
+                )
+                .await?;
+        }
         return Err("event publish failed on all relays".to_string());
+    }
+    if let Some(journal) = journal {
+        journal
+            .ack(
+                &format!("relay:{}", event.id),
+                serde_json::json!({"accepted":true}),
+            )
+            .await?;
     }
     Ok(())
 }
 
+struct PublicationProgress<R: tauri::Runtime> {
+    app: tauri::AppHandle<R>,
+    operation_id: String,
+    publisher_npub: String,
+    game_coordinate: String,
+    session: arcadestr_core::settlement_recovery::SessionFence,
+}
+
 fn emit_progress<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
+    app: &PublicationProgress<R>,
     step: &str,
     status: &str,
     message: Option<String>,
@@ -4294,48 +5278,58 @@ fn emit_progress<R: tauri::Runtime>(
 }
 
 fn emit_server_progress<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
+    app: &PublicationProgress<R>,
     step: &str,
     status: &str,
     server_url: Option<String>,
     message: Option<String>,
 ) -> Result<(), String> {
-    app.emit(
-        "publish-progress",
-        PublishProgressPayload {
-            step: step.to_string(),
-            status: status.to_string(),
-            server_url,
-            message,
-            bytes_uploaded: None,
-            total_bytes: None,
-        },
-    )
-    .map_err(|err| err.to_string())
+    app.session.ensure_current()?;
+    app.app
+        .emit(
+            "publish-progress",
+            PublishProgressPayload {
+                operation_id: app.operation_id.clone(),
+                publisher_npub: app.publisher_npub.clone(),
+                game_coordinate: app.game_coordinate.clone(),
+                step: step.to_string(),
+                status: status.to_string(),
+                server_url,
+                message,
+                bytes_uploaded: None,
+                total_bytes: None,
+            },
+        )
+        .map_err(|err| err.to_string())
 }
 
 fn emit_upload_progress<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
+    app: &PublicationProgress<R>,
     server_url: &str,
     bytes_uploaded: u64,
     total_bytes: u64,
 ) -> Result<(), String> {
-    app.emit(
-        "publish-progress",
-        PublishProgressPayload {
-            step: "upload".to_string(),
-            status: "progress".to_string(),
-            server_url: Some(server_url.to_string()),
-            message: None,
-            bytes_uploaded: Some(bytes_uploaded),
-            total_bytes: Some(total_bytes),
-        },
-    )
-    .map_err(|err| err.to_string())
+    app.session.ensure_current()?;
+    app.app
+        .emit(
+            "publish-progress",
+            PublishProgressPayload {
+                operation_id: app.operation_id.clone(),
+                publisher_npub: app.publisher_npub.clone(),
+                game_coordinate: app.game_coordinate.clone(),
+                step: "upload".to_string(),
+                status: "progress".to_string(),
+                server_url: Some(server_url.to_string()),
+                message: None,
+                bytes_uploaded: Some(bytes_uploaded),
+                total_bytes: Some(total_bytes),
+            },
+        )
+        .map_err(|err| err.to_string())
 }
 
 fn progress_error<R: tauri::Runtime, E: std::fmt::Display>(
-    app: &tauri::AppHandle<R>,
+    app: &PublicationProgress<R>,
     step: &str,
     err: E,
 ) -> String {
@@ -4353,7 +5347,39 @@ fn now_unix_i64() -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
+    include!("publisher_lifecycle_tests.rs");
     use super::*;
+
+    #[test]
+    fn publisher_commercial_capabilities_reject_missing_incompatible_and_wrong_identity_metadata() {
+        let operator = nostr::Keys::generate().public_key().to_hex();
+        let fixture = serde_json::json!({
+            "adp_version":"0.2", "pubkey": operator,
+            "event_kinds": {"entitlement_grant":1030,"adp_campaign":1031,
+                "commercial_terms":1032,"private_quote":1033,"recovery_evidence":1034},
+            "settlement": {"version":1,"split_enabled":true,"terms_event_id":"11".repeat(32),
+                "fee":{"type":"none"},"legacy_paid_sales":"allow"}
+        });
+        let decode = |json| serde_json::from_value::<AdpServerInfo>(json).expect("fixture");
+        let server = publisher_terms_server("https://operator.test", decode(fixture.clone()))
+            .expect("supported");
+        assert_eq!(server.operator_pubkey, operator);
+        for (path, value) in [
+            ("/settlement/version", serde_json::json!(2)),
+            ("/settlement/split_enabled", serde_json::json!(false)),
+            ("/event_kinds/commercial_terms", serde_json::json!(1021)),
+            ("/event_kinds/private_quote", serde_json::Value::Null),
+            ("/event_kinds/recovery_evidence", serde_json::json!(9999)),
+            ("/pubkey", serde_json::json!("not-an-operator")),
+        ] {
+            let mut changed = fixture.clone();
+            *changed.pointer_mut(path).expect("path") = value;
+            assert!(publisher_terms_server("https://operator.test", decode(changed)).is_err());
+        }
+        let mut absent = fixture;
+        absent["settlement"] = serde_json::Value::Null;
+        assert!(publisher_terms_server("https://operator.test", decode(absent)).is_err());
+    }
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
@@ -4387,6 +5413,95 @@ mod tests {
     struct CountingSigner {
         keys: Keys,
         calls: AtomicUsize,
+    }
+
+    struct DelayedPublicationSigner {
+        keys: Keys,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        reject: bool,
+    }
+    #[async_trait::async_trait]
+    impl NostrSigner for DelayedPublicationSigner {
+        async fn get_public_key(&self) -> Result<nostr::PublicKey, SignerError> {
+            Ok(self.keys.public_key())
+        }
+        async fn sign_event(
+            &self,
+            unsigned: nostr::UnsignedEvent,
+        ) -> Result<nostr::Event, SignerError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            if self.reject {
+                return Err(SignerError::SigningFailed("rejected".into()));
+            }
+            unsigned
+                .sign(&self.keys)
+                .await
+                .map_err(|e| SignerError::SigningFailed(e.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_signer_fences_delayed_results_and_no_later_side_effect() {
+        use arcadestr_core::settlement_recovery::RecoveryCoordinator;
+        for transition in ["switch", "roundtrip", "logout", "reconnect", "reject"] {
+            let coordinator = RecoveryCoordinator::default();
+            let delayed = Arc::new(DelayedPublicationSigner {
+                keys: Keys::generate(),
+                started: Default::default(),
+                release: Default::default(),
+                reject: transition == "reject",
+            });
+            let account = delayed.keys.public_key().to_hex();
+            coordinator.activate(Some(account.clone()));
+            let fenced = PublicationSigner {
+                signer: delayed.clone(),
+                session: coordinator.session_fence().expect("session"),
+            };
+            let unsigned = EventBuilder::new(Kind::Custom(30402), "offline fixture")
+                .build(delayed.keys.public_key());
+            let task = tokio::spawn(async move { fenced.sign_event(unsigned).await });
+            delayed.started.notified().await;
+            match transition {
+                "switch" => coordinator.activate(Some("bob".into())),
+                "roundtrip" => {
+                    coordinator.activate(Some("bob".into()));
+                    coordinator.activate(Some(account));
+                }
+                "logout" => coordinator.activate(None),
+                "reconnect" => coordinator.activate(Some(account)),
+                _ => {}
+            }
+            delayed.release.notify_one();
+            assert!(
+                task.await.expect("task").is_err(),
+                "{transition} must not expose a signed result to publication/provision/upload"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_signer_timeout_exposes_no_signed_result() {
+        let coordinator = arcadestr_core::settlement_recovery::RecoveryCoordinator::default();
+        let delayed = Arc::new(DelayedPublicationSigner {
+            keys: Keys::generate(),
+            started: Default::default(),
+            release: Default::default(),
+            reject: false,
+        });
+        coordinator.activate(Some(delayed.keys.public_key().to_hex()));
+        let signer = PublicationSigner {
+            signer: delayed.clone(),
+            session: coordinator.session_fence().expect("session"),
+        };
+        let unsigned = EventBuilder::new(Kind::Custom(30402), "offline fixture")
+            .build(delayed.keys.public_key());
+        let error = signer
+            .sign_with_timeout(unsigned, Duration::from_millis(10))
+            .await
+            .expect_err("timeout");
+        assert!(error.to_string().contains("timed out"));
     }
 
     impl CountingSigner {
@@ -4990,7 +6105,7 @@ mod tests {
 
         assert!(FORM_MANAGED_LISTING_TAGS.contains(&"launch_default"));
         assert_eq!(
-            preserved_listing_tags(&existing, false),
+            preserved_listing_tags(&existing),
             vec![vec!["summary".to_string(), "Keep me".to_string()]]
         );
     }
@@ -5094,7 +6209,7 @@ mod tests {
             platforms: vec!["linux-x86_64".into()],
             campaigns,
             nip94_event_id: None,
-            preserved_tags: preserved_listing_tags(existing_tags, false),
+            preserved_tags: preserved_listing_tags(existing_tags),
         }
     }
 
@@ -5293,16 +6408,19 @@ mod tests {
             "delegate-key".into(),
         ]);
 
-        let preserved = preserved_listing_tags(&existing, false);
+        let preserved = preserved_listing_tags(&existing);
         assert!(preserved
             .iter()
             .any(|values| is_fulfillment_authorization_tag(values)));
 
-        // A publication that issues its own authorization replaces it instead.
-        let replaced = preserved_listing_tags(&existing, true);
-        assert!(!replaced
-            .iter()
-            .any(|values| is_fulfillment_authorization_tag(values)));
+        // Adding authority can never erase unrelated or historical siblings.
+        assert_eq!(
+            preserved
+                .iter()
+                .filter(|values| is_fulfillment_authorization_tag(values))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -5513,7 +6631,7 @@ mod tests {
             unknown_tags[1].clone(),
         ];
 
-        let preserved = preserved_listing_tags(&authoritative_tags, false);
+        let preserved = preserved_listing_tags(&authoritative_tags);
 
         assert_eq!(preserved, unknown_tags);
         assert!(preserved.iter().all(|tag| {
@@ -5604,7 +6722,7 @@ mod tests {
             unmanaged_tags[0].clone(),
             unmanaged_tags[1].clone(),
         ];
-        let preserved = preserved_listing_tags(&authoritative_tags, false);
+        let preserved = preserved_listing_tags(&authoritative_tags);
         let mut input = retry_listing_input(&authoritative_tags, Vec::new());
         input.preserved_tags = preserved.clone();
 
@@ -5671,7 +6789,7 @@ mod tests {
             .iter()
             .map(|tag| tag.clone().to_vec())
             .collect::<Vec<_>>();
-        let preserved_tags = preserved_listing_tags(&authoritative_tags, false);
+        let preserved_tags = preserved_listing_tags(&authoritative_tags);
         let listing = AdpListingInput {
             d_tag: "managed-edit".to_owned(),
             title: "Edited Game".to_owned(),
@@ -6041,6 +7159,10 @@ mod tests {
             .map(|profile| profile.id.clone())
             .unwrap_or_else(|| ProfileId::parse("play").expect("test default profile ID"));
         PublishAdpListingRequestExtension {
+            authorize_operators: false,
+            server_roles: Vec::new(),
+            commercial_intent: Default::default(),
+            operation_id: None,
             launch_tier: Some(arcadestr_core::adp_publish_contract::AdpLaunchTierIntent {
                 package_format: arcadestr_core::distribution::PackageFormat::Zip,
                 platforms: vec![arcadestr_core::distribution::PlatformTarget {
@@ -6548,7 +7670,6 @@ mod tests {
         for side_effect in [
             "resolve_active_signer(",
             "resolve_provisioning(",
-            ".provision(",
             "validate_and_sign_adp_listing(",
             ".upload",
         ] {
@@ -6560,6 +7681,7 @@ mod tests {
                 "enforcement must precede {side_effect}"
             );
         }
+        assert!(!pipeline.contains("repair_existing_authorization("));
     }
 
     #[test]
@@ -6576,6 +7698,31 @@ mod tests {
 
         assert_eq!(forward.id.to_hex(), expected_id);
         assert_eq!(reverse.id.to_hex(), expected_id);
+    }
+
+    #[test]
+    fn publication_has_optimistic_revision_checks_on_both_sides_of_remote_signing() {
+        let source = include_str!("adp_commands.rs");
+        let pipeline = source
+            .split("async fn publish_adp_listing_pipeline_inner")
+            .nth(1)
+            .and_then(|s| s.split("async fn validate_current_attestation").next())
+            .expect("pipeline");
+        let signing = pipeline
+            .find("validate_and_sign_adp_listing(")
+            .expect("signing");
+        let publication = pipeline
+            .find("publish_event(&state, &listing_event")
+            .expect("publication");
+        let checks = pipeline
+            .match_indices("ensure_listing_revision_current(")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert!(checks.iter().any(|index| *index < signing));
+        assert!(checks
+            .iter()
+            .any(|index| *index > signing && *index < publication));
+        assert!(pipeline.contains("listing_replacement_timestamp("));
     }
 
     #[test]
@@ -6735,6 +7882,16 @@ mod tests {
 
     async fn live_test_app(relays: Vec<String>) -> tauri::App<tauri::test::MockRuntime> {
         let db_path = unique_test_path("arcadestr-adp-live-command", "db");
+        let http_client: Arc<dyn HttpClient> =
+            Arc::new(ReqwestHttpClient::new(Duration::from_secs(10)).expect("fixture HTTP client"));
+        test_app_with_http(relays, db_path, http_client).await
+    }
+
+    async fn test_app_with_http(
+        relays: Vec<String>,
+        db_path: PathBuf,
+        http_client: Arc<dyn HttpClient>,
+    ) -> tauri::App<tauri::test::MockRuntime> {
         let database = Database::new(&db_path)
             .await
             .expect("live test database should open");
@@ -6771,16 +7928,12 @@ mod tests {
         auth.connect_with_key("0000000000000000000000000000000000000000000000000000000000000001")
             .expect("live test signer should initialize");
         let relay_cache = Arc::new(
-            RelayCache::new(unique_test_path("arcadestr-adp-live-relay-cache", "db"))
+            RelayCache::new(db_path.with_extension("relay-cache.db"))
                 .expect("relay cache should open"),
         );
         let relay_hints = Arc::new(
-            RelayHints::new(unique_test_path("arcadestr-adp-live-relay-hints", "db"))
+            RelayHints::new(db_path.with_extension("relay-hints.db"))
                 .expect("relay hints should open"),
-        );
-        let http_client: Arc<dyn HttpClient> = Arc::new(
-            ReqwestHttpClient::new(Duration::from_secs(10))
-                .expect("reqwest http client should initialize"),
         );
         let profile_fetcher = Arc::new({
             let mut fetcher = ProfileFetcher::with_persistent_cache(user_cache.clone());
@@ -6792,9 +7945,12 @@ mod tests {
             database.pool().clone(),
         ));
 
+        let settlement_recovery =
+            arcadestr_core::settlement_recovery::RecoveryCoordinator::default();
+        settlement_recovery.activate(auth.public_key().map(|key| key.to_hex()));
         tauri::test::mock_builder()
             .manage(AppState {
-                settlement_recovery: Default::default(),
+                settlement_recovery,
                 auth: Arc::new(AsyncMutex::new(auth)),
                 nostr: Arc::new(AsyncMutex::new(nostr)),
                 database: Arc::new(database),
@@ -6986,34 +8142,34 @@ mod tests {
         let mock = Arc::new(
             LocalMockHttpClient::default()
                 .with_json_response(
-                    "http://large/.well-known/adp",
+                    "https://large/.well-known/adp",
                     json!({"adp_version":"0.2.0", "pubkey":"operator", "max_upload_bytes":2048}),
                 )
                 .with_json_response(
-                    "http://small/.well-known/adp",
+                    "https://small/.well-known/adp",
                     json!({"adp_version":"0.2.0", "pubkey":"operator", "max_upload_bytes":1024}),
                 )
                 .with_json_response(
-                    "http://legacy/.well-known/adp",
+                    "https://legacy/.well-known/adp",
                     json!({"adp_version":"0.2.0", "pubkey":"operator"}),
                 ),
         );
         let http: Arc<dyn HttpClient> = mock.clone();
-        let servers = vec!["http://large".into(), "http://small".into()];
+        let servers = vec!["https://large".into(), "https://small".into()];
         let error = preflight_upload_capacity(&servers, 1025, &http)
             .await
             .expect_err("small server");
-        assert!(error.to_string().contains("http://small"));
+        assert!(error.to_string().contains("https://small"));
         assert!(error.to_string().contains("1025"));
         assert!(error.to_string().contains("1024"));
         preflight_upload_capacity(&servers, 1024, &http)
             .await
             .expect("exact cap");
-        preflight_upload_capacity(&["http://legacy".into()], u64::MAX, &http)
+        preflight_upload_capacity(&["https://legacy".into()], u64::MAX, &http)
             .await
             .expect("unknown legacy cap");
-        assert_eq!(mock.post_call_count("http://small/provision"), 0);
-        assert_eq!(mock.post_call_count("http://small/upload"), 0);
+        assert_eq!(mock.post_call_count("https://small/provision"), 0);
+        assert_eq!(mock.post_call_count("https://small/upload"), 0);
     }
 
     #[async_trait::async_trait]
@@ -7082,6 +8238,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiple_operator_provisioning_retains_partial_results_and_requires_uncertain_retry() {
+        let db = test_db().await;
+        let repo = AdpProvisioningRepository::new(db.pool().clone());
+        let signer = LocalSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("signer");
+        let publisher = signer.get_public_key().await.expect("publisher");
+        let publisher_hex = publisher.to_hex();
+        let info = |url: &str| AdpServerInfo {
+            max_upload_bytes: None,
+            adp_version: "0.2.0".into(),
+            pubkey: Keys::generate().public_key().to_hex(),
+            name: None,
+            url: Some(url.into()),
+            event_kinds: None,
+            event_kind_status: None,
+            settlement: None,
+        };
+        let one = info("https://one.test");
+        let two = info("https://two.test");
+        let response = |key: nostr::PublicKey| json!({"fulfillment_pubkey":key.to_hex(),"attestation_event_id":"fixture","scope":"game"});
+        let first_http = Arc::new(LocalMockHttpClient::default().with_json_post_response(
+            "https://one.test/provision",
+            response(Keys::generate().public_key()),
+        ));
+        let second_http = Arc::new(LocalMockHttpClient::default());
+        let first = AdpClient::new("https://one.test", first_http.clone());
+        let second = AdpClient::new("https://two.test", second_http.clone());
+        let journal_repo = arcadestr_core::publisher_recovery::repository::PublisherRepository::new(
+            db.pool().clone(),
+        );
+        journal_repo
+            .begin(
+                &publisher_hex,
+                &arcadestr_core::publisher_recovery::PublisherOperation {
+                    operation_id: "multi".into(),
+                    kind: "listing".into(),
+                    coordinate: format!("30402:{publisher}:game"),
+                    intent: json!({"operators":[one.pubkey,two.pubkey]}),
+                    artifact_hash: None,
+                    state: "incomplete".into(),
+                    result: None,
+                },
+            )
+            .await
+            .expect("operation");
+        let mut journal = crate::publisher_commands::PublisherJournal {
+            repo: journal_repo,
+            publisher: publisher_hex.clone(),
+            operation_id: "multi".into(),
+            allow_uncertain: false,
+        };
+        let input = |client, info, url, issuing| ResolveProvisioningInput {
+            provisioning_repo: &repo,
+            adp_client: client,
+            signer: &signer,
+            developer_pubkey: publisher,
+            developer_npub: &publisher_hex,
+            server_url: url,
+            scope: "game",
+            server_info: info,
+            reusable_authorization: None,
+            required_capabilities: if issuing {
+                BTreeSet::from([
+                    CAPABILITY_UPLOAD_BUILD.into(),
+                    CAPABILITY_ISSUE_RECEIPT.into(),
+                ])
+            } else {
+                BTreeSet::from([CAPABILITY_UPLOAD_BUILD.into()])
+            },
+        };
+        let first_result = crate::publisher_commands::JOURNAL
+            .scope(
+                journal.clone(),
+                resolve_provisioning(input(&first, &one, "https://one.test", true)),
+            )
+            .await
+            .expect("first operator succeeds");
+        let ProvisioningDecision::Created {
+            authorization_event,
+            ..
+        } = first_result
+        else {
+            panic!("new operator")
+        };
+        let authority =
+            arcadestr_core::authorization::parse_authorization_event(&authorization_event)
+                .expect("authority");
+        assert!(authority
+            .terms
+            .capabilities
+            .contains(CAPABILITY_ISSUE_RECEIPT));
+        assert!(!authority
+            .terms
+            .capabilities
+            .contains(CAPABILITY_ISSUE_GRANT));
+        assert!(crate::publisher_commands::JOURNAL
+            .scope(
+                journal.clone(),
+                resolve_provisioning(input(&second, &two, "https://two.test", false))
+            )
+            .await
+            .is_err());
+        let steps = journal
+            .repo
+            .steps(&publisher_hex, "multi")
+            .await
+            .expect("steps");
+        assert!(steps
+            .iter()
+            .find(|step| step.target == "https://one.test")
+            .expect("first")
+            .outcome
+            .is_some());
+        assert!(steps
+            .iter()
+            .find(|step| step.target == "https://two.test")
+            .expect("second")
+            .outcome
+            .is_none());
+        let retry_http = Arc::new(LocalMockHttpClient::default().with_json_post_response(
+            "https://two.test/provision",
+            response(Keys::generate().public_key()),
+        ));
+        let retry = AdpClient::new("https://two.test", retry_http.clone());
+        assert!(crate::publisher_commands::JOURNAL
+            .scope(
+                journal.clone(),
+                resolve_provisioning(input(&retry, &two, "https://two.test", false))
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            retry_http.post_call_count("https://two.test/provision"),
+            0,
+            "restart must not silently repeat uncertain POST"
+        );
+        journal.allow_uncertain = true;
+        let retry_result = crate::publisher_commands::JOURNAL
+            .scope(
+                journal,
+                resolve_provisioning(input(&retry, &two, "https://two.test", false)),
+            )
+            .await
+            .expect("explicit retry");
+        let ProvisioningDecision::Created {
+            authorization_event,
+            ..
+        } = retry_result
+        else {
+            panic!("new second operator")
+        };
+        assert_eq!(
+            arcadestr_core::authorization::parse_authorization_event(&authorization_event)
+                .expect("authority")
+                .terms
+                .capabilities,
+            BTreeSet::from([CAPABILITY_UPLOAD_BUILD.into()])
+        );
+        assert_eq!(first_http.post_call_count("https://one.test/provision"), 1);
+        assert_eq!(retry_http.post_call_count("https://two.test/provision"), 1);
+    }
+
+    #[tokio::test]
     async fn publish_same_scope_reuses_provisioning_after_revalidating_with_operator() {
         let db = test_db().await;
         let repo = AdpProvisioningRepository::new(db.pool().clone());
@@ -7125,13 +8446,30 @@ mod tests {
             server_url: "https://dist.example.com",
             scope: "game",
             server_info: &server_info,
+            reusable_authorization: None,
+            required_capabilities: BTreeSet::from([
+                CAPABILITY_ISSUE_RECEIPT.into(),
+                CAPABILITY_ISSUE_GRANT.into(),
+                CAPABILITY_UPLOAD_BUILD.into(),
+            ]),
         })
         .await
         .expect("first provisioning should succeed");
-        let ProvisioningDecision::Created { row, .. } = first else {
+        let ProvisioningDecision::Created {
+            row,
+            authorization_event: original_authorization,
+            ..
+        } = first
+        else {
             panic!("first call should provision");
         };
         repo.upsert(&row).await.expect("row should persist");
+        let original_root = original_authorization.id;
+        let resolved = arcadestr_core::authorization::resolve_authorization(
+            original_root,
+            &[(*original_authorization).clone()],
+        )
+        .expect("original authority");
 
         let second = resolve_provisioning(ResolveProvisioningInput {
             provisioning_repo: &repo,
@@ -7142,6 +8480,12 @@ mod tests {
             server_url: "https://dist.example.com",
             scope: "game",
             server_info: &server_info,
+            reusable_authorization: Some(&resolved),
+            required_capabilities: BTreeSet::from([
+                CAPABILITY_ISSUE_RECEIPT.into(),
+                CAPABILITY_ISSUE_GRANT.into(),
+                CAPABILITY_UPLOAD_BUILD.into(),
+            ]),
         })
         .await
         .expect("second provisioning should succeed");
@@ -7162,6 +8506,10 @@ mod tests {
                 authorization_event.tags
             )
         });
+        assert_eq!(
+            authorization_event.id, original_root,
+            "retry must not renew the root"
+        );
         let AuthorizationTransition::ActiveRoot = parsed.transition else {
             panic!("reused authorization should be an active root");
         };
@@ -7176,10 +8524,121 @@ mod tests {
         assert_eq!(row.valid_from, valid_from);
         assert_eq!(row.acceptance_event_id, authorization_event.id.to_hex());
         assert_eq!(mock.post_call_count(provision_url), 2);
+        let mut cancelled = resolved.clone();
+        cancelled.cancelled_at = Some(0);
+        let rejected = resolve_provisioning(ResolveProvisioningInput {
+            provisioning_repo: &repo,
+            adp_client: &client,
+            signer: &signer,
+            developer_pubkey,
+            developer_npub: &developer_npub,
+            server_url: "https://dist.example.com",
+            scope: "game",
+            server_info: &server_info,
+            reusable_authorization: Some(&cancelled),
+            required_capabilities: BTreeSet::from([
+                CAPABILITY_ISSUE_RECEIPT.into(),
+                CAPABILITY_ISSUE_GRANT.into(),
+                CAPABILITY_UPLOAD_BUILD.into(),
+            ]),
+        })
+        .await;
+        assert!(
+            rejected.is_err(),
+            "cancelled pending authority cannot be silently renewed"
+        );
+        assert_eq!(
+            mock.post_call_count(provision_url),
+            2,
+            "reject before another provisioning request"
+        );
+        let journal_repo = arcadestr_core::publisher_recovery::repository::PublisherRepository::new(
+            db.pool().clone(),
+        );
+        journal_repo
+            .begin(
+                &developer_npub,
+                &arcadestr_core::publisher_recovery::PublisherOperation {
+                    operation_id: "uncertain-provision".into(),
+                    kind: "listing".into(),
+                    coordinate: format!("30402:{developer_npub}:game"),
+                    intent: json!({"original":"immutable"}),
+                    artifact_hash: None,
+                    state: "incomplete".into(),
+                    result: None,
+                },
+            )
+            .await
+            .expect("durable operation");
+        let mut journal = crate::publisher_commands::PublisherJournal {
+            repo: journal_repo,
+            publisher: developer_npub.clone(),
+            operation_id: "uncertain-provision".into(),
+            allow_uncertain: false,
+        };
+        journal
+            .prepare(
+                "provision:https://dist.example.com:game",
+                "provision",
+                "https://dist.example.com",
+                json!({"scope":"game","operator":server_info.pubkey}),
+            )
+            .await
+            .expect("checkpoint before uncertain POST");
+        let input = || ResolveProvisioningInput {
+            provisioning_repo: &repo,
+            adp_client: &client,
+            signer: &signer,
+            developer_pubkey,
+            developer_npub: &developer_npub,
+            server_url: "https://dist.example.com",
+            scope: "game",
+            server_info: &server_info,
+            reusable_authorization: Some(&resolved),
+            required_capabilities: BTreeSet::from([
+                CAPABILITY_ISSUE_RECEIPT.into(),
+                CAPABILITY_ISSUE_GRANT.into(),
+                CAPABILITY_UPLOAD_BUILD.into(),
+            ]),
+        };
+        assert!(crate::publisher_commands::JOURNAL
+            .scope(journal.clone(), resolve_provisioning(input()))
+            .await
+            .is_err());
+        assert_eq!(
+            mock.post_call_count(provision_url),
+            2,
+            "no automatic uncertain POST"
+        );
+        journal.allow_uncertain = true;
+        let retry = crate::publisher_commands::JOURNAL
+            .scope(journal.clone(), resolve_provisioning(input()))
+            .await
+            .expect("explicit same-scope reconciliation retry");
+        assert!(matches!(retry, ProvisioningDecision::Reused { .. }));
+        assert_eq!(mock.post_call_count(provision_url), 3);
+        journal.allow_uncertain = false;
+        let cached = crate::publisher_commands::JOURNAL
+            .scope(journal, resolve_provisioning(input()))
+            .await
+            .expect("reuse acknowledged response");
+        let ProvisioningDecision::Reused {
+            authorization_event,
+            ..
+        } = cached
+        else {
+            panic!("exact root reuse");
+        };
+        assert_eq!(authorization_event.id, original_root);
+        assert_eq!(
+            mock.post_call_count(provision_url),
+            3,
+            "acknowledged provisioning is not repeated"
+        );
     }
 
     #[tokio::test]
-    async fn existing_unrevoked_delegated_edit_repairs_authorization_with_fresh_evidence() {
+    async fn imported_delegated_edit_preserves_exact_root_without_local_history() {
         let db = test_db().await;
         let repo = AdpProvisioningRepository::new(db.pool().clone());
         let developer = LocalSigner::from_hex(
@@ -7213,55 +8672,71 @@ mod tests {
             revoked_at: None,
             created_at: original_valid_from,
         };
-        repo.upsert(&row).await.expect("row should persist");
-        let provision = ProvisionResponse {
-            fulfillment_pubkey: fulfillment_pubkey.clone(),
-            attestation_event_id: "refreshed-attestation-id".to_string(),
-            attestation: None,
-            scope: Some("game".to_string()),
+        assert!(repo
+            .active_for_scope(&developer_hex, &row.server_url, Some("game"))
+            .await
+            .expect("lookup")
+            .is_none());
+        let terms = AuthorizationTerms {
+            authorization_id: "imported-root".into(),
+            coordinate: format!("30402:{developer_hex}:game"),
+            operator_pubkey: nostr::PublicKey::from_hex(&row.operator_pubkey).expect("operator"),
+            fulfillment_pubkey: nostr::PublicKey::from_hex(&fulfillment_pubkey).expect("key"),
+            capabilities: BTreeSet::from([CAPABILITY_ISSUE_RECEIPT.into()]),
+            valid_from: original_valid_from as u64,
         };
-
-        let repair = repair_existing_authorization(ExistingAuthorizationRepairInput {
-            provisioning_repo: &repo,
-            signer: &developer,
-            developer_pubkey,
-            developer_hex: &developer_hex,
-            operator_url: "https://operator.example.com",
-            scope: "game",
-            fulfillment_pubkey: &fulfillment_pubkey,
-            provision: &provision,
-        })
-        .await
-        .expect("existing authorization should repair");
-
-        let parsed = parse_authorization_event(&repair.authorization_event)
-            .expect("repaired authorization should parse");
-        let AuthorizationTransition::ActiveRoot = parsed.transition else {
-            panic!("repaired authorization should be active");
-        };
-        let terms = parsed.terms;
-        assert!(!terms.authorization_id.is_empty());
-        assert_eq!(terms.coordinate, format!("30402:{developer_hex}:game"));
-        assert_eq!(terms.fulfillment_pubkey.to_hex(), fulfillment_pubkey);
-        assert_eq!(terms.valid_from, repair.row.valid_from as u64);
-        assert!(repair.row.valid_from >= original_valid_from);
-        assert_eq!(repair.row.fulfillment_pubkey, fulfillment_pubkey);
-        assert_eq!(repair.row.attestation_event_id, "refreshed-attestation-id");
+        let authorization = developer
+            .sign_event(
+                build_fulfillment_authorization_event_builder(&terms)
+                    .expect("builder")
+                    .build(developer_pubkey),
+            )
+            .await
+            .expect("sign offline fixture");
+        let resolved = arcadestr_core::authorization::resolve_authorization(
+            authorization.id,
+            &[authorization.clone()],
+        )
+        .expect("chain");
+        let listing = developer
+            .sign_event(
+                EventBuilder::new(Kind::Custom(30402), "imported")
+                    .tags([
+                        Tag::parse(["d", "game"]).expect("d"),
+                        Tag::parse(["title", "Imported"]).expect("title"),
+                        Tag::parse([
+                            "fulfillment_authorization",
+                            &authorization.id.to_hex(),
+                            &fulfillment_pubkey,
+                            "wss://imported.example",
+                        ])
+                        .expect("reference"),
+                    ])
+                    .build(developer_pubkey),
+            )
+            .await
+            .expect("listing");
+        let references = arcadestr_core::authorization::validate_listing_authorization_references(
+            &listing,
+            &[resolved],
+        )
+        .expect("no local row required");
+        assert_eq!(references[0].root_event_id, authorization.id);
         assert_eq!(
-            repair.row.acceptance_event_id,
-            repair.authorization_event.id.to_hex()
+            references[0].relay_hint.as_deref(),
+            Some("wss://imported.example")
         );
-        repo.upsert(&repair.row)
-            .await
-            .expect("repaired row should persist");
-        let stored = repo
-            .active_for_scope(&developer_hex, "https://operator.example.com", Some("game"))
-            .await
-            .expect("repaired row lookup should succeed")
-            .expect("repaired row should remain active");
-        assert_eq!(stored.valid_from, repair.row.valid_from);
-        assert_eq!(stored.fulfillment_pubkey, fulfillment_pubkey);
-        assert_eq!(stored.acceptance_event_id, repair.authorization_event_id);
+        let tags = listing
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            preserved_listing_tags(&tags),
+            tags.into_iter()
+                .filter(|tag| is_fulfillment_authorization_tag(tag))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

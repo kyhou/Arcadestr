@@ -261,6 +261,70 @@ pub struct CampaignPointer {
     pub relay_hint: Option<String>,
 }
 
+/// Cache pointers are untrusted discovery hints, never campaign/issuance proof.
+/// An invalid entry must not discard other valid pointers or the whole listing.
+pub fn cached_campaign_pointers(json: &str) -> Vec<CampaignPointer> {
+    let values = serde_json::from_str::<Vec<serde_json::Value>>(json).unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<CampaignPointer>(value).ok())
+        .filter(|pointer| {
+            pointer
+                .relay_hint
+                .as_ref()
+                .is_none_or(|hint| nostr::RelayUrl::parse(hint).is_ok())
+        })
+        .filter(|pointer| seen.insert(pointer.root_event_id))
+        .collect()
+}
+
+/// Ordinary metadata edits cannot remove verified campaign associations merely
+/// because an older cache/form omitted them. Explicit pointer removal has its
+/// own current-revision-checked command. Verified hints win over cached hints.
+pub fn merge_campaign_references(
+    authoritative: Option<&Event>,
+    requested: &[(String, Option<String>)],
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let mut merged = if let Some(event) = authoritative {
+        event
+            .verify()
+            .map_err(|_| "Invalid authoritative listing signature")?;
+        if event.kind.as_u16() != 30402 {
+            return Err("Expected an authoritative listing".into());
+        }
+        parse_listing(event.clone())?
+            .campaigns
+            .into_iter()
+            .map(|pointer| (pointer.root_event_id.to_hex(), pointer.relay_hint))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut seen = merged
+        .iter()
+        .map(|(root, _)| root.clone())
+        .collect::<std::collections::HashSet<_>>();
+    // Canonicalize/deduplicate existing references without trusting the editor.
+    let mut unique = std::collections::HashSet::new();
+    merged.retain(|(root, _)| unique.insert(root.clone()));
+    for (root, hint) in requested {
+        let root = nostr::EventId::from_hex(root)
+            .map_err(|_| "Invalid campaign root event ID")?
+            .to_hex();
+        if hint
+            .as_ref()
+            .is_some_and(|hint| nostr::RelayUrl::parse(hint).is_err())
+        {
+            return Err("Invalid campaign relay hint".into());
+        }
+        if seen.insert(root.clone()) {
+            merged.push((root, hint.clone()));
+        }
+    }
+    Ok(merged)
+}
+
 /// One independently valid listing reference to a fulfillment authorization root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FulfillmentAuthorizationReference {
@@ -850,7 +914,7 @@ fn parse_product(event: Event) -> Result<Nip15Product, serde_json::Error> {
     })
 }
 
-fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
+pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
     #[cfg(debug_assertions)]
     let raw_event_json = serde_json::to_string(&event).ok();
 
@@ -1082,37 +1146,105 @@ fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
     })
 }
 
-/// Returns true when `target_coordinate` appears from at least `min_relays` distinct relays.
-pub(crate) fn listing_seen_on_min_relays(
-    relay_events: &[(String, Vec<Event>)],
-    target_coordinate: &str,
-    min_relays: usize,
-) -> bool {
-    use std::collections::HashSet;
-
-    let mut relays = HashSet::new();
-    for (relay_url, events) in relay_events {
-        if events
-            .iter()
-            .any(|event| event_matches_coordinate(event, target_coordinate))
-        {
-            relays.insert(relay_url.clone());
-        }
-    }
-    relays.len() >= min_relays
-}
-
 type RelayEventsByUrl = Vec<(String, Vec<Event>)>;
 
-/// Confirms a NIP-99 listing is visible from at least `min_relays` distinct relays.
+/// Exact current revision among the supplied evidence, using NIP-01 ordering.
+pub fn current_listing_revision(
+    events: &[Event],
+    publisher: nostr::PublicKey,
+    identifier: &str,
+) -> Option<Event> {
+    events
+        .iter()
+        .filter(|event| {
+            event.pubkey == publisher
+                && event.kind.as_u16() == 30402
+                && event.verify().is_ok()
+                && event
+                    .tags
+                    .iter()
+                    .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("d"))
+                    .count()
+                    == 1
+                && !identifier.is_empty()
+                && event
+                    .tags
+                    .iter()
+                    .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("d"))
+                    .all(|tag| matches!(tag.as_slice(), [_, value] if value == identifier))
+                && parse_listing((*event).clone()).is_ok_and(|listing| listing.id == identifier)
+        })
+        .cloned()
+        .reduce(|current, candidate| {
+            if is_replaceable_event_newer(
+                candidate.created_at.as_secs(),
+                Some(&candidate.id.to_hex()),
+                current.created_at.as_secs(),
+                Some(&current.id.to_hex()),
+            ) {
+                candidate
+            } else {
+                current
+            }
+        })
+}
+
+/// Do not race same-second ID tie breaking or chase a future-dated predecessor.
+pub fn listing_replacement_timestamp(
+    predecessor: &Event,
+    now: Timestamp,
+) -> Result<Timestamp, String> {
+    if predecessor.created_at >= now {
+        return Err("The current revision is dated at or after the local clock. Wait for the clock to advance and reload before replacing it; no future timestamp was generated.".into());
+    }
+    Ok(now)
+}
+
+pub fn exact_listing_seen_on_min_relays(
+    relay_events: &[(String, Vec<Event>)],
+    expected: &Event,
+    min_relays: usize,
+) -> bool {
+    let Ok(listing) = parse_listing(expected.clone()) else {
+        return false;
+    };
+    if expected.verify().is_err() {
+        return false;
+    }
+    let mut by_relay = std::collections::HashMap::<&str, Vec<Event>>::new();
+    for (relay, events) in relay_events {
+        by_relay
+            .entry(relay.as_str())
+            .or_default()
+            .extend(events.iter().cloned());
+    }
+    by_relay
+        .values()
+        .filter(|events| {
+            current_listing_revision(events, expected.pubkey, &listing.id)
+                .is_some_and(|current| current.id == expected.id)
+        })
+        .count()
+        >= min_relays.max(1)
+}
+
+/// Confirms the exact current signed revision on selected relays, not global consensus.
 pub async fn confirm_nip99_listing_propagated(
     relay_manager: &Arc<Mutex<RelayManager>>,
-    target_coordinate: &str,
+    expected: &Event,
     min_relays: usize,
 ) -> Result<bool, String> {
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
-    let filter = build_filter_since_secs(Kind::Custom(30402), 50, None, None, &["game"]);
+    expected.verify().map_err(|_| "invalid signed listing")?;
+    if expected.kind.as_u16() != 30402 {
+        return Err("expected a signed kind:30402 listing".into());
+    }
+    let listing = parse_listing(expected.clone()).map_err(|_| "invalid signed listing")?;
+    let filter = Filter::new()
+        .kind(Kind::Custom(30402))
+        .author(expected.pubkey)
+        .identifier(&listing.id);
     let relay_events: StdArc<StdMutex<RelayEventsByUrl>> = StdArc::new(StdMutex::new(Vec::new()));
     let relay_events_clone = StdArc::clone(&relay_events);
 
@@ -1130,19 +1262,9 @@ pub async fn confirm_nip99_listing_propagated(
     let collected = relay_events
         .lock()
         .map_err(|_| "relay propagation collection mutex poisoned".to_string())?;
-    Ok(listing_seen_on_min_relays(
-        &collected,
-        target_coordinate,
-        min_relays,
+    Ok(exact_listing_seen_on_min_relays(
+        &collected, expected, min_relays,
     ))
-}
-
-fn event_matches_coordinate(event: &Event, target_coordinate: &str) -> bool {
-    parse_listing(event.clone())
-        .map(|listing| {
-            format!("30402:{}:{}", event.pubkey.to_hex(), listing.id) == target_coordinate
-        })
-        .unwrap_or(false)
 }
 
 pub(crate) async fn fetch_nip99_listings_impl(
@@ -1466,6 +1588,101 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(seen.len(), 1);
         assert_eq!(seen.values().next(), Some(&(20, "ccc".to_string())));
+    }
+
+    #[test]
+    fn exact_revision_confirmation_rejects_old_wrong_current_and_incomplete_visibility() {
+        let keys = nostr::Keys::generate();
+        let make = |identifier: &str, at: u64, content: &str| {
+            nostr::EventBuilder::new(Kind::Custom(30402), content)
+                .tags([
+                    nostr::Tag::parse(["d", identifier]).expect("d"),
+                    nostr::Tag::parse(["title", "Game"]).expect("title"),
+                ])
+                .custom_created_at(Timestamp::from_secs(at))
+                .sign_with_keys(&keys)
+                .expect("listing")
+        };
+        let old = make("game", 100, "old");
+        let expected = make("game", 101, "expected");
+        let concurrent = make("game", 102, "concurrent");
+        let wrong = make("other", 103, "wrong coordinate");
+        assert!(!exact_listing_seen_on_min_relays(
+            &[("relay-a".into(), vec![old.clone()])],
+            &expected,
+            1
+        ));
+        assert!(!exact_listing_seen_on_min_relays(
+            &[("relay-a".into(), vec![wrong])],
+            &expected,
+            1
+        ));
+        assert!(!exact_listing_seen_on_min_relays(
+            &[("relay-a".into(), vec![expected.clone(), concurrent.clone()])],
+            &expected,
+            1
+        ));
+        assert!(
+            !exact_listing_seen_on_min_relays(
+                &[
+                    ("relay-a".into(), vec![expected.clone()]),
+                    ("relay-a".into(), vec![concurrent])
+                ],
+                &expected,
+                1
+            ),
+            "merge all batches before choosing the relay's current revision"
+        );
+        assert!(!exact_listing_seen_on_min_relays(
+            &[("relay-a".into(), vec![expected.clone()])],
+            &expected,
+            2
+        ));
+        assert!(!exact_listing_seen_on_min_relays(
+            &[
+                ("relay-a".into(), vec![expected.clone()]),
+                ("relay-a".into(), vec![expected.clone()])
+            ],
+            &expected,
+            2
+        ));
+        assert!(exact_listing_seen_on_min_relays(
+            &[
+                ("relay-a".into(), vec![old, expected.clone()]),
+                ("relay-b".into(), vec![expected.clone()])
+            ],
+            &expected,
+            2
+        ));
+        let collision = make("game", 101, "same timestamp");
+        let winning = if collision.id < expected.id {
+            &collision
+        } else {
+            &expected
+        };
+        for events in [
+            vec![collision.clone(), expected.clone()],
+            vec![expected.clone(), collision.clone()],
+        ] {
+            assert_eq!(
+                current_listing_revision(&events, keys.public_key(), "game")
+                    .expect("current")
+                    .id,
+                winning.id
+            );
+            assert!(exact_listing_seen_on_min_relays(
+                &[("relay-a".into(), events)],
+                winning,
+                1
+            ));
+        }
+        assert!(listing_replacement_timestamp(&expected, Timestamp::from_secs(100)).is_err());
+        assert!(listing_replacement_timestamp(&expected, Timestamp::from_secs(101)).is_err());
+        assert_eq!(
+            listing_replacement_timestamp(&expected, Timestamp::from_secs(102))
+                .expect("clock advanced"),
+            Timestamp::from_secs(102)
+        );
     }
 
     #[test]
@@ -1925,13 +2142,13 @@ mod tests {
             "Title",
             vec![vec!["d", "game"], vec!["title", "Title"], vec!["t", "game"]],
         );
-        let target = format!("30402:{}:game", event.pubkey.to_hex());
+        let target = event.clone();
         let relays = vec![
             ("wss://relay-one.example".to_string(), vec![event.clone()]),
             ("wss://relay-two.example".to_string(), vec![event]),
         ];
 
-        assert!(listing_seen_on_min_relays(&relays, &target, 2));
+        assert!(exact_listing_seen_on_min_relays(&relays, &target, 2));
     }
 
     #[test]
@@ -1941,10 +2158,10 @@ mod tests {
             "Title",
             vec![vec!["d", "game"], vec!["title", "Title"], vec!["t", "game"]],
         );
-        let target = format!("30402:{}:game", event.pubkey.to_hex());
+        let target = event.clone();
         let relays = vec![("wss://relay-one.example".to_string(), vec![event])];
 
-        assert!(!listing_seen_on_min_relays(&relays, &target, 2));
+        assert!(!exact_listing_seen_on_min_relays(&relays, &target, 2));
     }
 
     #[test]
@@ -1963,7 +2180,12 @@ mod tests {
             ("wss://relay-two.example".to_string(), vec![event]),
         ];
 
-        assert!(!listing_seen_on_min_relays(&relays, "30402:pubkey:game", 2));
+        let expected = make_nip99_event(
+            30402,
+            "Title",
+            vec![vec!["d", "game"], vec!["title", "Title"]],
+        );
+        assert!(!exact_listing_seen_on_min_relays(&relays, &expected, 2));
     }
 
     #[test]

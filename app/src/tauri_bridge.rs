@@ -39,14 +39,28 @@ pub use arcadestr_core::purchase_contract::{
     ApprovePurchasePlanRequest, InvoiceNetwork, LegProgress, PurchasePlanRequest,
     PurchasePlanReview,
 };
+pub use arcadestr_core::receipt_sync_contract::{
+    ReceiptImportRequest, ReceiptSyncReport, ReceiptSyncRequest, ReceiptVerification,
+};
 use arcadestr_core::store_page::{StorePageDraft, StorePageValidationDiagnostic};
 use serde::{Deserialize, Serialize};
-pub use arcadestr_core::receipt_sync_contract::{ReceiptSyncRequest,ReceiptImportRequest,ReceiptSyncReport,ReceiptVerification};
-pub async fn invoke_sync_purchase_receipts(request:ReceiptSyncRequest)->Result<ReceiptSyncReport,String>{
-    recovery_invoke("sync_purchase_receipts",serde_json::json!({"request":request})).await
+pub async fn invoke_sync_purchase_receipts(
+    request: ReceiptSyncRequest,
+) -> Result<ReceiptSyncReport, String> {
+    recovery_invoke(
+        "sync_purchase_receipts",
+        serde_json::json!({"request":request}),
+    )
+    .await
 }
-pub async fn invoke_import_purchase_receipts(request:ReceiptImportRequest)->Result<ReceiptSyncReport,String>{
-    recovery_invoke("import_purchase_receipts",serde_json::json!({"request":request})).await
+pub async fn invoke_import_purchase_receipts(
+    request: ReceiptImportRequest,
+) -> Result<ReceiptSyncReport, String> {
+    recovery_invoke(
+        "import_purchase_receipts",
+        serde_json::json!({"request":request}),
+    )
+    .await
 }
 
 pub async fn invoke_get_purchase_plan(
@@ -1194,6 +1208,8 @@ pub struct PublishServerUploadResult {
 /// Result returned by the ADP publish command.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PublishAdpListingResult {
+    #[serde(default)]
+    pub operation_id: String,
     pub event_id: String,
     /// Set only when the backend minted an identifier for this publication.
     pub game_id: Option<uuid::Uuid>,
@@ -1206,8 +1222,11 @@ pub struct PublishAdpListingResult {
 }
 
 /// Progress event payload emitted during ADP publishing.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PublishProgressPayload {
+    pub operation_id: String,
+    pub publisher_npub: String,
+    pub game_coordinate: String,
     pub step: String,
     pub status: String,
     pub server_url: Option<String>,
@@ -1600,6 +1619,57 @@ pub struct UpdateCampaignPointerRequest {
 
 /// Invoke desktop `check_adp_server` command.
 #[cfg(not(feature = "web"))]
+pub async fn invoke_publisher_recovery_state(
+    publisher: String,
+) -> Result<arcadestr_core::publisher_recovery::PublisherRecoveryState, String> {
+    crate::tauri_invoke::invoke(
+        "publisher_recovery_state",
+        serde_json::json!({"expectedPublisherNpub":publisher}),
+    )
+    .await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_publisher_recovery_state(
+    _: String,
+) -> Result<arcadestr_core::publisher_recovery::PublisherRecoveryState, String> {
+    Err("Publisher recovery requires the desktop app".into())
+}
+#[cfg(not(feature = "web"))]
+pub async fn invoke_save_publisher_draft(
+    publisher: String,
+    draft: arcadestr_core::publisher_recovery::PublisherDraft,
+    expected_revision: Option<u64>,
+) -> Result<u64, String> {
+    crate::tauri_invoke::invoke("save_publisher_draft", serde_json::json!({"request":{"expected_publisher_npub":publisher,"draft":draft,"expected_revision":expected_revision}})).await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_save_publisher_draft(
+    _: String,
+    _: arcadestr_core::publisher_recovery::PublisherDraft,
+    _: Option<u64>,
+) -> Result<u64, String> {
+    Err("Publisher drafts require the desktop app".into())
+}
+#[cfg(not(feature = "web"))]
+pub async fn invoke_resume_publisher_operation(
+    publisher: String,
+    operation_id: String,
+    confirm_uncertain_retry: bool,
+    selected_build: Option<BuildSelectionRef>,
+) -> Result<serde_json::Value, String> {
+    crate::tauri_invoke::invoke("resume_publisher_operation", serde_json::json!({"request":{"expected_publisher_npub":publisher,"operation_id":operation_id,"confirm_resume":true,"confirm_uncertain_retry":confirm_uncertain_retry,"selected_build":selected_build}})).await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_resume_publisher_operation(
+    _: String,
+    _: String,
+    _: bool,
+    _: Option<BuildSelectionRef>,
+) -> Result<serde_json::Value, String> {
+    Err("Publisher recovery requires the desktop app".into())
+}
+
+#[cfg(not(feature = "web"))]
 pub async fn invoke_check_adp_server(server_url: String) -> Result<AdpServerInfo, String> {
     crate::tauri_invoke::invoke(
         "check_adp_server",
@@ -1609,12 +1679,83 @@ pub async fn invoke_check_adp_server(server_url: String) -> Result<AdpServerInfo
 }
 
 /// Web fallback for `check_adp_server`.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_publisher_distribution_state(
+    publisher: String,
+    coordinate: String,
+) -> Result<Vec<arcadestr_core::publisher_management::DistributionEvidence>, String> {
+    crate::tauri_invoke::invoke(
+        "publisher_distribution_state",
+        serde_json::json!({"expectedPublisherNpub":publisher,"coordinate":coordinate}),
+    )
+    .await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_publisher_distribution_state(
+    _: String,
+    _: String,
+) -> Result<Vec<arcadestr_core::publisher_management::DistributionEvidence>, String> {
+    Err("Distribution management requires the desktop app".into())
+}
+#[cfg(not(feature = "web"))]
+pub async fn invoke_review_publisher_credential(
+    publisher: String,
+    coordinate: String,
+    root: String,
+    action: arcadestr_core::publisher_management::RevocationAction,
+) -> Result<arcadestr_core::publisher_management::CredentialReview, String> {
+    crate::tauri_invoke::invoke("review_publisher_credential",serde_json::json!({"expectedPublisherNpub":publisher,"coordinate":coordinate,"rootEventId":root,"action":action})).await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_review_publisher_credential(
+    _: String,
+    _: String,
+    _: String,
+    _: arcadestr_core::publisher_management::RevocationAction,
+) -> Result<arcadestr_core::publisher_management::CredentialReview, String> {
+    Err("Credential management requires the desktop app".into())
+}
+#[cfg(not(feature = "web"))]
+pub async fn invoke_revoke_publisher_credential(
+    request: arcadestr_core::publisher_management::RevokePublisherCredentialRequest,
+) -> Result<nostr::Event, String> {
+    crate::tauri_invoke::invoke(
+        "revoke_publisher_credential",
+        serde_json::json!({"request":request}),
+    )
+    .await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_revoke_publisher_credential(
+    _: arcadestr_core::publisher_management::RevokePublisherCredentialRequest,
+) -> Result<nostr::Event, String> {
+    Err("Credential management requires the desktop app".into())
+}
+
 #[cfg(feature = "web")]
 pub async fn invoke_check_adp_server(_server_url: String) -> Result<AdpServerInfo, String> {
     Err("ADP server checks are only available in desktop builds.".to_string())
 }
 
 /// Invoke desktop `discover_adp_servers` command.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_preview_publisher_terms(
+    request: arcadestr_core::adp_settlement::PublisherTermsContext,
+) -> Result<arcadestr_core::adp_settlement::PublisherTermsReview, String> {
+    crate::tauri_invoke::invoke(
+        "preview_publisher_terms",
+        serde_json::json!({ "request": request }),
+    )
+    .await
+}
+
+#[cfg(feature = "web")]
+pub async fn invoke_preview_publisher_terms(
+    _request: arcadestr_core::adp_settlement::PublisherTermsContext,
+) -> Result<arcadestr_core::adp_settlement::PublisherTermsReview, String> {
+    Err("Commercial review requires the desktop publisher".into())
+}
+
 #[cfg(not(feature = "web"))]
 pub async fn invoke_discover_adp_servers() -> Result<Vec<AdpServerAnnouncement>, String> {
     crate::tauri_invoke::invoke("discover_adp_servers", serde_json::json!({})).await
@@ -2686,6 +2827,17 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publisher_progress_requires_operation_account_and_coordinate_scope() {
+        let legacy = serde_json::json!({"step":"listing-coordinate", "status":"ok", "message":"30402:alice:one"});
+        assert!(serde_json::from_value::<super::PublishProgressPayload>(legacy).is_err());
+        let scoped = serde_json::json!({"operation_id":"operation-one", "publisher_npub":"alice", "game_coordinate":"30402:alice:one", "step":"listing-coordinate", "status":"ok"});
+        let event: super::PublishProgressPayload =
+            serde_json::from_value(scoped).expect("scoped IPC payload");
+        assert_eq!(event.operation_id, "operation-one");
+        assert_eq!(event.publisher_npub, "alice");
+        assert_eq!(event.game_coordinate, "30402:alice:one");
+    }
     use super::*;
 
     #[test]

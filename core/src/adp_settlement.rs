@@ -46,6 +46,277 @@ pub struct AcceptedTermsRef {
     pub terms_event_id: String,
 }
 
+/// Local publication intent, not a new protocol event or settlement approval.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "intent", rename_all = "snake_case")]
+pub enum PublisherCommercialIntent {
+    #[default]
+    Preserve,
+    ReplaceAfterReview {
+        review: PublisherTermsReview,
+    },
+    /// Deliberately unavailable until prospective operator retirement is agreed.
+    Retire,
+}
+
+impl PublisherCommercialIntent {
+    pub fn is_preserve(&self) -> bool {
+        matches!(self, Self::Preserve)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublisherTermsContext {
+    pub publisher_pubkey: String,
+    pub servers: Vec<String>,
+    pub price_sats: u64,
+    pub developer_destination: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublisherTermsReview {
+    pub context: PublisherTermsContext,
+    pub accepted_terms: Vec<AcceptedTermsRef>,
+    pub offers: Vec<CommercialTerms>,
+    pub legs: Vec<PaymentLeg>,
+}
+
+/// Validated live endpoint capabilities, supplied by the existing ADP discovery path.
+#[derive(Debug, Clone)]
+pub struct PublisherTermsServer {
+    pub url: String,
+    pub operator_pubkey: String,
+    pub version: u16,
+    pub split_enabled: bool,
+    pub advertised_terms: Option<String>,
+}
+
+/// Decode exact developer acceptance; never substitute a current advertisement.
+pub fn listing_accepted_terms(event: &Event) -> Result<Vec<AcceptedTermsRef>, SettlementError> {
+    if event.kind.as_u16() != 30402 || event.verify().is_err() {
+        return Err(SettlementError::Event("invalid source listing".into()));
+    }
+    let mut refs = BTreeMap::new();
+    for tag in event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("adp_terms"))
+    {
+        let [_, operator, root] = tag.as_slice() else {
+            return Err(SettlementError::TermsCoverage(
+                "malformed acceptance".into(),
+            ));
+        };
+        canonical_terms_reference(operator, root)?;
+        if refs
+            .insert(
+                operator.clone(),
+                AcceptedTermsRef {
+                    operator_pubkey: operator.clone(),
+                    terms_event_id: root.clone(),
+                },
+            )
+            .is_some()
+        {
+            return Err(SettlementError::TermsCoverage("duplicate operator".into()));
+        }
+    }
+    Ok(refs.into_values().collect())
+}
+
+fn canonical_terms_reference(operator: &str, root: &str) -> Result<(), SettlementError> {
+    if !crate::is_sha256_hex(operator)
+        || !crate::is_sha256_hex(root)
+        || operator
+            .bytes()
+            .chain(root.bytes())
+            .any(|b| b.is_ascii_uppercase())
+        || nostr::PublicKey::from_hex(operator).is_err()
+    {
+        return Err(SettlementError::TermsCoverage(
+            "noncanonical operator or root".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Consent is pinned to a complete local review. This never mutates an old
+/// listing, quote, receipt, or terms event and grants no payment authority.
+pub fn publisher_commercial_references(
+    intent: &PublisherCommercialIntent,
+    source: Option<&Event>,
+    fresh: Option<&PublisherTermsReview>,
+) -> Result<Vec<AcceptedTermsRef>, SettlementError> {
+    match intent {
+        PublisherCommercialIntent::Preserve => source.map(listing_accepted_terms).transpose().map(Option::unwrap_or_default),
+        PublisherCommercialIntent::ReplaceAfterReview { review } if fresh == Some(review) => {
+            let previous = source.map(listing_accepted_terms).transpose()?.unwrap_or_default();
+            if previous.iter().any(|old| !review.accepted_terms.iter().any(|new| new.operator_pubkey == old.operator_pubkey)) {
+                return Err(SettlementError::TermsCoverage("replacement cannot implicitly retire an operator; prospective retirement is unavailable".into()));
+            }
+            Ok(review.accepted_terms.clone())
+        }
+        PublisherCommercialIntent::ReplaceAfterReview { .. } => Err(SettlementError::TermsCoverage("commercial terms or allocation changed; review and approve again".into())),
+        PublisherCommercialIntent::Retire => Err(SettlementError::TermsCoverage("operator retirement is unavailable pending an agreed prospective workflow; historical sales remain unchanged".into())),
+    }
+}
+
+fn valid_commercial_destination(value: &str) -> bool {
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if let Ok(url) = url::Url::parse(value) {
+        return url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+            && (url.scheme() == "https"
+                || (cfg!(debug_assertions)
+                    && url.scheme() == "http"
+                    && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))));
+    }
+    let parts = value.split('@').collect::<Vec<_>>();
+    parts.len() == 2
+        && !parts[0].is_empty()
+        && !parts[0].chars().any(|c| matches!(c, '/' | '?' | '#' | ':'))
+        && url::Url::parse(&format!("https://{}", parts[1])).is_ok_and(|url| {
+            url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+}
+
+/// Build the same deterministic allocation as buyer quote verification, without
+/// requesting an invoice. `events` must include exact roots and the observed
+/// operator terms history from a successful bounded relay query. Absence of a
+/// withdrawal here is not a claim of global relay completeness.
+pub fn review_publisher_terms(
+    context: &PublisherTermsContext,
+    servers: &[PublisherTermsServer],
+    accepted: &[AcceptedTermsRef],
+    events: &[Event],
+    require_advertised: bool,
+    now: u64,
+) -> Result<PublisherTermsReview, SettlementError> {
+    if servers.len() != context.servers.len()
+        || servers
+            .iter()
+            .zip(&context.servers)
+            .any(|(info, url)| &info.url != url)
+        || !crate::is_sha256_hex(&context.publisher_pubkey)
+        || context
+            .publisher_pubkey
+            .bytes()
+            .any(|b| b.is_ascii_uppercase())
+        || nostr::PublicKey::from_hex(&context.publisher_pubkey).is_err()
+    {
+        return Err(SettlementError::TermsCoverage(
+            "publication context mismatch".into(),
+        ));
+    }
+    let operators = servers
+        .iter()
+        .map(|s| ServerOperator {
+            url: s.url.clone(),
+            operator_pubkey: s.operator_pubkey.clone(),
+        })
+        .collect::<Vec<_>>();
+    let accepted = validate_terms_coverage(&operators, accepted)?;
+    if accepted.is_empty() {
+        return Err(SettlementError::TermsCoverage(
+            "no operator terms selected".into(),
+        ));
+    }
+    let mut offers = Vec::new();
+    for reference in &accepted {
+        canonical_terms_reference(&reference.operator_pubkey, &reference.terms_event_id)?;
+        for server in servers
+            .iter()
+            .filter(|s| s.operator_pubkey == reference.operator_pubkey)
+        {
+            if server.version != SETTLEMENT_VERSION || !server.split_enabled {
+                return Err(SettlementError::Version);
+            }
+            if require_advertised
+                && server.advertised_terms.as_deref() != Some(&reference.terms_event_id)
+            {
+                return Err(SettlementError::TermsCoverage(
+                    "advertised terms changed; review again".into(),
+                ));
+            }
+        }
+        let root = events
+            .iter()
+            .find(|e| e.id.to_hex() == reference.terms_event_id)
+            .ok_or_else(|| SettlementError::TermsCoverage("exact terms root unavailable".into()))?;
+        let TermsPayload::Offer { terms } = parse_terms_event(root)? else {
+            return Err(SettlementError::TermsCoverage(
+                "root is not an offer".into(),
+            ));
+        };
+        if terms.operator_pubkey != reference.operator_pubkey || root.created_at.as_secs() > now {
+            return Err(SettlementError::TermsCoverage(
+                "wrong operator or future offer".into(),
+            ));
+        }
+        // Destinations follow the existing Lightning-address contract. Limitations
+        // are operator-authored disclosure text, not invented client policy rules.
+        if !valid_commercial_destination(&terms.payment_destination) {
+            return Err(SettlementError::TermsCoverage(
+                "invalid operator destination".into(),
+            ));
+        }
+        for event in events.iter().filter(|e| {
+            e.pubkey == root.pubkey
+                && e.created_at.as_secs() <= now
+                && e.kind.as_u16() == TERMS_KIND
+        }) {
+            if event.verify().is_err() {
+                continue;
+            }
+            if let Ok(TermsPayload::Withdraw { terms_event_id, .. }) = parse_terms_event(event) {
+                if terms_event_id == reference.terms_event_id {
+                    verify_terms_withdrawal(event, root)?;
+                    return Err(SettlementError::TermsCoverage(
+                        "accepted terms were withdrawn; no new publication".into(),
+                    ));
+                }
+            }
+        }
+        offers.push((terms, reference.terms_event_id.clone()));
+    }
+    let gross = context
+        .price_sats
+        .checked_mul(1000)
+        .ok_or(SettlementError::Overflow)?;
+    let legs = if gross == 0 && !require_advertised {
+        // Preserve existing references during a non-payment listing update;
+        // grants/public access never acquire payment legs or require settlement.
+        Vec::new()
+    } else {
+        if !valid_commercial_destination(&context.developer_destination) {
+            return Err(SettlementError::TermsCoverage(
+                "invalid developer destination".into(),
+            ));
+        }
+        build_payment_legs(
+            gross,
+            &context.publisher_pubkey,
+            &context.developer_destination,
+            &offers,
+        )?
+    };
+    Ok(PublisherTermsReview {
+        context: context.clone(),
+        accepted_terms: accepted,
+        offers: offers.into_iter().map(|(terms, _)| terms).collect(),
+        legs,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerOperator {
     pub url: String,

@@ -91,7 +91,7 @@ pub(crate) fn exact_tag(
     Ok(Some(values[1].clone()))
 }
 
-pub(crate) fn coordinate_publisher(coordinate: &str) -> Option<nostr::PublicKey> {
+pub fn coordinate_publisher(coordinate: &str) -> Option<nostr::PublicKey> {
     let mut parts = coordinate.splitn(3, ':');
     let kind = parts.next()?;
     let publisher = parts.next()?;

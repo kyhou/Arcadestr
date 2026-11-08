@@ -20,6 +20,27 @@ struct Coordination {
 }
 #[derive(Clone, Default)]
 pub struct RecoveryCoordinator(Arc<Mutex<Coordination>>);
+/// A session snapshot, independent of recovery/purchase authority or operation locks.
+#[derive(Clone)]
+pub struct SessionFence {
+    coordinator: RecoveryCoordinator,
+    account: Option<String>,
+    epoch: u64,
+}
+impl SessionFence {
+    pub fn ensure_current(&self) -> Result<(), String> {
+        let state = self
+            .coordinator
+            .0
+            .lock()
+            .map_err(|_| "Session unavailable")?;
+        if state.epoch == self.epoch && state.account == self.account && self.account.is_some() {
+            Ok(())
+        } else {
+            Err("Publication session changed; start a new operation".into())
+        }
+    }
+}
 pub struct RecoveryLease {
     coordinator: RecoveryCoordinator,
     account: String,
@@ -27,6 +48,14 @@ pub struct RecoveryLease {
     epoch: u64,
 }
 impl RecoveryCoordinator {
+    pub fn session_fence(&self) -> Result<SessionFence, String> {
+        let state = self.0.lock().map_err(|_| "Session unavailable")?;
+        Ok(SessionFence {
+            coordinator: self.clone(),
+            account: state.account.clone(),
+            epoch: state.epoch,
+        })
+    }
     /// Call when a session is replaced, including A -> B -> A transitions.
     pub fn activate(&self, account: Option<String>) {
         if let Ok(mut state) = self.0.lock() {
@@ -180,6 +209,50 @@ pub async fn existing_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn publication_session_fences_reject_roundtrips_logout_and_reconnect() {
+        let coordinator = RecoveryCoordinator::default();
+        coordinator.activate(Some("alice".into()));
+        let first = coordinator.session_fence().expect("snapshot");
+        first.ensure_current().expect("current");
+        coordinator.activate(Some("bob".into()));
+        assert!(first.ensure_current().is_err());
+        coordinator.activate(Some("alice".into()));
+        assert!(first.ensure_current().is_err());
+        let second = coordinator.session_fence().expect("snapshot");
+        coordinator.activate(None);
+        assert!(second.ensure_current().is_err());
+        coordinator.activate(Some("alice".into()));
+        let third = coordinator.session_fence().expect("snapshot");
+        coordinator.activate(Some("alice".into()));
+        assert!(third.ensure_current().is_err());
+    }
+    #[test]
+    fn publication_coordinate_and_duplicate_operation_locks_are_scoped() {
+        let coordinator = RecoveryCoordinator::default();
+        coordinator.activate(Some("alice".into()));
+        let coordinate = coordinator
+            .claim("alice", "publish:30402:alice:one")
+            .expect("coordinate");
+        assert!(coordinator
+            .claim("alice", "publish:30402:alice:one")
+            .is_err());
+        let other = coordinator
+            .claim("alice", "publish:30402:alice:two")
+            .expect("independent coordinate");
+        let operation = coordinator
+            .claim("alice", "publish-operation:one")
+            .expect("operation");
+        assert!(coordinator.claim("alice", "publish-operation:one").is_err());
+        // Publisher coordination does not take purchase/recovery authority.
+        let recovery = coordinator
+            .claim("alice", "quote-one")
+            .expect("independent recovery");
+        drop((coordinate, other, operation, recovery));
+        assert!(coordinator
+            .claim("alice", "publish:30402:alice:one")
+            .is_ok());
+    }
     #[test]
     fn concurrent_recovery_and_account_roundtrip_are_fenced_without_async_mutex_guards() {
         let c = RecoveryCoordinator::default();

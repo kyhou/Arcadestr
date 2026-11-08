@@ -72,6 +72,8 @@ mod install;
 mod launcher;
 mod marketplace_stream;
 mod nip46_commands;
+mod publisher_commands;
+mod publisher_management;
 mod receipt_commands;
 mod settlement_ui;
 mod startup_runtime;
@@ -8270,6 +8272,13 @@ fn main() {
             blossom_commands::set_preferred_blossom_server,
             blossom_commands::resolve_blossom_server_candidates,
             adp_commands::check_adp_server,
+            adp_commands::preview_publisher_terms,
+            publisher_commands::save_publisher_draft,
+            publisher_commands::publisher_recovery_state,
+            publisher_management::publisher_distribution_state,
+            publisher_management::review_publisher_credential,
+            publisher_management::revoke_publisher_credential,
+            publisher_commands::resume_publisher_operation,
             adp_commands::discover_adp_servers,
             adp_commands::discover_campaigns,
             adp_commands::discover_campaign_summaries,

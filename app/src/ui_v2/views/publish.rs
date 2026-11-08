@@ -680,6 +680,7 @@ pub fn PublishV2View(
 
     view! {
         <div class="arc-publisher-shell">
+            <crate::components::publisher_recovery::PublisherRecoveryPanel />
             {move || {
                 let publisher = auth.npub.get();
                 let signer = publisher_signer_state(
@@ -767,6 +768,47 @@ pub fn PublishV2View(
             }}
         </div>
     }
+}
+
+/// Mount the real publisher routing/components against allowlisted mock IPC.
+/// No separate authoring implementation or production route is introduced.
+#[cfg(all(debug_assertions, not(feature = "web")))]
+#[component]
+pub fn PublisherConsolePreview() -> impl IntoView {
+    use nostr::nips::nip19::ToBech32;
+    let public = nostr::PublicKey::from_hex(
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    )
+    .expect("public fixture");
+    let publisher = public.to_bech32().expect("npub fixture");
+    let listing:GameListing=serde_json::from_value(serde_json::json!({"id":"fixture","source":"nip99_listing","title":"Publisher lifecycle fixture","description":"Existing interface integration fixture","publisher_npub":publisher,"created_at":100,"price_sats":1000,"price":1000,"currency":"SATS","lud16":"dev@publisher.invalid","event_id":"11".repeat(32),"images":["https://media.invalid/fixture.png"],"platforms":["linux-x86_64"],"specs":[["server","https://one.test"],["server","https://two.test"],["version","1.0"],["file_hash","ab".repeat(32)],["fulfillment_authorization",serde_json::json!({"root_event_id":"aa".repeat(32),"fulfillment_pubkey":"22".repeat(32),"relay_hint":null}).to_string()]],"campaigns":[{"root_event_id":"33".repeat(32),"relay_hint":null}]})).expect("projection fixture");
+    let auth = crate::AuthContext::new();
+    auth.npub.set(Some(publisher.clone()));
+    auth.begin_auth_flow();
+    auth.active_account.set(Some(crate::StoredAccount {
+        id: "synthetic".into(),
+        npub: publisher,
+        name: None,
+        signing_mode: "local".into(),
+        last_used: 0,
+        is_current: true,
+        picture: None,
+        display_name: None,
+        username: None,
+        nip05: None,
+        about: None,
+    }));
+    provide_context(auth.clone());
+    let state = RwSignal::new(PublishViewState::Game(listing.clone()));
+    let navigate = Callback::new(move |next| state.set(next));
+    let edit = listing.clone();
+    let manage = listing.clone();
+    view! {<div style="max-width:1440px;margin:0 auto;font-family:ui-monospace,monospace">
+        <button type="button" data-testid="fixture-edit" style="padding:10px;background:transparent;color:oklch(0.78 0.13 210);border:1px solid oklch(0.5 0.13 210)" on:click=move |_|state.set(PublishViewState::EditPublication(edit.clone()))>"OPEN FIXTURE EDITOR"</button>
+        <button type="button" data-testid="fixture-manage" style="padding:10px;background:transparent;color:oklch(0.78 0.13 210);border:1px solid oklch(0.5 0.13 210)" on:click=move |_|state.set(PublishViewState::Game(manage.clone()))>"OPEN FIXTURE MANAGEMENT"</button>
+        <button type="button" data-testid="fixture-account-switch" style="padding:10px;background:transparent;color:oklch(0.78 0.13 210);border:1px solid oklch(0.5 0.13 210)" on:click=move |_|{auth.begin_auth_flow();auth.npub.set(None);auth.active_account.set(None);}>"MOCK ACCOUNT SWITCH"</button>
+        {move ||view!{<PublishV2View state=state.get() on_navigate=navigate on_open_listing=Callback::new(|_|{})/>}}
+    </div>}
 }
 
 #[component]
@@ -1385,6 +1427,21 @@ fn GameManagementView(
     on_back: Callback<()>,
     on_navigate: Callback<PublishViewState>,
 ) -> impl IntoView {
+    let management_publisher = listing.publisher_npub.clone();
+    let management_coordinate = listing_coordinate(&listing);
+    let management_servers = listing
+        .specs
+        .iter()
+        .filter(|(name, _)| name == "server")
+        .map(|(_, url)| url.clone())
+        .collect::<Vec<_>>();
+    let management_roots = listing
+        .specs
+        .iter()
+        .filter(|(name, _)| name == "fulfillment_authorization")
+        .filter_map(|(_, value)| serde_json::from_str::<serde_json::Value>(value).ok())
+        .filter_map(|value| value["root_event_id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
     let auth = use_context::<crate::AuthContext>().expect("AuthContext not provided");
     let campaigns = RwSignal::new(Vec::<DiscoveredCampaign>::new());
     let loading = RwSignal::new(true);
@@ -1720,12 +1777,13 @@ fn GameManagementView(
                 {move || error.get().map(|message| view! { <p class="v2-publisher-summary-state v2-publisher-summary-error" role="alert">{format!("Promotion chain unavailable: {message}")}</p> })}
                 {move || if loading.get() { view! { <p class="v2-publisher-summary-state" role="status">"Discovering Promotions..."</p> }.into_any() } else if error.get().is_some() { view! { <></> }.into_any() } else if campaigns.get().is_empty() { view! { <p class="v2-publisher-summary-state">"No valid Promotions found. Discovery checks Promotion links and relay search."</p> }.into_any() } else { let selected_listing = listing_for_effect.clone(); let navigate = on_navigate.clone(); view! { <div class="v2-publisher-promotion-list">{campaigns.get().into_iter().map(|campaign| campaign_row(campaign, selected_listing.clone(), navigate.clone())).collect_view()}</div> }.into_any() }}
             </section>
+            <crate::components::publisher_management::PublisherManagementPanel publisher=management_publisher coordinate=management_coordinate servers=management_servers authority_roots=management_roots />
             </main>
             <aside class="v2-publisher-panel v2-publisher-sidebar">
                 <h2>"Distribution"</h2>
                 <div><h3>"Platforms"</h3><p class="v2-publisher-summary-state">{if listing.platforms.is_empty() { "Unspecified".into() } else { listing.platforms.join(", ") }}</p></div>
                 <div><h3>"Acquisition policy"</h3><p class="v2-publisher-summary-state">{access_label(&listing.acquisition)}</p><p class="v2-publisher-summary-state">"Timed access is configured on the Game page, not as a Claim and keep Promotion."</p></div>
-                <div><h3>"Unavailable actions"</h3><p class="v2-publisher-summary-state">"Unlisting, disabling public or timed access, and individual access revocation are not rendered because no backing command exists. Promotion cancellation is prospective and is handled in the Promotions panel."</p></div>
+                <div><h3>"Separate lifecycle actions"</h3><p class="v2-publisher-summary-state">"Credential management supports explicit authority cancellation and individual grant revocation. Unlisting, disabling public or timed access, and operator offboarding remain unavailable. Promotion cancellation is prospective and is handled in the Promotions panel."</p></div>
             </aside>
             </div>
         </section>
@@ -2024,10 +2082,13 @@ fn campaign_row(
     let action_in_progress = RwSignal::new(false);
     let action_completed = RwSignal::new(false);
     let action_generation = RwSignal::new(0_u64);
-    let action_account = RwSignal::new(auth.npub.get_untracked());
+    let action_account = RwSignal::new((auth.npub.get_untracked(), auth.current_auth_flow()));
     let auth_for_epoch = auth.clone();
     Effect::new(move |_| {
-        let current = auth_for_epoch.npub.get();
+        let current = (
+            auth_for_epoch.npub.get(),
+            auth_for_epoch.current_auth_flow(),
+        );
         if current != action_account.get_untracked() {
             action_account.set(current);
             action_generation.update(|value| *value = value.wrapping_add(1));
@@ -2064,15 +2125,21 @@ fn campaign_row(
         let root_event_id = pointer_campaign.root_event_id.clone();
         let navigate = pointer_navigate.clone();
         let auth_for_request = pointer_auth.clone();
+        let auth_epoch = auth_for_request.current_auth_flow();
         action_in_progress.set(true);
         spawn_local(async move {
             let result = invoke_update_campaign_pointer(request).await;
-            if !accepts_account_response(
-                auth_for_request.npub.get_untracked().as_deref(),
-                &publisher_npub,
-                action_generation.get_untracked(),
-                request_generation,
-            ) {
+            if action_generation.try_get_untracked().is_none() {
+                return;
+            }
+            if !auth_for_request.is_current_auth_flow(auth_epoch)
+                || !accepts_account_response(
+                    auth_for_request.npub.get_untracked().as_deref(),
+                    &publisher_npub,
+                    action_generation.get_untracked(),
+                    request_generation,
+                )
+            {
                 action_in_progress.set(false);
                 action_completed.set(true);
                 pointer_message.set(Some("Account changed while the Promotion link was updating. The stale response was ignored; refresh this Game page before another change.".into()));
@@ -2130,14 +2197,20 @@ fn campaign_row(
         let navigate = cancel_navigate.clone();
         let auth_for_request = auth.clone();
         action_in_progress.set(true);
+        let auth_epoch = auth_for_request.current_auth_flow();
         spawn_local(async move {
             let result = invoke_publish_campaign(request).await;
-            if !accepts_account_response(
-                auth_for_request.npub.get_untracked().as_deref(),
-                &publisher_npub,
-                action_generation.get_untracked(),
-                request_generation,
-            ) {
+            if action_generation.try_get_untracked().is_none() {
+                return;
+            }
+            if !auth_for_request.is_current_auth_flow(auth_epoch)
+                || !accepts_account_response(
+                    auth_for_request.npub.get_untracked().as_deref(),
+                    &publisher_npub,
+                    action_generation.get_untracked(),
+                    request_generation,
+                )
+            {
                 action_in_progress.set(false);
                 action_completed.set(true);
                 cancel_message.set(Some("Account changed while cancellation was being signed. The stale response was ignored; refresh this Game page to reconcile the Promotion state.".into()));
@@ -2283,10 +2356,13 @@ fn CampaignEditorView(
     let error = RwSignal::new(None::<String>);
     let operation_generation = RwSignal::new(0_u64);
     let pointer_retry = RwSignal::new(None::<(String, bool)>);
-    let operation_account = RwSignal::new(auth.npub.get_untracked());
+    let operation_account = RwSignal::new((auth.npub.get_untracked(), auth.current_auth_flow()));
     let auth_for_epoch = auth.clone();
     Effect::new(move |_| {
-        let current = auth_for_epoch.npub.get();
+        let current = (
+            auth_for_epoch.npub.get(),
+            auth_for_epoch.current_auth_flow(),
+        );
         if current != operation_account.get_untracked() {
             operation_account.set(current);
             operation_generation.update(|value| *value = value.wrapping_add(1));
@@ -2361,14 +2437,20 @@ fn CampaignEditorView(
         operation_generation.update(|value| *value = value.wrapping_add(1));
         let request_generation = operation_generation.get_untracked();
         let auth_for_request = auth.clone();
+        let auth_epoch = auth_for_request.current_auth_flow();
         spawn_local(async move {
             let result = invoke_publish_campaign(request).await;
-            if !accepts_account_response(
-                auth_for_request.npub.get_untracked().as_deref(),
-                &publisher_npub,
-                operation_generation.get_untracked(),
-                request_generation,
-            ) {
+            if operation_generation.try_get_untracked().is_none() {
+                return;
+            }
+            if !auth_for_request.is_current_auth_flow(auth_epoch)
+                || !accepts_account_response(
+                    auth_for_request.npub.get_untracked().as_deref(),
+                    &publisher_npub,
+                    operation_generation.get_untracked(),
+                    request_generation,
+                )
+            {
                 submitting.set(false);
                 completed.set(true);
                 error.set(Some("Account changed during Promotion publication. The stale response was ignored; return to the Game page and refresh before retrying.".into()));
@@ -2402,12 +2484,17 @@ fn CampaignEditorView(
                             remove: true,
                         };
                         let removal_result = invoke_update_campaign_pointer(removal_request).await;
-                        if !accepts_account_response(
-                            auth_for_request.npub.get_untracked().as_deref(),
-                            &publisher_for_pointer_removal,
-                            operation_generation.get_untracked(),
-                            request_generation,
-                        ) {
+                        if operation_generation.try_get_untracked().is_none() {
+                            return;
+                        }
+                        if !auth_for_request.is_current_auth_flow(auth_epoch)
+                            || !accepts_account_response(
+                                auth_for_request.npub.get_untracked().as_deref(),
+                                &publisher_for_pointer_removal,
+                                operation_generation.get_untracked(),
+                                request_generation,
+                            )
+                        {
                             submitting.set(false);
                             completed.set(true);
                             error.set(Some("Account changed while the Promotion link was updating. The stale response was ignored; return to the Game page and refresh.".into()));
@@ -2496,14 +2583,20 @@ fn CampaignEditorView(
         operation_generation.update(|value| *value = value.wrapping_add(1));
         let request_generation = operation_generation.get_untracked();
         let auth_for_request = auth_for_cancel.clone();
+        let auth_epoch = auth_for_request.current_auth_flow();
         spawn_local(async move {
             let result = invoke_publish_campaign(request).await;
-            if !accepts_account_response(
-                auth_for_request.npub.get_untracked().as_deref(),
-                &publisher_npub,
-                operation_generation.get_untracked(),
-                request_generation,
-            ) {
+            if operation_generation.try_get_untracked().is_none() {
+                return;
+            }
+            if !auth_for_request.is_current_auth_flow(auth_epoch)
+                || !accepts_account_response(
+                    auth_for_request.npub.get_untracked().as_deref(),
+                    &publisher_npub,
+                    operation_generation.get_untracked(),
+                    request_generation,
+                )
+            {
                 submitting.set(false);
                 completed.set(true);
                 error.set(Some("Account changed during Promotion cancellation. The stale response was ignored; return to the Game page and refresh before another change.".into()));
@@ -2561,18 +2654,24 @@ fn CampaignEditorView(
             remove,
         };
         let auth_for_request = auth_for_retry.clone();
+        let auth_epoch = auth_for_request.current_auth_flow();
         let listing = listing_for_retry.clone();
         let on_saved = on_saved_for_retry.clone();
         submitting.set(true);
         error.set(None);
         spawn_local(async move {
             let result = invoke_update_campaign_pointer(request).await;
-            if !accepts_account_response(
-                auth_for_request.npub.get_untracked().as_deref(),
-                &publisher_npub,
-                operation_generation.get_untracked(),
-                request_generation,
-            ) {
+            if operation_generation.try_get_untracked().is_none() {
+                return;
+            }
+            if !auth_for_request.is_current_auth_flow(auth_epoch)
+                || !accepts_account_response(
+                    auth_for_request.npub.get_untracked().as_deref(),
+                    &publisher_npub,
+                    operation_generation.get_untracked(),
+                    request_generation,
+                )
+            {
                 submitting.set(false);
                 completed.set(true);
                 error.set(Some("Account changed while the Promotion link was updating. The stale response was ignored; return to the Game page and refresh.".into()));

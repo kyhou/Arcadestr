@@ -25,6 +25,19 @@ pub struct AdpLaunchTierIntent {
 /// Additive publication fields reserved for the typed publish command.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishAdpListingRequestExtension {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_roles: Vec<crate::publisher_management::ServerRoleIntent>,
+    /// Explicit authority setup, never inferred from a metadata edit or retry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub authorize_operators: bool,
+    /// IPC correlation only; this does not grant publisher or purchase authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::adp_settlement::PublisherCommercialIntent::is_preserve"
+    )]
+    pub commercial_intent: crate::adp_settlement::PublisherCommercialIntent,
     pub launch_tier: Option<AdpLaunchTierIntent>,
     pub acknowledged_removed_profile_ids: Vec<ProfileId>,
 }
@@ -491,6 +504,10 @@ mod tests {
 
     fn extension() -> PublishAdpListingRequestExtension {
         PublishAdpListingRequestExtension {
+            authorize_operators: false,
+            server_roles: Vec::new(),
+            commercial_intent: Default::default(),
+            operation_id: None,
             launch_tier: Some(AdpLaunchTierIntent {
                 package_format: PackageFormat::Zip,
                 platforms: vec![PlatformTarget {

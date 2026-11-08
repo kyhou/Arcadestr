@@ -6,6 +6,9 @@ use wasm_bindgen_futures::spawn_local;
 use arcadestr_core::adp_publish_contract::{
     PublishAdpListingError, PublishAdpListingRequestExtension,
 };
+use arcadestr_core::adp_settlement::{
+    FeePolicy, PublisherCommercialIntent, PublisherTermsContext, PublisherTermsReview,
+};
 use arcadestr_core::archive_inspection_contract::ArchiveSelectionError;
 use arcadestr_core::distribution::ProfileId;
 use arcadestr_core::is_sha256_hex;
@@ -70,7 +73,7 @@ enum ServerStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum AcquisitionKind {
     Gated,
     Public,
@@ -117,9 +120,8 @@ impl PublishStage {
     }
 }
 
-/// Arcadestr has no Create Game draft persistence. The workflow must say so
-/// instead of offering the prototype's draft-saving control.
-const SUPPORTS_DRAFTS: bool = false;
+/// Drafts are explicitly saved to account-scoped native storage, not localStorage.
+const SUPPORTS_DRAFTS: bool = true;
 
 /// Truthful state of a single stage in the indicator.
 ///
@@ -295,7 +297,7 @@ fn signer_requirement_message(state: PublisherSignerState) -> &'static str {
 }
 
 /// Snapshot of every author-editable field, used only to tell pristine from dirty.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct FormSnapshot {
     title: String,
     description: String,
@@ -310,6 +312,69 @@ struct FormSnapshot {
     ends_at: String,
     images: Vec<String>,
     fulfillment_enabled: bool,
+    commercial: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct DurableListingDraft {
+    #[serde(default)]
+    server_roles: Vec<arcadestr_core::publisher_management::ServerRoleIntent>,
+    form: FormSnapshot,
+    identity: PublishedIdentity,
+    launch: LaunchMode,
+    servers: Vec<String>,
+    mode: FulfillmentMode,
+    acquisition: AcquisitionKind,
+    artifact_hash: Option<String>,
+    commercial_intent: String,
+    commercial_review: Option<PublisherTermsReview>,
+    #[serde(default)]
+    accepted_terms: Vec<(String, String)>,
+    #[serde(default)]
+    authorization_references: Vec<(String, String)>,
+}
+
+fn reviewed_commercial_intent(
+    mode: &str,
+    context: &PublisherTermsContext,
+    review: Option<PublisherTermsReview>,
+    approved: bool,
+) -> Result<PublisherCommercialIntent, String> {
+    match mode {
+        "preserve" => Ok(PublisherCommercialIntent::Preserve),
+        "replace" if approved => match review {
+            Some(review) if &review.context == context => {
+                Ok(PublisherCommercialIntent::ReplaceAfterReview { review })
+            }
+            _ => Err("Commercial review is stale; retrieve exact signed terms again".into()),
+        },
+        "replace" => {
+            Err("Review the signed terms and explicitly approve their allocation first".into())
+        }
+        _ => {
+            Err("Operator retirement is unavailable pending an agreed prospective workflow".into())
+        }
+    }
+}
+
+fn fee_policy_label(policy: &FeePolicy) -> String {
+    match policy {
+        FeePolicy::None => "No operator fee".into(),
+        FeePolicy::Fixed { amount_msat } => format!("Fixed {amount_msat} msat"),
+        FeePolicy::BasisPoints {
+            basis_points,
+            minimum_msat,
+            maximum_msat,
+        } => {
+            let minimum = minimum_msat
+                .map(|amount| format!("{amount} msat"))
+                .unwrap_or_else(|| "none".into());
+            let maximum = maximum_msat
+                .map(|amount| format!("{amount} msat"))
+                .unwrap_or_else(|| "none".into());
+            format!("{basis_points} basis points · minimum {minimum} · maximum {maximum}")
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -579,7 +644,7 @@ fn publication_progress(
 /// transactional, so this is filled in as soon as the listing event is on a
 /// relay — a retry after a later failure must replace that listing rather than
 /// create a second coordinate.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PublishedIdentity {
     event_id: Option<String>,
     d_tag: Option<String>,
@@ -687,6 +752,27 @@ fn publication_completed(
 /// then dropped rather than shown as stages the publisher is waiting on.
 fn is_recovery_channel(step: &str) -> bool {
     matches!(step, "listing-coordinate" | "pending-coordinate")
+}
+
+fn accepts_publication_progress(
+    operation: &str,
+    publisher: &str,
+    coordinate: &mut Option<String>,
+    event: &PublishProgressPayload,
+) -> bool {
+    if event.operation_id != operation
+        || event.publisher_npub != publisher
+        || event.game_coordinate.is_empty()
+        || coordinate
+            .as_ref()
+            .is_some_and(|expected| expected != &event.game_coordinate)
+    {
+        return false;
+    }
+    if coordinate.is_none() {
+        *coordinate = Some(event.game_coordinate.clone());
+    }
+    true
 }
 
 fn progress_label(event: &PublishProgressPayload) -> String {
@@ -903,10 +989,9 @@ fn validate_listing(
             }
             FulfillmentMode::Direct => {}
             FulfillmentMode::Delegate => {
-                if operator_url.trim().is_empty() {
-                    return Err("Operator URL is required for delegated fulfillment".to_string());
-                }
-                if !is_http_url(operator_url) {
+                // Metadata edits preserve signed authority without a local operator row.
+                // The backend requires an operator when explicit new provisioning is needed.
+                if !operator_url.trim().is_empty() && !is_http_url(operator_url) {
                     return Err("Operator URL must start with http:// or https://".to_string());
                 }
             }
@@ -1161,21 +1246,46 @@ fn listing_fulfillment_mode(listing: &GameListing) -> FulfillmentMode {
 }
 
 fn listing_fulfillment_pubkey(listing: &GameListing) -> Option<String> {
-    listing_authorizations(listing)
-        .first()
-        .map(|(_, key)| key.clone())
+    let references = listing_authorizations(listing);
+    let (_, key) = references.first()?;
+    references
+        .iter()
+        .all(|(_, candidate)| candidate == key)
+        .then(|| key.clone())
 }
 
 fn published_listing(
     existing: Option<GameListing>,
     request: &PublishAdpListingRequest,
     result: &PublishAdpListingResult,
+    commercial: &PublisherCommercialIntent,
 ) -> GameListing {
     let mut specs = request
         .servers
         .iter()
         .map(|server| ("server".to_string(), server.clone()))
         .collect::<Vec<_>>();
+    if let Some(existing) = &existing {
+        specs.extend(
+            existing
+                .specs
+                .iter()
+                .filter(|(name, _)| {
+                    name == "fulfillment_authorization"
+                        || (matches!(commercial, PublisherCommercialIntent::Preserve)
+                            && name.starts_with("adp_terms:"))
+                })
+                .cloned(),
+        );
+    }
+    if let PublisherCommercialIntent::ReplaceAfterReview { review } = commercial {
+        specs.extend(review.accepted_terms.iter().map(|reference| {
+            (
+                format!("adp_terms:{}", reference.operator_pubkey),
+                reference.terms_event_id.clone(),
+            )
+        }));
+    }
     if let Some(file_hash) = result
         .file_hash
         .clone()
@@ -1255,7 +1365,7 @@ fn operator_resolution_request(listing: &GameListing) -> Option<ResolveAdpOperat
     if !matches!(listing_fulfillment_mode(listing), FulfillmentMode::Delegate) {
         return None;
     }
-    let fulfillment_pubkey = listing_authorizations(listing).first()?.1.clone();
+    let fulfillment_pubkey = listing_fulfillment_pubkey(listing)?;
     Some(ResolveAdpOperatorRequest {
         publisher_npub: listing.publisher_npub.clone(),
         fulfillment_pubkey,
@@ -1279,6 +1389,53 @@ fn operator_prefill_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commercial_consent_defaults_to_preserve_and_requires_fresh_explicit_review() {
+        let context = PublisherTermsContext {
+            publisher_pubkey: "publisher".into(),
+            servers: vec!["https://operator.test".into()],
+            price_sats: 100,
+            developer_destination: "developer@example.test".into(),
+        };
+        let review = PublisherTermsReview {
+            context: context.clone(),
+            accepted_terms: vec![arcadestr_core::adp_settlement::AcceptedTermsRef {
+                operator_pubkey: "operator".into(),
+                terms_event_id: "old-root".into(),
+            }],
+            offers: Vec::new(),
+            legs: Vec::new(),
+        };
+        assert_eq!(
+            reviewed_commercial_intent("preserve", &context, Some(review.clone()), false),
+            Ok(PublisherCommercialIntent::Preserve)
+        );
+        assert!(
+            reviewed_commercial_intent("replace", &context, Some(review.clone()), false).is_err()
+        );
+        assert!(reviewed_commercial_intent("replace", &context, None, true).is_err());
+        assert!(matches!(
+            reviewed_commercial_intent("replace", &context, Some(review.clone()), true),
+            Ok(PublisherCommercialIntent::ReplaceAfterReview { .. })
+        ));
+        let mut changed = context.clone();
+        changed.price_sats += 1;
+        assert!(
+            reviewed_commercial_intent("replace", &changed, Some(review.clone()), true).is_err()
+        );
+        let mut changed = context.clone();
+        changed.servers.push("https://second.test".into());
+        assert!(
+            reviewed_commercial_intent("replace", &changed, Some(review.clone()), true).is_err()
+        );
+        let mut changed = context.clone();
+        changed.publisher_pubkey = "another publisher".into();
+        assert!(
+            reviewed_commercial_intent("replace", &changed, Some(review.clone()), true).is_err()
+        );
+        assert!(reviewed_commercial_intent("retire", &context, Some(review), true).is_err());
+    }
 
     const VALID_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1672,6 +1829,71 @@ mod tests {
     }
 
     #[test]
+    fn multioperator_metadata_does_not_choose_a_first_key_or_drop_sibling_references() {
+        use nostr::nips::nip19::ToBech32;
+        let publisher = nostr::Keys::generate()
+            .public_key()
+            .to_bech32()
+            .expect("npub");
+        let mut listing = managed_listing(
+            publisher.clone(),
+            nostr::Keys::generate().public_key().to_hex(),
+        );
+        listing.specs.push((
+            "fulfillment_authorization".into(),
+            serde_json::json!({
+                "root_event_id": "22".repeat(32),
+                "fulfillment_pubkey": nostr::Keys::generate().public_key().to_hex(),
+                "relay_hint": "wss://sibling.example"
+            })
+            .to_string(),
+        ));
+        listing.specs.push((
+            "adp_terms:operator-one".into(),
+            "exact-original-root".into(),
+        ));
+        let original = listing
+            .specs
+            .iter()
+            .filter(|(name, _)| name == "fulfillment_authorization")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(listing_fulfillment_pubkey(&listing), None);
+        assert!(operator_resolution_request(&listing).is_none());
+        let mut request = frozen_prepared().request;
+        request.expected_publisher_npub = publisher;
+        let result = PublishAdpListingResult {
+            operation_id: "metadata-operation".into(),
+            event_id: "new-event".into(),
+            game_id: None,
+            d_tag: listing.id.clone(),
+            game_coordinate: "coordinate".into(),
+            acceptance_event_id: None,
+            fulfillment_pubkey: None,
+            file_hash: None,
+            uploads: Vec::new(),
+        };
+        let updated = published_listing(
+            Some(listing),
+            &request,
+            &result,
+            &PublisherCommercialIntent::Preserve,
+        );
+        assert!(updated.specs.contains(&(
+            "adp_terms:operator-one".into(),
+            "exact-original-root".into()
+        )));
+        assert_eq!(
+            updated
+                .specs
+                .into_iter()
+                .filter(|(name, _)| name == "fulfillment_authorization")
+                .collect::<Vec<_>>(),
+            original
+        );
+    }
+
+    #[test]
     fn operator_prefill_only_applies_unique_success_to_empty_input() {
         assert_eq!(
             operator_prefill_update("", Ok(Some("https://operator.example.com".to_string())))
@@ -1748,10 +1970,10 @@ mod tests {
     }
 
     #[test]
-    fn drafts_are_not_supported() {
-        assert!(!SUPPORTS_DRAFTS);
-        assert!(!include_str!("publish.rs").contains(concat!("Save", " Draft")));
-        assert!(!include_str!("publish.rs").contains(concat!("Save", " draft")));
+    fn drafts_use_explicit_account_scoped_database_actions() {
+        assert!(SUPPORTS_DRAFTS);
+        assert!(include_str!("publish.rs").contains("invoke_save_publisher_draft"));
+        assert!(include_str!("publish.rs").contains("RESTORE SAVED DRAFT (REPLACES FORM)"));
     }
 
     #[test]
@@ -1917,6 +2139,7 @@ mod tests {
                 message: None,
                 bytes_uploaded: None,
                 total_bytes: None,
+                ..Default::default()
             },
         );
         let partial = publication_progress(
@@ -1928,6 +2151,7 @@ mod tests {
                 message: Some("offline".into()),
                 bytes_uploaded: None,
                 total_bytes: None,
+                ..Default::default()
             },
         );
         assert_eq!(partial.outcome, PublicationOutcome::Partial);
@@ -2192,6 +2416,7 @@ mod tests {
                 message: Some("listing-event-id".into()),
                 bytes_uploaded: None,
                 total_bytes: None,
+                ..Default::default()
             },
         );
         let identity = publication_identity_progress(
@@ -2203,6 +2428,7 @@ mod tests {
                 message: Some("30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
                 bytes_uploaded: None,
                 total_bytes: None,
+                ..Default::default()
             },
         );
         // The upload that follows fails; the identity survives it.
@@ -2215,6 +2441,7 @@ mod tests {
                 message: Some("connection refused".into()),
                 bytes_uploaded: None,
                 total_bytes: None,
+                ..Default::default()
             },
         );
 
@@ -2249,6 +2476,7 @@ mod tests {
                 message: Some("30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
                 bytes_uploaded: None,
                 total_bytes: None,
+                ..Default::default()
             },
         );
         assert_eq!(after_retry, recovered);
@@ -2262,7 +2490,52 @@ mod tests {
             message: Some(message.into()),
             bytes_uploaded: None,
             total_bytes: None,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn publication_progress_isolated_by_operation_account_and_coordinate() {
+        let mut coordinate = None;
+        let mut event = progress("pending-coordinate", "coordinate-a");
+        event.operation_id = "operation-a".into();
+        event.publisher_npub = "alice".into();
+        event.game_coordinate = "coordinate-a".into();
+        // Same-account concurrent publication cannot bind or overwrite identity.
+        assert!(!accepts_publication_progress(
+            "operation-b",
+            "alice",
+            &mut coordinate,
+            &event
+        ));
+        assert!(coordinate.is_none());
+        assert!(!accepts_publication_progress(
+            "operation-a",
+            "bob",
+            &mut coordinate,
+            &event
+        ));
+        assert!(accepts_publication_progress(
+            "operation-a",
+            "alice",
+            &mut coordinate,
+            &event
+        ));
+        event.game_coordinate = "coordinate-b".into();
+        assert!(!accepts_publication_progress(
+            "operation-a",
+            "alice",
+            &mut coordinate,
+            &event
+        ));
+        assert_eq!(coordinate.as_deref(), Some("coordinate-a"));
+        // A late event from a previous attempt is ignored by the replacement attempt.
+        assert!(!accepts_publication_progress(
+            "retry-operation",
+            "alice",
+            &mut coordinate,
+            &event
+        ));
     }
 
     #[test]
@@ -2392,6 +2665,7 @@ mod tests {
                 message: Some("30402:publisherhex:2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b".into()),
                 bytes_uploaded: None,
                 total_bytes: None,
+                ..Default::default()
             },
         );
 
@@ -2539,6 +2813,56 @@ pub fn PublishView(
         .and_then(|item| item.nip94_event_id.clone());
     let existing_fulfillment_locked = existing_fulfillment_pubkey.is_some();
 
+    let draft_revision = RwSignal::new(None::<u64>);
+    let draft_message = RwSignal::new(None::<String>);
+    let draft_busy = RwSignal::new(false);
+    let restored_artifact_hash = RwSignal::new(None::<String>);
+    let durable_draft_id = StoredValue::new(format!(
+        "listing:{}",
+        listing
+            .as_ref()
+            .map(|listing| listing.id.as_str())
+            .unwrap_or("new")
+    ));
+    let durable_draft_owner = StoredValue::new(
+        listing
+            .as_ref()
+            .map(|listing| listing.publisher_npub.clone())
+            .or_else(|| auth.npub.get_untracked()),
+    );
+    let durable_accepted_terms = StoredValue::new(
+        listing
+            .as_ref()
+            .map(|listing| {
+                listing
+                    .specs
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("adp_terms:"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    );
+    let durable_authorizations = StoredValue::new(
+        listing
+            .as_ref()
+            .map(|listing| {
+                listing
+                    .specs
+                    .iter()
+                    .filter(|(key, _)| key == "fulfillment_authorization")
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    );
+    let draft_epoch_auth = auth.clone();
+    Effect::new(move |_| {
+        draft_epoch_auth.current_auth_flow();
+        draft_busy.set(false);
+        draft_revision.set(None);
+        draft_message.set(None);
+    });
     let title = RwSignal::new(
         listing
             .as_ref()
@@ -2611,12 +2935,27 @@ pub fn PublishView(
     } else {
         FulfillmentMode::Delegate
     });
-    let accept_service_fees = RwSignal::new(listing.as_ref().is_some_and(|listing| {
+    let commercial_mode = RwSignal::new("preserve".to_string());
+    let commercial_review = RwSignal::new(None::<PublisherTermsReview>);
+    let commercial_approved = RwSignal::new(false);
+    let commercial_loading = RwSignal::new(false);
+    let commercial_error = RwSignal::new(None::<String>);
+    let commercial_generation = RwSignal::new(0_u64);
+    let preserved_terms_label = StoredValue::new(
         listing
-            .specs
-            .iter()
-            .any(|(key, _)| key.starts_with("adp_terms:"))
-    }));
+            .as_ref()
+            .map(|listing| {
+                listing
+                    .specs
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("adp_terms:"))
+                    .map(|(operator, root)| format!("{operator} → {root}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "No accepted roots; legacy fee-free configuration".into()),
+    );
     let discovered_servers = RwSignal::new(Vec::<AdpServerAnnouncement>::new());
     let discovery_error = RwSignal::new(None::<String>);
     let initial_servers = if use_default_provider {
@@ -2647,6 +2986,17 @@ pub fn PublishView(
     let custom_server = RwSignal::new(String::new());
     let initial_operator_url = initial_operator_url(editing_delegated_listing);
     let operator_url = RwSignal::new(initial_operator_url.clone());
+    let server_roles =
+        RwSignal::new(Vec::<arcadestr_core::publisher_management::ServerRoleIntent>::new());
+    let authorize_operators = RwSignal::new(false);
+    let role_auth = auth.clone();
+    Effect::new(move |_| {
+        server_roles.track();
+        servers.track();
+        operator_url.track();
+        role_auth.npub.track();
+        authorize_operators.set(false);
+    });
     let operator_auto_added = RwSignal::new(use_default_provider.then_some(initial_operator_url));
     let file_hash = RwSignal::new(existing_file_hash);
     let version = RwSignal::new(
@@ -2668,6 +3018,12 @@ pub fn PublishView(
     let publication_state = RwSignal::new(PublicationState::default());
     let initiating_account = RwSignal::new(None::<String>);
     let publication_account_stale = RwSignal::new(false);
+    let active_publication =
+        StoredValue::new_local(std::rc::Rc::new(std::cell::RefCell::new(None::<String>)));
+    on_cleanup(move || active_publication.with_value(|active| *active.borrow_mut() = None));
+    let publication_view_alive =
+        StoredValue::new_local(std::rc::Rc::new(std::cell::Cell::new(true)));
+    on_cleanup(move || publication_view_alive.with_value(|alive| alive.set(false)));
     let publish_draft = RwSignal::new(PublishState {
         archive: ArchiveSelectionState::new(auth.npub.get_untracked().unwrap_or_default()),
         launch: LaunchMode::DownloadOnly,
@@ -3035,6 +3391,23 @@ pub fn PublishView(
                 .as_ref()
                 .ok()
                 .map(|build| build.sha256.as_str().to_string());
+            if restored_artifact_hash
+                .get_untracked()
+                .as_ref()
+                .is_some_and(|expected| {
+                    hash_for_display
+                        .as_ref()
+                        .is_some_and(|actual| actual != expected)
+                })
+            {
+                publish_draft.update(|state| {
+                    state.archive.consume_success();
+                    state.launch.mark_bindings_stale();
+                });
+                error_message.set(Some("The reselected archive does not match the saved draft digest. The saved artifact reference was not changed.".into()));
+                is_hashing.set(false);
+                return;
+            }
             let hash_error = hashed.as_ref().err().cloned();
             let transition = publish_draft
                 .try_update(|state| state.archive.apply_hash(&hash_operation, hashed))
@@ -3365,6 +3738,82 @@ pub fn PublishView(
         }
     };
 
+    let commercial_context_auth = auth.clone();
+    let commercial_context = move || -> Result<PublisherTermsContext, String> {
+        let publisher_pubkey = commercial_context_auth
+            .npub
+            .get()
+            .as_deref()
+            .and_then(publisher_hex)
+            .ok_or("Authenticate as the publisher first")?;
+        let kind = acquisition_kind.get();
+        let destination = lud16.get().trim().to_string();
+        Ok(PublisherTermsContext {
+            publisher_pubkey,
+            servers: if fulfillment_enabled.get() {
+                servers.get().iter().map(|s| s.url.clone()).collect()
+            } else {
+                Vec::new()
+            },
+            price_sats: price_for_acquisition(kind, &price_input.get(), &destination)?,
+            developer_destination: if kind == AcquisitionKind::Gated {
+                destination
+            } else {
+                String::new()
+            },
+        })
+    };
+    let last_commercial_context = RwSignal::new(None::<PublisherTermsContext>);
+    let last_commercial_epoch = RwSignal::new(None::<u64>);
+    let commercial_epoch_auth = auth.clone();
+    let commercial_context_for_effect = commercial_context.clone();
+    Effect::new(move |_| {
+        let context = commercial_context_for_effect().ok();
+        let epoch = commercial_epoch_auth.current_auth_flow();
+        if last_commercial_context.get_untracked() != context
+            || last_commercial_epoch.get_untracked() != Some(epoch)
+        {
+            last_commercial_context.set(context);
+            last_commercial_epoch.set(Some(epoch));
+            commercial_review.set(None);
+            commercial_approved.set(false);
+            commercial_loading.set(false);
+            commercial_generation.update(|value| *value = value.wrapping_add(1));
+        }
+    });
+    let review_auth = auth.clone();
+    let commercial_context_for_review = commercial_context.clone();
+    let on_review_terms = Callback::new(move |_: ()| {
+        let context = match commercial_context_for_review() {
+            Ok(context) => context,
+            Err(error) => {
+                commercial_error.set(Some(error));
+                return;
+            }
+        };
+        commercial_generation.update(|value| *value = value.wrapping_add(1));
+        let generation = commercial_generation.get_untracked();
+        let epoch = review_auth.current_auth_flow();
+        let response_auth = review_auth.clone();
+        commercial_review.set(None);
+        commercial_approved.set(false);
+        commercial_error.set(None);
+        commercial_loading.set(true);
+        spawn_local(async move {
+            let result = crate::tauri_bridge::invoke_preview_publisher_terms(context).await;
+            if commercial_generation.get_untracked() != generation
+                || !response_auth.is_current_auth_flow(epoch)
+            {
+                return;
+            }
+            commercial_loading.set(false);
+            match result {
+                Ok(review) => commercial_review.set(Some(review)),
+                Err(error) => commercial_error.set(Some(error)),
+            }
+        });
+    });
+
     let full_form_snapshot = move || FormSnapshot {
         title: title.get(),
         description: description.get(),
@@ -3388,7 +3837,185 @@ pub fn PublishView(
             })
             .collect(),
         fulfillment_enabled: fulfillment_enabled.get(),
+        commercial: format!(
+            "{}:{:?}:{}",
+            commercial_mode.get(),
+            commercial_review.get(),
+            commercial_approved.get()
+        ),
     };
+    let save_auth = auth.clone();
+    let save_snapshot = full_form_snapshot.clone();
+    let on_save_draft = Callback::new(move |_: ()| {
+        let Some(publisher) = save_auth.npub.get_untracked() else {
+            return;
+        };
+        if durable_draft_owner.get_value().as_deref() != Some(publisher.as_str()) {
+            draft_message.set(Some(
+                "Switch back to this editor's publisher before saving its draft".into(),
+            ));
+            return;
+        }
+        if draft_busy.get_untracked() || is_publishing.get_untracked() {
+            return;
+        }
+        let epoch = save_auth.current_auth_flow();
+        let response_auth = save_auth.clone();
+        let mut form = save_snapshot();
+        form.images.retain(|url| url.starts_with("hosted:"));
+        let snapshot = DurableListingDraft {
+            server_roles: server_roles.get_untracked(),
+            form,
+            identity: published_identity.get_untracked(),
+            launch: publish_draft.get_untracked().launch,
+            servers: servers
+                .get_untracked()
+                .into_iter()
+                .map(|server| server.url)
+                .collect(),
+            mode: fulfillment_mode.get_untracked(),
+            acquisition: acquisition_kind.get_untracked(),
+            artifact_hash: file_hash.get_untracked(),
+            commercial_intent: commercial_mode.get_untracked(),
+            commercial_review: commercial_review.get_untracked(),
+            accepted_terms: durable_accepted_terms.get_value(),
+            authorization_references: durable_authorizations.get_value(),
+        };
+        let payload = match serde_json::to_value(snapshot) {
+            Ok(payload) => payload,
+            Err(_) => {
+                draft_message.set(Some("Draft could not be encoded".into()));
+                return;
+            }
+        };
+        let draft = arcadestr_core::publisher_recovery::PublisherDraft {
+            draft_id: durable_draft_id.get_value(),
+            kind: "listing".into(),
+            payload,
+            revision: draft_revision.get_untracked().unwrap_or(0),
+        };
+        draft_busy.set(true);
+        spawn_local(async move {
+            let result = crate::tauri_bridge::invoke_save_publisher_draft(
+                publisher,
+                draft,
+                draft_revision.get_untracked(),
+            )
+            .await;
+            if !response_auth.is_current_auth_flow(epoch) {
+                return;
+            }
+            draft_busy.set(false);
+            match result {
+                Ok(revision) => {
+                    draft_revision.set(Some(revision));
+                    draft_message.set(Some("Draft saved to this account's database. Archive and pending media selections must be reselected after restart.".into()));
+                }
+                Err(error) => draft_message.set(Some(error)),
+            }
+        });
+    });
+    let restore_auth = auth.clone();
+    let on_restore_draft = Callback::new(move |_: ()| {
+        let Some(publisher) = restore_auth.npub.get_untracked() else {
+            return;
+        };
+        if durable_draft_owner.get_value().as_deref() != Some(publisher.as_str()) {
+            draft_message.set(Some(
+                "Switch back to this editor's publisher before restoring its draft".into(),
+            ));
+            return;
+        }
+        if draft_busy.get_untracked() || is_publishing.get_untracked() || is_hashing.get_untracked()
+        {
+            return;
+        }
+        let epoch = restore_auth.current_auth_flow();
+        let response_auth = restore_auth.clone();
+        draft_busy.set(true);
+        spawn_local(async move {
+            let result = crate::tauri_bridge::invoke_publisher_recovery_state(publisher).await;
+            if !response_auth.is_current_auth_flow(epoch) {
+                return;
+            }
+            draft_busy.set(false);
+            let stored = match result {
+                Ok(state) => state
+                    .drafts
+                    .into_iter()
+                    .find(|draft| draft.draft_id == durable_draft_id.get_value()),
+                Err(error) => {
+                    draft_message.set(Some(error));
+                    return;
+                }
+            };
+            let Some(stored) = stored else {
+                draft_message.set(Some("No saved draft for this editor and publisher".into()));
+                return;
+            };
+            let snapshot: DurableListingDraft = match serde_json::from_value(stored.payload) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    draft_message.set(Some("Saved draft is invalid".into()));
+                    return;
+                }
+            };
+            title.set(snapshot.form.title);
+            description.set(snapshot.form.description);
+            tag_input.set(snapshot.form.tags);
+            price_input.set(snapshot.form.price);
+            lud16.set(snapshot.form.lud16);
+            platforms_input.set(snapshot.form.platforms);
+            version.set(snapshot.form.version);
+            operator_url.set(snapshot.form.operator_url);
+            acquisition_starts_at.set(snapshot.form.starts_at);
+            acquisition_ends_at.set(snapshot.form.ends_at);
+            fulfillment_enabled.set(snapshot.form.fulfillment_enabled);
+            acquisition_kind.set(snapshot.acquisition);
+            fulfillment_mode.set(snapshot.mode);
+            server_roles.set(snapshot.server_roles);
+            authorize_operators.set(false);
+            image_drafts.set(
+                snapshot
+                    .form
+                    .images
+                    .into_iter()
+                    .filter_map(|url| {
+                        url.strip_prefix("hosted:")
+                            .map(|url| ListingImageDraft::Hosted(url.to_string()))
+                    })
+                    .collect(),
+            );
+            servers.set(
+                snapshot
+                    .servers
+                    .into_iter()
+                    .map(|url| ServerEntry {
+                        label: url.clone(),
+                        url,
+                        reachability: ServerStatus::Idle,
+                        upload: ServerStatus::Idle,
+                        auto_operator: false,
+                    })
+                    .collect(),
+            );
+            published_identity.set(snapshot.identity);
+            restored_artifact_hash.set(snapshot.artifact_hash.clone());
+            file_hash.set(snapshot.artifact_hash);
+            publish_draft.update(|state| {
+                state.archive.consume_success();
+                state.launch = snapshot.launch;
+                state.launch.mark_bindings_stale();
+            });
+            commercial_mode.set(snapshot.commercial_intent);
+            commercial_review.set(snapshot.commercial_review);
+            commercial_approved.set(false);
+            durable_accepted_terms.set_value(snapshot.accepted_terms);
+            durable_authorizations.set_value(snapshot.authorization_references);
+            draft_revision.set(Some(stored.revision));
+            draft_message.set(Some("Draft restored locally, not published. Reselect the pinned archive, revalidate launch paths and review commercial changes before publishing.".into()));
+        });
+    });
     let form_snapshot = {
         let full_form_snapshot = full_form_snapshot.clone();
         move || {
@@ -3434,13 +4061,30 @@ pub fn PublishView(
     let existing_listing_for_dispatch = existing_listing_for_submit.clone();
     let form_snapshot_for_dispatch = full_form_snapshot.clone();
     let distribution_snapshot_for_dispatch = distribution_snapshot.clone();
+    let publication_auth = auth.clone();
     let dispatch_prepared = Callback::new(
         move |(prepared, initiating_npub, confirmed_removed_ids): (
             PreparedPublish,
             String,
             Option<Vec<ProfileId>>,
         )| {
+            if active_publication.with_value(|active| active.borrow().is_some()) {
+                return;
+            }
+            let mut prepared = prepared;
+            let prior_operation = publish_attempt
+                .get_untracked()
+                .prepared
+                .as_ref()
+                .and_then(|previous| previous.extension.operation_id.clone());
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let auth_epoch = publication_auth.current_auth_flow();
+            let response_auth = publication_auth.clone();
+            prepared.extension.operation_id = Some(operation_id.clone());
+            let active_operation = active_publication.get_value();
+            *active_operation.borrow_mut() = Some(operation_id.clone());
             let published_request = prepared.request.clone();
+            let published_commercial_intent = prepared.extension.commercial_intent.clone();
             let existing_listing = existing_listing_for_dispatch.clone();
             is_publishing.set(true);
             initiating_account.set(Some(initiating_npub.clone()));
@@ -3462,13 +4106,31 @@ pub fn PublishView(
             let dirty_at_dispatch = distribution_snapshot_for_dispatch.clone();
             spawn_local(async move {
                 let progress_account = initiating_npub.clone();
+                let progress_operation = operation_id.clone();
+                let progress_active = active_operation.clone();
+                let progress_auth = response_auth.clone();
+                let mut progress_coordinate =
+                    prepared.request.existing_d_tag.as_ref().and_then(|d| {
+                        publisher_hex(&progress_account)
+                            .map(|publisher| format!("30402:{publisher}:{d}"))
+                    });
                 let listener_cleanup = listen_publish_progress(move |payload| {
-                    if publication_account_stale.get_untracked()
+                    if progress_active.borrow().as_deref() != Some(progress_operation.as_str())
+                        || !progress_auth.is_current_auth_flow(auth_epoch)
+                        || publication_account_stale.get_untracked()
                         || !publication_account_matches(
                             &progress_account,
                             auth.npub.get_untracked().as_deref(),
                         )
                     {
+                        return;
+                    }
+                    if !accepts_publication_progress(
+                        &progress_operation,
+                        &progress_account,
+                        &mut progress_coordinate,
+                        &payload,
+                    ) {
                         return;
                     }
                     published_identity.update(|identity| {
@@ -3504,9 +4166,16 @@ pub fn PublishView(
                     }
                 })
                 .await;
+                if active_operation.borrow().as_deref() != Some(operation_id.as_str()) {
+                    if let Ok(cleanup) = listener_cleanup {
+                        cleanup();
+                    }
+                    return;
+                }
                 let listener_cleanup = match listener_cleanup {
                     Ok(cleanup) => cleanup,
                     Err(error) => {
+                        *active_operation.borrow_mut() = None;
                         publication_state.set(PublicationState {
                             outcome: PublicationOutcome::Failed,
                             listing_published: false,
@@ -3520,6 +4189,38 @@ pub fn PublishView(
                     }
                 };
 
+                if !response_auth.is_current_auth_flow(auth_epoch) {
+                    listener_cleanup();
+                    *active_operation.borrow_mut() = None;
+                    is_publishing.set(false);
+                    initiating_account.set(None);
+                    return;
+                }
+
+                if let Some(prior) = prior_operation {
+                    let recovery = crate::tauri_bridge::invoke_publisher_recovery_state(
+                        initiating_npub.clone(),
+                    )
+                    .await;
+                    if !response_auth.is_current_auth_flow(auth_epoch) {
+                        listener_cleanup();
+                        return;
+                    }
+                    if recovery.as_ref().is_err()
+                        || recovery.ok().is_some_and(|state| {
+                            state.operations.iter().any(|operation| {
+                                operation.operation_id == prior && operation.state != "complete"
+                            })
+                        })
+                    {
+                        listener_cleanup();
+                        *active_operation.borrow_mut() = None;
+                        is_publishing.set(false);
+                        initiating_account.set(None);
+                        error_message.set(Some("An earlier operation is incomplete. Save edits as a draft, then use Publisher recovery to reconcile and resume its exact signed events.".into()));
+                        return;
+                    }
+                }
                 if let Some(removed_profile_ids) = confirmed_removed_ids {
                     acknowledged_removed_profile_ids.set(removed_profile_ids);
                 }
@@ -3530,7 +4231,12 @@ pub fn PublishView(
                 )
                 .await;
                 listener_cleanup();
+                if active_operation.borrow().as_deref() != Some(operation_id.as_str()) {
+                    return;
+                }
+                *active_operation.borrow_mut() = None;
                 if publication_account_stale.get_untracked()
+                    || !response_auth.is_current_auth_flow(auth_epoch)
                     || !publication_account_matches(
                         &initiating_npub,
                         auth.npub.get_untracked().as_deref(),
@@ -3558,6 +4264,12 @@ pub fn PublishView(
                 }
                 let published = match publish_result {
                     Ok(result) => {
+                        if result.operation_id != operation_id {
+                            is_publishing.set(false);
+                            initiating_account.set(None);
+                            error_message.set(Some("Publication response did not match the active operation; refresh Published games.".into()));
+                            return;
+                        }
                         pending_removal_confirmation.set(None);
                         publish_attempt.update(|attempt| attempt.succeed(result.clone()));
                         publish_draft.update(PublishState::consume_selected_archive);
@@ -3576,7 +4288,12 @@ pub fn PublishView(
                             )
                         });
                         (!uploads_failed).then(|| {
-                            published_listing(existing_listing, &published_request, &result)
+                            published_listing(
+                                existing_listing,
+                                &published_request,
+                                &result,
+                                &published_commercial_intent,
+                            )
                         })
                     }
                     Err(err) => {
@@ -3643,6 +4360,7 @@ pub fn PublishView(
             });
         },
     );
+    let submit_auth = auth.clone();
     let on_submit = Callback::new(move |()| {
         if is_selecting_image.get_untracked() {
             error_message.set(Some("Finish selecting the image before publishing.".into()));
@@ -3774,59 +4492,49 @@ pub fn PublishView(
             }
         };
         let extension = PublishAdpListingRequestExtension {
+            authorize_operators: authorize_operators.get_untracked(),
+            server_roles: servers_val
+                .iter()
+                .map(|server| {
+                    server_roles
+                        .get_untracked()
+                        .into_iter()
+                        .find(|role| role.server_url == server.url)
+                        .unwrap_or(arcadestr_core::publisher_management::ServerRoleIntent {
+                            server_url: server.url.clone(),
+                            issue_receipt: server.url == operator_url.get_untracked(),
+                            issue_grant: server.url == operator_url.get_untracked(),
+                        })
+                })
+                .collect(),
+            operation_id: None,
+            commercial_intent: match reviewed_commercial_intent(
+                &commercial_mode.get_untracked(),
+                &PublisherTermsContext {
+                    publisher_pubkey: image_publisher_hex.clone(),
+                    servers: if fulfillment_enabled_val {
+                        servers_val.iter().map(|s| s.url.clone()).collect()
+                    } else {
+                        Vec::new()
+                    },
+                    price_sats: price_val,
+                    developer_destination: if acquisition_kind_val == AcquisitionKind::Gated {
+                        lud16_val.clone()
+                    } else {
+                        String::new()
+                    },
+                },
+                commercial_review.get_untracked(),
+                commercial_approved.get_untracked(),
+            ) {
+                Ok(intent) => intent,
+                Err(error) => {
+                    error_message.set(Some(error));
+                    return;
+                }
+            },
             launch_tier,
             acknowledged_removed_profile_ids: acknowledged_removed_profile_ids.get_untracked(),
-        };
-        let accepted_terms = if accept_service_fees.get_untracked() {
-            let selected = servers_val
-                .iter()
-                .map(|server| server.url.as_str())
-                .collect::<std::collections::HashSet<_>>();
-            let mut by_operator = std::collections::BTreeMap::new();
-            for server in discovered_servers
-                .get_untracked()
-                .into_iter()
-                .filter(|server| selected.contains(server.url.as_str()))
-            {
-                let Some(terms_event_id) = server.terms_event_id else {
-                    error_message.set(Some(format!(
-                        "{} does not advertise immutable service terms.",
-                        server.url
-                    )));
-                    return;
-                };
-                if !server.split_enabled {
-                    error_message.set(Some(format!(
-                        "{} does not support split settlement.",
-                        server.url
-                    )));
-                    return;
-                }
-                if by_operator
-                    .insert(server.pubkey.clone(), terms_event_id)
-                    .is_some()
-                {
-                    continue;
-                }
-            }
-            if by_operator.is_empty() {
-                error_message.set(Some(
-                    "Resolve every selected distribution provider before accepting service fees."
-                        .into(),
-                ));
-                return;
-            }
-            by_operator
-                .into_iter()
-                .map(|(operator_pubkey, terms_event_id)| {
-                    arcadestr_core::adp_settlement::AcceptedTermsRef {
-                        operator_pubkey,
-                        terms_event_id,
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
         };
         let mut request = PublishAdpListingRequest {
             expected_publisher_npub: initiating_npub.clone(),
@@ -3850,7 +4558,7 @@ pub fn PublishView(
                 servers_val.into_iter().map(|entry| entry.url).collect(),
             )
             .unwrap_or_default(),
-            accepted_terms,
+            accepted_terms: Vec::new(),
             file_path: None,
             selected_build: selected_build.clone(),
             existing_file_hash: (fulfillment_enabled_val && selected_build.is_none())
@@ -3908,19 +4616,39 @@ pub fn PublishView(
             }
         });
 
+        let submit_epoch = submit_auth.current_auth_flow();
+        let response_auth = submit_auth.clone();
+        let view_alive = publication_view_alive.get_value();
         spawn_local(async move {
+            let stop_stale_preparation = || {
+                if !view_alive.get() {
+                    return true;
+                }
+                if !response_auth.is_current_auth_flow(submit_epoch) {
+                    is_publishing.set(false);
+                    initiating_account.set(None);
+                    image_upload_status.set(None);
+                    return true;
+                }
+                false
+            };
+            if stop_stale_preparation() {
+                return;
+            }
             if !pending_images.is_empty() {
                 image_upload_status.set(Some(format!(
                     "Preparing {} image upload(s)",
                     pending_images.len()
                 )));
-                let settings = match invoke_get_blossom_server_settings(
-                    ExpectedBlossomPublisherRequest {
+                let settings_result =
+                    invoke_get_blossom_server_settings(ExpectedBlossomPublisherRequest {
                         expected_publisher_hex: image_publisher_hex.clone(),
-                    },
-                )
-                .await
-                {
+                    })
+                    .await;
+                if stop_stale_preparation() {
+                    return;
+                }
+                let settings = match settings_result {
                     Ok(settings) if settings.publisher_pubkey == image_publisher_hex => settings,
                     Ok(_) => {
                         publication_state.set(PublicationState {
@@ -3972,7 +4700,9 @@ pub fn PublishView(
                 };
                 let upload_started = js_sys::Date::now().max(0.0) as u64;
                 for (index, selection) in pending_images.iter().enumerate() {
-                    if auth.npub.get_untracked().as_deref() != Some(initiating_npub.as_str()) {
+                    if !response_auth.is_current_auth_flow(submit_epoch)
+                        || auth.npub.get_untracked().as_deref() != Some(initiating_npub.as_str())
+                    {
                         publication_state.set(PublicationState {
                             outcome: PublicationOutcome::Failed,
                             listing_published: false,
@@ -4000,6 +4730,9 @@ pub fn PublishView(
                         request_id: fresh_request_id(upload_started, index as u64 + 1),
                     })
                     .await;
+                    if stop_stale_preparation() {
+                        return;
+                    }
                     let response = match response {
                         Ok(response)
                             if response.mime_type == selection.detected_mime
@@ -4328,6 +5061,11 @@ pub fn PublishView(
 
             {move || stage_error.get().map(|msg| view! { <div id="publish-stage-error" role="alert" class="v2-create-alert v2-create-alert-error">{msg}</div> })}
             {move || error_message.get().map(|msg| view! { <div role="alert" class="v2-create-alert v2-create-alert-error">{msg}</div> })}
+            <section style="padding:14px;border:1px solid oklch(0.32 0.01 60);background:#121215;font:400 12.5px/1.6 ui-monospace,monospace;color:#fff">
+                <button type="button" style="padding:10px;color:oklch(0.8 0.13 210);background:transparent;border:1px solid oklch(0.5 0.13 210);font-family:ui-monospace,monospace" disabled=move || draft_busy.get() || is_publishing.get() on:click=move |_| on_save_draft.run(())>"SAVE DRAFT"</button>
+                <button type="button" style="padding:10px;color:oklch(0.8 0.13 210);background:transparent;border:1px solid oklch(0.5 0.13 210);font-family:ui-monospace,monospace" disabled=move || draft_busy.get() || is_publishing.get() || is_hashing.get() on:click=move |_| on_restore_draft.run(())>"RESTORE SAVED DRAFT (REPLACES FORM)"</button>
+                {move || draft_message.get().map(|message| view! { <p role="status">{message}</p> })}
+            </section>
             {(!SUPPORTS_DRAFTS).then(|| view! {
                 <p class="v2-create-persistence-note">"Arcadestr does not store Create Game drafts. Nothing here is saved locally or on a relay until network publication succeeds; leaving this workflow discards it."</p>
             })}
@@ -4676,27 +5414,65 @@ pub fn PublishView(
                                             }
                                         }).collect_view()}
                                     </div>
+                                    <Show when=move || fulfillment_mode.get() == FulfillmentMode::Delegate>
+                                        <div style="padding:14px;background:#121215;border:1px solid oklch(0.32 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace;color:#fff">
+                                            <p style="color:oklch(0.8 0.16 60);font-weight:800">"OPERATOR ISSUING ROLES"</p>
+                                            <p>"Every selected operator gets upload-build only unless you authorize receipt or grant issuance below. Aliases of the same operator must use identical roles. Metadata edits preserve existing authority; use management to cancel it."</p>
+                                            <label><input type="checkbox" prop:checked=move || authorize_operators.get() on:change:target=move |event| authorize_operators.set(event.target().checked()) />" AUTHORIZE NEW OPERATORS ON THIS EDIT (does not renew cancelled authority or expand existing capabilities)"</label>
+                                            {move || servers.get().into_iter().map(|server| {
+                                                let url = server.url;
+                                                let display = url.clone();
+                                                let receipt_url = url.clone(); let grant_url = url.clone();
+                                                let receipt_checked = url.clone(); let grant_checked = url.clone();
+                                                view! { <div style="border-top:1px solid oklch(0.32 0.01 60);padding:10px;overflow-wrap:anywhere">
+                                                    <p>{display}</p>
+                                                    <label><input type="checkbox" prop:checked=move || server_roles.get().iter().find(|role| role.server_url == receipt_checked).map(|role| role.issue_receipt).unwrap_or_else(|| receipt_checked == operator_url.get()) on:change:target=move |event| { let checked=event.target().checked(); server_roles.update(|roles| { if let Some(role)=roles.iter_mut().find(|role| role.server_url == receipt_url) { role.issue_receipt=checked; } else { roles.push(arcadestr_core::publisher_management::ServerRoleIntent { server_url:receipt_url.clone(),issue_receipt:checked,issue_grant:receipt_url==operator_url.get_untracked() }); } }); } />" ISSUE RECEIPTS "</label>
+                                                    <label><input type="checkbox" prop:checked=move || server_roles.get().iter().find(|role| role.server_url == grant_checked).map(|role| role.issue_grant).unwrap_or_else(|| grant_checked == operator_url.get()) on:change:target=move |event| { let checked=event.target().checked(); server_roles.update(|roles| { if let Some(role)=roles.iter_mut().find(|role| role.server_url == grant_url) { role.issue_grant=checked; } else { roles.push(arcadestr_core::publisher_management::ServerRoleIntent { server_url:grant_url.clone(),issue_receipt:grant_url==operator_url.get_untracked(),issue_grant:checked }); } }); } />" ISSUE GRANTS"</label>
+                                                </div> }
+                                            }).collect_view()}
+                                        </div>
+                                    </Show>
                                     <div style="clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));border:1px solid oklch(0.32 0.01 60);background:#121215;padding:18px;display:grid;gap:12px;font-family:ui-monospace,monospace">
                                         <div style="display:flex;align-items:center;gap:10px">
                                             <span style="font:800 12px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">"◆ SERVICE FEE CONSENT"</span>
                                             <span style="flex:1;height:1px;background:repeating-linear-gradient(90deg,oklch(0.4 0.03 60 / .6) 0 4px,transparent 4px 8px)"></span>
                                         </div>
-                                        <label style="display:flex;align-items:flex-start;gap:10px;color:#fff;font:600 12.5px/1.6 ui-monospace,monospace">
-                                            <input type="checkbox" checked=move || accept_service_fees.get() on:change:target=move |event| accept_service_fees.set(event.target().checked()) />
-                                            <span>"Accept each selected provider's immutable ADP service terms and enable split settlement."</span>
+                                        <label style="color:#fff;font:600 12.5px/1.6 ui-monospace,monospace">"COMMERCIAL INTENTION"
+                                            <select aria-label="Commercial intention" style="display:block;width:100%;background:#141417;color:#fff;border:1px solid oklch(0.32 0.01 60);padding:10px;font-family:ui-monospace,monospace" prop:value=move || commercial_mode.get() disabled=move || is_publishing.get() on:change:target=move |event| {
+                                                commercial_mode.set(event.target().value());
+                                                commercial_review.set(None);
+                                                commercial_approved.set(false);
+                                                commercial_loading.set(false);
+                                                commercial_generation.update(|value| *value = value.wrapping_add(1));
+                                            }>
+                                                <option value="preserve">"PRESERVE EXACT ACCEPTANCE"</option>
+                                                <option value="replace">"REPLACE AFTER REVIEW"</option>
+                                                <option value="retire" disabled=true>"RETIRE — UNAVAILABLE"</option>
+                                            </select>
                                         </label>
-                                        <p style="margin:0;color:oklch(0.68 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace">
-                                            {move || {
-                                                let selected = servers.get();
-                                                let announcements = discovered_servers.get();
-                                                let covered = announcements.iter().filter(|announcement| {
-                                                    announcement.split_enabled && announcement.terms_event_id.is_some()
-                                                        && selected.iter().any(|server| server.url == announcement.url)
-                                                }).map(|announcement| announcement.pubkey.as_str()).collect::<std::collections::BTreeSet<_>>().len();
-                                                format!("ECONOMIC PREVIEW · gross {} sats · {} operator fee leg(s) · developer receives the exact remainder after the signed fee policies are applied.", price_input.get(), covered)
-                                            }}
-                                        </p>
-                                        <p style="margin:0;color:oklch(0.55 0.01 60);font:600 10.5px/1.5 ui-monospace,monospace">"Terms roots are copied into the signed listing. Missing or unresolved coverage blocks publication when consent is enabled."</p>
+                                        <p style="margin:0;color:oklch(0.68 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace;overflow-wrap:anywhere">{move || format!("Existing acceptance: {}", preserved_terms_label.get_value())}</p>
+                                        <Show when=move || commercial_mode.get() == "replace">
+                                            <button type="button" style="padding:10px;background:transparent;border:1px solid oklch(0.5 0.13 210);color:oklch(0.8 0.13 210);font:800 12px ui-monospace,monospace" disabled=move || commercial_loading.get() || is_publishing.get() on:click=move |_| on_review_terms.run(())>{move || if commercial_loading.get() { "VERIFYING TERMS…" } else { "RETRIEVE SIGNED TERMS >" }}</button>
+                                            {move || commercial_review.get().map(|review| view! {
+                                                <div style="display:grid;gap:10px;color:oklch(0.68 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace;overflow-wrap:anywhere" aria-live="polite">
+                                                    <p>{format!("Gross: {} msat", review.context.price_sats.saturating_mul(1000))}</p>
+                                                    {review.offers.into_iter().zip(review.accepted_terms).map(|(offer, reference)| view! {
+                                                        <div style="border-top:1px solid oklch(0.4 0.03 60 / .3);padding-top:8px">
+                                                            <p>{format!("Operator {} · terms {} · settlement v{}", offer.operator_pubkey, reference.terms_event_id, offer.version)}</p>
+                                                            <p>{format!("{} · destination {}", fee_policy_label(&offer.fee), offer.payment_destination)}</p>
+                                                            <p>{format!("Operator limitations: {}", if offer.limitations.is_empty() { "None advertised".into() } else { offer.limitations.join("; ") })}</p>
+                                                        </div>
+                                                    }).collect_view()}
+                                                    {review.legs.into_iter().map(|leg| view! { <p>{format!("{:?}: {} → {} · {} msat", leg.role, leg.recipient_pubkey, leg.destination, leg.amount_msat)}</p> }).collect_view()}
+                                                </div>
+                                            })}
+                                            <label style="display:flex;align-items:flex-start;gap:10px;color:#fff;font:600 12.5px/1.6 ui-monospace,monospace">
+                                                <input type="checkbox" disabled=move || commercial_review.get().is_none() || is_publishing.get() prop:checked=move || commercial_approved.get() on:change:target=move |event| commercial_approved.set(event.target().checked()) />
+                                                <span>"I approve these exact signed terms, recipients and allocation for this listing. Changes require a new review."</span>
+                                            </label>
+                                        </Show>
+                                        {move || commercial_error.get().map(|error| view! { <p role="alert" style="color:oklch(0.65 0.18 25);font:400 12.5px/1.6 ui-monospace,monospace">{error}</p> })}
+                                        <p style="margin:0;color:oklch(0.68 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace">"Preserve never accepts new advertisements. Withdrawal checks cover available configured-relay evidence, not global history. Historical sales and receipts are unchanged. Operator retirement is unavailable pending an agreed prospective workflow."</p>
                                     </div>
                                 </div>
                                     </div>
