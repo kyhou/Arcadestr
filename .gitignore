@@ -27,6 +27,16 @@ node_modules/
 /.tmp*/
 /Arcadestr/.tmp/
 
+# Local link to documentation from a separate repository
+/adp-server_CODEBASE.md
+
+# Imported design exports, ad-hoc captures, and other local-only artifacts
+/.local-artifacts/
+/stitch_arcadestr_game_storefront.zip
+/arcadestr-current-page.png
+/Arcadestr_UI_Screen_Inventory.docx
+/.board-task-change-freshness/
+
 # Claude Code local workspace: machine-specific settings.local.json and
 # scratch worktrees. No shared configuration is tracked under it.
 /.claude/
