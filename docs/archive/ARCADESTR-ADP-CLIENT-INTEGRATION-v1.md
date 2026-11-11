@@ -1,5 +1,10 @@
 # Arcadestr Client — ADP-01 / NIP-102 Integration Spec v1
 
+> Historical integration design. Preserve its requirements for comparison, but
+> use the current root protocol specifications and [CODEBASE.md](../../CODEBASE.md)
+> to establish current behavior. Paths in the original text are repository-root
+> relative unless they name the companion completion prompt in this directory.
+
 Status: draft, for review before roadmap/completion-prompt generation
 Depends on: `ADP-01.md`, `NIP-102.md`, `adp-server` (implemented, reference impl available)
 Supersedes: all prior Arcadestr publish/buy/install notes in `ARCADESTR-CODEBASE.md` — that

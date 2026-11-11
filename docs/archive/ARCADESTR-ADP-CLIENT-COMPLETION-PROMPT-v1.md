@@ -1,5 +1,11 @@
 # Arcadestr — ADP-01 / NIP-102 Client Integration: Gated Implementation Prompt v1
 
+> Historical implementation sequence, not current agent instructions or evidence
+> that every gate is complete. Paths below are relative to the repository root
+> unless they name the companion integration document in this directory. Consult
+> [AGENTS.md](../../AGENTS.md), [CODEBASE.md](../../CODEBASE.md), and current tests
+> before treating an item as outstanding work.
+
 For: opencode
 Reviewer/gatekeeper: Claude (Joel runs this — do not skip a gate's stop point)
 Design source of truth: `ARCADESTR-ADP-CLIENT-INTEGRATION-v1.md` (read it in full before

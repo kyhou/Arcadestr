@@ -1,5 +1,9 @@
 # Nostrconnect URI Generation - Implementation & Testing
 
+> Historical implementation report. Commands and behavior below describe the
+> original work, not the current application. Use [CODEBASE.md](../../CODEBASE.md)
+> and [COMMANDS.md](../../COMMANDS.md) for current architecture and commands.
+
 ## Summary
 
 I've implemented the `nostrconnect://` URI generation feature and created comprehensive tests for it. The issue with the button hanging was due to the Tauri command returning a `serde_json::Value` which wasn't being handled correctly in the WASM bridge. I fixed this by changing the return type to `String`.

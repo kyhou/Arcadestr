@@ -1,5 +1,8 @@
 **Current screens, missing screens, and user-facing information requirements**
 
+> Historical inventory, retained to preserve original requirements. The maintained
+> acquisition-aware inventory is [Arcadestr_UI_Screen_Inventory_Revised.md](../../Arcadestr_UI_Screen_Inventory_Revised.md).
+
 *Product and UX planning document \| July 2026*
 
 # Document purpose

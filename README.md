@@ -2,6 +2,9 @@
 
 A decentralized game marketplace built on NOSTR with Lightning payments.
 
+Development commands: [COMMANDS.md](COMMANDS.md). Documentation status and
+repository contents policy: [docs/README.md](docs/README.md).
+
 ## What is Arcadestr?
 
 Arcadestr is a decentralized marketplace for indie games that runs entirely on the NOSTR protocol. Unlike traditional game stores, Arcadestr has no central server, no custodial payments, and no platform fees. Publishers maintain full custody of their games and earnings, while buyers pay sellers directly via Lightning Network zaps.

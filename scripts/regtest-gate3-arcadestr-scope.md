@@ -251,7 +251,7 @@ Missing Arcadestr behavior cannot be relabeled as an external dependency.
 ### Next existing development milestone
 
 The existing plan names **Gate 4 — core::nwc_client + Buy Flow** in
-`ARCADESTR-ADP-CLIENT-COMPLETION-PROMPT-v1.md`. Much overlaps this work; begin
+`docs/archive/ARCADESTR-ADP-CLIENT-COMPLETION-PROMPT-v1.md`. Much overlaps this work; begin
 with a non-spending gap/acceptance audit rather than implementing duplicate NWC
 storage or weakening the guards. Its live-payment acceptance remains separately
 restricted. Gate 5 download flow follows that plan. No follow-on milestone is
