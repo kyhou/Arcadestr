@@ -1,6 +1,9 @@
 [serve]
 # The port to serve the application on
 port = 5173
+# WebKit can cache index.html across launches while Trunk replaces hashed WASM.
+# Development responses must always come from the current build.
+headers = { "Cache-Control" = "no-store" }
 
 [build]
 # The index HTML file to use

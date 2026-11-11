@@ -13,7 +13,7 @@
       "script": "cargo run -p arcadestr-xtask -- frontend-build --release",
       "cwd": ".."
     },
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:5173/?tauri-dev=1",
     "frontendDist": "../web/dist"
   },
   "app": {
