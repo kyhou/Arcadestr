@@ -1,5 +1,9 @@
 # Arcadestr Instructions
 
+## Development Status
+
+Arcadestr is not yet in production. Data migrations and backward-compatibility migrations are unnecessary unless explicitly requested.
+
 ## Architecture
 
 - `core`: protocol, storage, Nostr, and domain logic.
