@@ -149,18 +149,19 @@ This means:
 arcadestr/
 ├── Cargo.toml              # Workspace manifest - defines all 5 crates and Rust 1.89 MSRV
 ├── Cargo.lock              # Dependency lock file
+├── .gitignore              # Generated output, local databases, caches, and environment exclusions
 ├── README.md               # Project overview and quickstart
 ├── CLAUDE.md               # Development guidelines for Claude Code
 ├── AGENTS.md               # Agent-specific build/test commands
 ├── RUST_GUIDELINES.md      # Microsoft Rust Guidelines reference
-├── NOSTRCONNECT_IMPLEMENTATION.md  # NIP-46 implementation notes
 ├── ADP-01.md               # ADP protocol specification
 ├── ADP-01-amendment-free-acquisitions.md # Explicit access/campaign amendment
 ├── ADP-01-amendment-launch-profiles.md # Signed package, platform, launch profile/default amendment
 ├── NIP-102.md              # Purchase receipt specification used by ownership
 ├── NIP-103.md              # Experimental entitlement/campaign proposal notes
-├── Arcadestr_UI_Screen_Inventory.md # Product screen/capability inventory
-├── Arcadestr_UI_Screen_Inventory_Revised.md # Revised acquisition-aware inventory
+├── Arcadestr_UI_Screen_Inventory_Revised.md # Maintained acquisition-aware inventory
+├── docs/README.md           # Documentation status and repository contents policy
+├── docs/archive/            # Original inventory, client integration plans, NIP-46 report
 ├── opencode.json           # Repository-local OpenCode MCP/watch configuration
 ├── COMMANDS.md             # Available CLI commands
 ├── test_nostrconnect.sh    # Test script for NIP-46
@@ -262,6 +263,16 @@ arcadestr/
 │   │   ├── package_extraction.rs # Verified bounded capability extraction and manifest
 │   │   ├── adp_storage.rs    # Provisioning, token, installation/snapshot, retained-package, launch-preference, and library repositories
 │   │   ├── settlement_repository.rs # Account-scoped resumable quote/leg/attempt persistence
+│   │   ├── settlement_recovery.rs # Account/session fencing and exclusive recovery leases
+│   │   ├── durable_payments.rs # Journaled NWC dispatch and proof reconciliation
+│   │   ├── purchase_contract.rs # Plan review, explicit approval, network/fee policy wire types
+│   │   ├── purchase_execution.rs # Verified plan approvals, admissions, and guarded leg execution
+│   │   ├── receipt_portability.rs # Receipt import, relay discovery, and authority verification
+│   │   ├── receipt_sync_contract.rs # Buyer-scoped receipt sync/import request and report types
+│   │   ├── entitlement_reconciliation.rs # Revalidate known grant chains and update projections
+│   │   ├── entitlement_sync_contract.rs # Expected-account reconciliation request/report
+│   │   ├── publisher_recovery.rs # Draft revisions and durable publisher operation checkpoints
+│   │   ├── publisher_management.rs # Credential revocation and distribution-evidence rules
 │   │   ├── blossom.rs        # Blossom protocol types: server origins, upload authorizations, blob descriptors, MIME policy
 │   │   ├── store_page.rs     # Store Page (kind 30407) schema, validation, sanitized rendering, and listing pointers
 │   │   ├── store_page_content_policy.rs # Store Page Markdown sanitizer and content-size limits
@@ -293,7 +304,17 @@ arcadestr/
 │   │   ├── 013_store_pages.sql # Validated Store Pages
 │   │   ├── 014_store_page_listing_events.sql # Signed reciprocal listings
 │   │   ├── 015_blossom_server_settings.sql # Account Blossom policy
-│   │   └── 016_launch_profile_preferences.sql # Per-coordinate launcher preference
+│   │   ├── 016_launch_profile_preferences.sql # Per-coordinate launcher preference
+│   │   ├── 017_split_settlement.sql # Account-scoped quotes, legs, invoices, and recovery
+│   │   ├── 018_payment_durability.sql # Durable NWC payment journal and intent checkpoints
+│   │   ├── 019_settlement_leg_projection.sql # Repair derived leg state from persisted evidence
+│   │   ├── 020_client_refund_recovery.sql # Encrypted refund invoices, proofs, and local recovery
+│   │   ├── 021_purchase_execution.sql # Explicit plan approvals and irreversible dispatch admissions
+│   │   ├── 022_purchase_verification.sql # Signed listing/terms sources for plan review
+│   │   ├── 023_receipt_portability.sql # Buyer-scoped receipt discovery and chain verification
+│   │   ├── 024_publisher_recovery.sql # Revisioned publisher drafts and operation journals
+│   │   ├── 025_marketplace_campaign_pointers.sql # Advisory listing campaign-pointer projection
+│   │   └── 026_quote_initiations.sql # Durable purchase IDs and quote-request commitments
 │   └── tests/
 │       ├── integration.rs          # Core integration coverage
 │       ├── integration_nip05.rs    # NIP-05 HTTP integration tests
@@ -390,6 +411,11 @@ arcadestr/
 │   ├── src/
 │   │   ├── main.rs         # Entry point, Tauri setup, commands
 │   │   ├── adp_commands.rs # ADP discovery, publishing, purchase, and wallet commands
+│   │   ├── publisher_commands.rs # Draft persistence and explicitly confirmed operation resume
+│   │   ├── publisher_management.rs # Managed distribution and credential lifecycle IPC
+│   │   ├── settlement_ui.rs # Pending settlement/refund reconciliation and recipient history
+│   │   ├── receipt_commands.rs # Receipt sync/import and ownership update events
+│   │   ├── entitlement_commands.rs # Known-grant reconciliation for the active buyer
 │   │   ├── archive_commands.rs # Opaque archive selection, inspection, query, hash, discard IPC
 │   │   ├── archive_selection.rs # Managed staged selections and publication leases
 │   │   ├── store_page_commands.rs # Store Page enrichment, editor, validation, and publishing commands
@@ -733,6 +759,15 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 
 ### 5.2 Command Inventory
 
+This inventory covers the handlers registered in `desktop/src/main.rs`'s
+`tauri::generate_handler!`. Parameters omit Tauri-injected state, app handles,
+and windows; Rust parameter names are shown (the JavaScript bridge uses Tauri's
+camelCase argument convention). Return types show the successful value unless
+an explicit `Result` documents a typed error contract. Other fallible commands
+return `Result<T, String>`; `get_platform_info` returns its value directly.
+`CoreGameListing` is the desktop alias for the core listing model. Types shown
+without module qualification are defined or imported in the named source file.
+
 | Command | File | Parameters | Return Type | What it does |
 |---------|------|------------|-------------|--------------|
 | `connect_bunker` | `nip46_commands.rs` | `identifier: String`, `display_name: String` | `serde_json::Value` | Connects to NIP-46 and synchronizes the SDK signer into shared `AppState.auth` |
@@ -759,10 +794,10 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `import_encrypted_key` | `main.rs` | `request: ImportKeyRequest` | `ImportKeyResult` | Runs the generic encrypted-key import contract |
 | `verify_nip05` | `main.rs` | `identifier: String`, `expected_npub: String` | `Nip05Status` | Verifies and normalizes a NIP-05 identifier |
 | `verify_nip05_identity` | `main.rs` | `request: VerifyNip05Request` | `VerifyNip05Result` | Executes the typed NIP-05 identity contract |
-| `fetch_listings` | `main.rs` | `limit: usize` | `Vec<GameListing>` | Fetches recent listings |
-| `fetch_listing_by_id` | `main.rs` | `publisher_npub: String`, `listing_id: String` | `GameListing` | Fetches specific listing |
+| `fetch_listings` | `main.rs` | `limit: usize` | `Vec<CoreGameListing>` | Fetches recent listings |
+| `fetch_listing_by_id` | `main.rs` | `publisher_npub: String`, `listing_id: String` | `CoreGameListing` | Fetches specific listing |
 | `fetch_marketplace` | `main.rs` | `limit: usize`, `since_days: Option<u64>`, `filter: Option<MarketplaceFilter>` | `Vec<AppGameListing>` | Fetches NIP-99 marketplace listings with optional filtering and ownership enrichment |
-| `fetch_profile` | `main.rs` | `npub: String`, `additional_relays: Option<Vec<String>>` | `UserProfile` | Fetches NIP-01 metadata |
+| `fetch_profile` | `main.rs` | `npub: String`, `_additional_relays: Option<Vec<String>>` | `UserProfile` | Fetches NIP-01 metadata using relay discovery; the reserved additional-relays argument is currently ignored |
 | `request_invoice` | `main.rs` | `zap_request: ZapRequest` | `ZapInvoice` | Generates Lightning invoice |
 | `get_saved_users` | `main.rs` | None | `String` | Returns saved users JSON |
 | `get_saved_user` | `main.rs` | `user_id: String` | `String` | Get specific saved user by ID |
@@ -773,7 +808,7 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `get_connected_relay_count` | `main.rs` | None | `usize` | Returns relay count |
 | `get_connected_relays` | `main.rs` | None | `Vec<String>` | Returns connected relay URLs |
 | `reconnect_relays` | `main.rs` | None | `String` | Reconnect to default relays |
-| `fetch_and_save_user_profile` | `main.rs` | None (uses app handle) | `UserProfile` | Fetch and save current user's profile |
+| `fetch_and_save_user_profile` | `main.rs` | None | `UserProfile` | Fetch and save current user's profile |
 | `get_extended_network_stats` | `main.rs` | None | `Option<NetworkStats>` | Returns extended network info |
 | `get_relay_hints_for_pubkey` | `main.rs` | `pubkey: String` | `Vec<String>` | Returns relay hints for pubkey |
 | `fetch_profile_with_hints` | `main.rs` | `identifier: String` | `UserProfile` | Fetch profile using NIP-19 hints |
@@ -791,16 +826,16 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `list_installation_lifecycle_issues` | `main.rs` | None | `Vec<InstallationLifecycleIssue>` | Lists non-ready installing/failed/uninstalling records for recovery UI |
 | `retry_installation_recovery` | `main.rs` | None | `RecoveryReport` | Locks and classifies interrupted installations without deleting an uncertain final tree |
 | `list_retained_packages` | `main.rs` | None | `Vec<RetainedPackageDto>` | Lists coordinate-keyed verified packages and their pinned reinstall snapshot identity |
-| `get_uninstall_sizes` | `main.rs` | `installation_id: String` | `UninstallSizes` | Measures the no-follow install tree and optional retained package before confirmation |
+| `get_uninstall_sizes` | `main.rs` | `installation_id: String` | `UninstallSizesDto` | Measures the no-follow install tree and optional retained package before confirmation |
 | `uninstall_game` | `main.rs` | `installation_id: String`, `retain_package: bool` | `()` | Transitions ready → uninstalling, removes the locked managed tree, and optionally deletes the retained package |
 | `resume_uninstall` | `main.rs` | `installation_id: String` | `()` | Safely resumes an interrupted uninstall while retaining the package |
 | `remove_failed_installation` | `main.rs` | `installation_id: String` | `()` | Removes a failed row/tree according to its persisted recovery discriminator |
-| `delete_retained_package` | `main.rs` | `game_coordinate`, `expected_package_id` | `()` | Deletes the exact retained package only if its optimistic identity still matches |
-| `reinstall_retained_package` | `main.rs` | `game_coordinate`, `expected_package_id` | `()` | Re-verifies and extracts the pinned package snapshot offline, without account or relay access |
-| `get_launch_options` | `launcher.rs` | `installation_id: String` | `LaunchConfiguration` | Returns persisted options plus saved/publisher preference status, effective profile, and fallback reasons |
-| `set_launch_profile_preference` | `launcher.rs` | `installation_id`, `profile_id`, `preference_updated_at` | `LaunchConfiguration` | Sets or clears a coordinate-scoped available game-profile preference under the installation lock |
-| `launch_game` | `launcher.rs` | `installation_id`, `profile_id: Option<String>` | `LaunchSession` | Revalidates the snapshot/root and directly spawns an available game profile without a shell |
-| `get_launch_status` | `launcher.rs` | `installation_id: String` | `Option<LaunchSession>` | Returns this client session's latest supervised launch status |
+| `delete_retained_package` | `main.rs` | `game_coordinate: String`, `expected_package_id: String` | `()` | Deletes the exact retained package only if its optimistic identity still matches |
+| `reinstall_retained_package` | `main.rs` | `game_coordinate: String`, `expected_package_id: String` | `()` | Re-verifies and extracts the pinned package snapshot offline, without account or relay access |
+| `get_launch_options` | `launcher.rs` | `installation_id: String` | `Result<LaunchConfiguration, LaunchError>` | Returns persisted options plus saved/publisher preference status, effective profile, and fallback reasons |
+| `set_launch_profile_preference` | `launcher.rs` | `installation_id: String`, `profile_id: Option<String>`, `preference_updated_at: i64` | `Result<LaunchConfiguration, LaunchError>` | Sets or clears a coordinate-scoped available game-profile preference under the installation lock |
+| `launch_game` | `launcher.rs` | `installation_id: String`, `profile_id: Option<String>` | `Result<LaunchSession, LaunchError>` | Revalidates the snapshot/root and directly spawns an available game profile without a shell |
+| `get_launch_status` | `launcher.rs` | `installation_id: String` | `Result<Option<LaunchSession>, LaunchError>` | Returns this client session's latest supervised launch status |
 | `ingest_receipt` | `main.rs` | `raw_event_json: String` | `()` | Parses and persists a NIP-102 kind-1020 purchase receipt |
 | `check_adp_server` | `adp_commands.rs` | `server_url: String` | `AdpServerInfo` | Fetches and decodes `/.well-known/adp` |
 | `discover_adp_servers` | `adp_commands.rs` | None | `Vec<AdpServerAnnouncement>` | Discovers and deduplicates kind-30403 server announcements from connected relays |
@@ -810,16 +845,18 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `publish_campaign` | `adp_commands.rs` | `request: PublishCampaignRequest` | `PublishCampaignResponse` | Publishes create/update/cancel events; listing-pointer failure is typed partial success |
 | `update_campaign_pointer` | `adp_commands.rs` | `request: UpdateCampaignPointerRequest` | `String` | Adds/removes one campaign pointer on the current replacement listing |
 | `claim_entitlement` | `adp_commands.rs` | `request: ClaimEntitlementRequest` | `ClaimEntitlementResponse` | Claims a campaign grant, validates/persists it, and caches a buyer-scoped token |
-| `select_archive_build` | `archive_commands.rs` | `SelectArchiveRequest` | `SelectArchiveResponse` | Copies a picked archive into private managed staging and returns an opaque account-bound handle; cancellation preserves the prior UI selection |
-| `inspect_archive` | `archive_commands.rs` | `InspectArchiveRequest` | `InspectArchiveResponse` | Content-detects and indexes a staged archive under strict path/count/size/ratio limits |
-| `hash_selected_archive` | `archive_commands.rs` | `HashSelectedArchiveRequest` | `HashSelectedArchiveResponse` | Hashes the staged identity and returns a `BuildSelectionRef` suitable for publication |
-| `query_archive_files` / `query_archive_working_directories` | `archive_commands.rs` | Typed paged query | Typed page | Searches safe file or working-directory choices without returning host paths |
-| `query_archive_candidates` | `archive_commands.rs` | `QueryArchiveCandidatesRequest` | `QueryArchiveCandidatesResponse` | Returns ranked launch executable candidates for one canonical platform |
-| `query_archive_hazards` / `query_archive_warnings` | `archive_commands.rs` | Typed paged query | Typed page | Pages blocking path/archive hazards and non-blocking warnings |
-| `discard_archive_selection` | `archive_commands.rs` | `DiscardArchiveSelectionRequest` | `DiscardArchiveSelectionResponse` | Explicitly deletes an idle staged selection; active publication leases win |
-| `load_authoritative_adp_edit_metadata` | `adp_commands.rs` | `LoadAuthoritativeAdpEditMetadataRequest` | `AuthoritativeAdpEditMetadata` | Refetches and verifies the exact signed edit revision, preserving raw launch tags and typed defects |
+| `select_archive_build` | `archive_commands.rs` | `request: SelectArchiveRequest` | `Result<SelectArchiveResponse, ArchiveSelectionError>` | Copies a picked archive into private managed staging and returns an opaque account-bound handle; cancellation preserves the prior UI selection |
+| `inspect_archive` | `archive_commands.rs` | `request: InspectArchiveRequest` | `Result<InspectArchiveResponse, ArchiveSelectionError>` | Content-detects and indexes a staged archive under strict path/count/size/ratio limits |
+| `hash_selected_archive` | `archive_commands.rs` | `request: HashSelectedArchiveRequest` | `Result<HashSelectedArchiveResponse, ArchiveSelectionError>` | Hashes the staged identity and returns a `BuildSelectionRef` suitable for publication |
+| `query_archive_files` | `archive_commands.rs` | `request: QueryArchiveFilesRequest` | `Result<QueryArchiveFilesResponse, ArchiveSelectionError>` | Pages safe file choices without returning host paths |
+| `query_archive_working_directories` | `archive_commands.rs` | `request: QueryArchiveWorkingDirectoriesRequest` | `Result<QueryArchiveWorkingDirectoriesResponse, ArchiveSelectionError>` | Pages safe working-directory choices without returning host paths |
+| `query_archive_candidates` | `archive_commands.rs` | `request: QueryArchiveCandidatesRequest` | `Result<QueryArchiveCandidatesResponse, ArchiveSelectionError>` | Returns ranked launch executable candidates for one canonical platform |
+| `query_archive_hazards` | `archive_commands.rs` | `request: QueryArchiveHazardsRequest` | `Result<QueryArchiveHazardsResponse, ArchiveSelectionError>` | Pages blocking archive/path hazards |
+| `query_archive_warnings` | `archive_commands.rs` | `request: QueryArchiveWarningsRequest` | `Result<QueryArchiveWarningsResponse, ArchiveSelectionError>` | Pages non-blocking archive warnings |
+| `discard_archive_selection` | `archive_commands.rs` | `request: DiscardArchiveSelectionRequest` | `Result<DiscardArchiveSelectionResponse, ArchiveSelectionError>` | Explicitly deletes an idle staged selection; active publication leases win |
+| `load_authoritative_adp_edit_metadata` | `adp_commands.rs` | `request: LoadAuthoritativeAdpEditMetadataRequest` | `Result<AuthoritativeAdpEditMetadata, PublishAdpListingError>` | Refetches and verifies the exact signed edit revision, preserving raw launch tags and typed defects |
 | `select_build_file` | `adp_commands.rs` | None | `Option<String>` | Legacy native path picker retained for compatibility; launch-tier publication uses `select_archive_build` instead |
-| `hash_build_file` | `adp_commands.rs` | `HashBuildFileRequest` | `String` | Legacy path-based SHA-256 helper retained for compatibility; opaque selections use `hash_selected_archive` |
+| `hash_build_file` | `adp_commands.rs` | `request: HashBuildFileRequest` | `String` | Legacy path-based SHA-256 helper retained for compatibility; opaque selections use `hash_selected_archive` |
 | `publish_adp_listing` | `adp_commands.rs` | `request: PublishAdpListingRequest` | `Result<PublishAdpListingResult, PublishAdpListingError>` | Compatibility entry point that runs the same pipeline with a default, non-launch-tier `PublishAdpListingRequestExtension` |
 | `publish_adp_listing_with_contract` | `adp_commands.rs` | `request: PublishAdpListingRequest`, `extension: PublishAdpListingRequestExtension` | `Result<PublishAdpListingResult, PublishAdpListingError>` | Publishes validated package/launch metadata from an opaque build lease; mints/resumes backend UUID identity and reports typed partial publication |
 | `request_lnurl_invoice` | `adp_commands.rs` | `request: RequestLnurlInvoiceRequest` | `RequestLnurlInvoiceResponse` | Requests the listing's fixed-amount LNURL invoice |
@@ -829,10 +866,12 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `start_split_purchase` | `adp_commands.rs` | `request: StartSplitPurchaseRequest` | `StartSplitPurchaseResponse` | Refetches listing/terms, validates the refund LNURL bounds, creates and decrypts the all-leg-preflighted private quote, then persists it under the active account |
 | `next_split_invoice` | `adp_commands.rs` | `request: SplitQuoteRequest` | `SplitInvoiceResponse` | Requests only the next committed leg and stores the invoice attempt NIP-44 encrypted to the active account |
 | `submit_split_payment` | `adp_commands.rs` | `request: SubmitSplitPaymentRequest` | `SplitSettlementResponse` | Submits one proof, persists leg state, and validates/persists the aggregate receipt and download token after the final leg |
-| `settlement_history` / `refresh_settlement` | `adp_commands.rs` | None / `SplitQuoteRequest` | Account-scoped history / status | Lists durable quote and recovery state or refreshes one quote from its processor with account-switch rejection |
-| `replace_split_refund_destination` | `adp_commands.rs` | `ReplaceSplitRefundDestinationRequest` | JSON acknowledgement | Resolves and authorizes a replacement refund destination without resetting failure/deadline state |
-| `prepare_split_recovery` | `adp_commands.rs` | `SplitQuoteRequest` | `RecoveryPreparationResponse` | Obtains processor evidence or signs/encrypts buyer fallback kind-1034 evidence and persists every paid-leg obligation |
-| `prepare_split_refund` / `confirm_split_refund` | `adp_commands.rs` | Leg request / attempt and preimage | Refund invoice / acknowledgement | Drives exact principal refund invoicing and durable initiated/verified recovery states |
+| `settlement_history` | `adp_commands.rs` | None | `Vec<SettlementHistoryItem>` | Lists account-scoped durable quote and recovery state |
+| `refresh_settlement` | `adp_commands.rs` | `request: SplitQuoteRequest` | `SettlementStatusResponse` | Refreshes one quote from its processor with account-switch rejection |
+| `replace_split_refund_destination` | `adp_commands.rs` | `request: ReplaceSplitRefundDestinationRequest` | `serde_json::Value` | Resolves and authorizes a replacement refund destination without resetting failure/deadline state |
+| `prepare_split_recovery` | `adp_commands.rs` | `request: SplitQuoteRequest` | `RecoveryPreparationResponse` | Obtains processor evidence or signs/encrypts buyer fallback kind-1034 evidence and persists every paid-leg obligation |
+| `prepare_split_refund` | `adp_commands.rs` | `request: SplitRefundRequest` | `RefundInvoiceResponse` | Prepares an exact-principal refund invoice and persists the recipient's original attempt |
+| `confirm_split_refund` | `adp_commands.rs` | `request: ConfirmSplitRefundRequest` | `serde_json::Value` | Submits refund proof and records verified recovery state |
 | `fetch_profile_badges` | `main.rs` | `profile_pubkey: String` | `Vec<ProfileBadgeEntry>` | Fetch NIP-58 badges for a profile (desktop only) |
 | `fetch_earned_badges` | `main.rs` | `profile_pubkey: String` | `Vec<EarnedBadgeSummary>` | Fetch earned badges with definitions (desktop only) |
 | `publish_game_score` | `nip46_commands.rs` | `score: u64` | `String` | Placeholder command; requires NIP-46 session but does not yet publish an event |
@@ -841,6 +880,51 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 | `get_network_discovery_settings` | `main.rs` | None | `NetworkDiscoverySettings` | Get relay discovery settings |
 | `set_allow_insecure_public_ws` | `main.rs` | `allow: bool` | `()` | Toggle allowing insecure ws:// relays for public hosts |
 | `test_extended_network_discovery` | `main.rs` | None | `serde_json::Value` | Debug-only forced extended-network discovery with detailed statistics |
+| `select_blossom_media_file` | `blossom_commands.rs` | `request: ExpectedBlossomPublisherRequest` | `Result<Option<BlossomMediaSelectionDto>, BlossomCommandError>` | Selects and inspects media for the expected publisher; cancellation returns `None` |
+| `start_blossom_upload` | `blossom_commands.rs` | `request: StartBlossomUploadRequest` | `Result<BlossomUploadResponse, BlossomCommandError>` | Starts account-scoped upload with signed authorization, verification, and progress events |
+| `retry_blossom_upload` | `blossom_commands.rs` | `request: RetryBlossomUploadRequest` | `Result<BlossomUploadResponse, BlossomCommandError>` | Retries a retained media selection without requiring another file pick |
+| `cancel_blossom_upload` | `blossom_commands.rs` | `request: CancelBlossomUploadRequest` | `Result<CancelBlossomUploadResponse, BlossomCommandError>` | Requests cancellation of the matching account-bound upload |
+| `discard_blossom_media_selection` | `blossom_commands.rs` | `request: DiscardBlossomMediaRequest` | `Result<DiscardBlossomMediaResponse, BlossomCommandError>` | Discards a selection and cleans up its managed upload state |
+| `get_blossom_server_settings` | `blossom_commands.rs` | `request: ExpectedBlossomPublisherRequest` | `Result<BlossomServerSettingsDto, BlossomCommandError>` | Reads the active publisher's server configuration |
+| `probe_blossom_server_health` | `blossom_commands.rs` | `request: ExpectedBlossomPublisherRequest` | `Result<BlossomServerHealthResponse, BlossomCommandError>` | Probes configured servers and returns health observations |
+| `replace_blossom_server_settings` | `blossom_commands.rs` | `request: ReplaceBlossomServerSettingsRequest` | `Result<BlossomServerSettingsDto, BlossomCommandError>` | Validates and replaces the publisher's server configuration |
+| `add_blossom_server` | `blossom_commands.rs` | `request: AddBlossomServerRequest` | `Result<BlossomServerSettingsDto, BlossomCommandError>` | Adds a normalized server origin to publisher settings |
+| `update_blossom_server` | `blossom_commands.rs` | `request: UpdateBlossomServerRequest` | `Result<BlossomServerSettingsDto, BlossomCommandError>` | Updates a configured server's editable settings |
+| `remove_blossom_server` | `blossom_commands.rs` | `request: BlossomServerOriginRequest` | `Result<BlossomServerSettingsDto, BlossomCommandError>` | Removes one configured server |
+| `reorder_blossom_servers` | `blossom_commands.rs` | `request: ReorderBlossomServersRequest` | `Result<BlossomServerSettingsDto, BlossomCommandError>` | Changes publisher-defined server order |
+| `set_preferred_blossom_server` | `blossom_commands.rs` | `request: SetPreferredBlossomServerRequest` | `Result<BlossomServerSettingsDto, BlossomCommandError>` | Sets or clears the preferred server |
+| `resolve_blossom_server_candidates` | `blossom_commands.rs` | `request: ResolveBlossomServerCandidatesRequest` | `Result<Vec<String>, BlossomCommandError>` | Resolves configured upload candidates for the publisher |
+| `preview_publisher_terms` | `adp_commands.rs` | `request: PublisherTermsContext` | `PublisherTermsReview` | Reviews commercial terms before publisher side effects |
+| `save_publisher_draft` | `publisher_commands.rs` | `request: SavePublisherDraftRequest` | `u64` | Saves a revisioned account-scoped publisher draft |
+| `publisher_recovery_state` | `publisher_commands.rs` | `expected_publisher_npub: String` | `PublisherRecoveryState` | Loads the expected publisher's drafts and operation journals |
+| `publisher_distribution_state` | `publisher_management.rs` | `expected_publisher_npub: String`, `coordinate: String` | `Vec<DistributionEvidence>` | Resolves distribution evidence for a managed listing |
+| `review_publisher_credential` | `publisher_management.rs` | `expected_publisher_npub: String`, `coordinate: String`, `root_event_id: String`, `action: RevocationAction` | `CredentialReview` | Reviews exact authorization/attestation evidence before a lifecycle action |
+| `revoke_publisher_credential` | `publisher_management.rs` | `request: RevokePublisherCredentialRequest` | `Event` | Publishes the explicitly reviewed publisher credential action |
+| `resume_publisher_operation` | `publisher_commands.rs` | `request: ResumePublisherOperationRequest` | `serde_json::Value` | Resumes a journaled publisher operation with explicit confirmation and account/session fencing |
+| `get_nwc_wallet` | `adp_commands.rs` | `expected_account_pubkey: String` | `Option<ConnectNwcWalletResponse>` | Returns safe connection metadata for the expected account |
+| `disconnect_nwc_wallet` | `adp_commands.rs` | `expected_account_pubkey: String` | `()` | Removes the expected account's saved wallet connection |
+| `verify_nwc_wallet` | `adp_commands.rs` | `expected_account_pubkey: String` | `String` | Performs a non-paying wallet verification request |
+| `get_purchase_plan` | `adp_commands.rs` | `request: PurchasePlanRequest` | `PurchasePlanReview` | Reviews the original quote and signed terms without dispatching payment |
+| `approve_purchase_plan` | `adp_commands.rs` | `request: ApprovePurchasePlanRequest` | `PurchasePlanReview` | Persists explicit full-plan approval with payment limits, network, and fee policy |
+| `resume_split_payment` | `adp_commands.rs` | `request: ResumeSplitPaymentRequest` | `SplitSettlementResponse` | Reconciles an existing attempt; never requests a replacement invoice or dispatches payment |
+| `reconcile_pending_settlements` | `settlement_ui.rs` | None | `RecoveryReport` | Reconciles pending account-scoped payments and refunds without new spending |
+| `recipient_refund_history` | `settlement_ui.rs` | `request: RefundHistoryRequest` | `Vec<RefundHistoryItem>` | Reads processor obligations and merges local recipient payment/proof checkpoints |
+| `pay_split_refund` | `settlement_ui.rs` | `request: RefundPaymentRequest` | `serde_json::Value` | Dispatches the original refund attempt only after explicit payment confirmation |
+| `resume_split_refund` | `settlement_ui.rs` | `request: RefundPaymentRequest` | `serde_json::Value` | Reconciles the original refund attempt without a new payment dispatch |
+| `enrich_store_pages` | `store_page_commands.rs` | `request: StorePageEnrichmentRequest` | `StorePageBatchEnrichment` | Batch-enriches listings with validated Store Page presentation data |
+| `enrich_store_page_detail` | `store_page_commands.rs` | `request: StorePageDetailRequest` | `StorePageDetailEnrichment` | Resolves validated detail-page content for a listing |
+| `load_publisher_store_page_editor` | `store_page_commands.rs` | `request: LoadPublisherStorePageRequest` | `PublisherStorePageEditorState` | Loads current publisher Store Page and listing association evidence |
+| `validate_store_page_draft_command` | `store_page_commands.rs` | `request: ValidateStorePageDraftRequest` | `ValidateStorePageDraftResponse` | Validates a draft against Store Page content and association policy |
+| `publish_store_page` | `store_page_commands.rs` | `request: PublishStorePageRequest` | `PublishStorePageResponse` | Signs/publishes a Store Page and reports reciprocal listing-pointer status |
+| `clone_store_page` | `store_page_commands.rs` | `request: CloneStorePageRequest` | `StorePageDraft` | Produces a reusable draft from an existing Store Page |
+| `retry_store_page_pointer_sync` | `store_page_commands.rs` | `request: RetryStorePagePointersRequest` | `PublishStorePageResponse` | Retries listing-pointer synchronization after partial publication |
+| `add_game_to_library` | `main.rs` | `game_coordinate: String`, `expected_buyer_npub: String` | `()` | Saves a listing to the expected buyer's account library |
+| `is_game_in_library` | `main.rs` | `game_coordinate: String` | `bool` | Checks the active account's library-save state |
+| `get_library_games` | `main.rs` | None | `Vec<LibraryGame>` | Lists games saved to the active account's library |
+| `sync_purchase_receipts` | `receipt_commands.rs` | `request: ReceiptSyncRequest` | `ReceiptSyncReport` | Synchronizes buyer-scoped public receipt/authority evidence and emits ownership updates |
+| `reconcile_known_entitlements` | `entitlement_commands.rs` | `request: EntitlementSyncRequest` | `EntitlementSyncReport` | Rechecks known grants for the expected account and signals revoked ownership |
+| `import_purchase_receipts` | `receipt_commands.rs` | `request: ReceiptImportRequest` | `ReceiptSyncReport` | Imports signed receipt evidence offline and emits account-scoped ownership updates |
+| `regtest_nip44_probe` | `nip46_commands.rs` | None | `String` | Non-paying local remote-signer challenge; runtime-rejected unless debug and `ARCADESTR_REGTEST_NIP46_PROBE` are enabled |
 
 ### 5.3 Event System
 
@@ -1344,8 +1428,23 @@ Startup also runs interrupted-installation recovery before stale `Installing` ro
 | `core::http_client` | Testable HTTP and atomic downloads | `HttpClient`, `ReqwestHttpClient`, `HttpDownloadOutcome` | `get()`, `post_json()`, `download_to_path()` |
 | `core::nip98_client` | Signed HTTP requests | NIP-98 event/header helpers | `build_nip98_auth_header()` |
 | `core::nwc_client` | Nostr Wallet Connect | Wallet connection/payment types | Connect and pay invoice operations |
+| `core::durable_payments` | Restart-safe payment journal | `PaymentWallet`, `DurableNwcPayments`, `DurablePaymentError` | `pay_or_resume_guarded()`, `reconcile()`, `validate_payment_proof()` |
+| `core::purchase_contract` | Explicit purchase-plan review and approval | `PurchasePlanReview`, `ApprovePurchasePlanRequest`, `InvoiceNetwork`, `RoutingFeePolicy` | `dispatch_ready()`, `require_live_purchase_authorization()` |
+| `core::purchase_execution` | Verified approvals and irreversible dispatch admissions | `PurchaseExecutor`, `ExecutionError` | `review()`, `verify_sources()`, `approve_verified_with_fee_policy()`, `pay_leg_guarded()`, `reconcile_leg()` |
+| `core::settlement_recovery` | Account/session-fenced recovery coordination | `RecoveryCoordinator`, `SessionFence`, `RecoveryLease` | `activate()`, `observe()`, `claim()`, `ensure_current()` |
+| `core::receipt_portability` | Portable receipt discovery and verification | `ReceiptPortability`, `ReceiptSource` | `import_json()`, `ingest()`, `synchronize()` |
+| `core::receipt_sync_contract` | Buyer-scoped receipt IPC | `ReceiptSyncRequest`, `ReceiptImportRequest`, `ReceiptSyncReport`, `ReceiptVerification` | Request/report and chain-verification wire types |
+| `core::entitlement_reconciliation` | Reconcile known grant evidence | `EntitlementSource`, `EntitlementEvidence` | `EntitlementsRepository::reconcile_known_grants()` |
+| `core::entitlement_sync_contract` | Buyer-scoped grant reconciliation IPC | `EntitlementSyncRequest`, `EntitlementSyncReport` | Expected-account request and reconciliation counters |
+| `core::publisher_recovery` | Durable publisher intent and operations | `repository::PublisherRepository`, `PublisherDraft`, `PublisherOperation`, `PublisherRecoveryState` | Revisioned drafts and journal checkpoints |
+| `core::publisher_management` | Distribution roles and credential lifecycle | `RevocationAction`, `CredentialReview`, `DistributionEvidence` | `operator_plans()`, `distribution_evidence()`, `validate_revocation_submission()` |
 | `core::subscriptions` | Relay subscription lifecycle | `SubscriptionRegistry` | `dispatch_ephemeral_reads_batch_with_policy()`, `dispatch_permanent_subscriptions()`, `run_notification_loop()` |
 | `desktop::adp_commands` | ADP IPC orchestration | `PublishAdpListingRequest`, `ConfirmPurchaseRequest` | `publish_adp_listing_with_contract()`, `confirm_purchase()`, `discover_adp_servers()` |
+| `desktop::publisher_commands` | Publisher drafts and resumable operations | `SavePublisherDraftRequest`, `ResumePublisherOperationRequest` | `save_publisher_draft()`, `publisher_recovery_state()`, `resume_publisher_operation()` |
+| `desktop::publisher_management` | Publisher distribution and revocation IPC | `CredentialReview`, `DistributionEvidence` | `publisher_distribution_state()`, `review_publisher_credential()`, `revoke_publisher_credential()` |
+| `desktop::settlement_ui` | Settlement and recipient-refund recovery | `RefundHistoryRequest`, `RefundPaymentRequest`, `RefundHistoryItem` | `reconcile_pending_settlements()`, `recipient_refund_history()`, `pay_split_refund()`, `resume_split_refund()` |
+| `desktop::receipt_commands` | Receipt portability IPC | `ReceiptSyncRequest`, `ReceiptImportRequest`, `ReceiptSyncReport` | `sync_purchase_receipts()`, `import_purchase_receipts()` |
+| `desktop::entitlement_commands` | Known-grant reconciliation IPC | `EntitlementSyncRequest`, `EntitlementSyncReport` | `reconcile_known_entitlements()` |
 | `desktop::archive_selection` | Managed archive capabilities | `ArchiveSelectionService`, `PublicationLease` | Stage/inspect/hash/query/discard and leased upload |
 | `desktop::archive_commands` | Archive IPC adapters | Typed archive request/response models | Selection, inspection, paged query, hash, discard commands |
 | `desktop::install` | Atomic placement and recovery | `OperationLock`, `PlacedInstallation`, `RecoveryReport` | Capability extraction, commit, startup recovery, no-follow removal |
@@ -2061,23 +2160,29 @@ cargo install tauri-cli --version "^2"
 
 **Desktop Development**:
 ```bash
-# Run with hot reload (60s timeout to prevent hanging)
-cargo tauri dev --manifest-path desktop/Cargo.toml
+# From the repository root, run with hot reload
+(cd desktop && cargo tauri dev)
 
 # Production build
-cargo tauri build --manifest-path desktop/Cargo.toml
+(cd desktop && cargo tauri build)
 ```
 
 **Web Development**:
 ```bash
 cd web
-trunk serve              # Development server at http://localhost:5173
+trunk serve --features web # Standalone browser frontend at http://localhost:5173
 cd ..
 cargo run -p arcadestr-xtask -- frontend-build
 cargo run -p arcadestr-xtask -- frontend-build --release
 ```
 
 Desktop development uses the object-form `beforeDevCommand` to run `trunk serve` without waiting and loads `devUrl`. Production invokes the release xtask before Tauri packaging. Running `trunk build --release` directly can create `web/dist`, but it does **not** write the Arcadestr freshness stamp and therefore is not a reproducible desktop release build.
+
+The Tauri CLI is invoked from `desktop/`, where `tauri.conf.json` lives; it does
+not accept Cargo's `--manifest-path` flag. Plain `trunk serve` intentionally
+builds the desktop WebView frontend, while `--features web` enables browser
+authentication and native-command fallbacks for standalone use. The xtask
+commands above build the desktop frontend, not the standalone browser variant.
 
 **Testing**:
 ```bash
@@ -2143,7 +2248,7 @@ tauri = "2"
       "script": "cargo run -p arcadestr-xtask -- frontend-build --release",
       "cwd": ".."
     },
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:5173/?tauri-dev=1",
     "frontendDist": "../web/dist"
   },
   "app": {
@@ -2159,6 +2264,7 @@ tauri = "2"
 ```toml
 [serve]
 port = 5173
+headers = { "Cache-Control" = "no-store" }
 
 [build]
 target = "index.html"
@@ -2169,6 +2275,8 @@ public_url = "/"
 `build-support/frontend_fingerprint.rs` hashes tracked app/core/web sources and manifests separately from `web/dist`. The xtask runs Trunk, computes both hashes, and atomically writes `FrontendBuildStamp` to `web/.arcadestr-frontend-build.txt` with build profile and timestamp. `desktop/build.rs` rejects a missing, debug-profile, source-stale, or distribution-stale stamp in release; debug embedded builds compile but print a prominent freshness diagnostic, while `trunk serve` development bypasses embedded assets. The build script also embeds `windows-app-manifest.xml` with `longPathAware=true`, and Tauri bundles the checked-in PNG/ICO icons. `.github/workflows/msrv.yml` reads Rust 1.89 from the workspace and checks native, Windows, xtask, and WASM targets with `--locked`.
 
 The desktop manifest additionally carries the native archive/extraction and disk-capacity dependencies, `tauri-plugin-dialog = "2"` for archive selection, and debug-only `tauri-plugin-mcp-bridge`. The app manifest uses unconditional `nostr = "0.44"`, `url = "2"`, `HtmlDialogElement`, and `send_wrapper = "0.6"`; its `web` feature is an empty target marker. `desktop/capabilities/default.json` grants dialog/event and MCP capabilities; only MCP registration is compile-time debug-gated. `web/tailwind.config.js` scans `../app/src/**/*.rs`. Root `opencode.json` excludes generated/build/database artifacts from watching.
+
+Root `.gitignore` keeps `target/`, `node_modules/`, `desktop/gen/`, `web/dist/`, and the frontend build stamp out of version control; generated Tauri schemas and built frontend assets must be regenerated locally. It also excludes local worktrees, temporary context, compiler/script caches, root-level SQLite databases and sidecars, `desktop/arcadestr.db` and its sidecars, and `/data/`. Database exclusions are scoped rather than a global `*.db` rule, leaving fixture directories visible. `.env` and `.env.*` are ignored except `.env.example`; `docs/` is no longer blanket-excluded, and the two `.vscode/` debugging Markdown guides are explicitly allowed alongside the shared editor configuration.
 
 ### 9.3 Feature Flags
 
@@ -2434,7 +2542,7 @@ cargo test -p arcadestr-app favorites
 cargo test -p arcadestr-desktop favorites
 
 # Run desktop
-cargo tauri dev
+(cd desktop && cargo tauri dev)
 
 # Test the feature:
 # 1. Log in
@@ -2471,10 +2579,10 @@ async fn my_command() {
 **View Logs**:
 ```bash
 # Desktop app logs to terminal
-cargo tauri dev 2>&1 | grep -E "(INFO|ERROR|WARN)"
+(cd desktop && cargo tauri dev) 2>&1 | grep -E "(INFO|ERROR|WARN)"
 
 # Or use RUST_LOG environment variable
-RUST_LOG=debug cargo tauri dev
+(cd desktop && RUST_LOG=debug cargo tauri dev)
 ```
 
 **Attaching a Debugger**:
@@ -2489,13 +2597,13 @@ rust-gdb target/debug/arcadestr-desktop
 **Debug Relay Selection**:
 ```bash
 # Override relay selection during development via environment variables
-ARCADESTR_RELAYS="wss://relay.example.com" cargo tauri dev
+(cd desktop && ARCADESTR_RELAYS="wss://relay.example.com" cargo tauri dev)
 
 # Block runtime relay discovery (NIP-65 gossip) when using debug relays
-ARCADESTR_BLOCK_DISCOVERY=1 cargo tauri dev
+(cd desktop && ARCADESTR_BLOCK_DISCOVERY=1 cargo tauri dev)
 
 # Or use CLI args (highest precedence over env vars and settings):
-cargo tauri dev -- --relay "wss://debug.local" --block-discovery
+(cd desktop && cargo tauri dev -- -- --relay "wss://debug.local" --block-discovery)
 
 # Precedence chain: CLI args > Environment vars > NetworkDiscoverySettings > Defaults
 ```

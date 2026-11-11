@@ -20,7 +20,7 @@ code --install-extension tamasfe.even-better-toml
 ### 2. Open Project in VS Code
 
 ```bash
-cd /home/joel/Sync/Projetos/Arcadestr
+# From the repository root:
 code .
 ```
 

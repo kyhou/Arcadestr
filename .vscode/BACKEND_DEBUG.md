@@ -18,7 +18,7 @@ code --install-extension rust-lang.rust-analyzer
 ### 2. Open Project
 
 ```bash
-cd /home/joel/Sync/Projetos/Arcadestr
+# From the repository root:
 code .
 ```
 
