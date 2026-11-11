@@ -478,7 +478,7 @@ impl AdpClient {
         let path = quote_id
             .map(|q| format!("/settlement/{q}/refunds"))
             .unwrap_or_else(|| "/settlement/refunds".into());
-        let url = self.url(&path);
+        let url = self.checked_url(&path)?;
         let auth = build_nip98_auth_header(signer, &url, "POST").await?;
         let value = self
             .http
@@ -505,7 +505,10 @@ impl AdpClient {
     /// Returns [`AdpClientError`] if the server cannot be reached or decoded.
     pub async fn well_known(&self) -> Result<AdpServerInfo, AdpClientError> {
         crate::http_client::validate_publication_endpoint(&self.base_url)?;
-        let value = self.http.get_json(&self.url("/.well-known/adp")).await?;
+        let value = self
+            .http
+            .get_json(&self.checked_url("/.well-known/adp")?)
+            .await?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -518,7 +521,7 @@ impl AdpClient {
         signer: &dyn NostrSigner,
         scope: Option<&str>,
     ) -> Result<ProvisionResponse, AdpClientError> {
-        let url = self.url("/provision");
+        let url = self.checked_url("/provision")?;
         crate::http_client::validate_publication_endpoint(&url)?;
         let auth_header = build_nip98_auth_header(signer, &url, "POST").await?;
         let body = match scope {
@@ -542,7 +545,7 @@ impl AdpClient {
         signer: &dyn NostrSigner,
         fulfillment_pubkey: &str,
     ) -> Result<RevokeResponse, AdpClientError> {
-        let url = self.url("/provision/revoke");
+        let url = self.checked_url("/provision/revoke")?;
         let auth_header = build_nip98_auth_header(signer, &url, "POST").await?;
         let body = serde_json::json!({ "fulfillment_pubkey": fulfillment_pubkey });
         let value = self
@@ -657,11 +660,11 @@ impl AdpClient {
         &self,
         signer: &dyn NostrSigner,
     ) -> Result<UploadAuthorization, AdpClientError> {
-        crate::http_client::validate_publication_endpoint(&self.url("/upload"))?;
-        let header = build_nip98_auth_header(signer, &self.url("/upload"), "POST").await?;
+        let endpoint = self.checked_url("/upload")?;
+        let header = build_nip98_auth_header(signer, &endpoint, "POST").await?;
         Ok(UploadAuthorization {
             header,
-            endpoint: self.url("/upload"),
+            endpoint,
             session: None,
         })
     }
@@ -681,7 +684,7 @@ impl AdpClient {
     where
         F: Fn(u64, u64) + Send + Sync + 'static,
     {
-        let url = self.url("/upload");
+        let url = self.checked_url("/upload")?;
         crate::http_client::validate_publication_endpoint(&url)?;
         let listing_json = serde_json::to_string(listing_event)?;
         let metadata_file = Arc::clone(&file);
@@ -741,7 +744,7 @@ impl AdpClient {
         signer: &dyn NostrSigner,
         req: PurchaseConfirmRequest,
     ) -> Result<PurchaseConfirmResponse, AdpClientError> {
-        let url = self.url("/purchase/confirm");
+        let url = self.checked_url("/purchase/confirm")?;
         let auth_header = build_nip98_auth_header(signer, &url, "POST").await?;
         let body = serde_json::to_value(req)?;
         let value = self
@@ -758,7 +761,7 @@ impl AdpClient {
         signer: &dyn NostrSigner,
         req: CreateSettlementQuoteRequest,
     ) -> Result<SettlementQuoteResponse, AdpClientError> {
-        let url = self.url("/settlement/quote");
+        let url = self.checked_url("/settlement/quote")?;
         let auth = build_nip98_auth_header(signer, &url, "POST").await?;
         let value = self
             .http
@@ -777,7 +780,7 @@ impl AdpClient {
         signer: &dyn NostrSigner,
         quote_id: &str,
     ) -> Result<SettlementStatusResponse, AdpClientError> {
-        let url = self.url(&format!("/settlement/{quote_id}/status"));
+        let url = self.checked_url(&format!("/settlement/{quote_id}/status"))?;
         let auth = build_nip98_auth_header(signer, &url, "POST").await?;
         let value = self
             .http
@@ -796,7 +799,7 @@ impl AdpClient {
         signer: &dyn NostrSigner,
         quote_id: &str,
     ) -> Result<SettlementInvoiceResponse, AdpClientError> {
-        let url = self.url(&format!("/settlement/{quote_id}/next"));
+        let url = self.checked_url(&format!("/settlement/{quote_id}/next"))?;
         let auth = build_nip98_auth_header(signer, &url, "POST").await?;
         let value = self
             .http
@@ -816,7 +819,7 @@ impl AdpClient {
         quote_id: &str,
         req: SettlementProofRequest,
     ) -> Result<SettlementProofResponse, AdpClientError> {
-        let url = self.url(&format!("/settlement/{quote_id}/proof"));
+        let url = self.checked_url(&format!("/settlement/{quote_id}/proof"))?;
         let auth = build_nip98_auth_header(signer, &url, "POST").await?;
         let value = self
             .http
@@ -836,7 +839,7 @@ impl AdpClient {
         quote_id: &str,
         destination: crate::adp_settlement::RefundDestination,
     ) -> Result<serde_json::Value, AdpClientError> {
-        let url = self.url(&format!("/settlement/{quote_id}/refund-destination"));
+        let url = self.checked_url(&format!("/settlement/{quote_id}/refund-destination"))?;
         let auth = build_nip98_auth_header(signer, &url, "POST").await?;
         self.http
             .post_json(
@@ -853,7 +856,7 @@ impl AdpClient {
         signer: &dyn NostrSigner,
         quote_id: &str,
     ) -> Result<RecoveryPreparationResponse, AdpClientError> {
-        let url = self.url(&format!("/settlement/{quote_id}/recovery"));
+        let url = self.checked_url(&format!("/settlement/{quote_id}/recovery"))?;
         let auth = build_nip98_auth_header(signer, &url, "POST").await?;
         let value = self
             .http
@@ -874,7 +877,7 @@ impl AdpClient {
         event: Event,
         plaintext: String,
     ) -> Result<serde_json::Value, AdpClientError> {
-        let url = self.url(&format!("/settlement/{quote_id}/recovery/submit"));
+        let url = self.checked_url(&format!("/settlement/{quote_id}/recovery/submit"))?;
         let auth = build_nip98_auth_header(signer, &url, "POST").await?;
         self.http
             .post_json(
@@ -892,7 +895,7 @@ impl AdpClient {
         quote_id: &str,
         leg_id: &str,
     ) -> Result<RefundInvoiceResponse, AdpClientError> {
-        let url = self.url(&format!("/settlement/{quote_id}/refund/{leg_id}/prepare"));
+        let url = self.checked_url(&format!("/settlement/{quote_id}/refund/{leg_id}/prepare"))?;
         let auth = build_nip98_auth_header(signer, &url, "POST").await?;
         let value = self
             .http
@@ -914,7 +917,7 @@ impl AdpClient {
         attempt_id: &str,
         preimage: &str,
     ) -> Result<serde_json::Value, AdpClientError> {
-        let url = self.url(&format!("/settlement/{quote_id}/refund/{leg_id}/confirm"));
+        let url = self.checked_url(&format!("/settlement/{quote_id}/refund/{leg_id}/confirm"))?;
         let auth = build_nip98_auth_header(signer, &url, "POST").await?;
         self.http
             .post_json(
@@ -932,7 +935,7 @@ impl AdpClient {
         signer: &dyn NostrSigner,
         request: EntitlementClaimRequest,
     ) -> Result<EntitlementClaimResponse, AdpClientError> {
-        let url = self.url("/entitlement/claim");
+        let url = self.checked_url("/entitlement/claim")?;
         let auth_header = build_nip98_auth_header(signer, &url, "POST").await?;
         let body = serde_json::to_value(request)?;
         let value = self
@@ -964,16 +967,14 @@ impl AdpClient {
         mut on_progress: impl FnMut(u64, Option<u64>) + Send,
     ) -> Result<DownloadOutcome, AdpClientError> {
         let encoded_coordinate = urlencoding::encode(game_coordinate);
+        let endpoint = self.checked_url(&format!("/game/{encoded_coordinate}"))?;
         let (url, headers) = match auth {
             DownloadAuth::Token(token) => {
                 let encoded_token = urlencoding::encode(&token);
-                (
-                    self.url(&format!("/game/{encoded_coordinate}?token={encoded_token}")),
-                    Vec::new(),
-                )
+                (format!("{endpoint}?token={encoded_token}"), Vec::new())
             }
             DownloadAuth::Nip98 { signer } => {
-                let url = self.url(&format!("/game/{encoded_coordinate}"));
+                let url = endpoint;
                 let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
                 (url, vec![("Authorization".to_string(), auth_header)])
             }
@@ -1021,16 +1022,14 @@ impl AdpClient {
         mut on_progress: impl FnMut(u64, Option<u64>) + Send,
     ) -> Result<RetainedDownloadOutcome, AdpClientError> {
         let encoded_coordinate = urlencoding::encode(game_coordinate);
+        let endpoint = self.checked_url(&format!("/game/{encoded_coordinate}"))?;
         let (url, headers) = match auth {
             DownloadAuth::Token(token) => {
                 let encoded_token = urlencoding::encode(&token);
-                (
-                    self.url(&format!("/game/{encoded_coordinate}?token={encoded_token}")),
-                    Vec::new(),
-                )
+                (format!("{endpoint}?token={encoded_token}"), Vec::new())
             }
             DownloadAuth::Nip98 { signer } => {
-                let url = self.url(&format!("/game/{encoded_coordinate}"));
+                let url = endpoint;
                 let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
                 (url, vec![("Authorization".to_string(), auth_header)])
             }
@@ -1059,16 +1058,14 @@ impl AdpClient {
         mut on_progress: impl FnMut(u64, Option<u64>) + Send,
     ) -> Result<RetainedDownloadOutcome, AdpClientError> {
         let encoded_coordinate = urlencoding::encode(game_coordinate);
+        let endpoint = self.checked_url(&format!("/game/{encoded_coordinate}"))?;
         let (url, headers) = match auth {
             DownloadAuth::Token(token) => {
                 let encoded_token = urlencoding::encode(&token);
-                (
-                    self.url(&format!("/game/{encoded_coordinate}?token={encoded_token}")),
-                    Vec::new(),
-                )
+                (format!("{endpoint}?token={encoded_token}"), Vec::new())
             }
             DownloadAuth::Nip98 { signer } => {
-                let url = self.url(&format!("/game/{encoded_coordinate}"));
+                let url = endpoint;
                 let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
                 (url, vec![("Authorization".to_string(), auth_header)])
             }
@@ -1088,6 +1085,15 @@ impl AdpClient {
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    /// Validate before signing, disclosing tokens/proofs or entering transport.
+    /// Preserve the exact URL bytes: validation is not signed-URL normalization.
+    fn checked_url(&self, path: &str) -> Result<String, AdpClientError> {
+        crate::http_client::validate_publication_endpoint(&self.base_url)?;
+        let url = self.url(path);
+        crate::http_client::validate_publication_endpoint(&url)?;
+        Ok(url)
     }
 }
 
@@ -1308,6 +1314,294 @@ mod tests {
             assert_eq!(http.call_count(&client.url("/.well-known/adp")), 0);
             assert_eq!(http.call_count(&client.url("/provision")), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn unsafe_buyer_claim_endpoint_is_rejected_before_signer_and_network() {
+        let http = Arc::new(MockHttpClient::new());
+        let client = AdpClient::new("http://remote.example", http.clone());
+        let error = client
+            .entitlement_claim(
+                &NeverPublicationSigner,
+                EntitlementClaimRequest {
+                    game_coordinate: "30402:fixture:game".into(),
+                    campaign_event_id: "11".repeat(32),
+                },
+            )
+            .await
+            .expect_err("remote plaintext HTTP must not receive buyer authorization");
+        assert!(matches!(error, AdpClientError::Http(_)));
+        assert_eq!(http.last_requested_url(), None);
+    }
+
+    #[tokio::test]
+    async fn buyer_endpoints_reject_unsafe_urls_without_disclosing_credentials_or_proofs() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(30402), "offline fixture")
+            .sign_with_keys(&keys)
+            .expect("fixture event");
+        let destination = crate::adp_settlement::RefundDestination {
+            endpoint: "buyer@example.test".into(),
+            min_sendable_msat: 1000,
+            max_sendable_msat: 100000,
+        };
+        for endpoint in [
+            "http://remote.example",
+            "https://user:password@example.com",
+            "https://example.com?token=secret",
+            "https://example.com#secret",
+            "file:///tmp/build",
+            "not a URL",
+        ] {
+            let http = Arc::new(MockHttpClient::new());
+            let client = AdpClient::new(endpoint, http.clone());
+            let signer = NeverPublicationSigner;
+            macro_rules! rejected {
+                ($request:expr) => {
+                    assert!(matches!(
+                        $request.await,
+                        Err(AdpClientError::Http(HttpClientError::Request(message)))
+                            if message == "unsafe publication endpoint"
+                    ));
+                };
+            }
+            rejected!(client.purchase_confirm(
+                &signer,
+                PurchaseConfirmRequest {
+                    game_coordinate: "30402:fixture:game".into(),
+                    listing_event: event.clone(),
+                    zap_receipt_event: None,
+                    bolt11: Some("private-invoice".into()),
+                    preimage: Some("private-proof".into()),
+                    quote_id: None,
+                }
+            ));
+            rejected!(client.create_settlement_quote(
+                &signer,
+                CreateSettlementQuoteRequest {
+                    purchase_id: "purchase".into(),
+                    listing_event: event.clone(),
+                    terms_events: vec![],
+                    refund_destination: destination.clone(),
+                    zap_requests: Default::default(),
+                }
+            ));
+            rejected!(client.settlement_status(&signer, "purchase"));
+            rejected!(client.settlement_next_invoice(&signer, "purchase"));
+            rejected!(client.submit_settlement_proof(
+                &signer,
+                "purchase",
+                SettlementProofRequest {
+                    attempt_id: "attempt".into(),
+                    preimage: "private-proof".into(),
+                }
+            ));
+            rejected!(client.replace_refund_destination(&signer, "purchase", destination.clone()));
+            rejected!(client.prepare_recovery(&signer, "purchase"));
+            rejected!(client.submit_recovery(
+                &signer,
+                "purchase",
+                event.clone(),
+                "private-evidence".into()
+            ));
+            rejected!(client.prepare_refund(&signer, "purchase", "leg"));
+            rejected!(client.confirm_refund(
+                &signer,
+                "purchase",
+                "leg",
+                "attempt",
+                "private-proof"
+            ));
+            rejected!(client.refund_obligations(&signer, None));
+            rejected!(client.refund_obligations(&signer, Some("purchase")));
+            rejected!(client.entitlement_claim(
+                &signer,
+                EntitlementClaimRequest {
+                    game_coordinate: "30402:fixture:game".into(),
+                    campaign_event_id: "11".repeat(32),
+                }
+            ));
+            let dir = tempfile::tempdir().expect("private fixture directory");
+            let path = dir.path().join("candidate");
+            std::fs::write(&path, b"preserved").expect("existing candidate");
+            for auth in [
+                DownloadAuth::Token("private-token".into()),
+                DownloadAuth::Nip98 { signer: &signer },
+            ] {
+                rejected!(
+                    client.download("30402:fixture:game", auth, &path, |_, _| panic!(
+                        "no progress"
+                    ))
+                );
+            }
+            for auth in [
+                DownloadAuth::Token("private-token".into()),
+                DownloadAuth::Nip98 { signer: &signer },
+            ] {
+                rejected!(client.download_retained(
+                    "30402:fixture:game",
+                    auth,
+                    &path,
+                    |_, _| panic!("no progress")
+                ));
+            }
+            for auth in [
+                DownloadAuth::Token("private-token".into()),
+                DownloadAuth::Nip98 { signer: &signer },
+            ] {
+                rejected!(client.download_retained_with_preflight(
+                    "30402:fixture:game",
+                    auth,
+                    &path,
+                    |_| panic!("no preflight"),
+                    |_, _| panic!("no progress")
+                ));
+            }
+            for auth in [
+                DownloadAuth::Token("private-token".into()),
+                DownloadAuth::Nip98 { signer: &signer },
+            ] {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .expect("owned candidate");
+                rejected!(client.download_retained_to_open_file_with_preflight(
+                    "30402:fixture:game",
+                    auth,
+                    file,
+                    |_| panic!("no preflight"),
+                    |_, _| panic!("no progress")
+                ));
+            }
+            assert_eq!(
+                std::fs::read(&path).expect("candidate preserved"),
+                b"preserved"
+            );
+            assert_eq!(
+                http.last_requested_url(),
+                None,
+                "no credential or proof transport"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn buyer_claim_preserves_exact_https_and_loopback_nip98_targets() {
+        let signer = LocalSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("synthetic signer");
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(1030), "fixture only")
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("event");
+        for base in [
+            "https://dist.example.test/prefix",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            let url = format!("{base}/entitlement/claim");
+            let http = Arc::new(MockHttpClient::new().with_json_post_response(
+                &url,
+                json!({
+                    "grant":event,"download_token":"fixture-token","token_expires_at":2000
+                }),
+            ));
+            AdpClient::new(format!("{base}/"), http.clone())
+                .entitlement_claim(
+                    &signer,
+                    EntitlementClaimRequest {
+                        game_coordinate: "30402:fixture:game".into(),
+                        campaign_event_id: "11".repeat(32),
+                    },
+                )
+                .await
+                .expect("safe fixture transport");
+            let headers = http.last_json_post_headers(&url).expect("headers");
+            let auth = headers
+                .iter()
+                .find(|(name, _)| name == "Authorization")
+                .expect("authorization");
+            let signed: Event = serde_json::from_slice(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(auth.1.strip_prefix("Nostr ").expect("scheme"))
+                    .expect("base64"),
+            )
+            .expect("signed event");
+            signed.verify().expect("event id and signature");
+            assert!(signed
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["u", url.as_str()]));
+            assert_eq!(http.last_requested_url().as_deref(), Some(url.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn buyer_claim_and_token_download_do_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let signer = LocalSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("synthetic signer");
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("target");
+        let destination = target.local_addr().expect("address");
+        let http = Arc::new(
+            crate::http_client::ReqwestHttpClient::new(std::time::Duration::from_secs(2))
+                .expect("HTTP"),
+        );
+        for download in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("source");
+            let base = format!("http://{}", listener.local_addr().expect("address"));
+            let source = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("request");
+                let mut request = [0; 8192];
+                stream.read(&mut request).await.expect("read request");
+                stream.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{destination}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.expect("redirect");
+            });
+            let client = AdpClient::new(base, http.clone());
+            let dir = tempfile::tempdir().expect("private fixture");
+            let candidate = dir.path().join("candidate");
+            let error = if download {
+                client
+                    .download(
+                        "30402:fixture:game",
+                        DownloadAuth::Token("private-token".into()),
+                        &candidate,
+                        |_, _| {},
+                    )
+                    .await
+                    .expect_err("token redirect blocked")
+            } else {
+                client
+                    .entitlement_claim(
+                        &signer,
+                        EntitlementClaimRequest {
+                            game_coordinate: "30402:fixture:game".into(),
+                            campaign_event_id: "11".repeat(32),
+                        },
+                    )
+                    .await
+                    .expect_err("auth redirect blocked")
+            };
+            assert!(matches!(
+                error,
+                AdpClientError::Http(HttpClientError::RedirectBlocked(_))
+            ));
+            assert!(!candidate.exists());
+            source.await.expect("source task");
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(40), target.accept())
+                .await
+                .is_err(),
+            "redirect target received no credentials"
+        );
     }
 
     #[tokio::test]
