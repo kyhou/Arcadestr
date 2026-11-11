@@ -1,5 +1,11 @@
 # Rust build artifacts
-/target
+target/
+
+# Node dependencies and local build caches
+node_modules/
+/.npm/
+/.parcel-cache/
+/web/.vite/
 
 # IDE and editor files
 /.opencode
@@ -9,6 +15,8 @@
 !/.vscode/tasks.json
 !/.vscode/extensions.json
 !/.vscode/settings.json
+!/.vscode/README.md
+!/.vscode/BACKEND_DEBUG.md
 /.idea
 *.swp
 *.swo
@@ -16,7 +24,8 @@
 
 # Git worktrees and temp
 /.worktrees
-/.tmp
+/.tmp*/
+/Arcadestr/.tmp/
 
 # Claude Code local workspace: machine-specific settings.local.json and
 # scratch worktrees. No shared configuration is tracked under it.
@@ -29,35 +38,48 @@
 /web/dist/
 /web/.arcadestr-frontend-build.txt
 
-# SQLite database files (test artifacts)
-*.db
+# Root-level runtime/test SQLite files; keep fixture directories visible
+/*.db
+/*.db-wal
+/*.db-shm
+/*.db-journal
+/*.sqlite
+/*.sqlite-wal
+/*.sqlite-shm
+/*.sqlite-journal
+/*.sqlite3
+/*.sqlite3-wal
+/*.sqlite3-shm
+/*.sqlite3-journal
+/desktop/arcadestr.db
+/desktop/arcadestr.db-wal
+/desktop/arcadestr.db-shm
+/desktop/arcadestr.db-journal
+/data/
 
 # Environment files
 .env
-.env.local
+.env.*
+!.env.example
 
 # OS-specific files
 .DS_Store
 Thumbs.db
- 
+
 # Log files
 *.log
 
 # V8 compile cache
 v8-compile-cache-*/
 
-rust*/
-tsx-1000/
+# Local compiler and script-runner scratch output
+/rustc*/
+/tsx-[0-9]*/
 
 .nostr_client_key
-*.cdtor.o
-*.s
-*.res
-*.cdtor.c
+/*.cdtor.o
+/cc*.s
+/cc*.res
+/*.cdtor.c
 *.bak
-tmp.*
-/docs
-!/docs/
-/docs/*
-!/docs/design-handoff/
-!/docs/design-handoff/**
+/tmp.*
