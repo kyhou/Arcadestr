@@ -179,6 +179,8 @@ const MIGRATION_24_PUBLISHER_RECOVERY: &str =
     include_str!("../../migrations/024_publisher_recovery.sql");
 const MIGRATION_25_MARKETPLACE_CAMPAIGNS: &str =
     include_str!("../../migrations/025_marketplace_campaign_pointers.sql");
+const MIGRATION_26_QUOTE_INITIATIONS: &str =
+    include_str!("../../migrations/026_quote_initiations.sql");
 
 #[cfg(test)]
 const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
@@ -254,6 +256,11 @@ const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
         25,
         "025_marketplace_campaign_pointers.sql",
         MIGRATION_25_MARKETPLACE_CAMPAIGNS,
+    ),
+    (
+        26,
+        "026_quote_initiations.sql",
+        MIGRATION_26_QUOTE_INITIATIONS,
     ),
 ];
 
@@ -364,6 +371,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "025_marketplace_campaign_pointers.sql",
         sql: MIGRATION_25_MARKETPLACE_CAMPAIGNS,
+    },
+    Migration {
+        name: "026_quote_initiations.sql",
+        sql: MIGRATION_26_QUOTE_INITIATIONS,
     },
 ];
 
@@ -1402,6 +1413,7 @@ mod tests {
             "purchase_execution_admissions",
             "purchase_execution_approvals",
             "purchase_quote_verification",
+            "quote_initiations",
             "purchases",
             "receipt_chain_verifications",
             "receipt_sync_cursors",
@@ -1470,6 +1482,95 @@ mod tests {
             foreign_keys, 0,
             "preferences must survive installation deletion"
         );
+    }
+
+    #[tokio::test]
+    async fn gate7_version_25_copy_upgrades_additively_without_rewriting_existing_records() {
+        let directory = TempDir::new().expect("disposable directory");
+        let original = directory.path().join("version-25.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&original)
+                    .create_if_missing(true)
+                    .foreign_keys(true),
+            )
+            .await
+            .expect("old database");
+        Database::run_migrations(&original, &pool, &MIGRATIONS[..25])
+            .await
+            .expect("supported version 25");
+        // Byte-preservation sentinels in actual tables, not claimed as signed
+        // protocol evidence. Signed-record restart is tested by cross-flow fixtures.
+        sqlx::query("INSERT INTO purchases(event_id,order_id,listing_coordinate,buyer_pubkey,merchant_pubkey,status,created_at,raw_event) VALUES('r','o','coordinate','buyer','merchant','paid',1,'original receipt bytes')").execute(&pool).await.expect("purchase sentinel");
+        sqlx::query("INSERT INTO publisher_operations(publisher,operation_id,kind,coordinate,intent_json,updated_at) VALUES('publisher','operation','listing','coordinate','original publisher intent',1)").execute(&pool).await.expect("publisher sentinel");
+        sqlx::query("INSERT INTO installations(id,game_coordinate,installation_root,package_digest,package_format,resolved_os,resolved_arch,raw_event_json,state,created_at,updated_at) VALUES('installed','coordinate','/isolated/game','digest','zip','linux','x86_64','original installation event','ready',1,1)").execute(&pool).await.expect("installation sentinel");
+        sqlx::query("INSERT INTO secure_storage(id,salt,created_at) VALUES(1,X'000102FEFF',1)")
+            .execute(&pool)
+            .await
+            .expect("salt byte sentinel");
+        pool.close().await;
+        let copy = directory.path().join("upgrade-copy.db");
+        std::fs::copy(&original, &copy).expect("copy, never reset the original database");
+        let upgraded = Database::new(&copy)
+            .await
+            .expect("supported additive upgrade");
+        let receipt: String =
+            sqlx::query_scalar("SELECT raw_event FROM purchases WHERE event_id='r'")
+                .fetch_one(upgraded.pool())
+                .await
+                .expect("receipt survives");
+        let publisher: String = sqlx::query_scalar(
+            "SELECT intent_json FROM publisher_operations WHERE operation_id='operation'",
+        )
+        .fetch_one(upgraded.pool())
+        .await
+        .expect("publisher survives");
+        let installation: (String, String) =
+            sqlx::query_as("SELECT raw_event_json,state FROM installations WHERE id='installed'")
+                .fetch_one(upgraded.pool())
+                .await
+                .expect("installation survives");
+        let bytes: Vec<u8> = sqlx::query_scalar("SELECT salt FROM secure_storage WHERE id=1")
+            .fetch_one(upgraded.pool())
+            .await
+            .expect("salt bytes survive");
+        assert_eq!(receipt, "original receipt bytes");
+        assert_eq!(publisher, "original publisher intent");
+        assert_eq!(
+            installation,
+            ("original installation event".into(), "ready".into())
+        );
+        assert_eq!(bytes, vec![0, 1, 2, 254, 255]);
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(upgraded.pool())
+            .await
+            .expect("version");
+        assert_eq!(version, 26);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM quote_initiations")
+            .fetch_one(upgraded.pool())
+            .await
+            .expect("additive table");
+        assert_eq!(count, 0);
+        upgraded.close().await;
+        let reopened = Database::new(&copy).await.expect("restart after upgrade");
+        let persisted: String =
+            sqlx::query_scalar("SELECT raw_event FROM purchases WHERE event_id='r'")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("receipt after restart");
+        assert_eq!(persisted, receipt);
+        let old = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&original))
+            .await
+            .expect("original retained");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&old)
+            .await
+            .expect("original version");
+        assert_eq!(version, 25);
     }
 
     #[tokio::test]

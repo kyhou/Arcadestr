@@ -58,6 +58,61 @@ pub struct SettlementRepository {
 }
 
 impl SettlementRepository {
+    /// Reserve the request identity before creating a remote quote. This seam is
+    /// shared with the desktop entry point; it never authorizes live execution.
+    pub async fn reserve_quote_initiation(
+        &self,
+        account: &str,
+        processor: &str,
+        coordinate: &str,
+        listing_event_id: &str,
+        request_commitment: &str,
+        requested_id: Option<&str>,
+    ) -> Result<String, SettlementRepositoryError> {
+        let canonical_hash = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if nostr::PublicKey::from_hex(account).is_err()
+            || crate::adp_protocol::coordinate_publisher(coordinate).is_none()
+            || !canonical_hash(listing_event_id)
+            || !canonical_hash(request_commitment)
+            || requested_id.is_some_and(|id| id.is_empty() || id.len() > 128)
+            || crate::http_client::validate_publication_endpoint(processor).is_err()
+        {
+            return Err(SettlementRepositoryError::Binding);
+        }
+        let processor = processor.trim_end_matches('/');
+        let mut tx = self.pool.begin().await?;
+        let prior:Option<(String,String,String)>=sqlx::query_as(
+            "SELECT purchase_id,listing_event_id,request_commitment FROM quote_initiations WHERE account_pubkey=? AND processor_url=? AND game_coordinate=?")
+            .bind(account).bind(processor).bind(coordinate).fetch_optional(&mut *tx).await?;
+        if let Some((id, listing, commitment)) = &prior {
+            let completed:bool=sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM settlement_quotes WHERE account_pubkey=? AND quote_id=? AND state='settled' AND receipt_event_json IS NOT NULL)")
+                .bind(account).bind(id).fetch_one(&mut *tx).await?;
+            if !completed || requested_id == Some(id.as_str()) {
+                if listing != listing_event_id
+                    || commitment != request_commitment
+                    || requested_id.is_some_and(|requested| requested != id)
+                {
+                    return Err(SettlementRepositoryError::Binding);
+                }
+                return Ok(id.clone());
+            }
+        }
+        let id = requested_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        sqlx::query("INSERT INTO quote_initiations(account_pubkey,processor_url,game_coordinate,purchase_id,listing_event_id,request_commitment) VALUES(?,?,?,?,?,?) ON CONFLICT(account_pubkey,processor_url,game_coordinate) DO UPDATE SET purchase_id=excluded.purchase_id,listing_event_id=excluded.listing_event_id,request_commitment=excluded.request_commitment,created_at=unixepoch()")
+            .bind(account).bind(processor).bind(coordinate).bind(&id).bind(listing_event_id).bind(request_commitment)
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }

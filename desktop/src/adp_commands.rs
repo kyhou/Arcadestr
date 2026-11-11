@@ -2240,9 +2240,6 @@ pub async fn start_split_purchase(
     let endpoint = resolve_lud16(state.http_client.as_ref(), &request.refund_lud16)
         .await
         .map_err(|error| error.to_string())?;
-    let purchase_id = request
-        .purchase_id
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let client = AdpClient::new(request.server_url.clone(), Arc::clone(&state.http_client));
     let refund = arcadestr_core::adp_settlement::RefundDestination {
         endpoint: request.refund_lud16.clone(),
@@ -2251,6 +2248,29 @@ pub async fn start_split_purchase(
     };
     let refund_commitment = arcadestr_core::adp_settlement::destination_commitment(&refund)
         .map_err(|e| e.to_string())?;
+    let mut terms_ids = terms_events
+        .iter()
+        .map(|event| event.id.to_hex())
+        .collect::<Vec<_>>();
+    terms_ids.sort();
+    let request_commitment = format!(
+        "{:x}",
+        <sha2::Sha256 as sha2::Digest>::digest(
+            serde_json::to_vec(&(listing.id.to_hex(), terms_ids, &refund_commitment))
+                .map_err(|error| error.to_string())?,
+        )
+    );
+    let purchase_id = repository
+        .reserve_quote_initiation(
+            &buyer.to_hex(),
+            &request.server_url,
+            &coordinate,
+            &listing.id.to_hex(),
+            &request_commitment,
+            request.purchase_id.as_deref(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     let response = client
         .create_settlement_quote(
             signer,
