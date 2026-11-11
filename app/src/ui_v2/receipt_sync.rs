@@ -11,6 +11,10 @@ use wasm_bindgen_futures::spawn_local;
 
 #[derive(Clone, Copy)]
 pub struct ReceiptSyncContext {
+    pub grants_report: RwSignal<Option<crate::tauri_bridge::EntitlementSyncReport>>,
+    pub grants_error: RwSignal<Option<String>>,
+    grants_busy: RwSignal<bool>,
+    grants_retry: RwSignal<bool>,
     pub account: RwSignal<Option<String>>,
     pub busy: RwSignal<bool>,
     pub report: RwSignal<Option<ReceiptSyncReport>>,
@@ -22,6 +26,10 @@ pub struct ReceiptSyncContext {
 impl ReceiptSyncContext {
     pub fn new() -> Self {
         Self {
+            grants_report: RwSignal::new(None),
+            grants_error: RwSignal::new(None),
+            grants_busy: RwSignal::new(false),
+            grants_retry: RwSignal::new(false),
             account: RwSignal::new(None),
             busy: RwSignal::new(false),
             report: RwSignal::new(None),
@@ -34,6 +42,10 @@ impl ReceiptSyncContext {
     pub fn select_account(self, account: Option<String>) {
         self.generation.update(|n| *n = n.wrapping_add(1));
         self.account.set(account);
+        self.grants_report.set(None);
+        self.grants_error.set(None);
+        self.grants_busy.set(false);
+        self.grants_retry.set(false);
         self.report.set(None);
         self.error.set(None);
         self.busy.set(false);
@@ -62,6 +74,7 @@ impl ReceiptSyncContext {
         let Some(account) = self.account.get_untracked() else {
             return;
         };
+        self.reconcile_grants();
         if self.busy.get_untracked() {
             self.retry.set(true);
             return;
@@ -103,6 +116,55 @@ impl ReceiptSyncContext {
             }
         });
     }
+
+    fn finish_grants(
+        self,
+        generation: u64,
+        result: Result<crate::tauri_bridge::EntitlementSyncReport, String>,
+    ) -> bool {
+        if self.generation.try_get_untracked() != Some(generation) {
+            return false;
+        }
+        self.grants_busy.set(false);
+        match result {
+            Ok(report) => {
+                self.grants_report.set(Some(report));
+                self.grants_error.set(None);
+                // The existing History, Library and details resources share this
+                // invalidation signal. No optimistic local ownership projection.
+                self.revision.update(|n| *n = n.wrapping_add(1));
+            }
+            Err(error) => self.grants_error.set(Some(error)),
+        }
+        true
+    }
+
+    pub(crate) fn reconcile_grants(self) {
+        if cfg!(feature = "web") {
+            return;
+        }
+        if self.grants_busy.get_untracked() {
+            self.grants_retry.set(true);
+            return;
+        }
+        let Some(account) = self.account.get_untracked() else {
+            return;
+        };
+        let generation = self.generation.get_untracked();
+        self.grants_busy.set(true);
+        spawn_local(async move {
+            let result = crate::tauri_bridge::invoke_reconcile_known_entitlements(
+                crate::tauri_bridge::EntitlementSyncRequest {
+                    expected_account_pubkey: account,
+                },
+            )
+            .await;
+            if self.finish_grants(generation, result) && self.grants_retry.get_untracked() {
+                self.grants_retry.set(false);
+                self.reconcile_grants();
+            }
+        });
+    }
 }
 
 pub fn provide_receipt_sync(auth: AuthContext) -> ReceiptSyncContext {
@@ -118,52 +180,73 @@ pub fn provide_receipt_sync(auth: AuthContext) -> ReceiptSyncContext {
         receipts.select_account(account);
         receipts.synchronize(false);
     });
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", not(feature = "web")))]
     {
         let timer = send_wrapper::SendWrapper::new(gloo_timers::callback::Interval::new(
             60_000,
             move || receipts.synchronize(false),
         ));
         on_cleanup(move || drop(timer));
-        use std::{
-            cell::{Cell, RefCell},
-            rc::Rc,
-        };
-        let alive = Rc::new(Cell::new(true));
-        let cleanup: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(None));
-        let alive_cleanup = send_wrapper::SendWrapper::new(alive.clone());
-        let listener_cleanup = send_wrapper::SendWrapper::new(cleanup.clone());
-        on_cleanup(move || {
-            alive_cleanup.set(false);
-            if let Some(unlisten) = listener_cleanup.borrow_mut().take() {
-                unlisten();
-            }
-        });
-        let callback_alive = alive.clone();
-        spawn_local(async move {
-            if let Ok(unlisten) =
-                crate::tauri_invoke::listen("receipt-ownership-updated", move |payload| {
-                    if !callback_alive.get() {
-                        return;
-                    }
-                    if payload.get("account").and_then(|v| v.as_str())
-                        == receipts.account.get_untracked().as_deref()
-                        && !receipts.busy.get_untracked()
-                    {
-                        receipts.revision.update(|v| *v = v.wrapping_add(1));
-                    }
-                })
-                .await
-            {
-                if alive.get() {
-                    *cleanup.borrow_mut() = Some(Box::new(unlisten));
-                } else {
-                    unlisten();
-                }
-            }
-        });
+        listen_ownership_events(receipts);
     }
     receipts
+}
+
+#[cfg(all(target_arch = "wasm32", not(feature = "web")))]
+fn listen_ownership_events(receipts: ReceiptSyncContext) {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    let alive = Rc::new(Cell::new(true));
+    let cleanup: Rc<RefCell<Vec<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(Vec::new()));
+    let alive_cleanup = send_wrapper::SendWrapper::new(alive.clone());
+    let listener_cleanup = send_wrapper::SendWrapper::new(cleanup.clone());
+    on_cleanup(move || {
+        alive_cleanup.set(false);
+        for unlisten in listener_cleanup.borrow_mut().drain(..) {
+            unlisten();
+        }
+    });
+    let callback_alive = alive.clone();
+    spawn_local(async move {
+        if let Ok(unlisten) =
+            crate::tauri_invoke::listen("receipt-ownership-updated", move |payload| {
+                if !callback_alive.get() {
+                    return;
+                }
+                if payload.get("account").and_then(|v| v.as_str())
+                    == receipts.account.get_untracked().as_deref()
+                    && !receipts.busy.get_untracked()
+                {
+                    receipts.revision.update(|v| *v = v.wrapping_add(1));
+                }
+            })
+            .await
+        {
+            if alive.get() {
+                cleanup.borrow_mut().push(Box::new(unlisten));
+            } else {
+                unlisten();
+            }
+        }
+        let connected_alive = alive.clone();
+        if let Ok(unlisten) = crate::tauri_invoke::listen("relay-connection", move |payload| {
+            if connected_alive.get()
+                && payload.get("type").and_then(|v| v.as_str()) == Some("connected")
+            {
+                receipts.reconcile_grants();
+            }
+        })
+        .await
+        {
+            if alive.get() {
+                cleanup.borrow_mut().push(Box::new(unlisten));
+            } else {
+                unlisten();
+            }
+        }
+    });
 }
 
 #[component]
@@ -204,6 +287,43 @@ pub fn ReceiptPortabilityPanel() -> impl IntoView {
 mod tests {
     use super::*;
     #[test]
+    fn entitlement_reconciliation_ignores_stale_success_errors_and_aba_without_clearing_new_work() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let c = ReceiptSyncContext::new();
+            c.select_account(Some("alice".into()));
+            let old = c.generation.get_untracked();
+            for account in [Some("bob".into()), None, Some("alice".into())] {
+                c.select_account(account);
+            }
+            let current = c.generation.get_untracked();
+            c.grants_busy.set(true);
+            let revision = c.revision.get_untracked();
+            assert!(!c.finish_grants(
+                old,
+                Ok(crate::tauri_bridge::EntitlementSyncReport {
+                    revoked: 1,
+                    ..Default::default()
+                })
+            ));
+            assert!(!c.finish_grants(old, Err("old error".into())));
+            assert!(c.grants_busy.get_untracked());
+            assert!(c.grants_report.get_untracked().is_none());
+            assert!(c.grants_error.get_untracked().is_none());
+            assert_eq!(c.revision.get_untracked(), revision);
+            assert!(c.finish_grants(
+                current,
+                Ok(crate::tauri_bridge::EntitlementSyncReport {
+                    revoked: 1,
+                    ..Default::default()
+                })
+            ));
+            assert!(!c.grants_busy.get_untracked());
+            assert_eq!(c.revision.get_untracked(), revision + 1);
+            assert_eq!(c.grants_report.get_untracked().expect("report").revoked, 1);
+        });
+    }
+    #[test]
     fn stale_account_and_aba_results_cannot_change_receipts_or_revision() {
         let owner = Owner::new();
         owner.with(|| {
@@ -231,6 +351,8 @@ pub fn ReceiptPortabilityPreview() -> impl IntoView {
     let receipts = ReceiptSyncContext::new();
     provide_context(receipts);
     receipts.select_account(Some(BUYER.into()));
+    #[cfg(all(target_arch = "wasm32", not(feature = "web")))]
+    listen_ownership_events(receipts);
     Effect::new(move |_| receipts.synchronize(false));
     view! {
         <main style="max-width:1440px;margin:0 auto;padding:26px 28px;background:#0b0b0d">

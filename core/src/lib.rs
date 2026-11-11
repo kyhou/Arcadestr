@@ -99,6 +99,9 @@ pub mod blossom;
 pub mod campaign;
 #[cfg(feature = "native")]
 pub mod campaign_discovery;
+#[cfg(feature = "native")]
+pub mod entitlement_reconciliation;
+pub mod entitlement_sync_contract;
 pub mod entitlements;
 #[cfg(feature = "native")]
 pub mod entitlements_repository;

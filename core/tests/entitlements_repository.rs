@@ -11,8 +11,91 @@ use arcadestr_core::purchases::PurchasesRepository;
 use arcadestr_core::storage::Database;
 use nostr::{Event, EventBuilder, EventId, Keys, Kind, Tag, Timestamp};
 
+include!("support/gate7_revocations.rs");
+
 fn tag(values: &[&str]) -> Tag {
     Tag::parse(values.iter().copied()).expect("test tag must be valid")
+}
+
+#[tokio::test]
+async fn gate7_independent_buyer_reconciles_developer_revocation() {
+    let dir = tempfile::tempdir_in("/tmp/opencode").expect("isolated databases");
+    let publisher_db = Database::new(&dir.path().join("publisher.db"))
+        .await
+        .expect("publisher");
+    let buyer_db = Database::new(&dir.path().join("buyer.db"))
+        .await
+        .expect("buyer");
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = format!("30402:{}:game", developer.public_key());
+    let campaign = campaign(&developer, &coordinate);
+    let root = grant(
+        &developer,
+        &buyer,
+        &coordinate,
+        "independent",
+        campaign.root_event_id,
+        GrantStatus::Granted,
+        None,
+        150,
+    );
+    let revoke = grant(
+        &developer,
+        &buyer,
+        &coordinate,
+        "independent",
+        campaign.root_event_id,
+        GrantStatus::Revoked,
+        Some(root.id),
+        160,
+    );
+    let publisher = EntitlementsRepository::new(publisher_db.pool().clone());
+    let repository = EntitlementsRepository::new(buyer_db.pool().clone());
+    publisher
+        .ingest_event(&root, &campaign, None)
+        .await
+        .expect("publisher root");
+    repository
+        .ingest_event(&root, &campaign, None)
+        .await
+        .expect("buyer known root");
+    publisher
+        .ingest_event(&revoke, &campaign, None)
+        .await
+        .expect("publisher revokes");
+    assert!(!publisher
+        .is_owned(&buyer.public_key().to_hex(), &coordinate)
+        .await
+        .expect("publisher ownership"));
+    struct Source(Vec<Event>);
+    #[async_trait::async_trait]
+    impl arcadestr_core::entitlement_reconciliation::EntitlementSource for Source {
+        async fn query(
+            &self,
+            _: nostr::Filter,
+        ) -> Result<arcadestr_core::entitlement_reconciliation::EntitlementEvidence, String>
+        {
+            Ok(
+                arcadestr_core::entitlement_reconciliation::EntitlementEvidence {
+                    events: self.0.clone(),
+                    incomplete: false,
+                },
+            )
+        }
+    }
+    let report = repository
+        .reconcile_known_grants(buyer.public_key(), &Source(vec![revoke]), &|| Ok(()))
+        .await
+        .expect("reconcile");
+    assert_eq!(report.revoked, 1);
+    assert!(
+        !repository
+            .is_owned(&buyer.public_key().to_hex(), &coordinate)
+            .await
+            .expect("buyer ownership"),
+        "independent buyer must reconcile available signed revocation evidence"
+    );
 }
 
 fn unique_db_path(name: &str) -> PathBuf {

@@ -40,6 +40,91 @@ pub struct EntitlementHistoryRecord {
 }
 
 impl EntitlementsRepository {
+    /// Append verified developer revocations to an already validated root. Never
+    /// replace a projection, insert a new root, or reinterpret historical authority.
+    pub(crate) async fn merge_known_revocations(
+        &self,
+        buyer: nostr::PublicKey,
+        coordinate: &str,
+        grant_id: &str,
+        evidence: &[Event],
+        ensure_current: &(dyn Fn() -> Result<(), String> + Send + Sync),
+    ) -> Result<Option<(bool, usize)>, String> {
+        ensure_current()?;
+        let mut tx = self.db.begin().await.map_err(|e| e.to_string())?;
+        let raw:Vec<String>=sqlx::query_scalar("SELECT raw_event_json FROM entitlement_events WHERE buyer_pubkey=? AND game_coordinate=? AND grant_id=? AND validated=1 ORDER BY created_at,event_id")
+            .bind(buyer.to_hex()).bind(coordinate).bind(grant_id).fetch_all(&mut *tx).await.map_err(|e|e.to_string())?;
+        let mut nodes = raw
+            .iter()
+            .map(|raw| {
+                serde_json::from_str::<Event>(raw)
+                    .map_err(|e| e.to_string())
+                    .and_then(|event| parse_entitlement_event(&event).map_err(|e| e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let known = resolve_entitlement_grant(&nodes).map_err(|e| e.to_string())?;
+        if known.status() != Some(GrantStatus::Granted) {
+            return Ok(Some((false, 0)));
+        }
+        let root = known.events.first().ok_or("Missing known root")?;
+        let root_id = root.event.id;
+        let developer = crate::adp_protocol::coordinate_publisher(coordinate)
+            .ok_or("Invalid stored coordinate")?;
+        let mut ids = nodes
+            .iter()
+            .map(|n| n.event.id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut rejected = 0;
+        for event in evidence {
+            if !ids.insert(event.id) {
+                continue;
+            }
+            // A relay cannot inject grants or foreign issuers, even if it ignores filters.
+            if event.pubkey != developer
+                || event.kind.as_u16() != crate::adp_protocol::ENTITLEMENT_GRANT_KIND
+            {
+                rejected += 1;
+                continue;
+            }
+            let parsed = match parse_entitlement_event(event) {
+                Ok(p) => p,
+                Err(_) => return Ok(None),
+            };
+            if parsed.grant_id != grant_id
+                || parsed.recipient != buyer
+                || parsed.coordinate != coordinate
+            {
+                rejected += 1;
+                continue;
+            }
+            // Any contradictory developer-signed member makes this batch indeterminate.
+            if parsed.status != GrantStatus::Revoked || parsed.predecessor != Some(root_id) {
+                return Ok(None);
+            }
+            nodes.push(parsed);
+        }
+        let resolved = match resolve_entitlement_grant(&nodes) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        if resolved.root_event_id != root_id || resolved.events.len() != nodes.len() {
+            return Ok(None);
+        }
+        let Some(revocation) = resolved.events.get(1) else {
+            return Ok(Some((false, rejected)));
+        };
+        ensure_current()?;
+        sqlx::query("INSERT INTO entitlement_events (event_id,grant_id,buyer_pubkey,game_coordinate,campaign_root_id,issuer_pubkey,status,predecessor_event_id,created_at,raw_event_json,validated) VALUES (?,?,?,?,?,?,?,?,?,?,1) ON CONFLICT(event_id) DO NOTHING")
+            .bind(revocation.event.id.to_hex()).bind(grant_id).bind(buyer.to_hex()).bind(coordinate)
+            .bind(revocation.source_event.to_hex()).bind(developer.to_hex()).bind(GrantStatus::Revoked.as_str())
+            .bind(root_id.to_hex()).bind(revocation.event.created_at.as_secs() as i64)
+            .bind(serde_json::to_string(&revocation.event).map_err(|e|e.to_string())?)
+            .execute(&mut *tx).await.map_err(|e|e.to_string())?;
+        ensure_current()?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(Some((true, rejected)))
+    }
+
     pub fn new(db: SqlitePool) -> Self {
         Self { db }
     }

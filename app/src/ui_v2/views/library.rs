@@ -1041,11 +1041,17 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
         if retained_reinstalling.get_untracked().is_some() {
             return;
         }
+        if let Some(receipts) = receipt_sync {
+            receipts.reconcile_grants();
+        }
         refresh_generation.update(|generation| *generation = generation.wrapping_add(1));
     });
     let retry_refresh_error = Callback::new(move |_: leptos::ev::MouseEvent| {
         if retained_reinstalling.get_untracked().is_some() {
             return;
+        }
+        if let Some(receipts) = receipt_sync {
+            receipts.reconcile_grants();
         }
         refresh_generation.update(|generation| *generation = generation.wrapping_add(1));
     });

@@ -42,6 +42,16 @@ pub use arcadestr_core::purchase_contract::{
 pub use arcadestr_core::receipt_sync_contract::{
     ReceiptImportRequest, ReceiptSyncReport, ReceiptSyncRequest, ReceiptVerification,
 };
+pub use arcadestr_core::entitlement_sync_contract::{EntitlementSyncReport, EntitlementSyncRequest};
+pub async fn invoke_reconcile_known_entitlements(
+    request: EntitlementSyncRequest,
+) -> Result<EntitlementSyncReport, String> {
+    recovery_invoke(
+        "reconcile_known_entitlements",
+        serde_json::json!({"request":request}),
+    )
+    .await
+}
 use arcadestr_core::store_page::{StorePageDraft, StorePageValidationDiagnostic};
 use serde::{Deserialize, Serialize};
 pub async fn invoke_sync_purchase_receipts(

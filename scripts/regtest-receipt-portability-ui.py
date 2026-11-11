@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Isolated debug WASM / mock IPC. No relay, signer, wallet or publication.
-Usage: python3 -B scripts/regtest-receipt-portability-ui.py /tmp/opencode/receipt-frontend
+Usage: python3 -B scripts/regtest-receipt-portability-ui.py FRONTEND [OUTPUT_DIR]
 Requires Chromium and Python websockets.
 """
 import asyncio
@@ -17,7 +17,7 @@ import time
 import urllib.request
 import websockets
 
-OUT = Path('/tmp/opencode')
+OUT = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else Path('/tmp/opencode')
 
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
@@ -61,6 +61,7 @@ async def verify(port, debug):
         window.__TAURI__={core:{invoke:async(cmd,args)=>{
           window.calls.push({cmd,args});
           if(cmd==='sync_purchase_receipts')return structuredClone(window.report);
+          if(cmd==='reconcile_known_entitlements')return {checked:0,revoked:0,rejected_events:0,indeterminate:0,incomplete:true};
           if(cmd==='import_purchase_receipts'){
             if(window.delayImport)return await new Promise(resolve=>window.resolveOldImport=resolve);
             return structuredClone(window.report);
@@ -102,12 +103,13 @@ async def verify(port, debug):
             shot = await call('Page.captureScreenshot', dict(format='png', captureBeyondViewport=True))
             OUT.joinpath(f'receipt-portability-{name}.png').write_bytes(base64.b64decode(shot['data']))
         calls = await js('window.calls')
-        assert all(c['cmd'] in ['sync_purchase_receipts', 'import_purchase_receipts'] for c in calls)
+        assert all(c['cmd'] in ['sync_purchase_receipts', 'import_purchase_receipts', 'reconcile_known_entitlements'] for c in calls)
         OUT.joinpath('receipt-portability-ui.json').write_text(json.dumps(dict(result='PASS', mode='real WASM / mock IPC only', calls=calls, live_payments=0, receipt_publications=0), indent=2))
         print('PASS receipt statuses, bounded recovery disclosure, manual import, rescan, parent refresh, account fencing, desktop/mobile UI; mock IPC only')
 
 
 if __name__ == '__main__':
+    OUT.mkdir(parents=True, exist_ok=True)
     root = Path(sys.argv[1]).resolve()
     assert root.joinpath('index.html').is_file(), 'Build isolated debug WASM first'
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Quiet, directory=str(root)))

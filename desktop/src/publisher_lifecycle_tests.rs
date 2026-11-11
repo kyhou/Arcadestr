@@ -2,6 +2,7 @@
 mod isolated_lifecycle {
     use super::*;
     include!("gate7_claim_tests.rs");
+    include!("gate7_revocation_tests.rs");
     use arcadestr_core::{
         http_client::{HttpClientError, HttpDownloadOutcome},
         publisher_management::*,

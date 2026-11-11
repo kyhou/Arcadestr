@@ -496,6 +496,9 @@ pub fn PurchasesView() -> impl IntoView {
         }
     });
     let refresh_settlements = Callback::new(move |()| {
+        if let Some(receipts) = receipt_sync {
+            receipts.reconcile_grants();
+        }
         history_refresh.update(|generation| *generation = generation.wrapping_add(1));
     });
 

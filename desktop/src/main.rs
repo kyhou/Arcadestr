@@ -75,6 +75,7 @@ mod nip46_commands;
 mod publisher_commands;
 mod publisher_management;
 mod receipt_commands;
+mod entitlement_commands;
 mod settlement_ui;
 mod startup_runtime;
 mod store_page_commands;
@@ -8356,6 +8357,7 @@ fn main() {
             install_game,
             ingest_receipt,
             receipt_commands::sync_purchase_receipts,
+            entitlement_commands::reconcile_known_entitlements,
             receipt_commands::import_purchase_receipts,
             get_purchase_records,
             fetch_profile,
