@@ -1528,6 +1528,7 @@ pub struct SplitRefundInvoiceResponse {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ClaimEntitlementRequest {
+    pub expected_account_pubkey: String,
     pub publisher_npub: String,
     pub listing_id: String,
     pub campaign_event_id: String,

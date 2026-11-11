@@ -1,6 +1,7 @@
 // Included only inside adp_commands::tests. No real relays, operators or wallets.
 mod isolated_lifecycle {
     use super::*;
+    include!("gate7_claim_tests.rs");
     use arcadestr_core::{
         http_client::{HttpClientError, HttpDownloadOutcome},
         publisher_management::*,
@@ -933,6 +934,7 @@ mod isolated_lifecycle {
         .await;
         let claimed = claim_entitlement(
             ClaimEntitlementRequest {
+                expected_account_pubkey: buyer.to_hex(),
                 publisher_npub: publisher.clone(),
                 listing_id: d.clone(),
                 server_url: one.url.clone(),

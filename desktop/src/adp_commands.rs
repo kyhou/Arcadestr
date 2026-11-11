@@ -960,6 +960,7 @@ pub struct ConfirmSplitRefundRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaimEntitlementRequest {
+    pub expected_account_pubkey: String,
     pub publisher_npub: String,
     pub listing_id: String,
     pub campaign_event_id: String,
@@ -2961,42 +2962,91 @@ pub async fn confirm_split_refund(
     Ok(response)
 }
 
+/// Claim signing is session-bound, but never uses publisher signing checkpoints.
+struct ClaimSigner<'a> {
+    signer: &'a dyn NostrSigner,
+    session: arcadestr_core::settlement_recovery::SessionFence,
+}
+
+#[async_trait::async_trait]
+impl NostrSigner for ClaimSigner<'_> {
+    async fn get_public_key(&self) -> Result<nostr::PublicKey, SignerError> {
+        self.session
+            .ensure_current()
+            .map_err(SignerError::SigningFailed)?;
+        let result = self.signer.get_public_key().await;
+        self.session
+            .ensure_current()
+            .map_err(SignerError::SigningFailed)?;
+        result
+    }
+
+    async fn sign_event(
+        &self,
+        unsigned: nostr::UnsignedEvent,
+    ) -> Result<nostr::Event, SignerError> {
+        self.session
+            .ensure_current()
+            .map_err(SignerError::SigningFailed)?;
+        let result = self.signer.sign_event(unsigned).await;
+        self.session
+            .ensure_current()
+            .map_err(SignerError::SigningFailed)?;
+        result
+    }
+}
+
 #[tauri::command]
 pub async fn claim_entitlement(
     request: ClaimEntitlementRequest,
     state: State<'_, AppState>,
 ) -> Result<ClaimEntitlementResponse, String> {
-    let auth_snapshot = { state.auth.lock().await.clone() };
-    let signer = auth_snapshot
-        .signer()
-        .ok_or_else(|| "not authenticated".to_string())?;
+    // Capture the epoch before any signer/relay await, including A -> B -> A.
+    let (auth_snapshot, session) = {
+        let auth = state.auth.lock().await;
+        let account = auth.public_key().ok_or("not authenticated")?;
+        let expected = nostr::PublicKey::from_hex(&request.expected_account_pubkey)
+            .map_err(|_| "invalid claim account".to_string())?;
+        if account != expected {
+            return Err("active claim account changed".into());
+        }
+        state.settlement_recovery.observe(Some(account.to_hex()));
+        (auth.clone(), state.settlement_recovery.session_fence()?)
+    };
+    let signer = ClaimSigner {
+        signer: auth_snapshot.signer().ok_or("not authenticated")?,
+        session: session.clone(),
+    };
     let buyer = signer
         .get_public_key()
         .await
         .map_err(|error| error.to_string())?;
+    if auth_snapshot.public_key() != Some(buyer) {
+        return Err("claim signer does not match the initiating account".into());
+    }
     let game_coordinate =
         listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
     let campaign_root_id = nostr::EventId::from_hex(&request.campaign_event_id)
         .map_err(|_| "invalid campaign event id".to_string())?;
     let listing = fetch_listing_event_by_coordinate(&state, &game_coordinate).await?;
+    session.ensure_current()?;
     let publisher = listing.pubkey;
     let pointer = arcadestr_core::marketplace::CampaignPointer {
         root_event_id: campaign_root_id,
         relay_hint: None,
     };
     let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
-    let relay_manager_guard = relay_manager.lock().await;
-    let report =
-        arcadestr_core::campaign_discovery::CampaignDiscoveryService::new(&relay_manager_guard)
-            .discover(
-                &[pointer],
-                publisher,
-                &game_coordinate,
-                now_unix_i64()? as u64,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-    drop(relay_manager_guard);
+    let relay_manager = { relay_manager.lock().await.clone() };
+    let report = arcadestr_core::campaign_discovery::CampaignDiscoveryService::new(&relay_manager)
+        .discover(
+            &[pointer],
+            publisher,
+            &game_coordinate,
+            now_unix_i64()? as u64,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    session.ensure_current()?;
     let campaign = report
         .campaigns
         .into_iter()
@@ -3007,7 +3057,7 @@ pub async fn claim_entitlement(
     let client = AdpClient::new(request.server_url.clone(), Arc::clone(&state.http_client));
     let response = client
         .entitlement_claim(
-            signer,
+            &signer,
             CoreEntitlementClaimRequest {
                 game_coordinate: game_coordinate.clone(),
                 campaign_event_id: request.campaign_event_id,
@@ -3015,6 +3065,7 @@ pub async fn claim_entitlement(
         )
         .await
         .map_err(|error| error.to_string())?;
+    session.ensure_current()?;
 
     let parsed = arcadestr_core::entitlements::parse_entitlement_event(&response.grant)
         .map_err(|error| format!("invalid grant response: {error}"))?;
@@ -3030,10 +3081,9 @@ pub async fn claim_entitlement(
     let grant = arcadestr_core::entitlements::resolve_entitlement_grant(&[parsed.clone()])
         .map_err(|error| format!("invalid grant response: {error}"))?;
     let authorization = if let Some(root_event_id) = parsed.authorization {
-        let relay_manager_guard = relay_manager.lock().await;
         Some(
             arcadestr_core::authorization::discover_authorization(
-                &relay_manager_guard,
+                &relay_manager,
                 root_event_id,
                 publisher,
             )
@@ -3052,6 +3102,7 @@ pub async fn claim_entitlement(
     )
     .map_err(|error| format!("invalid grant response: {error}"))?;
     let buyer_hex = buyer.to_hex();
+    session.ensure_current()?;
     if state
         .auth
         .lock()
@@ -3063,6 +3114,7 @@ pub async fn claim_entitlement(
     {
         return Err("active account changed while grant authorization was being verified".into());
     }
+    session.ensure_current()?;
 
     let entitlements = arcadestr_core::entitlements_repository::EntitlementsRepository::new(
         state.database.pool().clone(),
@@ -3071,6 +3123,7 @@ pub async fn claim_entitlement(
         .ingest_event(&response.grant, &campaign, authorization.as_ref())
         .await
         .map_err(|error| error.to_string())?;
+    session.ensure_current()?;
     DownloadTokensRepository::new(state.database.pool().clone())
         .upsert(&DownloadToken {
             buyer_pubkey: buyer_hex,
@@ -3081,6 +3134,7 @@ pub async fn claim_entitlement(
         })
         .await
         .map_err(|error| error.to_string())?;
+    session.ensure_current()?;
 
     Ok(ClaimEntitlementResponse {
         grant: response.grant,

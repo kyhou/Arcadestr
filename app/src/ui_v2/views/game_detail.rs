@@ -908,6 +908,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let retained_state_loading: RwSignal<bool> = RwSignal::new(!cfg!(feature = "web"));
     let retained_state_error = RwSignal::new(false);
     let operation = RwSignal::new(DetailOperation::Idle);
+    let pending_claim: RwSignal<Option<DiscoveredCampaign>> = RwSignal::new(None);
     let checkout_account = RwSignal::new(auth.npub.get_untracked());
     let checkout_flow = RwSignal::new(auth.current_auth_flow());
     let checkout_auth = auth.clone();
@@ -923,11 +924,13 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             split_plan.set(None);
             buy_error.set(None);
             success_message.set(None);
+            pending_claim.set(None);
             if matches!(
                 operation.get_untracked(),
                 DetailOperation::RequestingInvoice
                     | DetailOperation::PayingWallet
                     | DetailOperation::ConfirmingPurchase
+                    | DetailOperation::Claiming
             ) {
                 operation.set(DetailOperation::Idle);
             }
@@ -940,7 +943,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let campaign_loading: RwSignal<bool> = RwSignal::new(true);
     let campaign_error: RwSignal<Option<String>> = RwSignal::new(None);
     let campaign_refresh = RwSignal::new(0_u64);
-    let pending_claim: RwSignal<Option<DiscoveredCampaign>> = RwSignal::new(None);
     let platform_info: RwSignal<Option<PlatformInfo>> = RwSignal::new(None);
     let platform_loading = RwSignal::new(!cfg!(feature = "web"));
     let platform_error = RwSignal::new(false);
@@ -1908,6 +1910,13 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             buy_error.set(Some("Not authenticated".to_string()));
             return;
         };
+        let Some(expected_account_pubkey) =
+            crate::ui_v2::components::blossom_media_upload::publisher_hex(&initiating_account)
+        else {
+            buy_error.set(Some("Invalid claim account".into()));
+            return;
+        };
+        let auth_epoch = claim_auth.current_auth_flow();
         let Some(server_url) = adp_server_url(&claim_listing.specs, &claim_listing.download_url)
         else {
             buy_error.set(Some(
@@ -1920,6 +1929,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         success_message.set(None);
         pending_claim.set(None);
         let request = ClaimEntitlementRequest {
+            expected_account_pubkey,
             publisher_npub: claim_listing.publisher_npub.clone(),
             listing_id: claim_listing.id.clone(),
             campaign_event_id: campaign.root_event_id,
@@ -1927,11 +1937,21 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         };
         let auth_for_response = claim_auth.clone();
         spawn_local(async move {
-            let result = invoke_claim_entitlement(request).await;
-            if auth_for_response.npub.get_untracked().as_deref()
-                != Some(initiating_account.as_str())
+            if !auth_for_response.is_current_auth_flow(auth_epoch)
+                || !account_response_is_current(
+                    auth_for_response.npub.get_untracked().as_deref(),
+                    &initiating_account,
+                )
             {
-                operation.set(DetailOperation::Idle);
+                return;
+            }
+            let result = invoke_claim_entitlement(request).await;
+            if !auth_for_response.is_current_auth_flow(auth_epoch)
+                || !account_response_is_current(
+                    auth_for_response.npub.get_untracked().as_deref(),
+                    &initiating_account,
+                )
+            {
                 return;
             }
             match result {
@@ -2555,6 +2575,70 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 })}
             </Dialog>
         </section>
+    }
+}
+
+/// Isolated real-component fixture. Production builds contain no synthetic account controls.
+#[cfg(all(debug_assertions, not(feature = "web")))]
+#[component]
+pub fn ClaimSessionPreview() -> impl IntoView {
+    use nostr::nips::nip19::ToBech32;
+    let auth = AuthContext::new();
+    let alice = nostr::PublicKey::from_hex(
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    )
+    .expect("synthetic public key")
+    .to_bech32()
+    .expect("synthetic npub");
+    let bob = nostr::PublicKey::from_hex(
+        "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+    )
+    .expect("synthetic public key")
+    .to_bech32()
+    .expect("synthetic npub");
+    auth.npub.set(Some(alice.clone()));
+    provide_context(auth.clone());
+    provide_context(crate::ui_v2::nwc_wallet::NwcWalletContext::new());
+    let listing = GameListing {
+        id: "claim-session".into(),
+        source: ListingSource::Nip99Listing,
+        title: "Isolated claim session fixture".into(),
+        description: "Mock IPC only".into(),
+        images: vec![],
+        download_url: String::new(),
+        price: 1.0,
+        currency: "SATS".into(),
+        price_sats: 1,
+        quantity: None,
+        tags: vec![],
+        specs: vec![("server".into(), "https://claim.example.test".into())],
+        publisher_npub: alice.clone(),
+        stall_id: String::new(),
+        stall_name: None,
+        lud16: "fixture@example.test".into(),
+        event_id: Some("11".repeat(32)),
+        created_at: 100,
+        platforms: vec!["linux-x86_64".into()],
+        nip94_event_id: None,
+        acquisition: AcquisitionPolicy::Gated,
+        campaigns: vec![],
+        is_owned: false,
+        nip99_raw_event_json: None,
+    };
+    let reset_auth = auth.clone();
+    let switch_auth = auth.clone();
+    let logout_auth = auth.clone();
+    let reconnect_auth = auth.clone();
+    view! {
+        <main style="max-width:1440px;margin:0 auto;background:#0b0b0d;color:#fff;font-family:ui-monospace,monospace">
+            <div style="display:flex;gap:12px;padding:16px;flex-wrap:wrap">
+                <button data-testid="claim-switch" style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" on:click=move |_| {switch_auth.begin_auth_flow();switch_auth.npub.set(Some(bob.clone()));}>"SWITCH ACCOUNT"</button>
+                <button data-testid="claim-return" style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" on:click=move |_| {reset_auth.begin_auth_flow();reset_auth.npub.set(Some(alice.clone()));}>"RETURN TO BUYER"</button>
+                <button data-testid="claim-logout" style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" on:click=move |_| {logout_auth.begin_auth_flow();logout_auth.npub.set(None);}>"LOG OUT"</button>
+                <button data-testid="claim-reconnect" style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" on:click=move |_| {reconnect_auth.begin_auth_flow();}>"REPLACE SESSION"</button>
+            </div>
+            <GameDetailView listing=listing on_back=Callback::new(|()| {})/>
+        </main>
     }
 }
 

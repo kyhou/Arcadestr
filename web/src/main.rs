@@ -8,6 +8,14 @@ fn main() {
     #[cfg(all(debug_assertions, not(feature = "web")))]
     if web_sys::window()
         .and_then(|window| window.location().search().ok())
+        .is_some_and(|query| query == "?claim-session-preview=1")
+    {
+        mount_to_body(|| view! {<arcadestr_app::ui_v2::views::game_detail::ClaimSessionPreview/>});
+        return;
+    }
+    #[cfg(all(debug_assertions, not(feature = "web")))]
+    if web_sys::window()
+        .and_then(|window| window.location().search().ok())
         .is_some_and(|query| query == "?publisher-console-preview=1")
     {
         mount_to_body(|| view! {<arcadestr_app::ui_v2::views::publish::PublisherConsolePreview/>});
