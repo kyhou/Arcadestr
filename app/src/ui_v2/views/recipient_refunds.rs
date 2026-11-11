@@ -145,8 +145,19 @@ pub fn RecipientRefunds() -> impl IntoView {
     let rows = RwSignal::new(Vec::<RefundHistoryItem>::new());
     let generation = RwSignal::new(0u64);
     let busy = RwSignal::new(false);
-    let message=RwSignal::new("Choose a processor to load obligations owed by the active identity. Loading never sends a payment.".to_owned());
-    let recovery_events = RwSignal::new("connecting");
+    let message = RwSignal::new(
+        if cfg!(feature = "web") {
+            "Recipient refund discovery, recovery and payment require the desktop application."
+        } else {
+            "Choose a processor to load obligations owed by the active identity. Loading never sends a payment."
+        }
+        .to_owned(),
+    );
+    let recovery_events = RwSignal::new(if cfg!(feature = "web") {
+        "unavailable"
+    } else {
+        "connecting"
+    });
     let auth_effect = auth.clone();
     Effect::new(move || {
         let _ = auth_effect.npub.get();
@@ -160,6 +171,9 @@ pub fn RecipientRefunds() -> impl IntoView {
     let load = {
         let auth = auth.clone();
         Callback::new(move |()| {
+            if cfg!(feature = "web") {
+                return;
+            }
             let Some(account) = auth.npub.get_untracked() else {
                 message.set("Connect the obligated recipient account first.".into());
                 return;
@@ -196,7 +210,7 @@ pub fn RecipientRefunds() -> impl IntoView {
             });
         })
     };
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", not(feature = "web")))]
     {
         use std::{
             cell::{Cell, RefCell},
@@ -250,7 +264,7 @@ pub fn RecipientRefunds() -> impl IntoView {
     view! {
         <section data-recovery-events=move||recovery_events.get() style="display:grid;gap:16px;margin:28px 0;max-width:1440px;font-family:ui-monospace,monospace">
             <div style="display:flex;gap:10px;align-items:center"><span style="font:800 12px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">"◆ RECIPIENT REFUNDS"</span><span style="flex:1;height:1px;background:repeating-linear-gradient(90deg,oklch(0.4 0.03 60 / .6) 0 4px,transparent 4px 8px)"></span></div>
-            <div style="display:flex;gap:12px;flex-wrap:wrap"><input data-testid="refund-processor" aria-label="Original refund processor URL" placeholder="https://your-processor.example" prop:value=move||server.get() on:input:target=move|event|server.set(event.target().value()) style="flex:1;min-width:200px;padding:10px 12px;background:#141417;color:#fff;border:1px solid oklch(0.32 0.01 60);font:600 12px ui-monospace,monospace;border-radius:4px" /><button data-testid="load-refunds" style=BUTTON disabled=move||busy.get() on:click=move |_|load.run(())>"LOAD OBLIGATIONS — NO PAYMENT"</button></div>
+            <div style="display:flex;gap:12px;flex-wrap:wrap"><input data-testid="refund-processor" aria-label="Original refund processor URL" placeholder="https://your-processor.example" disabled=cfg!(feature="web") prop:value=move||server.get() on:input:target=move|event|server.set(event.target().value()) style="flex:1;min-width:200px;padding:10px 12px;background:#141417;color:#fff;border:1px solid oklch(0.32 0.01 60);font:600 12px ui-monospace,monospace;border-radius:4px" /><button data-testid="load-refunds" style=BUTTON disabled=move||cfg!(feature="web")||busy.get() on:click=move |_|load.run(())>"LOAD OBLIGATIONS — NO PAYMENT"</button></div>
             <p role="status" style=TEXT>{move||message.get()}</p>
             {move||rows.get().into_iter().map(|row|view!{<RefundCard row=row server=loaded_server.get_untracked() account=auth.npub.get_untracked().unwrap_or_default() generation=generation on_changed=load />}).collect_view()}
         </section>

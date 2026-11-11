@@ -95,6 +95,9 @@ impl ReceiptSyncContext {
         });
     }
     pub fn import(self, json: String) {
+        if cfg!(feature = "web") {
+            return;
+        }
         let Some(account) = self.account.get_untracked() else {
             return;
         };
@@ -264,21 +267,21 @@ pub fn ReceiptPortabilityPanel() -> impl IntoView {
             <h2 style="font:800 12px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">"◆ PORTABLE PURCHASE RECEIPTS"</h2>
             <p>"Recover purchases for this Nostr identity through configured relays or import signed receipt events. Relay availability and retention limit discovery: automatic synchronization does not guarantee recovery of every historical receipt. Manual import is an independent recovery mechanism."</p>
             <p>"This is read-only. It never pays or publishes receipts. Encrypted receipt content stays encrypted. Private NIP-59-wrapped receipts are not discovered by public p-tag queries."</p>
-            <p role="status" data-testid="receipt-sync-status">{move||match receipts {Some(c) if c.busy.get()=>"Synchronizing / verifying receipt evidence…".to_string(),Some(c) if c.account.get().is_none()=>"Connect the original buyer account.".into(),Some(c)=>c.report.get().map(|r|r.message).unwrap_or_else(||"No synchronization result yet. Existing local purchases are preserved.".into()),None=>"Receipt synchronization requires the desktop application.".into()}}</p>
+            <p role="status" data-testid="receipt-sync-status">{move||match receipts {_ if cfg!(feature="web")=>"Receipt import, synchronization and grant reconciliation require the desktop application.".into(),Some(c) if c.busy.get()=>"Synchronizing / verifying receipt evidence…".to_string(),Some(c) if c.account.get().is_none()=>"Connect the original buyer account.".into(),Some(c)=>c.report.get().map(|r|r.message).unwrap_or_else(||"No synchronization result yet. Existing local purchases are preserved.".into()),None=>"Receipt synchronization requires the desktop application.".into()}}</p>
             {move||receipts.and_then(|c|c.error.get()).map(|e|view!{<p role="alert" style="color:oklch(0.65 0.18 25)">{e}</p>})}
             {move||receipts.and_then(|c|c.report.get()).map(|r|view!{
                 <p data-testid="receipt-sync-summary">{format!("VERIFIED: {} · INDETERMINATE: {} · INVALID chains: {} · rejected events: {} · unavailable relay requests: {} · discovery incomplete: {}",r.chains.iter().filter(|c|c.verification==ReceiptVerification::Verified).count(),r.chains.iter().filter(|c|c.verification==ReceiptVerification::Indeterminate).count(),r.chains.iter().filter(|c|c.verification==ReceiptVerification::Invalid).count(),r.rejected_events,r.relay_failures,r.incomplete)}</p>
                 {r.chains.into_iter().filter(|c|c.verification!=ReceiptVerification::Verified).take(20).map(|c|view!{<p>{format!("{} · {:?}: {}",c.order_id,c.verification,c.reason)}</p>}).collect_view()}
             })}
             <div style="display:flex;gap:10px;flex-wrap:wrap">
-                <button type="button" style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" disabled=move||receipts.is_none_or(|c|c.busy.get()||c.account.get().is_none()) on:click=move |_|{if let Some(c)=receipts {c.synchronize(false);}}>"SYNC RECEIPTS"</button>
-                <button type="button" style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" disabled=move||receipts.is_none_or(|c|c.busy.get()||c.account.get().is_none()) on:click=move |_|{if let Some(c)=receipts {c.synchronize(true);}}>"RESCAN AVAILABLE HISTORY"</button>
+                <button type="button" style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" disabled=move||cfg!(feature="web")||receipts.is_none_or(|c|c.busy.get()||c.account.get().is_none()) on:click=move |_|{if let Some(c)=receipts {c.synchronize(false);}}>"SYNC RECEIPTS"</button>
+                <button type="button" style="padding:9px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace;border-radius:4px" disabled=move||cfg!(feature="web")||receipts.is_none_or(|c|c.busy.get()||c.account.get().is_none()) on:click=move |_|{if let Some(c)=receipts {c.synchronize(true);}}>"RESCAN AVAILABLE HISTORY"</button>
             </div>
             <label style="display:grid;gap:8px;margin-top:16px">"SIGNED NOSTR EVENT OR JSON ARRAY — MAXIMUM 4 MIB / 2048 EVENTS"
-                <textarea data-testid="receipt-import-input" rows="5" maxlength="4194304" prop:value=move||input.get() on:input=move|e|input.set(event_target_value(&e)) style="box-sizing:border-box;width:100%;min-width:0;padding:12px;background:#141417;border:1px solid oklch(0.32 0.01 60);color:#fff;font:400 12px ui-monospace,monospace;border-radius:4px"/>
+                <textarea data-testid="receipt-import-input" rows="5" maxlength="4194304" disabled=cfg!(feature="web") prop:value=move||input.get() on:input=move|e|input.set(event_target_value(&e)) style="box-sizing:border-box;width:100%;min-width:0;padding:12px;background:#141417;border:1px solid oklch(0.32 0.01 60);color:#fff;font:400 12px ui-monospace,monospace;border-radius:4px"/>
             </label>
             <p>"Import works offline. Include predecessor receipts and required signed authorization events when available. Missing evidence is INDETERMINATE, not ownership; use Sync to retry missing relay or public LSP evidence. VERIFIED chains grant access only when their resolved status permits it."</p>
-            <button data-testid="receipt-import-submit" type="button" style="padding:11px 20px;border:0;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 13px ui-monospace,monospace;border-radius:5px" disabled=move||input.get().trim().is_empty()||receipts.is_none_or(|c|c.busy.get()||c.account.get().is_none()) on:click=move |_|{if let Some(c)=receipts {let json=input.get_untracked();input.set(String::new());c.import(json);}}>"VERIFY AND IMPORT"</button>
+            <button data-testid="receipt-import-submit" type="button" style="padding:11px 20px;border:0;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 13px ui-monospace,monospace;border-radius:5px" disabled=move||cfg!(feature="web")||input.get().trim().is_empty()||receipts.is_none_or(|c|c.busy.get()||c.account.get().is_none()) on:click=move |_|{if let Some(c)=receipts {let json=input.get_untracked();input.set(String::new());c.import(json);}}>"VERIFY AND IMPORT"</button>
         </section>
     }
 }

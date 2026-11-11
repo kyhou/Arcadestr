@@ -5400,7 +5400,11 @@ fn DebugOverlay() -> impl IntoView {
     let version_info = RwSignal::new(None::<VersionInfo>);
     let error_msg = RwSignal::new(None::<String>);
     let signer_probe_busy = RwSignal::new(false);
-    let signer_probe_result = RwSignal::new(None::<String>);
+    let signer_probe_result = RwSignal::new(if cfg!(feature = "web") {
+        Some("The NIP-44 regtest signer probe is available only in the desktop app.".to_string())
+    } else {
+        None
+    });
     let on_signer_probe = move |_| {
         if signer_probe_busy.get_untracked() {
             return;
@@ -5408,11 +5412,15 @@ fn DebugOverlay() -> impl IntoView {
         signer_probe_busy.set(true);
         signer_probe_result.set(None);
         spawn_local(async move {
+            #[cfg(not(feature = "web"))]
             let result = crate::tauri_invoke::invoke::<String>(
                 "regtest_nip44_probe",
                 serde_json::json!(null),
             )
             .await;
+            #[cfg(feature = "web")]
+            let result: Result<String, String> =
+                Err("The NIP-44 regtest signer probe is available only in the desktop app.".into());
             signer_probe_result.set(Some(match result {
                 Ok(message) => message,
                 Err(error) => format!("{error:?}"),
@@ -5483,7 +5491,7 @@ fn DebugOverlay() -> impl IntoView {
                         <p style="color: #888;">Press Ctrl+Shift+I for DevTools</p>
                         <button data-testid="regtest-nip44-probe"
                             style="margin-top:10px;padding:8px 10px;background:transparent;border:1px solid oklch(0.5 0.13 210);color:oklch(0.8 0.14 195);font:800 11px ui-monospace,monospace;border-radius:4px;cursor:pointer"
-                            disabled=move || signer_probe_busy.get() on:click=on_signer_probe>
+                            disabled=move || cfg!(feature = "web") || signer_probe_busy.get() on:click=on_signer_probe>
                             {move || if signer_probe_busy.get() { "WAITING FOR SIGNER" } else { "REGTEST NIP-44 CHECK — NO PAYMENT" }}
                         </button>
                         <p data-testid="regtest-nip44-result" aria-live="polite"
