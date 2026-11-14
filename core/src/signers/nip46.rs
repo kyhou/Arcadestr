@@ -503,7 +503,6 @@ impl Nip07Signer {
 
     /// Checks if window.nostr is available.
     fn is_available() -> bool {
-        use wasm_bindgen::JsCast;
         use web_sys::window;
 
         if let Some(win) = window() {
@@ -541,9 +540,14 @@ impl NostrSigner for Nip07Signer {
         let get_public_key = js_sys::Reflect::get(&nostr, &"getPublicKey".into())
             .map_err(|_| SignerError::NotConnected)?;
 
-        let promise: js_sys::Promise = get_public_key
+        let get_public_key: js_sys::Function = get_public_key
             .dyn_into()
             .map_err(|_| SignerError::JsError("getPublicKey is not a function".into()))?;
+        let promise = get_public_key
+            .call0(&nostr)
+            .map_err(|error| SignerError::JsError(format!("{error:?}")))?
+            .dyn_into::<js_sys::Promise>()
+            .map_err(|_| SignerError::JsError("getPublicKey did not return a Promise".into()))?;
 
         let result = JsFuture::from(promise)
             .await
@@ -579,9 +583,14 @@ impl NostrSigner for Nip07Signer {
         let event_js = js_sys::JSON::parse(&event_json)
             .map_err(|e| SignerError::JsError(format!("Failed to parse event JSON: {:?}", e)))?;
 
-        let promise: js_sys::Promise = sign_event
+        let sign_event: js_sys::Function = sign_event
             .dyn_into()
             .map_err(|_| SignerError::JsError("signEvent is not a function".into()))?;
+        let promise = sign_event
+            .call1(&nostr, &event_js)
+            .map_err(|error| SignerError::JsError(format!("{error:?}")))?
+            .dyn_into::<js_sys::Promise>()
+            .map_err(|_| SignerError::JsError("signEvent did not return a Promise".into()))?;
 
         let result = JsFuture::from(promise)
             .await
