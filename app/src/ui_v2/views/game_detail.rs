@@ -249,6 +249,9 @@ enum LocalGameState {
 enum DetailCompatibility {
     Compatible,
     Incompatible,
+    /// The listing carries no `platform` tag. Core refuses to resolve an
+    /// install plan for it, so no amount of platform detection can help.
+    NoPlatformDeclared,
     Unknown,
 }
 
@@ -386,6 +389,14 @@ fn select_primary_action(
             action: PrimaryAction::Incompatible,
             label: "Not compatible",
             explanation: "This build does not support the detected platform.",
+            enabled: false,
+        };
+    }
+    if compatibility == DetailCompatibility::NoPlatformDeclared {
+        return PrimaryActionDecision {
+            action: PrimaryAction::Incompatible,
+            label: "Not installable",
+            explanation: "The publisher has not declared a platform for this build, so it cannot be installed.",
             enabled: false,
         };
     }
@@ -650,7 +661,7 @@ fn listing_compatibility(
     platform: Option<&PlatformInfo>,
 ) -> DetailCompatibility {
     if listing.platforms.is_empty() {
-        DetailCompatibility::Unknown
+        DetailCompatibility::NoPlatformDeclared
     } else if let Some(platform) = platform {
         let host = arcadestr_core::distribution::PlatformTarget {
             os: arcadestr_core::distribution::normalize_os(&platform.os)
@@ -2165,7 +2176,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                         <p id="detail-compatibility-title" class="v2-store-kicker">"Compatibility"</p>
                         <div class="v2-detail-compatibility">
                             {if listing_platforms.is_empty() {
-                                view! { <span class="v2-chip">"No platform restriction declared"</span> }.into_any()
+                                view! { <span class="v2-chip">"No platform declared"</span> }.into_any()
                             } else {
                                 listing_platforms.iter().map(|platform| view! { <span class="v2-chip">{platform.clone()}</span> }).collect_view().into_any()
                             }}
@@ -2173,6 +2184,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                 {move || match listing_compatibility(&listing_for_compatibility, platform_info.get().as_ref()) {
                                     DetailCompatibility::Compatible => "Compatible with this device",
                                     DetailCompatibility::Incompatible => "Not available for this device",
+                                    DetailCompatibility::NoPlatformDeclared => "Not installable on any device",
                                     DetailCompatibility::Unknown if platform_error.get() => "Device compatibility unavailable",
                                     DetailCompatibility::Unknown => "Checking this device",
                                 }}
@@ -2741,7 +2753,11 @@ mod tests {
         };
         assert_eq!(
             listing_compatibility(&value, Some(&windows)),
-            DetailCompatibility::Unknown
+            DetailCompatibility::NoPlatformDeclared
+        );
+        assert_eq!(
+            listing_compatibility(&value, None),
+            DetailCompatibility::NoPlatformDeclared
         );
         value.platforms = vec!["WIN64-X64".to_string()];
         assert_eq!(
@@ -2962,6 +2978,25 @@ mod tests {
         assert_eq!(action_at(100), PrimaryAction::Download);
         assert_eq!(action_at(199), PrimaryAction::Download);
         assert_eq!(action_at(200), PrimaryAction::TimedExpired);
+    }
+
+    #[test]
+    fn owned_listing_without_platform_tag_is_not_installable_rather_than_pending() {
+        let listing = listing(AcquisitionPolicy::Gated);
+        let result = decision(
+            &listing,
+            true,
+            false,
+            &[],
+            false,
+            DetailCompatibility::NoPlatformDeclared,
+            DetailOperation::Idle,
+            false,
+            100,
+        );
+        assert_eq!(result.label, "Not installable");
+        assert!(!result.enabled);
+        assert!(!result.explanation.contains("detection"));
     }
 
     #[test]

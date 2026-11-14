@@ -270,6 +270,8 @@ impl LibraryFilter {
 enum LibraryCompatibility {
     Compatible,
     Incompatible,
+    /// The listing carries no `platform` tag, so core cannot plan an install.
+    NoPlatformDeclared,
     Unknown,
 }
 
@@ -448,7 +450,7 @@ fn listing_compatibility(
         return LibraryCompatibility::Unknown;
     };
     if listing.platforms.is_empty() {
-        return LibraryCompatibility::Unknown;
+        return LibraryCompatibility::NoPlatformDeclared;
     }
     match platform {
         Some(platform) => {
@@ -546,7 +548,10 @@ fn installed_entry_matches_filter(
             .is_some_and(|listing| matches!(listing.acquisition, AcquisitionPolicy::TimedAccess { .. })),
         LibraryFilter::NeedsAttention => {
             entry.malformed_coordinate
-                || compatibility == LibraryCompatibility::Incompatible
+                || matches!(
+                    compatibility,
+                    LibraryCompatibility::Incompatible | LibraryCompatibility::NoPlatformDeclared
+                )
                 || ownership_failed
                 || entry.listing.as_ref().is_some_and(|listing| {
                     matches!(listing.acquisition, AcquisitionPolicy::TimedAccess { ends_at, .. } if now >= ends_at)
@@ -596,8 +601,10 @@ fn saved_entry_matches_filter(
             matches!(listing.acquisition, AcquisitionPolicy::TimedAccess { .. })
         }),
         LibraryFilter::NeedsAttention => {
-            compatibility == LibraryCompatibility::Incompatible
-                || listing.is_some_and(|listing| {
+            matches!(
+                compatibility,
+                LibraryCompatibility::Incompatible | LibraryCompatibility::NoPlatformDeclared
+            ) || listing.is_some_and(|listing| {
                     matches!(listing.acquisition, AcquisitionPolicy::TimedAccess { ends_at, .. } if now >= ends_at)
                 })
         }
@@ -630,6 +637,7 @@ fn compatibility_chip(compatibility: LibraryCompatibility) -> (&'static str, Sta
     match compatibility {
         LibraryCompatibility::Compatible => ("Compatible", StatusChipVariant::Success),
         LibraryCompatibility::Incompatible => ("Unsupported", StatusChipVariant::Error),
+        LibraryCompatibility::NoPlatformDeclared => ("Not installable", StatusChipVariant::Error),
         LibraryCompatibility::Unknown => ("Compatibility unknown", StatusChipVariant::Neutral),
     }
 }
@@ -2112,6 +2120,10 @@ mod tests {
                     arch: "x86_64".into(),
                 })
             ),
+            LibraryCompatibility::NoPlatformDeclared
+        );
+        assert_eq!(
+            listing_compatibility(None, None),
             LibraryCompatibility::Unknown
         );
         value.platforms = vec!["linux-x86_64".to_string()];
