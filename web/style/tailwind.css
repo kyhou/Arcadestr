@@ -23,6 +23,9 @@
     --noir-primary-dim: 0.7 0.15 60;
     --noir-secondary: 0.8 0.14 195;
     --noir-secondary-dim: 0.6 0.13 195;
+    /* Tertiary/info is the handoff VIOLET (Arcadestr.dc.html): timed access,
+       pending, draft and attention states. Blue (0.78 0.13 210) is a
+       separate accent used only for tag chips and details actions. */
     --noir-tertiary: 0.68 0.15 300;
     --noir-tertiary-dim: 0.6 0.13 300;
     --noir-muted: 0.3 0.01 60;
@@ -202,6 +205,9 @@
   h3,
   .font-display {
     font-family: var(--noir-font-display);
+    /* Preflight resets headings to weight 400; every Signal Terminal heading
+       is 800. Component rules still override this base default. */
+    font-weight: var(--arc-weight-black);
     letter-spacing: normal;
   }
 

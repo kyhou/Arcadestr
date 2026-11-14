@@ -480,7 +480,11 @@ fn settlement_history_view(
 }
 
 #[component]
-pub fn PurchasesView() -> impl IntoView {
+pub fn PurchasesView(
+    /// Empty-state route back to discovery; omitted when not navigable.
+    #[prop(optional)]
+    on_browse_store: Option<Callback<()>>,
+) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let state = RwSignal::new(PurchasesState::Loading);
     let settlement_state = RwSignal::new(SettlementHistoryState::Loading);
@@ -561,21 +565,17 @@ pub fn PurchasesView() -> impl IntoView {
     }
 
     view! {
-        <section class="v2-purchases">
-            <header class="v2-purchases-hero v2-panel-glass">
+        <section class="v2-purchases" style="min-width:0;grid-template-columns:minmax(0,1fr)">
+            <header class="v2-purchases-hero">
                 <p class="v2-store-kicker">"Account records"</p>
                 <h1 class="v2-display">"Purchases and access"</h1>
-                <p>"Durable acquisitions, resumable split payments, and account-scoped recovery records."</p>
+                <p>"View your purchases and claimed games, check payments, or continue an unfinished purchase."</p>
             </header>
-            <crate::ui_v2::receipt_sync::ReceiptPortabilityPanel/>
-
             {move || settlement_history_view(
                 settlement_state.get(),
                 auth.npub.get().unwrap_or_default(),
                 refresh_settlements,
             )}
-            <super::recipient_refunds::RecipientRefunds />
-
             {move || match state.get() {
                 PurchasesState::Loading => view! {
                     <LoadingState
@@ -586,16 +586,25 @@ pub fn PurchasesView() -> impl IntoView {
                 PurchasesState::AccountRequired => purchase_state_view(
                     "person",
                     "Account required",
-                    "Connect an account to view its durable purchases and promotion claims.",
-                    false,
+                    "Sign in to view your purchases and games claimed through promotions.",
                 ),
-                PurchasesState::Empty => view! {
-                    <EmptyState
-                        title="No durable records yet"
-                        description="Paid purchases and claimed keep-forever promotions will appear here."
-                        icon="receipt_long"
-                    />
-                }.into_any(),
+                PurchasesState::Empty => match on_browse_store {
+                    Some(browse) => view! {
+                        <EmptyState
+                            title="No purchases or claims yet"
+                            description="Paid purchases and claimed keep-forever promotions will appear here. Buy or claim a game in the store to start your history."
+                            icon="receipt_long"
+                            primary_action=view! { <button class="v2-btn-secondary" on:click=move |_| browse.run(())>"Browse the store"<span aria-hidden="true">" >"</span></button> }.into_any()
+                        />
+                    }.into_any(),
+                    None => view! {
+                        <EmptyState
+                            title="No purchases or claims yet"
+                            description="Paid purchases and claimed keep-forever promotions will appear here."
+                            icon="receipt_long"
+                        />
+                    }.into_any(),
+                },
                 PurchasesState::Error => view! {
                     <ErrorState
                         title="Records unavailable"
@@ -606,8 +615,7 @@ pub fn PurchasesView() -> impl IntoView {
                 PurchasesState::WebUnavailable => purchase_state_view(
                     "desktop_windows",
                     "Desktop records unavailable on web",
-                    "Purchase and access history is stored and verified by the desktop app.",
-                    false,
+                    "Purchase and access history is stored and verified by the desktop app. Open Arcadestr on your computer to see your records.",
                 ),
                 PurchasesState::Ready(records) => {
                     let partial_count = records
@@ -638,7 +646,7 @@ pub fn PurchasesView() -> impl IntoView {
                             view! {
                                 <EmptyState
                                     title="No matching records"
-                                    description="No durable records match this filter."
+                                    description="No purchases or claims match this filter. Select another filter to see more."
                                     icon="filter_alt_off"
                                     layout=FeedbackLayout::Compact
                                 />
@@ -654,21 +662,19 @@ pub fn PurchasesView() -> impl IntoView {
                     .into_any()
                 }
             }}
+            <crate::ui_v2::components::AdvancedOptions title="SYNC PURCHASE RECEIPTS" description="Manage receipt sharing and recovery across devices. Your purchase history is shown above.">
+                <crate::ui_v2::receipt_sync::ReceiptPortabilityPanel/>
+            </crate::ui_v2::components::AdvancedOptions>
+            <crate::ui_v2::components::AdvancedOptions title="PAYMENT RECIPIENT TOOLS" description="For publishers and other payment recipients handling refunds. These tools are not needed to buy or play games.">
+                <super::recipient_refunds::RecipientRefunds />
+            </crate::ui_v2::components::AdvancedOptions>
         </section>
     }
 }
 
-fn purchase_state_view(
-    icon: &'static str,
-    title: &'static str,
-    message: &'static str,
-    error: bool,
-) -> AnyView {
+fn purchase_state_view(icon: &'static str, title: &'static str, message: &'static str) -> AnyView {
     view! {
-        <section class="v2-purchase-state v2-panel" class:v2-purchase-state-error=error role=if error { "alert" } else { "status" }>
-            <span class="material-symbols-outlined" aria-hidden="true">{icon}</span>
-            <div><h2>{title}</h2><p>{message}</p></div>
-        </section>
+        <EmptyState title=title description=message icon=icon layout=FeedbackLayout::Panel />
     }
     .into_any()
 }

@@ -684,7 +684,12 @@ fn completes_retained_reinstall_refresh(
 }
 
 #[component]
-pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
+pub fn LibraryView(
+    on_open_listing: Callback<GameListing>,
+    /// Empty-state route back to discovery; omitted when not navigable.
+    #[prop(optional)]
+    on_browse_store: Option<Callback<()>>,
+) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let standalone_web = cfg!(feature = "web");
     let availability = target_library_availability(standalone_web);
@@ -1297,9 +1302,14 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
         <section class="arc-library-page">
             <PageHeader
                 title="Library".to_string()
+                description="Find your saved games, install them, and play. Installed games are stored on this device.".to_string()
                 action=view! {
                     <span class="arc-library-summary">
-                        {move || format!("{} saved · {} installed", saved_games.get().len(), installed_games.get().len())}
+                        {move || (availability != LibraryAvailability::DesktopOnly).then(|| format!(
+                            "{} · {}",
+                            library_count_label(saved_loading.get(), saved_games.get().len(), "saved"),
+                            library_count_label(registry_loading.get(), installed_games.get().len(), "installed"),
+                        ))}
                     </span>
                 }.into_any()
             />
@@ -1307,8 +1317,8 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
             {if availability == LibraryAvailability::DesktopOnly {
                 view! {
                     <EmptyState
-                        title="Desktop Library unavailable on web"
-                        description="Installed-game records and native filesystem information are available only in the Arcadestr desktop application."
+                        title="Play your games in the desktop app"
+                        description="Open Arcadestr on your computer to view your library, install games, and play. You can still browse the store here."
                         icon="desktop_windows"
                         layout=FeedbackLayout::Panel
                     />
@@ -1330,7 +1340,7 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
                             <input
                                 id="library-search"
                                 type="search"
-                                placeholder="Search title, publisher, version, platform, or coordinate"
+                                placeholder="Search your games"
                                 bind:value=search
                             />
                         </label>
@@ -1340,7 +1350,10 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
                     </section>
 
                     <p class="arc-library-result-count" role="status" aria-live="polite">
-                        {move || format!("{} library record(s) shown", visible_saved_entries.get().len() + visible_installed_entries.get().len())}
+                        {move || library_shown_label(
+                            registry_loading.get() || saved_loading.get(),
+                            visible_saved_entries.get().len() + visible_installed_entries.get().len(),
+                        )}
                     </p>
 
                     <Show when=move || auth.npub.get().is_none()>
@@ -1372,7 +1385,7 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
                     <Show when=move || platform_loading.get() || platform_error.get()>
                         <div class="arc-library-notice" role="status">
                             <span class="material-symbols-outlined" aria-hidden="true">"devices"</span>
-                            <div><strong>{move || if platform_loading.get() { "Checking device compatibility" } else { "Device compatibility unavailable" }}</strong><p>"Unknown compatibility does not imply that an artifact is supported."</p></div>
+                            <div><strong>{move || if platform_loading.get() { "Checking device compatibility" } else { "Device compatibility unavailable" }}</strong><p>"We could not yet confirm whether these games run on your device. Check each game's supported platforms before installing."</p></div>
                         </div>
                     </Show>
                     <Show when=move || action_message.get().is_some()>
@@ -1547,6 +1560,16 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
                                             description=description
                                             icon="library_books"
                                             primary_action=view! { <button class="v2-btn-secondary" on:click=move |_| { library_filter.set(LibraryFilter::All); search.set(String::new()); }>"Clear filters"</button> }.into_any()
+                                            layout=FeedbackLayout::Panel
+                                        />
+                                    }.into_any()
+                                } else if let Some(browse) = on_browse_store {
+                                    view! {
+                                        <EmptyState
+                                            title=title
+                                            description="Games you buy or claim, and games installed on this device, appear here. Find one in the store to get started."
+                                            icon="library_books"
+                                            primary_action=view! { <button class="v2-btn-secondary" on:click=move |_| browse.run(())>"Browse the store"<span aria-hidden="true">" >"</span></button> }.into_any()
                                             layout=FeedbackLayout::Panel
                                         />
                                     }.into_any()
@@ -1752,10 +1775,37 @@ pub fn LibraryView(on_open_listing: Callback<GameListing>) -> impl IntoView {
     }
 }
 
+/// A count that is still loading and has nothing yet is unknown, not zero.
+fn library_count_label(loading: bool, count: usize, noun: &str) -> String {
+    if loading && count == 0 {
+        format!("checking {noun}")
+    } else {
+        format!("{count} {noun}")
+    }
+}
+
+fn library_shown_label(loading: bool, count: usize) -> String {
+    if loading && count == 0 {
+        "Loading games\u{2026}".to_string()
+    } else {
+        format!("{count} games shown")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nostr::nips::nip19::ToBech32;
+
+    #[test]
+    fn library_counts_are_not_reported_as_zero_while_loading() {
+        assert_eq!(library_count_label(true, 0, "saved"), "checking saved");
+        assert_eq!(library_count_label(true, 2, "saved"), "2 saved");
+        assert_eq!(library_count_label(false, 0, "installed"), "0 installed");
+        assert_eq!(library_shown_label(true, 0), "Loading games…");
+        assert_eq!(library_shown_label(false, 0), "0 games shown");
+        assert_eq!(library_shown_label(true, 3), "3 games shown");
+    }
 
     fn listing(id: &str) -> GameListing {
         let publisher_npub = nostr::Keys::generate()

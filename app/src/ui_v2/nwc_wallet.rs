@@ -241,9 +241,13 @@ pub fn NwcWalletPanel() -> impl IntoView {
         });
     };
     view! {
-        <section aria-label="Lightning Wallet (NWC)" style="min-width:0;display:grid;gap:12px;padding:20px;border:1px solid oklch(0.32 0.01 60);background:#121215;clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));font:400 12.5px/1.6 ui-monospace,monospace;color:oklch(0.68 0.01 60)">
-            <h2 style="margin:0;font:800 16px ui-monospace,monospace;color:oklch(0.8 0.16 60)">"LIGHTNING WALLET (NWC)"</h2>
-            <p style="margin:0">"This wallet belongs to the active Arcadestr account on this device. Other accounts have their own wallet settings. Credentials stay in the OS keyring. Disconnecting here does not revoke the connection in your wallet."</p>
+        <section class="v2-settings-card" aria-labelledby="settings-wallet-title" style="font:400 12.5px/1.6 ui-monospace,monospace;color:oklch(0.68 0.01 60)">
+            <header class="v2-settings-card-header">
+                <span class="v2-settings-icon material-symbols-outlined" aria-hidden="true">"bolt"</span>
+                <div><p class="v2-store-kicker">"Payments"</p><h2 id="settings-wallet-title">"Lightning wallet"</h2></div>
+            </header>
+            <p style="margin:0">"Connect a compatible Lightning wallet to pay from Arcadestr. In your wallet, create a Nostr Wallet Connect (NWC) connection and paste it below. Treat this address like a password: it can authorize payments. Set a spending limit in your wallet before connecting."</p>
+            <p style="margin:0">"The connection is saved securely on this device for your current account. Disconnecting here removes the saved connection; revoke it in your wallet too if you no longer want it used."</p>
             <strong role="status" style="color:oklch(0.8 0.14 195)">{move || {
                 if wallet.account.get().is_none() { "Sign in to configure a wallet".into() }
                 else if wallet.busy.get() { wallet.operation.get().to_string() }
@@ -256,6 +260,7 @@ pub fn NwcWalletPanel() -> impl IntoView {
                     Verification::Failed => "Configured · verification failed; payment can still be attempted",
                 }.into() }
             }}</strong>
+            <crate::ui_v2::components::AdvancedOptions title="WALLET CONNECTION DETAILS">
             {move || wallet.metadata.get().map(|metadata| view! {
                 <div style="display:grid;gap:4px;overflow-wrap:anywhere">
                     <span>{format!("Wallet pubkey: {}…{}", &metadata.wallet_pubkey[..8], &metadata.wallet_pubkey[metadata.wallet_pubkey.len()-8..])}</span>
@@ -263,7 +268,8 @@ pub fn NwcWalletPanel() -> impl IntoView {
                     {metadata.lud16.map(|address| view! { <span>{format!("Lightning address: {address}")}</span> })}
                 </div>
             })}
-            <label style="display:grid;gap:6px;font:800 11px ui-monospace,monospace">"NWC CONNECTION URI"
+            </crate::ui_v2::components::AdvancedOptions>
+            <label style="display:grid;gap:6px;font:800 11px ui-monospace,monospace">"WALLET CONNECTION ADDRESS (NWC)"
                 <input type="password" autocomplete="off" spellcheck="false" autocapitalize="off" aria-label="NWC connection URI" placeholder="nostr+walletconnect://…"
                     style="min-width:0;width:100%;box-sizing:border-box;padding:10px;border:1px solid oklch(0.32 0.01 60);border-radius:4px;background:#141417;color:#fff;font:400 12px ui-monospace,monospace"
                     prop:value=move || input.get() on:input=move |event| input.set(event_target_value(&event)) disabled=move || wallet.busy.get() || wallet.account.get().is_none() />
@@ -272,7 +278,7 @@ pub fn NwcWalletPanel() -> impl IntoView {
                 style="padding:11px 20px;border:0;border-radius:5px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 13px ui-monospace,monospace">
                 {move || if wallet.metadata.get().is_some() { "REPLACE WALLET" } else { "SAVE WALLET" }}
             </button>
-            <p style="margin:0">"Saving does not test connectivity. Verification uses get_info, never a payment. Your wallet may not support verification."</p>
+            <p style="margin:0">"After saving, select Verify connection to check whether your wallet responds. This check does not send a payment. Some wallets do not support it."</p>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
                 <button type="button" on:click=move |_| { spawn_local(async move { wallet.refresh().await; }); } disabled=move || wallet.busy.get() || wallet.account.get().is_none()
                     style="padding:8px;border:1px solid oklch(0.5 0.13 210);border-radius:4px;background:transparent;color:oklch(0.8 0.13 210);font:800 11px ui-monospace,monospace">"REFRESH SAVED WALLET"</button>

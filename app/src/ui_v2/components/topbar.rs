@@ -65,22 +65,24 @@ pub fn TopBar(
     };
 
     view! {
-        <header class="arc-topbar">
-            <div class="arc-topbar-inner">
+        <header class="arc-topbar" style="height:auto;min-height:64px">
+            <div class="arc-topbar-inner" style="height:auto;min-height:64px;flex-wrap:wrap;column-gap:30px;row-gap:12px;padding-block:10px">
                 <ArcadestrLogo on_click=on_open_store />
 
-                <nav class="arc-primary-nav" aria-label="Primary navigation">
+                <nav class="arc-primary-nav" aria-label="Primary navigation" style="flex:1 1 260px;min-width:0;justify-content:flex-start;column-gap:22px;row-gap:4px;flex-wrap:wrap">
                     <button
                         type="button"
                         class:arc-nav-active=move || discover_active.get()
+                        style="min-height:44px"
                         aria-current=move || discover_active.get().then_some("page")
                         on:click=move |_| on_open_store.run(())
                     >
-                        "Discover"
+                        "Store"
                     </button>
                     <button
                         type="button"
                         class:arc-nav-active=move || library_active.get()
+                        style="min-height:44px"
                         aria-current=move || library_active.get().then_some("page")
                         on:click=move |_| on_open_library.run(())
                     >
@@ -89,6 +91,7 @@ pub fn TopBar(
                     <button
                         type="button"
                         class:arc-nav-active=move || community_active.get()
+                        style="min-height:44px"
                         aria-current=move || community_active.get().then_some("page")
                         on:click=move |_| on_open_community.run(())
                     >
@@ -97,6 +100,7 @@ pub fn TopBar(
                     <button
                         type="button"
                         class:arc-nav-active=move || publish_active.get()
+                        style="min-height:44px"
                         aria-current=move || publish_active.get().then_some("page")
                         on:click=move |_| on_open_publish.run(())
                     >
@@ -104,9 +108,10 @@ pub fn TopBar(
                     </button>
                 </nav>
 
-                <div class="arc-topbar-actions">
+                <div class="arc-topbar-actions" style="flex:1 1 330px;min-width:0">
                     <form
                         class="arc-search"
+                        style="flex:1 1 120px;min-width:0;width:auto"
                         role="search"
                         on:submit=move |event| {
                             event.prevent_default();
@@ -123,9 +128,18 @@ pub fn TopBar(
                             <span class="sr-only">"Search games, creators, and tags"</span>
                             <input
                                 type="search"
+                                autocomplete="off"
+                                spellcheck="false"
+                                enterkeyhint="search"
                                 placeholder="Search games, creators, tags"
                                 prop:value=move || search_query.get()
                                 on:input=move |event| search_query.set(event_target_value(&event))
+                                on:keydown=move |event| {
+                                    if event.key() == "Escape" && !search_query.get_untracked().is_empty() {
+                                        event.prevent_default();
+                                        search_query.set(String::new());
+                                    }
+                                }
                             />
                         </label>
                     </form>
@@ -135,7 +149,9 @@ pub fn TopBar(
                             id="relay-control-trigger"
                             type="button"
                             class="arc-relay-control"
-                            aria-label="Show relay connections"
+                            class:arc-relay-control-offline=move || relay_count.get() == 0
+                            style="min-height:44px"
+                            aria-label="Show network status"
                             aria-expanded=move || aria_bool(relay_menu_open.get())
                             aria-controls="relay-status-menu"
                             title=move || match relay_count.get() {
@@ -161,9 +177,8 @@ pub fn TopBar(
                             ></span>
                             <span>
                                 {move || match relay_count.get() {
-                                    0 => "NO RELAYS".to_string(),
-                                    1 => "1 RELAY".to_string(),
-                                    count => format!("{count} RELAYS"),
+                                    0 => "OFFLINE".to_string(),
+                                    _ => "ONLINE".to_string(),
                                 }}
                             </span>
                         </button>
@@ -182,7 +197,7 @@ pub fn TopBar(
                                 }
                             >
                                 <div class="arc-menu-heading">
-                                    <h2>"Relay connections"</h2>
+                                    <h2>"Network status"</h2>
                                     <button
                                         type="button"
                                         class="arc-menu-close"
@@ -198,7 +213,7 @@ pub fn TopBar(
                                 {move || {
                                     let relays = connected_relays.get();
                                     if relays.is_empty() {
-                                        view! { <p class="arc-menu-empty">"No relays are currently connected."</p> }
+                                        view! { <p class="arc-menu-empty">"Not connected to the game network. Check your internet connection, then try reconnecting in Settings."</p> }
                                             .into_any()
                                     } else {
                                         view! {
@@ -237,15 +252,16 @@ pub fn TopBar(
                             id="account-control-trigger"
                             type="button"
                             class="arc-account-control"
+                            style="min-width:44px;min-height:44px"
                             aria-label=move || format!("Open account menu for {}", display_name.get())
                             aria-expanded=move || aria_bool(account_menu_open.get())
                             aria-controls="account-control-menu"
                             title=move || {
                                 let status = connection_status.get();
                                 if let Some(error) = connection_error.get() {
-                                    format!("Signer: {status} ({error})")
+                                    format!("Account connection: {status} ({error})")
                                 } else {
-                                    format!("Signer: {status}")
+                                    format!("Account connection: {status}")
                                 }
                             }
                             on:click=move |_| {
@@ -297,7 +313,7 @@ pub fn TopBar(
                                 }
                             >
                                 <p class="arc-signer-state">
-                                    <span>"Signer"</span>
+                                    <span>"Account connection"</span>
                                     <strong>{move || connection_status.get()}</strong>
                                 </p>
                                 <button type="button" on:click=move |_| close_account_and(on_open_profile)>

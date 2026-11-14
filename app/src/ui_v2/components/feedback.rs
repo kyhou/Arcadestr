@@ -120,17 +120,25 @@ pub fn EmptyState(
     #[prop(optional)] layout: FeedbackLayout,
 ) -> impl IntoView {
     let has_actions = feedback_has_actions(primary_action.is_some(), secondary_action.is_some());
+    let spacious = matches!(layout, FeedbackLayout::Panel | FeedbackLayout::FullPage);
     view! {
-        <section class=format!("arc-feedback arc-feedback-empty {}", layout.class())>
+        <section
+            class=format!("arc-feedback arc-feedback-empty {}", layout.class())
+            style=spacious.then_some("min-height:420px;padding:clamp(40px,8vw,110px) 28px;gap:20px")
+        >
             {icon.map(|icon| view! {
-                <span class="material-symbols-outlined arc-feedback-icon" aria-hidden="true">{icon}</span>
+                <span
+                    class="material-symbols-outlined arc-feedback-icon"
+                    aria-hidden="true"
+                    style=spacious.then_some("display:grid;place-items:center;width:64px;height:64px;overflow:hidden;border-radius:50%;border:1px solid rgba(255,255,255,.1);background:repeating-linear-gradient(135deg,#141417 0 10px,#121215 10px 20px);color:oklch(0.68 0.01 60);font-size:28px;line-height:1")
+                >{icon}</span>
             })}
-            <div class="arc-feedback-copy">
-                <h2>{title}</h2>
-                <p>{description}</p>
+            <div class="arc-feedback-copy" style="max-width:380px;overflow-wrap:anywhere">
+                <h2 style=spacious.then_some("font:800 20px/1.3 ui-monospace,monospace;color:#fff")>{title}</h2>
+                <p style="font:400 12.5px/1.7 ui-monospace,monospace;color:oklch(0.68 0.01 60);margin-top:10px">{description}</p>
             </div>
             {has_actions.then(|| view! {
-                <div class="arc-feedback-actions">
+                <div class="arc-feedback-actions" style="gap:12px;max-width:100%">
                     {primary_action}
                     {secondary_action}
                 </div>
@@ -152,10 +160,15 @@ pub enum PartialRelayKind {
 }
 
 pub fn partial_relay_copy(kind: PartialRelayKind, result_count: usize) -> (&'static str, String) {
+    let results = if result_count == 1 {
+        "result"
+    } else {
+        "results"
+    };
     match kind {
         PartialRelayKind::Loading if result_count > 0 => (
             "Results still arriving",
-            format!("Showing {result_count} result(s) while more relays respond."),
+            format!("Showing {result_count} {results} while more relays respond."),
         ),
         PartialRelayKind::Loading => (
             "Waiting for relays",
@@ -163,7 +176,7 @@ pub fn partial_relay_copy(kind: PartialRelayKind, result_count: usize) -> (&'sta
         ),
         PartialRelayKind::Failed if result_count > 0 => (
             "Partial relay results",
-            format!("Showing {result_count} result(s). The refresh failed, so results may be incomplete."),
+            format!("Showing {result_count} {results}. The refresh failed, so results may be incomplete."),
         ),
         PartialRelayKind::Failed => (
             "Relay results unavailable",
@@ -171,7 +184,7 @@ pub fn partial_relay_copy(kind: PartialRelayKind, result_count: usize) -> (&'sta
         ),
         PartialRelayKind::ResultsAvailable => (
             "Partial results available",
-            format!("Showing {result_count} result(s); this may not be the complete relay set."),
+            format!("Showing {result_count} {results}; this may not be the complete relay set."),
         ),
         PartialRelayKind::NoResultsYet => (
             "No results yet",
@@ -307,7 +320,10 @@ mod tests {
     fn partial_relay_copy_preserves_loaded_results() {
         let (title, message) = partial_relay_copy(PartialRelayKind::Failed, 4);
         assert_eq!(title, "Partial relay results");
-        assert!(message.contains("Showing 4 result(s)"));
+        assert!(message.contains("Showing 4 results"));
+
+        let (_, message) = partial_relay_copy(PartialRelayKind::Loading, 1);
+        assert!(message.contains("Showing 1 result while"));
 
         let (title, message) = partial_relay_copy(PartialRelayKind::Loading, 0);
         assert_eq!(title, "Waiting for relays");

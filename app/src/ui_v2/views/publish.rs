@@ -646,10 +646,18 @@ pub fn PublishV2View(
 ) -> impl IntoView {
     let _ = (state, on_navigate, on_open_listing);
     view! {
-        <section class="v2-publisher-studio v2-publisher-unavailable" aria-labelledby="publisher-unavailable-title">
-            <p class="v2-publisher-kicker">"Publisher studio"</p>
-            <h1 id="publisher-unavailable-title">"Publishing unavailable on the web"</h1>
-            <p>"Network publication and Promotion management require the Arcadestr desktop app. This standalone web build does not provide nonfunctional publishing controls."</p>
+        <section class="arc-publish-web-page">
+            <crate::ui_v2::components::PageHeader
+                title="Publish".to_string()
+                eyebrow="Publisher studio".to_string()
+                description="Publish games and manage promotions from the Arcadestr desktop app.".to_string()
+            />
+            <crate::ui_v2::components::EmptyState
+                title="Publishing unavailable on the web"
+                description="Network publication and promotion management need the Arcadestr desktop app. Open it on your computer to publish and manage your games."
+                icon="desktop_windows"
+                layout=crate::ui_v2::components::FeedbackLayout::Panel
+            />
         </section>
     }
 }
@@ -1271,7 +1279,7 @@ fn PublishedGamesView(
                     <button type="button" class="v2-btn-primary" aria-describedby="publisher-create-game-requirement" on:click=move |_| on_navigate.run(PublishViewState::NewPublication) disabled=move || !signer_can_publish(signer_state.get())>"+ Create Game"</button>
                 </div>
             </header>
-            <p id="publisher-create-game-requirement" class="v2-publisher-action-requirement">{move || match signer_state.get() { PublisherSignerState::Available => "Create Game uses the active account signer.", PublisherSignerState::Connecting => "Create Game is unavailable while the remote signer connects.", PublisherSignerState::Unavailable => "Create Game requires an available signer for the active account.", PublisherSignerState::Unknown => "Create Game remains unavailable until signer availability is resolved." }}</p>
+            <p id="publisher-create-game-requirement" class="v2-publisher-action-requirement">{move || match signer_state.get() { PublisherSignerState::Available => "Create a game listing, add your files, then review before publishing.", PublisherSignerState::Connecting => "Connecting your signing app. Please wait before creating a game.", PublisherSignerState::Unavailable => "Reconnect your signing app in Settings before creating a game.", PublisherSignerState::Unknown => "Checking your account connection before you can create a game." }}</p>
 
             {move || match dashboard_state.get() {
                 PublisherDashboardState::SignedOut => view! { <section class="v2-publisher-feedback" role="status"><span class="material-symbols-outlined" aria-hidden="true">"person_off"</span><div><h2>"Sign in to open the publisher dashboard"</h2><p>"Sign in with the account you use to publish games. Only that account's games will appear here."</p></div></section> }.into_any(),
@@ -1305,7 +1313,7 @@ fn PublishedGamesView(
                             <div><dt>{if counts.get().campaigns_complete_for_loaded_listings { "Resolved active campaigns" } else { "Active campaigns in resolved results" }}</dt><dd>{counts.get().resolved_active_campaigns}</dd></div>
                             <div><dt>"Items requiring attention"</dt><dd>{counts.get().attention_items}</dd></div>
                         </dl>
-                        <p class="v2-publisher-relay-scope">"Counts apply only to the loaded authored-listing window. Relay completeness is not inferred."</p>
+                        <p class="v2-publisher-relay-scope">"These counts cover the games loaded so far. Missing a game? Check your connection and refresh."</p>
 
                         <section class="v2-publisher-attention" aria-labelledby="publisher-attention-title">
                             <div><p class="v2-publisher-kicker">"Actionable state only"</p><h2 id="publisher-attention-title">"Needs attention"</h2></div>
@@ -1879,6 +1887,15 @@ impl CampaignConfirmation {
             Self::RemovePointer => DialogTone::Neutral,
         }
     }
+
+    /// The accept button follows the dialog tone: destructive decisions use
+    /// the red destructive button, never the amber primary CTA.
+    fn accept_class(self) -> &'static str {
+        match self.tone() {
+            DialogTone::Destructive => "v2-btn-danger",
+            DialogTone::Neutral => "v2-btn-primary",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2086,7 +2103,7 @@ fn CampaignConfirmationDialog(
                 </button>
                 <button
                     type="button"
-                    class="v2-btn-primary"
+                    class=move || confirmation.get().map(CampaignConfirmation::accept_class).unwrap_or("v2-btn-primary")
                     on:click=move |_| on_decision.run(Some(true))
                 >
                     {move || confirmation.get().map(CampaignConfirmation::accept_label).unwrap_or_default()}
@@ -2917,6 +2934,22 @@ fn timezone_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destructive_campaign_decisions_use_the_destructive_button() {
+        assert_eq!(
+            CampaignConfirmation::CancelCampaign.accept_class(),
+            "v2-btn-danger"
+        );
+        assert_eq!(
+            CampaignConfirmation::DiscardChanges.accept_class(),
+            "v2-btn-danger"
+        );
+        assert_eq!(
+            CampaignConfirmation::RemovePointer.accept_class(),
+            "v2-btn-primary"
+        );
+    }
 
     #[test]
     fn unreachable_network_and_other_failures_get_distinct_copy() {

@@ -10,10 +10,10 @@ fn community_unavailable_message() -> &'static str {
 pub fn SocialView() -> impl IntoView {
     view! {
         <section class="arc-community-page">
-            <PageHeader title="Community".to_string() description="Public identity and publisher information come from signed Nostr data. Social activity is not implemented.".to_string() />
+            <PageHeader title="Community".to_string() description="Community features are coming in a future update.".to_string() />
             <EmptyState
                 title=community_unavailable_message()
-                description="Arcadestr does not currently query or publish a feed, follows, reactions, messages, player presence, trends, recommendations, or zap activity. Your current-account public profile and verified NIP-58 badges remain available from their existing destinations."
+                description="Posts, messages, and social activity are not available yet. You can view your profile and achievements from the account menu."
                 icon="forum"
                 layout=FeedbackLayout::Panel
             />

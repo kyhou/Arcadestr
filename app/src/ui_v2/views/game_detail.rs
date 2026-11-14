@@ -2255,21 +2255,21 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
 
                     {move || detail_presentation.get().map(|presentation| view! { <StorePageRichDetail presentation=presentation /> })}
 
-                    <section class="v2-detail-section v2-detail-description-block">
-                        <div class="v2-section-header"><h2>"Access campaigns"</h2></div>
+                    <section class="v2-detail-section v2-detail-description-block" aria-labelledby="detail-promotions-title">
+                        <h2 id="detail-promotions-title" class="v2-store-kicker">"Promotions"</h2>
                         {move || if campaign_loading.get() {
-                            view! { <p class="v2-social-meta">"Checking signed campaign events..."</p> }.into_any()
+                            view! { <p class="v2-social-meta">"Checking available promotions..."</p> }.into_any()
                         } else if let Some(error) = campaign_error.get() {
                             view! {
                                 <div class="v2-detail-alert v2-detail-alert-error">
-                                    <p>{format!("Campaign lookup failed: {error}")}</p>
+                                    <p>{format!("Could not load promotions: {error}")}</p>
                                     <button class="v2-btn-secondary" on:click=move |_| campaign_refresh.update(|generation| *generation = generation.wrapping_add(1))>
-                                        "Retry campaign lookup"
+                                        "Try again"
                                     </button>
                                 </div>
                             }.into_any()
                         } else if campaigns.get().is_empty() {
-                            view! { <p class="v2-social-meta">"No entitlement campaigns are attached to this listing."</p> }.into_any()
+                            view! { <p class="v2-social-meta">"No promotions were found for this game."</p> }.into_any()
                         } else {
                             let cards = campaigns.get().into_iter().map(|campaign| view! {
                                 <article class="v2-detail-campaign-card">
@@ -2286,15 +2286,14 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                         }}
                     </section>
 
-                    <section class="v2-detail-section v2-detail-description-block">
-                        <h2>"Technical details"</h2>
+                    <crate::ui_v2::components::AdvancedOptions title="TECHNICAL DETAILS">
                         <div class="v2-spec-grid">
                             {technical.iter().flat_map(|(label, value)| vec![
                                 view! { <span>{label.clone()}</span> }.into_any(),
                                 view! { <span class="v2-detail-technical-value">{value.clone()}</span> }.into_any(),
                             ]).collect::<Vec<_>>()}
                         </div>
-                    </section>
+                    </crate::ui_v2::components::AdvancedOptions>
                 </main>
 
                 <aside class="v2-detail-sidebar">
@@ -2333,7 +2332,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                 <div style="display:grid;gap:8px;margin-bottom:12px;font-family:ui-monospace,monospace">
                                     <label for="split-refund-lud16" style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">"REFUND LIGHTNING ADDRESS"</label>
                                     <input id="split-refund-lud16" class="v2-input" type="text" placeholder="you@example.com" prop:value=move || refund_lud16.get() on:input:target=move |event| refund_lud16.set(event.target().value()) />
-                                    <span style="color:oklch(0.55 0.01 60);font:600 10.5px/1.5 ui-monospace,monospace">"Required before quote activation. The processor checks every possible principal refund against this destination."</span>
+                                    <span style="color:oklch(0.68 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace">"Enter the Lightning address where you want to receive any refund. It must be checked before you can continue to payment."</span>
                                 </div>
                             </Show>
                             <button
@@ -2440,9 +2439,11 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                         view! {
                             <div class="v2-detail-invoice">
                                 <p class="v2-social-meta">{move || split_leg_label.get().map(|leg| format!("Committed payment leg · {leg}")).unwrap_or_else(|| "Lightning invoice".into())}</p>
-                                <code>{move || invoice.get().unwrap_or_default()}</code>
+                                <crate::ui_v2::components::AdvancedOptions title="INVOICE DETAILS">
+                                    <code style="overflow-wrap:anywhere;word-break:break-all">{move || invoice.get().unwrap_or_default()}</code>
+                                </crate::ui_v2::components::AdvancedOptions>
                                 <div class="v2-detail-action-row">
-                                    <button class="v2-btn-secondary" on:click=move |_| on_copy_invoice.run(())>"Copy"</button>
+                                    <button class="v2-btn-secondary" on:click=move |_| on_copy_invoice.run(())>"Copy invoice"</button>
                                     <button class="v2-btn-secondary" disabled=arcadestr_core::purchase_contract::require_live_purchase_authorization().is_err() on:click=move |_| on_open_wallet.run(())>"Open wallet"</button>
                                 </div>
                                 <Show when=move || !cfg!(feature = "web")>
@@ -2453,9 +2454,12 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                     on:click=move |_| on_pay_nwc.run(())
                                     disabled=move || !wallet.payment_available() || operation_blocks_dispatch(operation.get()) || !split_plan.get().is_some_and(|p|p.dispatch_ready(current_unix_secs())) || arcadestr_core::purchase_contract::require_live_purchase_authorization().is_err()
                                 >
-                                    {move || if split_quote_id.get().is_some() { "Pay this leg" } else { "Pay and confirm" }}
+                                    {move || if split_quote_id.get().is_some() { "Pay this part" } else { "Pay and confirm" }}
                                 </button>
+                                <crate::ui_v2::components::AdvancedOptions title="CONFIRM PAYMENT MANUALLY" description="Use this only if your wallet provides a payment proof (preimage) and automatic confirmation has not worked. Paste the proof below; do not pay the invoice again.">
+                                <label for="manual-payment-proof">"Payment proof (preimage)"</label>
                                 <input
+                                    id="manual-payment-proof"
                                     class="v2-input"
                                     type="text"
                                     aria-label="Payment preimage"
@@ -2466,6 +2470,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                 <button class="v2-btn-secondary" on:click=move |_| on_confirm_manual.run(())>
                                     "Confirm manual payment"
                                 </button>
+                                </crate::ui_v2::components::AdvancedOptions>
                             </div>
                         }.into_any()
                     } else {
@@ -2474,7 +2479,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
 
                     <div class="v2-detail-buy-meta">
                         <span>{release_label.clone()}</span>
-                        <span>{format!("Protocol: {protocol_label}")}</span>
+                        <crate::ui_v2::components::AdvancedOptions title="PROTOCOL DETAILS">
+                            <span>{format!("Protocol: {protocol_label}")}</span>
+                        </crate::ui_v2::components::AdvancedOptions>
                     </div>
                     </section>
 

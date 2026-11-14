@@ -111,13 +111,13 @@ body.arc-modal-open {
   background: var(--arc-surface-lowest);
 }
 
-/* The handoff top bar is full-bleed (padding: 0 28px, no max-width) while the
-   main area caps at 1440px. Capping the bar too left the brand, nav and account
-   controls floating in the middle of a maximized window. */
+/* The bar's inner row shares the main column's 1440px cap and inline inset, so
+   the brand, nav and account edges line up with page content when maximized. */
 .arc-topbar-inner {
   width: 100%;
+  max-width: var(--arc-content-max);
   height: 100%;
-  margin: 0;
+  margin: 0 auto;
   padding: 0 var(--arc-page-inline);
   display: flex;
   align-items: center;
@@ -282,6 +282,18 @@ body.arc-modal-open {
   background: oklch(0.8 0.14 195 / 8%);
 }
 
+/* Cyan means a live network; with no relays the chip drops to the tertiary
+   treatment so the colour never claims connectivity it does not have. */
+.arc-relay-control-offline {
+  border-color: rgba(255, 255, 255, 0.22);
+  color: var(--arc-text-secondary);
+}
+
+.arc-relay-control-offline:hover {
+  border-color: var(--arc-border-strong);
+  background: rgba(255, 255, 255, 0.04);
+}
+
 .arc-relay-dot {
   width: 7px;
   height: 7px;
@@ -323,7 +335,7 @@ body.arc-modal-open {
   place-items: center;
   background: var(--arc-progress-track);
   color: var(--arc-text-primary);
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 800;
 }
 
@@ -397,7 +409,7 @@ body.arc-modal-open {
   padding: 4px 6px 8px;
   border-bottom: 1px solid var(--arc-border-subtle);
   color: var(--arc-text-subdued);
-  font-size: 10px;
+  font-size: 10.5px;
   text-transform: uppercase;
 }
 
@@ -560,8 +572,9 @@ body.arc-modal-open {
 }
 
 @media (max-width: 820px) {
+  /* Matches the narrowed .arc-page-container inset below. */
   .arc-topbar-inner {
-    padding-inline: 16px;
+    padding-inline: 20px;
   }
 
   .arc-logo-wordmark {
@@ -979,7 +992,7 @@ select option:disabled {
   letter-spacing: 0.04em;
 }
 
-.v2-store-category-primary { background: rgba(182, 160, 255, 0.2); }
+.v2-store-category-primary { background: oklch(0.78 0.16 60 / 0.2); }
 .v2-store-category-secondary { background: rgba(0, 210, 253, 0.2); }
 .v2-store-category-tertiary { background: rgba(255, 150, 187, 0.2); }
 .v2-store-category-neutral { background: var(--v2-surface-highest); }
@@ -992,12 +1005,14 @@ select option:disabled {
   padding: var(--v2-space-5);
 }
 
+/* Section kicker: amber uppercase, 800 11-12px, 1.5px tracking. */
 .v2-store-kicker {
   margin: 0;
-  color: var(--v2-tertiary);
-  font-weight: 700;
+  color: oklch(0.8 0.16 60);
+  font-size: var(--arc-text-11);
+  font-weight: var(--arc-weight-black);
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: var(--arc-tracking-label);
 }
 
 .v2-store-front-content {
@@ -1780,7 +1795,7 @@ select option:disabled {
 
 .v2-detail-publisher-verification {
   margin: 2px 0 0;
-  color: var(--arc-info);
+  color: var(--arc-action);
   font-size: 10.5px;
   font-weight: 600;
 }
@@ -2452,10 +2467,14 @@ select option:disabled {
   min-height: 0;
 }
 
+/* Thumbnail wells are too small for a legible caption: keep the hatch,
+   hide the text (the well's aria-label still names the state). */
 .arc-library-art .arc-artwork-fallback {
-  padding: 4px;
-  font-size: 7.5px;
-  letter-spacing: 0.25px;
+  padding: 0;
+}
+
+.arc-library-art .arc-artwork-fallback span {
+  display: none;
 }
 
 .arc-library-row-copy {
@@ -2598,7 +2617,7 @@ select option:disabled {
 .arc-library-row-warning,
 .arc-library-device-note {
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   line-height: 1.45;
 }
 
@@ -2611,7 +2630,7 @@ select option:disabled {
 .arc-library-technical {
   margin-top: 5px;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
 }
 
 .arc-library-technical summary {
@@ -2726,7 +2745,7 @@ select option:disabled {
   border: 1px solid var(--arc-border-default);
   border-radius: 999px;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2778,7 +2797,7 @@ select option:disabled {
 
 .arc-game-properties-unavailable span {
   color: var(--arc-warning);
-  font-size: 10px;
+  font-size: 10.5px;
   line-height: 1.4;
 }
 
@@ -3018,7 +3037,8 @@ select option:disabled {
 .v2-social-meta {
   margin: 0 0 var(--v2-space-2) 0;
   color: var(--v2-on-surface-variant);
-  font-size: 0.9rem;
+  font-size: var(--arc-text-12-5);
+  line-height: var(--arc-leading-body);
 }
 
 .v2-social-actions {
@@ -3046,7 +3066,7 @@ select option:disabled {
   align-items: center;
   gap: var(--v2-space-5);
   background:
-    radial-gradient(circle at 12% 20%, rgba(182, 160, 255, 0.24), transparent 32%),
+    radial-gradient(circle at 12% 20%, oklch(0.78 0.16 60 / 0.24), transparent 32%),
     linear-gradient(135deg, rgba(27, 32, 40, 0.92), rgba(42, 35, 55, 0.78));
 }
 
@@ -3057,9 +3077,9 @@ select option:disabled {
   display: grid;
   place-items: center;
   flex: 0 0 auto;
-  border: 1px solid rgba(182, 160, 255, 0.3);
+  border: 1px solid oklch(0.78 0.16 60 / 0.3);
   border-radius: 28px;
-  background: rgba(182, 160, 255, 0.12);
+  background: oklch(0.78 0.16 60 / 0.12);
   color: var(--v2-primary);
   box-shadow: var(--v2-shadow-glow-primary);
 }
@@ -3137,10 +3157,10 @@ select option:disabled {
   display: grid;
   place-items: center;
   overflow: hidden;
-  border: 1px solid rgba(182, 160, 255, 0.18);
+  border: 1px solid oklch(0.78 0.16 60 / 0.18);
   border-radius: var(--v2-radius-lg);
   background:
-    radial-gradient(circle at center, rgba(182, 160, 255, 0.2), transparent 58%),
+    radial-gradient(circle at center, oklch(0.78 0.16 60 / 0.2), transparent 58%),
     var(--v2-surface-lowest);
 }
 
@@ -3254,7 +3274,7 @@ select option:disabled {
   display: grid;
   place-items: center;
   border-radius: var(--v2-radius-md);
-  background: rgba(182, 160, 255, 0.12);
+  background: oklch(0.78 0.16 60 / 0.12);
   color: var(--v2-primary);
 }
 
@@ -3265,7 +3285,8 @@ select option:disabled {
 
 .v2-badge-showcase-state {
   color: var(--v2-on-surface-variant);
-  line-height: 1.55;
+  font-size: var(--arc-text-12-5);
+  line-height: var(--arc-leading-body);
 }
 
 .v2-badge-showcase-error {
@@ -3296,7 +3317,7 @@ select option:disabled {
   flex: 0 0 auto;
   overflow: hidden;
   border-radius: var(--v2-radius-md);
-  background: rgba(182, 160, 255, 0.12);
+  background: oklch(0.78 0.16 60 / 0.12);
   color: var(--v2-primary);
 }
 
@@ -3547,10 +3568,10 @@ select option:disabled {
   max-height: calc(100vh - 2rem);
   overflow-y: auto;
   padding: clamp(1.5rem, 5vw, 2.5rem);
-  border: 1px solid rgba(182, 160, 255, 0.26);
+  border: 1px solid oklch(0.78 0.16 60 / 0.26);
   border-radius: var(--v2-radius-xl);
   background:
-    radial-gradient(circle at 50% 12%, rgba(182, 160, 255, 0.2), transparent 34%),
+    radial-gradient(circle at 50% 12%, oklch(0.78 0.16 60 / 0.2), transparent 34%),
     var(--v2-surface-low);
   box-shadow: var(--v2-shadow-ambient), var(--v2-shadow-glow-primary);
 }
@@ -3602,9 +3623,9 @@ select option:disabled {
   place-items: center;
   margin-bottom: var(--v2-space-4);
   overflow: hidden;
-  border: 1px solid rgba(182, 160, 255, 0.24);
+  border: 1px solid oklch(0.78 0.16 60 / 0.24);
   border-radius: 34px;
-  background: rgba(182, 160, 255, 0.12);
+  background: oklch(0.78 0.16 60 / 0.12);
   color: var(--v2-primary);
 }
 
@@ -3691,7 +3712,7 @@ select option:disabled {
   height: 380px;
   left: -90px;
   top: 20%;
-  background: rgba(182, 160, 255, 0.14);
+  background: oklch(0.78 0.16 60 / 0.14);
   filter: blur(120px);
 }
 
@@ -3841,7 +3862,7 @@ select option:disabled {
 }
 
 .v2-user-profile-card:hover {
-  border-color: rgba(182, 160, 255, 0.35);
+  border-color: oklch(0.78 0.16 60 / 0.35);
   background: var(--v2-surface-bright);
   transform: translateY(-2px);
 }
@@ -3925,7 +3946,7 @@ select option:disabled {
 }
 
 .v2-user-add-card:hover {
-  border-color: rgba(182, 160, 255, 0.5);
+  border-color: oklch(0.78 0.16 60 / 0.5);
   color: var(--v2-on-background);
 }
 
@@ -4007,7 +4028,7 @@ select option:disabled {
   display: block;
   height: 1px;
   margin-top: 2px;
-  background: rgba(182, 160, 255, 0.65);
+  background: oklch(0.78 0.16 60 / 0.65);
 }
 
 .v2-user-select-footer {
@@ -4067,42 +4088,41 @@ select option:disabled {
 .v2-auth-screen {
   position: relative;
   overflow: hidden;
-  background:
-    radial-gradient(circle at 12% 12%, rgba(186, 132, 255, 0.14), transparent 32rem),
-    radial-gradient(circle at 88% 76%, rgba(48, 199, 224, 0.09), transparent 28rem),
-    var(--v2-background);
+  background: transparent;
 }
 
 .v2-auth-topbar {
-  min-height: 72px;
+  min-height: var(--arc-shell-height);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: var(--v2-space-3) clamp(1rem, 4vw, 3rem);
-  border-bottom: 1px solid var(--v2-outline-ghost);
-  background: rgba(14, 17, 22, 0.62);
-  backdrop-filter: blur(18px);
+  gap: 12px;
+  padding: 10px max(var(--arc-page-inline), calc((100% - var(--arc-content-max)) / 2 + var(--arc-page-inline)));
+  border-bottom: 1px solid var(--arc-separator);
+  background: var(--arc-surface-lowest);
 }
 
 .v2-auth-brand {
   display: flex;
   align-items: center;
-  gap: var(--v2-space-2);
-  font-family: var(--v2-font-display);
-  font-weight: 800;
+  gap: 10px;
+  color: var(--arc-text-heading);
+  font: 800 19px/1 var(--arc-font-mono);
+  letter-spacing: var(--arc-tracking-wordmark);
+  text-transform: uppercase;
 }
 
 .v2-auth-brand-mark {
-  width: 24px;
-  height: 24px;
-  border-radius: 6px;
-  background: linear-gradient(135deg, var(--v2-primary), var(--v2-secondary));
-  clip-path: polygon(0 0, 100% 0, 100% 100%, 38% 100%, 38% 62%, 0 62%);
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  background: var(--arc-accent);
+  clip-path: var(--arc-logo-clip);
 }
 
 .v2-auth-main {
   width: min(1180px, calc(100% - 2rem));
-  min-height: calc(100vh - 72px);
+  min-height: calc(100vh - var(--arc-shell-height));
   margin: 0 auto;
   display: grid;
   align-items: center;
@@ -4115,17 +4135,29 @@ select option:disabled {
 }
 
 .v2-auth-heading h1 {
-  margin: 0.15em 0;
-  font-size: clamp(2.6rem, 7vw, 5.8rem);
-  line-height: 0.94;
+  margin: 10px 0 12px;
+  color: var(--arc-text-heading);
+  font: 800 32px/1.08 var(--arc-font-mono);
+  letter-spacing: var(--arc-tracking-tight);
+}
+
+.v2-auth-heading > p:last-child {
+  max-width: 640px;
+  font-size: var(--arc-text-13);
 }
 
 .v2-auth-heading > p:last-child,
 .v2-auth-method-card > p,
 .v2-auth-focus-card > p,
 .v2-settings-card > p {
-  color: var(--v2-on-surface-variant);
-  line-height: 1.55;
+  color: var(--arc-text-secondary);
+  line-height: var(--arc-leading-body);
+}
+
+.v2-auth-method-card > p,
+.v2-auth-focus-card > p {
+  margin: 0;
+  font-size: var(--arc-text-12-5);
 }
 
 .v2-auth-account-grid {
@@ -4138,10 +4170,9 @@ select option:disabled {
 .v2-auth-add-card,
 .v2-auth-method-card,
 .v2-auth-focus-card {
-  border: 1px solid var(--v2-outline-ghost);
-  border-radius: var(--v2-radius-xl);
-  background: rgba(29, 33, 42, 0.72);
-  box-shadow: var(--v2-shadow-ambient);
+  border: 1px solid var(--arc-border-subtle);
+  border-radius: var(--arc-radius-lg);
+  background: var(--arc-surface);
 }
 
 .v2-auth-account-card {
@@ -4152,8 +4183,7 @@ select option:disabled {
 }
 
 .v2-auth-account-card-active {
-  border-color: rgba(186, 132, 255, 0.5);
-  box-shadow: var(--v2-shadow-ambient), 0 0 28px rgba(186, 132, 255, 0.13);
+  border-color: oklch(0.78 0.16 60 / 55%);
 }
 
 .v2-auth-account-identity,
@@ -4170,15 +4200,16 @@ select option:disabled {
   flex: 0 0 auto;
   border-radius: 50%;
   object-fit: cover;
-  box-shadow: 0 0 0 3px rgba(186, 132, 255, 0.2);
+  border: 1px solid var(--arc-border-subtle);
 }
 
 .v2-auth-account-fallback,
 .v2-settings-avatar-fallback {
   display: grid;
   place-items: center;
-  background: linear-gradient(145deg, var(--v2-primary-container), var(--v2-surface-bright));
-  font-family: var(--v2-font-display);
+  background: linear-gradient(135deg, oklch(0.55 0.1 320), oklch(0.4 0.1 260));
+  color: var(--arc-text-heading);
+  font-family: var(--arc-font-mono);
   font-size: 1.45rem;
   font-weight: 800;
 }
@@ -4190,12 +4221,15 @@ select option:disabled {
 .v2-auth-account-copy h2,
 .v2-settings-active-account h3 {
   margin: 0;
+  color: var(--arc-text-heading);
+  font: 800 15px/1.2 var(--arc-font-mono);
 }
 
 .v2-auth-account-copy p,
 .v2-settings-active-account p {
   margin: 0.25rem 0 0;
-  color: var(--v2-on-surface-variant);
+  color: var(--arc-text-secondary);
+  font-size: var(--arc-text-12);
   overflow-wrap: anywhere;
 }
 
@@ -4234,6 +4268,13 @@ select option:disabled {
   color: var(--arc-error-text);
 }
 
+/* Ghost + danger is still destructive: red text and hairline, not grey. The
+   two-class selector outranks .v2-btn-ghost regardless of source order. */
+.v2-btn-ghost.v2-btn-danger:not(:disabled) {
+  border-color: oklch(0.65 0.18 25 / 45%);
+  color: var(--arc-error-text);
+}
+
 .v2-btn-danger:hover:not(:disabled) {
   border-color: var(--v2-danger);
   background: oklch(0.6 0.18 25 / 20%);
@@ -4256,7 +4297,7 @@ select option:disabled {
 
 .v2-auth-add-card:hover,
 .v2-auth-method-link:hover {
-  border-color: var(--v2-primary);
+  border-color: var(--arc-accent);
   color: var(--v2-on-background);
 }
 
@@ -4270,36 +4311,46 @@ select option:disabled {
 .v2-auth-focus-card {
   display: grid;
   align-content: start;
-  gap: var(--v2-space-3);
-  padding: clamp(1.25rem, 4vw, 2.2rem);
+  gap: 12px;
+  padding: 26px;
 }
 
+/* Recommended method: amber hairline, no glow or gradient. */
 .v2-auth-method-featured {
-  background:
-    linear-gradient(145deg, rgba(186, 132, 255, 0.09), transparent 48%),
-    rgba(29, 33, 42, 0.78);
+  border-color: oklch(0.78 0.16 60 / 45%);
 }
 
 .v2-auth-method-icon {
-  width: 48px;
-  height: 48px;
+  width: 40px;
+  height: 40px;
   display: grid;
   place-items: center;
-  border-radius: var(--v2-radius-md);
-  background: var(--v2-primary-container);
-  color: var(--v2-primary);
+  overflow: hidden;
+  border: 1px solid oklch(0.78 0.16 60 / 35%);
+  border-radius: var(--arc-radius-sm);
+  background: oklch(0.78 0.16 60 / 14%);
+  color: var(--arc-accent);
+  font-size: 22px;
 }
 
-.v2-auth-method-card h2,
+.v2-auth-method-card h2 {
+  margin: 0;
+  color: var(--arc-text-heading);
+  font: 800 15px/1.25 var(--arc-font-mono);
+}
+
 .v2-auth-focus-card h1 {
   margin: 0;
+  color: var(--arc-text-heading);
+  font: 800 22px/1.2 var(--arc-font-mono);
 }
 
 .v2-auth-method-card label,
 .v2-auth-focus-card label,
 .nip49-modal-field label,
 .nip49-modal-result label {
-  font-size: 0.8rem;
+  color: var(--arc-text-secondary);
+  font-size: var(--arc-text-11);
   font-weight: 700;
 }
 
@@ -4711,7 +4762,7 @@ dialog.v2-confirm-backdrop::backdrop {
   padding: clamp(1.5rem, 5vw, 3rem);
   background:
     radial-gradient(circle at 75% 15%, rgba(48, 199, 224, 0.12), transparent 38%),
-    radial-gradient(circle at 15% 75%, rgba(186, 132, 255, 0.17), transparent 40%),
+    radial-gradient(circle at 15% 75%, oklch(0.78 0.16 60 / 0.17), transparent 40%),
     var(--v2-surface-high);
 }
 
@@ -4988,7 +5039,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .arc-profile-metadata a {
-  color: var(--arc-info);
+  color: var(--arc-action);
 }
 
 .arc-profile-key-details {
@@ -5073,7 +5124,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .arc-profile-listing-copy small {
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
 }
 
 .arc-profile-listing-copy .arc-status-chip {
@@ -5149,7 +5200,7 @@ dialog.v2-confirm-backdrop::backdrop {
   flex-basis: 100%;
   margin: 0;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   line-height: 1.45;
 }
 
@@ -5278,10 +5329,14 @@ dialog.v2-confirm-backdrop::backdrop {
   min-height: 0;
 }
 
+/* Thumbnail wells are too small for a legible caption: keep the hatch,
+   hide the text (the well's aria-label still names the state). */
 .v2-achievement-art .arc-artwork-fallback {
-  padding: 3px;
-  font-size: 6.5px;
-  letter-spacing: 0;
+  padding: 0;
+}
+
+.v2-achievement-art .arc-artwork-fallback span {
+  display: none;
 }
 
 .v2-achievement-copy h2 {
@@ -5290,7 +5345,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-achievement-copy > p:last-child {
-  font-size: 10px;
+  font-size: 10.5px;
   line-height: 1.45;
 }
 
@@ -5306,7 +5361,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-achievement-meta dt,
 .v2-achievement-meta dd {
-  font-size: 9px;
+  font-size: 10.5px;
 }
 
 .v2-achievement-state {
@@ -5340,7 +5395,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-badge-showcase-source {
   margin: 0 0 10px;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   line-height: 1.45;
 }
 
@@ -5349,7 +5404,7 @@ dialog.v2-confirm-backdrop::backdrop {
   border-left: 2px solid var(--arc-warning);
   padding-left: 8px;
   color: var(--arc-text-secondary);
-  font-size: 10px;
+  font-size: 10.5px;
   line-height: 1.45;
 }
 
@@ -5374,10 +5429,14 @@ dialog.v2-confirm-backdrop::backdrop {
   min-height: 0;
 }
 
+/* Thumbnail wells are too small for a legible caption: keep the hatch,
+   hide the text (the well's aria-label still names the state). */
 .v2-badge-chip-art .arc-artwork-fallback {
-  padding: 3px;
-  font-size: 6px;
-  letter-spacing: 0;
+  padding: 0;
+}
+
+.v2-badge-chip-art .arc-artwork-fallback span {
+  display: none;
 }
 
 .v2-badge-chip strong {
@@ -5385,7 +5444,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-badge-chip span {
-  font-size: 9.5px;
+  font-size: 10.5px;
 }
 
 @media (max-width: 924px) {
@@ -5423,7 +5482,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-display {
   font-family: var(--v2-font-display);
-  letter-spacing: -0.02em;
+  letter-spacing: var(--arc-tracking-tight);
 }
 
 .v2-panel,
@@ -5666,14 +5725,15 @@ dialog.v2-confirm-backdrop::backdrop {
   font-size: 11px;
 }
 
+/* Plain muted text: 8px boxed text read as an empty pill. */
 .arc-tab-unavailable {
   display: inline-flex;
   align-items: center;
-  border: 1px solid var(--arc-border-default);
-  border-radius: var(--arc-radius-xs);
-  padding: 2px 4px;
-  font-size: 8px;
-  letter-spacing: 0.4px;
+  color: var(--arc-text-subdued);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .arc-status-chip {
@@ -5886,7 +5946,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .arc-game-card-art-shade {
   position: absolute;
   inset: auto 0 0;
-  height: 72px;
+  height: 88px;
   background: linear-gradient(180deg, transparent, rgb(0 0 0 / 86%));
   pointer-events: none;
 }
@@ -5902,8 +5962,12 @@ dialog.v2-confirm-backdrop::backdrop {
   font-size: 17px;
   font-weight: 800;
   line-height: 1.15;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* Two lines, not one: listings often share long title prefixes, and a
+     single-line ellipsis made distinct games read as identical. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
 }
 
 .arc-game-card-body {
@@ -5992,6 +6056,19 @@ dialog.v2-confirm-backdrop::backdrop {
   font-size: 11px;
   font-weight: 800;
   cursor: pointer;
+}
+
+/* Secondary (navigational) card action: blue outline, never the amber CTA. */
+.arc-game-card-action-secondary {
+  border-color: oklch(0.5 0.13 210);
+  background: transparent;
+  color: oklch(0.8 0.13 210);
+  text-transform: uppercase;
+}
+
+.arc-game-card-action-secondary:hover:not(:disabled) {
+  border-color: oklch(0.78 0.13 210);
+  background: oklch(0.78 0.13 210 / 10%);
 }
 
 .arc-game-card-action:disabled {
@@ -6456,6 +6533,21 @@ dialog.v2-confirm-backdrop::backdrop {
   font-size: 13px;
 }
 
+/* Navigational hero action is the outlined secondary (reference DETAILS >);
+   a filled button is reserved for the acquisition CTA. */
+.arc-store-hero-actions > .v2-btn-action {
+  padding: 11px 20px;
+  border-color: oklch(0.45 0.13 195);
+  background: transparent;
+  color: oklch(0.8 0.14 195);
+  text-transform: uppercase;
+}
+
+.arc-store-hero-actions > .v2-btn-action:hover:not(:disabled) {
+  border-color: oklch(0.8 0.14 195);
+  background: oklch(0.8 0.14 195 / 8%);
+}
+
 .arc-store-hero-capabilities {
   display: flex;
   flex-wrap: wrap;
@@ -6637,9 +6729,11 @@ dialog.v2-confirm-backdrop::backdrop {
   min-width: 0;
 }
 
+/* Skill section header: amber "◆ NAME" kicker followed by the dashed rule. */
 .arc-store-section-heading {
   margin-bottom: 18px;
-  color: var(--arc-text-primary);
+  gap: 10px;
+  color: oklch(0.8 0.16 60);
   font-size: 12px;
   letter-spacing: 1.5px;
 }
@@ -6647,6 +6741,10 @@ dialog.v2-confirm-backdrop::backdrop {
 .arc-store-section-heading h2 {
   margin: 0;
   font: inherit;
+}
+
+.arc-store-section-heading h2::before {
+  content: "\25C6\00a0";
 }
 
 .arc-store-section-heading button {
@@ -6851,7 +6949,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .arc-browse-active-filters > span {
   margin-right: 2px;
   color: var(--arc-text-subdued);
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 800;
   letter-spacing: 1px;
   text-transform: uppercase;
@@ -7034,8 +7132,7 @@ dialog.v2-confirm-backdrop::backdrop {
   border: 1px solid var(--v2-outline-ghost);
   border-radius: var(--v2-radius-xl);
   background:
-    radial-gradient(circle at 90% 0%, oklch(0.78 0.16 300 / 20%), transparent 38%),
-    linear-gradient(145deg, var(--v2-surface-low), var(--v2-surface-high));
+    var(--arc-surface);
   box-shadow: var(--v2-shadow-ambient);
 }
 
@@ -7294,7 +7391,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-publisher-dashboard .v2-publisher-kicker {
   margin-bottom: 4px;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   letter-spacing: 1.5px;
 }
 
@@ -7408,7 +7505,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-publisher-summary-state {
   margin: 0;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   line-height: 1.5;
 }
 
@@ -7445,10 +7542,14 @@ dialog.v2-confirm-backdrop::backdrop {
   min-height: 0;
 }
 
+/* Thumbnail wells are too small for a legible caption: keep the hatch,
+   hide the text (the well's aria-label still names the state). */
 .v2-publisher-row-art .arc-artwork-fallback {
-  padding: 3px;
-  font-size: 6px;
-  letter-spacing: 0;
+  padding: 0;
+}
+
+.v2-publisher-row-art .arc-artwork-fallback span {
+  display: none;
 }
 
 .v2-publisher-row-copy {
@@ -7567,6 +7668,7 @@ dialog.v2-confirm-backdrop::backdrop {
   background: var(--arc-surface);
 }
 
+/* Needs attention: handoff violet panel (Arcadestr.dc.html "Attention needed"). */
 .v2-publisher-attention {
   border-color: oklch(0.5 0.13 300 / 50%);
   background: oklch(0.5 0.13 300 / 8%);
@@ -7574,8 +7676,9 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-publisher-attention > p {
   margin: 0;
-  color: var(--arc-info);
-  font-size: 11px;
+  color: oklch(0.75 0.13 300);
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .v2-publisher-attention ul {
@@ -7673,7 +7776,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-publisher-campaign-summary > div span {
   overflow: hidden;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -7903,7 +8006,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-publisher-manage .v2-publisher-kicker {
   margin-bottom: 0;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   letter-spacing: 1.5px;
 }
 
@@ -8008,21 +8111,21 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-auth-copy-npub {
   margin-left: 8px;
   padding: 2px 8px;
-  font-size: 10px;
+  font-size: 10.5px;
 }
 
 .v2-auth-copy-status {
   display: block;
   margin-top: 4px;
   color: var(--arc-success);
-  font-size: 10px;
+  font-size: 10.5px;
 }
 
 .v2-settings-state {
   border: 1px solid var(--arc-border-control);
   border-radius: var(--arc-radius-xs);
   padding: 3px 8px;
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 700;
   white-space: nowrap;
 }
@@ -8058,30 +8161,25 @@ dialog.v2-confirm-backdrop::backdrop {
   gap: 12px;
 }
 
+/* Page headers sit unboxed on the page, matching PageHeader elsewhere. */
 .v2-purchases-hero {
   min-height: 0;
-  padding: 14px 16px;
-  border: 1px solid var(--arc-border-card);
-  border-radius: var(--arc-radius-md);
-  background: var(--arc-surface);
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .v2-purchases-hero h1 {
-  margin: 3px 0 4px;
-  font: 800 18px/1.3 var(--arc-font-mono);
+  margin: 6px 0;
+  font: 800 22px/1.25 var(--arc-font-mono);
   letter-spacing: 0;
-}
-
-.v2-purchases-hero .v2-store-kicker {
-  color: var(--arc-text-muted);
-  font-size: 10px;
-  letter-spacing: 1.5px;
 }
 
 .v2-purchases-hero > p:last-child {
   color: var(--arc-text-muted);
-  font-size: 10.5px;
-  line-height: 1.5;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .v2-purchases h2 {
@@ -8104,7 +8202,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-purchase-copy {
   margin-left: 8px;
   padding: 2px 8px;
-  font-size: 10px;
+  font-size: 10.5px;
 }
 
 .v2-purchase-copy-status {
@@ -8178,7 +8276,7 @@ dialog.v2-confirm-backdrop::backdrop {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 700;
 }
 
@@ -8264,7 +8362,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-publisher-editor .v2-publisher-kicker {
   margin-bottom: 3px;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   letter-spacing: 1.5px;
 }
 
@@ -8530,7 +8628,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-create-stage-index {
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 800;
   letter-spacing: 1.2px;
   text-transform: uppercase;
@@ -8544,7 +8642,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-create-stage-status {
-  font-size: 10px;
+  font-size: 10.5px;
   line-height: 1.4;
 }
 
@@ -8634,7 +8732,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-create-kicker {
   margin: 0;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 800;
   letter-spacing: 1.5px;
   text-transform: uppercase;
@@ -8696,7 +8794,7 @@ dialog.v2-confirm-backdrop::backdrop {
   background: transparent;
   color: var(--arc-error-text);
   font-family: inherit;
-  font-size: 10px;
+  font-size: 10.5px;
   cursor: pointer;
 }
 
@@ -8894,7 +8992,7 @@ dialog.v2-confirm-backdrop::backdrop {
   background: oklch(0 0 0 / 60%);
   color: var(--arc-text-overlay);
   font-family: inherit;
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 700;
   cursor: pointer;
 }
@@ -8905,7 +9003,7 @@ dialog.v2-confirm-backdrop::backdrop {
   background: transparent;
   color: var(--arc-text-overlay);
   font-family: inherit;
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 700;
   cursor: pointer;
 }
@@ -9029,7 +9127,7 @@ dialog.v2-confirm-backdrop::backdrop {
   padding: 3px 8px;
   background: var(--arc-accent);
   color: var(--arc-background);
-  font-size: 9.5px;
+  font-size: 10.5px;
   font-weight: 800;
   letter-spacing: 1px;
   text-transform: uppercase;
@@ -9185,7 +9283,7 @@ dialog.v2-confirm-backdrop::backdrop {
   border: 1px solid var(--arc-border-control);
   border-radius: var(--arc-radius-xs);
   padding: 3px 8px;
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 700;
   white-space: nowrap;
 }
@@ -9250,7 +9348,7 @@ dialog.v2-confirm-backdrop::backdrop {
   justify-content: space-between;
   gap: 10px;
   margin-bottom: 5px;
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 700;
 }
 
@@ -9273,7 +9371,7 @@ dialog.v2-confirm-backdrop::backdrop {
   margin: 10px 0 0;
   padding-left: 16px;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   line-height: 1.45;
 }
 
@@ -9305,7 +9403,7 @@ dialog.v2-confirm-backdrop::backdrop {
 
 .v2-create-authoring-dirty {
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
 }
 
 .v2-create-actions-buttons {
@@ -9393,7 +9491,7 @@ dialog.v2-confirm-backdrop::backdrop {
 .v2-store-page-editor .v2-publisher-kicker {
   margin-bottom: 3px;
   color: var(--arc-text-muted);
-  font-size: 10px;
+  font-size: 10.5px;
   letter-spacing: 1.5px;
 }
 
@@ -9438,7 +9536,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .v2-store-tab-flag {
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 800;
   line-height: 1;
 }
@@ -9458,9 +9556,33 @@ dialog.v2-confirm-backdrop::backdrop {
   line-height: 1.5;
 }
 
+/* Field labels: 700 11px dim, stacked above the control (handoff spec).
+   align-content: start stops a tall grid row from stretching the control. */
 .v2-store-page-editor label {
   display: grid;
+  align-content: start;
   gap: 5px;
+}
+
+.v2-store-page-editor label:not(:has(> input[type="checkbox"], > input[type="radio"])) {
+  color: oklch(0.6 0.01 60);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.v2-store-page-editor label > .v2-input,
+.v2-store-page-editor label > textarea,
+.v2-store-page-editor label > select {
+  font-weight: 400;
+}
+
+/* Panel titles are section kickers: amber, uppercase, tracked. */
+.v2-store-page-editor .v2-publisher-panel > h2 {
+  color: oklch(0.8 0.16 60);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
 }
 
 .v2-store-page-editor ul {
@@ -10495,24 +10617,32 @@ dialog.v2-confirm-backdrop::backdrop {
   min-width: 0;
 }
 
-.arc-dialog-kicker {
+/* Dialog text rules are written as .arc-dialog .x so page-scoped rules
+   (e.g. .v2-store-page-editor h2 / p) cannot restyle a dialog opened from
+   inside that page. */
+.arc-dialog .arc-dialog-kicker {
   margin: 0;
-  color: var(--arc-text-muted);
-  font-size: var(--arc-text-10-5);
+  color: oklch(0.8 0.16 60);
+  font-size: var(--arc-text-11);
+  font-weight: var(--arc-weight-black);
   letter-spacing: var(--arc-tracking-label);
+  line-height: 1.4;
   text-transform: uppercase;
 }
 
-.arc-dialog-title {
+.arc-dialog .arc-dialog-title {
   margin: 0;
   color: var(--arc-text-heading);
-  font-size: var(--arc-text-18);
-  font-weight: var(--arc-weight-bold);
+  font-family: var(--arc-font-mono);
+  font-size: var(--arc-text-16);
+  font-weight: var(--arc-weight-black);
+  letter-spacing: 0;
   line-height: var(--arc-leading-title);
   overflow-wrap: anywhere;
+  text-transform: none;
 }
 
-.arc-dialog-description {
+.arc-dialog .arc-dialog-description {
   flex: 0 0 auto;
   margin: 0;
   color: var(--arc-text-secondary);

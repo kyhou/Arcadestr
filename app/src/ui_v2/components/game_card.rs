@@ -78,6 +78,9 @@ pub struct GameCardStatus {
 pub struct GameCardActionPresentation {
     pub label: String,
     pub disabled: bool,
+    /// Navigation to the details page renders as the secondary action; buy,
+    /// claim and install stay the primary contextual action.
+    pub navigational: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +210,7 @@ pub fn GameCard(
     let action_presentation = action.map(|action| GameCardActionPresentation {
         label: action_label(action, presentation).to_string(),
         disabled: false,
+        navigational: action == GameCardAction::ViewDetails,
     });
     let action_callback = on_action.map(|callback| {
         Callback::new(move |_| {
@@ -264,10 +268,11 @@ pub fn GameCardVisual(
     let artwork = artwork_state_from_url(content.artwork_url.clone());
 
     view! {
-        <article class=format!("arc-game-card {}", density.class()) class:arc-game-card-disabled=disabled>
+        <article class=format!("arc-game-card {}", density.class()) class:arc-game-card-disabled=disabled style="display:flex;flex-direction:column">
             <button
                 type="button"
                 class="arc-game-card-main"
+                style="flex:1 1 auto"
                 disabled=disabled
                 aria-label={format!("Open details for {title}")}
                 on:click=move |_| {
@@ -324,10 +329,12 @@ pub fn GameCardVisual(
                 <button
                     type="button"
                     class="arc-game-card-action"
+                    class:arc-game-card-action-secondary=action.navigational
                     disabled=disabled || action.disabled
                     on:click=move |_| callback.run(())
                 >
                     {action.label}
+                    {action.navigational.then(|| view! { <span aria-hidden="true">" >"</span> })}
                 </button>
             })}
         </article>

@@ -720,7 +720,7 @@ pub fn SettingsView(
             <PageHeader
                 eyebrow="Account and client".to_string()
                 title="Settings".to_string()
-                description="Manage real signer, network, key-export, and application state. Unsupported controls are intentionally absent.".to_string()
+                description="Manage your account, wallet, and security. Network tools and troubleshooting are available under advanced options.".to_string()
             />
 
             <Show when=move || action_error.get().is_some()>
@@ -734,7 +734,7 @@ pub fn SettingsView(
                 <section class="v2-settings-card v2-settings-account-card">
                     <header class="v2-settings-card-header">
                         <span class="v2-settings-icon material-symbols-outlined" aria-hidden="true">"person"</span>
-                        <div><p class="v2-store-kicker">"Identity"</p><h2>"Account and signer"</h2></div>
+                        <div><p class="v2-store-kicker">"Your account"</p><h2>"Account and sign-in"</h2></div>
                     </header>
                     <div class="v2-settings-active-account">
                         {move || match active_avatar.get() {
@@ -754,7 +754,7 @@ pub fn SettingsView(
                     <div class="v2-settings-actions">
                         <Show when=move || !standalone_web && active_account.get().map(|account| account.signing_mode.eq_ignore_ascii_case("nip46")).unwrap_or(false)>
                             <button class="v2-btn-secondary" on:click=on_reconnect_signer disabled=move || reconnecting.get() || auth_stored.get_value().is_loading.get()>
-                                {move || if reconnecting.get() { "Reconnecting..." } else { "Reconnect signer" }}
+                                {move || if reconnecting.get() { "Reconnecting..." } else { "Reconnect signing app" }}
                             </button>
                         </Show>
                         <button class="v2-btn-danger" disabled=move || auth_stored.get_value().is_loading.get() on:click=move |_| on_sign_out.run(())>"Sign out"</button>
@@ -771,7 +771,7 @@ pub fn SettingsView(
                                 <article class="v2-settings-account-row">
                                     <div><strong>{label}</strong><span>{npub_fallback_label(&account.npub)}</span><span>{signer_label(&account.signing_mode)}</span></div>
                                     <div class="v2-settings-row-actions">
-                                        <button class="v2-btn-ghost" disabled=move || is_active || auth_stored.get_value().is_loading.get() on:click=move |_| {
+                                        <button class=if is_active { "v2-btn-ghost" } else { "v2-btn-secondary" } disabled=move || is_active || auth_stored.get_value().is_loading.get() on:click=move |_| {
                                             let auth = auth_stored.get_value();
                                             let account_id = account_id.clone();
                                             spawn_local(async move {
@@ -796,37 +796,39 @@ pub fn SettingsView(
                     <section class="v2-settings-card">
                         <header class="v2-settings-card-header">
                             <span class="v2-settings-icon material-symbols-outlined" aria-hidden="true">"key"</span>
-                            <div><p class="v2-store-kicker">"Local protection"</p><h2>"Security and keys"</h2></div>
+                            <div><p class="v2-store-kicker">"Local protection"</p><h2>"Back up your sign-in key"</h2></div>
                         </header>
-                        <p>"NIP-49 export encrypts a local secret key with a new password. Remote signers do not expose their keys to Arcadestr."</p>
+                        <p>"Save a password-protected copy of your secret key. Keep the backup and its password somewhere safe: they are needed to restore access. If you use a signing app, back up your account in that app instead."</p>
                         {move || if supports_local_export(active_account.get().as_ref(), standalone_web) {
                             view! { <button class="v2-btn-primary" disabled=move || auth_stored.get_value().is_loading.get() on:click=move |_| {
                                 export_account.set(auth.npub.get_untracked().unwrap_or_default());
                                 show_export.set(true);
-                            }>"Export encrypted NIP-49 key"</button> }.into_any()
+                            }>"Save encrypted key backup"</button> }.into_any()
                         } else {
-                            view! { <p class="v2-settings-muted">"Encrypted-key export is unavailable for the active signer type."</p> }.into_any()
+                            view! { <p class="v2-settings-muted">"Arcadestr cannot export a key for this sign-in method. Use your signing app or extension to manage its backup."</p> }.into_any()
                         }}
                         {move || export_status.get().map(|status| view! { <p class="v2-settings-alert" role="status">{status}</p> })}
                     </section>
                 </Show>
 
                 <Show when=move || availability.native_network>
+                    <crate::ui_v2::components::AdvancedOptions title="ADVANCED NETWORK OPTIONS" description="Arcadestr manages network connections for you. Use these tools to troubleshoot connections or choose where your uploaded images and videos are stored.">
                     <section class="v2-settings-card">
                         <header class="v2-settings-card-header">
                             <span class="v2-settings-icon material-symbols-outlined" aria-hidden="true">"hub"</span>
                             <div><p class="v2-store-kicker">"Nostr network"</p><h2>"Network and relays"</h2></div>
                         </header>
-                        <p>"Relays are network servers used to receive and publish Nostr events."</p>
+                        <p>"Relays are the servers Arcadestr uses to find games and share updates."</p>
                         <strong>{move || relay_state_label(connected_relays.get().len())}</strong>
                         {move || if connected_relays.get().is_empty() {
-                            view! { <p class="v2-settings-muted">"The client currently has no confirmed relay connections."</p> }.into_any()
+                            view! { <p class="v2-settings-muted">"Not connected. Check your internet connection, then select Reconnect."</p> }.into_any()
                         } else {
                             view! { <ul class="v2-settings-relay-list">{connected_relays.get().into_iter().map(|relay| view! { <li>{relay}</li> }).collect::<Vec<_>>()}</ul> }.into_any()
                         }}
                         <button class="v2-btn-secondary" on:click=on_reconnect_relays disabled=move || relay_reconnecting.get()>
-                            {move || if relay_reconnecting.get() { "Reconnecting..." } else { "Reconnect relays" }}
+                            {move || if relay_reconnecting.get() { "Reconnecting..." } else { "Reconnect" }}
                         </button>
+                        <crate::ui_v2::components::AdvancedOptions title="DEVELOPER CONNECTION OPTIONS" description="Leave this off for normal use. Unencrypted public connections can expose network traffic or allow it to be altered.">
                         <label class="v2-settings-toggle-row">
                             <span><strong>"Allow insecure public ws:// relays"</strong><small>"Keep off for safety. Local development relays remain allowed."</small></span>
                             <input type="checkbox" disabled=move || insecure_setting_saving.get() prop:checked=move || allow_insecure_public_ws.get() on:change=move |event| {
@@ -845,15 +847,13 @@ pub fn SettingsView(
                                 });
                             } />
                         </label>
+                        </crate::ui_v2::components::AdvancedOptions>
                         {move || settings_error.get().map(|error| view! { <p class="v2-settings-alert v2-settings-alert-error" role="alert">{error}</p> })}
                     </section>
-                </Show>
-
-                <Show when=move || availability.native_network>
                     <section class="v2-settings-card" aria-labelledby="settings-blossom-title">
                         <header class="v2-settings-card-header">
                             <span class="v2-settings-icon material-symbols-outlined" aria-hidden="true">"cloud_upload"</span>
-                            <div><p class="v2-store-kicker">"Media hosting"</p><h2 id="settings-blossom-title">"Blossom servers"</h2></div>
+                            <div><p class="v2-store-kicker">"Media hosting"</p><h2 id="settings-blossom-title">"Image and video servers"</h2></div>
                             {move || { let state = settings_operation_state(
                                 availability.native_network,
                                 blossom_loading.get(),
@@ -865,7 +865,7 @@ pub fn SettingsView(
                             ); view! { <span class=move || format!("v2-settings-state {}", state.class()) role="status">{state.label()}</span> } }}
                         </header>
                         <div class="v2-settings-section-heading">
-                            <p>"Blossom servers host game covers, screenshots, trailers, and Store Page media. Settings are scoped to the active account."</p>
+                            <p>"These servers (called Blossom servers) store the game covers, screenshots, and videos you upload. Changes apply only to your current account."</p>
                             <button type="button" class="v2-btn-ghost v2-settings-heading-action" disabled=move || blossom_loading.get() || blossom_health_loading.get() || blossom_settings.get().is_none() on:click=move |_| blossom_health_refresh.update(|value| *value = value.wrapping_add(1))>{move || if blossom_health_loading.get() { "Checking…" } else { "Refresh status" }}</button>
                         </div>
                         <Show when=move || blossom_loading.get()>
@@ -923,6 +923,7 @@ pub fn SettingsView(
                         {move || blossom_health_error.get().map(|error| view! { <p class="v2-settings-alert v2-settings-alert-error" role="alert">{format!("Server status check failed: {error}")}</p> })}
                         {move || blossom_status.get().map(|status| view! { <p class="v2-settings-alert" role="status">{status}</p> })}
                     </section>
+                    </crate::ui_v2::components::AdvancedOptions>
                 </Show>
 
                 <section class="v2-settings-card">
@@ -930,9 +931,10 @@ pub fn SettingsView(
                         <span class="v2-settings-icon material-symbols-outlined" aria-hidden="true">"backup"</span>
                         <div><p class="v2-store-kicker">"Recovery"</p><h2>"Account backup"</h2></div>
                     </header>
-                    <p class="v2-settings-muted">"Full account backup and restore are unavailable because this build has no registered create or restore commands. No nonfunctional controls are shown."</p>
+                    <p class="v2-settings-muted">"Full app backup and restore are not available yet. If you sign in with a secret key, use the desktop app's encrypted key backup. If you use a signing app or extension, use its backup tools instead."</p>
                 </section>
 
+                <crate::ui_v2::components::AdvancedOptions title="TROUBLESHOOTING" description="Application details for investigating a problem. You do not need these tools to play games.">
                 <section class="v2-settings-card v2-settings-diagnostics">
                     <header class="v2-settings-card-header">
                         <span class="v2-settings-icon material-symbols-outlined" aria-hidden="true">"info"</span>
@@ -947,9 +949,10 @@ pub fn SettingsView(
                     {move || platform_error.get().map(|error| view! { <p class="v2-settings-muted">{format!("Platform detection unavailable: {error}")}</p> })}
                     <p class="v2-settings-muted">"For troubleshooting, launch Arcadestr from a terminal to capture application logs. The summary below contains no keys or authentication tokens."</p>
                     <pre class="v2-settings-diagnostic-summary">{move || diagnostic_text.get()}</pre>
-                    <button class="v2-btn-secondary" on:click=on_copy_diagnostics>"Copy non-sensitive summary"</button>
+                    <button class="v2-btn-secondary" on:click=on_copy_diagnostics>"Copy troubleshooting details"</button>
                     {move || diagnostic_copy_status.get().map(|status| view! { <p class="v2-settings-alert" role="status">{status}</p> })}
                 </section>
+                </crate::ui_v2::components::AdvancedOptions>
             </div>
 
             <Dialog

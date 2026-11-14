@@ -87,6 +87,23 @@ enum UiV2View {
     Settings,
 }
 
+impl UiV2View {
+    fn page_title(&self) -> String {
+        match self {
+            Self::Store => "Store".to_string(),
+            Self::Browse(_) => "Browse games".to_string(),
+            Self::Detail(listing, _) => listing.title.clone(),
+            Self::Library => "Library".to_string(),
+            Self::Social => "Community".to_string(),
+            Self::Achievements => "Achievements".to_string(),
+            Self::Purchases => "Purchases and access".to_string(),
+            Self::Publish(_) => "Publisher console".to_string(),
+            Self::Profile => "Profile".to_string(),
+            Self::Settings => "Settings".to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -380,6 +397,18 @@ mod tests {
     }
 
     #[test]
+    fn navigation_titles_identify_the_destination() {
+        assert_eq!(UiV2View::Store.page_title(), "Store");
+        assert_eq!(UiV2View::Social.page_title(), "Community");
+        assert_eq!(UiV2View::Settings.page_title(), "Settings");
+        let game = listing();
+        assert_eq!(
+            UiV2View::Detail(game.clone(), DetailOrigin::Store).page_title(),
+            game.title
+        );
+    }
+
+    #[test]
     fn profile_achievements_and_settings_navigation_remain_available() {
         let source = include_str!("shell.rs");
         for destination in [
@@ -423,6 +452,36 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
         });
     }
     let current_view = RwSignal::new(UiV2View::Store);
+    let page_title = Signal::derive(move || current_view.with(UiV2View::page_title));
+
+    // Signal-based routes do not get browser navigation's title, focus, or
+    // scroll reset for free. Wait for the destination DOM before focusing it.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let previous_view = StoredValue::new(None::<UiV2View>);
+        Effect::new(move |_| {
+            let view = current_view.get();
+            document().set_title(&format!("{} — Arcadestr", view.page_title()));
+            let previous = previous_view.get_value();
+            previous_view.set_value(Some(view.clone()));
+            if previous.as_ref().is_some_and(|previous| previous != &view) {
+                request_animation_frame(move || {
+                    // A newer navigation may have superseded this frame.
+                    if current_view.get_untracked() != view {
+                        return;
+                    }
+                    use wasm_bindgen::JsCast;
+                    if let Some(main) = document()
+                        .get_element_by_id(ROUTE_FOCUS_FALLBACK_ID)
+                        .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+                    {
+                        let _ = main.focus();
+                    }
+                    window().scroll_to_with_x_and_y(0.0, 0.0);
+                });
+            }
+        });
+    }
     let connected_relays = RwSignal::new(Vec::<String>::new());
     let relay_snapshot_loaded = RwSignal::new(false);
     let pending_relay_events = RwSignal::new(Vec::<(String, String)>::new());
@@ -721,7 +780,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                 on_disconnect=on_disconnect
             />
 
-            <main id=ROUTE_FOCUS_FALLBACK_ID tabindex="-1">
+            <main id=ROUTE_FOCUS_FALLBACK_ID tabindex="-1" aria-label=move || page_title.get()>
                 <PageContainer wide=true full_height=true>
                     {move || match current_view.get() {
                         UiV2View::Store => view! {
@@ -737,12 +796,12 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         }
                         .into_any(),
                         UiV2View::Library => view! {
-                            <LibraryView on_open_listing=on_select_library_listing />
+                            <LibraryView on_open_listing=on_select_library_listing on_browse_store=navigate_store />
                         }
                         .into_any(),
                         UiV2View::Social => view! { <SocialView /> }.into_any(),
                         UiV2View::Achievements => view! { <AchievementsView /> }.into_any(),
-                        UiV2View::Purchases => view! { <PurchasesView /> }.into_any(),
+                        UiV2View::Purchases => view! { <PurchasesView on_browse_store=navigate_store /> }.into_any(),
                         UiV2View::Publish(state) => {
                             let on_navigate = Callback::new(move |state| {
                                 navigate_guarded.run(UiV2View::Publish(state));

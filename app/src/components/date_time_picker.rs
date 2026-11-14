@@ -66,7 +66,7 @@ pub fn DateTimeRangePicker(
                         }
                     }
                 >
-                    <span class="text-[10px] font-bold uppercase tracking-widest text-secondary">"Starts"</span>
+                    <span class="text-[10.5px] font-bold uppercase tracking-widest text-secondary">"Starts"</span>
                     <strong class="truncate text-xs">{move || display_datetime(&starts_at.get())}</strong>
                 </button>
                 <button
@@ -80,7 +80,7 @@ pub fn DateTimeRangePicker(
                         }
                     }
                 >
-                    <span class="text-[10px] font-bold uppercase tracking-widest text-secondary">"Ends"</span>
+                    <span class="text-[10.5px] font-bold uppercase tracking-widest text-secondary">"Ends"</span>
                     <strong class="truncate text-xs">{move || display_datetime(&ends_at.get())}</strong>
                 </button>
             </div>
@@ -88,11 +88,11 @@ pub fn DateTimeRangePicker(
             <div class="p-3">
                 <header class="mb-2 grid grid-cols-[2rem_1fr_2rem] items-center">
                     <button type="button" class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-on-surface-variant transition-colors hover:bg-surface-bright hover:text-on-surface disabled:opacity-40" aria-label="Previous month" disabled=move || disabled.get() on:click=previous_month>
-                        <span class="material-symbols-outlined text-lg" aria-hidden="true">"chevron_left"</span>
+                        <span class="material-symbols-outlined text-lg leading-none" aria-hidden="true">"chevron_left"</span>
                     </button>
                     <strong class="text-center text-sm font-bold">{move || format!("{} {}", display_date.get().month(), display_date.get().year())}</strong>
                     <button type="button" class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-on-surface-variant transition-colors hover:bg-surface-bright hover:text-on-surface disabled:opacity-40" aria-label="Next month" disabled=move || disabled.get() on:click=next_month>
-                        <span class="material-symbols-outlined text-lg" aria-hidden="true">"chevron_right"</span>
+                        <span class="material-symbols-outlined text-lg leading-none" aria-hidden="true">"chevron_right"</span>
                     </button>
                 </header>
 
@@ -148,14 +148,14 @@ pub fn DateTimeRangePicker(
                     <span>"Start time"</span>
                     <span class="relative">
                         <input aria-label="Start time" required=true class="w-full min-w-0 rounded-lg border border-outline-variant/25 bg-surface-container-high py-2 pl-2.5 pr-8 text-sm text-on-surface [&::-webkit-calendar-picker-indicator]:hidden" type="time" step="60" prop:value=move || datetime_time(&starts_at.get()) on:input:target=move |event| on_starts_at.run(replace_datetime_time(&starts_at.get_untracked(), &event.target().value())) disabled=move || disabled.get() />
-                        <span class="material-symbols-outlined pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-lg text-on-surface-variant" aria-hidden="true">"schedule"</span>
+                        <span class="material-symbols-outlined pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-lg leading-none text-on-surface-variant" aria-hidden="true">"schedule"</span>
                     </span>
                 </label>
                 <label class="grid min-w-0 gap-1 text-xs font-semibold text-on-surface-variant">
                     <span>"End time"</span>
                     <span class="relative">
                         <input aria-label="End time" required=true class="w-full min-w-0 rounded-lg border border-outline-variant/25 bg-surface-container-high py-2 pl-2.5 pr-8 text-sm text-on-surface [&::-webkit-calendar-picker-indicator]:hidden" type="time" step="60" prop:value=move || datetime_time(&ends_at.get()) on:input:target=move |event| on_ends_at.run(replace_datetime_time(&ends_at.get_untracked(), &event.target().value())) disabled=move || disabled.get() />
-                        <span class="material-symbols-outlined pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-lg text-on-surface-variant" aria-hidden="true">"schedule"</span>
+                        <span class="material-symbols-outlined pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-lg leading-none text-on-surface-variant" aria-hidden="true">"schedule"</span>
                     </span>
                 </label>
             </div>
@@ -188,7 +188,7 @@ pub fn DatePicker(
             <button
                 id=trigger_id
                 type="button"
-                class="v2-input flex min-h-12 items-center justify-between gap-3 text-left"
+                class="v2-input flex items-center justify-between gap-3 text-left"
                 aria-label="Choose release date"
                 aria-expanded=move || aria_bool(open.get())
                 disabled=move || disabled.get()
@@ -203,7 +203,7 @@ pub fn DatePicker(
                     let current = value.get();
                     if current.trim().is_empty() { "Select a date".to_string() } else { current }
                 }}</span>
-                <span class="material-symbols-outlined text-lg text-on-surface-variant" aria-hidden="true">"calendar_month"</span>
+                <span class="material-symbols-outlined text-lg leading-none text-on-surface-variant" aria-hidden="true">"calendar_month"</span>
             </button>
             <Show when=move || open.get()>
                 <section
@@ -222,11 +222,11 @@ pub fn DatePicker(
                 >
                     <header class="mb-2 grid grid-cols-[2rem_1fr_2rem] items-center">
                         <button type="button" class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-on-surface-variant hover:bg-surface-bright hover:text-on-surface" aria-label="Previous month" on:click=move |_| display_date.update(|date| *date = adjacent_month(*date, false))>
-                            <span class="material-symbols-outlined text-lg" aria-hidden="true">"chevron_left"</span>
+                            <span class="material-symbols-outlined text-lg leading-none" aria-hidden="true">"chevron_left"</span>
                         </button>
                         <strong class="text-center text-sm font-bold">{move || format!("{} {}", display_date.get().month(), display_date.get().year())}</strong>
                         <button type="button" class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-on-surface-variant hover:bg-surface-bright hover:text-on-surface" aria-label="Next month" on:click=move |_| display_date.update(|date| *date = adjacent_month(*date, true))>
-                            <span class="material-symbols-outlined text-lg" aria-hidden="true">"chevron_right"</span>
+                            <span class="material-symbols-outlined text-lg leading-none" aria-hidden="true">"chevron_right"</span>
                         </button>
                     </header>
                     <div class="grid grid-cols-7 text-center text-[11px] font-semibold text-on-surface-variant" aria-hidden="true">

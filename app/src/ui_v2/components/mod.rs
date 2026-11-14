@@ -1,5 +1,7 @@
 //! Shared UI v2 components.
 
+pub mod advanced_options;
+pub use advanced_options::AdvancedOptions;
 pub mod aria;
 pub mod blossom_media_upload;
 pub mod button;

@@ -477,7 +477,7 @@ pub fn LoginV2View() -> impl IntoView {
             <header class="v2-auth-topbar">
                 <div class="v2-auth-brand" aria-label="Arcadestr">
                     <span class="v2-auth-brand-mark" aria-hidden="true"></span>
-                    <span>"Arcadestr Noir"</span>
+                    <span>"Arcadestr"</span>
                 </div>
                 <Show when=move || show_back_button(
                     panel.get(),
@@ -497,7 +497,7 @@ pub fn LoginV2View() -> impl IntoView {
                             <header class="v2-auth-heading">
                                 <p class="v2-store-kicker">"Saved identities"</p>
                                 <h1 class="v2-display">"Choose an account"</h1>
-                                <p>"Switch to a securely stored identity or connect another signer."</p>
+                                <p>"Choose a saved account to continue, or connect another account."</p>
                             </header>
                             {move || if loading_accounts.get() {
                                 view! { <p class="v2-auth-live" role="status">"Restoring saved accounts..."</p> }.into_any()
@@ -577,7 +577,7 @@ pub fn LoginV2View() -> impl IntoView {
                                         <button class="v2-auth-add-card" on:click=move |_| panel.set(LoginPanel::Methods)>
                                             <span class="material-symbols-outlined" aria-hidden="true">"add"</span>
                                             <strong>"Connect another account"</strong>
-                                            <span>"Remote signer, local key, or browser extension"</span>
+                                            <span>"Use a signing app or browser extension"</span>
                                         </button>
                                     </div>
                                 }.into_any()
@@ -588,33 +588,16 @@ pub fn LoginV2View() -> impl IntoView {
                         <section>
                             <header class="v2-auth-heading">
                                 <p class="v2-store-kicker">"Sign in or connect"</p>
-                                <h1 class="v2-display">"Your keys, your choice"</h1>
-                                <p>"Choose a supported signing method. Arcadestr keeps target-specific limitations visible."</p>
+                                <h1 class="v2-display">"Sign in to Arcadestr"</h1>
+                                <p>"Use your Nostr account to continue. A signing app or browser extension lets you approve sign-in without sharing your secret key. If you do not have an account, create one in a compatible Nostr signing app first."</p>
                             </header>
                             <div class="v2-auth-method-grid">
-                                {if capabilities.bunker {
-                                    view! {
-                                        <section class="v2-auth-method-card v2-auth-method-featured">
-                                            <span class="material-symbols-outlined v2-auth-method-icon" aria-hidden="true">"security"</span>
-                                            <h2>"Remote signer"</h2>
-                                            <p>"Connect with a bunker URI or NIP-05 signer identifier. Approval stays with your signing application."</p>
-                                            <label for="bunker-uri">"Bunker URI or signer identifier"</label>
-                                            <input id="bunker-uri" class="v2-input" type="text" autocomplete="off" placeholder="bunker://... or name@example.com" bind:value=bunker_uri />
-                                            <label for="bunker-name">"Account label (optional)"</label>
-                                            <input id="bunker-name" class="v2-input" type="text" autocomplete="off" bind:value=bunker_name />
-                                            <button class="v2-btn-primary" on:click=on_connect_bunker disabled=move || auth_stored.get_value().is_loading.get()>"Connect remote signer"</button>
-                                        </section>
-                                    }.into_any()
-                                } else {
-                                    view! { <></> }.into_any()
-                                }}
-
                                 {if capabilities.nip07 {
                                     view! {
                                         <section class="v2-auth-method-card v2-auth-method-featured">
                                             <span class="material-symbols-outlined v2-auth-method-icon" aria-hidden="true">"extension"</span>
                                             <h2>"Browser extension"</h2>
-                                            <p>"Ask a NIP-07 extension for the active public key. The extension may be unavailable or deny permission."</p>
+                                            <p>"Already have a Nostr browser extension? Connect it, then approve the request in your extension."</p>
                                             <button class="v2-btn-primary" on:click=on_connect_nip07 disabled=move || auth_stored.get_value().is_loading.get()>"Connect browser extension"</button>
                                         </section>
                                     }.into_any()
@@ -626,8 +609,8 @@ pub fn LoginV2View() -> impl IntoView {
                                     view! {
                                         <section class="v2-auth-method-card">
                                             <span class="material-symbols-outlined v2-auth-method-icon" aria-hidden="true">"qr_code_2"</span>
-                                            <h2>"Nostr Connect QR"</h2>
-                                            <p>"Scan a one-time connection request with a compatible signing app."</p>
+                                            <h2>"Sign in with a QR code"</h2>
+                                            <p>"Use a signing app that supports Nostr Connect. Open its scanner, scan the code, then approve the connection."</p>
                                             <button class="v2-btn-secondary" on:click=on_start_qr disabled=move || auth_stored.get_value().is_loading.get()>"Start QR connection"</button>
                                         </section>
                                     }.into_any()
@@ -635,12 +618,29 @@ pub fn LoginV2View() -> impl IntoView {
                                     view! { <></> }.into_any()
                                 }}
 
+                                <crate::ui_v2::components::AdvancedOptions title="OTHER SIGN-IN OPTIONS" description="For users who already have a connection address or secret key. A signing app or browser extension is the safer choice on a shared device.">
+                                {if capabilities.bunker {
+                                    view! {
+                                        <section class="v2-auth-method-card">
+                                            <span class="material-symbols-outlined v2-auth-method-icon" aria-hidden="true">"security"</span>
+                                            <h2>"Connect a signing app manually"</h2>
+                                            <p>"Paste the connection address (bunker URI) or signer identifier supplied by your signing app, then approve the connection there."</p>
+                                            <label for="bunker-uri">"Connection address or signer identifier"</label>
+                                            <input id="bunker-uri" class="v2-input" type="text" autocomplete="off" placeholder="bunker://... or name@example.com" bind:value=bunker_uri />
+                                            <label for="bunker-name">"Account label (optional)"</label>
+                                            <input id="bunker-name" class="v2-input" type="text" autocomplete="off" bind:value=bunker_name />
+                                            <button class="v2-btn-primary" on:click=on_connect_bunker disabled=move || auth_stored.get_value().is_loading.get()>"Connect remote signer"</button>
+                                        </section>
+                                    }.into_any()
+                                } else {
+                                    view! { <></> }.into_any()
+                                }}
                                 {if capabilities.local_nsec {
                                     view! {
                                         <section class="v2-auth-method-card">
                                             <span class="material-symbols-outlined v2-auth-method-icon" aria-hidden="true">"key"</span>
-                                            <h2>"Local secret key"</h2>
-                                            <p>"Use only on a trusted device. Desktop encrypts local accounts in secure storage; web storage has weaker same-origin protections."</p>
+                                            <h2>"Sign in with a secret key"</h2>
+                                            <p>"Your secret key gives full control of your account. Use it only on a device you trust. Desktop encrypts it in secure storage; browser storage offers less protection. Keep a backup before continuing."</p>
                                             <label for="local-account-name">"Account label (optional)"</label>
                                             <input id="local-account-name" class="v2-input" type="text" autocomplete="off" bind:value=local_name />
                                             <label for="local-nsec">"Secret key"</label>
@@ -656,13 +656,14 @@ pub fn LoginV2View() -> impl IntoView {
                                     view! {
                                         <button class="v2-auth-method-card v2-auth-method-link" on:click=move |_| panel.set(LoginPanel::Nip49)>
                                             <span class="material-symbols-outlined v2-auth-method-icon" aria-hidden="true">"lock"</span>
-                                            <strong>"Validate an encrypted NIP-49 key"</strong>
-                                            <span>"Desktop can decrypt and validate ncryptsec input. Account activation is not yet implemented."</span>
+                                            <strong>"Check an encrypted key backup"</strong>
+                                            <span>"Advanced tool: check a NIP-49 backup and its password. This does not sign you in or restore an account."</span>
                                         </button>
                                     }.into_any()
                                 } else {
                                     view! { <></> }.into_any()
                                 }}
+                                </crate::ui_v2::components::AdvancedOptions>
                             </div>
                         </section>
                     }.into_any(),
@@ -672,15 +673,17 @@ pub fn LoginV2View() -> impl IntoView {
                             <section class="v2-auth-focus-card">
                                 <p class="v2-store-kicker">"Nostr Connect"</p>
                                 <h1>"Approve in your signing app"</h1>
-                                <p>"Scan the QR code or copy the connection URI. This request expires; cancellation rejects late responses."</p>
+                                <p>"Open the scanner in your signing app, scan this code, then approve the connection. If the code expires, cancel and start again."</p>
                                 {match uri {
                                     Some(uri) => {
                                         let qr_svg = crate::qr::generate_qr_svg(&uri);
                                         view! {
                                             <div>
                                                 <div class="v2-auth-qr" aria-label="Nostr Connect QR code" inner_html=qr_svg></div>
-                                                <label for="nostrconnect-uri">"Manual connection URI"</label>
+                                                <crate::ui_v2::components::AdvancedOptions title="MANUAL CONNECTION ADDRESS">
+                                                <label for="nostrconnect-uri">"Copy this address into your signing app if you cannot scan the code"</label>
                                                 <textarea id="nostrconnect-uri" class="v2-input" readonly rows="4" prop:value=uri />
+                                                </crate::ui_v2::components::AdvancedOptions>
                                             </div>
                                         }.into_any()
                                     }

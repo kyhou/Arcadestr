@@ -404,7 +404,7 @@ pub fn ProfileV2View(
                         <div><h1 class="arc-profile-page-title">"Profile"</h1><div class="arc-profile-notice arc-profile-notice-error" role="alert"><strong>"Active account unavailable"</strong><span>"Profile identity cannot be shown because the active public key could not be resolved."</span></div></div>
                     }.into_any(),
                     ProfileMetadataState::SignedOut | ProfileMetadataState::Missing | ProfileMetadataState::Ready => view! {
-                        <div><h1 class="arc-profile-page-title">"Profile"</h1><EmptyState title="Sign in to view your profile" description="Public metadata, authored listings, NIP-05 identity, and earned badges are loaded for the active account." icon="person_off" layout=FeedbackLayout::Panel /></div>
+                        <div><h1 class="arc-profile-page-title">"Profile"</h1><EmptyState title="Sign in to view your profile" description="See your public profile, published games, and earned badges." icon="person_off" layout=FeedbackLayout::Panel /></div>
                     }.into_any(),
                 }
             >
@@ -438,15 +438,15 @@ pub fn ProfileV2View(
                         {if verification_available {
                             view! { <Nip05Badge status=nip05_status.into() on_verify=on_verify_nip05 /> }.into_any()
                         } else {
-                            view! { <p class="arc-profile-muted">{move || { let identifier = nip05_status_identifier(&nip05_status.get()); if identifier.is_empty() { "No NIP-05 identifier is available.".to_string() } else { format!("{identifier} · Verification unavailable on standalone web") } }}</p> }.into_any()
+                            view! { <p class="arc-profile-muted">{move || { let identifier = nip05_status_identifier(&nip05_status.get()); if identifier.is_empty() { "No verification address added.".to_string() } else { format!("{identifier} · Address verification requires the desktop app") } }}</p> }.into_any()
                         }}
                     </div>
                 </header>
 
                 {move || match metadata_state.get() {
                     ProfileMetadataState::Loading => view! { <LoadingState title="Loading profile metadata" description="Checking cached metadata while the active account finishes loading.".to_string() layout=FeedbackLayout::Compact /> }.into_any(),
-                    ProfileMetadataState::Error => view! { <div class="arc-profile-notice arc-profile-notice-error" role="alert"><strong>"Profile metadata unavailable"</strong><span>"The current account remains visible, but relay metadata could not be resolved."</span></div> }.into_any(),
-                    ProfileMetadataState::Missing => view! { <div class="arc-profile-notice" role="status"><strong>"No public profile metadata"</strong><span>"This account has no usable name, biography, website, or profile image in the current metadata result."</span></div> }.into_any(),
+                    ProfileMetadataState::Error => view! { <div class="arc-profile-notice arc-profile-notice-error" role="alert"><strong>"Could not load profile details"</strong><span>"Your account is still signed in. Your name, bio, and picture could not be loaded from the network."</span></div> }.into_any(),
+                    ProfileMetadataState::Missing => view! { <div class="arc-profile-notice" role="status"><strong>"No public profile details found"</strong><span>"No name, bio, website, or picture was found for this account. You can add these in your Nostr profile app."</span></div> }.into_any(),
                     ProfileMetadataState::ReadyWithError => view! { <div class="arc-profile-notice" role="status"><strong>"Profile refresh incomplete"</strong><span>"Previously loaded metadata remains visible because the latest refresh failed."</span></div> }.into_any(),
                     ProfileMetadataState::Ready | ProfileMetadataState::SignedOut => view! { <></> }.into_any(),
                 }}
@@ -461,7 +461,7 @@ pub fn ProfileV2View(
                                 {move || profile.get().and_then(|profile| profile.lud16).filter(|value| !value.trim().is_empty()).map(|value| view! { <div><dt>"Lightning address"</dt><dd>{value}</dd></div> })}
                             </dl>
                             <details class="arc-profile-key-details"><summary>"Public identity details"</summary><p>{move || current_npub.get()}</p></details>
-                            <p class="arc-profile-readonly">"Read-only signed metadata. Profile editing is not implemented in this client."</p>
+                            <p class="arc-profile-readonly">"To change your name, picture, or bio, edit your profile in your Nostr app. Profile editing is not available in Arcadestr yet."</p>
                         </section>
 
                         <section class="arc-profile-section" aria-labelledby="profile-games-title">

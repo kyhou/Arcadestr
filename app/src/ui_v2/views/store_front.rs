@@ -20,6 +20,7 @@ use crate::ui_v2::views::valid_cover_url;
 const STORE_FRONT_LISTING_LIMIT: usize = 24;
 const STORE_CARD_LIMIT: usize = 4;
 const STORE_CATEGORY_LIMIT: usize = 4;
+const STORE_FEATURED_FALLBACK_LIMIT: usize = 4;
 
 #[component]
 pub fn StoreFrontView(
@@ -166,6 +167,7 @@ pub fn StoreFrontView(
                                         on:click=move |_| on_select.run(selected.clone())
                                     >
                                         {hero_action_label()}
+                                        <span aria-hidden="true">" >"</span>
                                     </button>
                                 </div>
                                 <div class="arc-store-hero-capabilities" aria-label="Listing capabilities">
@@ -513,9 +515,19 @@ fn store_partial_result_kind(
 }
 
 fn featured_candidates(listings: &[GameListing]) -> Vec<GameListing> {
-    listings
+    let covered = listings
         .iter()
         .filter(|listing| valid_cover_url(&listing.images).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !covered.is_empty() {
+        return covered;
+    }
+    // No listing has a usable cover: still feature the newest listings, with
+    // the hatched key-art fallback, rather than dropping the hero entirely.
+    listings
+        .iter()
+        .take(STORE_FEATURED_FALLBACK_LIMIT)
         .cloned()
         .collect()
 }
@@ -745,6 +757,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["first", "second"]
         );
+    }
+
+    #[test]
+    fn featured_falls_back_to_listings_without_art_when_none_have_covers() {
+        // The hero keeps the featured layout with hatched key art instead of
+        // collapsing into a missing-artwork empty state.
+        let listings = (0..6)
+            .map(|index| listing(&format!("game-{index}"), 10 - index, Vec::new()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            featured_candidates(&listings)
+                .into_iter()
+                .map(|listing| listing.id)
+                .collect::<Vec<_>>(),
+            vec!["game-0", "game-1", "game-2", "game-3"]
+        );
+        assert!(featured_candidates(&[]).is_empty());
     }
 
     #[test]

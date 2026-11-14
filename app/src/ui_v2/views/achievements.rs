@@ -2,7 +2,9 @@
 
 use crate::models::EarnedBadgeSummary;
 use crate::tauri_bridge::{fetch_earned_badges, get_cached_earned_badges};
-use crate::ui_v2::components::{artwork_state_from_url, ArtworkRole, GameArtwork};
+use crate::ui_v2::components::{
+    artwork_state_from_url, ArtworkRole, EmptyState, FeedbackLayout, GameArtwork, LoadingState,
+};
 use crate::AuthContext;
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
@@ -325,36 +327,34 @@ pub fn AchievementsView() -> impl IntoView {
     });
 
     view! {
-        <section class="v2-achievements">
-            <header class="v2-achievements-hero v2-panel-glass">
+        <section class="v2-achievements" style="min-width:0;grid-template-columns:minmax(0,1fr)">
+            <header class="v2-achievements-hero" style="min-width:0;flex-wrap:wrap;overflow-wrap:anywhere">
                 <div class="v2-achievements-hero-mark" aria-hidden="true">
                     <span class="material-symbols-outlined" aria-hidden="true">"military_tech"</span>
                 </div>
-                <div>
-                    <p class="v2-store-kicker">"NIP-58 proof collection"</p>
+                <div style="min-width:0;flex:1 1 200px">
+                    <p class="v2-store-kicker">"Your badges"</p>
                     <h1 class="v2-display">"Achievements"</h1>
-                    <p>"Badges awarded to this profile and verified from signed Nostr events."</p>
+                    <p>"Badges awarded to your account. Arcadestr checks each award before showing it here."</p>
                 </div>
             </header>
 
             {move || match state.get() {
-                AchievementsState::Loading => achievement_state_view(
-                    "progress_activity",
-                    "Loading achievements",
-                    "Checking the local cache before refreshing from relays.",
-                    false,
-                ),
+                AchievementsState::Loading => view! {
+                    <LoadingState
+                        title="Loading achievements"
+                        description="Loading saved badges and checking for new awards."
+                    />
+                }.into_any(),
                 AchievementsState::SignedOut => achievement_state_view(
                     "person_off",
                     "Sign in to view earned badges",
-                    "NIP-58 awards are resolved for the active public key.",
-                    false,
+                    "Your earned badges will appear here when you sign in.",
                 ),
                 AchievementsState::Empty => achievement_state_view(
                     "workspace_premium",
                     achievements_empty_message(),
-                    "NIP-58 awards for this profile will appear here when they are found.",
-                    false,
+                    "Badges awarded to your account will appear here once Arcadestr finds and verifies them.",
                 ),
                 AchievementsState::Error => view! {
                     <section class="v2-achievement-state v2-achievement-state-error v2-panel" role="alert">
@@ -366,9 +366,8 @@ pub fn AchievementsView() -> impl IntoView {
                 #[cfg(feature = "web")]
                 AchievementsState::WebUnavailable => achievement_state_view(
                     "desktop_windows",
-                    "Desktop relay support required",
-                    "Badge relay display is not available on the web target. No achievement data is shown.",
-                    false,
+                    "View badges in the desktop app",
+                    "Open Arcadestr on your computer to load and verify your earned badges.",
                 ),
                 AchievementsState::Ready(badges) => view! {
                     <div class="v2-achievement-results">
@@ -416,17 +415,9 @@ fn achievement_state_view(
     icon: &'static str,
     title: &'static str,
     message: &'static str,
-    is_error: bool,
 ) -> AnyView {
     view! {
-        <section
-            class="v2-achievement-state v2-panel"
-            class:v2-achievement-state-error=is_error
-            role=if is_error { "alert" } else { "status" }
-        >
-            <span class="material-symbols-outlined" aria-hidden="true">{icon}</span>
-            <div><h2>{title}</h2><p>{message}</p></div>
-        </section>
+        <EmptyState title=title description=message icon=icon layout=FeedbackLayout::Panel />
     }
     .into_any()
 }
