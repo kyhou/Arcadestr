@@ -624,7 +624,13 @@ pub struct UserProfile {
 impl UserProfile {
     /// Returns true when the profile has user-visible metadata.
     pub fn has_metadata(&self) -> bool {
-        self.display_name.is_some() || self.name.is_some() || self.picture.is_some()
+        self.display_name.is_some()
+            || self.name.is_some()
+            || self.picture.is_some()
+            || self.about.is_some()
+            || self.website.is_some()
+            || self.nip05.is_some()
+            || self.lud16.is_some()
     }
 
     /// Returns the best available display name, falling back to truncated npub.

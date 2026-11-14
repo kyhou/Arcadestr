@@ -67,6 +67,7 @@ fn write_store(store: &WebAccountStore) -> Result<(), String> {
 }
 
 fn account_to_value(account: &WebAccount) -> serde_json::Value {
+    let profile = crate::web_profiles::cached(&account.npub);
     serde_json::json!({
         "id": account.id,
         "npub": account.npub,
@@ -74,11 +75,11 @@ fn account_to_value(account: &WebAccount) -> serde_json::Value {
         "signing_mode": account.signing_mode,
         "last_used": account.last_used,
         "is_current": account.is_current,
-        "picture": serde_json::Value::Null,
-        "display_name": serde_json::Value::Null,
-        "username": serde_json::Value::Null,
-        "nip05": serde_json::Value::Null,
-        "about": serde_json::Value::Null,
+        "picture": profile.as_ref().and_then(|profile| profile.picture.clone()),
+        "display_name": profile.as_ref().and_then(|profile| profile.display_name.clone()),
+        "username": profile.as_ref().and_then(|profile| profile.name.clone()),
+        "nip05": profile.as_ref().and_then(|profile| profile.nip05.clone()),
+        "about": profile.as_ref().and_then(|profile| profile.about.clone()),
     })
 }
 

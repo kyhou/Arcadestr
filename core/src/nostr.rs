@@ -652,18 +652,10 @@ pub struct UserProfile {
 }
 
 /// Internal deserialization struct for kind-0 metadata content.
-#[derive(Deserialize, Default, Clone)]
-pub struct UserProfileContent {
-    pub name: Option<String>,
-    pub display_name: Option<String>,
-    pub about: Option<String>,
-    pub picture: Option<String>,
-    pub website: Option<String>,
-    pub nip05: Option<String>,
-    pub lud16: Option<String>,
-}
+pub use crate::profile_metadata::UserProfileContent;
 
 /// NOSTR client for Arcadestr.
+#[derive(Clone)]
 pub struct NostrClient {
     relay_manager: Arc<Mutex<RelayManager>>,
     user_cache: Option<Arc<UserCache>>,
@@ -968,12 +960,26 @@ impl NostrClient {
     ) -> Result<UserProfile, NostrError> {
         // Check cache first
         if let Some(ref cache) = self.user_cache {
-            if let Some(cached_profile) = cache.get(npub).await {
-                tracing::info!("Found profile in cache for {}", npub);
-                return Ok(cached_profile);
+            if cache.is_fresh(npub).await {
+                if let Some(cached_profile) = cache.get(npub).await {
+                    return Ok(cached_profile);
+                }
             }
         }
 
+        self.refresh_profile(npub).await
+    }
+
+    /// Network-only refresh. Empty/failed queries never erase a saved profile.
+    pub async fn refresh_profile(&self, npub: &str) -> Result<UserProfile, NostrError> {
+        self.refresh_profile_streaming(npub, Arc::new(|_| {})).await
+    }
+
+    async fn refresh_profile_streaming(
+        &self,
+        npub: &str,
+        on_profile: Arc<dyn Fn(UserProfile) + Send + Sync>,
+    ) -> Result<UserProfile, NostrError> {
         // Parse npub as PublicKey
         let pubkey = PublicKey::parse(npub)
             .map_err(|e| NostrError::MalformedEvent(format!("Invalid npub: {}", e)))?;
@@ -993,30 +999,59 @@ impl NostrClient {
         );
 
         tracing::info!("Querying connected relays for profile with best-effort streaming...");
-        let events = {
-            let manager = self.relay_manager.lock().await;
-            manager
-                .fetch_events_best_effort(filter)
-                .await
-                .map_err(|e| NostrError::RelayError(format!("Failed to fetch profile: {}", e)))?
+        let manager = { self.relay_manager.lock().await.clone() };
+        manager
+            .wait_for_connections()
+            .await
+            .map_err(|error| NostrError::RelayError(error.to_string()))?;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let query = manager.fetch_events_streaming(filter, 10, 3, move |_, events| {
+            let _ = sender.send(events);
+        });
+        let receive = async {
+            let mut events = Vec::new();
+            let mut responded = false;
+            while let Some(batch) = receiver.recv().await {
+                responded = true;
+                events.extend(batch);
+                if let Some(event) = crate::profile_metadata::newest_metadata_event(&events, pubkey)
+                {
+                    let mut profile = self.parse_profile_event(event, npub)?;
+                    if let Some(cache) = &self.user_cache {
+                        cache
+                            .put_event(npub, event)
+                            .await
+                            .map_err(NostrError::RelayError)?;
+                        profile = cache.get(npub).await.unwrap_or(profile);
+                    }
+                    // Publish usable metadata as each relay responds, rather than
+                    // waiting for slower relays or NIP-65 discovery to complete.
+                    on_profile(profile);
+                }
+            }
+            Ok::<_, NostrError>((events, responded))
         };
+        let (query_result, received) = tokio::join!(query, receive);
+        let (events, responded) = received?;
+        if !responded {
+            query_result.map_err(|error| NostrError::RelayError(error.to_string()))?;
+        }
 
         tracing::debug!("Query returned {} events", events.len());
 
         // If no events returned, return minimal profile
-        let event = match events.first() {
-            Some(e) => {
-                tracing::info!(
-                    "Found profile event! Content preview: {}",
-                    &e.content[..e.content.len().min(100)]
-                );
-                e
-            }
+        let event = match crate::profile_metadata::newest_metadata_event(&events, pubkey) {
+            Some(e) => e,
             None => {
                 tracing::warn!(
                     "No kind-0 (metadata) events found for user {} on any relay",
                     npub
                 );
+                if let Some(cache) = &self.user_cache {
+                    if let Some(saved) = cache.get(npub).await {
+                        return Ok(saved);
+                    }
+                }
                 return Ok(UserProfile {
                     npub: npub.to_string(),
                     ..Default::default()
@@ -1028,8 +1063,12 @@ impl NostrClient {
 
         // Save to cache
         if let Some(ref cache) = self.user_cache {
-            if let Err(e) = cache.put(npub, &profile).await {
-                tracing::warn!("Failed to save profile to cache: {}", e);
+            cache
+                .put_event(npub, event)
+                .await
+                .map_err(NostrError::RelayError)?;
+            if let Some(saved) = cache.get(npub).await {
+                return Ok(saved);
             }
         }
 
@@ -1052,41 +1091,75 @@ impl NostrClient {
         &self,
         npub: &str,
     ) -> Result<UserProfile, NostrError> {
+        self.fetch_profile_with_updates(npub, |_| {}).await
+    }
+
+    /// Report both the fast result and any newer result found through outbox discovery.
+    pub async fn fetch_profile_with_updates<F>(
+        &self,
+        npub: &str,
+        on_profile: F,
+    ) -> Result<UserProfile, NostrError>
+    where
+        F: Fn(UserProfile) + Send + Sync + 'static,
+    {
+        let on_profile = Arc::new(on_profile);
         if self.blocked_discovery_relays().await.is_some() {
             tracing::debug!(
                 "Relay discovery is blocked; fetching profile without NIP-65 discovery"
             );
-            return self.fetch_profile(npub, None).await;
+            return self.refresh_profile_streaming(npub, on_profile).await;
         }
 
-        // First, try to discover the user's relays via NIP-65
-        tracing::info!("Discovering relays for {} via NIP-65...", npub);
+        // Query connected relays immediately while discovering the author's outbox.
+        // The discovery task owns a client snapshot, not the app-wide Nostr mutex.
+        let client = self.clone();
+        let author = npub.to_string();
+        let discovered_profile = on_profile.clone();
+        let discovery = tokio::spawn(async move {
+            match client.fetch_relay_list(&author).await {
+                Ok(relay_list) => {
+                    tracing::info!(
+                        "Found {} read relays and {} write relays for {}",
+                        relay_list.read_relays.len(),
+                        relay_list.write_relays.len(),
+                        author
+                    );
 
-        match self.fetch_relay_list(npub).await {
-            Ok(relay_list) => {
-                tracing::info!(
-                    "Found {} read relays and {} write relays for {}",
-                    relay_list.read_relays.len(),
-                    relay_list.write_relays.len(),
-                    npub
-                );
-
-                // Connect to the user's read relays
-                let manager = self.relay_manager.lock().await;
-                for relay_url in &relay_list.read_relays {
-                    if let Err(e) = manager.add_discovered_relay(relay_url.clone()).await {
-                        tracing::warn!("Failed to add relay {}: {}", relay_url, e);
+                    // Authors publish kind-0 events to their write/outbox relays.
+                    let manager = { client.relay_manager.lock().await.clone() };
+                    for relay_url in &relay_list.write_relays {
+                        if let Err(e) = manager.add_discovered_relay(relay_url.clone()).await {
+                            tracing::warn!("Failed to add relay {}: {}", relay_url, e);
+                        }
                     }
                 }
-                drop(manager);
+                Err(e) => {
+                    tracing::warn!("Could not discover relays for {}: {}", author, e);
+                }
             }
-            Err(e) => {
-                tracing::warn!("Could not discover relays for {}: {}", npub, e);
+            client
+                .refresh_profile_streaming(&author, discovered_profile)
+                .await
+        });
+        let immediate = self.refresh_profile_streaming(npub, on_profile).await;
+        if let Ok(profile) = &immediate {
+            if profile.name.is_some()
+                || profile.display_name.is_some()
+                || profile.picture.is_some()
+                || profile.about.is_some()
+                || profile.website.is_some()
+                || profile.nip05.is_some()
+                || profile.lud16.is_some()
+            {
+                // Dropping the JoinHandle leaves the bounded discovery refresh running.
+                return immediate;
             }
         }
-
-        // Now fetch the profile (will use the newly connected relays)
-        self.fetch_profile(npub, None).await
+        match discovery.await {
+            Ok(Ok(profile)) => Ok(profile),
+            _ => immediate,
+        }
     }
 
     /// Parse a profile event into UserProfile
@@ -1096,13 +1169,10 @@ impl NostrClient {
         npub: &str,
     ) -> Result<UserProfile, NostrError> {
         // Parse the event content as UserProfileContent
-        let content: UserProfileContent = match serde_json::from_str(&event.content) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("Failed to parse profile content: {}", e);
-                UserProfileContent::default()
-            }
-        };
+        let author = PublicKey::parse(npub)
+            .map_err(|error| NostrError::MalformedEvent(error.to_string()))?;
+        let content = crate::profile_metadata::validate_metadata_event(event, author)
+            .map_err(NostrError::MalformedEvent)?;
 
         tracing::info!(
             "Parsed profile: name={:?}, display_name={:?}, picture={:?}",
@@ -1283,7 +1353,7 @@ impl NostrClient {
 
         // Query through relay manager using best-effort streaming.
         let events = {
-            let manager = self.relay_manager.lock().await;
+            let manager = { self.relay_manager.lock().await.clone() };
             manager
                 .fetch_events_best_effort(filter)
                 .await
@@ -1291,7 +1361,19 @@ impl NostrClient {
         };
 
         let event = events
-            .first()
+            .iter()
+            .filter(|event| {
+                event.pubkey == pubkey
+                    && event.kind == Kind::from_u16(KIND_RELAY_LIST)
+                    && event.verify().is_ok()
+            })
+            .reduce(|current, candidate| {
+                if crate::profile_metadata::metadata_event_is_newer(candidate, current) {
+                    candidate
+                } else {
+                    current
+                }
+            })
             .ok_or_else(|| NostrError::MalformedEvent("No relay list found".into()))?;
 
         let relay_list = parse_relay_list_from_event(event)?;

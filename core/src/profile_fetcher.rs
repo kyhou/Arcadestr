@@ -10,7 +10,7 @@ use lru::LruCache;
 use nostr_sdk::prelude::*;
 
 use crate::nip05_validator::Nip05Validator;
-use crate::nostr::{NostrClient, NostrError, UserProfile, UserProfileContent};
+use crate::nostr::{NostrClient, NostrError, UserProfile};
 use crate::user_cache::UserCache;
 
 /// Configuration constants
@@ -216,20 +216,9 @@ impl ProfileFetcher {
         // Fetch from indexers first, then all relays
         match self.fetch_profiles_batch(client, &batch).await {
             Ok(profiles) => {
-                // Collect profiles for batch persistence
-                let mut profiles_to_persist: Vec<(String, UserProfile)> = Vec::new();
-
                 for (npub, profile) in profiles {
                     results.push(profile.clone());
                     self.cache.put(npub.clone(), profile.clone());
-                    profiles_to_persist.push((npub, profile));
-                }
-
-                // Persist to SQLite if persistent_cache is configured
-                if let Some(ref user_cache) = self.persistent_cache {
-                    if let Err(e) = user_cache.put_many(&profiles_to_persist).await {
-                        tracing::warn!("Failed to persist profiles to SQLite: {}", e);
-                    }
                 }
             }
             Err(e) => {
@@ -259,6 +248,11 @@ impl ProfileFetcher {
         // Check cache first
         if let Some(cached) = self.cache.get(npub) {
             tracing::info!("Profile cache HIT for {}", npub);
+            if let Some(cache) = &self.persistent_cache {
+                if let Some(saved) = cache.get(npub).await {
+                    return Some(saved);
+                }
+            }
             return Some(cached);
         }
         tracing::debug!("Profile cache MISS for {}", npub);
@@ -288,23 +282,25 @@ impl ProfileFetcher {
         match client.fetch_from_indexers_then_all(filter).await {
             Ok(events) => {
                 tracing::debug!("fetch_single got {} events for {}", events.len(), npub);
-                if let Some(event) = events.first() {
+                if let Some(event) = crate::profile_metadata::newest_metadata_event(&events, pubkey)
+                {
                     tracing::info!("Found profile event for {}, parsing...", npub);
                     match self.parse_profile_event(event, npub) {
-                        Ok(profile) => {
+                        Ok(mut profile) => {
                             tracing::info!(
                                 "Successfully parsed profile for {}: name={:?}",
                                 npub,
                                 profile.name
                             );
-                            self.cache.put(npub.to_string(), profile.clone());
-
                             // Persist to SQLite if persistent_cache is configured
                             if let Some(ref user_cache) = self.persistent_cache {
-                                if let Err(e) = user_cache.put(npub, &profile).await {
+                                if let Err(e) = user_cache.put_event(npub, event).await {
                                     tracing::warn!("Failed to persist profile to SQLite: {}", e);
+                                    return None;
                                 }
+                                profile = user_cache.get(npub).await.unwrap_or(profile);
                             }
+                            self.cache.put(npub.to_string(), profile.clone());
 
                             return Some(profile);
                         }
@@ -372,11 +368,25 @@ impl ProfileFetcher {
 
         let events = client.fetch_from_indexers_then_all(filter).await?;
 
-        // Parse events and match to requested pubkeys
-        for event in events {
-            let npub = event.pubkey.to_hex();
-            if let Ok(profile) = self.parse_profile_event(&event, &npub) {
-                results.push((npub, profile));
+        // One validated, correctly ordered event per requested identity. Persist
+        // the signed event, not an unversioned projection from arrival order.
+        for npub in npubs {
+            let Ok(author) = PublicKey::parse(npub) else {
+                continue;
+            };
+            let Some(event) = crate::profile_metadata::newest_metadata_event(&events, author)
+            else {
+                continue;
+            };
+            if let Ok(mut profile) = self.parse_profile_event(event, npub) {
+                if let Some(cache) = &self.persistent_cache {
+                    if let Err(error) = cache.put_event(npub, event).await {
+                        tracing::warn!("Failed to persist metadata: {error}");
+                        continue;
+                    }
+                    profile = cache.get(npub).await.unwrap_or(profile);
+                }
+                results.push((npub.clone(), profile));
             }
         }
 
@@ -386,7 +396,10 @@ impl ProfileFetcher {
     /// Parse a profile event into UserProfile
     fn parse_profile_event(&self, event: &Event, npub: &str) -> Result<UserProfile, NostrError> {
         // Parse the event content as UserProfileContent
-        let content: UserProfileContent = serde_json::from_str(&event.content).unwrap_or_default();
+        let author = PublicKey::parse(npub)
+            .map_err(|error| NostrError::MalformedEvent(error.to_string()))?;
+        let content = crate::profile_metadata::validate_metadata_event(event, author)
+            .map_err(NostrError::MalformedEvent)?;
 
         let profile = UserProfile {
             npub: npub.to_string(),

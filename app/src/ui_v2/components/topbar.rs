@@ -47,6 +47,7 @@ pub fn TopBar(
 ) -> impl IntoView {
     let relay_menu_open = RwSignal::new(false);
     let account_menu_open = RwSignal::new(false);
+    let failed_avatar_url = RwSignal::new(None::<String>);
 
     // Shared transient contract: an outside pointer press dismisses, and a
     // modal opening dismisses. Escape and the close control already dismiss and
@@ -258,9 +259,17 @@ pub fn TopBar(
                                 }
                             }
                         >
-                            {move || match avatar_url.get() {
+                            {move || match avatar_url.get().filter(|url| {
+                                !url.trim().is_empty() && failed_avatar_url.get().as_ref() != Some(url)
+                            }) {
                                 Some(url) => view! {
-                                    <img src=url alt="" class="arc-account-avatar" />
+                                    <img
+                                        src=url.clone()
+                                        alt=""
+                                        class="arc-account-avatar"
+                                        decoding="async"
+                                        on:error=move |_| failed_avatar_url.set(Some(url.clone()))
+                                    />
                                 }
                                 .into_any(),
                                 None => view! {

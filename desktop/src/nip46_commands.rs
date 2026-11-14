@@ -680,7 +680,15 @@ pub async fn list_saved_profiles(
         if !accounts_list.iter().any(|entry| {
             entry.get("npub").and_then(|value| value.as_str()) == Some(account.npub.as_str())
         }) {
-            accounts_list.push(local_account_json(&account));
+            let mut entry = local_account_json(&account);
+            if let Some(profile) = app_state.user_cache.get(&account.npub).await {
+                entry["picture"] = serde_json::json!(profile.picture);
+                entry["display_name"] = serde_json::json!(profile.display_name);
+                entry["username"] = serde_json::json!(profile.name);
+                entry["nip05"] = serde_json::json!(profile.nip05);
+                entry["about"] = serde_json::json!(profile.about);
+            }
+            accounts_list.push(entry);
         }
     }
 

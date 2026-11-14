@@ -181,6 +181,8 @@ const MIGRATION_25_MARKETPLACE_CAMPAIGNS: &str =
     include_str!("../../migrations/025_marketplace_campaign_pointers.sql");
 const MIGRATION_26_QUOTE_INITIATIONS: &str =
     include_str!("../../migrations/026_quote_initiations.sql");
+const MIGRATION_27_PROFILE_METADATA: &str =
+    include_str!("../../migrations/027_profile_metadata_events.sql");
 
 #[cfg(test)]
 const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
@@ -261,6 +263,11 @@ const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
         26,
         "026_quote_initiations.sql",
         MIGRATION_26_QUOTE_INITIATIONS,
+    ),
+    (
+        27,
+        "027_profile_metadata_events.sql",
+        MIGRATION_27_PROFILE_METADATA,
     ),
 ];
 
@@ -375,6 +382,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "026_quote_initiations.sql",
         sql: MIGRATION_26_QUOTE_INITIATIONS,
+    },
+    Migration {
+        name: "027_profile_metadata_events.sql",
+        sql: MIGRATION_27_PROFILE_METADATA,
     },
 ];
 
@@ -1407,6 +1418,7 @@ mod tests {
             "nwc_payment_journal",
             "profile_badge_entries",
             "profile_badge_lists",
+            "profile_metadata_events",
             "publisher_checkpoints",
             "publisher_drafts",
             "publisher_operations",
@@ -1547,7 +1559,7 @@ mod tests {
             .fetch_one(upgraded.pool())
             .await
             .expect("version");
-        assert_eq!(version, 26);
+        assert_eq!(version as usize, MIGRATIONS.len());
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM quote_initiations")
             .fetch_one(upgraded.pool())
             .await

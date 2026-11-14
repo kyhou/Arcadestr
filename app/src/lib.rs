@@ -53,14 +53,14 @@ pub mod ui_v2;
 // Import ProfileStore and related functions for store initialization and event handlers
 use crate::relay_state::{apply_relay_event, merge_relay_snapshot};
 use crate::store::{
-    provide_marketplace_store, provide_profile_store, try_use_marketplace_store,
-    try_use_profile_store, use_marketplace_store, use_profile_store, MarketplaceStore,
-    ProfileStore,
+    provide_marketplace_store, use_marketplace_store, use_profile_store, ProfileStore,
 };
 use crate::ui_v2::{views::LoginV2View, UiV2Root};
 
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 pub mod web_auth;
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+mod web_profiles;
 
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 pub mod web_secure_store;
@@ -204,7 +204,7 @@ pub async fn invoke_get_cached_profiles() -> Result<Vec<UserProfile>, String> {
 
 #[cfg(feature = "web")]
 pub async fn invoke_get_cached_profiles() -> Result<Vec<UserProfile>, String> {
-    Ok(Vec::new())
+    Ok(crate::web_profiles::cached_profiles())
 }
 
 /// Invoke get_cached_profile Tauri command (single profile)
@@ -216,8 +216,8 @@ pub async fn invoke_get_cached_profile(npub: String) -> Result<Option<UserProfil
 }
 
 #[cfg(feature = "web")]
-pub async fn invoke_get_cached_profile(_npub: String) -> Result<Option<UserProfile>, String> {
-    Ok(None)
+pub async fn invoke_get_cached_profile(npub: String) -> Result<Option<UserProfile>, String> {
+    Ok(crate::web_profiles::cached(&npub))
 }
 
 // =============================================================================
@@ -455,24 +455,6 @@ async fn invoke_set_allow_insecure_public_ws(allow: bool) -> Result<(), String> 
 #[cfg(feature = "web")]
 async fn invoke_set_allow_insecure_public_ws(_allow: bool) -> Result<(), String> {
     Ok(())
-}
-
-/// Invoke fetch_and_save_user_profile Tauri command
-/// Fetches and saves profile for the current authenticated user
-#[cfg(not(feature = "web"))]
-async fn invoke_fetch_and_save_user_profile() -> Result<UserProfile, String> {
-    use crate::tauri_invoke::invoke;
-
-    invoke("fetch_and_save_user_profile", serde_json::json!(null)).await
-}
-
-#[cfg(feature = "web")]
-async fn invoke_fetch_and_save_user_profile() -> Result<UserProfile, String> {
-    let npub = crate::web_auth::web_get_public_key().unwrap_or_default();
-    Ok(UserProfile {
-        npub,
-        ..UserProfile::default()
-    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1065,10 +1047,7 @@ pub async fn invoke_fetch_profile(
     npub: String,
     _additional_relays: Option<Vec<String>>,
 ) -> Result<UserProfile, String> {
-    Ok(UserProfile {
-        npub,
-        ..UserProfile::default()
-    })
+    crate::web_profiles::fetch(npub, crate::store::try_use_profile_store()).await
 }
 
 /// Invoke request_invoice Tauri command
@@ -1115,6 +1094,8 @@ pub struct AuthContext {
     // Existing fields
     pub npub: RwSignal<Option<String>>,
     pub profile: RwSignal<Option<UserProfile>>,
+    /// Explicit handle: async auth work must not rely on an ambient Leptos owner.
+    pub profile_store: ProfileStore,
     pub is_loading: RwSignal<bool>,
     pub error: RwSignal<Option<String>>,
 
@@ -1144,6 +1125,7 @@ impl AuthContext {
         Self {
             npub: RwSignal::new(None),
             profile: RwSignal::new(None),
+            profile_store: ProfileStore::new(),
             is_loading: RwSignal::new(false),
             error: RwSignal::new(None),
             accounts: RwSignal::new(Vec::new()),
@@ -1299,9 +1281,14 @@ impl AuthContext {
                         &format!("[load_profiles_list] Parsed {} accounts", accounts.len()).into(),
                     );
                     self.accounts.set(accounts.clone());
+                    // Authentication completion must not queue background picker
+                    // lookups ahead of the active identity's priority refresh.
+                    if self.is_loading.get_untracked() {
+                        return Ok(());
+                    }
 
                     // Fetch profiles for all accounts to show pictures/names in the list
-                    let store = try_use_profile_store();
+                    let store = Some(self.profile_store.clone());
                     web_sys::console::log_1(
                         &format!(
                             "[load_profiles_list] ProfileStore available: {}",
@@ -1310,6 +1297,10 @@ impl AuthContext {
                         .into(),
                     );
                     for account in accounts {
+                        // The active identity has its own priority refresh below.
+                        if self.npub.get_untracked().as_deref() == Some(account.npub.as_str()) {
+                            continue;
+                        }
                         if let Some(store) = store.clone() {
                             let npub = account.npub.clone();
                             let name = account.name.clone();
@@ -4992,8 +4983,8 @@ pub fn App() -> impl IntoView {
     let auth_stored = StoredValue::new(auth.clone());
 
     // Initialize profile store
-    provide_profile_store();
-    let profile_store = use_profile_store();
+    let profile_store = auth.profile_store.clone();
+    provide_context(profile_store.clone());
 
     // Initialize marketplace store for persistent listings
     provide_marketplace_store();
@@ -5083,7 +5074,7 @@ pub fn App() -> impl IntoView {
                                     auth.accounts.set(accounts.clone());
 
                                     // Fetch profiles for all saved accounts to show pictures/names
-                                    let store = try_use_profile_store();
+                                    let store = Some(auth.profile_store.clone());
                                     for account in accounts {
                                         if let Some(store) = store.clone() {
                                             let npub = account.npub.clone();
@@ -5143,11 +5134,12 @@ pub fn App() -> impl IntoView {
     });
 
     // Load cached profiles from backend on startup
+    let startup_profile_store = profile_store.clone();
     spawn_local(async move {
         match invoke_get_cached_profiles().await {
             Ok(profiles) => {
                 // Try to get the store - it might not be ready yet
-                let store: Option<ProfileStore> = try_use_profile_store();
+                let store = Some(startup_profile_store);
                 if let Some(store) = store {
                     #[cfg(debug_assertions)]
                     {
@@ -5165,7 +5157,11 @@ pub fn App() -> impl IntoView {
                             );
                         }
                     }
-                    store.put_many(profiles);
+                    for profile in profiles {
+                        if !store.has_untracked(&profile.npub) {
+                            store.put(profile);
+                        }
+                    }
                     #[cfg(debug_assertions)]
                     {
                         web_sys::console::log_1(
@@ -5196,9 +5192,23 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    // Account metadata is shared with the picker and background relay updates.
+    let auth_for_profiles = auth.clone();
+    let profiles_for_auth = profile_store.clone();
+    Effect::new(move |_| {
+        let selected = auth_for_profiles.npub.get();
+        if let Some(profile) = selected
+            .as_deref()
+            .and_then(|npub| profiles_for_auth.get(npub))
+        {
+            auth_for_profiles.profile.set(Some(profile));
+        }
+    });
+
     // Auto-fetch profile when npub becomes Some
     // Track npub signal and fetch profile when it changes
     let auth_for_effect = auth.clone();
+    let profile_store_for_effect = profile_store.clone();
     let profile_request_generation = RwSignal::new(0_u64);
     Effect::new(move |_| {
         // This read makes the effect track auth.npub
@@ -5213,7 +5223,8 @@ pub fn App() -> impl IntoView {
 
         if let Some(npub) = npub {
             let auth = auth_for_effect.clone();
-            auth.profile.set(None);
+            let store = profile_store_for_effect.clone();
+            auth.profile.set(store.get_untracked(&npub));
             spawn_local(async move {
                 #[cfg(debug_assertions)]
                 {
@@ -5237,6 +5248,7 @@ pub fn App() -> impl IntoView {
                             return;
                         }
                         baseline_profile = Some(profile.clone());
+                        store.put(profile.clone());
                         auth.profile.set(Some(profile));
                     }
                     _ => {
@@ -5250,7 +5262,11 @@ pub fn App() -> impl IntoView {
                 }
 
                 // Stale-while-revalidate: always fetch from relays for fresh metadata.
-                match invoke_fetch_profile(npub.clone(), None).await {
+                #[cfg(feature = "web")]
+                let refreshed = crate::web_profiles::fetch(npub.clone(), Some(store.clone())).await;
+                #[cfg(not(feature = "web"))]
+                let refreshed = invoke_fetch_profile(npub.clone(), None).await;
+                match refreshed {
                     Ok(profile) => {
                         if profile_request_generation.get_untracked() != request_generation
                             || auth.npub.get_untracked().as_deref() != Some(npub.as_str())
@@ -5282,28 +5298,8 @@ pub fn App() -> impl IntoView {
                                 );
                             }
                             auth.profile.set(Some(profile.clone()));
-
-                            // Save latest profile for future startup/account list display.
-                            spawn_local(async move {
-                                match invoke_fetch_and_save_user_profile().await {
-                                    Ok(_) => {
-                                        #[cfg(debug_assertions)]
-                                        {
-                                            web_sys::console::log_1(
-                                                &"Profile saved to saved users".into(),
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        #[cfg(debug_assertions)]
-                                        {
-                                            web_sys::console::log_1(
-                                                &format!("Failed to save profile: {}", e).into(),
-                                            );
-                                        }
-                                    }
-                                }
-                            });
+                            // The fetch persists its signed event before returning.
+                            store.put(profile);
                         } else {
                             #[cfg(debug_assertions)]
                             {
@@ -5323,7 +5319,7 @@ pub fn App() -> impl IntoView {
                     }
                 }
 
-                // Retry logic: if profile is empty (no metadata), retry after 30 seconds
+                // A newly connected relay may not have been ready for the first query.
                 let auth = auth.clone();
                 if auth
                     .profile
@@ -5334,7 +5330,7 @@ pub fn App() -> impl IntoView {
                     #[cfg(debug_assertions)]
                     {
                         web_sys::console::log_1(
-                            &"Profile empty or not found, scheduling retry in 30s...".into(),
+                            &"Profile empty or not found, scheduling retry in 2s...".into(),
                         );
                     }
 
@@ -5346,7 +5342,7 @@ pub fn App() -> impl IntoView {
                             web_sys::window()
                                 .unwrap()
                                 .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                    &resolve, 30000,
+                                    &resolve, 2000,
                                 )
                                 .unwrap();
                         }))
@@ -5354,6 +5350,11 @@ pub fn App() -> impl IntoView {
                     }
 
                     // Retry fetch
+                    if profile_request_generation.get_untracked() != request_generation
+                        || auth.npub.get_untracked().as_deref() != Some(npub.as_str())
+                    {
+                        return;
+                    }
                     #[cfg(debug_assertions)]
                     {
                         web_sys::console::log_1(&"Retrying profile fetch...".into());
@@ -5370,6 +5371,7 @@ pub fn App() -> impl IntoView {
                                     &format!("Profile fetched on retry: {:?}", profile.name).into(),
                                 );
                             }
+                            store.put(profile.clone());
                             auth.profile.set(Some(profile));
                         }
                     }

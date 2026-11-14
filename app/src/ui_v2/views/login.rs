@@ -75,6 +75,20 @@ fn account_display_name(account: &StoredAccount) -> String {
         .unwrap_or_else(|| npub_fallback_label(&account.npub))
 }
 
+fn account_with_metadata(
+    mut account: StoredAccount,
+    profile: Option<crate::models::UserProfile>,
+) -> StoredAccount {
+    if let Some(profile) = profile.filter(|profile| profile.npub == account.npub) {
+        account.display_name = profile.display_name;
+        account.username = profile.name;
+        account.picture = profile.picture;
+        account.nip05 = profile.nip05;
+        account.about = profile.about;
+    }
+    account
+}
+
 fn account_mode_label(signing_mode: &str) -> &'static str {
     match signing_mode.to_ascii_lowercase().as_str() {
         "nip46" | "remote" => "Remote signer",
@@ -130,6 +144,7 @@ fn nip49_import_message(backend_message: &str) -> String {
 pub fn LoginV2View() -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let auth_stored = StoredValue::new(auth.clone());
+    let profile_store = StoredValue::new(crate::use_profile_store());
     let standalone_web = cfg!(feature = "web");
     let capabilities = target_auth_capabilities(standalone_web);
 
@@ -490,7 +505,9 @@ pub fn LoginV2View() -> impl IntoView {
                                 let accounts = auth_stored.get_value().accounts.get();
                                 view! {
                                     <div class="v2-auth-account-grid">
-                                        {accounts.into_iter().map(|account| {
+                                         {accounts.into_iter().map(|account| {
+                                             let profile = profile_store.get_value().get(&account.npub);
+                                             let account = account_with_metadata(account, profile);
                                             let switch_id = account.id.clone();
                                             let remove_id = account.id.clone();
                                             let label = account_display_name(&account);
@@ -822,6 +839,46 @@ mod tests {
     #[test]
     fn account_display_falls_back_to_abbreviated_npub() {
         assert_eq!(account_display_name(&account()), "npub1vcq8nv3...6syj3d9l");
+    }
+
+    #[test]
+    fn picker_uses_shared_metadata_without_reloading_account_snapshots() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let account = account();
+            let store = crate::ProfileStore::new();
+            let account_for_signal = account.clone();
+            let store_for_signal = store.clone();
+            let displayed = Signal::derive(move || {
+                account_with_metadata(
+                    account_for_signal.clone(),
+                    store_for_signal.get(&account_for_signal.npub),
+                )
+            });
+            assert_eq!(
+                account_display_name(&displayed.get()),
+                account_display_name(&account)
+            );
+            store.put(crate::models::UserProfile {
+                npub: account.npub.clone(),
+                display_name: Some("Player".into()),
+                picture: Some("https://example.com/avatar.png".into()),
+                ..Default::default()
+            });
+            assert_eq!(account_display_name(&displayed.get()), "Player");
+            assert_eq!(
+                displayed.get().picture.as_deref(),
+                Some("https://example.com/avatar.png")
+            );
+            store.put(crate::models::UserProfile {
+                npub: account.npub.clone(),
+                ..Default::default()
+            });
+            assert!(
+                displayed.get().picture.is_none(),
+                "valid metadata may remove a picture"
+            );
+        });
     }
 
     #[test]

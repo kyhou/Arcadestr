@@ -30,6 +30,9 @@ web-sys = { version = "0.3", features = [
     "Node",
     "NodeList",
     "KeyboardEvent",
+    "WebSocket",
+    "MessageEvent",
+    "Event",
 ] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 gloo-timers = { version = "0.3", features = ["futures"] }

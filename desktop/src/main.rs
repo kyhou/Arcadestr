@@ -35,11 +35,7 @@ use arcadestr_core::marketplace::{apply_filter, apply_filter_nip99, MarketplaceF
 use arcadestr_core::marketplace_cache::{MarketplaceCache, UpsertOutcome};
 use arcadestr_core::nip05_validator::Nip05Validator;
 use arcadestr_core::nip46::AppSignerState;
-use arcadestr_core::nip46::{
-    restore_session_on_startup,
-    storage::{get_profile_metadata_by_id, load_profile_from_keyring},
-    SessionRestoreResult,
-};
+use arcadestr_core::nip46::{restore_session_on_startup, SessionRestoreResult};
 use arcadestr_core::nostr::{
     parse_nip19_identifier, EventDeduplicator, GameListing as CoreGameListing, ListingSource,
     NostrClient, UserProfile, DEFAULT_RELAYS,
@@ -68,6 +64,7 @@ pub mod blossom_commands;
 pub mod blossom_settings;
 pub mod blossom_upload;
 mod command_contracts;
+mod entitlement_commands;
 mod install;
 mod launcher;
 mod marketplace_stream;
@@ -75,7 +72,6 @@ mod nip46_commands;
 mod publisher_commands;
 mod publisher_management;
 mod receipt_commands;
-mod entitlement_commands;
 mod settlement_ui;
 mod startup_runtime;
 mod store_page_commands;
@@ -3205,13 +3201,16 @@ async fn fetch_marketplace_stream(
 async fn fetch_profile(
     npub: String,
     _additional_relays: Option<Vec<String>>,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<UserProfile, String> {
-    let nostr = state.nostr.lock().await;
+    let nostr = { state.nostr.lock().await.clone() };
 
     // Use NIP-65 relay discovery first, then fetch profile
     nostr
-        .fetch_profile_with_relay_discovery(&npub)
+        .fetch_profile_with_updates(&npub, move |profile| {
+            let _ = app.emit("profile_fetched", profile);
+        })
         .await
         .map_err(|e| e.to_string())
 }
@@ -7641,11 +7640,8 @@ fn main() {
     /// This is called when the app initializes to update saved user metadata.
     #[tauri::command]
     async fn fetch_and_save_user_profile(
-        app: tauri::AppHandle,
         state: tauri::State<'_, AppState>,
     ) -> Result<UserProfile, String> {
-        use arcadestr_core::saved_users::{load_saved_users, update_user_profile};
-
         let auth = state.auth.lock().await;
         let npub = auth
             .public_key()
@@ -7654,105 +7650,11 @@ fn main() {
             .map_err(|e| e.to_string())?;
         drop(auth);
 
-        tracing::info!("fetch_and_save_user_profile called for npub: {}", npub);
-
-        // Find the saved user with this npub
-        let users = load_saved_users()?;
-        tracing::info!("Loaded {} saved users", users.users.len());
-
-        let user = users
-            .users
-            .iter()
-            .find(|u| u.npub == npub)
-            .cloned()
-            .ok_or_else(|| {
-                tracing::error!("User with npub {} not found in saved users", npub);
-                "User not found in saved users".to_string()
-            })?;
-
-        tracing::info!("Found saved user: id={}, name={}", user.id, user.name);
-
-        // Get the bunker relay from NIP-46 session
-        let signer_state = app.state::<Arc<Mutex<AppSignerState>>>();
-        let signer_state_guard = signer_state.lock().await;
-
-        let bunker_relays: Vec<String> =
-            if let Some(ref profile_id) = signer_state_guard.active_profile_id {
-                // Get the bunker pubkey from metadata
-                if let Some(metadata) = get_profile_metadata_by_id(profile_id) {
-                    if let Some(profile) = load_profile_from_keyring(&metadata.bunker_pubkey_hex) {
-                        // Extract relay URLs from bunker_uri
-                        profile
-                            .bunker_uri
-                            .relays()
-                            .iter()
-                            .map(|url| url.to_string())
-                            .collect()
-                    } else {
-                        vec![]
-                    }
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            };
-
-        drop(signer_state_guard);
-
-        tracing::info!(
-            "Using {} bunker relays from NIP-46: {:?}",
-            bunker_relays.len(),
-            bunker_relays
-        );
-
-        // Fetch profile with bunker relays
-        let nostr = state.nostr.lock().await;
-        let profile = match nostr.fetch_profile(&npub, Some(bunker_relays)).await {
-            Ok(p) => {
-                tracing::info!(
-                    "Profile fetched: name={:?}, display_name={:?}, picture={:?}",
-                    p.name,
-                    p.display_name,
-                    p.picture
-                );
-                p
-            }
-            Err(e) => {
-                tracing::error!("Failed to fetch profile: {}", e);
-                return Err(e.to_string());
-            }
-        };
-        drop(nostr);
-
-        // Save profile to saved user
-        tracing::info!(
-            "Saving profile to saved user {}: display_name={:?}, name={:?}, picture={:?}",
-            user.id,
-            profile.display_name,
-            profile.name,
-            profile.picture
-        );
-
-        let result = update_user_profile(
-            &user.id,
-            profile.display_name.clone(),
-            profile.name.clone(),
-            profile.picture.clone(),
-            profile.nip05.clone(),
-            profile.about.clone(),
-        );
-
-        match result {
-            Ok(_) => {
-                tracing::info!("Profile saved successfully for user {}", npub);
-                Ok(profile)
-            }
-            Err(e) => {
-                tracing::error!("Failed to save profile: {}", e);
-                Err(e)
-            }
-        }
+        let nostr = { state.nostr.lock().await.clone() };
+        nostr
+            .fetch_profile_with_relay_discovery(&npub)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Get all cached profiles from SQLite

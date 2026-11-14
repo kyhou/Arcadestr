@@ -1,0 +1,22 @@
+{
+  "npub": "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d",
+  "pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "event": {
+    "id": "31c19f276df7b04f11c048bf0e1a00179013d0ea3f65e9226e9ca4654f083d9b",
+    "pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "created_at": 10,
+    "kind": 0,
+    "tags": [],
+    "content": "{\"name\":\"cached-player\",\"display_name\":\"Cached Player\",\"picture\":\"https://example.com/avatar.png\"}",
+    "sig": "e385075175cb165d74c7b73ef0d95b62e9958c9a849432a4fc5e9979ed369d3689f0024584ba169f03103e33d860875ec08e9c9f8c94a016b6435218231cd3c1"
+  },
+  "updated": {
+    "id": "630f2fabc8fbafb7769c88e315b03bf460ddbf008def02934bd93c6b5cac1f8d",
+    "pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "created_at": 20,
+    "kind": 0,
+    "tags": [],
+    "content": "{\"name\":\"updated-player\",\"display_name\":\"Updated Player\"}",
+    "sig": "46d1e8d638dc8ec0a104249caae6cf83a93a9f1f93fc34b0817ecc66a4abea57c210bcd88fda71d2f9fd79d5bd4a35dc7780a6f72474a2290a9e26abfbf7b606"
+  }
+}

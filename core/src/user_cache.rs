@@ -22,18 +22,15 @@ impl UserCache {
 
     /// Get a user profile from cache
     pub async fn get(&self, npub: &str) -> Option<UserProfile> {
-        let now = Self::now();
-
         let row = sqlx::query(
             r#"
             SELECT npub, name, display_name, picture, about, 
                    nip05, lud16, website, created_at
             FROM users 
-            WHERE npub = ? AND expires_at > ?
+            WHERE npub = ?
             "#,
         )
         .bind(npub)
-        .bind(now)
         .fetch_optional(&self.db)
         .await
         .ok()?;
@@ -71,6 +68,7 @@ impl UserCache {
                 website = excluded.website,
                 updated_at = excluded.updated_at,
                 expires_at = excluded.expires_at
+            WHERE NOT EXISTS (SELECT 1 FROM profile_metadata_events WHERE npub = excluded.npub)
             "#,
         )
         .bind(npub)
@@ -113,6 +111,7 @@ impl UserCache {
                     website = excluded.website,
                     updated_at = excluded.updated_at,
                     expires_at = excluded.expires_at
+                WHERE NOT EXISTS (SELECT 1 FROM profile_metadata_events WHERE npub = excluded.npub)
                 "#,
             )
             .bind(npub)
@@ -136,18 +135,14 @@ impl UserCache {
 
     /// Get all cached users
     pub async fn get_all(&self) -> Result<Vec<UserProfile>, sqlx::Error> {
-        let now = Self::now();
-
         let rows = sqlx::query(
             r#"
             SELECT npub, name, display_name, picture, about, 
                    nip05, lud16, website, created_at
             FROM users 
-            WHERE expires_at > ?
             ORDER BY updated_at DESC
             "#,
         )
-        .bind(now)
         .fetch_all(&self.db)
         .await?;
 
@@ -169,14 +164,64 @@ impl UserCache {
 
     /// Check if profile exists and is fresh
     pub async fn is_fresh(&self, npub: &str) -> bool {
-        self.get(npub).await.is_some()
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE npub = ? AND expires_at > ?)",
+        )
+        .bind(npub)
+        .bind(Self::now())
+        .fetch_one(&self.db)
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Persist a validated signed event and its projection atomically. Arrival order
+    /// and unsigned legacy/batch writes cannot roll a signed profile backwards.
+    pub async fn put_event(&self, npub: &str, event: &nostr::Event) -> Result<bool, String> {
+        let author = nostr::PublicKey::parse(npub).map_err(|error| error.to_string())?;
+        let profile = crate::profile_metadata::validate_metadata_event(event, author)?;
+        let raw = serde_json::to_string(event).map_err(|error| error.to_string())?;
+        let timestamp = i64::try_from(event.created_at.as_secs())
+            .map_err(|_| "Metadata timestamp exceeds storage range".to_string())?;
+        let mut tx = self.db.begin().await.map_err(|error| error.to_string())?;
+        let changed = sqlx::query(
+            "INSERT INTO profile_metadata_events(npub,event_id,event_created_at,raw_event_json) VALUES(?,?,?,?)
+             ON CONFLICT(npub) DO UPDATE SET event_id=excluded.event_id,
+             event_created_at=excluded.event_created_at,raw_event_json=excluded.raw_event_json
+             WHERE excluded.event_created_at > profile_metadata_events.event_created_at
+             OR (excluded.event_created_at = profile_metadata_events.event_created_at
+                 AND excluded.event_id < profile_metadata_events.event_id)",
+        )
+        .bind(npub).bind(event.id.to_hex()).bind(timestamp).bind(raw)
+        .execute(&mut *tx).await.map_err(|error| error.to_string())?
+        .rows_affected() > 0;
+        if changed {
+            let now = Self::now();
+            sqlx::query(
+                "INSERT INTO users(npub,name,display_name,picture,about,nip05,lud16,website,created_at,updated_at,expires_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(npub) DO UPDATE SET
+                 name=excluded.name,display_name=excluded.display_name,picture=excluded.picture,
+                 about=excluded.about,nip05=excluded.nip05,lud16=excluded.lud16,website=excluded.website,
+                 updated_at=excluded.updated_at,expires_at=excluded.expires_at",
+            )
+            .bind(npub).bind(profile.name).bind(profile.display_name).bind(profile.picture)
+            .bind(profile.about).bind(profile.nip05).bind(profile.lud16).bind(profile.website)
+            .bind(now).bind(now).bind(now + self.ttl_seconds)
+            .execute(&mut *tx).await.map_err(|error| error.to_string())?;
+        } else {
+            // An identical event confirms freshness without changing its ordering.
+            sqlx::query("UPDATE users SET expires_at = ? WHERE npub = ? AND EXISTS (SELECT 1 FROM profile_metadata_events p WHERE p.npub = users.npub AND p.event_id = ?)")
+                .bind(Self::now() + self.ttl_seconds).bind(npub).bind(event.id.to_hex())
+                .execute(&mut *tx).await.map_err(|error| error.to_string())?;
+        }
+        tx.commit().await.map_err(|error| error.to_string())?;
+        Ok(changed)
     }
 
     /// Delete expired profiles
     pub async fn cleanup_expired(&self) -> Result<u64, sqlx::Error> {
         let now = Self::now();
 
-        let result = sqlx::query("DELETE FROM users WHERE expires_at <= ?")
+        let result = sqlx::query("DELETE FROM users WHERE expires_at <= ? AND NOT EXISTS (SELECT 1 FROM profile_metadata_events p WHERE p.npub = users.npub) AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.npub = users.npub)")
             .bind(now)
             .execute(&self.db)
             .await?;
@@ -290,5 +335,89 @@ mod tests {
 
         assert_eq!(loaded.name, v2.name);
         assert_eq!(loaded.about, v2.about);
+    }
+
+    #[tokio::test]
+    async fn expired_profile_remains_available_after_reopening_database() {
+        let temp = TempDir::new().expect("temp directory");
+        let path = temp.path().join("profiles.db");
+        let db = Database::new(&path).await.expect("database");
+        let cache = UserCache::new(db.pool().clone());
+        let profile = create_test_profile();
+        cache.put(&profile.npub, &profile).await.expect("save");
+        sqlx::query("UPDATE users SET expires_at = 0")
+            .execute(db.pool())
+            .await
+            .expect("expire");
+        assert!(!cache.is_fresh(&profile.npub).await);
+        drop(cache);
+        db.pool().close().await;
+        let reopened = Database::new(&path).await.expect("reopen");
+        let cache = UserCache::new(reopened.pool().clone());
+        assert_eq!(
+            cache.get(&profile.npub).await.expect("saved").name,
+            profile.name
+        );
+        assert_eq!(cache.get_all().await.expect("all").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn signed_metadata_cannot_be_rolled_back_or_overwritten_by_unsigned_profiles() {
+        use nostr::{EventBuilder, Keys, Kind, Timestamp, ToBech32};
+        let temp = TempDir::new().expect("temp directory");
+        let path = temp.path().join("profiles.db");
+        let db = Database::new(&path).await.expect("database");
+        let cache = UserCache::new(db.pool().clone());
+        let keys = Keys::generate();
+        let npub = keys.public_key().to_bech32().expect("npub");
+        let make = |name: &str, time| {
+            EventBuilder::new(Kind::Metadata, format!(r#"{{"name":"{name}"}}"#))
+                .custom_created_at(Timestamp::from(time))
+                .sign_with_keys(&keys)
+                .expect("signed event")
+        };
+        let latest = make("latest", 20);
+        assert!(cache.put_event(&npub, &latest).await.expect("save event"));
+        assert!(!cache
+            .put_event(&npub, &make("old", 10))
+            .await
+            .expect("stale"));
+        assert!(!cache.put_event(&npub, &latest).await.expect("duplicate"));
+        let mut unsigned = create_test_profile();
+        unsigned.npub = npub.clone();
+        cache.put(&npub, &unsigned).await.expect("unsigned write");
+        cache
+            .put_many(&[(npub.clone(), unsigned)])
+            .await
+            .expect("unsigned batch");
+        assert_eq!(
+            cache.get(&npub).await.expect("profile").name.as_deref(),
+            Some("latest")
+        );
+        let raw: String =
+            sqlx::query_scalar("SELECT raw_event_json FROM profile_metadata_events WHERE npub = ?")
+                .bind(&npub)
+                .fetch_one(db.pool())
+                .await
+                .expect("raw event");
+        assert_eq!(
+            serde_json::from_str::<nostr::Event>(&raw).expect("event"),
+            latest
+        );
+        sqlx::query("UPDATE users SET expires_at = 0")
+            .execute(db.pool())
+            .await
+            .expect("expire");
+        cache.cleanup_expired().await.expect("cleanup");
+        assert!(cache.get(&npub).await.is_some());
+        let wrong_author = Keys::generate()
+            .public_key()
+            .to_bech32()
+            .expect("other npub");
+        assert!(cache.put_event(&wrong_author, &latest).await.is_err());
+        let malformed = EventBuilder::new(Kind::Metadata, "not json")
+            .sign_with_keys(&keys)
+            .expect("signed invalid content");
+        assert!(cache.put_event(&npub, &malformed).await.is_err());
     }
 }
