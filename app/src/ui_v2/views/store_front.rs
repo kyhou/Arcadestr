@@ -4,10 +4,10 @@ use leptos::prelude::*;
 
 use crate::models::{AcquisitionPolicy, GameListing, StorePageCardPresentation};
 use crate::ui_v2::components::{
-    artwork_state_from_url, ArtworkRole, ArtworkState, EmptyState, ErrorSeverity, ErrorState,
-    GameArtwork, GameCard, GameCardAction, GameCardCampaign, GameCardPresentation,
-    GameCardSkeleton, PartialRelayKind, PartialRelayState, PlatformCompatibility, Skeleton,
-    SkeletonKind, StatusChip, StatusChipSize, StatusChipVariant,
+    artwork_state_from_url, ArtworkRole, ArtworkState, EmptyState, GameArtwork, GameCard,
+    GameCardAction, GameCardCampaign, GameCardPresentation, GameCardSkeleton, PartialRelayKind,
+    PartialRelayState, PlatformCompatibility, Skeleton, SkeletonKind, StatusChip, StatusChipSize,
+    StatusChipVariant,
 };
 use crate::ui_v2::views::browse_games::{extract_categories, listing_categories, BrowseRequest};
 use crate::ui_v2::views::marketplace_loader::{
@@ -260,20 +260,11 @@ pub fn StoreFrontView(
                             <Skeleton kind=SkeletonKind::Panel class="arc-store-hero-art" />
                         </section>
                     }.into_any(),
-                    StoreFallbackState::Error => view! {
-                        <div class="arc-store-hero-state">
-                            <ErrorState
-                                title="Marketplace unavailable"
-                                message="Connected relays could not provide marketplace listings."
-                                severity=ErrorSeverity::Recoverable
-                            />
-                        </div>
-                    }.into_any(),
                     StoreFallbackState::Empty => view! {
                         <div class="arc-store-hero-state">
                             <EmptyState
-                                title="No marketplace listings"
-                                description="No valid game listings were returned by the connected relays."
+                                title="No games found yet"
+                                description="The network has not returned any games. Check the network status at the top of the page, then refresh the catalog."
                                 icon="sports_esports"
                             />
                         </div>
@@ -291,9 +282,6 @@ pub fn StoreFrontView(
             }}
 
             <div class="arc-store-content">
-                {move || marketplace.error.get().map(|message| view! {
-                    <p class="arc-store-enrichment-warning" role="alert">{message}</p>
-                })}
                 {move || store_partial_result_kind(
                     listings.get().len(),
                     marketplace.refreshing.get(),
@@ -474,7 +462,6 @@ fn select_access_promotion(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreFallbackState {
     Loading,
-    Error,
     Empty,
     NoFeaturedArtwork,
 }
@@ -499,12 +486,11 @@ fn featured_artwork_state(
 fn store_fallback_state(
     listing_count: usize,
     loading: bool,
-    has_error: bool,
+    _has_error: bool,
 ) -> StoreFallbackState {
+    // Relay failures stay in backend diagnostics, not the discovery UI.
     if loading {
         StoreFallbackState::Loading
-    } else if has_error && listing_count == 0 {
-        StoreFallbackState::Error
     } else if listing_count == 0 {
         StoreFallbackState::Empty
     } else {
@@ -517,10 +503,8 @@ fn store_partial_result_kind(
     refreshing: bool,
     has_error: bool,
 ) -> Option<PartialRelayKind> {
-    if listing_count == 0 {
+    if listing_count == 0 || has_error {
         None
-    } else if has_error {
-        Some(PartialRelayKind::Failed)
     } else if refreshing {
         Some(PartialRelayKind::Loading)
     } else {
@@ -821,14 +805,14 @@ mod tests {
     }
 
     #[test]
-    fn store_loading_error_empty_and_missing_artwork_are_distinct() {
+    fn relay_errors_do_not_replace_empty_results_or_show_failure_notices() {
         assert_eq!(
             store_fallback_state(0, true, false),
             StoreFallbackState::Loading
         );
         assert_eq!(
             store_fallback_state(0, false, true),
-            StoreFallbackState::Error
+            StoreFallbackState::Empty
         );
         assert_eq!(
             store_fallback_state(0, false, false),
@@ -842,11 +826,13 @@ mod tests {
             store_partial_result_kind(4, true, false),
             Some(PartialRelayKind::Loading)
         );
-        assert_eq!(
-            store_partial_result_kind(4, true, true),
-            Some(PartialRelayKind::Failed)
-        );
+        assert_eq!(store_partial_result_kind(4, true, true), None);
         assert_eq!(store_partial_result_kind(0, true, true), None);
+        assert_eq!(store_partial_result_kind(4, false, true), None);
+        assert_eq!(
+            store_fallback_state(2, false, true),
+            StoreFallbackState::NoFeaturedArtwork
+        );
     }
 
     #[test]

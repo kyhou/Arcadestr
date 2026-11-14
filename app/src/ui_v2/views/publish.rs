@@ -27,9 +27,9 @@ use crate::tauri_bridge::{
 };
 use crate::ui_v2::components::{
     artwork_state_from_url, ArtworkRole, Dialog, DialogCloseAction, DialogClosePolicy,
-    DialogCloseRequest, DialogDismissal, DialogInitialFocus, DialogTone, DialogWidth, GameArtwork,
-    PublisherDestination, PublisherTabItem, PublisherTabs, StatusChip, StatusChipSize,
-    StatusChipVariant,
+    DialogCloseRequest, DialogDismissal, DialogInitialFocus, DialogTone, DialogWidth,
+    ErrorSeverity, ErrorState, GameArtwork, PublisherDestination, PublisherTabItem, PublisherTabs,
+    StatusChip, StatusChipSize, StatusChipVariant,
 };
 use crate::ui_v2::views::marketplace_loader::canonical_listing_coordinate;
 use crate::ui_v2::views::store_page_publish::{
@@ -203,6 +203,24 @@ fn publisher_dashboard_state(
         PublisherDashboardState::Ready
     } else {
         PublisherDashboardState::Empty
+    }
+}
+
+/// User-facing title and explanation for a failed publisher listing load.
+/// Partial relay coverage never reaches here: it is a successful refresh.
+fn publisher_load_error_copy(
+    error: &arcadestr_core::marketplace_fetch::MarketplaceFetchError,
+) -> (&'static str, &'static str) {
+    if error.is_unreachable() {
+        (
+            "No relays responded",
+            "Arcadestr could not reach any relay. Check your internet connection, then try again.",
+        )
+    } else {
+        (
+            "Your published games could not be loaded",
+            "Check the network status at the top of the page, then try again.",
+        )
     }
 }
 
@@ -821,7 +839,8 @@ fn PublishedGamesView(
     let loading = RwSignal::new(true);
     let refreshing = RwSignal::new(false);
     let load_error = RwSignal::new(false);
-    let load_error_message = RwSignal::new(None::<String>);
+    let load_error_message =
+        RwSignal::new(None::<arcadestr_core::marketplace_fetch::MarketplaceFetchError>);
     let loaded_publisher = RwSignal::new(None::<String>);
     let listing_generation = RwSignal::new(0_u64);
     let listing_request = RwSignal::new(None::<(String, u64)>);
@@ -1255,13 +1274,31 @@ fn PublishedGamesView(
             <p id="publisher-create-game-requirement" class="v2-publisher-action-requirement">{move || match signer_state.get() { PublisherSignerState::Available => "Create Game uses the active account signer.", PublisherSignerState::Connecting => "Create Game is unavailable while the remote signer connects.", PublisherSignerState::Unavailable => "Create Game requires an available signer for the active account.", PublisherSignerState::Unknown => "Create Game remains unavailable until signer availability is resolved." }}</p>
 
             {move || match dashboard_state.get() {
-                PublisherDashboardState::SignedOut => view! { <section class="v2-publisher-feedback" role="status"><span class="material-symbols-outlined" aria-hidden="true">"person_off"</span><div><h2>"Sign in to open the publisher dashboard"</h2><p>"Publisher listings and in-session authoring state are bound to the active account."</p></div></section> }.into_any(),
-                PublisherDashboardState::Loading => view! { <section class="v2-publisher-feedback" role="status"><span class="material-symbols-outlined" aria-hidden="true">"progress_activity"</span><div><h2>"Loading publisher state"</h2><p>"Checking authored NIP-99 listings before resolving independent Store Page and campaign state."</p></div></section> }.into_any(),
-                PublisherDashboardState::Error => view! { <section class="v2-publisher-feedback v2-publisher-feedback-error" role="alert"><span class="material-symbols-outlined" aria-hidden="true">"cloud_off"</span><div><h2>"Publisher listings unavailable"</h2><p>{load_error_message.get().unwrap_or_default()}</p></div></section> }.into_any(),
-                PublisherDashboardState::Empty => view! { <section class="v2-publisher-feedback"><span class="material-symbols-outlined" aria-hidden="true">"sports_esports"</span><div><h2>"No authored listings in the loaded relay window"</h2><p>"Create Game starts the existing publication workflow. Unfinished Create Game state is not saved as a draft."</p>{signer_can_publish(signer_state.get()).then(|| view! { <button type="button" class="v2-btn-primary" on:click=move |_| on_navigate.run(PublishViewState::NewPublication)>"Create Game"</button> })}</div></section> }.into_any(),
+                PublisherDashboardState::SignedOut => view! { <section class="v2-publisher-feedback" role="status"><span class="material-symbols-outlined" aria-hidden="true">"person_off"</span><div><h2>"Sign in to open the publisher dashboard"</h2><p>"Sign in with the account you use to publish games. Only that account's games will appear here."</p></div></section> }.into_any(),
+                PublisherDashboardState::Loading => view! { <section class="v2-publisher-feedback" role="status"><span class="material-symbols-outlined" aria-hidden="true">"progress_activity"</span><div><h2>"Loading your games"</h2><p>"Finding your published games, store pages, and promotions."</p></div></section> }.into_any(),
+                PublisherDashboardState::Error => {
+                    let error = load_error_message.get().unwrap_or_else(|| {
+                        arcadestr_core::marketplace_fetch::MarketplaceFetchError::failed(
+                            "Unknown error",
+                        )
+                    });
+                    let (title, message) = publisher_load_error_copy(&error);
+                    view! {
+                        <ErrorState
+                            title=title
+                            message=message
+                            technical_detail=error.to_string()
+                            on_retry=Callback::new(move |_| refresh.run(()))
+                            retry_busy=Signal::derive(move || loading.get() || refreshing.get())
+                            severity=ErrorSeverity::Recoverable
+                        />
+                    }
+                    .into_any()
+                }
+                PublisherDashboardState::Empty => view! { <section class="v2-publisher-feedback"><span class="material-symbols-outlined" aria-hidden="true">"sports_esports"</span><div><h2>"No published games found"</h2><p>"Select Create Game to publish your first game. Unfinished new-game forms are not saved, so have your details and files ready. If you already published a game, check your account and refresh."</p>{signer_can_publish(signer_state.get()).then(|| view! { <button type="button" class="v2-btn-primary" on:click=move |_| on_navigate.run(PublishViewState::NewPublication)>"Create Game"</button> })}</div></section> }.into_any(),
                 PublisherDashboardState::Partial | PublisherDashboardState::Ready => view! {
                     <div class="v2-publisher-dashboard-content" aria-live="polite" aria-busy=move || refreshing.get() || store_page_loading.get()>
-                        {(dashboard_state.get() == PublisherDashboardState::Partial).then(|| view! { <div class="v2-publisher-scope-warning" role="status"><strong>"Partial publisher results"</strong><span>{load_error_message.get().unwrap_or_default()}</span></div> })}
+                        {(dashboard_state.get() == PublisherDashboardState::Partial).then(|| view! { <div class="v2-publisher-scope-warning" role="status"><strong>"Showing games loaded earlier"</strong><span>"The latest refresh could not reach the network. Select Refresh to try again."</span></div> })}
                         <dl class="v2-publisher-facts" aria-label="Resolved publisher counts">
                             <div><dt>"Authored listings loaded"</dt><dd>{counts.get().loaded_listings}</dd></div>
                             <div><dt>"Store Page drafts this session"</dt><dd>{counts.get().local_store_page_drafts}</dd></div>
@@ -2880,6 +2917,26 @@ fn timezone_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreachable_network_and_other_failures_get_distinct_copy() {
+        use arcadestr_core::marketplace_fetch::MarketplaceFetchError;
+        let unreachable = publisher_load_error_copy(&MarketplaceFetchError::Unreachable {
+            failed: 6,
+            timed_out: 3,
+        });
+        assert_eq!(unreachable.0, "No relays responded");
+        assert!(unreachable.1.contains("try again"));
+        let failed =
+            publisher_load_error_copy(&MarketplaceFetchError::failed("connection refused"));
+        assert_eq!(failed.0, "Your published games could not be loaded");
+        // A failure whose text merely resembles the unreachable message is not
+        // promoted to it.
+        let forged = publisher_load_error_copy(&MarketplaceFetchError::failed(
+            "No relay responded: 1 failed, 0 timed out",
+        ));
+        assert_eq!(forged.0, "Your published games could not be loaded");
+    }
 
     #[test]
     fn every_campaign_dismissal_channel_means_no_decision() {

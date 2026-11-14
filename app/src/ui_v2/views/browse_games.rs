@@ -10,9 +10,8 @@ use crate::models::{AcquisitionPolicy, GameListing, PlatformInfo, StorePageCardP
 use crate::tauri_bridge::{invoke_get_installed_games, invoke_get_platform_info};
 use crate::ui_v2::components::aria::aria_bool;
 use crate::ui_v2::components::{
-    EmptyState, ErrorSeverity, ErrorState, GameCard, GameCardAction, GameCardCampaign,
-    GameCardDensity, GameCardPresentation, GameCardSkeleton, InlineLoading, PartialRelayKind,
-    PartialRelayState, PlatformCompatibility,
+    EmptyState, GameCard, GameCardAction, GameCardCampaign, GameCardDensity, GameCardPresentation,
+    GameCardSkeleton, InlineLoading, PartialRelayKind, PartialRelayState, PlatformCompatibility,
 };
 use crate::ui_v2::views::marketplace_loader::{
     canonical_listing_coordinate, listing_state_key, use_listing_campaign_states,
@@ -176,7 +175,6 @@ fn cleared_browse_filters() -> ClearedBrowseFilters {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrowseContentState {
     Loading,
-    Error,
     MarketplaceEmpty,
     FilterPending,
     NoMatches,
@@ -187,13 +185,12 @@ fn browse_content_state(
     loaded_count: usize,
     filtered_count: usize,
     loading: bool,
-    has_error: bool,
+    _has_error: bool,
     filter_pending: bool,
 ) -> BrowseContentState {
+    // Empty and retained results remain usable even when some relays fail.
     if loaded_count == 0 && loading {
         BrowseContentState::Loading
-    } else if loaded_count == 0 && has_error {
-        BrowseContentState::Error
     } else if loaded_count == 0 {
         BrowseContentState::MarketplaceEmpty
     } else if filtered_count == 0 && filter_pending {
@@ -218,10 +215,8 @@ fn browse_partial_result_kind(
     refreshing: bool,
     has_error: bool,
 ) -> Option<PartialRelayKind> {
-    if listing_count == 0 {
+    if listing_count == 0 || has_error {
         None
-    } else if has_error {
-        Some(PartialRelayKind::Failed)
     } else if refreshing {
         Some(PartialRelayKind::Loading)
     } else {
@@ -514,9 +509,6 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                 </div>
             </Show>
 
-            {move || marketplace.error.get().map(|message| view! {
-                <p class="arc-browse-enrichment-warning" role="alert">{message}</p>
-            })}
             {move || browse_partial_result_kind(
                 listings.get().len(),
                 marketplace.refreshing.get(),
@@ -553,27 +545,18 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                             <GameCardSkeleton browse=true />
                         </div>
                     }.into_any(),
-                    BrowseContentState::Error => view! {
-                        <div class="arc-browse-state">
-                            <ErrorState
-                                title="Marketplace unavailable"
-                                message="Connected relays could not provide marketplace listings."
-                                severity=ErrorSeverity::Recoverable
-                            />
-                        </div>
-                    }.into_any(),
                     BrowseContentState::MarketplaceEmpty => view! {
                         <div class="arc-browse-state">
                             <EmptyState
-                                title="No marketplace listings"
-                                description="No valid game listings were returned by the connected relays."
+                                title="No games found yet"
+                                description="The network has not returned any games. Check the network status at the top of the page, then refresh the catalog."
                                 icon="sports_esports"
                             />
                         </div>
                     }.into_any(),
                     BrowseContentState::FilterPending => view! {
                         <div class="arc-browse-filter-pending" role="status">
-                            <InlineLoading label="Checking more relay results for active filters" />
+                            <InlineLoading label="Looking for more games that match your filters" />
                         </div>
                     }.into_any(),
                     BrowseContentState::NoMatches => {
@@ -1466,14 +1449,14 @@ mod tests {
     }
 
     #[test]
-    fn loading_empty_error_filtered_and_ready_states_are_distinct() {
+    fn relay_errors_do_not_replace_empty_browse_results() {
         assert_eq!(
             browse_content_state(0, 0, true, false, false),
             BrowseContentState::Loading
         );
         assert_eq!(
             browse_content_state(0, 0, false, true, false),
-            BrowseContentState::Error
+            BrowseContentState::MarketplaceEmpty
         );
         assert_eq!(
             browse_content_state(0, 0, false, false, false),
@@ -1485,6 +1468,10 @@ mod tests {
         );
         assert_eq!(
             browse_content_state(4, 2, false, false, false),
+            BrowseContentState::Ready
+        );
+        assert_eq!(
+            browse_content_state(4, 2, false, true, false),
             BrowseContentState::Ready
         );
         assert_eq!(
@@ -1519,10 +1506,7 @@ mod tests {
             browse_partial_result_kind(4, true, false),
             Some(PartialRelayKind::Loading)
         );
-        assert_eq!(
-            browse_partial_result_kind(4, false, true),
-            Some(PartialRelayKind::Failed)
-        );
+        assert_eq!(browse_partial_result_kind(4, false, true), None);
         assert_eq!(browse_partial_result_kind(0, true, true), None);
     }
 

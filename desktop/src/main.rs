@@ -2982,7 +2982,7 @@ async fn fetch_marketplace_stream(
     since_days: Option<u64>,
     until_secs: Option<u64>,
     request_id: String,
-) -> Result<(), String> {
+) -> Result<(), arcadestr_core::marketplace_fetch::MarketplaceFetchError> {
     use std::collections::HashMap;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 

@@ -76,7 +76,13 @@ async fn closed_is_failure_not_pool_successful_empty() {
     let error = fetch_nip99_listings_streaming_since(&manager, 10, None, None, |_| {})
         .await
         .expect_err("marketplace must propagate failure");
-    assert!(error.contains("1 failed"));
+    assert_eq!(
+        error,
+        arcadestr_core::marketplace_fetch::MarketplaceFetchError::Unreachable {
+            failed: 1,
+            timed_out: 0
+        }
+    );
 }
 
 #[tokio::test]
@@ -182,26 +188,74 @@ async fn inactivity_timeout_retains_completed_relay_results() {
     assert_eq!(*received.lock().expect("received"), vec![event]);
 }
 
-#[tokio::test]
-async fn marketplace_retains_partial_listings_and_propagates_failure() {
-    let event = EventBuilder::new(Kind::Custom(30402), "A game")
+fn listing_event(d: &str) -> nostr_sdk::Event {
+    EventBuilder::new(Kind::Custom(30402), "A game")
         .tags([
-            Tag::parse(["d", "partial-game"]).expect("d tag"),
+            Tag::parse(["d", d]).expect("d tag"),
             Tag::parse(["title", "Partial Game"]).expect("title tag"),
             Tag::parse(["price", "0", "sats"]).expect("price tag"),
             Tag::parse(["t", "game"]).expect("game tag"),
         ])
         .sign_with_keys(&Keys::generate())
-        .expect("signed listing");
-    let good = LocalRelay::start(Reply::Events(vec![event])).await;
-    let bad = LocalRelay::start(Reply::Closed).await;
-    let manager = Arc::new(tokio::sync::Mutex::new(manager(&[&good, &bad]).await));
+        .expect("signed listing")
+}
+
+async fn marketplace_fetch(
+    relays: &[&LocalRelay],
+) -> (
+    Result<u32, arcadestr_core::marketplace_fetch::MarketplaceFetchError>,
+    usize,
+) {
+    let manager = Arc::new(tokio::sync::Mutex::new(manager(relays).await));
     let received = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&received);
     let result = fetch_nip99_listings_streaming_since(&manager, 10, None, None, move |listing| {
         sink.lock().expect("sink").push(listing)
     })
     .await;
-    assert!(result.expect_err("partial warning").contains("1 failed"));
-    assert_eq!(received.lock().expect("received").len(), 1);
+    let count = received.lock().expect("received").len();
+    (result, count)
+}
+
+// On Nostr some relay is always down, slow or refusing: partial coverage is
+// the normal outcome of a refresh, not a failure.
+#[tokio::test]
+async fn marketplace_partial_coverage_is_a_successful_refresh() {
+    let good = LocalRelay::start(Reply::Events(vec![listing_event("partial-game")])).await;
+    let bad = LocalRelay::start(Reply::Closed).await;
+    let (result, delivered) = marketplace_fetch(&[&good, &bad]).await;
+    assert_eq!(result.expect("partial coverage succeeds"), 1);
+    assert_eq!(delivered, 1);
+}
+
+#[tokio::test]
+async fn marketplace_answered_empty_is_successful_despite_failed_relays() {
+    let empty = LocalRelay::start(Reply::Events(Vec::new())).await;
+    let bad = LocalRelay::start(Reply::Closed).await;
+    let (result, delivered) = marketplace_fetch(&[&empty, &bad]).await;
+    assert_eq!(result.expect("an EOSE answer is a real empty result"), 0);
+    assert_eq!(delivered, 0);
+}
+
+#[tokio::test]
+async fn marketplace_listings_from_a_relay_that_then_timed_out_count_as_an_answer() {
+    let slow = LocalRelay::start(Reply::EventsThenSilent(vec![listing_event("slow-game")])).await;
+    let (result, delivered) = marketplace_fetch(&[&slow]).await;
+    assert_eq!(result.expect("received listings are an answer"), 1);
+    assert_eq!(delivered, 1);
+}
+
+#[tokio::test]
+async fn marketplace_with_no_relay_answering_is_unreachable() {
+    let silent = LocalRelay::start(Reply::Silent).await;
+    let closed = LocalRelay::start(Reply::Closed).await;
+    let (result, delivered) = marketplace_fetch(&[&silent, &closed]).await;
+    assert_eq!(
+        result.expect_err("nothing answered"),
+        arcadestr_core::marketplace_fetch::MarketplaceFetchError::Unreachable {
+            failed: 1,
+            timed_out: 1
+        }
+    );
+    assert_eq!(delivered, 0);
 }

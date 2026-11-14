@@ -897,7 +897,7 @@ pub async fn invoke_fetch_marketplace_stream<F, C>(
     until_secs: Option<u64>,
     mut on_listing: F,
     on_complete: Option<C>,
-) -> Result<(impl FnOnce(), impl FnOnce()), String>
+) -> Result<(impl FnOnce(), impl FnOnce()), arcadestr_core::marketplace_fetch::MarketplaceFetchError>
 where
     F: FnMut(GameListing) + 'static,
     C: FnOnce() + 'static,
@@ -924,7 +924,14 @@ where
 
     let product_cleanup = match product_listener {
         Ok(cleanup) => cleanup,
-        Err(e) => return Err(format!("Failed to setup product listener: {}", e)),
+        Err(e) => {
+            return Err(
+                arcadestr_core::marketplace_fetch::MarketplaceFetchError::failed(format!(
+                    "Failed to setup product listener: {}",
+                    e
+                )),
+            )
+        }
     };
 
     // Set up completion listener
@@ -941,7 +948,12 @@ where
         Err(e) => {
             // Clean up product listener since we're failing
             product_cleanup();
-            return Err(format!("Failed to setup completion listener: {}", e));
+            return Err(
+                arcadestr_core::marketplace_fetch::MarketplaceFetchError::failed(format!(
+                    "Failed to setup completion listener: {}",
+                    e
+                )),
+            );
         }
     };
 
@@ -960,7 +972,9 @@ where
         // Clean up listeners on error
         product_cleanup();
         completion_cleanup();
-        return Err(e);
+        // Decode the typed refresh outcome once, here, so callers match on
+        // the variant instead of inspecting error text.
+        return Err(arcadestr_core::marketplace_fetch::MarketplaceFetchError::from_bridge(&e));
     }
 
     // Return cleanup functions for caller to use when done
@@ -974,12 +988,16 @@ pub async fn invoke_fetch_marketplace_stream<F, C>(
     _until_secs: Option<u64>,
     _on_listing: F,
     _on_complete: Option<C>,
-) -> Result<(impl FnOnce(), impl FnOnce()), String>
+) -> Result<(impl FnOnce(), impl FnOnce()), arcadestr_core::marketplace_fetch::MarketplaceFetchError>
 where
     F: FnMut(GameListing) + 'static,
     C: FnOnce() + 'static,
 {
-    Err::<(fn(), fn()), String>("Tauri not available in web mode".to_string())
+    Err::<(fn(), fn()), _>(
+        arcadestr_core::marketplace_fetch::MarketplaceFetchError::failed(
+            "Tauri not available in web mode",
+        ),
+    )
 }
 
 /// Invoke fetch_listing_by_id Tauri command

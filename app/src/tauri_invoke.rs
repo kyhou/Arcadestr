@@ -145,6 +145,24 @@ where
     .await
 }
 
+/// Text of a rejected command. Backend errors are passed through as written;
+/// structured errors (tagged enums) arrive as their JSON so callers can decode
+/// them. Never the `Debug` dump of the `JsValue`.
+fn invoke_error_text(error: &JsValue) -> String {
+    let json = || {
+        js_sys::JSON::stringify(error)
+            .ok()
+            .and_then(|value| value.as_string())
+    };
+    bridge_error_text(error.as_string(), json)
+}
+
+fn bridge_error_text(text: Option<String>, json: impl FnOnce() -> Option<String>) -> String {
+    text.or_else(|| json().filter(|value| value != "{}" && value != "null"))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "The desktop command failed without an error message.".to_string())
+}
+
 /// Invoke a Tauri command via direct JavaScript interop
 fn receipt_private_command(command:&str)->bool {
     matches!(command,"sync_purchase_receipts"|"import_purchase_receipts"|"ingest_receipt")
@@ -186,7 +204,7 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
                 "NWC operation failed. Retry or refresh the saved wallet.".into()
             })
         } else {
-            format!("JS error: {:?}", e)
+            invoke_error_text(&e)
         }
     })?;
 
@@ -341,7 +359,7 @@ pub async fn invoke_void(command: &str, args: serde_json::Value) -> Result<(), S
 
     let _ = JsFuture::from(promise)
         .await
-        .map_err(|e| format!("JS error: {:?}", e))?;
+        .map_err(|e| invoke_error_text(&e))?;
 
     Ok(())
 }
@@ -375,5 +393,40 @@ mod receipt_privacy_tests {
     fn receipt_commands_do_not_echo_request_or_response_payloads(){
         for command in ["sync_purchase_receipts","import_purchase_receipts","ingest_receipt"] {assert!(super::receipt_private_command(command));}
         assert!(!super::receipt_private_command("get_platform_info"));
+    }
+}
+
+#[cfg(test)]
+mod invoke_error_text_tests {
+    use super::bridge_error_text;
+
+    #[test]
+    fn backend_error_strings_are_passed_through_unwrapped() {
+        assert_eq!(
+            bridge_error_text(Some("Relay unreachable".into()), || None),
+            "Relay unreachable"
+        );
+    }
+
+    #[test]
+    fn structured_errors_arrive_as_json_not_debug_output() {
+        let json = r#"{"kind":"incomplete","succeeded":1,"failed":1,"timed_out":0,"events":3}"#;
+        let text = bridge_error_text(None, || Some(json.into()));
+        assert_eq!(text, json);
+        assert!(!text.contains("JsValue"));
+    }
+
+    #[test]
+    fn empty_rejections_get_a_readable_fallback() {
+        for json in [None, Some("{}".to_string()), Some("null".to_string())] {
+            assert_eq!(
+                bridge_error_text(None, || json.clone()),
+                "The desktop command failed without an error message."
+            );
+        }
+        assert_eq!(
+            bridge_error_text(Some("  ".into()), || None),
+            "The desktop command failed without an error message."
+        );
     }
 }

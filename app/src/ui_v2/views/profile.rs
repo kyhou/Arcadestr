@@ -465,25 +465,14 @@ pub fn ProfileV2View(
                         </section>
 
                         <section class="arc-profile-section" aria-labelledby="profile-games-title">
-                            {move || marketplace_state.error.get().map(|message| view! {
-                                <p class="arc-profile-notice" role="alert">{message}</p>
-                            })}
                             <div class="arc-profile-section-header"><div><p class="v2-store-kicker">"Publisher catalog"</p><h2 id="profile-games-title">"Published games"</h2></div></div>
                             {move || if marketplace_state.loading.get() && my_listings.get().is_empty() {
                                 view! { <LoadingState title="Loading published listings" description="The profile remains available while authored listing events load.".to_string() layout=FeedbackLayout::Compact /> }.into_any()
-                            } else if marketplace_state.error.get().is_some() && my_listings.get().is_empty() {
-                                view! { <div class="arc-profile-notice arc-profile-notice-error" role="alert"><strong>"Published listings unavailable"</strong><span>"No authored listings are available from the current marketplace result."</span></div> }.into_any()
                             } else if my_listings.get().is_empty() {
-                                view! { <EmptyState title="No authored listings in the loaded catalog" description="The latest marketplace window contains no current NIP-99 listings authored by this account." icon="sports_esports" layout=FeedbackLayout::Compact /> }.into_any()
+                                view! { <EmptyState title="No listings found" description="No published games for this account were found in the relay results." icon="sports_esports" layout=FeedbackLayout::Compact /> }.into_any()
                             } else {
-                                let refresh_failed = marketplace_state.error.get().is_some();
                                 view! {
                                     <div>
-                                        {refresh_failed.then(|| if marketplace_state.using_cached_data.get() {
-                                            view! { <div class="arc-profile-notice" role="status"><strong>"Cached publisher catalog"</strong><span>"Cached authored listings remain visible after a relay refresh failure."</span></div> }
-                                        } else {
-                                            view! { <div class="arc-profile-notice" role="status"><strong>"Partial publisher catalog"</strong><span>"Authored listings received before the marketplace refresh failed remain visible."</span></div> }
-                                        })}
                                         <div class="arc-profile-listings-grid">
                                             {my_listings.get().into_iter().map(|listing| {
                                                 let selected = listing.clone();

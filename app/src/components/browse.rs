@@ -111,7 +111,7 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                     }
                     Err(e) => {
                         batch(move || {
-                            error.set(Some(e.clone()));
+                            error.set(Some(e.to_string()));
                             // If fetch fails but we have cached data, use it as fallback
                             if let Some(s) = &store {
                                 let cached = s.get_all();
@@ -128,12 +128,12 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                                         .into(),
                                     );
                                 } else {
-                                    error.set(Some(e));
+                                    error.set(Some(e.to_string()));
                                     is_loading.set(false);
                                     has_fetched.set(true);
                                 }
                             } else {
-                                error.set(Some(e));
+                                error.set(Some(e.to_string()));
                                 is_loading.set(false);
                                 has_fetched.set(true);
                             }

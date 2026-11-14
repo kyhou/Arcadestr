@@ -1331,7 +1331,7 @@ pub async fn fetch_nip99_listings_streaming<F>(
     since_days: Option<u64>,
     until_secs: Option<u64>,
     on_product: F,
-) -> Result<u32, String>
+) -> Result<u32, crate::marketplace_fetch::MarketplaceFetchError>
 where
     F: FnMut(Nip99Listing) + Send + 'static,
 {
@@ -1377,7 +1377,7 @@ pub async fn fetch_nip99_listings_streaming_since<F>(
     since_secs: Option<u64>,
     until_secs: Option<u64>,
     mut on_product: F,
-) -> Result<u32, String>
+) -> Result<u32, crate::marketplace_fetch::MarketplaceFetchError>
 where
     F: FnMut(Nip99Listing) + Send + 'static,
 {
@@ -1443,9 +1443,23 @@ where
         })
         .await;
 
-    // Callbacks have already delivered valid partial results. Do not turn a
-    // failed refresh into a successful empty page or mark the cache fresh.
-    result.map_err(|error| error.to_string())?;
+    // Partial relay coverage is normal on Nostr and still a successful
+    // refresh; only a fetch where nothing answered is an error.
+    if let Err(crate::relay_manager::RelayManagerError::FetchIncomplete {
+        succeeded,
+        failed,
+        timed_out,
+        ..
+    }) = &result
+    {
+        tracing::info!(
+            "Marketplace relay coverage: {} answered, {} failed, {} timed out",
+            succeeded,
+            failed,
+            timed_out
+        );
+    }
+    crate::marketplace_fetch::classify_relay_fetch(result)?;
     let count = *product_count.lock().await;
     tracing::info!("Streaming fetch complete: {} unique listings", count);
     Ok(count)

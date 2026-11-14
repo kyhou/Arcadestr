@@ -635,7 +635,7 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                                     target_limit,
                                 );
                             });
-                            error.set(Some(e));
+                            error.set(Some(e.to_string()));
                             loading.set(false);
                             loading_more.set(false);
                             refreshing.set(false);
