@@ -14,3 +14,9 @@ dist = "dist"
 
 # The public URL of the application
 public_url = "/"
+
+[watch]
+# The UI lives in ../app and its protocol types in ../core; without these,
+# `cargo tauri dev` rebuilds the desktop binary but never the frontend.
+# Paths are relative to this file. `dist/` is ignored by Trunk itself.
+watch = [".", "../app", "../core"]
