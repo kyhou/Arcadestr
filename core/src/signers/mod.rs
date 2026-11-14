@@ -15,6 +15,9 @@ mod lazy_nip46;
 #[cfg(not(target_arch = "wasm32"))]
 mod restored_nip46;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use restored_nip46::RestoredNip46Signer;
+
 // LocalSigner is native-only (requires sqlx, encryption)
 #[cfg(not(target_arch = "wasm32"))]
 pub use local::LocalSigner;

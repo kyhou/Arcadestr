@@ -30,6 +30,7 @@ pub mod version;
 
 mod replaceable_event;
 pub use replaceable_event::is_replaceable_event_newer;
+pub mod relay_defaults;
 
 mod hash_validation;
 pub use hash_validation::is_sha256_hex;

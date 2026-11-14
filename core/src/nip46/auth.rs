@@ -339,30 +339,28 @@ pub async fn generate_login_qr(
     let secret = hex::encode(secret_bytes);
     info!("Generated secure nonce for QR session");
 
-    // Use well-known reliable relays as the rendezvous point
-    let relays = vec![
-        "wss://relay.damus.io".to_string(),
-        "wss://nos.lol".to_string(),
-    ];
+    // Match Amethyst's dedicated NIP-46 rendezvous defaults, not feed relays.
+    let relays = crate::relay_defaults::DEFAULT_NIP46_RELAYS;
 
-    // Build the nostrconnect:// URI using the proper constructor
-    let relay_urls: Vec<RelayUrl> = relays.iter().filter_map(|r| r.parse().ok()).collect();
-
-    // Use NostrConnectURI::client() to create a properly formatted URI
-    let base_uri = NostrConnectURI::client(app_keys.public_key(), relay_urls, "Arcadestr");
-
-    // Convert to string and add the secret parameter
-    // The base_uri looks like: nostrconnect://<pubkey>?relay=...&name=...
-    let base_uri_str = base_uri.to_string();
-    let uri = if base_uri_str.contains('?') {
-        format!("{}&secret={}", base_uri_str, secret)
-    } else {
-        format!("{}?secret={}", base_uri_str, secret)
-    };
-
-    info!("Generated nostrconnect URI for QR display: {}", uri);
-
-    Ok((uri, app_keys, secret))
+    let mut uri = Url::parse(&format!(
+        "nostrconnect://{}",
+        app_keys.public_key().to_hex()
+    ))?;
+    {
+        let mut query = uri.query_pairs_mut();
+        query.append_pair("name", "Arcadestr");
+        // Keep the older SDK metadata field alongside the current NIP-46 name.
+        query.append_pair("metadata", r#"{"name":"Arcadestr"}"#);
+        for relay in relays {
+            query.append_pair("relay", relay);
+        }
+        query.append_pair("secret", &secret);
+        if let Some(permissions) = permissions.filter(|permissions| !permissions.is_empty()) {
+            query.append_pair("perms", &permissions.join(","));
+        }
+    }
+    info!("Generated QR login URI (pairing secret omitted from logs)");
+    Ok((uri.to_string(), app_keys, secret))
 }
 
 /// After the QR is scanned, wait for the signer to initiate the connection.
@@ -371,10 +369,10 @@ pub async fn generate_login_qr(
 /// This function:
 /// 1. Connects to the relay(s) in the QR URI
 /// 2. Subscribes to kind 24133 events where p tag = app_keys.public_key()
-/// 3. Waits for a "connect" request from the signer
+/// 3. Waits for a "connect" response from the signer
 /// 4. Validates the secret nonce
-/// 5. Sends back "ack" response
-/// 6. Returns the saved profile and connected signer client
+/// 5. Requests the account public key over the already-authorized transport
+/// 6. Returns the saved profile and connected signer client without re-pairing
 ///
 /// # Arguments
 /// * `qr_uri_string` - The nostrconnect:// URI that was displayed as QR
@@ -387,183 +385,35 @@ pub async fn wait_for_qr_connection(
     expected_secret: String,
     timeout_secs: u64,
 ) -> anyhow::Result<(SavedProfile, nostr_sdk::Client)> {
-    use nostr::{Filter, Kind, Timestamp};
-    use nostr_sdk::Client;
-    use std::time::Duration;
-
-    info!("Waiting for QR connection... timeout={}s", timeout_secs);
-
-    // Parse the QR URI manually to extract relays and secret
-    // The URI format is: nostrconnect://<pubkey>?relay=<url>&relay=<url>&name=<name>&secret=<secret>
-    let uri_url =
-        url::Url::parse(qr_uri_string).map_err(|e| anyhow::anyhow!("Invalid QR URI: {}", e))?;
-
-    // Extract relays from query parameters
-    let mut relays: Vec<RelayUrl> = Vec::new();
-    for (key, value) in uri_url.query_pairs() {
-        if key == "relay" {
-            if let Ok(relay_url) = value.parse::<RelayUrl>() {
-                relays.push(relay_url);
-            }
-        }
-    }
-
-    if relays.is_empty() {
-        // Fallback to default relays if none found
-        relays.push("wss://relay.damus.io".parse().unwrap());
-        relays.push("wss://nos.lol".parse().unwrap());
-    }
-
-    info!("Using {} relays for QR connection", relays.len());
-
-    // Create a temporary client to listen for the signer's connect request
-    let client = Client::new(app_keys.clone());
-
-    // Add all relays from the URI
-    for relay in &relays {
-        info!("Adding relay: {}", relay);
-        client.add_relay(relay).await?;
-    }
-
-    // Connect to relays
-    client.connect().await;
-    info!("Connected to relays, waiting for signer...");
-
-    // Create subscription filter for kind 24133 events where p tag = our pubkey
-    let filter = Filter::new()
-        .kind(Kind::NostrConnect)
-        .pubkey(app_keys.public_key())
-        .since(Timestamp::now());
-
-    // Subscribe to events
-    let _ = client.subscribe(filter, None).await;
-    info!("Subscribed to NIP-46 connect events");
-
-    // Wait for connection with timeout
-    let timeout = Duration::from_secs(timeout_secs);
-    let start_time = std::time::Instant::now();
-
-    // Get notifications from client
-    let mut notifications = client.notifications();
-
-    loop {
-        // Check for timeout
-        if start_time.elapsed() > timeout {
-            client.disconnect().await;
-            anyhow::bail!(
-                "QR connection timeout - no signer connected within {} seconds",
-                timeout_secs
-            );
-        }
-
-        // Try to get next notification with a short timeout
-        match tokio::time::timeout(Duration::from_millis(500), notifications.recv()).await {
-            Ok(Ok(notification)) => {
-                info!("Received notification");
-
-                // Check if this is a NIP-46 event
-                if let nostr_sdk::RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind == Kind::NostrConnect {
-                        info!("Received NIP-46 event from {}", event.pubkey);
-
-                        // Try to decrypt and validate the connect request
-                        match handle_nip46_connect_event(&event, &app_keys, &expected_secret).await
-                        {
-                            Ok((bunker_pubkey, request_id)) => {
-                                info!(
-                                    "Successfully validated connect request from bunker {} with id: {}",
-                                    bunker_pubkey, request_id
-                                );
-
-                                // Send ack response with matching request id
-                                if let Err(e) = send_connect_ack(
-                                    &client,
-                                    &app_keys,
-                                    event.pubkey,
-                                    &relays,
-                                    &request_id,
-                                )
-                                .await
-                                {
-                                    warn!("Failed to send ack: {}", e);
-                                }
-
-                                // IMPORTANT: event.pubkey is the BUNKER's ephemeral key, NOT the user's identity key
-                                // We need to perform NIP-46 handshake to get the actual user's pubkey
-                                info!(
-                                    "Performing NIP-46 handshake to get user's identity pubkey..."
-                                );
-
-                                // Create bunker URI with the bunker's pubkey
-                                let relay_params: Vec<String> =
-                                    relays.iter().map(|r| format!("relay={}", r)).collect();
-                                let bunker_uri_str = format!(
-                                    "bunker://{}?{}",
-                                    bunker_pubkey.to_hex(),
-                                    relay_params.join("&")
-                                );
-                                let bunker_uri = NostrConnectURI::parse(&bunker_uri_str)?;
-
-                                // Create NostrConnect client to perform handshake
-                                let signer = NostrConnect::new(
-                                    bunker_uri.clone(),
-                                    app_keys.clone(),
-                                    Duration::from_secs(30),
-                                    None,
-                                )?;
-
-                                // Get the actual user's identity pubkey (not the bunker's key)
-                                let user_pubkey = signer.get_public_key().await?;
-                                info!(
-                                    "NIP-46 handshake complete! User identity pubkey: {}",
-                                    user_pubkey.to_hex()
-                                );
-
-                                let profile = SavedProfile {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    name: "QR Connected Account".to_string(),
-                                    user_pubkey,
-                                    bunker_uri,
-                                    app_keys,
-                                };
-                                let signer_client =
-                                    Client::new(Arc::new(signer) as Arc<dyn nostr::NostrSigner>);
-
-                                client.disconnect().await;
-                                return Ok((profile, signer_client));
-                            }
-                            Err(e) => {
-                                warn!("Failed to handle connect event: {}", e);
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Err(_)) => {
-                // Channel closed
-                client.disconnect().await;
-                anyhow::bail!("Notification channel closed");
-            }
-            Err(_) => {
-                // Timeout - no events yet, continue polling
-                continue;
-            }
-        }
-    }
+    super::QrLoginSession::start(qr_uri_string, app_keys, expected_secret, timeout_secs)
+        .await?
+        .wait()
+        .await
 }
 
 /// Handle a NIP-46 connect event
 /// Decrypts the event content and validates the secret
 /// Accepts both request format (method+params) and response format (id+result)
-/// Returns the signer's public key and the request id (for JSON-RPC response correlation)
-async fn handle_nip46_connect_event(
+/// Returns the remote transport key and an optional legacy request id to acknowledge.
+pub(super) async fn handle_nip46_connect_event(
     event: &nostr::Event,
     app_keys: &Keys,
     expected_secret: &str,
-) -> anyhow::Result<(PublicKey, String)> {
+) -> anyhow::Result<(PublicKey, Option<String>)> {
     use nostr::nips::nip44;
 
-    info!("Handling NIP-46 connect event from {}", event.pubkey);
+    anyhow::ensure!(
+        event.kind == nostr::Kind::NostrConnect && event.verify().is_ok(),
+        "Invalid QR approval event"
+    );
+    let recipient = app_keys.public_key().to_hex();
+    anyhow::ensure!(
+        event.tags.iter().any(|tag| {
+            let fields = tag.as_slice();
+            fields.len() >= 2 && fields[0] == "p" && fields[1] == recipient
+        }),
+        "QR approval recipient mismatch"
+    );
 
     // Try to decrypt the event content using NIP-44
     // nip44::decrypt takes (secret_key, public_key, ciphertext)
@@ -574,8 +424,6 @@ async fn handle_nip46_connect_event(
         }
     };
 
-    info!("Decrypted NIP-46 content: {}", decrypted);
-
     // Parse the JSON-RPC message
     let message: serde_json::Value = serde_json::from_str(&decrypted)
         .map_err(|e| anyhow::anyhow!("Failed to parse JSON-RPC message: {}", e))?;
@@ -584,16 +432,22 @@ async fn handle_nip46_connect_event(
     let request_id = message
         .get("id")
         .and_then(|id| id.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            // If no id in request, generate one (shouldn't happen with compliant signers)
-            warn!("No id field in NIP-46 connect request, generating random id");
-            uuid::Uuid::new_v4().to_string()
-        });
-    info!("Extracted request id: {}", request_id);
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("QR approval requires a request id"))?;
+    anyhow::ensure!(
+        message.get("error").is_none_or(serde_json::Value::is_null),
+        "Signer rejected QR approval"
+    );
 
     // Try to extract the secret from various formats
-    let received_secret = if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
+    let received_secret = if let Some(method) = message.get("method") {
+        let method = method
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid QR request method"))?;
+        anyhow::ensure!(
+            message.get("result").is_none(),
+            "QR approval cannot be both request and response"
+        );
         // Request format: {"id":"...","method":"connect","params":[secret]}
         if method == "connect" {
             let params = message
@@ -629,12 +483,16 @@ async fn handle_nip46_connect_event(
     info!("Secret validated successfully");
 
     // Return the signer's public key and the request id
-    Ok((event.pubkey, request_id))
+    let acknowledgement = message
+        .get("method")
+        .is_some()
+        .then(|| request_id.to_string());
+    Ok((event.pubkey, acknowledgement))
 }
 
 /// Send a connect acknowledgment response
 /// Uses the same id as the request for JSON-RPC correlation
-async fn send_connect_ack(
+pub(super) async fn send_connect_ack(
     client: &nostr_sdk::Client,
     app_keys: &Keys,
     signer_pubkey: PublicKey,
@@ -644,10 +502,7 @@ async fn send_connect_ack(
     use nostr::nips::nip44;
     use nostr::{EventBuilder, Tag};
 
-    info!(
-        "Sending connect ack to {} with request id: {}",
-        signer_pubkey, request_id
-    );
+    info!("Sending legacy QR connect acknowledgement");
 
     // Build the JSON-RPC response using the SAME id as the request
     // This is required by JSON-RPC 2.0 spec for proper correlation
@@ -677,7 +532,7 @@ async fn send_connect_ack(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to send ack: {}", e))?;
 
-    info!("Connect ack sent successfully with id: {}", request_id);
+    info!("Legacy QR connect acknowledgement sent");
     Ok(())
 }
 
@@ -940,6 +795,86 @@ mod tests {
             .expect_err("mismatched secret must be rejected");
 
         assert!(err.to_string().contains("Secret mismatch"));
+    }
+
+    fn qr_approval(payload: serde_json::Value, recipient: nostr::PublicKey) -> Event {
+        let signer = signer_keys();
+        let encrypted = nostr::nips::nip44::encrypt(
+            signer.secret_key(),
+            &app_keys().public_key(),
+            payload.to_string(),
+            nostr::nips::nip44::Version::V2,
+        )
+        .expect("encrypt approval");
+        EventBuilder::new(Kind::NostrConnect, encrypted)
+            .tags([nostr::Tag::public_key(recipient)])
+            .sign_with_keys(&signer)
+            .expect("signed approval")
+    }
+
+    #[tokio::test]
+    async fn standard_qr_response_does_not_require_an_acknowledgement() {
+        let app = app_keys();
+        let event = qr_approval(
+            json!({"id":"approval-id","result":"test-secret","error":null}),
+            app.public_key(),
+        );
+        let (remote, acknowledgement) = handle_nip46_connect_event(&event, &app, "test-secret")
+            .await
+            .expect("valid approval");
+        assert_eq!(remote, signer_keys().public_key());
+        assert!(acknowledgement.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_or_untrusted_qr_approvals_are_rejected() {
+        let app = app_keys();
+        for payload in [
+            json!({"id":"approval","result":"wrong-secret"}),
+            json!({"id":"approval","result":"test-secret","error":"denied"}),
+            json!({"result":"test-secret"}),
+            json!({"id":42,"result":"test-secret"}),
+            json!({"id":"approval","method":42,"result":"test-secret"}),
+            json!({"id":"approval","method":"connect","params":["test-secret"],"result":"test-secret"}),
+        ] {
+            let event = qr_approval(payload, app.public_key());
+            assert!(handle_nip46_connect_event(&event, &app, "test-secret")
+                .await
+                .is_err());
+        }
+        let payload = json!({"id":"approval","result":"test-secret"});
+        let wrong_recipient = qr_approval(payload.clone(), user_keys().public_key());
+        assert!(
+            handle_nip46_connect_event(&wrong_recipient, &app, "test-secret")
+                .await
+                .is_err()
+        );
+        let mut forged = qr_approval(payload, app.public_key());
+        forged.content.push('x');
+        assert!(handle_nip46_connect_event(&forged, &app, "test-secret")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn qr_uri_encodes_metadata_permissions_and_secret_as_query_parameters() {
+        let (uri, keys, secret) =
+            generate_login_qr(Some(vec!["sign_event:1".into(), "nip44_encrypt".into()]))
+                .await
+                .expect("QR URI");
+        let parsed = url::Url::parse(&uri).expect("encoded URI");
+        let values: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(parsed.host_str(), Some(keys.public_key().to_hex().as_str()));
+        assert_eq!(values["name"], "Arcadestr");
+        assert_eq!(values["secret"], secret);
+        assert_eq!(values["perms"], "sign_event:1,nip44_encrypt");
+        let relays = parsed
+            .query_pairs()
+            .filter(|(key, _)| key == "relay")
+            .map(|(_, value)| value.into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(relays, crate::relay_defaults::DEFAULT_NIP46_RELAYS);
+        assert!(uri.contains("relay=wss%3A%2F%2F"));
     }
 
     #[test]

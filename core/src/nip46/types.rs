@@ -77,6 +77,12 @@ pub struct SavedProfile {
 /// Runtime application state managed by Tauri's State system.
 /// This lives in memory only — nothing here is written to disk directly.
 pub struct AppSignerState {
+    /// Serializes short session commits, never the remote approval wait.
+    pub auth_operations: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Invalidates pending approvals and connection checks after identity changes.
+    pub auth_generation: u64,
+    /// Changes only when the selected signing session changes, not on canceled approvals.
+    pub session_generation: u64,
     /// All profiles loaded from keyring at startup.
     pub saved_profiles: Vec<SavedProfile>,
 
@@ -105,6 +111,9 @@ impl AppSignerState {
     /// Creates a new empty AppSignerState
     pub fn new() -> Self {
         Self {
+            auth_operations: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            auth_generation: 0,
+            session_generation: 0,
             saved_profiles: Vec::new(),
             active_client: None,
             active_profile_id: None,
@@ -113,6 +122,49 @@ impl AppSignerState {
             bunker_retry_handle: None,
             connection_state: ConnectionState::Disconnected,
         }
+    }
+
+    pub fn invalidate_pending_auth(&mut self) -> u64 {
+        self.auth_generation = self.auth_generation.wrapping_add(1);
+        self.pending_qr = None;
+        self.auth_generation
+    }
+
+    pub fn can_complete_qr(&self, generation: u64, uri: &str) -> bool {
+        self.auth_generation == generation
+            && self
+                .pending_qr
+                .as_ref()
+                .is_some_and(|pending| pending.uri == uri)
+    }
+}
+
+#[cfg(test)]
+mod auth_generation_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_and_new_attempts_reject_late_qr_approvals() {
+        let mut state = AppSignerState::new();
+        state.session_generation = 42;
+        let generation = state.invalidate_pending_auth();
+        let pending = PendingQrState {
+            uri: "nostrconnect://test-attempt".into(),
+            session: None,
+            created_at: std::time::Instant::now(),
+        };
+        state.pending_qr = Some(pending.clone());
+        assert!(state.can_complete_qr(generation, &pending.uri));
+        state.invalidate_pending_auth();
+        assert_eq!(
+            state.session_generation, 42,
+            "canceling an approval must not invalidate the active session's verification"
+        );
+        assert!(!state.can_complete_qr(generation, &pending.uri));
+        state.pending_qr = Some(pending.clone());
+        assert!(!state.can_complete_qr(generation, &pending.uri));
+        assert!(state.can_complete_qr(state.auth_generation, &pending.uri));
+        assert!(!state.can_complete_qr(state.auth_generation, "different-attempt"));
     }
 }
 
@@ -163,17 +215,23 @@ pub struct ProfileMetadata {
 }
 
 /// Pending QR connection state (Flow B).
-/// Holds the app_keys and secret until the signer scans the QR code.
-#[derive(Debug, Clone)]
+/// Keeps one live listener until approval is claimed, canceled, or expired.
+#[derive(Clone)]
 pub struct PendingQrState {
     /// The nostrconnect:// URI that was displayed as QR
     pub uri: String,
-    /// The ephemeral keys for this connection attempt
-    pub app_keys: Keys,
-    /// The secret nonce for validating the connection
-    pub secret: String,
+    /// A single continuously listening connection. None is used by state-only tests.
+    pub session: Option<std::sync::Arc<super::QrLoginSession>>,
     /// Timestamp when the QR was generated
     pub created_at: std::time::Instant,
+}
+
+impl std::fmt::Debug for PendingQrState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingQrState")
+            .field("created_at", &self.created_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Keyring key naming constants.

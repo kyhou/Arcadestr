@@ -28,33 +28,7 @@ use crate::user_cache::UserCache;
 /// Using kind 30078 (NIP-78 arbitrary app data, parameterized replaceable).
 pub const KIND_GAME_LISTING: u16 = 30078;
 
-/// Default relays for Arcadestr.
-/// Includes popular relay discovery services that aggregate user metadata.
-pub const DEFAULT_RELAYS: &[&str] = &[
-    // Relay discovery services (query these first for user lookups)
-    "wss://relay.nostr.info", // Relay discovery service
-    "wss://relay.nostr.band", // Relay aggregator with good coverage
-    // General relays
-    "wss://relay.damus.io",
-    "wss://nos.lol",
-    "wss://relay.snort.social",
-    "wss://relay.current.fyi",
-    "wss://nostr.wine",
-];
-
-/// Relay discovery services - prioritized for user lookups
-pub const DISCOVERY_RELAYS: &[&str] = &[
-    "wss://relay.nostr.info",
-    "wss://relay.nostr.band",
-    "wss://relay.nsec.app", // NIP-46 service relay
-];
-
-/// Indexer relays for profile/relay discovery (subset of DEFAULT_RELAYS)
-pub const INDEXER_RELAYS: &[&str] = &[
-    "wss://relay.primal.net",
-    "wss://relay.nostr.band",
-    "wss://indexer.coracle.social",
-];
+pub use crate::relay_defaults::{DEFAULT_RELAYS, DISCOVERY_RELAYS, INDEXER_RELAYS};
 
 /// Kind 10002: Relay List Metadata (NIP-65)
 pub const KIND_RELAY_LIST: u16 = 10002;

@@ -16,8 +16,8 @@ use arcadestr_core::nip46::{
     activate_profile, attempt_manual_reconnect, cancel_bunker_retry, clear_last_active_profile_id,
     delete_profile_from_keyring, generate_login_qr, get_profile_metadata_by_id,
     init_signer_session, list_profile_index, load_profile_from_keyring, logout, ping_active_signer,
-    save_profile_to_keyring, set_last_active_profile_id, wait_for_qr_connection, AppSignerState,
-    ConnectionState, PendingQrState, ProfileMetadata,
+    save_profile_to_keyring, set_last_active_profile_id, AppSignerState, ConnectionState,
+    PendingQrState, ProfileMetadata, QrLoginSession, QrLoginStatus,
 };
 use arcadestr_core::signers::{ActiveSigner, SdkSignerAdapter};
 
@@ -50,7 +50,7 @@ fn local_account_login_json(account: &Account, name: Option<String>) -> serde_js
     })
 }
 
-async fn activate_local_account(
+fn activate_local_account(
     account_manager: &AccountManager,
     account: &Account,
     auth: &mut AuthState,
@@ -63,6 +63,22 @@ async fn activate_local_account(
     Ok(())
 }
 
+async fn auth_operation(
+    state: &Arc<Mutex<AppSignerState>>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+    let gate = { state.lock().await.auth_operations.clone() };
+    gate.acquire_owned()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn cancel_login(state: State<'_, Arc<Mutex<AppSignerState>>>) -> Result<(), String> {
+    let _operation = auth_operation(state.inner()).await?;
+    state.lock().await.invalidate_pending_auth();
+    Ok(())
+}
+
 async fn activate_remote_account(
     signer: Arc<dyn nostr::NostrSigner>,
     app_state: &crate::AppState,
@@ -71,6 +87,14 @@ async fn activate_remote_account(
         .get_public_key()
         .await
         .map_err(|error| format!("failed to get active signer pubkey: {error}"))?;
+    install_remote_account(signer, public_key, app_state).await
+}
+
+async fn install_remote_account(
+    signer: Arc<dyn nostr::NostrSigner>,
+    public_key: nostr::PublicKey,
+    app_state: &crate::AppState,
+) -> Result<nostr::PublicKey, String> {
     let mut auth = app_state.auth.lock().await;
     auth.set_signer(ActiveSigner::Sdk(SdkSignerAdapter::new(signer)));
     auth.set_public_key(public_key);
@@ -89,6 +113,8 @@ pub async fn login_with_nsec(
     app_state: State<'_, crate::AppState>,
     signer_state: State<'_, Arc<Mutex<AppSignerState>>>,
 ) -> Result<serde_json::Value, String> {
+    let _operation = auth_operation(signer_state.inner()).await?;
+    signer_state.lock().await.invalidate_pending_auth();
     app_state.settlement_recovery.activate(None);
     let account = account_manager
         .login_with_nsec(&nsec)
@@ -106,6 +132,7 @@ pub async fn login_with_nsec(
     clear_last_active_profile_id();
     {
         let mut signer_guard = signer_state.lock().await;
+        signer_guard.session_generation = signer_guard.session_generation.wrapping_add(1);
         signer_guard.active_client = None;
         signer_guard.active_profile_id = None;
         signer_guard.connection_state = ConnectionState::Disconnected;
@@ -113,7 +140,7 @@ pub async fn login_with_nsec(
 
     {
         let mut auth = app_state.auth.lock().await;
-        activate_local_account(account_manager.inner(), &account, &mut auth).await?;
+        activate_local_account(account_manager.inner(), &account, &mut auth)?;
         app_state
             .settlement_recovery
             .observe(Some(account.pubkey.clone()));
@@ -137,9 +164,13 @@ pub async fn connect_bunker(
     app_handle: AppHandle,
     app_state: State<'_, crate::AppState>,
 ) -> Result<serde_json::Value, String> {
+    let generation = {
+        let _operation = auth_operation(state.inner()).await?;
+        state.lock().await.invalidate_pending_auth()
+    };
     info!(
-        "connect_bunker called (blocking handshake): identifier={}, display_name={}",
-        identifier, display_name
+        "connect_bunker called (blocking handshake): display_name={}",
+        display_name
     );
 
     // STEP 1: Parse the identifier to get bunker_uri and optional user_pubkey hint
@@ -192,6 +223,11 @@ pub async fn connect_bunker(
         profile.name = display_name.clone();
     }
 
+    // Approval can arrive after cancellation or another account selection.
+    let _operation = auth_operation(state.inner()).await?;
+    if state.lock().await.auth_generation != generation {
+        return Err("Login canceled or superseded".into());
+    }
     // STEP 5: Save to keyring
     save_profile_to_keyring(&profile).map_err(|e| {
         error!("save_profile_to_keyring failed: {}", e);
@@ -201,17 +237,17 @@ pub async fn connect_bunker(
     info!("Profile saved to keyring: id={}", profile.id);
 
     // STEP 6: Get bunker pubkey for state management
-    let bunker_pubkey = profile
+    profile
         .bunker_uri
         .remote_signer_public_key()
-        .ok_or("No remote signer public key in URI")?
-        .to_hex();
+        .ok_or("No remote signer public key in URI")?;
 
     // STEP 7: Update state with the client
     {
         let mut state_guard = state.lock().await;
+        state_guard.session_generation = state_guard.session_generation.wrapping_add(1);
         state_guard.active_client = Some(client.clone());
-        state_guard.active_profile_id = Some(bunker_pubkey.clone());
+        state_guard.active_profile_id = Some(profile.id.clone());
         state_guard.connection_state = ConnectionState::Connected; // Already connected!
     }
     let signer = client
@@ -440,6 +476,8 @@ pub async fn start_qr_login(
     state: State<'_, Arc<Mutex<AppSignerState>>>,
     _app_handle: AppHandle,
 ) -> Result<String, String> {
+    let _operation = auth_operation(state.inner()).await?;
+    state.lock().await.invalidate_pending_auth();
     info!("start_qr_login called");
 
     // Generate QR with no specific permissions requested
@@ -448,13 +486,15 @@ pub async fn start_qr_login(
         e.to_string()
     })?;
 
+    let session = QrLoginSession::start(&uri_string, app_keys, secret, 300)
+        .await
+        .map_err(|_| "Could not start the QR login listener".to_string())?;
     // Store pending QR state in AppSignerState
     {
         let mut state_guard = state.lock().await;
         state_guard.pending_qr = Some(PendingQrState {
             uri: uri_string.clone(),
-            app_keys,
-            secret,
+            session: Some(Arc::new(session)),
             created_at: std::time::Instant::now(),
         });
     }
@@ -472,75 +512,53 @@ pub async fn check_qr_connection(
     app_handle: AppHandle,
     app_state: State<'_, crate::AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
-    info!("check_qr_connection called");
+    tracing::debug!("check_qr_connection called");
 
-    // Check if already processing to prevent concurrent calls
-    {
+    let (pending, generation) = {
         let state_guard = state.lock().await;
-        if state_guard.pending_qr.is_none() {
-            // No pending QR - either already connected or never started
-            // Check if we have an active profile (connection succeeded)
-            if state_guard.active_profile_id.is_some() {
-                // Connection already established, return success
-                if let Some(ref client) = state_guard.active_client {
-                    // Get signer from client, then get public key
-                    match client.signer().await {
-                        Ok(signer) => match signer.get_public_key().await {
-                            Ok(pubkey) => {
-                                let user_npub = pubkey.to_bech32().unwrap_or_default();
-                                return Ok(Some(serde_json::json!({
-                                    "id": state_guard.active_profile_id.as_ref().unwrap(),
-                                    "name": "QR Connected Account",
-                                    "pubkey": user_npub,
-                                    "pubkey_hex": pubkey.to_hex(),
-                                })));
-                            }
-                            Err(_) => {}
-                        },
-                        Err(_) => {}
-                    }
-                }
-            }
-            return Err("No QR login in progress. Call start_qr_login first.".to_string());
-        }
-    }
-
-    // Get pending QR state
-    let pending = {
-        let state_guard = state.lock().await;
-        state_guard.pending_qr.clone().unwrap()
+        (
+            state_guard
+                .pending_qr
+                .clone()
+                .ok_or("No QR login in progress")?,
+            state_guard.auth_generation,
+        )
     };
 
     // Check if QR has expired (5 minute timeout)
     if pending.created_at.elapsed().as_secs() > 300 {
         // Clear expired QR state
         let mut state_guard = state.lock().await;
-        state_guard.pending_qr = None;
+        if state_guard.auth_generation == generation {
+            state_guard.invalidate_pending_auth();
+        }
         return Err("QR code expired. Please generate a new one.".to_string());
     }
 
-    // Try to complete the connection with 30 second timeout per poll
-    // The frontend polls every 3 seconds, so this gives plenty of time
-    match wait_for_qr_connection(
-        &pending.uri,
-        pending.app_keys.clone(),
-        pending.secret.clone(),
-        30,
-    )
-    .await
-    {
-        Ok((profile, client)) => {
+    let session = pending.session.as_ref().ok_or("QR listener unavailable")?;
+    match session.status() {
+        QrLoginStatus::Waiting => Ok(None),
+        QrLoginStatus::Ready { profile, client } => {
+            let _operation = auth_operation(state.inner()).await?;
+            {
+                let guard = state.lock().await;
+                if !guard.can_complete_qr(generation, &pending.uri) {
+                    return Err("QR login canceled or superseded".into());
+                }
+            }
             info!("QR connection established for profile: {}", profile.id);
 
             // Save profile to keyring
             if let Err(e) = save_profile_to_keyring(&profile) {
                 error!("Failed to save QR profile to keyring: {}", e);
+                state.lock().await.invalidate_pending_auth();
                 return Err(format!("Connected but failed to save profile: {}", e));
             }
 
             {
                 let mut state_guard = state.lock().await;
                 state_guard.pending_qr = None;
+                state_guard.session_generation = state_guard.session_generation.wrapping_add(1);
                 state_guard.active_profile_id = Some(profile.id.clone());
                 state_guard.active_client = Some(client.clone());
                 state_guard.connection_state = ConnectionState::Connected;
@@ -549,10 +567,11 @@ pub async fn check_qr_connection(
                 .signer()
                 .await
                 .map_err(|error| format!("failed to access QR signer: {error}"))?;
-            activate_remote_account(signer, &app_state).await?;
+            install_remote_account(signer, profile.user_pubkey, &app_state).await?;
             if let Err(error) = set_last_active_profile_id(&profile.id) {
                 warn!("Failed to persist active QR profile: {error}");
             }
+            session.accept();
 
             info!(
                 "QR profile {} activated with its connected signer",
@@ -571,10 +590,12 @@ pub async fn check_qr_connection(
                 "pubkey_hex": profile.user_pubkey.to_hex(),
             })))
         }
-        Err(e) => {
-            // Connection not yet established, return None (frontend will poll again)
-            info!("QR connection not yet established: {}", e);
-            Ok(None)
+        QrLoginStatus::Failed(error) => {
+            let mut guard = state.lock().await;
+            if guard.can_complete_qr(generation, &pending.uri) {
+                guard.invalidate_pending_auth();
+            }
+            Err(error)
         }
     }
 }
@@ -682,6 +703,8 @@ pub async fn switch_profile(
     app_state: State<'_, crate::AppState>,
     account_manager: State<'_, Arc<AccountManager>>,
 ) -> Result<serde_json::Value, String> {
+    let _operation = auth_operation(state.inner()).await?;
+    state.lock().await.invalidate_pending_auth();
     app_state.settlement_recovery.activate(None);
     info!("switch_profile called: profile_id={}", profile_id);
 
@@ -700,13 +723,14 @@ pub async fn switch_profile(
         clear_last_active_profile_id();
         {
             let mut signer_guard = state.lock().await;
+            signer_guard.session_generation = signer_guard.session_generation.wrapping_add(1);
             signer_guard.active_client = None;
             signer_guard.active_profile_id = None;
             signer_guard.connection_state = ConnectionState::Disconnected;
         }
         {
             let mut auth = app_state.auth.lock().await;
-            activate_local_account(account_manager.inner(), &account, &mut auth).await?;
+            activate_local_account(account_manager.inner(), &account, &mut auth)?;
             app_state
                 .settlement_recovery
                 .observe(Some(account.pubkey.clone()));
@@ -821,8 +845,8 @@ pub async fn attempt_reconnect(
             info!("Manual reconnect successful");
 
             // Get the user pubkey
-            let state_guard = state.lock().await;
-            if let Some(ref client) = state_guard.active_client {
+            let client = { state.lock().await.active_client.clone() };
+            if let Some(client) = client {
                 match client.signer().await {
                     Ok(signer) => match signer.get_public_key().await {
                         Ok(pubkey) => {
@@ -852,6 +876,30 @@ pub async fn attempt_reconnect(
 mod local_account_tests {
     use super::*;
     use nostr::{Keys, ToBech32};
+    use tauri::Manager;
+
+    #[tokio::test]
+    async fn cancel_login_rejects_pending_approval_without_disconnecting_selected_account() {
+        let app = tauri::test::mock_app();
+        let mut signer = AppSignerState::new();
+        signer.active_profile_id = Some("existing-account".into());
+        signer.connection_state = ConnectionState::Connecting;
+        signer.session_generation = 7;
+        let generation = signer.invalidate_pending_auth();
+        signer.pending_qr = Some(PendingQrState {
+            uri: "nostrconnect://pending".into(),
+            session: None,
+            created_at: std::time::Instant::now(),
+        });
+        let signer = Arc::new(Mutex::new(signer));
+        app.manage(signer.clone());
+        cancel_login(app.state()).await.expect("cancel command");
+        let state = signer.lock().await;
+        assert!(!state.can_complete_qr(generation, "nostrconnect://pending"));
+        assert_eq!(state.active_profile_id.as_deref(), Some("existing-account"));
+        assert_eq!(state.session_generation, 7);
+        assert_eq!(state.connection_state, ConnectionState::Connecting);
+    }
 
     #[test]
     fn local_account_login_response_contains_local_signing_metadata() {
@@ -890,6 +938,8 @@ pub async fn delete_profile(
     app_state: State<'_, crate::AppState>,
     account_manager: State<'_, Arc<AccountManager>>,
 ) -> Result<(), String> {
+    let _operation = auth_operation(state.inner()).await?;
+    state.lock().await.invalidate_pending_auth();
     info!("delete_profile called: profile_id={}", profile_id);
 
     if account_manager
@@ -907,6 +957,7 @@ pub async fn delete_profile(
         app_state.settlement_recovery.activate(None);
         drop(auth);
         let mut signer_guard = state.lock().await;
+        signer_guard.session_generation = signer_guard.session_generation.wrapping_add(1);
         signer_guard.active_client = None;
         signer_guard.active_profile_id = None;
         signer_guard.connection_state = ConnectionState::Disconnected;
@@ -1031,6 +1082,8 @@ pub async fn logout_nip46(
     app_state: State<'_, crate::AppState>,
     account_manager: State<'_, Arc<AccountManager>>,
 ) -> Result<(), String> {
+    let _operation = auth_operation(state.inner()).await?;
+    state.lock().await.invalidate_pending_auth();
     info!("logout_nip46 called");
     logout(state.inner()).await;
     account_manager
@@ -1067,6 +1120,9 @@ pub async fn load_active_account(
     app_state: State<'_, crate::AppState>,
     account_manager: State<'_, Arc<AccountManager>>,
 ) -> Result<serde_json::Value, String> {
+    // Do not depend on the startup task winning a race against frontend mount.
+    arcadestr_core::nip46::restore_session_on_startup(state.inner()).await;
+    let _operation = auth_operation(state.inner()).await?;
     info!("load_active_account called");
 
     let (active_profile_id, active_client) = {
@@ -1110,7 +1166,7 @@ pub async fn load_active_account(
         .map_err(|err| err.to_string())?
     {
         let mut auth = app_state.auth.lock().await;
-        activate_local_account(account_manager.inner(), &account, &mut auth).await?;
+        activate_local_account(account_manager.inner(), &account, &mut auth)?;
         app_state
             .settlement_recovery
             .observe(Some(account.pubkey.clone()));

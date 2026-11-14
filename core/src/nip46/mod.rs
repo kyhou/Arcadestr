@@ -18,6 +18,8 @@
 
 pub mod auth;
 pub mod methods;
+mod qr;
+pub use qr::{QrLoginSession, QrLoginStatus};
 pub mod session;
 pub mod storage;
 pub mod types;

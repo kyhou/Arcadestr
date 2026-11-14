@@ -6775,10 +6775,9 @@ fn main() {
             LoginMethod::Nostrconnect | LoginMethod::Bunker => {
                 // For nostrconnect/bunker, we reconnect using the client keys
                 // The signer will remember the approval based on the client public key
-                let relay = user
-                    .relay
-                    .clone()
-                    .unwrap_or_else(|| "wss://relay.nsec.app".to_string());
+                let relay = user.relay.clone().unwrap_or_else(|| {
+                    arcadestr_core::relay_defaults::PRIMARY_NIP46_RELAY.to_string()
+                });
 
                 // Build URI from client keys (we already have them saved)
                 let uri_str = user.uri.clone().unwrap_or_else(|| {
@@ -8399,6 +8398,7 @@ fn main() {
             nip46_commands::has_accounts,
             nip46_commands::load_active_account,
             nip46_commands::login_with_nsec,
+            nip46_commands::cancel_login,
             nip46_commands::attempt_reconnect,
             #[cfg(debug_assertions)]
             test_extended_network_discovery,

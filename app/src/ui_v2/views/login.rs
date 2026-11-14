@@ -147,6 +147,13 @@ pub fn LoginV2View() -> impl IntoView {
     let qr_uri = RwSignal::new(None::<String>);
     let qr_polling = RwSignal::new(false);
     let qr_error = RwSignal::new(None::<String>);
+    on_cleanup(move || {
+        if qr_polling.try_get_untracked().unwrap_or(false) {
+            spawn_local(async {
+                let _ = crate::invoke_cancel_login().await;
+            });
+        }
+    });
 
     let import_ncryptsec = RwSignal::new(String::new());
     let import_password = RwSignal::new(String::new());
@@ -184,7 +191,14 @@ pub fn LoginV2View() -> impl IntoView {
             return;
         }
         auth.begin_auth_flow();
-        auth.is_loading.set(false);
+        auth.is_loading.set(true);
+        let auth_for_cancel = auth.clone();
+        spawn_local(async move {
+            if let Err(error) = crate::invoke_cancel_login().await {
+                auth_for_cancel.error.set(Some(error));
+            }
+            auth_for_cancel.is_loading.set(false);
+        });
         qr_polling.set(false);
         qr_uri.set(None);
         qr_error.set(None);
@@ -400,7 +414,7 @@ pub fn LoginV2View() -> impl IntoView {
                                     break;
                                 }
                             }
-                            gloo_timers::future::TimeoutFuture::new(5_000).await;
+                            gloo_timers::future::TimeoutFuture::new(500).await;
                         }
                     });
                 }

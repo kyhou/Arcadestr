@@ -1032,6 +1032,18 @@ struct FetchProfileArgs {
     additional_relays: Option<Vec<String>>,
 }
 
+/// Invalidate pending backend approvals before another login can begin.
+pub async fn invoke_cancel_login() -> Result<(), String> {
+    #[cfg(not(feature = "web"))]
+    {
+        crate::tauri_invoke::invoke("cancel_login", serde_json::json!({})).await
+    }
+    #[cfg(feature = "web")]
+    {
+        Ok(())
+    }
+}
+
 /// Invoke fetch_profile Tauri command
 #[cfg(not(feature = "web"))]
 pub async fn invoke_fetch_profile(
@@ -3822,7 +3834,7 @@ fn LoginView() -> impl IntoView {
     // Form input signals for bunker:// flow (updated for new NIP-46 API)
     let bunker_uri = RwSignal::new(String::new());
     let bunker_display_name = RwSignal::new(String::new()); // NEW: display name for the profile
-    let relay = RwSignal::new("wss://relay.damus.io".to_string());
+    let relay = RwSignal::new(arcadestr_core::relay_defaults::PRIMARY_NIP46_RELAY.to_string());
 
     // Signals for nostrconnect:// flow (keep existing)
     let generated_uri = RwSignal::new(None::<String>);

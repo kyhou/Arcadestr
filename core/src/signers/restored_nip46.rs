@@ -18,7 +18,7 @@ use nostr_sdk::{
 };
 use std::time::Duration;
 
-pub(super) struct RestoredNip46Signer {
+pub(crate) struct RestoredNip46Signer {
     client: Client,
     keys: Keys,
     remote: PublicKey,
@@ -36,6 +36,37 @@ impl std::fmt::Debug for RestoredNip46Signer {
 }
 
 impl RestoredNip46Signer {
+    /// QR approval already authorized this transport. Discover the account key
+    /// without starting a second `connect` exchange or replacing the listener.
+    pub(crate) async fn from_authorized_client(
+        client: Client,
+        keys: Keys,
+        remote: PublicKey,
+        timeout: Duration,
+    ) -> Result<(Self, PublicKey), SignerError> {
+        let mut signer = Self {
+            client,
+            keys,
+            remote,
+            user: remote,
+            timeout,
+        };
+        let user = signer
+            .request(NostrConnectRequest::GetPublicKey)
+            .await
+            .and_then(|result| result.to_get_public_key().map_err(SignerError::backend));
+        match user {
+            Ok(user) => {
+                signer.user = user;
+                Ok((signer, user))
+            }
+            Err(error) => {
+                signer.client.disconnect().await;
+                Err(error)
+            }
+        }
+    }
+
     pub(super) async fn connect(
         uri: &NostrConnectURI,
         keys: Keys,
