@@ -1125,6 +1125,7 @@ fn test_nip99_listing(id: &str, merchant_npub: &str, created_at: u64) -> Nip99Li
         acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
         campaigns: Vec::new(),
         status: Some("active".to_string()),
+        lud16: None,
         #[cfg(debug_assertions)]
         raw_event_json: None,
         merchant_npub: merchant_npub.to_string(),

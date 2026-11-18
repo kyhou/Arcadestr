@@ -416,7 +416,7 @@ fn listing_signature(listing: &CoreGameListing) -> String {
     let acquisition_json =
         serde_json::to_string(&listing.acquisition).unwrap_or_else(|_| "\"Gated\"".to_string());
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         listing.publisher_npub,
         listing.id,
         listing.title,
@@ -429,7 +429,8 @@ fn listing_signature(listing: &CoreGameListing) -> String {
         listing.nip94_event_id.as_deref().unwrap_or_default(),
         specs_json,
         acquisition_json,
-        listing.event_id.as_deref().unwrap_or_default()
+        listing.event_id.as_deref().unwrap_or_default(),
+        listing.lud16
     )
 }
 
@@ -5848,6 +5849,7 @@ mod task4_tests {
             acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
             campaigns: Vec::new(),
             status: None,
+            lud16: None,
             #[cfg(debug_assertions)]
             raw_event_json: None,
         }
@@ -5924,6 +5926,14 @@ mod task4_tests {
         assert_ne!(
             listing_signature(&linux_listing),
             listing_signature(&windows_listing)
+        );
+
+        // A cached projection missing its signed lud16 must be re-emitted.
+        let mut paid_listing = linux_listing.clone();
+        paid_listing.lud16 = "dev@example.com".to_string();
+        assert_ne!(
+            listing_signature(&linux_listing),
+            listing_signature(&paid_listing)
         );
 
         let mut nip94_listing = linux_listing.clone();

@@ -547,7 +547,9 @@ impl GameListing {
             publisher_npub: listing.merchant_npub,
             stall_id: String::new(),
             stall_name: None,
-            lud16: String::new(),
+            // The signed listing's own payment address; callers may still
+            // fill it from the merchant profile only when the tag is absent.
+            lud16: listing.lud16.unwrap_or_default(),
             event_id: Some(listing.event_id),
             created_at: listing.created_at,
             platforms: listing.platforms,
@@ -890,6 +892,7 @@ mod tests {
                 acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Gated,
                 campaigns: Vec::new(),
                 status: Some("active".to_string()),
+                lud16: None,
                 #[cfg(debug_assertions)]
                 raw_event_json: Some(r#"{"kind":30402}"#.to_string()),
                 merchant_npub: "npub1seller".to_string(),
@@ -931,5 +934,17 @@ mod tests {
         assert!(mapped
             .specs
             .contains(&("malformed_adp_terms".into(), "1".into())));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn native_listing_mapping_keeps_the_signed_lud16() {
+        let source: arcadestr_core::marketplace::Nip99Listing =
+            serde_json::from_value(serde_json::json!({
+                "event_id":"event","id":"paid","title":"Paid","content":"","images":[],"tags":[],
+                "merchant_npub":"npub1seller","created_at":100,"lud16":"dev@example.com"
+            }))
+            .expect("test listing");
+        assert_eq!(GameListing::from_listing(source).lud16, "dev@example.com");
     }
 }

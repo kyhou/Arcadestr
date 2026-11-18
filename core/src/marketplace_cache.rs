@@ -238,7 +238,10 @@ impl MarketplaceCache {
                         excluded.created_at = marketplace_listings.created_at AND
                         excluded.source_event_id IS NOT NULL AND
                         excluded.source_event_id = marketplace_listings.source_event_id AND
-                        excluded.campaigns_json <> marketplace_listings.campaigns_json
+                        (
+                            excluded.campaigns_json <> marketplace_listings.campaigns_json OR
+                            excluded.lud16 <> marketplace_listings.lud16
+                        )
                     ) OR
                     (
                         excluded.created_at = marketplace_listings.created_at AND

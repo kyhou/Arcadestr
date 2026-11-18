@@ -244,6 +244,19 @@ enum LocalGameState {
     Installed { launchable: bool },
 }
 
+impl LocalGameState {
+    /// For acquisition decisions an installed copy counts as already present
+    /// on the device (no download is needed), never as account access.
+    fn filter_installed(self, needs_acquisition: bool) -> Self {
+        match self {
+            LocalGameState::Installed { .. } if needs_acquisition => LocalGameState::NotInstalled {
+                exact_package_cached: false,
+            },
+            state => state,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetailCompatibility {
     Compatible,
@@ -328,7 +341,30 @@ fn select_primary_action(
             enabled: false,
         };
     }
-    if let LocalGameState::Installed { launchable } = local_state {
+    // Installation is device-local; access is per account. An installed copy
+    // only replaces the acquisition action when this account needs none.
+    let needs_acquisition = !owned
+        && match listing.acquisition {
+            AcquisitionPolicy::Public => false,
+            AcquisitionPolicy::TimedAccess { starts_at, ends_at } => {
+                now < starts_at || now >= ends_at
+            }
+            AcquisitionPolicy::Gated => true,
+        };
+    if matches!(local_state, LocalGameState::Installed { .. })
+        && needs_acquisition
+        && ownership_loading
+    {
+        return PrimaryActionDecision {
+            action: PrimaryAction::CheckingOwnership,
+            label: "Checking ownership...",
+            explanation: "Checking durable access for the active account.",
+            enabled: false,
+        };
+    }
+    if let LocalGameState::Installed { launchable } =
+        local_state.filter_installed(needs_acquisition)
+    {
         return if launchable {
             PrimaryActionDecision {
                 action: PrimaryAction::PlayGame,
@@ -2210,8 +2246,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                         <p class="v2-detail-access-note" role="status">"No recorded launch profile resolves to this installation. The verified files remain installed and can be uninstalled or reinstalled from Library."</p>
                     </Show>
                     <p class="v2-detail-access-note">{move || primary_explanation.get()}</p>
+                    {move || payment_activation.test_build_label().map(|label| view! { <p class="v2-detail-access-note" role="note" data-testid="payment-test-build-banner" style="color:oklch(0.8 0.16 60);font-weight:800">{label}</p> })}
                     <Show
-                        when=move || installed_game.get().is_some_and(|game| game.launchable)
+                        when=move || installed_game.get().is_some_and(|game| game.launchable) && primary_action.get() == PrimaryAction::PlayGame
                         fallback=move || view! {
                             <Show when=move || split_enabled && !purchase_confirmed.get()>
                                 <div style="display:grid;gap:8px;margin-bottom:12px;font-family:ui-monospace,monospace">
@@ -2235,7 +2272,17 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                             />
                         })}
                     </Show>
-                    <Show when=move || installed_game.get().is_some() && !cfg!(all(target_arch = "wasm32", feature = "web"))>
+                    // Device-local Play remains available for an installed copy even
+                    // when this account must first buy or claim access.
+                    <Show when=move || installed_game.get().is_some_and(|game| game.launchable) && primary_action.get() != PrimaryAction::PlayGame>
+                        <Show when=move || matches!(primary_action.get(), PrimaryAction::Buy | PrimaryAction::Claim)>
+                            <p class="v2-detail-access-note" role="note">"Installed on this device. The active account does not hold access to this game."</p>
+                        </Show>
+                        {move || installed_game.get().map(|installed| view! { <InstallationLauncher installation_id=installed.installation_id /> })}
+                    </Show>
+                    // Updating downloads a new build, which requires this account's
+                    // access; a device-local copy alone does not grant it.
+                    <Show when=move || installed_game.get().is_some() && update_requires_no_acquisition(primary_action.get()) && !cfg!(all(target_arch = "wasm32", feature = "web"))>
                         <button
                             style="margin-top:10px;padding:11px 20px;background:transparent;border:1px solid oklch(0.5 0.13 210);color:oklch(0.8 0.13 210);font:800 13px ui-monospace,monospace;border-radius:5px"
                             disabled=move || operation_blocks_dispatch(operation.get()) || listing_validation_loading.get() || listing_validation_error.get() || auth.npub.get().is_none()
@@ -2899,6 +2946,94 @@ mod tests {
         assert_eq!(result.label, "Not installable");
         assert!(!result.enabled);
         assert!(!result.explanation.contains("detection"));
+    }
+
+    #[test]
+    fn local_installation_never_hides_acquisition_for_an_unentitled_account() {
+        let mut paid = listing(AcquisitionPolicy::Gated);
+        paid.specs
+            .push(("adp_terms:operator".into(), "terms".into()));
+        let run = |owned, installed, campaigns: &[DiscoveredCampaign]| {
+            decision(
+                &paid,
+                owned,
+                installed,
+                campaigns,
+                false,
+                DetailCompatibility::Compatible,
+                DetailOperation::Idle,
+                false,
+                100,
+            )
+            .action
+        };
+        // Account A owns and installed it; account B shares the device.
+        assert_eq!(run(true, true, &[]), PrimaryAction::PlayGame);
+        assert_eq!(run(false, true, &[]), PrimaryAction::Buy);
+        assert_eq!(
+            run(false, true, &[campaign("active")]),
+            PrimaryAction::Claim
+        );
+        assert_eq!(run(true, false, &[]), PrimaryAction::Download);
+        assert_eq!(run(false, false, &[]), PrimaryAction::Buy);
+        // Public and active timed listings need no acquisition: Play stays.
+        let public = listing(AcquisitionPolicy::Public);
+        assert_eq!(
+            decision(
+                &public,
+                false,
+                true,
+                &[],
+                false,
+                DetailCompatibility::Compatible,
+                DetailOperation::Idle,
+                false,
+                100
+            )
+            .action,
+            PrimaryAction::PlayGame
+        );
+        let ended = listing(AcquisitionPolicy::TimedAccess {
+            starts_at: 10,
+            ends_at: 50,
+        });
+        assert_eq!(
+            decision(
+                &ended,
+                false,
+                true,
+                &[],
+                false,
+                DetailCompatibility::Compatible,
+                DetailOperation::Idle,
+                false,
+                100
+            )
+            .action,
+            PrimaryAction::TimedExpired
+        );
+        assert!(update_requires_no_acquisition(run(true, true, &[])));
+        assert!(!update_requires_no_acquisition(run(false, true, &[])));
+        assert!(!update_requires_no_acquisition(run(
+            false,
+            true,
+            &[campaign("active")]
+        )));
+        // While a switched account's ownership is unresolved, never show Play.
+        let checking = select_primary_action(
+            &paid,
+            false,
+            LocalGameState::Installed { launchable: true },
+            true,
+            &[],
+            false,
+            DetailCompatibility::Compatible,
+            DetailOperation::Idle,
+            false,
+            true,
+            100,
+        );
+        assert_eq!(checking.action, PrimaryAction::CheckingOwnership);
     }
 
     #[test]

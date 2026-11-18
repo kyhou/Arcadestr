@@ -194,15 +194,28 @@ async fn additive_projection_migration_preserves_existing_rows_and_allows_verifi
         .upsert_listing(&listing, Some(&signed.id.to_hex()))
         .await
         .expect("old row");
-    // Recreate the immediately preceding projection schema in this isolated DB.
-    sqlx::query("ALTER TABLE marketplace_listings DROP COLUMN campaigns_json")
-        .execute(db.pool())
-        .await
-        .expect("pre-25 projection");
-    sqlx::query("DELETE FROM schema_migrations WHERE name='025_marketplace_campaign_pointers.sql'")
+    // Recreate a complete version-24 database in this isolated DB: roll back
+    // every later migration's schema and identity row, so the unchanged
+    // identity validation sees a consistent pre-25 ledger.
+    for rollback in [
+        "DROP TABLE profile_metadata_events",
+        "DROP TABLE quote_initiations",
+        "ALTER TABLE marketplace_listings DROP COLUMN campaigns_json",
+    ] {
+        sqlx::query(rollback)
+            .execute(db.pool())
+            .await
+            .expect("pre-25 schema");
+    }
+    sqlx::query("DELETE FROM schema_migrations WHERE version > 24")
         .execute(db.pool())
         .await
         .expect("pre-25 ledger");
+    let (latest,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM schema_migrations")
+        .fetch_one(db.pool())
+        .await
+        .expect("ledger count");
+    assert_eq!(latest, 24, "fixture must roll back every later migration");
     sqlx::query("PRAGMA user_version=24")
         .execute(db.pool())
         .await
@@ -232,4 +245,38 @@ async fn additive_projection_migration_preserves_existing_rows_and_allows_verifi
             .campaigns,
         listing.campaigns
     );
+}
+
+#[tokio::test]
+async fn same_signed_revision_backfills_a_cached_row_missing_its_signed_lud16() {
+    let temp = tempfile::tempdir().expect("temp");
+    let db = Database::new(&temp.path().join("lud16.db"))
+        .await
+        .expect("db");
+    let signed = EventBuilder::new(Kind::Custom(30402), "metadata")
+        .tags([
+            Tag::parse(["d", "paid"]).expect("d"),
+            Tag::parse(["title", "Paid fixture"]).expect("title"),
+            Tag::parse(["price", "2000", "sat"]).expect("price"),
+            Tag::parse(["lud16", "dev@example.com"]).expect("lud16"),
+        ])
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&Keys::generate())
+        .expect("signature");
+    let current = GameListing::from_listing(parse_listing(signed.clone()).expect("listing"));
+    assert_eq!(current.lud16, "dev@example.com");
+    // Projection produced before the signed tag was parsed.
+    let mut legacy = current.clone();
+    legacy.lud16.clear();
+    let cache = MarketplaceCache::new(db.pool().clone());
+    cache
+        .upsert_listing(&legacy, Some(&signed.id.to_hex()))
+        .await
+        .expect("legacy row");
+    cache
+        .upsert_listing(&current, Some(&signed.id.to_hex()))
+        .await
+        .expect("same signed revision refresh");
+    let loaded = cache.load_listings(10, None, None).await.expect("load");
+    assert_eq!(loaded[0].lud16, "dev@example.com");
 }

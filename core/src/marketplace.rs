@@ -388,6 +388,9 @@ pub struct Nip99Listing {
     #[serde(default)]
     pub campaigns: Vec<CampaignPointer>,
     pub status: Option<String>,
+    /// Lightning address from the signed `lud16` tag (first value wins).
+    #[serde(default)]
+    pub lud16: Option<String>,
     /// Original Nostr event JSON for debug-only inspection.
     #[cfg(debug_assertions)]
     #[serde(default)]
@@ -925,6 +928,7 @@ pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
     let mut location: Option<String> = None;
     let mut geohash: Option<String> = None;
     let mut status: Option<String> = None;
+    let mut lud16: Option<String> = None;
     let mut price_amount: Option<String> = None;
     let mut price_currency: Option<String> = None;
     let mut price_frequency: Option<String> = None;
@@ -975,6 +979,14 @@ pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
             Some("g") => {
                 if geohash.is_none() {
                     geohash = v.get(1).cloned();
+                }
+            }
+            Some("lud16") => {
+                if lud16.is_none() {
+                    lud16 = v
+                        .get(1)
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty());
                 }
             }
             Some("status") => {
@@ -1139,6 +1151,7 @@ pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
         acquisition,
         campaigns,
         status,
+        lud16,
         #[cfg(debug_assertions)]
         raw_event_json,
         merchant_npub: npub_of(&event.pubkey),
@@ -1511,6 +1524,7 @@ mod tests {
             geohash: None,
             tags: vec![],
             status: Some("active".into()),
+            lud16: None,
             merchant_npub: "npub1merchant".into(),
             created_at: 0,
             platforms: platforms
@@ -1602,6 +1616,34 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(seen.len(), 1);
         assert_eq!(seen.values().next(), Some(&(20, "ccc".to_string())));
+    }
+
+    #[test]
+    fn signed_lud16_tag_is_projected_and_never_left_empty() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(Kind::Custom(30402), "desc")
+            .tags([
+                nostr::Tag::parse(["d", "game"]).expect("d"),
+                nostr::Tag::parse(["title", "Game"]).expect("title"),
+                nostr::Tag::parse(["price", "2000", "sat"]).expect("price"),
+                nostr::Tag::parse(["lud16", " dev@example.com "]).expect("lud16"),
+                nostr::Tag::parse(["lud16", "second@example.com"]).expect("lud16"),
+            ])
+            .sign_with_keys(&keys)
+            .expect("listing");
+        let parsed = parse_listing(event).expect("parse");
+        assert_eq!(parsed.lud16.as_deref(), Some("dev@example.com"));
+        let projected = crate::nostr::GameListing::from_listing(parsed);
+        assert_eq!(projected.lud16, "dev@example.com");
+
+        let unsigned = nostr::EventBuilder::new(Kind::Custom(30402), "desc")
+            .tags([
+                nostr::Tag::parse(["d", "free"]).expect("d"),
+                nostr::Tag::parse(["title", "Free"]).expect("title"),
+            ])
+            .sign_with_keys(&keys)
+            .expect("listing");
+        assert_eq!(parse_listing(unsigned).expect("parse").lud16, None);
     }
 
     #[test]

@@ -613,7 +613,8 @@ impl GameListing {
             created_at: listing.created_at,
             tags: listing.tags,
             specs,
-            lud16: String::new(),
+            // The signed listing's own payment address, never a profile value.
+            lud16: listing.lud16.unwrap_or_default(),
             images: listing.images,
             platforms: listing.platforms,
             nip94_event_id: listing.nip94_event_id,
