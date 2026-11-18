@@ -65,24 +65,37 @@ pub struct NwcConnection {
 }
 
 /// Missing configuration is normal; other keyring failures remain errors.
+/// Credential-store access is deadline-bounded (see [`crate::credential_store`]).
 pub fn get_nwc_connection(account: &PublicKey) -> Result<Option<NwcConnection>, NwcClientError> {
-    let entry = account_nwc_entry(account)?;
-    load_nwc_entry(&entry)
+    let name = account_nwc_entry_name(account);
+    match crate::credential_store::run(move || {
+        keyring::Entry::new(NWC_KEYRING_SERVICE, &name)?.get_password()
+    }) {
+        Ok(uri) => NwcConnection::parse(&uri).map(Some),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(_) => Err(NwcClientError::Keyring(
+            "credential could not be read".into(),
+        )),
+    }
 }
 
 pub fn remove_nwc_connection(account: &PublicKey) -> Result<(), NwcClientError> {
-    remove_nwc_entry(&account_nwc_entry(account)?)
+    let name = account_nwc_entry_name(account);
+    match crate::credential_store::run(move || {
+        keyring::Entry::new(NWC_KEYRING_SERVICE, &name)?.delete_credential()
+    }) {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err(NwcClientError::Keyring(
+            "credential could not be removed".into(),
+        )),
+    }
 }
 
 fn account_nwc_entry_name(account: &PublicKey) -> String {
     format!("wallet-connect-uri:{}", account.to_hex())
 }
 
-fn account_nwc_entry(account: &PublicKey) -> Result<keyring::Entry, NwcClientError> {
-    keyring::Entry::new(NWC_KEYRING_SERVICE, &account_nwc_entry_name(account))
-        .map_err(|_| NwcClientError::Keyring("credential store unavailable".into()))
-}
-
+#[cfg(test)]
 fn load_nwc_entry(entry: &keyring::Entry) -> Result<Option<NwcConnection>, NwcClientError> {
     match entry.get_password() {
         Ok(uri) => NwcConnection::parse(&uri).map(Some),
@@ -93,6 +106,7 @@ fn load_nwc_entry(entry: &keyring::Entry) -> Result<Option<NwcConnection>, NwcCl
     }
 }
 
+#[cfg(test)]
 fn save_nwc_entry(entry: &keyring::Entry, uri: &str) -> Result<NwcConnection, NwcClientError> {
     let connection = NwcConnection::parse(uri)?;
     entry
@@ -101,6 +115,7 @@ fn save_nwc_entry(entry: &keyring::Entry, uri: &str) -> Result<NwcConnection, Nw
     Ok(connection)
 }
 
+#[cfg(test)]
 fn remove_nwc_entry(entry: &keyring::Entry) -> Result<(), NwcClientError> {
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -138,7 +153,15 @@ pub fn save_nwc_connection(
     account: &PublicKey,
     uri: &str,
 ) -> Result<NwcConnection, NwcClientError> {
-    save_nwc_entry(&account_nwc_entry(account)?, uri)
+    // Validate before touching the store; never persist an invalid URI.
+    let connection = NwcConnection::parse(uri)?;
+    let name = account_nwc_entry_name(account);
+    let value = uri.to_string();
+    crate::credential_store::run(move || {
+        keyring::Entry::new(NWC_KEYRING_SERVICE, &name)?.set_password(&value)
+    })
+    .map_err(|_| NwcClientError::Keyring("credential could not be saved".into()))?;
+    Ok(connection)
 }
 
 /// Loads this account's NWC connection URI from the OS keyring.
@@ -255,7 +278,7 @@ impl NwcConnection {
 }
 
 /// Thin NIP-47 client used to pay ADP purchase invoices.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NwcClient {
     connection: NwcConnection,
     timeout: Duration,

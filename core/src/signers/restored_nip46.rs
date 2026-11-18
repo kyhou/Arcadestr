@@ -202,7 +202,12 @@ fn safe_remote_error(error: &str) -> SignerError {
         .is_some_and(|reason| !reason.is_empty())
         || matches!(
             normalized.as_str(),
-            "rejected" | "user rejected" | "permission denied" | "authorization denied"
+            "rejected"
+                | "user rejected"
+                | "permission denied"
+                | "authorization denied"
+                | "unauthorized"
+                | "not authorized"
         )
     {
         SignerError::from("denied: rejected")
@@ -317,6 +322,16 @@ mod tests {
         assert!(matches!(
             crate::signers::SignerError::from(safe_remote_error("timeout")),
             crate::signers::SignerError::ConnectionTimeout
+        ));
+        // Exact refusal reply used by common bunkers for an unknown client.
+        assert!(matches!(
+            crate::signers::SignerError::from(safe_remote_error("unauthorized")),
+            crate::signers::SignerError::AuthorizationDenied
+        ));
+        // Not a substring match: transport text mentioning it is not a denial.
+        assert!(!matches!(
+            crate::signers::SignerError::from(safe_remote_error("relay said unauthorized client")),
+            crate::signers::SignerError::AuthorizationDenied
         ));
     }
     fn event(remote: &Keys, recipient: PublicKey, id: &str, error: Option<&str>) -> Event {

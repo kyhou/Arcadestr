@@ -52,7 +52,7 @@ impl Nip46UriType {
 /// It is safe to serialize and store the NON-SECRET fields to a config file.
 /// The SECRET fields (app_keys secret key, bunker URI secret param) MUST go
 /// through tauri-plugin-keyring. See `storage.rs` for the split logic.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SavedProfile {
     /// Stable unique ID for this profile entry (UUID v4 generated at creation).
     pub id: String,
@@ -180,6 +180,28 @@ pub mod session_config {
     pub const BUNKER_RETRY_INTERVAL_SECS: u64 = 30;
     /// Timeout for bunker connection attempts during auto-restore
     pub const BUNKER_CONNECT_TIMEOUT_SECS: u64 = 30;
+}
+
+/// Diagnostics never include the connection secret or the app secret key.
+impl std::fmt::Debug for SavedProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SavedProfile")
+            .field("id", &self.id)
+            .field(
+                "name",
+                &crate::connection_secrets::sanitize_account_label(
+                    &self.name,
+                    &self.user_pubkey.to_hex(),
+                ),
+            )
+            .field("user_pubkey", &self.user_pubkey)
+            .field(
+                "bunker_uri",
+                &crate::connection_secrets::redact_connection_uri(&self.bunker_uri.to_string()),
+            )
+            .field("app_pubkey", &self.app_keys.public_key())
+            .finish()
+    }
 }
 
 /// Profile metadata for listing (no secrets).

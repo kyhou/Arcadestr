@@ -39,8 +39,10 @@ pub use storage::{
     clear_last_active_profile_id, delete_ncryptsec_from_keychain, delete_profile_from_keyring,
     get_last_active_profile_id, get_ncryptsec_from_keychain, get_profile_metadata_by_id,
     get_profile_metadata_by_pubkey, list_profile_index, load_profile_from_keyring,
-    migrate_profile_to_keyring, ncryptsec_entry_exists, profile_exists, save_profile_to_keyring,
-    set_last_active_profile_id, set_profile_cache_dir, store_ncryptsec_in_keychain, StorageError,
+    migrate_profile_to_keyring, ncryptsec_entry_exists, profile_exists, retry_credential_store,
+    save_profile_to_keyring, set_last_active_profile_id, set_profile_cache_dir,
+    store_ncryptsec_in_keychain, try_get_last_active_profile_id, try_load_profile_from_keyring,
+    StorageError,
 };
 pub use types::{
     keyring_keys, session_config, AppSignerState, ConnectionState, Nip46KeyringError, Nip46UriType,

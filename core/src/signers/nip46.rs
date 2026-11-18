@@ -160,9 +160,12 @@ impl From<nostr::signer::SignerError> for SignerError {
             return Self::AuthorizationDenied;
         }
         match normalized.as_str() {
-            "rejected" | "user rejected" | "permission denied" | "authorization denied" => {
-                Self::AuthorizationDenied
-            }
+            "rejected"
+            | "user rejected"
+            | "permission denied"
+            | "authorization denied"
+            | "unauthorized"
+            | "not authorized" => Self::AuthorizationDenied,
             "timeout" => Self::ConnectionTimeout,
             _ => Self::SigningFailed(message),
         }
@@ -294,7 +297,10 @@ impl Nip46Signer {
 
         info!("Starting nostrconnect signer wait...");
         info!("Client pubkey: {}", client_keys.public_key().to_hex());
-        info!("URI: {}", uri);
+        info!(
+            "URI: {}",
+            crate::connection_secrets::redact_connection_uri(&uri.to_string())
+        );
 
         // Create the NostrConnect client (matching working implementation)
         info!("Creating NostrConnect client...");
@@ -358,7 +364,10 @@ impl Nip46Signer {
         use nostr::prelude::NostrConnectURI;
         use std::time::Duration;
 
-        info!("Parsing NIP-46 URI: {}", uri);
+        info!(
+            "Parsing NIP-46 URI: {}",
+            crate::connection_secrets::redact_connection_uri(uri)
+        );
 
         // Parse the NIP-46 URI
         let uri = NostrConnectURI::parse(uri).map_err(|e| {

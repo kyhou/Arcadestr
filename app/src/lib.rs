@@ -609,6 +609,30 @@ async fn invoke_has_accounts() -> Result<bool, String> {
     crate::web_auth::web_has_accounts()
 }
 
+/// OS credential-store status (never prompts).
+#[cfg(not(feature = "web"))]
+async fn invoke_get_credential_store_status() -> Result<serde_json::Value, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("get_credential_store_status", serde_json::json!({})).await
+}
+
+#[cfg(feature = "web")]
+async fn invoke_get_credential_store_status() -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({ "state": "available" }))
+}
+
+/// Explicit user retry after unlocking the system keyring (may show a prompt).
+#[cfg(not(feature = "web"))]
+async fn invoke_retry_credential_store() -> Result<serde_json::Value, String> {
+    use crate::tauri_invoke::invoke;
+    invoke("retry_credential_store", serde_json::json!({})).await
+}
+
+#[cfg(feature = "web")]
+async fn invoke_retry_credential_store() -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({ "state": "available" }))
+}
+
 /// Load active account for fast login (~4 seconds)
 #[cfg(not(feature = "web"))]
 async fn invoke_load_active_account() -> Result<serde_json::Value, String> {
@@ -1178,6 +1202,27 @@ impl Default for AuthContext {
 }
 
 /// Helper function to parse account from JSON result
+/// Connection label by signing mode. Local keys have no remote connection, so
+/// the NIP-46 connection state must not be shown for them.
+pub(crate) fn account_connection_label(signing_mode: Option<&str>, remote_status: &str) -> String {
+    match signing_mode.map(str::to_ascii_lowercase).as_deref() {
+        Some("local" | "nsec" | "debug") => "ready (local key)".to_string(),
+        Some("readonly" | "read_only") => "read-only".to_string(),
+        _ => remote_status.to_string(),
+    }
+}
+
+/// Reactive connection label for the active account (tracks both signals).
+pub(crate) fn display_connection_status(
+    active_account: RwSignal<Option<StoredAccount>>,
+    connection_status: RwSignal<String>,
+) -> String {
+    let mode = active_account
+        .get()
+        .map(|account| account.signing_mode.clone());
+    account_connection_label(mode.as_deref(), &connection_status.get())
+}
+
 fn parse_account_from_result(result: &serde_json::Value) -> Result<StoredAccount, String> {
     let account = result.get("account").ok_or("Missing account field")?;
 
@@ -1466,6 +1511,31 @@ impl AuthContext {
                 Err(e)
             }
         }
+    }
+
+    /// After the user unlocked the system keyring: refresh saved accounts and,
+    /// when the backend restored the previous session, enter it. A newer auth
+    /// flow started meanwhile always wins.
+    pub async fn resume_after_credential_unlock(&self) -> Result<(), String> {
+        let generation = self.begin_auth_flow();
+        let _ = self.load_accounts_list().await;
+        if !self.is_current_auth_flow(generation) {
+            return Ok(());
+        }
+        if let Ok(result) = invoke_load_active_account().await {
+            if !self.is_current_auth_flow(generation) {
+                return Ok(());
+            }
+            if let Ok(account) = parse_account_from_result(&result) {
+                self.active_account.set(Some(account.clone()));
+                self.npub.set(Some(account.npub.clone()));
+                self.has_secure_accounts.set(true);
+                if account.signing_mode == "nip46" {
+                    self.start_connection_status_polling().await;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Delete a profile (new NIP-46 API)
@@ -5548,4 +5618,24 @@ struct VersionInfo {
     full: String,
     os: String,
     arch: String,
+}
+
+#[cfg(test)]
+mod account_connection_label_tests {
+    use super::account_connection_label;
+
+    #[test]
+    fn local_and_read_only_accounts_never_show_remote_signer_state() {
+        let cases = [
+            (Some("local"), "disconnected", "ready (local key)"),
+            (Some("NSEC"), "failed", "ready (local key)"),
+            (Some("read_only"), "disconnected", "read-only"),
+            (Some("nip46"), "connected", "connected"),
+            (Some("nip46"), "disconnected", "disconnected"),
+            (None, "disconnected", "disconnected"),
+        ];
+        for (mode, remote, expected) in cases {
+            assert_eq!(account_connection_label(mode, remote), expected, "{mode:?}");
+        }
+    }
 }

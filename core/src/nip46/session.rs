@@ -9,9 +9,7 @@ use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 use tracing::{info, warn};
 
-use crate::nip46::storage::{
-    clear_last_active_profile_id, get_last_active_profile_id, load_profile_from_keyring,
-};
+use crate::nip46::storage::clear_last_active_profile_id;
 use crate::nip46::types::session_config::BUNKER_RETRY_INTERVAL_SECS;
 use crate::nip46::types::AppSignerState;
 use crate::nip46::types::ConnectionState;
@@ -41,12 +39,9 @@ pub async fn activate_profile(
     );
 
     // STEP 1: Load profile from keyring using bunker pubkey
-    let profile = load_profile_from_keyring(bunker_pubkey).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Profile with bunker pubkey {} not found in keyring",
-            bunker_pubkey
-        )
-    })?;
+    let profile = load_saved_profile(bunker_pubkey)
+        .await
+        .map_err(|reason| anyhow::anyhow!(reason))?;
 
     // STEP 2: Drop old active_client by setting it to None
     {
@@ -122,6 +117,9 @@ pub enum SessionRestoreResult {
     OfflineMode,
     /// No saved session to restore
     NoSession,
+    /// The OS credential store is locked or unavailable. Nothing was changed;
+    /// the user can unlock it and retry.
+    CredentialStoreUnavailable(String),
     /// Other error occurred
     Failed(String),
 }
@@ -160,52 +158,21 @@ pub async fn restore_session_on_startup(
     }
     let generation = state.lock().await.auth_generation;
 
-    // STEP 1: Get last active profile ID
-    let profile_id = match get_last_active_profile_id() {
-        Some(id) => id,
-        None => {
-            info!("No last active profile found");
-            return SessionRestoreResult::NoSession;
+    // STEPS 1-3 read the OS credential store. Each read is deadline-bounded and
+    // runs off the async runtime; an unavailable store is never treated as a
+    // missing profile, so nothing stored is cleared or overwritten.
+    let loaded = tokio::task::spawn_blocking(load_last_active_profile).await;
+    let (profile_id, key_to_use, profile) = match loaded {
+        Ok(Ok(Some(found))) => found,
+        Ok(Ok(None)) => return SessionRestoreResult::NoSession,
+        Ok(Err(reason)) => {
+            warn!(
+                "Credential store unavailable during session restore: {}",
+                reason
+            );
+            return SessionRestoreResult::CredentialStoreUnavailable(reason);
         }
-    };
-
-    info!("Found last active profile ID: {}", profile_id);
-
-    // STEP 2: Load profile metadata to get bunker pubkey
-    let metadata = match crate::nip46::storage::get_profile_metadata_by_id(&profile_id) {
-        Some(m) => m,
-        None => {
-            warn!("Profile metadata not found for ID: {}", profile_id);
-            return SessionRestoreResult::NoSession;
-        }
-    };
-
-    // Determine which key to use for loading the full profile
-    let key_to_use = if metadata.bunker_pubkey_hex.is_empty() {
-        // Old profile - use profile_id
-        profile_id.clone()
-    } else {
-        // New profile - use bunker_pubkey_hex
-        metadata.bunker_pubkey_hex.clone()
-    };
-
-    // Validate: Check if profile actually exists in keyring before attempting restore
-    if load_profile_from_keyring(&key_to_use).is_none() {
-        warn!(
-            "Last active profile {} (key: {}) no longer exists in keyring, clearing last active",
-            profile_id, key_to_use
-        );
-        clear_last_active_profile_id();
-        return SessionRestoreResult::NoSession;
-    }
-
-    // STEP 3: Load full profile from keyring
-    let profile = match load_profile_from_keyring(&key_to_use) {
-        Some(p) => p,
-        None => {
-            warn!("Profile not found in keyring for key: {}", key_to_use);
-            return SessionRestoreResult::NoSession;
-        }
+        Err(error) => return SessionRestoreResult::Failed(error.to_string()),
     };
 
     // STEP 4: Create LazyNip46Signer with deferred connection (fast!)
@@ -256,6 +223,72 @@ pub async fn restore_session_on_startup(
     });
 
     SessionRestoreResult::Success
+}
+
+/// Load a stored signer profile off the async runtime, with an actionable
+/// error that distinguishes "removed" from "credential store not available".
+async fn load_saved_profile(key: &str) -> Result<crate::nip46::types::SavedProfile, String> {
+    let owned = key.to_string();
+    match tokio::task::spawn_blocking(move || {
+        crate::nip46::storage::try_load_profile_from_keyring(&owned)
+    })
+    .await
+    {
+        Ok(Ok(Some(profile))) => Ok(profile),
+        Ok(Ok(None)) => Err(format!(
+            "Saved signer for {key} was not found in the system keyring"
+        )),
+        Ok(Err(_)) => Err(crate::credential_store::status().message().to_string()),
+        Err(error) => Err(format!("Signer profile could not be loaded: {error}")),
+    }
+}
+
+/// Last-active profile id, keyring key and stored profile.
+type LoadedProfile = (String, String, crate::nip46::types::SavedProfile);
+
+/// Blocking credential-store reads for session restore.
+///
+/// `Ok(None)` means there is genuinely nothing to restore. `Err` means the
+/// store could not answer; the caller must leave every stored value untouched.
+fn load_last_active_profile() -> Result<Option<LoadedProfile>, String> {
+    let unavailable = || crate::credential_store::status().message().to_string();
+
+    // STEP 1: Get last active profile ID
+    let profile_id = match crate::nip46::storage::try_get_last_active_profile_id() {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            info!("No last active profile found");
+            return Ok(None);
+        }
+        Err(_) => return Err(unavailable()),
+    };
+    info!("Found last active profile ID: {}", profile_id);
+
+    // STEP 2: Load profile metadata to get bunker pubkey
+    let Some(metadata) = crate::nip46::storage::get_profile_metadata_by_id(&profile_id) else {
+        warn!("Profile metadata not found for ID: {}", profile_id);
+        return Ok(None);
+    };
+    let key_to_use = if metadata.bunker_pubkey_hex.is_empty() {
+        profile_id.clone()
+    } else {
+        metadata.bunker_pubkey_hex.clone()
+    };
+
+    // STEP 3: Load full profile. Only a store that answered "not found" may
+    // clear the stale pointer; an unavailable store changes nothing.
+    match crate::nip46::storage::try_load_profile_from_keyring(&key_to_use) {
+        Ok(Some(profile)) => Ok(Some((profile_id, key_to_use, profile))),
+        Ok(None) => {
+            warn!(
+                "Last active profile {} (key: {}) no longer exists in keyring, clearing last active",
+                profile_id, key_to_use
+            );
+            clear_last_active_profile_id();
+            Ok(None)
+        }
+        Err(_) => Err(unavailable()),
+    }
 }
 
 /// Start a periodic task to retry bunker connection.
@@ -350,10 +383,7 @@ pub async fn attempt_manual_reconnect(state: &Arc<Mutex<AppSignerState>>) -> Res
     };
 
     // Load profile
-    let profile = match load_profile_from_keyring(&key_to_use) {
-        Some(p) => p,
-        None => return Err("Profile not found in keyring".to_string()),
-    };
+    let profile = load_saved_profile(&key_to_use).await?;
 
     // Create LazyNip46Signer and test connection immediately
     let lazy_signer = LazyNip46Signer::new(

@@ -654,18 +654,19 @@ pub fn build_list_saved_profiles_response(
     }
 
     let unique_profiles: Vec<ProfileMetadata> = seen_npubs.into_values().collect();
-    let single_profile_mode = unique_profiles.len() == 1;
 
     let accounts: Vec<serde_json::Value> = unique_profiles
         .into_iter()
         .map(|profile| {
-            let is_current = if single_profile_mode {
-                false
-            } else {
-                active_profile_id == Some(profile.id.as_str())
-            };
-
+            // Logout clears the active profile, so a signed-out sole profile
+            // still offers Connect; an active one is reported as current.
+            let is_current = active_profile_id == Some(profile.id.as_str());
             let cached = cached_profiles.get(&profile.pubkey_bech32);
+            // Prefer fresh cached kind-0 metadata, then the persisted
+            // (secret-free) profile index, so labels survive a restart.
+            let field = |cached_value: Option<&String>, stored: &Option<String>| {
+                cached_value.cloned().filter(|v| !v.trim().is_empty()).or_else(|| stored.clone())
+            };
 
             serde_json::json!({
                 "id": profile.id,
@@ -675,11 +676,11 @@ pub fn build_list_saved_profiles_response(
                 "signing_mode": "nip46",
                 "last_used": 0,
                 "is_current": is_current,
-                "picture": cached.and_then(|entry| entry.picture.clone()),
-                "display_name": cached.and_then(|entry| entry.display_name.clone()),
-                "username": cached.and_then(|entry| entry.name.clone()),
-                "nip05": cached.and_then(|entry| entry.nip05.clone()),
-                "about": cached.and_then(|entry| entry.about.clone()),
+                "picture": field(cached.and_then(|entry| entry.picture.as_ref()), &profile.picture),
+                "display_name": field(cached.and_then(|entry| entry.display_name.as_ref()), &profile.display_name),
+                "username": field(cached.and_then(|entry| entry.name.as_ref()), &profile.username),
+                "nip05": field(cached.and_then(|entry| entry.nip05.as_ref()), &profile.nip05),
+                "about": field(cached.and_then(|entry| entry.about.as_ref()), &profile.about),
             })
         })
         .collect();

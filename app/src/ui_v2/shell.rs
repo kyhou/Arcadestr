@@ -515,7 +515,9 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         .get("type")
                         .and_then(|value| value.as_str())
                         .unwrap_or_default();
-                    if event_type == "connected" { receipts.synchronize(false); }
+                    if event_type == "connected" {
+                        receipts.synchronize(false);
+                    }
                     let url = payload
                         .get("url")
                         .and_then(|value| value.as_str())
@@ -576,7 +578,9 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
 
     let relay_count_signal = Signal::derive(move || relay_count.get());
     let connected_relays_signal = Signal::derive(move || connected_relays.get());
-    let connection_status = Signal::derive(move || auth.connection_status.get());
+    let connection_status = Signal::derive(move || {
+        crate::display_connection_status(auth.active_account, auth.connection_status)
+    });
     let connection_error = Signal::derive(move || auth.connection_error.get());
     let display_name = Signal::derive(move || {
         auth.profile

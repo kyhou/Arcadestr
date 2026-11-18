@@ -530,7 +530,10 @@ async fn connect_nip46(
     use tracing::{error, info};
 
     info!("Connecting via NIP-46...");
-    info!("URI: {}", uri);
+    info!(
+        "URI: {}",
+        arcadestr_core::connection_secrets::redact_connection_uri(&uri)
+    );
     info!("Relay: {}", relay);
 
     let mut auth = state.auth.lock().await;
@@ -8060,6 +8063,11 @@ fn main() {
                         info!("No saved session to restore");
                         let _ = app_handle.emit("show_login", ());
                     }
+                    SessionRestoreResult::CredentialStoreUnavailable(reason) => {
+                        warn!("Session not restored; credential store unavailable: {}", reason);
+                        let _ = app_handle.emit("credential_store_unavailable", reason);
+                        let _ = app_handle.emit("show_login", ());
+                    }
                     SessionRestoreResult::Failed(e) => {
                         error!("Failed to restore session: {}", e);
                         let _ = app_handle.emit("session_restore_failed", e);
@@ -8298,6 +8306,8 @@ fn main() {
             nip46_commands::ping_bunker,
             nip46_commands::logout_nip46,
             nip46_commands::has_accounts,
+            nip46_commands::get_credential_store_status,
+            nip46_commands::retry_credential_store,
             nip46_commands::load_active_account,
             nip46_commands::login_with_nsec,
             nip46_commands::cancel_login,

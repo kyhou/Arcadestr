@@ -22,6 +22,22 @@ enum LoginPanel {
     Nip49,
 }
 
+/// Actionable notice when the OS credential store cannot be used; `None` when
+/// it is available or not yet known.
+fn credential_store_notice(status: &serde_json::Value) -> Option<String> {
+    let state = status.get("state").and_then(|value| value.as_str())?;
+    if matches!(state, "available" | "unknown") {
+        return None;
+    }
+    Some(
+        status
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Your system keyring is unavailable. Unlock it, then choose Retry.")
+            .to_string(),
+    )
+}
+
 fn show_back_button(panel: LoginPanel, has_saved_accounts: bool) -> bool {
     match panel {
         LoginPanel::Accounts => false,
@@ -176,6 +192,9 @@ pub fn LoginV2View() -> impl IntoView {
     let import_result = RwSignal::new(None::<String>);
     let import_loading = RwSignal::new(false);
 
+    let keyring_notice = RwSignal::new(None::<String>);
+    let keyring_retrying = RwSignal::new(false);
+
     Effect::new(move |_| {
         let auth = auth_stored.get_value();
         spawn_local(async move {
@@ -189,8 +208,34 @@ pub fn LoginV2View() -> impl IntoView {
                 panel.set(LoginPanel::Methods);
             }
             loading_accounts.set(false);
+            if let Ok(status) = crate::invoke_get_credential_store_status().await {
+                keyring_notice.set(credential_store_notice(&status));
+            }
         });
     });
+
+    let retry_keyring = move |_| {
+        if keyring_retrying.get_untracked() {
+            return;
+        }
+        keyring_retrying.set(true);
+        let auth = auth_stored.get_value();
+        spawn_local(async move {
+            match crate::invoke_retry_credential_store().await {
+                Ok(status) => {
+                    let notice = credential_store_notice(&status);
+                    if notice.is_none() {
+                        if let Err(error) = auth.resume_after_credential_unlock().await {
+                            auth.error.set(Some(error));
+                        }
+                    }
+                    keyring_notice.set(notice);
+                }
+                Err(error) => keyring_notice.set(Some(error)),
+            }
+            keyring_retrying.set(false);
+        });
+    };
 
     let begin_flow = move || {
         let auth = auth_stored.get_value();
@@ -491,6 +536,19 @@ pub fn LoginV2View() -> impl IntoView {
             </header>
 
             <main class="v2-auth-main">
+                {move || keyring_notice.get().map(|notice| view! {
+                    <div class="arc-profile-notice" role="alert" data-testid="credential-store-notice">
+                        <span>{notice}</span>
+                        <button
+                            class="v2-btn-secondary"
+                            type="button"
+                            disabled=move || keyring_retrying.get()
+                            on:click=retry_keyring
+                        >
+                            {move || if keyring_retrying.get() { "Waiting for keyring..." } else { "Retry" }}
+                        </button>
+                    </div>
+                })}
                 {move || match panel.get() {
                     LoginPanel::Accounts => view! {
                         <section class="v2-auth-account-shell">
@@ -821,6 +879,34 @@ mod tests {
             .nth(1)
             .expect("action row should exist");
         assert!(actions.contains("if auth.is_loading.get_untracked()"));
+    }
+
+    #[test]
+    fn credential_store_notice_is_shown_only_when_the_keyring_cannot_be_used() {
+        for state in ["available", "unknown"] {
+            assert_eq!(
+                credential_store_notice(&serde_json::json!({ "state": state })),
+                None
+            );
+        }
+        for state in ["locked", "dismissed", "timed_out", "unavailable"] {
+            let notice = credential_store_notice(&serde_json::json!({
+                "state": state,
+                "message": "Your system keyring is locked. Unlock it, then choose Retry. Saved accounts are kept."
+            }));
+            assert!(notice.is_some_and(|text| text.contains("Retry")), "{state}");
+        }
+        assert!(credential_store_notice(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn keyring_retry_cannot_be_started_twice() {
+        let source = include_str!("login.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes the test module");
+        assert!(source.contains("if keyring_retrying.get_untracked()"));
+        assert!(source.contains("disabled=move || keyring_retrying.get()"));
     }
 
     fn account() -> StoredAccount {

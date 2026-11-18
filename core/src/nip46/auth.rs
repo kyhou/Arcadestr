@@ -51,7 +51,10 @@ impl AuthUrlHandler for TauriAuthUrlHandler {
     ) -> nostr_connect::prelude::BoxedFuture<nostr_connect::prelude::Result<()>> {
         let handler = self.on_auth.clone();
         Box::pin(async move {
-            info!("Auth URL received from bunker: {}", auth_url);
+            info!(
+                "Auth URL received from bunker: {}",
+                crate::connection_secrets::redact_url_query(auth_url.as_str())
+            );
             handler(auth_url);
             Ok(())
         })
@@ -82,7 +85,10 @@ pub async fn init_signer_session<F>(
 where
     F: Fn(Url) + Send + Sync + 'static,
 {
-    info!("init_signer_session called with identifier: {}", identifier);
+    info!(
+        "init_signer_session called with identifier: {}",
+        crate::connection_secrets::redact_connection_uri(identifier)
+    );
 
     // STEP 1 — URI Resolution (NIP-05 discovery or direct parse)
     let uri = if identifier.contains('@') {
@@ -149,9 +155,11 @@ where
     // STEP 8 — Generate profile ID and return
     let profile_id = uuid::Uuid::new_v4().to_string();
 
+    // Never derive a label from the identifier: a bunker URI carries its
+    // connection secret. Callers may override with a user-chosen name.
     let profile = SavedProfile {
         id: profile_id,
-        name: identifier.to_string(),
+        name: crate::connection_secrets::default_remote_signer_name(&user_pubkey),
         user_pubkey,
         bunker_uri: uri,
         app_keys,

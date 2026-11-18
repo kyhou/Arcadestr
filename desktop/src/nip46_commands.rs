@@ -37,6 +37,47 @@ fn local_account_json(account: &AccountInfo) -> serde_json::Value {
     })
 }
 
+/// Active remote-signer account response. Carries the same secret-free label
+/// metadata as the saved-profile list, so the active account is labelled
+/// consistently after restart or switching, before kind-0 refresh completes.
+async fn remote_account_json(
+    app_state: &crate::AppState,
+    profile_id: &str,
+    npub: &str,
+    name: String,
+    stored: Option<&ProfileMetadata>,
+) -> serde_json::Value {
+    let mut cached = std::collections::HashMap::new();
+    if let Some(profile) = app_state.user_cache.get(npub).await {
+        cached.insert(npub.to_owned(), profile);
+    }
+    let profile = stored.cloned().map(|mut profile| {
+        profile.id = profile_id.to_owned();
+        profile.pubkey_bech32 = npub.to_owned();
+        profile.name = name.clone();
+        profile
+    });
+    let mut account = profile
+        .map(|profile| {
+            crate::command_contracts::build_list_saved_profiles_response(
+                vec![profile],
+                Some(profile_id),
+                &cached,
+            )["accounts"][0]
+                .clone()
+        })
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "id": profile_id, "npub": npub, "name": name, "signing_mode": "nip46",
+                "last_used": 0, "is_current": true,
+                "display_name": cached.get(npub).and_then(|p| p.display_name.clone()),
+                "picture": cached.get(npub).and_then(|p| p.picture.clone()),
+            })
+        });
+    account["npub"] = serde_json::json!(npub);
+    serde_json::json!({ "account": account })
+}
+
 fn local_account_login_json(account: &Account, name: Option<String>) -> serde_json::Value {
     serde_json::json!({
         "account": {
@@ -197,7 +238,10 @@ pub async fn connect_bunker(
     // STEP 2: Set up auth URL handler for bunkers that need browser approval (e.g., nsec.app)
     let app_handle_clone = app_handle.clone();
     let auth_url_handler = move |auth_url: url::Url| {
-        info!("Auth URL received from bunker: {}", auth_url);
+        info!(
+            "Auth URL received from bunker: {}",
+            arcadestr_core::connection_secrets::redact_url_query(auth_url.as_str())
+        );
         // Emit event to frontend to open browser
         let _ = app_handle_clone.emit("bunker-auth-challenge", auth_url.to_string());
     };
@@ -220,7 +264,11 @@ pub async fn connect_bunker(
 
     // STEP 4: Allow the user to override the auto-generated name
     if !display_name.is_empty() {
-        profile.name = display_name.clone();
+        // A pasted connection URI is never accepted as a label.
+        profile.name = arcadestr_core::connection_secrets::sanitize_account_label(
+            &display_name,
+            &profile.user_pubkey.to_hex(),
+        );
     }
 
     // Approval can arrive after cancellation or another account selection.
@@ -617,60 +665,23 @@ pub async fn list_saved_profiles(
         state_guard.active_profile_id.clone()
     };
 
-    let profiles = list_profile_index();
+    let profiles = profile_index().await;
 
-    // Deduplicate by npub - use a HashMap to keep only first profile for each npub
-    use std::collections::HashMap;
-    let mut seen_npubs: HashMap<String, ProfileMetadata> = HashMap::new();
-
-    for profile in profiles {
-        // Only keep the first profile for each npub
-        seen_npubs
-            .entry(profile.pubkey_bech32.clone())
-            .or_insert(profile);
+    let mut cached_profiles = std::collections::HashMap::new();
+    for profile in &profiles {
+        if let Some(cached) = app_state.user_cache.get(&profile.pubkey_bech32).await {
+            cached_profiles.insert(profile.pubkey_bech32.clone(), cached);
+        }
     }
-
-    // Convert back to vec
-    let unique_profiles: Vec<ProfileMetadata> = seen_npubs.into_values().collect();
-
-    // When there's only one profile, always show Connect button (never mark as current)
-    // This ensures the user can always reconnect after logout
-    let single_profile_mode = unique_profiles.len() == 1;
-
-    // Return in the format the frontend expects (matching old API)
-    // Include profile metadata from UserCache
-    let mut accounts_list: Vec<serde_json::Value> = Vec::new();
-
-    for p in unique_profiles {
-        // Check if this profile is currently active
-        // But don't mark as current if there's only one profile (always show Connect)
-        let is_current = if single_profile_mode {
-            false // Always show Connect button for single profile
-        } else {
-            active_profile_id.as_ref() == Some(&p.id)
-        };
-
-        // Fetch profile metadata from UserCache
-        let cached_profile = app_state.user_cache.get(&p.pubkey_bech32).await;
-
-        let account_json = serde_json::json!({
-            "id": p.id,
-            "name": p.name,
-            "npub": p.pubkey_bech32,
-            "pubkey_hex": p.pubkey_hex,
-            "signing_mode": "nip46", // Default to nip46 for NIP-46 profiles
-            "last_used": 0, // We don't track this currently
-            "is_current": is_current,
-            // Include profile metadata from cache if available
-            "picture": cached_profile.as_ref().and_then(|prof| prof.picture.clone()),
-            "display_name": cached_profile.as_ref().and_then(|prof| prof.display_name.clone()),
-            "username": cached_profile.as_ref().and_then(|prof| prof.name.clone()),
-            "nip05": cached_profile.as_ref().and_then(|prof| prof.nip05.clone()),
-            "about": cached_profile.as_ref().and_then(|prof| prof.about.clone()),
-        });
-
-        accounts_list.push(account_json);
-    }
+    let mut accounts_list: Vec<serde_json::Value> =
+        crate::command_contracts::build_list_saved_profiles_response(
+            profiles,
+            active_profile_id.as_deref(),
+            &cached_profiles,
+        )["accounts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
 
     let local_accounts = account_manager
         .list_accounts()
@@ -692,11 +703,7 @@ pub async fn list_saved_profiles(
         }
     }
 
-    info!(
-        "Returning {} unique profiles (single_profile_mode: {})",
-        accounts_list.len(),
-        single_profile_mode
-    );
+    info!("Returning {} unique profiles", accounts_list.len());
     Ok(serde_json::json!({
         "accounts": accounts_list,
     }))
@@ -769,40 +776,29 @@ pub async fn switch_profile(
         metadata.bunker_pubkey_hex.clone()
     };
 
-    // Load the full profile using the determined key
-    // Retry up to 5 times with 200ms delay to handle temporary keyring unavailability
-    // The OS keyring can be locked for a short time after logout or during auth operations
-    let mut profile = None;
-    for attempt in 1..=5 {
-        profile = load_profile_from_keyring(&key_to_use);
-        if profile.is_some() {
-            if attempt > 1 {
-                info!(
-                    "Profile {} loaded from keyring on attempt {}",
-                    profile_id, attempt
-                );
-            }
-            break;
-        }
-        if attempt < 5 {
-            warn!(
-                "Profile {} not found in keyring on attempt {}, retrying in 200ms...",
-                profile_id, attempt
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        }
-    }
-
-    let _profile = match profile {
-        Some(p) => p,
-        None => {
+    // Load the full profile. A locked or unavailable credential store is
+    // reported as such (with a retry path); it is never treated as "not found".
+    let key = key_to_use.clone();
+    match tokio::task::spawn_blocking(move || {
+        arcadestr_core::nip46::try_load_profile_from_keyring(&key)
+    })
+    .await
+    {
+        Ok(Ok(Some(_))) => {}
+        Ok(Ok(None)) => {
             error!(
-                "Profile {} not found in keyring after 5 attempts (key: {})",
+                "Profile {} not found in keyring (key: {})",
                 profile_id, key_to_use
             );
             return Err(format!("Profile not found: {}", profile_id));
         }
-    };
+        Ok(Err(_)) => {
+            return Err(arcadestr_core::credential_store::status()
+                .message()
+                .to_string())
+        }
+        Err(error) => return Err(format!("Signer profile could not be loaded: {error}")),
+    }
 
     // All NIP-46 profiles retain enough data to restore a signing client.
     // Use the key_to_use (bunker_pubkey_hex for new profiles, profile_id for old)
@@ -828,15 +824,8 @@ pub async fn switch_profile(
     let pubkey = activate_remote_account(signer, &app_state).await?;
     let user_npub = pubkey.to_bech32().unwrap_or_default();
     let _ = app_handle.emit("auth_success", user_npub.clone());
-    Ok(serde_json::json!({
-        "account": {
-            "id": profile_id,
-            "npub": user_npub,
-            "name": metadata.name,
-            "signing_mode": "nip46",
-            "last_used": 0,
-        }
-    }))
+    let name = metadata.name.clone();
+    Ok(remote_account_json(&app_state, &profile_id, &user_npub, name, Some(&metadata)).await)
 }
 
 /// Attempt to manually reconnect to the bunker.
@@ -1112,12 +1101,58 @@ pub async fn logout_nip46(
 #[tauri::command]
 pub async fn has_accounts(account_manager: State<'_, Arc<AccountManager>>) -> Result<bool, String> {
     info!("has_accounts called");
-    let profiles = list_profile_index();
+    let profiles = profile_index().await;
     let has_local_accounts = account_manager
         .has_accounts()
         .await
         .map_err(|err| err.to_string())?;
     Ok(!profiles.is_empty() || has_local_accounts)
+}
+
+/// Bounded profile-index read off the async runtime. When the credential store
+/// is unavailable this returns the non-secret local metadata cache.
+async fn profile_index() -> Vec<ProfileMetadata> {
+    tokio::task::spawn_blocking(list_profile_index)
+        .await
+        .unwrap_or_default()
+}
+
+fn credential_status_json(
+    status: &arcadestr_core::credential_store::CredentialStoreStatus,
+    restored: bool,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({}));
+    value["message"] = serde_json::json!(status.message());
+    value["restored"] = serde_json::json!(restored);
+    value
+}
+
+/// Report whether the OS credential store is usable. Never prompts.
+#[tauri::command]
+pub async fn get_credential_store_status() -> Result<serde_json::Value, String> {
+    Ok(credential_status_json(
+        &arcadestr_core::credential_store::status(),
+        false,
+    ))
+}
+
+/// Explicit user retry after unlocking the system keyring. May show an unlock
+/// prompt; waits a bounded time. If the store becomes available, the saved
+/// remote-signer session is restored unless a newer login/switch already
+/// happened (restore refuses to overwrite a newer session).
+#[tauri::command]
+pub async fn retry_credential_store(
+    state: State<'_, Arc<Mutex<AppSignerState>>>,
+) -> Result<serde_json::Value, String> {
+    let status = tokio::task::spawn_blocking(arcadestr_core::nip46::retry_credential_store)
+        .await
+        .map_err(|error| format!("Credential store retry failed: {error}"))?;
+    let restored = status == arcadestr_core::credential_store::CredentialStoreStatus::Available
+        && matches!(
+            arcadestr_core::nip46::restore_session_on_startup(state.inner()).await,
+            arcadestr_core::nip46::SessionRestoreResult::Success
+        );
+    Ok(credential_status_json(&status, restored))
 }
 
 /// Load the currently active account if one exists
@@ -1156,15 +1191,15 @@ pub async fn load_active_account(
                 .map_err(|error| format!("failed to access active signer: {error}"))?;
             let pubkey = activate_remote_account(signer, &app_state).await?;
             let user_npub = pubkey.to_bech32().unwrap_or_default();
-            return Ok(serde_json::json!({
-                "account": {
-                    "id": profile_id,
-                    "npub": user_npub,
-                    "name": profile_name,
-                    "signing_mode": "nip46",
-                    "last_used": 0,
-                }
-            }));
+            let metadata = get_profile_metadata_by_id(&profile_id);
+            return Ok(remote_account_json(
+                &app_state,
+                &profile_id,
+                &user_npub,
+                profile_name,
+                metadata.as_ref(),
+            )
+            .await);
         }
     }
 

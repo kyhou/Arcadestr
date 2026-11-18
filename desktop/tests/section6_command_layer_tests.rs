@@ -257,7 +257,60 @@ fn list_saved_profiles_contract_contains_added_profile() {
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0]["id"], serde_json::json!("profile-1"));
     assert_eq!(accounts[0]["npub"], serde_json::json!("npub1alice"));
-    assert_eq!(accounts[0]["is_current"], serde_json::json!(false));
+    // The sole remote-signer profile is current while it is the active one.
+    assert_eq!(accounts[0]["is_current"], serde_json::json!(true));
+
+    let signed_out = command_contracts::build_list_saved_profiles_response(
+        vec![sample_profile_metadata(
+            "profile-1",
+            "npub1alice",
+            "abc123",
+            "bunker123",
+        )],
+        None,
+        &HashMap::new(),
+    );
+    assert_eq!(
+        signed_out["accounts"][0]["is_current"],
+        serde_json::json!(false)
+    );
+}
+
+#[test]
+fn remote_signer_label_survives_missing_profile_cache() {
+    let mut stored = sample_profile_metadata("profile-1", "npub1alice", "abc123", "bunker123");
+    stored.display_name = Some("Alice".into());
+    stored.picture = Some("https://example.test/a.png".into());
+    let response = command_contracts::build_list_saved_profiles_response(
+        vec![stored.clone()],
+        Some("profile-1"),
+        &HashMap::new(),
+    );
+    assert_eq!(
+        response["accounts"][0]["display_name"],
+        serde_json::json!("Alice")
+    );
+    assert_eq!(
+        response["accounts"][0]["picture"],
+        serde_json::json!("https://example.test/a.png")
+    );
+
+    let mut cached = HashMap::new();
+    cached.insert("npub1alice".to_string(), sample_profile("npub1alice"));
+    let response =
+        command_contracts::build_list_saved_profiles_response(vec![stored], None, &cached);
+    let expected = sample_profile("npub1alice")
+        .display_name
+        .unwrap_or_else(|| "Alice".into());
+    assert_eq!(
+        response["accounts"][0]["display_name"],
+        serde_json::json!(expected)
+    );
+    let encoded = response.to_string();
+    assert!(
+        !encoded.contains("bunker123"),
+        "connection key material is never exposed"
+    );
 }
 
 #[test]

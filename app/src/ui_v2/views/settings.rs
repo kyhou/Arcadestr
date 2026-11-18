@@ -437,7 +437,7 @@ pub fn SettingsView(
             },
             platform.get().as_ref(),
             connected_relays.get().len(),
-            &auth.connection_status.get(),
+            &crate::display_connection_status(auth.active_account, auth.connection_status),
             auth.active_account
                 .get()
                 .as_ref()
@@ -746,7 +746,7 @@ pub fn SettingsView(
                             {move || active_key_line.get().map(|line| view! { <p>{line}</p> })}
                             <p>{move || {
                                 let mode = active_account.get().map(|account| signer_label(&account.signing_mode)).unwrap_or("Unknown signer");
-                                format!("{mode} · {}", auth.connection_status.get())
+                                format!("{mode} · {}", crate::display_connection_status(auth.active_account, auth.connection_status))
                             }}</p>
                         </div>
                     </div>

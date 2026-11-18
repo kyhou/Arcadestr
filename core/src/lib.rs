@@ -3,6 +3,9 @@
 // Signer is needed for both native and WASM targets
 pub mod signers;
 
+// Redaction of NIP-46 connection secrets (shared by native and WASM code).
+pub mod connection_secrets;
+
 // Auth and storage are native-only (require sqlx, encryption, etc.)
 #[cfg(feature = "native")]
 pub mod achievements;
@@ -12,6 +15,10 @@ pub mod auth;
 
 #[cfg(feature = "native")]
 pub mod storage;
+
+// Deadline-bounded access to the OS credential store (native-only).
+#[cfg(feature = "native")]
+pub mod credential_store;
 
 // NIP-46 remote signing module (native-only, uses OS keychain)
 #[cfg(feature = "native")]
