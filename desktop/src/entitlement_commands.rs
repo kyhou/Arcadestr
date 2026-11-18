@@ -20,6 +20,18 @@ impl EntitlementSource for RelayEntitlementSource {
         let mut successes = 0;
         let mut incomplete = false;
         for url in &self.urls {
+            // An unreachable relay answers with an empty result; never count it
+            // as a successful query.
+            let connected = self
+                .manager
+                .get_client()
+                .relay(url.as_str())
+                .await
+                .is_ok_and(|relay| relay.is_connected());
+            if !connected {
+                incomplete = true;
+                continue;
+            }
             match self
                 .manager
                 .fetch_events_from_subset(filter.clone(), vec![url.clone()])
@@ -92,4 +104,25 @@ pub(crate) async fn reconcile_for_account(
         .await?;
     session.ensure_current()?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unreachable_entitlement_relays_are_unavailable_not_empty_evidence() {
+        let (manager, url) = crate::receipt_commands::tests::unreachable_relay().await;
+        let source = RelayEntitlementSource {
+            manager,
+            urls: vec![url],
+        };
+        let result = source
+            .query(Filter::new().kind(nostr::Kind::Custom(1030)))
+            .await;
+        assert_eq!(
+            result.err().as_deref(),
+            Some("Entitlement relays unavailable; known ownership retained")
+        );
+    }
 }

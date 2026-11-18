@@ -35,6 +35,9 @@ pub use arcadestr_core::archive_inspection_contract::{
     SelectArchiveRequest, SelectArchiveResponse, SelectableArchiveFile, SelectableWorkingDirectory,
     ARCHIVE_PAGE_SIZE_DEFAULT, ARCHIVE_PAGE_SIZE_MAX,
 };
+pub use arcadestr_core::entitlement_sync_contract::{
+    EntitlementSyncReport, EntitlementSyncRequest,
+};
 pub use arcadestr_core::purchase_contract::{
     ApprovePurchasePlanRequest, InvoiceNetwork, LegProgress, PurchasePlanRequest,
     PurchasePlanReview,
@@ -42,7 +45,6 @@ pub use arcadestr_core::purchase_contract::{
 pub use arcadestr_core::receipt_sync_contract::{
     ReceiptImportRequest, ReceiptSyncReport, ReceiptSyncRequest, ReceiptVerification,
 };
-pub use arcadestr_core::entitlement_sync_contract::{EntitlementSyncReport, EntitlementSyncRequest};
 pub async fn invoke_reconcile_known_entitlements(
     request: EntitlementSyncRequest,
 ) -> Result<EntitlementSyncReport, String> {

@@ -164,8 +164,11 @@ fn bridge_error_text(text: Option<String>, json: impl FnOnce() -> Option<String>
 }
 
 /// Invoke a Tauri command via direct JavaScript interop
-fn receipt_private_command(command:&str)->bool {
-    matches!(command,"sync_purchase_receipts"|"import_purchase_receipts"|"ingest_receipt")
+fn receipt_private_command(command: &str) -> bool {
+    matches!(
+        command,
+        "sync_purchase_receipts" | "import_purchase_receipts" | "ingest_receipt"
+    )
 }
 
 /// Invoke a Tauri command via direct JavaScript interop
@@ -234,7 +237,9 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
     match result {
         Ok(value) => Ok(value),
         Err(_) => {
-            if receipt_private_command(command) {return Err("Invalid receipt verification response".into());}
+            if receipt_private_command(command) {
+                return Err("Invalid receipt verification response".into());
+            }
             // If JSON parsing fails, try to deserialize as a plain string
             // This handles commands that return plain strings like "npub1..."
             // We need to properly escape the string for JSON
@@ -390,8 +395,14 @@ fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promis
 #[cfg(test)]
 mod receipt_privacy_tests {
     #[test]
-    fn receipt_commands_do_not_echo_request_or_response_payloads(){
-        for command in ["sync_purchase_receipts","import_purchase_receipts","ingest_receipt"] {assert!(super::receipt_private_command(command));}
+    fn receipt_commands_do_not_echo_request_or_response_payloads() {
+        for command in [
+            "sync_purchase_receipts",
+            "import_purchase_receipts",
+            "ingest_receipt",
+        ] {
+            assert!(super::receipt_private_command(command));
+        }
         assert!(!super::receipt_private_command("get_platform_info"));
     }
 }

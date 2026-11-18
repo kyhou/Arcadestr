@@ -351,6 +351,108 @@ async fn delegated_roots_require_authorization_and_historical_validity() {
 }
 
 #[tokio::test]
+async fn unauthorized_signers_cannot_revoke_fork_or_join_a_genuine_chain() {
+    for delegated in [false, true] {
+        let f = Fixture::new().await;
+        let key = Keys::generate();
+        let auth = f.auth(&key, None, 1);
+        let (signer, authority) = if delegated {
+            (&key, Some(&auth))
+        } else {
+            (&f.developer, None)
+        };
+        let root = f.event(signer, "paid", None, "order", 100, authority);
+        let mut evidence = vec![root.clone()];
+        if delegated {
+            evidence.push(auth.clone());
+        }
+        f.service()
+            .ingest(f.buyer.public_key(), evidence, None, &|| Ok(()))
+            .await
+            .expect("genuine chain");
+        assert!(f.owned().await);
+
+        // Receipts are public: an outsider can copy the buyer, order and
+        // listing tags and publish anything to the relays.
+        let attacker = Keys::generate();
+        let missing = f.event(signer, "fulfilled", Some(&root), "order", 101, authority);
+        let unknown_authority = f.auth(&attacker, None, 1);
+        let mut own_listing = Fixture::new().await;
+        own_listing.buyer = f.buyer.clone();
+        own_listing.developer = attacker.clone();
+        let attacks = vec![
+            f.event(&attacker, "refunded", Some(&root), "order", 102, authority),
+            f.event(&attacker, "paid", None, "order", 103, authority),
+            f.event(
+                &attacker,
+                "refunded",
+                Some(&missing),
+                "order",
+                104,
+                authority,
+            ),
+            f.event(
+                &attacker,
+                "paid",
+                None,
+                "order",
+                105,
+                Some(&unknown_authority),
+            ),
+            own_listing.event(&attacker, "refunded", Some(&root), "order", 106, None),
+        ];
+        let result = f
+            .service()
+            .ingest(f.buyer.public_key(), attacks, None, &|| Ok(()))
+            .await
+            .expect("attack evidence is processed");
+        let genuine = result
+            .chains
+            .iter()
+            .find(|c| c.listing_coordinate == f.coordinate() && c.order_id == "order")
+            .expect("genuine chain reported");
+        assert_eq!(genuine.verification, V::Verified, "delegated={delegated}");
+        assert_eq!(genuine.tip_event_id, Some(root.id.to_hex()));
+        assert!(f.owned().await, "delegated={delegated}");
+        let foreign: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM purchases WHERE merchant_pubkey=?")
+                .bind(attacker.public_key().to_hex())
+                .fetch_one(f.db.pool())
+                .await
+                .expect("purchases");
+        assert_eq!(foreign, 0, "unauthorized events are never persisted");
+    }
+}
+
+#[tokio::test]
+async fn conflicting_roots_with_unresolved_authority_are_indeterminate_not_invalid() {
+    let f = Fixture::new().await;
+    let key = Keys::generate();
+    let auth = f.auth(&key, None, 1);
+    let genuine = f.event(&key, "paid", None, "order", 100, Some(&auth));
+    let forged = f.event(&Keys::generate(), "paid", None, "order", 101, Some(&auth));
+    let result = f
+        .service()
+        .ingest(
+            f.buyer.public_key(),
+            vec![genuine, forged],
+            None,
+            &|| Ok(()),
+        )
+        .await
+        .expect("missing authority");
+    assert_eq!(result.chains[0].verification, V::Indeterminate);
+    assert!(!f.owned().await);
+    let result = f
+        .service()
+        .ingest(f.buyer.public_key(), vec![auth], None, &|| Ok(()))
+        .await
+        .expect("authority arrives");
+    assert_eq!(result.chains[0].verification, V::Verified);
+    assert!(f.owned().await);
+}
+
+#[tokio::test]
 async fn forks_unreachable_updates_and_untrusted_roots_fail_closed() {
     for case in 0..3 {
         let f = Fixture::new().await;

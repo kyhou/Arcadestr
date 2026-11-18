@@ -23,6 +23,17 @@ impl ReceiptSource for RelayReceiptSource {
         self.urls.clone()
     }
     async fn query(&self, relay: &str, filter: Filter) -> Result<Vec<Event>, String> {
+        // The pool answers an unreachable relay with an empty result. Report it
+        // as unavailable so discovery is never presented as complete.
+        let connected = self
+            .manager
+            .get_client()
+            .relay(relay)
+            .await
+            .is_ok_and(|relay| relay.is_connected());
+        if !connected {
+            return Err("Receipt relay unavailable".into());
+        }
         self.manager
             .fetch_events_from_subset(filter, vec![relay.to_string()])
             .await
@@ -262,4 +273,48 @@ pub(crate) async fn archive_confirmation(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A relay manager configured with one relay on a closed loopback port.
+    pub(crate) async fn unreachable_relay() -> (RelayManager, String) {
+        let url = "ws://127.0.0.1:9".to_string();
+        let nostr = arcadestr_core::nostr::NostrClient::new(
+            "relay-outage-test".into(),
+            vec![],
+            Some(arcadestr_core::relay_manager::RelayManagerConfig {
+                debug_relays: Some(vec![url.clone()]),
+                block_discovery: true,
+                query_timeout_secs: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("relay manager");
+        nostr.connect().await;
+        let manager = { nostr.get_relay_manager().lock().await.clone() };
+        (manager, url)
+    }
+
+    #[tokio::test]
+    async fn unreachable_receipt_relay_is_unavailable_not_an_empty_history() {
+        let (manager, url) = unreachable_relay().await;
+        let source = RelayReceiptSource {
+            manager,
+            urls: vec![url.clone()],
+            http: Arc::new(
+                arcadestr_core::http_client::ReqwestHttpClient::new(
+                    std::time::Duration::from_secs(1),
+                )
+                .expect("http"),
+            ),
+        };
+        let result = source
+            .query(&url, Filter::new().kind(Kind::Custom(1020)))
+            .await;
+        assert_eq!(result.unwrap_err(), "Receipt relay unavailable");
+    }
 }

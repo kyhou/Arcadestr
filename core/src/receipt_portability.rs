@@ -455,6 +455,10 @@ impl ReceiptPortability {
                     }
                 }
             }
+            // Events from signers without authority over this listing are not
+            // evidence about the purchase. They must neither invalidate a genuine
+            // chain nor be persisted as part of it.
+            let chain = authorized_chain_members(&coordinate, chain, &events);
             let cached_lsp:Option<String>=sqlx::query_scalar("SELECT lsp_pubkey FROM receipt_chain_verifications WHERE buyer_pubkey=? AND listing_coordinate=? AND order_id=?")
                 .bind(buyer.to_hex()).bind(&coordinate).bind(&order).fetch_optional(&mut *tx).await.map_err(|_|"Receipt verification checkpoint unavailable")?.flatten();
             let cached_key = cached_lsp.and_then(|s| PublicKey::from_hex(&s).ok());
@@ -699,6 +703,86 @@ impl ReceiptPortability {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberAuthority {
+    Authorized,
+    /// Names an authorization that is not in the evidence yet.
+    Unknown,
+    Unauthorized,
+}
+
+/// Authority is judged against the chain's listing coordinate, not the
+/// member's own `a` tag: successors that mutate `a` are still followed so they
+/// can be rejected, and must not gain authority from another listing.
+fn member_authority(
+    developer: PublicKey,
+    event: &Event,
+    evidence: &BTreeMap<EventId, Event>,
+) -> MemberAuthority {
+    use MemberAuthority::*;
+    if event.pubkey == developer {
+        return Authorized;
+    }
+    let Ok(receipt) = parse_receipt_event(event) else {
+        return Unauthorized;
+    };
+    let Some(id) = receipt.authorization else {
+        return Unauthorized;
+    };
+    let Some(root) = evidence.get(&id) else {
+        return Unknown;
+    };
+    let Ok(root) = parse_authorization_event(root) else {
+        return Unauthorized;
+    };
+    if root.event.pubkey != developer {
+        return Unauthorized;
+    }
+    let delegated = evidence
+        .values()
+        .filter(|e| e.kind.as_u16() == FULFILLMENT_AUTHORIZATION_KIND && e.pubkey == developer)
+        .filter_map(|e| parse_authorization_event(e).ok())
+        .filter(|a| a.terms.authorization_id == root.terms.authorization_id)
+        .any(|a| a.terms.fulfillment_pubkey == event.pubkey);
+    if delegated {
+        Authorized
+    } else {
+        Unauthorized
+    }
+}
+
+/// Keeps only members that the listing developer or its authorized
+/// fulfillment key could have signed. When authority is undeterminable
+/// (missing authorization evidence) those members are kept so verification
+/// reports the chain as indeterminate. A group with no plausible member is
+/// returned unchanged so it is still reported as invalid, never as owned.
+fn authorized_chain_members(
+    coordinate: &str,
+    chain: Vec<Event>,
+    evidence: &BTreeMap<EventId, Event>,
+) -> Vec<Event> {
+    let Some(developer) = coordinate_publisher(coordinate) else {
+        return chain;
+    };
+    let authority = chain
+        .iter()
+        .map(|event| member_authority(developer, event, evidence))
+        .collect::<Vec<_>>();
+    let keep = if authority.contains(&MemberAuthority::Authorized) {
+        MemberAuthority::Authorized
+    } else if authority.contains(&MemberAuthority::Unknown) {
+        MemberAuthority::Unknown
+    } else {
+        return chain;
+    };
+    chain
+        .into_iter()
+        .zip(authority)
+        .filter(|(_, authority)| *authority == keep)
+        .map(|(event, _)| event)
+        .collect()
+}
+
 fn verify_chain<'a>(
     buyer: PublicKey,
     chain: &'a [Event],
@@ -743,6 +827,14 @@ fn verify_chain<'a>(
         return (Invalid, "Receipt chain has no valid paid root", None);
     }
     if roots.len() != 1 {
+        // Roots whose signer authority cannot be resolved yet are not proof of
+        // an authorized fork; wait for the authorization evidence.
+        if roots.iter().any(|r| {
+            r.authorization
+                .is_some_and(|id| !evidence.contains_key(&id))
+        }) {
+            return (Indeterminate, "Missing fulfillment authorization", None);
+        }
         return (Invalid, "Conflicting receipt roots", None);
     }
     let root = roots[0];
