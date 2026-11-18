@@ -15,6 +15,143 @@ loader.exec_module(regtest)
 
 
 class SafetyTests(unittest.TestCase):
+    def test_default_status_does_not_send_nwc(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(regtest, 'STATE', Path(tmp) / 'must-not-exist'), \
+             patch.object(regtest.sys, 'argv', ['regtest', 'status']), \
+             patch.object(regtest, 'run', return_value='running') as command, \
+             patch.object(regtest, 'polar_status'), patch.object(regtest, 'probe'), \
+             patch.object(regtest, 'hub_status'), patch.object(regtest, 'save') as save, \
+             patch.object(regtest, 'verify_nwc') as nwc:
+            self.assertEqual(regtest.main(), 0)
+            nwc.assert_not_called()
+            save.assert_not_called()
+            self.assertFalse(regtest.STATE.exists())
+            self.assertEqual(command.call_args.args[0][:2], ['docker', 'info'])
+
+    def test_nwc_diagnostic_is_explicit_and_local(self):
+        with patch.object(regtest, 'verify_bitcoin'), patch.object(regtest, 'node_rpc'), \
+             patch.object(regtest, 'hub_status'), patch.object(regtest, 'verify_hub_app'), \
+             patch.object(regtest, 'verify_nwc') as nwc:
+            regtest.nwc_diagnostic(None)
+            nwc.assert_called_once_with(local_only=True)
+
+    def test_polar_recovery_orders_rpc_and_reconnects_missing_peer_only_once(self):
+        events = []
+        running = dict.fromkeys(('backend1', *regtest.NODES), 'running')
+        running['backend1'] = 'exited'
+        running['bob'] = 'restarting'  # LND had started before Bitcoin.
+        running['dave'] = 'created'
+        tip = {'blocks': 182, 'bestblockhash': 'tip', 'time': 100}
+        links = set(regtest.POLAR_LINKS) - {('alice', 'bob')}
+        rpc_attempts = 0
+
+        def docker(command, **_kwargs):
+            name = command[-1].removeprefix('polar-n1-')
+            events.append((command[1], name))
+            if command[1] == 'inspect':
+                return running[name]
+            self.assertEqual(command[1], 'start')
+            running[name] = 'running'
+
+        def bitcoin():
+            nonlocal rpc_attempts
+            rpc_attempts += 1
+            events.append(('bitcoin', 'rpc'))
+            if rpc_attempts == 1:
+                raise regtest.Blocked('RPC warming up')
+            return tip
+
+        def cli(node, method, *args):
+            if method == 'getinfo':
+                return {'chains': [{'chain': 'bitcoin', 'network': 'regtest'}],
+                        'identity_pubkey': regtest.POLAR_KEYS[node],
+                        'synced_to_chain': True, 'block_height': 182, 'block_hash': 'tip'}
+            if method == 'listpeers':
+                return {'peers': [{'pub_key': regtest.POLAR_KEYS[b if a == node else a],
+                                   'address': '172.99.0.250:9735'}
+                                  for a, b in links if node in (a, b)]}
+            if method == 'listchannels':
+                return {'channels': [{'remote_pubkey': regtest.POLAR_KEYS[b if a == node else a],
+                                      'channel_point': f'{b}:{i}', 'active': (a, b) in links,
+                                      'local_balance': '10000', 'remote_balance': '10000'}
+                                     for a, b in regtest.POLAR_LINKS if node in (a, b)
+                                     for i in range(2)]}
+            self.assertEqual((node, method, args),
+                             ('alice', 'connect', (f'{regtest.POLAR_KEYS["bob"]}@polar-n1-bob:9735',)))
+            events.append(('connect', 'bob'))
+            links.add(('alice', 'bob'))
+
+        with patch.object(regtest, 'run', side_effect=docker), \
+             patch.object(regtest, 'verify_bitcoin', side_effect=bitcoin), \
+             patch.object(regtest, 'lncli', side_effect=cli), \
+             patch.object(regtest.time, 'sleep'), patch.object(regtest, 'mine_fresh_tip') as mine:
+            regtest.recover_polar()
+            regtest.recover_polar()
+            mine.assert_not_called()
+        self.assertEqual(events[:5], [('inspect', 'backend1'), ('start', 'backend1'),
+                                      ('bitcoin', 'rpc'), ('bitcoin', 'rpc'), ('inspect', 'alice')])
+        self.assertEqual(events.count(('start', 'dave')), 1)
+        self.assertEqual(events.count(('connect', 'bob')), 1)
+        self.assertNotIn(('start', 'bob'), events)
+
+    def test_stale_tip_mines_once_only_when_nodes_are_on_old_tip(self):
+        old = {'blocks': 182, 'bestblockhash': 'old', 'time': 100}
+        fresh = {'blocks': 183, 'bestblockhash': 'fresh', 'time': 10000}
+        tip = old
+
+        def infos():
+            return {node: {'synced_to_chain': tip == fresh, 'block_height': tip['blocks'],
+                           'block_hash': tip['bestblockhash'], 'best_header_timestamp': str(tip['time'])}
+                    for node in regtest.NODES}
+
+        def mine(previous):
+            nonlocal tip
+            self.assertEqual(previous, old)
+            tip = fresh
+
+        with patch.object(regtest.time, 'time', return_value=10000), \
+             patch.object(regtest.time, 'sleep'), patch.object(regtest, 'start_existing_container'), \
+             patch.object(regtest, 'verify_bitcoin', side_effect=lambda: tip), \
+             patch.object(regtest, 'node_rpc', side_effect=infos), \
+             patch.object(regtest, 'mine_fresh_tip', side_effect=mine) as mining, \
+             patch.object(regtest, 'expected_channels', return_value={}), \
+             patch.object(regtest, 'missing_peers', return_value=[]):
+            self.assertTrue(regtest.recover_polar()['alice']['synced_to_chain'])
+            mining.assert_called_once_with(old)
+            lagging = infos()
+            lagging['alice'].update(synced_to_chain=False, block_height=181)
+            self.assertFalse(regtest.needs_fresh_tip(lagging, old))
+            self.assertFalse(regtest.needs_fresh_tip(infos(), fresh))
+
+    def test_mining_uses_existing_payout_and_no_mempool_transactions(self):
+        old = {'blocks': 182, 'bestblockhash': 'old'}
+        fresh = {'blocks': 183, 'bestblockhash': 'fresh'}
+        coinbase = {'tx': [{'vin': [{'coinbase': 'data'}],
+                            'vout': [{'value': 50, 'scriptPubKey': {'address': 'existing'}}]}]}
+        with patch.object(regtest, 'bitcoin_rpc',
+                          side_effect=[coinbase, {'isvalid': True}, {'hash': 'fresh'}]) as rpc, \
+             patch.object(regtest, 'verify_bitcoin', side_effect=[old, fresh]):
+            regtest.mine_fresh_tip(old)
+        self.assertEqual(rpc.call_args.args, ('generateblock', 'existing', '[]'))
+
+    def test_inactive_channel_and_timeout_are_diagnostic(self):
+        channels = {'alice': [{'active': False, 'local_balance': 10000, 'remote_balance': 10000}]}
+        with self.assertRaisesRegex(regtest.Blocked, 'channel end\\(s\\) inactive'):
+            regtest.wait_for('channel recovery', lambda: regtest.require_active(channels), seconds=0)
+        with patch.object(regtest, 'start_existing_container') as start, \
+             patch.object(regtest, 'bitcoin_rpc', return_value={'chain': 'main'}), \
+             self.assertRaisesRegex(regtest.Blocked, 'not on regtest'):
+            regtest.recover_polar()
+        start.assert_called_once_with('backend1')
+
+    def test_unknown_lnd_identity_blocks_before_peer_or_mining_actions(self):
+        with patch.object(regtest, 'lncli', return_value={
+                'chains': [{'chain': 'bitcoin', 'network': 'regtest'}],
+                'identity_pubkey': 'unexpected'}), \
+             self.assertRaisesRegex(regtest.WrongPolarNetwork, 'unexpected Lightning identity'):
+            regtest.node_rpc()
+
     def test_gate2_incomplete_reservation_blocks_new_run_and_verification(self):
         with tempfile.TemporaryDirectory() as tmp:
             state=Path(tmp)
@@ -252,18 +389,48 @@ class SafetyTests(unittest.TestCase):
 
     def test_adp_requires_existing_database_and_local_relays(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            env = root / '.env'
+            root = Path(tmp) / 'repo'
+            root.mkdir()
+            env = Path(tmp) / 'private.env'
+            config = {'adp_env': str(env)}
             values = {'ADP_OPERATOR_NSEC':'not-a-real-secret','ADP_MASTER_KEY':'not-a-real-key',
                       'ADP_DB_PATH':'missing.db','ADP_FILES_DIR':'files',
                       'ADP_SERVER_URL':'http://localhost:9099', 'ADP_RELAYS':'ws://localhost:7777,ws://localhost:7778'}
             env.write_text('\n'.join(f'{k}={v}' for k,v in values.items()))
-            with patch.object(regtest, 'settings', return_value={}), self.assertRaisesRegex(regtest.Blocked, 'database missing'):
+            env.chmod(0o600)
+            with patch.object(regtest, 'settings', return_value=config), self.assertRaisesRegex(regtest.Blocked, 'database missing'):
                 regtest.adp_env(root)
             (root/'missing.db').touch()
+            with patch.object(regtest, 'settings', return_value=config), patch.object(regtest, 'STATE', Path(tmp)):
+                self.assertEqual(regtest.adp_env(root)['ADP_OPERATOR_NSEC'], values['ADP_OPERATOR_NSEC'])
             values['ADP_RELAYS'] = 'wss://external.example'
             env.write_text('\n'.join(f'{k}={v}' for k,v in values.items()))
-            with patch.object(regtest, 'settings', return_value={}), self.assertRaises(regtest.Blocked):
+            with patch.object(regtest, 'settings', return_value=config), self.assertRaises(regtest.Blocked):
+                regtest.adp_env(root)
+
+    def test_adp_never_falls_back_to_checkout_or_inherited_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'repo'
+            root.mkdir()
+            legacy = root / '.env'
+            legacy.touch(mode=0o600)
+            external = Path(tmp) / 'private.env'
+            external.touch(mode=0o644)
+            external.chmod(0o644)
+            external_alias = Path(tmp) / 'alias.env'
+            external_alias.symlink_to(legacy)
+            for config, reason in [
+                ({}, 'Set adp_env'),
+                ({'adp_env': str(legacy)}, 'outside both checkouts'),
+                ({'adp_env': str(external_alias)}, 'outside both checkouts'),
+                ({'adp_env': str(external)}, 'owner-only'),
+            ]:
+                with patch.object(regtest, 'settings', return_value=config), self.assertRaisesRegex(regtest.Blocked, reason):
+                    regtest.adp_env(root)
+            external.chmod(0o600)
+            with patch.object(regtest, 'settings', return_value={'adp_env': str(external)}), \
+                 patch.dict(regtest.os.environ, {'ADP_OPERATOR_NSEC': 'synthetic', 'ADP_MASTER_KEY': 'synthetic'}), \
+                 self.assertRaisesRegex(regtest.Blocked, 'ADP_OPERATOR_NSEC missing'):
                 regtest.adp_env(root)
 
     def test_atomic_state_is_owner_only(self):

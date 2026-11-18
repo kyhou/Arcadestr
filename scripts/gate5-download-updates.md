@@ -129,3 +129,23 @@ the default desktop WASM target. Log: `/tmp/opencode/gate5-browser-wasm-check.lo
 Development backup scope: Gate 5 implementation, tests and this report only.
 Full release validation is not required for this backup; unrelated working-tree
 changes remain outside the commit.
+
+## Staging cleanup after an interrupted extraction (D5)
+
+New extractions checkpoint the exact staging directory name and filesystem
+identity in the stable installation lock file before extracting archive
+contents. Recovery uses the existing coordinate and root locks. It removes
+only a matching checkpointed staging directory, never follows symlinks, and
+does not remove a ready installation or a retained package.
+
+After an interruption, recovery marks an incomplete installation failed.
+Cleanup errors leave the evidence in place for the next startup or explicit
+recovery. Removing a failed record or retrying an install must first resolve
+its staging cleanup. Update rollback still preserves the previous ready
+version and its retained archive.
+
+Directories from older builds, interrupted checkpoint writes, or unexpected
+replacements may lack usable ownership evidence. Startup reports remaining
+staging entries without deleting them; the count can also include active
+work. Inspect these entries offline before any manual action. Do not use
+filename or age alone to decide that a directory is safe to remove.

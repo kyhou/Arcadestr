@@ -28,7 +28,8 @@ From `Arcadestr`:
 
 ```zsh
 ./scripts/regtest up                 # build current sources; restore existing services
-./scripts/regtest status             # inspect readiness; never starts services
+./scripts/regtest status             # read-only readiness; no NWC, mining, starts or writes
+./scripts/regtest nwc-diagnostic     # explicit: one encrypted local NWC get_info (no payment)
 ./scripts/regtest test               # live read-only/invoice probes; reports coverage gaps
 ./scripts/regtest test --source      # additionally run protocol/storage/route regressions
 ./scripts/regtest test --payments    # real 1,000-sat Bob/Carol ADP purchase through existing NWC
@@ -70,9 +71,37 @@ not running, start Docker using the machine's existing administrative setup.
 | Arcadestr | existing accounts, application data and OS-keyring entries |
 
 `up` uses `docker start` on existing containers, never `compose up` or container
-recreation. Missing containers require operator investigation in Polar. No blocks
-are mined and no liquidity is moved automatically to repair channels. Polar's GUI
-is reported separately; its running containers do not require the GUI to be open.
+recreation. Missing containers require operator investigation in Polar. Recovery
+after a reboot or container restart is ordered and idempotent, with bounded waits:
+
+1. Start `polar-n1-backend1` if stopped and wait for Bitcoin RPC; refuse any
+   chain other than regtest.
+2. Start the four existing LND containers (an LND that crash-looped before
+   Bitcoin was reachable recovers once RPC is available) and wait for LND RPC.
+   Each node must report its pinned identity key; an unknown key stops recovery.
+3. Chain sync is checked separately: every node must match Bitcoin Core's
+   height and block hash. If all nodes sit on that tip but report unsynced
+   because the tip is older than two hours, exactly one **empty** block is
+   mined to the latest coinbase's existing payout address (no wallet is
+   created, no mempool transactions are included), then sync is rechecked.
+   Unavailable services or lagging nodes never trigger mining.
+4. Missing Alice↔Bob/Carol/Dave peers are reconnected as
+   `<pinned key>@polar-n1-<node>:9735` (stable Docker name, never a stale IP;
+   LND authenticates the key). Already connected peers are not reconnected.
+5. The existing funded channels (two per Alice link) must become active.
+   Channels are never created, closed or funded automatically.
+
+Each stage fails with a specific diagnostic (Bitcoin RPC, LND RPC, sync, peers,
+channels). Polar's GUI is not required.
+
+`status` is read-only: it takes no lock, creates no state files and does not
+start services, mine, publish events or contact the wallet over NWC. It reports
+container state, Bitcoin RPC, LND RPC/identity, chain sync, peer connectivity,
+active channels, ADP `/health` and discovery, relay `REQ`/`EOSE`, LNURL
+metadata and whether Alby Hub's process and local instance listener are up.
+The latter is not wallet reachability. `nwc-diagnostic` explicitly sends one
+encrypted NIP-47 `get_info` through local relay 7778 (no payment); `up` no
+longer does so.
 
 `down` deliberately leaves Polar containers and pre-existing Alby/GUI processes
 alone. It preserves all persistent data. Only processes started by this supervisor
@@ -97,9 +126,10 @@ Optional machine-specific overrides belong in
 }
 ```
 
-The pre-existing repository `.env` is read for compatibility, never copied or
-rewritten. Use `adp_env` to select an existing private external credential file.
-Never put new credentials in either checkout or in `settings.json`.
+`adp_env` is required for the ADP service. Point it to an existing, owner-only
+regular file outside both checkouts and all sync folders. The supervisor no
+longer reads the checkout `.env` or inherits the operator keys from the shell.
+Never put credential values in `settings.json`.
 
 ## Existing identities and startup requirements
 

@@ -13,6 +13,7 @@ import signal
 import secrets
 import socket
 import sqlite3
+import stat
 import struct
 import string
 import subprocess
@@ -27,6 +28,15 @@ HOME = Path.home()
 CONFIG = HOME / '.config/arcadestr-regtest'
 STATE = Path(os.environ.get('XDG_STATE_HOME', HOME / '.local/state')) / 'arcadestr-regtest'
 NODES = ('alice', 'bob', 'carol', 'dave')
+# Established Polar network 1 identities, not Docker addresses or LND aliases.
+POLAR_KEYS = {
+    'alice': '0262c317f04b9379e8c3bcda396c705e6c337e30e066f1b2363827d921182413e3',
+    'bob': '03b6a47c442c94e0f4ed8924f5b4bb92e8a4f057ed8e5d5baf090d0854ee90f2df',
+    'carol': '031b3f9d917efe1b88977534cce4f1e4f05036632a5ada028299ea93214fcb019c',
+    'dave': '038da1998373ff73754afd19e4d0db228aca6728979724dab747aaa3da09601970',
+}
+POLAR_LINKS = tuple(('alice', node) for node in NODES[1:])
+STALE_TIP_SECONDS = 2 * 60 * 60
 PORTS = {'strfry1': 7777, 'strfry2': 7778, 'nak1': 10547, 'nak2': 10548,
          'lnurl': 18080, 'adp': 9099, 'adp-dave': 19100, 'frontend': 5173}
 HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -34,6 +44,10 @@ HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 class Blocked(Exception):
     pass
+
+
+class WrongPolarNetwork(Blocked):
+    """Unsafe to retry or modify this stack."""
 
 
 def run(args, cwd=None, env=None, timeout=30):
@@ -175,37 +189,197 @@ def ws_query(port):
 def lncli(node, *args):
     if node not in NODES:
         raise Blocked('unknown local LND node')
+    timeout = 5 if args and args[0] in ('getinfo', 'listpeers', 'listchannels', 'connect') else 30
     return json.loads(run(['docker', 'exec', 'polar-n1-' + node, 'lncli',
-                           '--lnddir=/home/lnd/.lnd', '--network=regtest', *args]))
+                           '--lnddir=/home/lnd/.lnd', '--network=regtest', *args], timeout=timeout))
 
 
-def verify_nodes():
+def node_rpc():
     infos = {}
     for node in NODES:
-        info = lncli(node, 'getinfo')
+        try:
+            info = lncli(node, 'getinfo')
+        except (Blocked, ValueError) as exc:
+            raise Blocked(f'{node}: LND RPC unavailable; check backend connectivity or unlock the existing wallet') from exc
         if info.get('chains') != [{'chain': 'bitcoin', 'network': 'regtest'}]:
-            raise Blocked(f'{node}: not exclusively Bitcoin regtest; payments prohibited')
-        if not info.get('synced_to_chain'):
-            raise Blocked(f'{node}: not chain synced')
+            raise WrongPolarNetwork(f'{node}: not exclusively Bitcoin regtest')
+        if info.get('identity_pubkey') != POLAR_KEYS[node]:
+            raise WrongPolarNetwork(f'{node}: unexpected Lightning identity; refusing recovery')
         infos[node] = info
-    keys = {info['identity_pubkey'] for info in infos.values()}
-    for node in NODES:
-        channels = lncli(node, 'listchannels')['channels']
-        active = [c for c in channels if c['active'] and c['remote_pubkey'] in keys]
-        # Readiness floor only, not a claim that a route is guaranteed.
-        if (sum(int(c['local_balance']) for c in active) < 10_000 or
-                sum(int(c['remote_balance']) for c in active) < 10_000):
-            raise Blocked(f'{node}: insufficient local regtest liquidity (10,000 sats each direction)')
     return infos
 
 
+def same_tip(info, tip):
+    return info.get('block_height') == tip['blocks'] and info.get('block_hash') == tip['bestblockhash']
+
+
+def require_sync(infos, tip):
+    lagging = [node for node, info in infos.items()
+               if not info.get('synced_to_chain') or not same_tip(info, tip)]
+    if lagging:
+        raise Blocked(f'LND not synchronized to Bitcoin Core at height {tip["blocks"]}: {", ".join(lagging)}')
+
+
+def expected_channels():
+    by_node = {node: lncli(node, 'listchannels')['channels'] for node in NODES}
+    expected = {node: [] for node in NODES}
+    for source, target in POLAR_LINKS:
+        ends = [[c for c in by_node[a] if c['remote_pubkey'] == POLAR_KEYS[b]]
+                for a, b in ((source, target), (target, source))]
+        points = [{c['channel_point'] for c in channels} for channels in ends]
+        if len(points[0]) < 2 or points[0] != points[1]:
+            raise Blocked(f'{source}/{target}: expected at least two matching existing funded channels; no channels will be created')
+        expected[source].extend(ends[0])
+        expected[target].extend(ends[1])
+    return expected
+
+
+def require_active(channels):
+    for node, entries in channels.items():
+        inactive = sum(c['active'] is not True for c in entries)
+        if inactive:
+            raise Blocked(f'{node}: {inactive} expected channel end(s) inactive')
+        if (sum(int(c['local_balance']) for c in entries) < 10_000 or
+                sum(int(c['remote_balance']) for c in entries) < 10_000):
+            raise Blocked(f'{node}: insufficient local regtest liquidity (10,000 sats each direction)')
+
+
+def missing_peers():
+    peers = {node: {p['pub_key'] for p in lncli(node, 'listpeers')['peers']} for node in NODES}
+    return [(a, b) for a, b in POLAR_LINKS
+            if POLAR_KEYS[b] not in peers[a] or POLAR_KEYS[a] not in peers[b]]
+
+
+def require_peers():
+    missing = missing_peers()
+    if missing:
+        raise Blocked('Lightning peers disconnected: ' + ', '.join(f'{a}/{b}' for a, b in missing))
+
+
+def verify_nodes():
+    tip = verify_bitcoin()
+    infos = node_rpc()
+    require_sync(infos, tip)
+    require_peers()
+    require_active(expected_channels())
+    return infos
+
+
+def bitcoin_rpc(*args):
+    # Polar development RPC credentials must not appear in diagnostics.
+    return json.loads(run(['docker', 'exec', 'polar-n1-backend1', 'bitcoin-cli',
+                           '-regtest', '-rpcuser=polaruser', '-rpcpassword=polarpass',
+                           *args], timeout=5))
+
+
 def verify_bitcoin():
-    # Polar supplies these development RPC credentials; never print argv.
-    result = json.loads(run(['docker', 'exec', 'polar-n1-backend1', 'bitcoin-cli',
-                             '-regtest', '-rpcuser=polaruser', '-rpcpassword=polarpass',
-                             'getblockchaininfo']))
-    if result.get('chain') != 'regtest' or result.get('initialblockdownload'):
-        raise Blocked('Bitcoin Core is not ready on regtest')
+    try:
+        result = bitcoin_rpc('getblockchaininfo')
+    except (Blocked, ValueError) as exc:
+        raise Blocked('Bitcoin Core RPC unavailable; check polar-n1-backend1') from exc
+    if result.get('chain') != 'regtest':
+        raise WrongPolarNetwork('Bitcoin Core is not on regtest')
+    if result.get('initialblockdownload') is not False or result['blocks'] != result['headers']:
+        raise Blocked('Bitcoin Core RPC reachable, but its regtest chain is not ready')
+    return result
+
+
+def wait_for(stage, check, seconds=45):
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            return check()
+        except WrongPolarNetwork:
+            raise
+        except Blocked as exc:
+            if time.monotonic() >= deadline:
+                raise Blocked(f'{stage}: {exc}') from exc
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+
+def container_state(node):
+    name = 'polar-n1-' + node
+    try:
+        return run(['docker', 'inspect', '--format', '{{.State.Status}}', name], timeout=5).strip()
+    except Blocked as exc:
+        raise Blocked(f'{name}: existing container unavailable; inspect Polar (will not recreate it)') from exc
+
+
+def start_existing_container(node):
+    state = container_state(node)
+    if state in ('created', 'exited'):
+        run(['docker', 'start', 'polar-n1-' + node], timeout=30)
+    elif state not in ('running', 'restarting'):
+        raise Blocked(f'polar-n1-{node}: container state {state}; inspect Polar')
+
+
+def needs_fresh_tip(infos, tip):
+    unsynced = [info for info in infos.values() if not info.get('synced_to_chain')]
+    return (bool(unsynced)
+            and all(same_tip(info, tip) for info in infos.values())
+            and time.time() - tip['time'] > STALE_TIP_SECONDS
+            and all(int(info.get('best_header_timestamp', 0)) == tip['time'] for info in unsynced))
+
+
+def mine_fresh_tip(previous):
+    # Reuse the latest coinbase's unique payout destination. Never open/create a
+    # wallet or mine mempool transactions (which might change channel funding).
+    block = bitcoin_rpc('getblock', previous['bestblockhash'], '2')
+    outputs = block['tx'][0]
+    addresses = {out['scriptPubKey']['address'] for out in outputs['vout']
+                 if out['value'] > 0 and out['scriptPubKey'].get('address')}
+    if not outputs['vin'][0].get('coinbase') or len(addresses) != 1:
+        raise Blocked('cannot establish the existing regtest coinbase payout address; no block mined')
+    address = addresses.pop()
+    if not bitcoin_rpc('validateaddress', address).get('isvalid'):
+        raise Blocked('existing regtest coinbase payout address is invalid; no block mined')
+    if verify_bitcoin()['bestblockhash'] != previous['bestblockhash']:
+        raise Blocked('regtest tip changed before mining; retry startup')
+    result = bitcoin_rpc('generateblock', address, '[]')
+    tip = verify_bitcoin()
+    if tip['blocks'] != previous['blocks'] + 1 or tip['bestblockhash'] != result.get('hash'):
+        raise Blocked('could not verify exactly one newly mined regtest block; inspect chain before retrying')
+    print(f'OK mined one empty regtest block at height {tip["blocks"]} to refresh the stale tip')
+
+
+def recover_polar():
+    start_existing_container('backend1')
+    wait_for('Bitcoin startup', verify_bitcoin)
+    for node in NODES:
+        start_existing_container(node)
+    wait_for('Lightning RPC startup', node_rpc)
+    mined = False
+
+    def synchronize():
+        nonlocal mined
+        tip = verify_bitcoin()
+        infos = node_rpc()
+        if not mined and needs_fresh_tip(infos, tip):
+            mined = True
+            mine_fresh_tip(tip)
+            raise Blocked('waiting for LND to adopt the refreshed regtest tip')
+        require_sync(infos, tip)
+        return infos
+
+    infos = wait_for('Lightning chain synchronization', synchronize)
+    expected_channels()
+    def reconnect():
+        disconnected = missing_peers()
+        if not disconnected:
+            return
+        node_rpc()
+        for source, target in disconnected:
+            # LND authenticates the pinned key during the Lightning handshake.
+            try:
+                lncli(source, 'connect', f'{POLAR_KEYS[target]}@polar-n1-{target}:9735')
+            except (Blocked, ValueError):
+                # A startup auto-connect might have won the race.
+                pass
+        require_peers()
+
+    wait_for('Lightning peer recovery', reconnect, seconds=20)
+    wait_for('Lightning channel recovery', lambda: require_active(expected_channels()), seconds=30)
+    return infos
 
 
 def fixture_env(infos):
@@ -244,9 +418,26 @@ def fixture_env(infos):
 
 
 def adp_env(adp):
-    path = Path(settings().get('adp_env', str(adp / '.env')))
+    configured = settings().get('adp_env')
+    if not configured:
+        raise Blocked('Set adp_env to an existing private file outside the checkouts and sync folders')
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise Blocked('adp_env must be an absolute path')
+    try:
+        path = path.resolve(strict=True)
+        if path.is_relative_to(adp.resolve()) or path.is_relative_to(ROOT):
+            raise Blocked('adp_env must be outside both checkouts')
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise Blocked('adp_env must be an owner-only regular file')
+        contents = path.read_text()
+    except (OSError, UnicodeError, RuntimeError) as exc:
+        raise Blocked('Unable to read the configured private adp_env file') from exc
     env = os.environ.copy()
-    for line in path.read_text().splitlines():
+    env.pop('ADP_OPERATOR_NSEC', None)
+    env.pop('ADP_MASTER_KEY', None)
+    for line in contents.splitlines():
         line = line.strip()
         if not line or line.startswith('#'):
             continue
@@ -344,13 +535,16 @@ def probe(name):
     elif name.startswith(('strfry', 'nak')):
         ws_query(PORTS[name])
     elif name == 'adp-dave':
+        code, health = request('http://127.0.0.1:19100/health')
+        if code != 200 or not isinstance(health, dict) or health.get('status') != 'ok':
+            raise Blocked('Dave ADP health check failed')
         code, data = request('http://127.0.0.1:19100/.well-known/adp')
         identities = fixture_env(verify_nodes())
-        if code != 200 or data.get('pubkey') != identities['POLAR_DAVE_NOSTR_PUBKEY']:
+        if code != 200 or not isinstance(data, dict) or data.get('pubkey') != identities['POLAR_DAVE_NOSTR_PUBKEY']:
             raise Blocked('Dave independent ADP identity is not ready')
     elif name == 'adp':
         status, data = request('http://localhost:9099/health')
-        if status != 200 or not isinstance(data, dict):
+        if status != 200 or not isinstance(data, dict) or data.get('status') != 'ok':
             raise Blocked('ADP health check failed')
         status, data = request('http://localhost:9099/.well-known/adp')
         if status != 200 or not isinstance(data, dict):
@@ -455,6 +649,15 @@ def start_arcadestr():
 
 
 def hub_status():
+    processes = run(['ps', '-eo', 'comm']).splitlines()
+    if not any(p.strip() == 'Alby Hub' for p in processes):
+        raise Blocked('Alby Hub process not running; open and unlock the existing profile')
+    if not listening(21420):
+        raise Blocked('Alby Hub process running but local instance listener is not reachable')
+    print('INFO Alby Hub: process and instance listener reachable; not a wallet health check')
+
+
+def verify_hub_app():
     path = HOME / '.local/share/arcadestr-albyhub-regtest/nwc.db'
     if not path.exists():
         raise Blocked('existing Alby Hub database not found')
@@ -467,13 +670,7 @@ def hub_status():
         if not any(scope == 'pay_invoice' and (expiry is None or str(expiry) > time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime()))
                    for scope, expiry in permissions):
             raise Blocked('existing NWC pay permission missing or expired')
-    processes = run(['ps', '-eo', 'comm']).splitlines()
-    if not any(p.strip() == 'Alby Hub' for p in processes):
-        raise Blocked('Alby Hub is not running; open and unlock the existing profile')
-    print('OK Alby Hub: process and existing buyer app/permission found; live NWC not yet verified')
-
-
-def verify_nwc():
+def verify_nwc(*, local_only=False):
     path = HOME / '.local/share/arcadestr/accounts.db'
     if not path.exists():
         raise Blocked('existing Arcadestr account database unavailable')
@@ -485,6 +682,11 @@ def verify_nwc():
         raise Blocked('existing buyer account is ambiguous; no identity selected')
     env = os.environ.copy()
     env['ARCADESTR_REGTEST_BUYER_PUBKEY'] = accounts[0][0]
+    # The existing debug helper validates that the saved relays are local
+    # before selecting this explicitly local transport.
+    if local_only:
+        env['ARCADESTR_REGTEST_ALLOW_LOOPBACK_HTTP'] = 'true'
+        env['ARCADESTR_REGTEST_NWC_RELAY_PROXY'] = 'ws://127.0.0.1:7778'
     binary = ROOT / 'target/debug/examples/regtest_nwc'
     if not binary.exists():
         raise Blocked('build the local regtest_nwc example with --features native first')
@@ -504,7 +706,16 @@ def verify_nwc():
             'wallet_rejected_request':'existing wallet rejected the read-only verification',
         }
         raise Blocked('NWC: ' + reasons.get(data.get('reason'), 'invalid connection/response; inspect existing setup'))
-    print('OK existing buyer NWC: live read-only verification')
+    print('OK existing buyer NWC: live non-spending verification')
+
+
+def nwc_diagnostic(_args):
+    verify_bitcoin()
+    node_rpc()
+    hub_status()
+    verify_hub_app()
+    print('INFO NWC diagnostic sends an encrypted get_info request to the local relay; no payment')
+    verify_nwc(local_only=True)
 
 
 def build(adp):
@@ -528,23 +739,8 @@ def build(adp):
 def up(args):
     cfg = settings()
     run(['docker', 'info', '--format', '{{.ServerVersion}}'])
-    # docker start cannot recreate containers, volumes, wallets or identities.
-    for node in ('backend1', *NODES):
-        name = 'polar-n1-' + node
-        running = run(['docker', 'inspect', '--format', '{{.State.Running}}', name]).strip()
-        if running != 'true':
-            run(['docker', 'start', name], timeout=120)
-    deadline = time.monotonic() + 90
-    while True:
-        try:
-            verify_bitcoin()
-            infos = verify_nodes()
-            break
-        except Blocked:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(2)
-    print('OK Polar: existing Bitcoin Core and four funded LND nodes ready on regtest')
+    infos = recover_polar()
+    print('OK Polar: Bitcoin regtest RPC, Lightning sync, expected peers and channels ready')
     adp = Path(cfg['adp_repo'])
     if not args.no_build:
         build(adp)
@@ -568,7 +764,9 @@ def up(args):
         config = json.loads((adp / 'adp-server/examples/polar_lnurl_fixture/config.example.json').read_text())
         for recipient in config['recipients'].values():
             recipient['max_sendable_msat'] = 10_000_000
-        save(STATE / 'fixture.json', config)
+        fixture = STATE / 'fixture.json'
+        if not fixture.exists() or json.loads(fixture.read_text()) != config:
+            save(fixture, config)
         start('lnurl', [adp / 'target/debug/examples/polar_lnurl_fixture', STATE / 'fixture.json'], adp, env)
     except (Blocked, OSError) as exc:
         failures.append(str(exc))
@@ -583,7 +781,6 @@ def up(args):
     try:
         start_alby()
         hub_status()
-        verify_nwc()
     except Blocked as exc:
         failures.append(str(exc))
     if args.gui:
@@ -596,22 +793,38 @@ def up(args):
     return bool(failures)
 
 
+def polar_status():
+    for node in ('backend1', *NODES):
+        state = container_state(node)
+        print(f'INFO polar-n1-{node}: container {state}')
+    tip = verify_bitcoin()
+    print(f'PASS Bitcoin Core RPC: regtest height {tip["blocks"]}')
+    infos = node_rpc()
+    print('PASS LND RPC: four expected regtest identities')
+    require_sync(infos, tip)
+    print('PASS LND chain synchronization')
+    require_peers()
+    print('PASS Lightning peer connectivity')
+    channels = expected_channels()
+    require_active(channels)
+    print(f'PASS Lightning channels: {sum(map(len, channels.values())) // 2} active funded channels')
+
+
 def status(_args):
     failures = []
+    cfg = settings()
     checks = [('Docker', lambda: run(['docker', 'info', '--format', '{{.ServerVersion}}'])),
-              ('Bitcoin regtest', verify_bitcoin), ('LND regtest/liquidity', verify_nodes)]
-    polar_gui = 'polar' in run(['ps', '-eo', 'comm']).splitlines()
-    print('INFO Polar GUI:', 'running' if polar_gui else 'not running (not required for existing containers)')
+              ('Polar readiness', polar_status)]
     checks += [(name, lambda n=name: probe(n)) for name in PORTS
                if (name != 'frontend' or _args.gui) and
-               (name != 'adp-dave' or Path(settings().get('dave_adp_env',str(CONFIG/'dave-adp.env'))).exists())]
+               (name != 'adp-dave' or Path(cfg.get('dave_adp_env', str(CONFIG / 'dave-adp.env'))).exists())]
     checks.append(('Alby Hub', hub_status))
-    checks.append(('existing buyer NWC', verify_nwc))
+    print('INFO Alby wallet reachability not tested; use nwc-diagnostic to send a local encrypted request')
     for name, check in checks:
         try:
             check()
             print('PASS', name)
-        except (Blocked, OSError, ValueError, KeyError) as exc:
+        except (Blocked, OSError, ValueError, KeyError, TypeError, IndexError) as exc:
             print('FAIL', name, str(exc) if isinstance(exc, Blocked) else 'probe failed')
             failures.append(name)
     return bool(failures)
@@ -1228,7 +1441,6 @@ def test(args):
 
 def main():
     os.umask(0o077)
-    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('up')
@@ -1236,6 +1448,7 @@ def main():
     p.add_argument('--gui', action='store_true')
     p = sub.add_parser('status')
     p.add_argument('--gui', action='store_true', help='also require frontend readiness')
+    sub.add_parser('nwc-diagnostic', help='send encrypted local get_info traffic (no payment)')
     sub.add_parser('down')
     p = sub.add_parser('test')
     p.add_argument('--source', action='store_true', help='also run existing source regression suites')
@@ -1255,6 +1468,13 @@ def main():
     p.add_argument('--wallet-smoke', action='store_true', help='separate six wallet-only 100-sat transfers; NOT ADP purchases')
     p.add_argument('--gui', action='store_true', help='also require frontend readiness')
     args = parser.parse_args()
+    if args.command == 'status':
+        try:
+            return int(status(args))
+        except (Blocked, OSError, ValueError, KeyError, TypeError):
+            print('FAIL could not read local supervisor configuration')
+            return 1
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     with open(STATE / 'lock', 'a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1262,7 +1482,7 @@ def main():
             print('BLOCKED another regtest command is running')
             return 1
         try:
-            return int(bool(globals()[args.command](args)))
+            return int(bool(globals()[args.command.replace('-', '_')](args)))
         except (Blocked, OSError, ValueError, KeyError) as exc:
             print('BLOCKED', str(exc) if isinstance(exc, Blocked) else 'configuration/system error; inspect local settings')
             return 1
