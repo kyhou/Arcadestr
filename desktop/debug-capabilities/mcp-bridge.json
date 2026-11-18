@@ -1,0 +1,6 @@
+{
+  "identifier": "debug-mcp-bridge",
+  "description": "Debug-only UI automation bridge; added at runtime by debug builds and never compiled into release ACLs.",
+  "windows": ["main"],
+  "permissions": ["mcp-bridge:default"]
+}

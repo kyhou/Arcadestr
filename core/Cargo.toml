@@ -64,6 +64,13 @@ web-sys = { version = "0.3", features = ["Window", "console"] }
 default = []
 native = []
 wasm = []
+# Debug-only, regtest-only payment test activation (see payment_boundary).
+# Never enabled by default; release builds refuse to compile with either.
+regtest-buyer-payments = []
+regtest-refund-payments = []
+production-buyer-payments = []
+production-refund-payments = []
+production-reported-fees = ["production-buyer-payments"]
 
 [[example]]
 name = "regtest_nwc"

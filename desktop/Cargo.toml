@@ -58,3 +58,10 @@ tauri-build = { version = "2", features = [] }
 
 [features]
 default = []
+custom-protocol = ["tauri/custom-protocol"]
+regtest-buyer-payments = ["arcadestr-core/regtest-buyer-payments"]
+regtest-refund-payments = ["arcadestr-core/regtest-refund-payments"]
+production-buyer-payments = ["arcadestr-core/production-buyer-payments"]
+production-refund-payments = ["arcadestr-core/production-refund-payments"]
+production-reported-fees = ["production-buyer-payments", "arcadestr-core/production-reported-fees"]
+regtest-carol-only = ["regtest-buyer-payments"]

@@ -2,6 +2,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(all(feature = "regtest-carol-only", feature = "regtest-refund-payments"))]
+compile_error!("Carol-only buyer builds cannot enable desktop refund dispatch");
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::future::Future;
@@ -221,6 +224,23 @@ fn parse_debug_relay_cli_args(args: Vec<String>) -> Result<DebugRelayCliOptions,
     Ok(options)
 }
 
+/// Loopback address for the debug automation bridge.
+const MCP_BRIDGE_LOOPBACK: &str = "127.0.0.1";
+/// Environment variable that opts the debug bridge into remote access.
+const MCP_BRIDGE_REMOTE_ENV: &str = "ARCADESTR_MCP_BRIDGE_REMOTE";
+/// The only value that enables remote access; anything else stays on loopback.
+const MCP_BRIDGE_REMOTE_OPT_IN: &str = "allow-all-interfaces";
+
+/// Bind address for the debug automation bridge (debug builds only).
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+fn mcp_bridge_bind_address(remote_opt_in: Option<&str>) -> &'static str {
+    if remote_opt_in == Some(MCP_BRIDGE_REMOTE_OPT_IN) {
+        "0.0.0.0"
+    } else {
+        MCP_BRIDGE_LOOPBACK
+    }
+}
+
 fn parse_debug_relay_env(
     relays: Option<String>,
     block_discovery: Option<String>,
@@ -333,6 +353,43 @@ fn build_startup_relay_config(
     };
 
     (relay_config, startup_relays)
+}
+
+/// Creates `path` if needed and restricts it to its owner (Unix `0700`).
+/// Existing directories created by earlier builds are tightened as well.
+fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(std::io::Error::other(
+                "data directory must not be a symbolic link",
+            ));
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod private_dir_tests {
+    #[test]
+    fn data_directories_are_owner_only_including_existing_ones() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("temp");
+        let dir = temp.path().join("arcadestr");
+        std::fs::create_dir(&dir).expect("legacy dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        super::ensure_private_dir(&dir).expect("restrict");
+        assert_eq!(
+            std::fs::metadata(&dir).expect("meta").permissions().mode() & 0o777,
+            0o700
+        );
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).expect("symlink");
+        assert!(super::ensure_private_dir(&link).is_err());
+    }
 }
 
 fn settings_file_path() -> std::path::PathBuf {
@@ -6044,6 +6101,71 @@ mod task4_tests {
 }
 
 #[cfg(test)]
+mod mcp_bridge_exposure_tests {
+    #[test]
+    fn release_capabilities_never_grant_the_debug_bridge() {
+        let shipped = include_str!("../capabilities/default.json");
+        assert!(!shipped.contains("mcp-bridge"));
+        let source = include_str!("main.rs");
+        let added = source
+            .find("app.add_capability(include_str!(\"../debug-capabilities/mcp-bridge.json\"))")
+            .expect("debug capability is added at runtime");
+        assert!(source[..added]
+            .trim_end()
+            .ends_with("#[cfg(debug_assertions)]"));
+    }
+
+    use super::*;
+
+    #[test]
+    fn bridge_binds_loopback_unless_remote_access_is_explicitly_opted_in() {
+        assert_eq!(mcp_bridge_bind_address(None), "127.0.0.1");
+        for value in ["", "1", "true", "yes", "0.0.0.0", "ALLOW-ALL-INTERFACES"] {
+            assert_eq!(
+                mcp_bridge_bind_address(Some(value)),
+                "127.0.0.1",
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            mcp_bridge_bind_address(Some(MCP_BRIDGE_REMOTE_OPT_IN)),
+            "0.0.0.0"
+        );
+    }
+
+    #[test]
+    fn bridge_is_registered_only_in_debug_builds_and_never_with_default_config() {
+        let source = include_str!("main.rs");
+        // Built from pieces so the needle never matches this test's own text.
+        let needle = [
+            "builder = builder.plugin(",
+            "tauri_plugin_mcp_bridge::init_with_config(",
+        ]
+        .concat();
+        let registration = source.find(&needle).expect("bridge registration");
+        let guard = source[..registration]
+            .rfind("#[cfg(debug_assertions)]")
+            .expect("debug guard");
+        // The guard directly precedes the registration block.
+        assert!(
+            registration - guard < 900,
+            "registration must stay debug-only"
+        );
+        // The plugin's default config listens on all interfaces.
+        let default_init = ["tauri_plugin_mcp_bridge::", "init()"].concat();
+        assert!(!source.contains(&default_init));
+    }
+
+    #[test]
+    fn listener_on_loopback_is_not_reachable_from_other_interfaces() {
+        let listener =
+            std::net::TcpListener::bind((mcp_bridge_bind_address(None), 0)).expect("bind loopback");
+        let address = listener.local_addr().expect("address");
+        assert!(address.ip().is_loopback());
+    }
+}
+
+#[cfg(test)]
 mod debug_relay_config_tests {
     use super::*;
 
@@ -6443,9 +6565,10 @@ fn main() {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("arcadestr");
 
-    // Create directory if it doesn't exist
-    if let Err(e) = std::fs::create_dir_all(&keys_dir) {
-        eprintln!("Warning: Could not create keys directory: {}", e);
+    // Create directory if it doesn't exist. Purchase, receipt and account
+    // state lives here, so it is private to the owner even under a shared home.
+    if let Err(e) = ensure_private_dir(&keys_dir) {
+        eprintln!("Warning: Could not create private data directory: {}", e);
     }
 
     // Set the keys directory for the signer module
@@ -7776,9 +7899,22 @@ fn main() {
 
     let mut builder = tauri::Builder::default();
 
+    // Debug-only UI automation bridge. It can execute script in the webview and
+    // invoke IPC, so it listens on loopback only unless remote access is
+    // explicitly opted into for a separately authorized setup.
     #[cfg(debug_assertions)]
     {
-        builder = builder.plugin(tauri_plugin_mcp_bridge::init());
+        let remote = std::env::var(MCP_BRIDGE_REMOTE_ENV).ok();
+        let bind = mcp_bridge_bind_address(remote.as_deref());
+        if bind != MCP_BRIDGE_LOOPBACK {
+            warn!(
+                "Debug automation bridge exposed on all interfaces ({}={})",
+                MCP_BRIDGE_REMOTE_ENV, MCP_BRIDGE_REMOTE_OPT_IN
+            );
+        }
+        builder = builder.plugin(tauri_plugin_mcp_bridge::init_with_config(
+            tauri_plugin_mcp_bridge::Config::new(bind),
+        ));
     }
 
     builder
@@ -7810,6 +7946,8 @@ fn main() {
         .manage(blossom_state)
         .manage(Arc::new(account_manager))
         .setup(move |app| {
+            #[cfg(debug_assertions)]
+            app.add_capability(include_str!("../debug-capabilities/mcp-bridge.json"))?;
             settlement_ui::spawn_startup_recovery(app.handle().clone());
             // Recovery completes synchronously before the first window is shown,
             // so stale installing rows cannot be presented to the frontend.
@@ -7817,6 +7955,9 @@ fn main() {
                 .path()
                 .app_local_data_dir()
                 .map_err(|error| std::io::Error::other(format!("failed to resolve app data directory: {error}")))?;
+            if let Err(error) = ensure_private_dir(&recovery_app_data) {
+                warn!(%error, "could not restrict the application data directory");
+            }
             let recovery_repository = InstallationsRepository::new(
                 app.state::<AppState>().database.pool().clone(),
             );

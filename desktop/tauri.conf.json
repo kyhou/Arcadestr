@@ -28,7 +28,22 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self' 'wasm-unsafe-eval'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' https: data: blob:",
+        "media-src": "'self' https: blob:",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "frame-src": "'none'",
+        "form-action": "'none'"
+      },
+      "dangerousDisableAssetCspModification": [
+        "style-src"
+      ]
     }
   },
   "bundle": {
@@ -37,6 +52,19 @@
     "icon": [
       "icons/icon.png",
       "icons/icon.ico"
-    ]
+    ],
+    "publisher": "Arcadestr Team",
+    "category": "Game",
+    "shortDescription": "Decentralized indie game marketplace on Nostr",
+    "longDescription": "Arcadestr is a desktop marketplace for discovering, purchasing with Lightning, installing and publishing indie games over Nostr and ADP.",
+    "linux": {
+      "deb": {
+        "depends": [
+          "libc6 (>= 2.39)",
+          "libsecret-1-0",
+          "libssl3t64 | libssl3"
+        ]
+      }
+    }
   }
 }

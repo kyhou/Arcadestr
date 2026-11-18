@@ -5,22 +5,27 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
+/// Reads `window.__TAURI__.<api>` without evaluating JavaScript source, so the
+/// WebView can run under a Content Security Policy without `unsafe-eval`.
+fn tauri_api(api: &str) -> Option<JsValue> {
+    let window = web_sys::window()?;
+    let tauri = js_sys::Reflect::get(&window, &JsValue::from_str("__TAURI__")).ok()?;
+    if tauri.is_undefined() || tauri.is_null() {
+        return None;
+    }
+    js_sys::Reflect::get(&tauri, &JsValue::from_str(api))
+        .ok()
+        .filter(|value| !value.is_undefined() && !value.is_null())
+}
+
 /// Check if Tauri is available
 fn is_tauri_available() -> bool {
-    js_sys::eval(
-        "typeof window.__TAURI__ !== 'undefined' && typeof window.__TAURI__.core !== 'undefined'",
-    )
-    .map(|v| v.as_bool().unwrap_or(false))
-    .unwrap_or(false)
+    tauri_api("core").is_some()
 }
 
 /// Check if Tauri event API is available
 fn is_tauri_event_available() -> bool {
-    js_sys::eval(
-        "typeof window.__TAURI__ !== 'undefined' && typeof window.__TAURI__.event !== 'undefined'",
-    )
-    .map(|v| v.as_bool().unwrap_or(false))
-    .unwrap_or(false)
+    tauri_api("event").is_some()
 }
 
 /// Listen for a Tauri event
@@ -369,27 +374,31 @@ pub async fn invoke_void(command: &str, args: serde_json::Value) -> Result<(), S
     Ok(())
 }
 
-// Helper to get window and call __TAURI__.core.invoke
+// Calls `window.__TAURI__.core.invoke(command, args)` directly. Arguments are
+// passed as a parsed JSON value, never interpolated into script source.
 fn tauri_invoke(command: &str, args: serde_json::Value) -> Result<js_sys::Promise, String> {
-    // This uses JavaScript to access window.__TAURI__.core.invoke
-    let js_code = format!(
-        "window.__TAURI__.core.invoke('{}', {})",
-        command,
-        args.to_string()
-    );
-
-    js_sys::eval(&js_code)
-        .map(|v| v.unchecked_into::<js_sys::Promise>())
-        .map_err(|e| {
-            if command == "connect_nwc_wallet" {
-                // An eval exception can include source text containing the submitted URI.
-                "Failed to submit NWC credentials to the desktop backend.".to_string()
-            } else if receipt_private_command(command) {
-                "Failed to submit receipt evidence to the desktop backend.".to_string()
-            } else {
-                format!("Failed to invoke Tauri command: {:?}", e)
-            }
-        })
+    let failure = |e: JsValue| {
+        if command == "connect_nwc_wallet" {
+            // Never echo values derived from the submitted connection URI.
+            "Failed to submit NWC credentials to the desktop backend.".to_string()
+        } else if receipt_private_command(command) {
+            "Failed to submit receipt evidence to the desktop backend.".to_string()
+        } else {
+            format!("Failed to invoke Tauri command: {:?}", e)
+        }
+    };
+    let core = tauri_api("core")
+        .ok_or_else(|| failure(JsValue::from_str("Tauri core API unavailable")))?;
+    let invoke = js_sys::Reflect::get(&core, &JsValue::from_str("invoke"))
+        .map_err(failure)?
+        .dyn_into::<js_sys::Function>()
+        .map_err(failure)?;
+    let args = js_sys::JSON::parse(&args.to_string()).map_err(failure)?;
+    invoke
+        .call2(&core, &JsValue::from_str(command), &args)
+        .map_err(failure)?
+        .dyn_into::<js_sys::Promise>()
+        .map_err(failure)
 }
 
 #[cfg(test)]

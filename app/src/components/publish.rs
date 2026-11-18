@@ -51,10 +51,14 @@ use crate::{AuthContext, GameListing};
 
 use super::date_time_picker::DateTimeRangePicker;
 
-const DEFAULT_ADP_SERVER_URL: &str = match option_env!("ARCADESTR_DEFAULT_ADP_SERVER_URL") {
-    Some(url) => url,
-    None => "http://localhost:9099",
-};
+/// Distribution provider pre-filled for new publications. Only a build that
+/// explicitly configures one gets a default; otherwise the publisher must
+/// choose a provider, so no build silently targets a local development server.
+const DEFAULT_ADP_SERVER_URL: Option<&str> = option_env!("ARCADESTR_DEFAULT_ADP_SERVER_URL");
+
+fn configured_default_provider(configured: Option<&'static str>) -> Option<&'static str> {
+    configured.map(str::trim).filter(|url| !url.is_empty())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServerEntry {
@@ -1383,11 +1387,11 @@ fn published_listing(
     }
 }
 
-fn initial_operator_url(editing_delegated_listing: bool) -> String {
+fn initial_operator_url(editing_delegated_listing: bool, default: Option<&str>) -> String {
     if editing_delegated_listing {
         String::new()
     } else {
-        DEFAULT_ADP_SERVER_URL.to_string()
+        default.unwrap_or_default().to_string()
     }
 }
 
@@ -1913,7 +1917,10 @@ mod tests {
             listing_fulfillment_pubkey(&listing),
             Some(delegate.public_key().to_hex())
         );
-        assert_eq!(initial_operator_url(true), "");
+        assert_eq!(
+            initial_operator_url(true, Some("https://provider.example")),
+            ""
+        );
 
         let request = operator_resolution_request(&listing)
             .expect("delegated edit should request an exact local operator lookup");
@@ -1924,8 +1931,19 @@ mod tests {
 
     #[test]
     fn new_publications_use_the_configured_distribution_provider() {
-        assert_eq!(initial_operator_url(false), DEFAULT_ADP_SERVER_URL);
-        assert!(is_http_url(DEFAULT_ADP_SERVER_URL));
+        let configured = configured_default_provider(Some(" https://provider.example "));
+        assert_eq!(configured, Some("https://provider.example"));
+        assert_eq!(
+            initial_operator_url(false, configured),
+            "https://provider.example"
+        );
+    }
+
+    #[test]
+    fn unconfigured_builds_require_an_explicit_distribution_provider() {
+        assert_eq!(configured_default_provider(None), None);
+        assert_eq!(configured_default_provider(Some("  ")), None);
+        assert_eq!(initial_operator_url(false, None), "");
     }
 
     #[test]
@@ -3058,14 +3076,18 @@ pub fn PublishView(
     );
     let discovered_servers = RwSignal::new(Vec::<AdpServerAnnouncement>::new());
     let discovery_error = RwSignal::new(None::<String>);
+    let default_provider = configured_default_provider(DEFAULT_ADP_SERVER_URL);
     let initial_servers = if use_default_provider {
-        vec![ServerEntry {
-            url: DEFAULT_ADP_SERVER_URL.to_string(),
-            label: "Arcadestr distribution provider".into(),
-            reachability: ServerStatus::Pending,
-            upload: ServerStatus::Idle,
-            auto_operator: true,
-        }]
+        default_provider
+            .map(|url| ServerEntry {
+                url: url.to_string(),
+                label: "Arcadestr distribution provider".into(),
+                reachability: ServerStatus::Pending,
+                upload: ServerStatus::Idle,
+                auto_operator: true,
+            })
+            .into_iter()
+            .collect()
     } else {
         published_servers
             .iter()
@@ -3084,7 +3106,7 @@ pub fn PublishView(
         .collect::<Vec<_>>();
     let servers = RwSignal::new(initial_servers);
     let custom_server = RwSignal::new(String::new());
-    let initial_operator_url = initial_operator_url(editing_delegated_listing);
+    let initial_operator_url = initial_operator_url(editing_delegated_listing, default_provider);
     let operator_url = RwSignal::new(initial_operator_url.clone());
     let server_roles =
         RwSignal::new(Vec::<arcadestr_core::publisher_management::ServerRoleIntent>::new());
@@ -3097,7 +3119,9 @@ pub fn PublishView(
         role_auth.npub.track();
         authorize_operators.set(false);
     });
-    let operator_auto_added = RwSignal::new(use_default_provider.then_some(initial_operator_url));
+    let operator_auto_added = RwSignal::new(
+        (use_default_provider && !initial_operator_url.is_empty()).then_some(initial_operator_url),
+    );
     let file_hash = RwSignal::new(existing_file_hash);
     let version = RwSignal::new(
         listing
@@ -5394,7 +5418,10 @@ pub fn PublishView(
                                     </span>
                                     <span class="v2-create-help">"Recommended. The provider manages fulfillment authorization and build distribution for this game."</span>
                                     <Show when=move || fulfillment_mode.get() == FulfillmentMode::Delegate>
-                                        <span class="v2-create-mono-value">{move || operator_url.get()}</span>
+                                        <span class="v2-create-mono-value">{move || {
+                                            let url = operator_url.get();
+                                            if url.trim().is_empty() { "No provider selected. Choose one under Advanced distribution options.".to_string() } else { url }
+                                        }}</span>
                                         <Show when=move || operator_auto_added.get().is_some()>
                                             <span class="v2-create-help">"This provider is also included as a distribution server."</span>
                                         </Show>
