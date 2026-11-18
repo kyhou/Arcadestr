@@ -3297,6 +3297,15 @@ mod tests {
     }
 
     #[test]
+    fn only_a_payable_split_quote_is_resumed() {
+        assert!(should_resume_split_quote(Some(1_000), 999));
+        assert!(!should_resume_split_quote(Some(1_000), 1_000));
+        assert!(!should_resume_split_quote(Some(1_000), 5_000));
+        // Plan not loaded yet: keep the existing quote; never create a new one blindly.
+        assert!(should_resume_split_quote(None, 5_000));
+    }
+
+    #[test]
     fn archive_policy_failure_is_not_presented_as_transient() {
         let failure = install_failure_presentation(
             "archive_policy: package extraction failed at /private/game.zip: mismatch unsupported auth hash",
@@ -3308,6 +3317,16 @@ mod tests {
         let transient = install_failure_presentation("download HTTP request failed: timeout");
         assert_eq!(transient.title, "Installation could not finish");
         assert!(transient.retryable);
+    }
+
+    #[test]
+    fn interrupted_transfer_is_not_presented_as_an_authorization_failure() {
+        // Exact desktop text for a dropped or truncated download transfer.
+        let failure = install_failure_presentation(
+            "download HTTP request failed: HTTP request failed: download transfer failed or the source was unreachable; details omitted",
+        );
+        assert_eq!(failure.title, "Installation could not finish");
+        assert!(failure.retryable);
     }
 
     #[test]
@@ -3369,15 +3388,6 @@ mod tests {
             "event-1",
             &presentation,
         ));
-    }
-
-    #[test]
-    fn only_a_payable_split_quote_is_resumed() {
-        assert!(should_resume_split_quote(Some(1_000), 999));
-        assert!(!should_resume_split_quote(Some(1_000), 1_000));
-        assert!(!should_resume_split_quote(Some(1_000), 5_000));
-        // Plan not loaded yet: keep the existing quote; never create a new one blindly.
-        assert!(should_resume_split_quote(None, 5_000));
     }
 
     #[test]

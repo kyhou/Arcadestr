@@ -1486,6 +1486,14 @@ async fn remove_failed_installation_owned(
         managed_installations,
         &current.installation.installation_root,
     )?;
+    let staging_lock = operation_lock.clone();
+    tokio::task::spawn_blocking(move || {
+        staging_lock.cleanup_staging()?;
+        staging_lock.require_no_remaining_staging()
+    })
+    .await
+    .map_err(|error| format!("staging cleanup task failed: {error}"))?
+    .map_err(|error| format!("staging cleanup deferred: {error}"))?;
     match current.installation.recovery_discriminator {
         Some(InstallationRecoveryDiscriminator::FinalRootPresent) => {
             let removal_lock = operation_lock.clone();

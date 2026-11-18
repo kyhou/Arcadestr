@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -38,11 +38,18 @@ struct PlacedTree {
     operation_lock: OperationLock,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagingCheckpoint {
+    name: String,
+    identity: (u64, u64),
+}
+
 /// Owned lease serializing installation operations for one final root.
 #[derive(Debug, Clone)]
 pub(crate) struct OperationLock {
     final_root: PathBuf,
-    _file: Arc<File>,
+    file: Arc<File>,
     managed_directory: Arc<cap_std::fs::Dir>,
 }
 
@@ -136,6 +143,8 @@ pub(crate) struct RecoveryReport {
     pub busy: usize,
     pub deferred_errors: usize,
     pub changed: usize,
+    pub staging_removed: usize,
+    pub staging_remaining: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,31 +197,11 @@ pub(crate) fn extract_and_place_verified_package(
     let managed_directory = operation_lock.managed_directory.clone();
     ensure_final_root_absent_in(&managed_directory, final_name, final_root)?;
 
-    let staging_root = reserve_staging_path(&managed_directory, parent, final_name)?;
+    let (staging_root, staging_directory) =
+        operation_lock.create_tracked_staging(parent, final_name)?;
     let staging_name = staging_root
         .file_name()
         .ok_or_else(|| InstallationPlacementError::InvalidFinalRoot(staging_root.clone()))?;
-    managed_directory
-        .create_dir(staging_name)
-        .map_err(|source| {
-            placement_io("creating installation staging root", &staging_root, source)
-        })?;
-    let staging_directory = match open_managed_child_directory_no_follow(
-        &managed_directory,
-        staging_name,
-        &staging_root,
-    ) {
-        Ok(directory) => directory,
-        Err(error) => {
-            cleanup_staging_after_error(
-                &managed_directory,
-                &staging_root,
-                error.to_string(),
-                error.is_insufficient_storage(),
-            )?;
-            return Err(error);
-        }
-    };
 
     let capability_extraction = match extract_verified_package_into_capability(
         package,
@@ -312,6 +301,9 @@ pub(crate) fn extract_and_place_verified_package(
         ));
     }
 
+    if let Err(error) = operation_lock.clear_staging_checkpoint() {
+        tracing::warn!(%error, "staging checkpoint retirement deferred after promotion");
+    }
     Ok(PlacedInstallation {
         root: final_root.to_owned(),
         extraction,
@@ -479,7 +471,9 @@ pub(crate) async fn recover_updates(
                 // The stable root lock also excludes legacy recovery/uninstall.
                 let lock = OperationLock::acquire_existing_for_recovery(&root)
                     .map_err(|error| error.to_string())?;
-                cleanup_owned_staging_roots(&root, &lock).map_err(|error| error.to_string())?;
+                lock.cleanup_staging().map_err(|error| error.to_string())?;
+                lock.require_no_remaining_staging()
+                    .map_err(|error| error.to_string())?;
                 lock.remove_root_no_follow()
                     .map_err(|error| error.to_string())?;
                 if let Some(path) = package {
@@ -507,29 +501,6 @@ pub(crate) async fn recover_updates(
         }
     }
     first_error.map_or(Ok(()), Err)
-}
-
-fn cleanup_owned_staging_roots(root: &Path, lock: &OperationLock) -> Result<(), std::io::Error> {
-    lock.require_root(root).map_err(std::io::Error::other)?;
-    let name = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| std::io::Error::other("invalid update root"))?;
-    let prefix = format!(".{name}.");
-    for entry in lock.managed_directory.entries()? {
-        let entry = entry?;
-        let filename = entry.file_name();
-        if let Some(suffix) = filename
-            .to_str()
-            .and_then(|name| name.strip_prefix(&prefix))
-            .and_then(|name| name.strip_suffix(".tmp"))
-        {
-            if Uuid::parse_str(suffix).is_ok() {
-                remove_managed_child_no_follow(&lock.managed_directory, &filename)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn manifests_match(
@@ -905,6 +876,162 @@ fn remove_managed_child_no_follow(
 }
 
 impl OperationLock {
+    #[cfg(test)]
+    pub(crate) fn create_partial_staging_for_test(&self) -> PathBuf {
+        let (parent, name) = validated_final_root(&self.final_root).expect("fixture root");
+        let (path, dir) = self.create_tracked_staging(parent, name).expect("staging");
+        dir.create("partial")
+            .expect("partial")
+            .write_all(b"partial extraction")
+            .expect("partial bytes");
+        path
+    }
+
+    fn create_tracked_staging(
+        &self,
+        parent: &Path,
+        final_name: &str,
+    ) -> Result<(PathBuf, cap_std::fs::Dir), InstallationPlacementError> {
+        let managed = &self.managed_directory;
+        let path = reserve_staging_path(managed, parent, final_name)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| InstallationPlacementError::InvalidFinalRoot(path.clone()))?;
+        managed
+            .create_dir(name)
+            .map_err(|source| placement_io("creating installation staging root", &path, source))?;
+        let result =
+            open_managed_child_directory_no_follow(managed, name, &path).and_then(|directory| {
+                self.record_staging(name, &directory).map_err(|source| {
+                    placement_io("recording installation staging", &path, source)
+                })?;
+                Ok(directory)
+            });
+        match result {
+            Ok(directory) => Ok((path, directory)),
+            Err(error) => {
+                cleanup_staging_after_error(
+                    managed,
+                    &path,
+                    error.to_string(),
+                    error.is_insufficient_storage(),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn staging_name_matches(&self, name: &str) -> bool {
+        self.final_root
+            .file_name()
+            .and_then(|root| root.to_str())
+            .and_then(|root| name.strip_prefix(&format!(".{root}.")))
+            .and_then(|suffix| suffix.strip_suffix(".tmp"))
+            .is_some_and(|id| Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id))
+    }
+
+    fn record_staging(
+        &self,
+        name: &std::ffi::OsStr,
+        directory: &cap_std::fs::Dir,
+    ) -> std::io::Result<()> {
+        let name = name
+            .to_str()
+            .filter(|name| self.staging_name_matches(name))
+            .ok_or_else(|| std::io::Error::other("invalid staging name"))?;
+        let mut file = self.file.as_ref();
+        if file.metadata()?.len() != 0 {
+            return Err(std::io::Error::other(
+                "previous staging checkpoint must be recovered first",
+            ));
+        }
+        let checkpoint = StagingCheckpoint {
+            name: name.to_owned(),
+            identity: file_identity(&directory.try_clone()?.into_std_file())?,
+        };
+        file.rewind()?;
+        serde_json::to_writer(&mut file, &checkpoint)?;
+        file.sync_all()
+    }
+
+    /// Only the exact directory recorded before extraction is eligible.
+    /// A corrupt checkpoint, changed object or I/O error leaves evidence intact.
+    pub(crate) fn cleanup_staging(&self) -> std::io::Result<bool> {
+        let mut file = self.file.as_ref();
+        file.rewind()?;
+        let mut bytes = Vec::new();
+        file.take(2049).read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        if bytes.len() > 2048 {
+            return Err(std::io::Error::other(
+                "oversized staging checkpoint; preserving it",
+            ));
+        }
+        let checkpoint: StagingCheckpoint = serde_json::from_slice(&bytes)?;
+        if !self.staging_name_matches(&checkpoint.name) {
+            return Err(std::io::Error::other(
+                "staging checkpoint does not name a managed staging child",
+            ));
+        }
+        let name = std::ffi::OsStr::new(&checkpoint.name);
+        let removed = match self.managed_directory.symlink_metadata(name) {
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
+            result => {
+                let metadata = result?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(std::io::Error::other(
+                        "staging checkpoint does not name a directory; preserving it",
+                    ));
+                }
+                let path = self.final_root.with_file_name(name);
+                let dir =
+                    open_managed_child_directory_no_follow(&self.managed_directory, name, &path)
+                        .map_err(std::io::Error::other)?;
+                if file_identity(&dir.try_clone()?.into_std_file())? != checkpoint.identity {
+                    return Err(std::io::Error::other(
+                        "staging directory was replaced; preserving it",
+                    ));
+                }
+                dir.remove_open_dir_all()?;
+                match self.managed_directory.symlink_metadata(name) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                    Ok(_) => {
+                        return Err(std::io::Error::other(
+                            "staging name changed during cleanup; preserving the replacement",
+                        ))
+                    }
+                }
+                true
+            }
+        };
+        self.clear_staging_checkpoint()?;
+        Ok(removed)
+    }
+
+    fn clear_staging_checkpoint(&self) -> std::io::Result<()> {
+        self.file.set_len(0)?;
+        self.file.sync_all()
+    }
+
+    pub(crate) fn require_no_remaining_staging(&self) -> std::io::Result<()> {
+        for entry in self.managed_directory.entries()? {
+            let name = entry?.file_name();
+            if name
+                .to_str()
+                .is_some_and(|name| self.staging_name_matches(name))
+            {
+                return Err(std::io::Error::other(format!(
+                    "untracked staging entry {}; preserving it and the recovery record",
+                    name.to_string_lossy()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn root_exists_no_follow(&self) -> Result<bool, std::io::Error> {
         let name = self
             .final_root
@@ -934,6 +1061,7 @@ impl OperationLock {
         let lock_name = operation_lock_name(final_name);
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true).write(true).create(true);
+        options._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
         #[cfg(unix)]
         {
             use cap_std::fs::OpenOptionsExt;
@@ -970,7 +1098,7 @@ impl OperationLock {
         ensure_final_root_absent_in(&managed_directory, final_name, final_root)?;
         Ok(Self {
             final_root: final_root.to_owned(),
-            _file: Arc::new(file),
+            file: Arc::new(file),
             managed_directory: Arc::new(managed_directory),
         })
     }
@@ -986,6 +1114,7 @@ impl OperationLock {
         let lock_path = operation_lock_path(parent, final_name);
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true).write(true);
+        options._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
         let file = managed_directory
             .open_with(operation_lock_name(final_name), &options)
             .map_err(|source| {
@@ -995,7 +1124,7 @@ impl OperationLock {
         match file.try_lock() {
             Ok(()) => Ok(Self {
                 final_root: final_root.to_owned(),
-                _file: Arc::new(file),
+                file: Arc::new(file),
                 managed_directory: Arc::new(managed_directory),
             }),
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -1136,8 +1265,8 @@ pub(crate) fn require_managed_direct_child(
     Ok(())
 }
 
-/// Conservatively resolves interrupted installing rows. Lock and inspection
-/// errors are deferred, and this routine never removes filesystem objects.
+/// Resolve interrupted rows and discard only their identity-checked staging
+/// trees. Never delete a final root or a retained archive here.
 pub(crate) async fn recover_interrupted_installations(
     repository: &InstallationsRepository,
     managed_installations: &Path,
@@ -1150,14 +1279,11 @@ pub(crate) async fn recover_interrupted_installations(
             report.deferred_errors += 1;
         }
     }
-    let snapshots = repository.list_installing().await?;
-    for snapshot in snapshots {
+    let records = repository.list_installation_recovery_records().await?;
+    for recorded in records {
         let _coordinate_guard = if let Some(app_data) = managed_installations.parent() {
-            match super::acquire_coordinate_lifecycle_lock(
-                app_data,
-                &snapshot.installation.game_coordinate,
-            )
-            .await
+            match super::acquire_coordinate_lifecycle_lock(app_data, &recorded.game_coordinate)
+                .await
             {
                 Ok(lock) => Some(lock),
                 Err(_) => {
@@ -1169,9 +1295,11 @@ pub(crate) async fn recover_interrupted_installations(
             None
         };
         report.examined += 1;
-        let recorded = snapshot.installation;
         if require_managed_direct_child(managed_installations, &recorded.installation_root).is_err()
         {
+            if recorded.state != InstallationState::Installing {
+                continue;
+            }
             match repository
                 .mark_failed_for_recovery_if_unchanged(
                     &recorded.id,
@@ -1192,7 +1320,7 @@ pub(crate) async fn recover_interrupted_installations(
             OperationLock::acquire_existing_for_recovery(&root)
         })
         .await;
-        let _lock = match lock_result {
+        let lock = match lock_result {
             Ok(Ok(lock)) => lock,
             Ok(Err(InstallationPlacementError::Busy(_))) => {
                 report.busy += 1;
@@ -1204,12 +1332,76 @@ pub(crate) async fn recover_interrupted_installations(
             }
         };
 
+        if repository
+            .get_by_id(&recorded.id)
+            .await?
+            .map(|row| row.installation)
+            != Some(recorded.clone())
+        {
+            report.changed += 1;
+            continue;
+        }
+        let staging_lock = lock.clone();
+        match tokio::task::spawn_blocking(move || staging_lock.cleanup_staging()).await {
+            Ok(Ok(true)) => report.staging_removed += 1,
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
+                report.deferred_errors += 1;
+                tracing::warn!(%error, installation = %recorded.id.as_str(), "staging cleanup deferred");
+            }
+            Err(error) => {
+                report.deferred_errors += 1;
+                tracing::warn!(%error, "staging cleanup task failed");
+            }
+        }
+        if recorded.state != InstallationState::Installing {
+            continue;
+        }
         match recover_locked_installation(repository, &recorded, updated_at).await? {
             RecoveryMarkOutcome::MarkedFailed => report.marked_failed += 1,
             RecoveryMarkOutcome::Changed => report.changed += 1,
         }
     }
+    // Diagnostic only: includes active and pre-checkpoint directories. Never
+    // infer ownership (or abandonment) from their names.
+    let managed = managed_installations.to_owned();
+    match tokio::task::spawn_blocking(move || remaining_staging_count(&managed)).await {
+        Ok(Ok(count)) => report.staging_remaining = count,
+        Ok(Err(error)) => {
+            report.deferred_errors += 1;
+            tracing::warn!(%error, "could not inspect remaining installation staging");
+        }
+        Err(error) => {
+            report.deferred_errors += 1;
+            tracing::warn!(%error, "staging inspection task failed");
+        }
+    }
     Ok(report)
+}
+
+fn remaining_staging_count(managed: &Path) -> std::io::Result<usize> {
+    let directory = match secure_managed_directory(managed, false) {
+        Ok(directory) => directory,
+        Err(InstallationPlacementError::Io { source, .. })
+            if source.kind() == ErrorKind::NotFound =>
+        {
+            return Ok(0)
+        }
+        Err(error) => return Err(std::io::Error::other(error)),
+    };
+    let mut count = 0;
+    for entry in directory.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with('.') && name.ends_with(".tmp"))
+        {
+            count += 1;
+            tracing::debug!(entry = %name.to_string_lossy(), "staging entry left in place");
+        }
+    }
+    Ok(count)
 }
 
 async fn recover_locked_installation(
@@ -1723,6 +1915,267 @@ mod tests {
             .expect("test database should open");
         let repository = InstallationsRepository::new(database.pool().clone());
         (temp, database, repository)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn d5_extraction_child() {
+        let Some(app_data) = std::env::var_os("ARCADESTR_D5_DISPOSABLE_TEST_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(app_data)
+            .join("installations")
+            .join("d5-game");
+        let _coordinate = operation_lock(
+            &root
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("lifecycle-locks")
+                .join(super::super::coordinate_artifact_dir_name(
+                    &std::env::var("ARCADESTR_D5_TEST_COORDINATE").unwrap(),
+                )),
+        );
+        let lock = operation_lock(&root);
+        let (parent, name) = validated_final_root(&root).unwrap();
+        let (_path, staging) = lock.create_tracked_staging(parent, name).unwrap();
+        staging
+            .create("partial.bin")
+            .unwrap()
+            .write_all(&vec![42; 7_200_000])
+            .unwrap();
+        println!("D5_PARTIAL_READY");
+        std::io::stdout().flush().unwrap();
+        // The parent kills this disposable test process while its extraction
+        // output is incomplete and both operation locks are live.
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn d5_sigkill_restart_cleans_only_checkpointed_staging_and_retry_works() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let (temp, database, repository) = test_repository().await;
+        let managed = temp.path().join("installations");
+        let root = managed.join("d5-game");
+        let package = verified_fixture("windows-nested.zip", PackageFormat::Zip);
+        let profiles = vec![launch_profile("play", "bin/Game.exe", "bin")];
+        let record = installing_record("d5-game", &root, &package, &profiles);
+        repository
+            .begin(&record, &initial_profiles(&profiles))
+            .await
+            .unwrap();
+        let mut child = Child(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "install::tests::d5_extraction_child",
+                    "--nocapture",
+                ])
+                .env("ARCADESTR_D5_DISPOSABLE_TEST_ROOT", temp.path())
+                .env("ARCADESTR_D5_TEST_COORDINATE", &record.game_coordinate)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ready = BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+                .any(|line| line == "D5_PARTIAL_READY");
+            let _ = ready_tx.send(ready);
+        });
+        assert!(ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap());
+        let staging = staging_directories(&managed).pop().unwrap();
+        assert_eq!(
+            std::fs::metadata(staging.join("partial.bin"))
+                .unwrap()
+                .len(),
+            7_200_000
+        );
+        let other_profile = TempDir::new().unwrap();
+        let other_managed = other_profile.path().join("installations");
+        let other_root = other_managed.join("d5-game");
+        let other_lock = operation_lock(&other_root);
+        let (other_path, _) = other_lock
+            .create_tracked_staging(&other_managed, "d5-game")
+            .unwrap();
+        let ambiguous = managed.join(format!(".another-installation.{}.tmp", Uuid::new_v4()));
+        std::fs::create_dir(&ambiguous).unwrap();
+        let downloads = temp.path().join("retained-packages");
+        std::fs::create_dir(&downloads).unwrap();
+        let download = create_managed_direct_child_file(
+            &secure_managed_directory(&downloads, false).unwrap(),
+            &downloads.join("download-in-progress"),
+        )
+        .unwrap();
+        download
+            .download_file()
+            .unwrap()
+            .write_all(b"partial download")
+            .unwrap();
+
+        let active = recover_interrupted_installations(&repository, &managed, 2)
+            .await
+            .unwrap();
+        assert_eq!(active.busy, 1);
+        assert!(staging.exists());
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        drop(repository);
+        database.pool().close().await;
+        let reopened = Database::new(&temp.path().join("state.db")).await.unwrap();
+        let repository = InstallationsRepository::new(reopened.pool().clone());
+        let recovered = recover_interrupted_installations(&repository, &managed, 3)
+            .await
+            .unwrap();
+        assert_eq!(recovered.staging_removed, 1);
+        assert_eq!(recovered.staging_remaining, 1);
+        assert_eq!(recovered.marked_failed, 1);
+        assert!(!staging.exists());
+        assert!(ambiguous.is_dir());
+        assert!(other_path.is_dir());
+        assert_eq!(
+            std::fs::read(downloads.join("download-in-progress")).unwrap(),
+            b"partial download"
+        );
+        assert_eq!(
+            recover_interrupted_installations(&repository, &managed, 4)
+                .await
+                .unwrap()
+                .staging_removed,
+            0
+        );
+        super::super::remove_failed_installation_owned(&repository, &managed, &record.id)
+            .await
+            .unwrap();
+        let mut retry = record;
+        retry.id = InstallationId::generate();
+        repository
+            .begin(&retry, &initial_profiles(&profiles))
+            .await
+            .unwrap();
+        let placed =
+            extract_and_place_verified_package(&package, &root, &profiles, operation_lock(&root))
+                .unwrap();
+        commit_placed_installation(&repository, &retry.id, placed, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get_by_id(&retry.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .installation
+                .state,
+            InstallationState::Ready
+        );
+        assert!(root.join("bin/Game.exe").is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn d5_failed_row_preserves_ambiguous_and_symlinked_staging_then_retries() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let (temp, _database, repository) = test_repository().await;
+        let managed = temp.path().join("installations");
+        let root = managed.join("d5-retry");
+        let package = verified_fixture("windows-nested.zip", PackageFormat::Zip);
+        let profiles = vec![launch_profile("play", "bin/Game.exe", "bin")];
+        let record = installing_record("d5-retry", &root, &package, &profiles);
+        repository
+            .begin(&record, &initial_profiles(&profiles))
+            .await
+            .unwrap();
+        let lock = operation_lock(&root);
+        let (stage, handle) = lock.create_tracked_staging(&managed, "d5-retry").unwrap();
+        handle
+            .create("partial")
+            .unwrap()
+            .write_all(b"staged")
+            .unwrap();
+        drop(handle);
+        drop(lock);
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("preserve"), b"outside").unwrap();
+        let held = managed.join("parked");
+        std::fs::rename(&stage, &held).unwrap();
+        symlink(&outside, &stage).unwrap();
+        let report = recover_interrupted_installations(&repository, &managed, 2)
+            .await
+            .unwrap();
+        assert_eq!(report.deferred_errors, 1);
+        assert_eq!(report.marked_failed, 1);
+        assert!(stage.is_symlink());
+        assert_eq!(std::fs::read(outside.join("preserve")).unwrap(), b"outside");
+        assert!(
+            super::super::remove_failed_installation_owned(&repository, &managed, &record.id)
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(&stage).unwrap();
+        // A replacement directory, not just a symlink, is ambiguous.
+        std::fs::create_dir(&stage).unwrap();
+        assert_eq!(
+            recover_interrupted_installations(&repository, &managed, 3)
+                .await
+                .unwrap()
+                .deferred_errors,
+            1
+        );
+        std::fs::remove_dir(&stage).unwrap();
+        std::fs::rename(&held, &stage).unwrap();
+
+        // Root can bypass mode bits, so assert the real permission failure
+        // on ordinary runs only. The object mismatch retry above is universal.
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o500)).unwrap();
+            assert_eq!(
+                recover_interrupted_installations(&repository, &managed, 4)
+                    .await
+                    .unwrap()
+                    .deferred_errors,
+                1
+            );
+            assert!(stage.is_dir());
+            std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let ambiguous = managed.join(format!(".d5-retry.{}.tmp", Uuid::new_v4()));
+        std::fs::create_dir(&ambiguous).unwrap();
+        assert_eq!(
+            recover_interrupted_installations(&repository, &managed, 5)
+                .await
+                .unwrap()
+                .staging_removed,
+            1
+        );
+        assert!(!stage.exists());
+        assert!(
+            super::super::remove_failed_installation_owned(&repository, &managed, &record.id)
+                .await
+                .is_err()
+        );
+        assert!(repository.get_by_id(&record.id).await.unwrap().is_some());
+        assert!(ambiguous.is_dir());
     }
 
     #[tokio::test]

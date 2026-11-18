@@ -689,7 +689,7 @@ impl ArchiveSelectionService {
         account_check: AccountCheck,
     ) -> Result<PublicationLease, ArchiveSelectionError> {
         let token = Uuid::new_v4();
-        let (file, generation, actual, file_size) = {
+        let (file, generation, actual, file_size, path) = {
             let mut registry = self.registry.lock().map_err(|_| registry_unavailable())?;
             let entry = bound(&mut registry, &reference.selection_id, expected, active)?;
             if entry.in_progress || entry.publication_token.is_some() {
@@ -715,6 +715,7 @@ impl ArchiveSelectionService {
                 entry.generation,
                 entry.digest.clone(),
                 entry.identity.size,
+                entry.path.clone(),
             )
         };
         let reservation = PublicationReservationGuard {
@@ -723,6 +724,16 @@ impl ArchiveSelectionService {
             token,
             held: true,
         };
+        if let Err(error) = tokio::fs::symlink_metadata(&path).await {
+            return Err(if error.kind() == std::io::ErrorKind::NotFound {
+                ArchiveSelectionError::Handle {
+                    selection_id: reference.selection_id.clone(),
+                    failure: ArchiveHandleFailure::MissingStaging,
+                }
+            } else {
+                storage(ArchiveStorageOperation::Metadata)
+            });
+        }
         verify_file_digest(file, &actual).await?;
         let active_after_work = (account_check)().await?;
         require_account(expected, &active_after_work)?;
@@ -1164,11 +1175,7 @@ fn prune_locked(registry: &mut Registry, now: Instant) -> Vec<PathBuf> {
     let ids = registry
         .selections
         .iter()
-        .filter(|(_, value)| {
-            !value.in_progress
-                && value.publication_token.is_none()
-                && now.duration_since(value.last_access) >= SELECTION_TTL
-        })
+        .filter(|(_, value)| idle_expired(value, now))
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
     ids.into_iter()
@@ -1184,6 +1191,12 @@ fn prune_locked(registry: &mut Registry, now: Instant) -> Vec<PathBuf> {
         })
         .collect()
 }
+fn idle_expired(selection: &Selection, now: Instant) -> bool {
+    !selection.in_progress
+        && selection.publication_token.is_none()
+        && now.duration_since(selection.last_access) >= SELECTION_TTL
+}
+
 fn bound<'a>(
     registry: &'a mut Registry,
     id: &ArchiveSelectionId,
@@ -1213,7 +1226,14 @@ fn bound<'a>(
     if value.publisher != expected {
         return Err(unknown(id.clone()));
     }
-    value.last_access = Instant::now();
+    let now = Instant::now();
+    // Never refresh an expired token while waiting for physical cleanup.
+    if idle_expired(value, now) {
+        return Err(ArchiveSelectionError::Expired {
+            selection_id: id.clone(),
+        });
+    }
+    value.last_access = now;
     Ok(value)
 }
 fn tombstone(registry: &mut Registry, id: String, publisher: String, state: TombstoneState) {
@@ -2662,6 +2682,84 @@ mod tests {
             ArchiveSelectionError::BlockingHazards { .. }
         ));
         assert!(publication_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn publication_rejects_an_idle_expired_selection_before_and_after_cleanup() {
+        let temp = TempDir::new().expect("temp dir");
+        let service = service(temp.path());
+        let selected = service
+            .stage_source(
+                write_zip(temp.path(), "idle.zip", &[("game", b"x")]),
+                PUBLISHER,
+                account(PUBLISHER),
+            )
+            .await
+            .expect("stage selection");
+        let id = selected.selection_id;
+        service
+            .inspect(inspect_request(id.clone()), PUBLISHER, account(PUBLISHER))
+            .await
+            .expect("inspect selection");
+        let hash = service
+            .hash(hash_request(id.clone()), PUBLISHER, account(PUBLISHER))
+            .await
+            .expect("hash selection");
+        let reference = BuildSelectionRef {
+            selection_id: id.clone(),
+            sha256: hash.sha256,
+        };
+        let path = staged_path(&service, &id).await;
+        let moved_path = path.with_extension("moved");
+        std::fs::rename(&path, &moved_path).expect("simulate missing staging");
+        assert_eq!(
+            service
+                .publication_lease(&reference, PUBLISHER, PUBLISHER, account(PUBLISHER))
+                .await
+                .expect_err("an open descriptor must not hide missing staging"),
+            ArchiveSelectionError::Handle {
+                selection_id: id.clone(),
+                failure: ArchiveHandleFailure::MissingStaging,
+            },
+        );
+        std::fs::rename(&moved_path, &path).expect("restore fixture staging");
+        let at_deadline = Instant::now() - SELECTION_TTL;
+        service
+            .registry
+            .lock()
+            .expect("registry")
+            .selections
+            .get_mut(id.as_str())
+            .expect("selection")
+            .last_access = at_deadline;
+        for staged in [true, false] {
+            assert_eq!(path.exists(), staged);
+            let error = service
+                .publication_lease(&reference, PUBLISHER, PUBLISHER, account(PUBLISHER))
+                .await
+                .expect_err("expired selection cannot authorize publication");
+            assert_eq!(
+                error,
+                ArchiveSelectionError::Expired {
+                    selection_id: id.clone()
+                }
+            );
+            if staged {
+                {
+                    let registry = service.registry.lock().expect("registry");
+                    let selection = registry
+                        .selections
+                        .get(id.as_str())
+                        .expect("not pruned yet");
+                    assert_eq!(
+                        selection.last_access, at_deadline,
+                        "rejection must not renew expiry"
+                    );
+                    assert!(selection.publication_token.is_none());
+                }
+                service.prune_expired().await;
+            }
+        }
     }
 
     #[tokio::test]

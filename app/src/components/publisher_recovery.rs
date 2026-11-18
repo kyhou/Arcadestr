@@ -159,13 +159,13 @@ pub fn PublisherRecoveryPanel() -> impl IntoView {
                     message.set(Some("Operation reconciled through its original publication flow. Refresh the game to inspect current network state.".into()));
                     refresh.update(|v| *v = v.wrapping_add(1));
                 }
-                Err(error) => message.set(Some(error)),
+                Err(error) => message.set(Some(super::publish::publish_error_message(&error))),
             }
         });
     });
     view! {
-        <details style="margin:14px 0;padding:16px;background:#121215;border:1px solid oklch(0.32 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace;color:#fff;overflow-wrap:anywhere">
-            <summary style="color:oklch(0.8 0.16 60);font-weight:800">"PUBLISHER DRAFTS & RECOVERY"</summary>
+        <details prop:open=move || state.with(|state| state.as_ref().is_some_and(|state| incomplete_operations(state) > 0)) style="margin:14px 0;padding:16px;background:#121215;border:1px solid oklch(0.32 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace;color:#fff;overflow-wrap:anywhere">
+            <summary data-testid="publisher-recovery-summary" style="color:oklch(0.8 0.16 60);font-weight:800">{move || recovery_summary(state.get().as_ref())}</summary>
             <p>"Nothing resumes automatically. Restore drafts in their editors. Review checkpoints before authorizing an exact-event retry. Server availability is not inferred from a prior upload acknowledgement."</p>
             <button type="button" style="padding:10px;background:transparent;color:oklch(0.8 0.13 210);border:1px solid oklch(0.5 0.13 210);font-family:ui-monospace,monospace" disabled=move || busy.get() on:click=move |_| refresh.update(|v| *v = v.wrapping_add(1))>"REFRESH LOCAL RECOVERY"</button>
             <button type="button" style="padding:10px;background:transparent;color:oklch(0.8 0.13 210);border:1px solid oklch(0.5 0.13 210);font-family:ui-monospace,monospace" disabled=move || busy.get() on:click=move |_| select_archive.run(())>"RESELECT PINNED ARCHIVE"</button>
@@ -185,8 +185,12 @@ pub fn PublisherRecoveryPanel() -> impl IntoView {
                             <article style="padding:12px;margin-top:12px;border:1px solid oklch(0.32 0.01 60);background:#141417;clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px))">
                                 <p>{format!("{} · {} · {}", operation.kind, operation.coordinate, operation.state)}</p>
                                 <p>{format!("Operation {} · pinned hash {}", operation.operation_id, operation.artifact_hash.unwrap_or_else(|| "No new archive".into()))}</p>
-                                {steps.into_iter().map(|step| view! { <p>{format!("{} · {} · {}{}", step.kind, step.target, if step.state == "prepared" { "unacknowledged / outcome unknown" } else { step.state.as_str() }, step.last_error.map(|error| format!(" · previous attempt: {error}")).unwrap_or_default())}</p> }).collect_view()}
-                                <button type="button" style="padding:10px;background:transparent;color:oklch(0.8 0.13 210);border:1px solid oklch(0.5 0.13 210);font-family:ui-monospace,monospace" disabled=move || complete || busy.get() || !authorized.get() on:click=move |_| resume.run((id.clone(), needs_archive))>"RECONCILE & RESUME ORIGINAL"</button>
+                                {steps.into_iter().map(|step| view! { <p>{format!("{} · {} · {}{}", step.kind, step.target, checkpoint_label(complete, &step.kind, &step.state), step.last_error.map(|error| format!(" · previous attempt: {error}")).unwrap_or_default())}</p> }).collect_view()}
+                                {if complete {
+                                    view! { <p>"Completed · nothing to resume"</p> }.into_any()
+                                } else {
+                                    view! { <button type="button" style="padding:10px;background:transparent;color:oklch(0.8 0.13 210);border:1px solid oklch(0.5 0.13 210);font-family:ui-monospace,monospace" disabled=move || busy.get() || !authorized.get() on:click=move |_| resume.run((id.clone(), needs_archive))>"RECONCILE & RESUME ORIGINAL"</button> }.into_any()
+                                }}
                             </article>
                         }
                     }).collect_view()}
@@ -194,5 +198,98 @@ pub fn PublisherRecoveryPanel() -> impl IntoView {
             })}
             {move || message.get().map(|message| view! { <p role="status">{message}</p> })}
         </details>
+    }
+}
+
+/// Unfinished operations need publisher action; completed ones are history.
+fn incomplete_operations(state: &PublisherRecoveryState) -> usize {
+    state
+        .operations
+        .iter()
+        .filter(|operation| operation.state != "complete")
+        .count()
+}
+
+fn recovery_summary(state: Option<&PublisherRecoveryState>) -> String {
+    match state.map(incomplete_operations) {
+        Some(0) | None => "PUBLISHER DRAFTS & RECOVERY".into(),
+        Some(count) => {
+            format!("PUBLISHER DRAFTS & RECOVERY — {count} INCOMPLETE OPERATION(S) NEED REVIEW")
+        }
+    }
+}
+
+/// Recovery wording for one journal checkpoint. `prepared` rows are retained
+/// intents: only on an unfinished operation can their remote outcome be
+/// unknown, and `distribution` rows are declarations whose evidence comes from
+/// the provision/upload steps.
+fn checkpoint_label<'a>(operation_complete: bool, kind: &str, state: &'a str) -> &'a str {
+    match state {
+        "prepared" if operation_complete => "recorded · operation complete",
+        "prepared" if kind == "distribution" => "declared; see provision/upload steps",
+        "prepared" => "unacknowledged / outcome unknown",
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_label_tests {
+    use super::checkpoint_label;
+
+    #[test]
+    fn incomplete_operations_are_announced_and_completed_ones_are_not() {
+        use super::*;
+        let operation = |state: &str| arcadestr_core::publisher_recovery::PublisherOperation {
+            operation_id: state.into(),
+            kind: "listing".into(),
+            coordinate: "c".into(),
+            intent: serde_json::Value::Null,
+            artifact_hash: None,
+            state: state.into(),
+            result: None,
+        };
+        let mut state = PublisherRecoveryState {
+            drafts: vec![],
+            operations: vec![operation("complete")],
+            checkpoints: vec![],
+        };
+        assert_eq!(
+            recovery_summary(Some(&state)),
+            "PUBLISHER DRAFTS & RECOVERY"
+        );
+        state.operations.push(operation("incomplete"));
+        assert_eq!(incomplete_operations(&state), 1);
+        assert!(recovery_summary(Some(&state)).contains("1 INCOMPLETE OPERATION(S) NEED REVIEW"));
+    }
+
+    #[test]
+    fn completed_operations_never_report_unknown_outcomes() {
+        for kind in ["distribution", "revoke_grant", "upload", "provision"] {
+            assert_eq!(
+                checkpoint_label(true, kind, "prepared"),
+                "recorded · operation complete"
+            );
+        }
+        assert_eq!(
+            checkpoint_label(true, "relay", "acknowledged"),
+            "acknowledged"
+        );
+    }
+
+    #[test]
+    fn unfinished_operations_keep_unknown_outcomes_visible() {
+        assert_eq!(
+            checkpoint_label(false, "upload", "prepared"),
+            "unacknowledged / outcome unknown"
+        );
+        assert_eq!(
+            checkpoint_label(false, "provision", "prepared"),
+            "unacknowledged / outcome unknown"
+        );
+        assert_eq!(
+            checkpoint_label(false, "distribution", "prepared"),
+            "declared; see provision/upload steps"
+        );
+        assert_eq!(checkpoint_label(false, "upload", "failed"), "failed");
     }
 }

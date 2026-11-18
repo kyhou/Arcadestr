@@ -968,6 +968,18 @@ impl InstallationsRepository {
         Ok(snapshots)
     }
 
+    /// Failed rows remain eligible for staging cleanup until their record is removed.
+    pub async fn list_installation_recovery_records(
+        &self,
+    ) -> Result<Vec<InstallationRecord>, AdpStorageError> {
+        let rows = sqlx::query(&format!(
+            "{INSTALLATION_SELECT} WHERE state IN ('installing', 'failed') ORDER BY created_at, id"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(installation_from_row).collect()
+    }
+
     pub async fn manifest_entry(
         &self,
         id: &InstallationId,

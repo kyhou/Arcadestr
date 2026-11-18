@@ -1650,8 +1650,8 @@ pub async fn invoke_resume_publisher_operation(
     operation_id: String,
     confirm_uncertain_retry: bool,
     selected_build: Option<BuildSelectionRef>,
-) -> Result<serde_json::Value, String> {
-    crate::tauri_invoke::invoke("resume_publisher_operation", serde_json::json!({"request":{"expected_publisher_npub":publisher,"operation_id":operation_id,"confirm_resume":true,"confirm_uncertain_retry":confirm_uncertain_retry,"selected_build":selected_build}})).await
+) -> Result<serde_json::Value, PublishAdpListingError> {
+    crate::tauri_invoke::invoke_typed("resume_publisher_operation", serde_json::json!({"request":{"expected_publisher_npub":publisher,"operation_id":operation_id,"confirm_resume":true,"confirm_uncertain_retry":confirm_uncertain_retry,"selected_build":selected_build}})).await
 }
 #[cfg(feature = "web")]
 pub async fn invoke_resume_publisher_operation(
@@ -1659,8 +1659,8 @@ pub async fn invoke_resume_publisher_operation(
     _: String,
     _: bool,
     _: Option<BuildSelectionRef>,
-) -> Result<serde_json::Value, String> {
-    Err("Publisher recovery requires the desktop app".into())
+) -> Result<serde_json::Value, PublishAdpListingError> {
+    Err(PublishAdpListingError::UnsupportedPlatform)
 }
 
 #[cfg(not(feature = "web"))]

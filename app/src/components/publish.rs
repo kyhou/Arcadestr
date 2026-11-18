@@ -852,8 +852,14 @@ fn file_selection_changed(new_path: Option<String>) -> (Option<String>, Option<S
     }
 }
 
-fn publish_error_message(error: &PublishAdpListingError) -> String {
+pub(super) fn publish_error_message(error: &PublishAdpListingError) -> String {
     match error {
+        PublishAdpListingError::Archive { error } => archive_error_message(error),
+        PublishAdpListingError::PartialPublication { cause, successful_servers } => format!(
+            "Publication is incomplete ({} server(s) accepted it): {} Review the incomplete operation in publisher recovery; do not start a new publication.",
+            successful_servers.len(),
+            publish_error_message(cause)
+        ),
         PublishAdpListingError::StaleExpectedEventId { .. } => {
             "A concurrent listing revision was detected. Your local work is preserved and publication is blocked. Leave this workflow, return to Published games, and reopen the latest revision before publishing."
                 .to_string()
@@ -878,10 +884,34 @@ fn should_rebase_edit_distribution(
     authority_ready && operator_initialized && user_revision == 0
 }
 
+/// One message per archive failure category, so an expired selection, a
+/// rejected archive, local storage and transport problems are never reported
+/// as each other (or as an unrelated launch-profile problem).
 pub(super) fn archive_error_message(error: &ArchiveSelectionError) -> String {
-    publish_error_message(&PublishAdpListingError::Archive {
-        error: error.clone(),
-    })
+    use ArchiveSelectionError as E;
+    match error {
+        E::Account { .. } => "This build selection belongs to a different or signed-out account. Select the build again with the active account.".into(),
+        E::Expired { .. } => "The build selection expired after inactivity. Select the build file again.".into(),
+        E::Handle { .. } => "The staged build is missing or was discarded. Select the build file again.".into(),
+        E::Busy { .. } => "Another build-file operation is still running. Wait for it to finish, then retry.".into(),
+        E::Mutation { .. } => "The selected build file changed after it was selected. Select it again so the published hash matches the file.".into(),
+        E::NonRegularFile => "The selection is not a regular file. Choose a build archive file.".into(),
+        E::PickerFailed => "The file picker could not open. Retry the selection.".into(),
+        E::SelectedBuildRequired => "Select a build file before continuing.".into(),
+        E::InsufficientStorage { required, available } => format!(
+            "Not enough local storage to stage the build ({required} bytes needed, {available} available). Free space and select it again."
+        ),
+        E::Storage { .. } => "A local storage operation failed while staging the build. Check disk access and select the build again.".into(),
+        E::Detection { .. } => "The file is not a supported game archive (ZIP, tar.gz or tar.zst).".into(),
+        E::DigestMismatch { .. } => "The staged build no longer matches its recorded hash. Select the build file again.".into(),
+        E::Pagination { .. } => "The archive listing request was invalid. Reload the archive contents.".into(),
+        E::InvalidPlatform { .. } | E::UnsupportedPlatform => "The selected platform is not supported for this archive.".into(),
+        E::Inspection { .. } => "The archive could not be inspected: it is malformed or exceeds supported limits.".into(),
+        E::BlockingHazards { .. } => "The archive contains unsafe entries (such as links or path escapes) and cannot be published.".into(),
+        E::Registry { .. } => "The local build-selection registry is unavailable. Restart the desktop app and select the build again.".into(),
+        E::Cancellation { .. } => "The build selection could not be cancelled cleanly. Select the build again.".into(),
+        E::Transport | E::ContractMismatch => "The desktop backend did not return a valid response for the build selection. Restart the desktop app and retry.".into(),
+    }
 }
 
 fn build_capability_message() -> &'static str {
@@ -1389,6 +1419,76 @@ fn operator_prefill_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_errors_keep_their_precise_cause() {
+        use arcadestr_core::archive_inspection_contract::{
+            ArchiveDetectionFailure, ArchiveHandleFailure, ArchiveMutationFailure,
+            ArchiveSelectionId, ArchiveStorageOperation,
+        };
+        let id = ArchiveSelectionId::parse("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b").expect("id");
+        let cases = [
+            (
+                ArchiveSelectionError::Expired {
+                    selection_id: id.clone(),
+                },
+                "expired",
+            ),
+            (
+                ArchiveSelectionError::Handle {
+                    selection_id: id.clone(),
+                    failure: ArchiveHandleFailure::MissingStaging,
+                },
+                "staged build is missing",
+            ),
+            (
+                ArchiveSelectionError::Mutation {
+                    failure: ArchiveMutationFailure::TimestampChanged,
+                },
+                "changed after",
+            ),
+            (
+                ArchiveSelectionError::InsufficientStorage {
+                    required: 10,
+                    available: 1,
+                },
+                "storage",
+            ),
+            (
+                ArchiveSelectionError::Storage {
+                    operation: ArchiveStorageOperation::CopySource,
+                },
+                "local storage",
+            ),
+            (
+                ArchiveSelectionError::Detection {
+                    failure: ArchiveDetectionFailure::UnknownFormat,
+                },
+                "supported game archive",
+            ),
+            (ArchiveSelectionError::Transport, "desktop"),
+        ];
+        for (error, expected) in cases {
+            let error = PublishAdpListingError::Archive { error };
+            let wire = serde_json::to_value(&error).expect("encode IPC rejection");
+            let decoded = serde_json::from_value(wire).expect("decode IPC rejection");
+            assert_eq!(error, decoded);
+            let message = publish_error_message(&decoded);
+            assert!(
+                message.to_lowercase().contains(expected),
+                "{error:?}: {message}"
+            );
+            assert_ne!(message, "archive selection rejected publication");
+            assert!(!message.to_lowercase().contains("launch profile"));
+        }
+        let partial = PublishAdpListingError::PartialPublication {
+            cause: Box::new(PublishAdpListingError::Archive {
+                error: ArchiveSelectionError::Expired { selection_id: id },
+            }),
+            successful_servers: vec!["https://a".into()],
+        };
+        assert!(publish_error_message(&partial).contains("expired"));
+    }
 
     #[test]
     fn commercial_consent_defaults_to_preserve_and_requires_fresh_explicit_review() {

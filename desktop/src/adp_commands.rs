@@ -4271,6 +4271,17 @@ pub(crate) async fn publish_adp_listing_pipeline<R: tauri::Runtime>(
     }
 }
 
+/// Recovery of a listing that was never published must re-establish its
+/// artifact only from the reselected archive, which the pipeline verifies
+/// against the operation's pinned hash. The retained intent still carries the
+/// lease-derived hash from the interrupted attempt; replaying it would be a
+/// claimed-hash bootstrap, which publication correctly refuses.
+pub(crate) fn clear_unpublished_listing_claimed_hash(request: &mut PublishAdpListingRequest) {
+    if request.existing_event_id.is_none() {
+        request.existing_file_hash = None;
+    }
+}
+
 fn validate_selected_build_requirement(
     request: &PublishAdpListingRequest,
     extension: &PublishAdpListingRequestExtension,
@@ -7698,6 +7709,58 @@ mod tests {
                 .map(|profile_id| ProfileId::parse(profile_id).expect("profile ID should parse"))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn interrupted_new_listing_recovery_drops_the_retained_claimed_hash() {
+        let mut request = PublishAdpListingRequest {
+            expected_publisher_npub: "npub1publisher".to_owned(),
+            existing_event_id: None,
+            existing_d_tag: None,
+            pending_d_tag: Some("game".to_owned()),
+            title: "Game".to_owned(),
+            description: "Description".to_owned(),
+            price_sats: 0,
+            lud16: None,
+            tags: Vec::new(),
+            images: Vec::new(),
+            fulfillment_mode: FulfillmentMode::Delegate,
+            operator_url: Some("http://127.0.0.1:19101".to_owned()),
+            servers: vec!["http://127.0.0.1:19101".to_owned()],
+            accepted_terms: Vec::new(),
+            file_path: None,
+            selected_build: None,
+            // Retained from the interrupted attempt's archive lease.
+            existing_file_hash: Some("ab".repeat(32)),
+            existing_fulfillment_pubkey: None,
+            version: Some("1.0.0".to_owned()),
+            acquisition: arcadestr_core::marketplace::AcquisitionPolicy::Public,
+            platforms: Vec::new(),
+            campaigns: Vec::new(),
+            nip94_event_id: None,
+        };
+        let extension = PublishAdpListingRequestExtension::default();
+        // Replaying the retained intent is a claimed-hash bootstrap.
+        assert!(matches!(
+            validate_selected_build_requirement(&request, &extension),
+            Err(PublishAdpListingError::Other { .. })
+        ));
+        clear_unpublished_listing_claimed_hash(&mut request);
+        assert_eq!(request.existing_file_hash, None);
+        // Recovery now requires the reselected archive, verified downstream
+        // against the operation's pinned hash.
+        assert!(matches!(
+            validate_selected_build_requirement(&request, &extension),
+            Err(PublishAdpListingError::Archive {
+                error: arcadestr_core::archive_inspection_contract::ArchiveSelectionError::SelectedBuildRequired,
+            })
+        ));
+
+        // Edits of a published revision keep their authoritative hash.
+        request.existing_event_id = Some("cd".repeat(32));
+        request.existing_file_hash = Some("ab".repeat(32));
+        clear_unpublished_listing_claimed_hash(&mut request);
+        assert_eq!(request.existing_file_hash, Some("ab".repeat(32)));
     }
 
     #[test]

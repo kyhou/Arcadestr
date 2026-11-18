@@ -341,6 +341,8 @@ pub struct ArchiveFileSelection {
     pub selection_id: ArchiveSelectionId,
     pub safe_filename: SafeArchiveFilename,
     pub file_size: u64,
+    /// Advisory wall-clock estimate; the desktop enforces a rolling idle
+    /// timeout using a process-local monotonic clock.
     pub expires_at_unix: u64,
 }
 
@@ -659,6 +661,7 @@ pub enum ArchiveAccountFailure {
 pub enum ArchiveHandleFailure {
     Unknown,
     Discarded,
+    MissingStaging,
 }
 
 /// Snapshot mutation detected after the file was selected.

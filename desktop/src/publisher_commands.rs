@@ -376,9 +376,13 @@ pub async fn resume_publisher_operation<R: tauri::Runtime>(
     state: State<'_, AppState>,
     signer_state: State<'_, Arc<tokio::sync::Mutex<arcadestr_core::nip46::AppSignerState>>>,
     archive_service: State<'_, crate::archive_selection::ArchiveSelectionService>,
-) -> Result<Value, String> {
+) -> Result<Value, arcadestr_core::adp_publish_contract::PublishAdpListingError> {
+    use arcadestr_core::adp_publish_contract::PublishAdpListingError as Error;
+    let message = |text: &str| Error::from(text.to_owned());
     if !request.confirm_resume {
-        return Err("Explicit authorization is required to resume publisher operations".into());
+        return Err(message(
+            "Explicit authorization is required to resume publisher operations",
+        ));
     }
     let (publisher, session) = account(&state, &request.expected_publisher_npub).await?;
     let _lease = state.settlement_recovery.claim(
@@ -390,7 +394,7 @@ pub async fn resume_publisher_operation<R: tauri::Runtime>(
     if operation.state == "complete" {
         return operation
             .result
-            .ok_or("Completed operation result is unavailable".into());
+            .ok_or_else(|| message("Completed operation result is unavailable"));
     }
     let journal = PublisherJournal {
         repo: repo.clone(),
@@ -400,18 +404,20 @@ pub async fn resume_publisher_operation<R: tauri::Runtime>(
     };
     if operation.kind == "listing" {
         if operation.artifact_hash.is_none() && request.selected_build.is_some() {
-            return Err("This operation did not select a new archive. Resume without an archive; use a new publication to change artifacts".into());
+            return Err(message("This operation did not select a new archive. Resume without an archive; use a new publication to change artifacts"));
         }
         let mut intent: crate::adp_commands::PublishAdpListingRequest =
             serde_json::from_value(operation.intent["request"].clone())
-                .map_err(|_| "Invalid retained publication intent")?;
+                .map_err(|_| message("Invalid retained publication intent"))?;
         let mut extension: arcadestr_core::adp_publish_contract::PublishAdpListingRequestExtension =
             serde_json::from_value(operation.intent["extension"].clone())
-                .map_err(|_| "Invalid retained publication extension")?;
+                .map_err(|_| message("Invalid retained publication extension"))?;
         if intent.expected_publisher_npub != request.expected_publisher_npub {
-            return Err("Retained publication belongs to another account".into());
+            return Err(message("Retained publication belongs to another account"));
         }
         intent.selected_build = request.selected_build;
+        // A published revision below re-pins the hash from the operation.
+        crate::adp_commands::clear_unpublished_listing_claimed_hash(&mut intent);
         extension.operation_id = Some(request.operation_id.clone());
         let steps = repo.steps(&publisher, &request.operation_id).await?;
         let signed_listing = steps
@@ -419,7 +425,7 @@ pub async fn resume_publisher_operation<R: tauri::Runtime>(
             .find(|s| s.kind == "signed_event" && s.step_id.starts_with("signed:30402:"))
             .map(|s| serde_json::from_value::<Event>(s.intent.clone()))
             .transpose()
-            .map_err(|_| "Invalid retained listing")?;
+            .map_err(|_| message("Invalid retained listing"))?;
         let current =
             crate::adp_commands::recovery_current_listing(&state, &operation.coordinate).await?;
         if let Some(current) = current {
@@ -437,12 +443,12 @@ pub async fn resume_publisher_operation<R: tauri::Runtime>(
                     intent.existing_file_hash = Some(hash.clone());
                 }
             } else if intent.existing_event_id.as_deref() != Some(current.id.to_hex().as_str()) {
-                return Err("Listing changed after the retained operation; review the new revision instead of replaying old metadata".into());
+                return Err(message("Listing changed after the retained operation; review the new revision instead of replaying old metadata"));
             }
         } else if intent.existing_event_id.is_some() {
-            return Err(
-                "Original listing revision is unavailable; recovery remains pending".into(),
-            );
+            return Err(message(
+                "Original listing revision is unavailable; recovery remains pending",
+            ));
         }
         session.ensure_current()?;
         return crate::adp_commands::publish_adp_listing_pipeline(
@@ -456,15 +462,14 @@ pub async fn resume_publisher_operation<R: tauri::Runtime>(
             request.confirm_uncertain_retry,
         )
         .await
-        .map_err(|error| error.to_string())
         .and_then(|result| {
-            serde_json::to_value(result).map_err(|_| "Invalid publication result".into())
+            serde_json::to_value(result).map_err(|_| message("Invalid publication result"))
         });
     }
     if operation.kind == "store_page" {
         let mut intent: crate::store_page_commands::PublishStorePageRequest =
             serde_json::from_value(operation.intent)
-                .map_err(|_| "Invalid retained Store Page intent")?;
+                .map_err(|_| message("Invalid retained Store Page intent"))?;
         intent.operation_id = Some(request.operation_id);
         return crate::store_page_commands::publish_store_page_recoverable(
             state,
@@ -473,14 +478,15 @@ pub async fn resume_publisher_operation<R: tauri::Runtime>(
             true,
         )
         .await
+        .map_err(Error::from)
         .and_then(|result| {
-            serde_json::to_value(result).map_err(|_| "Invalid Store Page result".into())
+            serde_json::to_value(result).map_err(|_| message("Invalid Store Page result"))
         });
     }
     if operation.kind == "store_page_pointers" {
         let intent: crate::store_page_commands::RetryStorePagePointersRequest =
             serde_json::from_value(operation.intent)
-                .map_err(|_| "Invalid retained pointer intent")?;
+                .map_err(|_| message("Invalid retained pointer intent"))?;
         return crate::store_page_commands::retry_store_page_pointer_sync_recoverable(
             state,
             signer_state,
@@ -488,13 +494,14 @@ pub async fn resume_publisher_operation<R: tauri::Runtime>(
             Some(request.operation_id),
         )
         .await
+        .map_err(Error::from)
         .and_then(|result| {
-            serde_json::to_value(result).map_err(|_| "Invalid pointer result".into())
+            serde_json::to_value(result).map_err(|_| message("Invalid pointer result"))
         });
     }
     if operation.kind == "campaign" {
         let intent = serde_json::from_value(operation.intent)
-            .map_err(|_| "Invalid retained campaign intent")?;
+            .map_err(|_| message("Invalid retained campaign intent"))?;
         return crate::adp_commands::publish_campaign_recoverable(
             intent,
             state,
@@ -502,13 +509,14 @@ pub async fn resume_publisher_operation<R: tauri::Runtime>(
             Some(request.operation_id),
         )
         .await
+        .map_err(Error::from)
         .and_then(|result| {
-            serde_json::to_value(result).map_err(|_| "Invalid campaign result".into())
+            serde_json::to_value(result).map_err(|_| message("Invalid campaign result"))
         });
     }
     if operation.kind == "campaign_pointer" {
         let intent = serde_json::from_value(operation.intent)
-            .map_err(|_| "Invalid retained campaign pointer")?;
+            .map_err(|_| message("Invalid retained campaign pointer"))?;
         return crate::adp_commands::update_campaign_pointer_recoverable(
             intent,
             state,
@@ -516,18 +524,22 @@ pub async fn resume_publisher_operation<R: tauri::Runtime>(
             Some(request.operation_id),
         )
         .await
-        .map(Value::String);
+        .map(Value::String)
+        .map_err(Error::from);
     }
     if operation.kind == "credential_revocation" {
         let intent = serde_json::from_value(operation.intent)
-            .map_err(|_| "Invalid retained revocation intent")?;
+            .map_err(|_| message("Invalid retained revocation intent"))?;
         return crate::publisher_management::revoke_recoverable(intent, state, signer_state)
             .await
+            .map_err(Error::from)
             .and_then(|event| {
-                serde_json::to_value(event).map_err(|_| "Invalid revocation result".into())
+                serde_json::to_value(event).map_err(|_| message("Invalid revocation result"))
             });
     }
-    Err("This publisher operation requires review in its original editor".into())
+    Err(message(
+        "This publisher operation requires review in its original editor",
+    ))
 }
 
 /// Called by the original pipeline only after validating any reselected archive.

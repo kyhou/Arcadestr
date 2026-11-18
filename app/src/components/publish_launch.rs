@@ -357,6 +357,26 @@ fn profile_rejection_copy(rejection: &AuthoritativeProfileRejection) -> String {
     }
 }
 
+/// Launch-path confirmation depends on a current build selection. Without one
+/// the archive problem is the actionable cause; do not cascade per-profile
+/// binding errors beneath it.
+fn visible_profile_errors(
+    errors: Vec<ProfileDraftError>,
+    archive_ready: bool,
+) -> Vec<ProfileDraftError> {
+    errors
+        .into_iter()
+        .filter(|error| {
+            archive_ready
+                || !matches!(
+                    error,
+                    ProfileDraftError::ExecutableNotConfirmed
+                        | ProfileDraftError::WorkingDirectoryNotConfirmed
+                )
+        })
+        .collect()
+}
+
 fn profile_error_copy(error: ProfileDraftError) -> &'static str {
     match error {
         ProfileDraftError::InvalidId => "ID must match [a-z0-9][a-z0-9_-]{0,63}.",
@@ -1134,14 +1154,17 @@ pub(super) fn PublishLaunchEditor(
                                 },
                                 LaunchMode::DownloadOnly => (Vec::new(), Vec::new()),
                             };
+                            let archive_ready = state.get().archive.summary.is_some();
+                            let archive_hint = (!archive_ready && !profiles.is_empty()).then(|| view! { <p class="v2-create-help" role="note">"Select the build file to confirm each profile's executable and working directory."</p> });
                             if profiles.is_empty() {
                                 view! { <p class="v2-create-empty">"No profiles yet. Add a Game profile, then assign its Automatic Play targets."</p> }.into_any()
                             } else {
                                 let count = profiles.len();
+                                view! { <div>{archive_hint}{
                                 profiles.into_iter().enumerate().map(|(index, profile)| {
                                         let row_id = profile.row_id;
                                         let is_game = profile.launch_type == LaunchType::Game;
-                                        let errors = validations.iter().find(|entry| entry.row_id == row_id).map(|entry| entry.errors.clone()).unwrap_or_default();
+                                        let errors = visible_profile_errors(validations.iter().find(|entry| entry.row_id == row_id).map(|entry| entry.errors.clone()).unwrap_or_default(), archive_ready);
                                     view! {
                                         <article class="v2-create-profile-card">
                                             <div class="v2-create-row-between">
@@ -1197,14 +1220,14 @@ pub(super) fn PublishLaunchEditor(
                                                 </div>
                                             })}
                                             <div class="v2-create-field-pair">
-                                                <div><span class="v2-create-field-label">"Executable"</span><p class="v2-create-mono-value">{if profile.executable.text.is_empty() { "Not selected".to_string() } else { profile.executable.text.clone() }}</p>{profile.executable.stale.then(|| view! { <p class="v2-create-inline-error">"This value belongs to the previous archive and requires reconfirmation. Reselect it against the new index."</p> })}<button type="button" class="v2-btn-secondary" disabled=move || disabled.get() || state.get().archive.summary.is_none() on:click=move |_| open_picker.run((row_id, PickerKind::Executable))>"Choose from archive"</button></div>
-                                                <div><span class="v2-create-field-label">"Working directory"</span><p class="v2-create-mono-value">{profile.working_dir.text.clone()}</p>{profile.working_dir.stale.then(|| view! { <p class="v2-create-inline-error">"This value belongs to the previous archive and requires reconfirmation. Reselect it against the new index."</p> })}<button type="button" class="v2-btn-secondary" disabled=move || disabled.get() || state.get().archive.summary.is_none() on:click=move |_| open_picker.run((row_id, PickerKind::WorkingDirectory))>"Choose from archive"</button></div>
+                                                <div><span class="v2-create-field-label">"Executable"</span><p class="v2-create-mono-value">{if profile.executable.text.is_empty() { "Not selected".to_string() } else { profile.executable.text.clone() }}</p>{(profile.executable.stale && archive_ready).then(|| view! { <p class="v2-create-inline-error">"This value belongs to the previous archive and requires reconfirmation. Reselect it against the new index."</p> })}<button type="button" class="v2-btn-secondary" disabled=move || disabled.get() || state.get().archive.summary.is_none() on:click=move |_| open_picker.run((row_id, PickerKind::Executable))>"Choose from archive"</button></div>
+                                                <div><span class="v2-create-field-label">"Working directory"</span><p class="v2-create-mono-value">{profile.working_dir.text.clone()}</p>{(profile.working_dir.stale && archive_ready).then(|| view! { <p class="v2-create-inline-error">"This value belongs to the previous archive and requires reconfirmation. Reselect it against the new index."</p> })}<button type="button" class="v2-btn-secondary" disabled=move || disabled.get() || state.get().archive.summary.is_none() on:click=move |_| open_picker.run((row_id, PickerKind::WorkingDirectory))>"Choose from archive"</button></div>
                                             </div>
                                             <div><div class="v2-create-row-between"><span class="v2-create-field-label">"Arguments"</span><span class="v2-create-help">{format!("{} / {ARGUMENT_MAX} separate arguments", profile.arguments.len())}</span></div>{profile.arguments.into_iter().enumerate().map(|(argument_index, argument)| view! { <div class="v2-create-inline-row"><input class="v2-input" aria-label=format!("Argument {}", argument_index + 1) prop:value=argument on:input:target=move |event| state.update(|state| if let LaunchMode::Launchable(tier) = &mut state.launch { if let Some(profile) = tier.profiles.iter_mut().find(|profile| profile.row_id == row_id) { if let Some(argument) = profile.arguments.get_mut(argument_index) { *argument = event.target().value(); } } }) disabled=move || disabled.get() /><button type="button" class="v2-create-media-link v2-create-media-remove" on:click=move |_| state.update(|state| if let LaunchMode::Launchable(tier) = &mut state.launch { if let Some(profile) = tier.profiles.iter_mut().find(|profile| profile.row_id == row_id) { if argument_index < profile.arguments.len() { profile.arguments.remove(argument_index); } } }) disabled=move || disabled.get()>"Remove"</button></div> }).collect_view()}<button type="button" class="v2-btn-secondary" disabled=move || disabled.get() || (state.get().launch_profile_argument_count(row_id) >= ARGUMENT_MAX) on:click=move |_| state.update(|state| if let LaunchMode::Launchable(tier) = &mut state.launch { if let Some(profile) = tier.profiles.iter_mut().find(|profile| profile.row_id == row_id) { if profile.arguments.len() < ARGUMENT_MAX { profile.arguments.push(String::new()); } } })>"Add argument"</button><p class="v2-create-help">"Each row is one literal argument. No command string, JSON, shell parsing, expansion, or substitution."</p></div>
                                             {(!errors.is_empty()).then(|| view! { <ul class="v2-create-profile-errors">{errors.into_iter().map(|error| view! { <li>{profile_error_copy(error)}</li> }).collect_view()}</ul> })}
                                         </article>
                                     }
-                                }).collect_view().into_any()
+                                }).collect_view()}</div>}.into_any()
                             }
                         }}
                     </div>
@@ -1538,6 +1561,20 @@ fn PathPickerShell(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_binding_errors_wait_for_a_current_archive() {
+        let errors = vec![
+            ProfileDraftError::InvalidId,
+            ProfileDraftError::ExecutableNotConfirmed,
+            ProfileDraftError::WorkingDirectoryNotConfirmed,
+        ];
+        assert_eq!(
+            super::visible_profile_errors(errors.clone(), false),
+            vec![ProfileDraftError::InvalidId]
+        );
+        assert_eq!(super::visible_profile_errors(errors.clone(), true), errors);
+    }
+
     use super::*;
 
     #[test]

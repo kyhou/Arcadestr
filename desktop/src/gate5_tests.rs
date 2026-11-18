@@ -516,20 +516,12 @@ async fn gate5_restart_rolls_back_candidate_and_serializes_recovery() {
         if phase == 2 {
             std::fs::create_dir(&candidate.installation_root).expect("partly placed candidate");
         }
-        let staging = root.join("installations").join(format!(
-            ".{}.{}.tmp",
-            candidate
-                .installation_root
-                .file_name()
-                .expect("root name")
-                .to_string_lossy(),
-            uuid::Uuid::new_v4()
-        ));
-        if phase == 1 {
-            std::fs::create_dir(&staging).expect("interrupted extraction");
-            std::fs::write(staging.join("partial"), b"partial extraction")
-                .expect("staging content");
-        }
+        let staging = (phase == 1).then(|| candidate_lock.create_partial_staging_for_test());
+        let retained = repo
+            .get_retained_package(&coordinate)
+            .await
+            .expect("retained before rollback")
+            .expect("working package");
         std::fs::write(&package_path, b"partial download").expect("candidate archive");
         let lifecycle = acquire_coordinate_lifecycle_lock(&root, &coordinate)
             .await
@@ -538,6 +530,8 @@ async fn gate5_restart_rolls_back_candidate_and_serializes_recovery() {
             .await
             .expect("busy recovery skips");
         assert_eq!(repo.pending_updates().await.expect("journal").len(), 1);
+        assert!(staging.as_ref().is_none_or(|path| path.is_dir()));
+        assert!(package_path.is_file());
         drop(lifecycle);
         drop(candidate_lock);
         install::recover_updates(&repo, &root, 2, None)
@@ -549,7 +543,14 @@ async fn gate5_restart_rolls_back_candidate_and_serializes_recovery() {
         );
         assert!(!candidate.installation_root.exists());
         assert!(!package_path.exists());
-        assert!(!staging.exists());
+        assert!(staging.as_ref().is_none_or(|path| !path.exists()));
+        assert!(retained.package_path.is_file());
+        assert_eq!(
+            repo.get_retained_package(&coordinate)
+                .await
+                .expect("retained after rollback"),
+            Some(retained)
+        );
         assert!(repo.pending_updates().await.expect("journal").is_empty());
         repo.finish_update(&journal)
             .await

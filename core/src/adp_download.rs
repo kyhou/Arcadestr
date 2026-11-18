@@ -103,6 +103,13 @@ fn safe_error(error: AdpClientError) -> AdpClientError {
         | AdpClientError::Http(HttpClientError::StatusWithBody { status: 413, .. }) => {
             AdpClientError::Http(HttpClientError::Status(413))
         }
+        // A dropped, truncated or refused transfer is a transport failure, not
+        // missing authorization evidence. Keep it distinct, without details.
+        AdpClientError::Http(HttpClientError::Request(_)) => {
+            AdpClientError::Http(HttpClientError::Request(
+                "download transfer failed or the source was unreachable; details omitted".into(),
+            ))
+        }
         AdpClientError::DownloadProtocol(message) if message.starts_with("HTTP status 401") => {
             AdpClientError::DownloadProtocol(
                 "HTTP status 401: download authentication rejected".into(),
@@ -234,6 +241,22 @@ mod tests {
         assert!(candidates[1..].iter().all(|c| c.token.is_none()));
         assert_eq!(download_candidates(&servers, &tokens, false).len(), 1);
         assert!(download_candidates(&servers, &[], false).is_empty());
+    }
+    #[test]
+    fn transport_failures_stay_transport_errors_without_details() {
+        let error = safe_error(AdpClientError::Http(HttpClientError::Request(
+            "connection reset reading body from http://10.0.0.1/?token=secret".into(),
+        )));
+        let AdpClientError::Http(HttpClientError::Request(message)) = &error else {
+            panic!("transport failure must not become authorization evidence: {error:?}");
+        };
+        assert!(!message.contains("secret") && !message.contains("10.0.0.1"));
+        assert!(!message.contains("auth"));
+        // Server-reported evidence unavailability keeps its own classification.
+        assert!(matches!(
+            safe_error(AdpClientError::DownloadUnavailable("lookup".into())),
+            AdpClientError::DownloadUnavailable(_)
+        ));
     }
     #[test]
     fn entitlement_auth_and_local_failures_are_never_retryable() {

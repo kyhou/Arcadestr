@@ -284,7 +284,9 @@ pub(crate) fn archive_error_is_terminal(error: &ArchiveSelectionError) -> bool {
         error,
         ArchiveSelectionError::Account { .. }
             | ArchiveSelectionError::Handle {
-                failure: ArchiveHandleFailure::Unknown | ArchiveHandleFailure::Discarded,
+                failure: ArchiveHandleFailure::Unknown
+                    | ArchiveHandleFailure::Discarded
+                    | ArchiveHandleFailure::MissingStaging,
                 ..
             }
             | ArchiveSelectionError::Expired { .. }
