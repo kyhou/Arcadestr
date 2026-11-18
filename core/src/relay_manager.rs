@@ -659,6 +659,60 @@ impl RelayManager {
         }
     }
 
+    /// Query every configured relay once, under one deadline, and report which
+    /// relays completed (EOSE) with their events. Disconnected, failed or timed
+    /// out relays are reported as incomplete; any valid events they delivered
+    /// are kept separately and never count as coverage.
+    pub async fn fetch_relay_coverage(
+        &self,
+        filter: Filter,
+        deadline: Duration,
+    ) -> crate::checkout_freshness::RelayCoverage {
+        let mut coverage = crate::checkout_freshness::RelayCoverage::default();
+        let mut queries = FuturesUnordered::new();
+        for (url, relay) in self.client.relays().await {
+            let url = url.to_string();
+            if !relay.is_connected() {
+                coverage.incomplete.push(url);
+                continue;
+            }
+            let filter = filter.clone();
+            queries.push(async move {
+                let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let id = nostr_sdk::SubscriptionId::generate();
+                let result = query_relay(
+                    relay.clone(),
+                    id.clone(),
+                    filter,
+                    deadline,
+                    Arc::clone(&events),
+                )
+                .await;
+                if let Err(error) = relay.unsubscribe(&id).await {
+                    debug!("Coverage subscription cleanup failed: {error}");
+                }
+                let events = events
+                    .lock()
+                    .map(|mut events| std::mem::take(&mut *events))
+                    .unwrap_or_default();
+                (url, result, events)
+            });
+        }
+        while let Some((url, result, events)) = queries.next().await {
+            match result {
+                Ok(()) => {
+                    coverage.completed.insert(url, events);
+                }
+                Err(error) => {
+                    warn!("Relay {url} did not complete the coverage query: {error}");
+                    coverage.incomplete.push(url);
+                    coverage.partial_events.extend(events);
+                }
+            }
+        }
+        coverage
+    }
+
     /// Fetch events from a specific subset of relays.
     ///
     /// Queries only the specified relay URLs, not the entire pool.

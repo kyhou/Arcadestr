@@ -196,7 +196,7 @@ pub async fn invoke<T: serde::de::DeserializeOwned + 'static>(
                 | "get_nwc_wallet"
                 | "disconnect_nwc_wallet"
                 | "verify_nwc_wallet"
-                | "pay_nwc_invoice"
+                | "pay_purchase_leg"
                 | "sync_purchase_receipts"
                 | "import_purchase_receipts"
                 | "ingest_receipt"

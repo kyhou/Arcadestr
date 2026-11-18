@@ -16,10 +16,38 @@ use std::{
 struct Coordination {
     account: Option<String>,
     epoch: u64,
+    wallet_epoch: u64,
     running: HashSet<(String, String)>,
 }
 #[derive(Clone, Default)]
 pub struct RecoveryCoordinator(Arc<Mutex<Coordination>>);
+
+/// Snapshot of the desktop wallet selection and account at payment start.
+#[derive(Clone)]
+pub struct WalletDispatchFence {
+    coordinator: RecoveryCoordinator,
+    epoch: u64,
+    wallet_epoch: u64,
+}
+impl WalletDispatchFence {
+    /// Check and enqueue under the same lock as wallet/account changes. The
+    /// callback must only enqueue synchronously, never wait for a relay or wallet.
+    pub(crate) fn enqueue<T>(&self, send: impl FnOnce() -> T) -> Result<T, String> {
+        let state = self
+            .coordinator
+            .0
+            .lock()
+            .map_err(|_| "Session unavailable")?;
+        if state.epoch != self.epoch || state.wallet_epoch != self.wallet_epoch {
+            return Err("Account or wallet changed; payment was not dispatched".into());
+        }
+        Ok(send())
+    }
+
+    pub fn ensure_current(&self) -> Result<(), String> {
+        self.enqueue(|| ())
+    }
+}
 /// A session snapshot, independent of recovery/purchase authority or operation locks.
 #[derive(Clone)]
 pub struct SessionFence {
@@ -48,6 +76,29 @@ pub struct RecoveryLease {
     epoch: u64,
 }
 impl RecoveryCoordinator {
+    pub fn wallet_dispatch_fence(&self, account: &str) -> Result<WalletDispatchFence, String> {
+        let state = self.0.lock().map_err(|_| "Session unavailable")?;
+        if state.account.as_deref() != Some(account) {
+            return Err("Account changed; payment was not dispatched".into());
+        }
+        Ok(WalletDispatchFence {
+            coordinator: self.clone(),
+            epoch: state.epoch,
+            wallet_epoch: state.wallet_epoch,
+        })
+    }
+
+    /// Called by desktop wallet lifecycle commands, under the auth lock.
+    /// Even a failed credential write invalidates pending sends conservatively.
+    pub fn change_wallet<T>(
+        &self,
+        change: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut state = self.0.lock().map_err(|_| "Session unavailable")?;
+        state.wallet_epoch = state.wallet_epoch.wrapping_add(1);
+        change()
+    }
+
     pub fn session_fence(&self) -> Result<SessionFence, String> {
         let state = self.0.lock().map_err(|_| "Session unavailable")?;
         Ok(SessionFence {

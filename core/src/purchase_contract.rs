@@ -127,16 +127,32 @@ pub struct ApprovePurchasePlanRequest {
     pub accept_unenforced_fee_risk: bool,
 }
 
-/// Development completion is not permission to create live obligations. No
-/// environment flag, historical budget file or UI checkbox overrides this gate.
+/// Buyer-purchase activation from the release payment boundary. Quote creation,
+/// invoice disclosure and dispatch all require it. No environment flag,
+/// historical budget file or UI checkbox overrides it.
 pub fn require_live_purchase_authorization() -> Result<(), String> {
-    Err("Live purchase quotes, invoices and payment dispatch remain locked pending separate explicit authorization. Local approval and read-only recovery do not unlock spending.".into())
+    crate::payment_boundary::require_release_activation(
+        crate::payment_boundary::PaymentPurpose::BuyerPurchase,
+    )
+    .map_err(|refusal| refusal.to_string())
+}
+
+/// Recipient-refund activation, separate from buyer purchases.
+pub fn require_live_refund_authorization() -> Result<(), String> {
+    crate::payment_boundary::require_release_activation(
+        crate::payment_boundary::PaymentPurpose::RecipientRefund,
+    )
+    .map_err(|refusal| refusal.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    #[cfg(not(any(
+        feature = "regtest-buyer-payments",
+        feature = "production-buyer-payments"
+    )))]
     fn approval_does_not_authorize_live_execution() {
         assert!(require_live_purchase_authorization().is_err());
     }

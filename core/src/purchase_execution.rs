@@ -73,6 +73,16 @@ struct ApprovedPlan {
 pub struct PurchaseExecutor {
     pool: SqlitePool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupersedeOutcome {
+    /// Nothing was dispatched; the local quote can never be paid.
+    Superseded,
+    /// At least one leg was admitted; further dispatch is halted for recovery.
+    HaltedAfterDispatch,
+    AlreadySettled,
+}
 impl PurchaseExecutor {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -190,7 +200,7 @@ impl PurchaseExecutor {
         if let Some(guard) = guard {
             guard().map_err(|_| ExecutionError::Binding)?;
         }
-        let saved=sqlx::query("INSERT INTO purchase_execution_approvals(account_pubkey,quote_id,snapshot) VALUES(?,?,?) ON CONFLICT(account_pubkey,quote_id) DO UPDATE SET snapshot=purchase_execution_approvals.snapshot WHERE purchase_execution_approvals.snapshot=excluded.snapshot")
+        let saved=sqlx::query("INSERT INTO purchase_execution_approvals(account_pubkey,quote_id,snapshot) SELECT ?1,?2,?3 WHERE NOT EXISTS (SELECT 1 FROM settlement_invoice_attempts a WHERE a.account_pubkey=?1 AND a.quote_id=?2 AND (a.encrypted_proof IS NOT NULL OR a.state='settled') AND NOT EXISTS (SELECT 1 FROM purchase_execution_admissions p WHERE p.account_pubkey=?1 AND p.quote_id=?2 AND p.attempt_id=a.attempt_id AND p.state='verified' AND p.fees_paid_msat IS NOT NULL)) ON CONFLICT(account_pubkey,quote_id) DO UPDATE SET snapshot=purchase_execution_approvals.snapshot WHERE purchase_execution_approvals.snapshot=excluded.snapshot")
             .bind(&plan.quote.buyer_pubkey).bind(quote_id).bind(snapshot).execute(&self.pool).await?.rows_affected();
         if saved != 1 {
             return Err(ExecutionError::Binding);
@@ -426,8 +436,10 @@ impl PurchaseExecutor {
             wallet_connected: wallet.is_some(),
             wallet_capabilities: None,
             legs: statuses,
+            // Lock reason, or the visible test-build label under test activation.
             restriction: crate::purchase_contract::require_live_purchase_authorization()
                 .err()
+                .or_else(|| crate::payment_boundary::activation_status().test_build_label)
                 .unwrap_or_default(),
         })
     }
@@ -533,6 +545,49 @@ impl PurchaseExecutor {
             Some(guard),
         )
         .await
+    }
+
+    /// A listing change invalidated the approved quote. If nothing was ever
+    /// admitted for dispatch (no admission, journaled intent or proof), the local
+    /// quote becomes `superseded` and its approval is halted: no payment can
+    /// follow, and the processor's unpaid quote simply expires. If any leg was
+    /// admitted, only further dispatch is halted and the purchase continues
+    /// through partial-settlement recovery. Never pays, deletes or retries.
+    pub async fn supersede_unpaid(
+        &self,
+        account: &str,
+        quote_id: &str,
+    ) -> Result<SupersedeOutcome, ExecutionError> {
+        let mut tx = self.pool.begin().await?;
+        // Write first: serialize with dispatch admission for this quote.
+        let state: Option<String> = sqlx::query_scalar(
+            "UPDATE settlement_quotes SET updated_at=updated_at WHERE account_pubkey=? AND quote_id=? RETURNING state",
+        )
+        .bind(account)
+        .bind(quote_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(state) = state else {
+            return Err(ExecutionError::Binding);
+        };
+        match state.as_str() {
+            "superseded" => return Ok(SupersedeOutcome::Superseded),
+            "settled" => return Ok(SupersedeOutcome::AlreadySettled),
+            _ => {}
+        }
+        let dispatched:i64=sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM purchase_execution_admissions WHERE account_pubkey=?1 AND quote_id=?2)+(SELECT COUNT(*) FROM settlement_invoice_attempts a WHERE a.account_pubkey=?1 AND a.quote_id=?2 AND (a.encrypted_proof IS NOT NULL OR a.state='settled' OR EXISTS(SELECT 1 FROM nwc_payment_journal p WHERE p.account_pubkey=a.account_pubkey AND p.payment_hash=a.payment_hash)))")
+            .bind(account).bind(quote_id).fetch_one(&mut *tx).await?;
+        sqlx::query("UPDATE purchase_execution_approvals SET halted=1 WHERE account_pubkey=? AND quote_id=?")
+            .bind(account).bind(quote_id).execute(&mut *tx).await?;
+        let outcome = if dispatched == 0 && state == "active" {
+            sqlx::query("UPDATE settlement_quotes SET state='superseded',updated_at=unixepoch() WHERE account_pubkey=? AND quote_id=? AND state='active'")
+                .bind(account).bind(quote_id).execute(&mut *tx).await?;
+            SupersedeOutcome::Superseded
+        } else {
+            SupersedeOutcome::HaltedAfterDispatch
+        };
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     pub async fn pay_leg(

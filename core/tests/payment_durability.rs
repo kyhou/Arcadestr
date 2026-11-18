@@ -347,3 +347,112 @@ async fn expired_new_invoice_cannot_pay_but_expired_existing_intent_can_reconcil
     );
     assert_eq!(wallet.calls.load(Ordering::SeqCst), 0);
 }
+
+/// Standard NIP-47 wallet errors (budget, balance, permission, routing) are
+/// recorded as unresolved: Arcadestr cannot prove the wallet sent nothing, so it
+/// never pays the same invoice again. Only read-only lookup can settle it.
+#[tokio::test]
+async fn wallet_error_responses_are_unresolved_and_never_repaid() {
+    struct Denying {
+        code: &'static str,
+        calls: AtomicUsize,
+        lookups: AtomicUsize,
+    }
+    #[async_trait]
+    impl PaymentWallet for Denying {
+        fn identity(&self) -> Result<String, NwcClientError> {
+            Ok("wallet:app".into())
+        }
+        async fn pay(&self, _: &str) -> Result<PayInvoiceResult, NwcClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(NwcClientError::WalletError {
+                code: self.code.into(),
+                message: "denied".into(),
+            })
+        }
+        async fn lookup(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<PayInvoiceResult>, NwcClientError> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+    for code in [
+        "QUOTA_EXCEEDED",
+        "INSUFFICIENT_BALANCE",
+        "RESTRICTED",
+        "RATE_LIMITED",
+        "PAYMENT_FAILED",
+        "INTERNAL",
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(&dir.path().join("app.db")).await.expect("db");
+        let signer = signer();
+        let invoice = invoice(nostr::Timestamp::now().as_secs());
+        let wallet = Denying {
+            code,
+            calls: AtomicUsize::new(0),
+            lookups: AtomicUsize::new(0),
+        };
+        let payments = DurableNwcPayments::new(db.pool().clone());
+        for _ in 0..3 {
+            assert!(
+                matches!(
+                    payments.pay_or_resume(&signer, &wallet, &invoice).await,
+                    Err(DurablePaymentError::Unresolved)
+                ),
+                "{code}"
+            );
+        }
+        assert_eq!(
+            wallet.calls.load(Ordering::SeqCst),
+            1,
+            "{code}: exactly one pay_invoice"
+        );
+        assert_eq!(
+            wallet.lookups.load(Ordering::SeqCst),
+            2,
+            "{code}: later calls only look up"
+        );
+    }
+}
+
+/// get_info output of a standard NWC wallet connection, as checked by the
+/// release payment boundary before approval and before each dispatch.
+#[test]
+fn standard_get_info_is_verified_for_pay_and_lookup_methods_and_network() {
+    use arcadestr_core::{
+        nwc_client::parse_wallet_capabilities,
+        payment_boundary::{verify_wallet, BoundaryRefusal},
+        purchase_contract::InvoiceNetwork,
+    };
+    let full = json!({"result_type":"get_info","error":null,"result":{
+        "alias":"hub","network":"regtest","block_height":200,
+        "methods":["pay_invoice","get_balance","make_invoice","lookup_invoice","list_transactions","get_info"],
+        "notifications":["payment_received","payment_sent"]}});
+    let caps = parse_wallet_capabilities(&full.to_string()).expect("get_info");
+    assert!(verify_wallet("wallet:app", caps.clone(), InvoiceNetwork::Regtest).is_ok());
+    assert_eq!(
+        verify_wallet("wallet:app", caps, InvoiceNetwork::Bitcoin),
+        Err(BoundaryRefusal::WalletNetworkMismatch)
+    );
+    // A pay-only connection cannot reconcile an uncertain payment.
+    let pay_only = json!({"result_type":"get_info","error":null,"result":{"methods":["pay_invoice","get_info"]}});
+    assert_eq!(
+        verify_wallet(
+            "wallet:app",
+            parse_wallet_capabilities(&pay_only.to_string()).expect("get_info"),
+            InvoiceNetwork::Regtest
+        ),
+        Err(BoundaryRefusal::WalletUnverified("lookup_invoice".into()))
+    );
+    // A wallet without get_info gives no capability evidence at all.
+    let unsupported =
+        json!({"result_type":"get_info","error":{"code":"NOT_IMPLEMENTED","message":"no"}});
+    assert!(matches!(
+        parse_wallet_capabilities(&unsupported.to_string()),
+        Err(NwcClientError::VerificationUnsupported)
+    ));
+}

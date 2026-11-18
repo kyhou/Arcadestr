@@ -36,7 +36,9 @@ use arcadestr_core::distribution::{LaunchProfile, ProfileId, Sha256Digest};
 use arcadestr_core::file_hash::{sha256_file, sha256_file_with_progress};
 use arcadestr_core::http_client::HttpClient;
 use arcadestr_core::is_replaceable_event_newer;
-use arcadestr_core::lnurlp::{request_invoice, resolve_lud16_with_policy};
+#[cfg(test)]
+use arcadestr_core::lnurlp::request_invoice;
+use arcadestr_core::lnurlp::resolve_lud16_with_policy;
 use arcadestr_core::marketplace::confirm_nip99_listing_propagated;
 use arcadestr_core::nip46::AppSignerState;
 use arcadestr_core::nwc_client::{
@@ -805,12 +807,14 @@ pub(crate) async fn ensure_publish_account_current(
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg(test)]
 pub struct RequestLnurlInvoiceRequest {
     pub lud16: String,
     pub amount_sats: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg(test)]
 pub struct RequestLnurlInvoiceResponse {
     pub bolt11: String,
 }
@@ -829,15 +833,11 @@ pub struct ConnectNwcWalletResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PayNwcInvoiceRequest {
+#[serde(deny_unknown_fields)]
+pub struct PayPurchaseLegRequest {
     pub expected_account_pubkey: String,
-    pub bolt11: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PayNwcInvoiceResponse {
-    pub preimage: String,
-    pub fees_paid_msat: Option<u64>,
+    pub quote_id: String,
+    pub attempt_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -884,8 +884,14 @@ pub struct SplitInvoiceResponse {
     pub attempt_id: String,
     pub leg_id: String,
     pub amount_msat: u64,
-    pub payment_hash: String,
-    pub bolt11: String,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SplitRefundInvoiceResponse {
+    pub attempt_id: String,
+    pub leg_id: String,
+    pub amount_msat: u64,
     pub expires_at: u64,
 }
 
@@ -1566,15 +1572,6 @@ pub async fn select_build_file<R: tauri::Runtime>(
     Ok(path)
 }
 
-#[tauri::command]
-pub async fn request_lnurl_invoice(
-    request: RequestLnurlInvoiceRequest,
-    state: State<'_, AppState>,
-) -> Result<RequestLnurlInvoiceResponse, String> {
-    arcadestr_core::purchase_contract::require_live_purchase_authorization()?;
-    request_lnurl_invoice_with_http(state.http_client.as_ref(), request).await
-}
-
 // Resolve from backend authentication, never from an arbitrary frontend account key.
 fn nwc_account(
     auth: &arcadestr_core::auth::AuthState,
@@ -1637,7 +1634,9 @@ pub async fn disconnect_nwc_wallet(
 ) -> Result<(), String> {
     let auth = state.auth.lock().await;
     let account = nwc_account(&auth, &expected_account_pubkey)?;
-    remove_nwc_connection(&account).map_err(nwc_safe_error)
+    state
+        .settlement_recovery
+        .change_wallet(|| remove_nwc_connection(&account).map_err(nwc_safe_error))
 }
 
 #[tauri::command]
@@ -1668,8 +1667,9 @@ pub async fn connect_nwc_wallet(
 ) -> Result<ConnectNwcWalletResponse, String> {
     let auth = state.auth.lock().await;
     let account = nwc_account(&auth, &request.expected_account_pubkey)?;
-    let connection =
-        save_nwc_connection(&account, &request.connection_string).map_err(nwc_safe_error)?;
+    let connection = state.settlement_recovery.change_wallet(|| {
+        save_nwc_connection(&account, &request.connection_string).map_err(nwc_safe_error)
+    })?;
     Ok(nwc_connection_response(&connection))
 }
 
@@ -1684,14 +1684,21 @@ fn nwc_connection_response(
 }
 
 #[tauri::command]
-pub async fn pay_nwc_invoice(
-    request: PayNwcInvoiceRequest,
+pub async fn pay_purchase_leg(
+    request: PayPurchaseLegRequest,
     state: State<'_, AppState>,
-) -> Result<PayNwcInvoiceResponse, String> {
+) -> Result<SplitSettlementResponse, String> {
     arcadestr_core::purchase_contract::require_live_purchase_authorization()?;
-    let auth = { state.auth.lock().await.clone() };
-    let initiating_account = nwc_account(&auth, &request.expected_account_pubkey)?;
-    let connection = { load_nwc_connection(&initiating_account).map_err(nwc_safe_error)? };
+    let (auth, initiating_account, connection, wallet_fence) = {
+        let auth = state.auth.lock().await;
+        let account = nwc_account(&auth, &request.expected_account_pubkey)?;
+        state.settlement_recovery.observe(Some(account.to_hex()));
+        let fence = state
+            .settlement_recovery
+            .wallet_dispatch_fence(&account.to_hex())?;
+        let connection = load_nwc_connection(&account).map_err(nwc_safe_error)?;
+        (auth.clone(), account, connection, fence)
+    };
     let signer = auth
         .signer()
         .ok_or_else(|| "not authenticated".to_string())?;
@@ -1703,58 +1710,201 @@ pub async fn pay_nwc_invoice(
         return Err("payment signer/account mismatch".into());
     }
     ensure_purchase_account_current(&state, account).await?;
-    // Raw invoices are not purchase authorization. Only an original persisted
-    // attempt can enter the app-owned plan executor; there is no legacy bypass.
-    let parsed = request
-        .bolt11
-        .parse::<lightning_invoice::Bolt11Invoice>()
-        .map_err(|_| "Invalid payment invoice")?;
-    let (quote_id,attempt_id,encrypted):(String,String,Vec<u8>)=sqlx::query_as(
-        "SELECT quote_id,attempt_id,encrypted_attempt FROM settlement_invoice_attempts WHERE account_pubkey=? AND payment_hash=?")
-        .bind(account.to_hex()).bind(parsed.payment_hash().to_string()).fetch_optional(state.database.pool()).await
-        .map_err(|_|"Purchase checkpoint unavailable")?.ok_or("An immutable approved purchase is required; raw-invoice NWC dispatch is disabled")?;
-    let text = signer
-        .nip44_decrypt(
-            &account,
-            std::str::from_utf8(&encrypted).map_err(|_| "Invalid invoice checkpoint")?,
-        )
-        .await
-        .map_err(|_| "Invoice checkpoint locked")?;
-    let original: arcadestr_core::adp_client::SettlementInvoiceResponse =
-        serde_json::from_str(&text).map_err(|_| "Invalid invoice checkpoint")?;
-    if original.bolt11 != request.bolt11 {
-        return Err("Invoice differs from the original purchase checkpoint".into());
-    }
-    let stored = arcadestr_core::settlement_repository::SettlementRepository::new(
+    let PayPurchaseLegRequest {
+        quote_id,
+        attempt_id,
+        ..
+    } = request;
+    let repository = arcadestr_core::settlement_repository::SettlementRepository::new(
         state.database.pool().clone(),
-    )
-    .load(&account.to_hex(), &quote_id)
-    .await
-    .map_err(|_| "Purchase checkpoint unavailable")?
-    .ok_or("Purchase checkpoint missing")?;
+    );
+    let stored = repository
+        .load(&account.to_hex(), &quote_id)
+        .await
+        .map_err(|_| "Purchase checkpoint unavailable")?
+        .ok_or("Purchase checkpoint missing")?;
     let lease = crate::settlement_ui::claim(
         &state,
         account,
         &format!("purchase:{}:{}", stored.processor_url, quote_id),
     )
     .await?;
-    let result =
-        arcadestr_core::purchase_execution::PurchaseExecutor::new(state.database.pool().clone())
-            .pay_leg_guarded(
-                signer,
-                &NwcClient::new(connection),
-                &quote_id,
-                &attempt_id,
-                &|| lease.ensure_current(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+    let attempt = repository
+        .invoice_attempt(&account.to_hex(), &quote_id, &attempt_id)
+        .await
+        .map_err(|_| "Purchase checkpoint unavailable")?
+        .ok_or("Original purchase attempt missing")?;
+    let text = signer
+        .nip44_decrypt(
+            &account,
+            std::str::from_utf8(&attempt.encrypted_attempt)
+                .map_err(|_| "Invalid invoice checkpoint")?,
+        )
+        .await
+        .map_err(|_| "Invoice checkpoint locked")?;
+    let original: arcadestr_core::adp_client::SettlementInvoiceResponse =
+        serde_json::from_str(&text).map_err(|_| "Invalid invoice checkpoint")?;
+    let parsed = original
+        .bolt11
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .map_err(|_| "Invalid original payment invoice")?;
+    if original.quote_id != quote_id
+        || original.attempt_id != attempt_id
+        || original.payment_hash != attempt.payment_hash
+        || original.payment_hash != parsed.payment_hash().to_string()
+    {
+        return Err("Original invoice binding mismatch".into());
+    }
+    #[cfg(feature = "regtest-carol-only")]
+    arcadestr_core::payment_boundary::require_carol_only_dispatch(
+        std::env::var("ARCADESTR_REGTEST_CAROL_ONLY")
+            .ok()
+            .as_deref(),
+        &account.to_hex(),
+        &quote_id,
+        &original.leg_id,
+        &parsed,
+    )?;
+    let wallet = NwcClient::new(connection).with_dispatch_fence(wallet_fence.clone());
+    let executor =
+        arcadestr_core::purchase_execution::PurchaseExecutor::new(state.database.pool().clone());
+    buyer_dispatch_boundary(
+        &state,
+        signer,
+        &executor,
+        &wallet,
+        account,
+        &quote_id,
+        &parsed,
+        &original.bolt11,
+    )
+    .await?;
+    lease.ensure_current()?;
+    wallet_fence.ensure_current()?;
+    let result = executor
+        .pay_leg_guarded(signer, &wallet, &quote_id, &attempt_id, &|| {
+            lease.ensure_current()
+        })
+        .await
+        .map_err(|error| error.to_string())?;
     // Always persist the initiating account's result before checking an account switch.
     ensure_purchase_account_current(&state, account).await?;
-    Ok(PayNwcInvoiceResponse {
-        preimage: result.preimage,
-        fees_paid_msat: result.fees_paid_msat,
+    submit_split_payment_inner(
+        SubmitSplitPaymentRequest {
+            server_url: stored.processor_url,
+            quote_id,
+            attempt_id,
+            preimage: result.preimage,
+        },
+        state,
+        &lease,
+    )
+    .await
+}
+
+fn invoice_network(
+    invoice: &lightning_invoice::Bolt11Invoice,
+) -> Result<arcadestr_core::purchase_contract::InvoiceNetwork, String> {
+    use arcadestr_core::purchase_contract::InvoiceNetwork;
+    Ok(match invoice.currency() {
+        lightning_invoice::Currency::Bitcoin => InvoiceNetwork::Bitcoin,
+        lightning_invoice::Currency::BitcoinTestnet => InvoiceNetwork::Testnet,
+        lightning_invoice::Currency::Signet => InvoiceNetwork::Signet,
+        lightning_invoice::Currency::Regtest => InvoiceNetwork::Regtest,
+        _ => return Err("Unsupported invoice network".into()),
     })
+}
+
+/// Release payment boundary for one buyer leg, evaluated immediately before
+/// the durable executor admits it: activation, session, approved wallet,
+/// wallet capabilities and network, fee policy and listing freshness.
+#[allow(clippy::too_many_arguments)]
+async fn buyer_dispatch_boundary(
+    state: &State<'_, AppState>,
+    signer: &dyn arcadestr_core::signers::NostrSigner,
+    executor: &arcadestr_core::purchase_execution::PurchaseExecutor,
+    wallet: &NwcClient,
+    account: nostr::PublicKey,
+    quote_id: &str,
+    invoice: &lightning_invoice::Bolt11Invoice,
+    bolt11: &str,
+) -> Result<(), String> {
+    use arcadestr_core::{
+        durable_payments::PaymentWallet,
+        payment_boundary::{
+            authorize_buyer_dispatch, release_activation, require_network, verify_wallet,
+            BuyerDispatchCheck, PaymentPurpose,
+        },
+        purchase_contract::RoutingFeePolicy,
+    };
+    let activation = release_activation(PaymentPurpose::BuyerPurchase);
+    let network = invoice_network(invoice)?;
+    require_network(activation, network).map_err(|refusal| refusal.to_string())?;
+    let review = executor
+        .review(signer, Some(wallet), quote_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let verified = verify_wallet(
+        &wallet.payment_identity().map_err(nwc_safe_error)?,
+        wallet.capabilities().await.map_err(nwc_safe_error)?,
+        network,
+    )
+    .map_err(|refusal| refusal.to_string())?;
+    let listing = require_current_checkout_listing(
+        state,
+        &account.to_hex(),
+        quote_id,
+        &review.quote.listing_coordinate,
+        &review.quote.listing_event_id,
+    )
+    .await?;
+    let current = state.auth.lock().await.public_key().map(|key| key.to_hex());
+    let initiating = account.to_hex();
+    let fee_policy = review.approved_fee_policy.unwrap_or_default();
+    // Everything already admitted for this account, at its worst-case fee bound.
+    let account_admitted: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(amount_msat+COALESCE(fees_paid_msat,fee_bound_msat)),0) FROM purchase_execution_admissions WHERE account_pubkey=?")
+        .bind(&initiating)
+        .fetch_one(state.database.pool())
+        .await
+        .map_err(|_| "Purchase admissions unavailable")?;
+    let limits = review.approved_limits.as_ref();
+    // Conservative: this leg's principal plus the whole approved fee reserve.
+    let next_leg_msat = invoice
+        .amount_milli_satoshis()
+        .unwrap_or(u64::MAX)
+        .saturating_add(limits.map_or(u64::MAX, |l| l.fee_reserve_msat));
+    authorize_buyer_dispatch(
+        activation,
+        &BuyerDispatchCheck {
+            initiating_account: &initiating,
+            current_account: current.as_deref(),
+            approved_wallet_identity: match (review.approved, review.approved_limits.is_some()) {
+                (true, _) => Some(verified.identity.as_str()),
+                (false, true) => Some("a different wallet"),
+                (false, false) => None,
+            },
+            approval_halted: review.halted,
+            wallet: &verified,
+            fee_policy,
+            // The executor refuses to persist a reported-fee approval without it.
+            fee_risk_acknowledged: fee_policy == RoutingFeePolicy::ReportedFees,
+            wallet_fee_ceiling_available: wallet.maximum_fee_msat(bolt11).is_some(),
+            pinned_listing_event_id: &review.quote.listing_event_id,
+            listing: &listing,
+            invoice_network: network,
+            approved_total_msat: limits.map_or(u64::MAX, |l| l.total_msat),
+            account_admitted_msat: u64::try_from(account_admitted).unwrap_or(u64::MAX),
+            next_leg_msat,
+        },
+    )
+    .map_err(|refusal| refusal.to_string())
+}
+
+/// Activation compiled into this desktop build, for every payment surface.
+#[tauri::command]
+pub async fn get_payment_activation(
+) -> Result<arcadestr_core::payment_boundary::PaymentActivationStatus, String> {
+    Ok(arcadestr_core::payment_boundary::activation_status())
 }
 
 /// Non-spending review of the original plan. Optional get_info is the only
@@ -1819,10 +1969,17 @@ pub async fn approve_purchase_plan(
     if !request.confirm_complete_plan {
         return Err("Explicit approval of the complete settlement plan is required".into());
     }
-    let auth = { state.auth.lock().await.clone() };
-    let buyer = nwc_account(&auth, &request.expected_account_pubkey)?;
+    let (auth, buyer, wallet, wallet_fence) = {
+        let auth = state.auth.lock().await;
+        let buyer = nwc_account(&auth, &request.expected_account_pubkey)?;
+        state.settlement_recovery.observe(Some(buyer.to_hex()));
+        let fence = state
+            .settlement_recovery
+            .wallet_dispatch_fence(&buyer.to_hex())?;
+        let wallet = NwcClient::new(load_nwc_connection(&buyer).map_err(nwc_safe_error)?);
+        (auth.clone(), buyer, wallet, fence)
+    };
     let signer = auth.signer().ok_or("Connect/unlock the original buyer")?;
-    let wallet = NwcClient::new(load_nwc_connection(&buyer).map_err(nwc_safe_error)?);
     let lease =
         crate::settlement_ui::claim(&state, buyer, &format!("approve:{}", request.quote_id))
             .await?;
@@ -1832,6 +1989,55 @@ pub async fn approve_purchase_plan(
         .review(signer, Some(&wallet), &request.quote_id)
         .await
         .map_err(|e| e.to_string())?;
+    lease.ensure_current()?;
+    // A test build approves only regtest plans within its hard ceilings.
+    {
+        use arcadestr_core::payment_boundary::{
+            release_activation, require_activation, require_fee_policy, require_network,
+            require_test_ceilings, PaymentPurpose,
+        };
+        let activation = release_activation(PaymentPurpose::BuyerPurchase);
+        require_activation(activation, PaymentPurpose::BuyerPurchase).map_err(|r| r.to_string())?;
+        require_network(activation, request.network).map_err(|r| r.to_string())?;
+        require_fee_policy(
+            activation,
+            request.fee_policy,
+            request.accept_unenforced_fee_risk,
+        )
+        .map_err(|r| r.to_string())?;
+        require_test_ceilings(activation, request.total_msat, request.total_msat)
+            .map_err(|r| r.to_string())?;
+    }
+    // Approval binds a wallet only after standard get_info shows it can pay and
+    // reconcile on the approved network.
+    arcadestr_core::payment_boundary::verify_wallet(
+        &wallet.payment_identity().map_err(nwc_safe_error)?,
+        wallet.capabilities().await.map_err(nwc_safe_error)?,
+        request.network,
+    )
+    .map_err(|refusal| refusal.to_string())?;
+    if request.fee_policy == arcadestr_core::purchase_contract::RoutingFeePolicy::ProviderCeiling {
+        // This desktop currently constructs only the standard NIP-47 adapter.
+        // Do not persist an immutable strict approval for an unsupported wallet.
+        return Err(
+            arcadestr_core::payment_boundary::BoundaryRefusal::FeeCeilingUnavailable.to_string(),
+        );
+    }
+    if let arcadestr_core::payment_boundary::ListingCheck::NotCurrent(reason) =
+        require_current_checkout_listing(
+            &state,
+            &buyer.to_hex(),
+            &request.quote_id,
+            &review.quote.listing_coordinate,
+            &review.quote.listing_event_id,
+        )
+        .await?
+    {
+        return Err(
+            arcadestr_core::payment_boundary::BoundaryRefusal::ListingNotCurrent(reason)
+                .to_string(),
+        );
+    }
     lease.ensure_current()?;
     executor
         .approve_verified_with_fee_policy(
@@ -1849,11 +2055,15 @@ pub async fn approve_purchase_plan(
             request.network,
             request.fee_policy,
             request.accept_unenforced_fee_risk,
-            &|| lease.ensure_current(),
+            &|| {
+                lease.ensure_current()?;
+                wallet_fence.ensure_current()
+            },
         )
         .await
         .map_err(|e| e.to_string())?;
     lease.ensure_current()?;
+    wallet_fence.ensure_current()?;
     ensure_purchase_account_current(&state, buyer).await?;
     get_purchase_plan(
         arcadestr_core::purchase_contract::PurchasePlanRequest {
@@ -1865,11 +2075,19 @@ pub async fn approve_purchase_plan(
     .await
 }
 
-#[tauri::command]
+#[cfg(test)]
 pub async fn confirm_purchase(
     request: ConfirmPurchaseRequest,
     state: State<'_, AppState>,
 ) -> Result<ConfirmPurchaseResponse, String> {
+    arcadestr_core::durable_payments::validate_payment_proof(
+        &request.bolt11,
+        &arcadestr_core::nwc_client::PayInvoiceResult {
+            preimage: request.preimage.clone(),
+            fees_paid_msat: None,
+        },
+    )
+    .map_err(|_| "Payment proof does not match the supplied legacy invoice")?;
     let auth_snapshot = { state.auth.lock().await.clone() };
     let signer = auth_snapshot
         .signer()
@@ -2197,7 +2415,11 @@ pub async fn start_split_purchase(
         .await
         .map_err(|error| error.to_string())?;
     let coordinate = listing_coordinate_from_npub(&request.publisher_npub, &request.listing_id)?;
-    let listing = fetch_listing_event_by_coordinate(&state, &coordinate).await?;
+    let listing = match resolve_checkout_listing(&state, &buyer.to_hex(), &coordinate, None).await?
+    {
+        arcadestr_core::checkout_freshness::ListingFreshness::Current(event) => *event,
+        other => return Err(format!("No purchase was created: {}", other.describe())),
+    };
     let terms_events = fetch_terms_events(&state, &listing).await?;
     if !listing.tags.iter().any(|tag| {
         let v = tag.as_slice();
@@ -2216,10 +2438,22 @@ pub async fn start_split_purchase(
         .await
         .map_err(|_| "Stored settlements unavailable")?
     {
-        if existing.state == "settled" && existing.receipt_event_json.is_some() {
+        if (existing.state == "settled" && existing.receipt_event_json.is_some())
+            || existing.state == "superseded"
+        {
             continue;
         }
         if existing.processor_url.trim_end_matches('/') != request.server_url.trim_end_matches('/')
+        {
+            continue;
+        }
+        // A processor-confirmed failed quote with every payment resolved can no
+        // longer be paid; its refund obligations stay tracked on that quote.
+        if existing.state == "failed"
+            && repository
+                .failed_quote_resolved(&buyer.to_hex(), &existing.quote_id)
+                .await
+                .map_err(|_| "Stored settlements unavailable")?
         {
             continue;
         }
@@ -2231,6 +2465,22 @@ pub async fn start_split_purchase(
             .map_err(|_| "Stored purchase is locked; review recovery")?;
         let quote = arcadestr_core::adp_settlement::verify_quote_event(&event, &text)
             .map_err(|_| "Stored quote failed validation")?;
+        // An expired quote can no longer be paid, and the processor returns the
+        // same expired quote for the same purchase identity. Close it locally if
+        // nothing was ever dispatched; otherwise it stays halted for recovery.
+        if quote.listing_coordinate == coordinate
+            && existing.state == "active"
+            && nostr::Timestamp::now().as_secs() >= quote.payment_expires_at
+            && arcadestr_core::purchase_execution::PurchaseExecutor::new(
+                state.database.pool().clone(),
+            )
+            .supersede_unpaid(&buyer.to_hex(), &existing.quote_id)
+            .await
+            .map_err(|e| e.to_string())?
+                == arcadestr_core::purchase_execution::SupersedeOutcome::Superseded
+        {
+            continue;
+        }
         if quote.listing_coordinate == coordinate
             && request.purchase_id.as_deref() != Some(&existing.quote_id)
         {
@@ -2371,7 +2621,7 @@ pub async fn next_split_invoice(
     let invoice = client
         .settlement_next_invoice(signer, &request.quote_id)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "Processor could not prepare the next committed payment leg")?;
     let event: nostr::Event =
         serde_json::from_str(&stored.quote_event_json).map_err(|_| "Invalid original quote")?;
     let text = signer
@@ -2382,6 +2632,16 @@ pub async fn next_split_invoice(
         .map_err(|_| "Invalid original quote")?;
     arcadestr_core::adp_settlement::verify_original_invoice(&quote, &invoice)
         .map_err(|_| "Returned invoice does not bind the original plan")?;
+    let parsed = invoice
+        .bolt11
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .map_err(|_| "Invalid original payment invoice")?;
+    use arcadestr_core::payment_boundary::{release_activation, require_network, PaymentPurpose};
+    require_network(
+        release_activation(PaymentPurpose::BuyerPurchase),
+        invoice_network(&parsed)?,
+    )
+    .map_err(|refusal| refusal.to_string())?;
     ensure_purchase_account_current(&state, buyer).await?;
     let encrypted = signer
         .nip44_encrypt(
@@ -2408,8 +2668,6 @@ pub async fn next_split_invoice(
         attempt_id: invoice.attempt_id,
         leg_id: invoice.leg_id,
         amount_msat: invoice.amount_msat,
-        payment_hash: invoice.payment_hash,
-        bolt11: invoice.bolt11,
         expires_at: invoice.expires_at,
     })
 }
@@ -2485,6 +2743,19 @@ pub(crate) async fn submit_split_payment_inner(
     {
         return Err("stored invoice binding mismatch".into());
     }
+    let event: nostr::Event =
+        serde_json::from_str(&stored.quote_event_json).map_err(|_| "Invalid original quote")?;
+    let text = signer
+        .nip44_decrypt(&event.pubkey, &event.content)
+        .await
+        .map_err(|_| "Original quote locked")?;
+    let quote = arcadestr_core::adp_settlement::verify_quote_event(&event, &text)
+        .map_err(|_| "Invalid original quote")?;
+    if quote.buyer_pubkey != buyer.to_hex() || quote.quote_id != request.quote_id {
+        return Err("Original quote does not bind this buyer and attempt".into());
+    }
+    arcadestr_core::adp_settlement::verify_original_invoice(&quote, &invoice)
+        .map_err(|_| "Stored invoice does not bind the original plan")?;
     arcadestr_core::durable_payments::validate_payment_proof(
         &invoice.bolt11,
         &arcadestr_core::nwc_client::PayInvoiceResult {
@@ -2521,9 +2792,19 @@ pub(crate) async fn submit_split_payment_inner(
             },
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| {
+            "Processor confirmation unavailable; recover the original proof without paying again"
+        })?;
     lease.ensure_current()?;
     ensure_purchase_account_current(&state, buyer).await?;
+    if !matches!(response.state.as_str(), "active" | "settled")
+        || response.settled_leg.as_deref() != Some(invoice.leg_id.as_str())
+    {
+        return Err(
+            "Processor did not acknowledge the original paid leg; recover without paying again"
+                .into(),
+        );
+    }
     repository
         .update_invoice_state(
             &buyer.to_hex(),
@@ -2907,7 +3188,8 @@ pub async fn prepare_split_recovery(
 pub async fn prepare_split_refund(
     request: SplitRefundRequest,
     state: State<'_, AppState>,
-) -> Result<arcadestr_core::adp_client::RefundInvoiceResponse, String> {
+) -> Result<SplitRefundInvoiceResponse, String> {
+    arcadestr_core::purchase_contract::require_live_refund_authorization()?;
     let auth = { state.auth.lock().await.clone() };
     let signer = auth
         .signer()
@@ -2929,7 +3211,17 @@ pub async fn prepare_split_refund(
     let response = client
         .prepare_refund(signer, &request.quote_id, &request.leg_id)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "Could not prepare the original refund invoice")?;
+    let parsed = response
+        .bolt11
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .map_err(|_| "Invalid original refund invoice")?;
+    use arcadestr_core::payment_boundary::{release_activation, require_network, PaymentPurpose};
+    require_network(
+        release_activation(PaymentPurpose::RecipientRefund),
+        invoice_network(&parsed)?,
+    )
+    .map_err(|refusal| refusal.to_string())?;
     lease.ensure_current()?;
     crate::settlement_ui::store_prepared(&state, signer, account, &request, &response).await?;
     ensure_purchase_account_current(&state, account).await?;
@@ -2942,7 +3234,12 @@ pub async fn prepare_split_refund(
         )
         .await
         .map_err(|error| error.to_string())?;
-    Ok(response)
+    Ok(SplitRefundInvoiceResponse {
+        attempt_id: response.attempt_id,
+        leg_id: response.leg_id,
+        amount_msat: response.amount_msat,
+        expires_at: response.expires_at,
+    })
 }
 
 #[tauri::command]
@@ -2958,6 +3255,49 @@ pub async fn confirm_split_refund(
         .get_public_key()
         .await
         .map_err(|error| error.to_string())?;
+    let lease = crate::settlement_ui::claim(
+        &state,
+        account,
+        &format!(
+            "refund:{}:{}:{}",
+            request.server_url, request.quote_id, request.leg_id
+        ),
+    )
+    .await?;
+    let encrypted: Vec<u8> = sqlx::query_scalar("SELECT encrypted_invoice FROM client_refund_attempts WHERE account_pubkey=? AND processor_url=? AND quote_id=? AND leg_id=? AND attempt_id=?")
+        .bind(account.to_hex()).bind(&request.server_url).bind(&request.quote_id).bind(&request.leg_id).bind(&request.attempt_id)
+        .fetch_optional(state.database.pool()).await.map_err(|_| "Refund checkpoint unavailable")?
+        .ok_or("Original refund attempt is not stored for this account")?;
+    let plaintext = signer
+        .nip44_decrypt(
+            &account,
+            std::str::from_utf8(&encrypted).map_err(|_| "Invalid refund checkpoint")?,
+        )
+        .await
+        .map_err(|_| "Original refund locked")?;
+    let invoice: arcadestr_core::adp_client::RefundInvoiceResponse =
+        serde_json::from_str(&plaintext).map_err(|_| "Invalid refund checkpoint")?;
+    if invoice.attempt_id != request.attempt_id || invoice.leg_id != request.leg_id {
+        return Err("Original refund attempt binding mismatch".into());
+    }
+    arcadestr_core::durable_payments::validate_payment_proof(
+        &invoice.bolt11,
+        &arcadestr_core::nwc_client::PayInvoiceResult {
+            preimage: request.preimage.clone(),
+            fees_paid_msat: None,
+        },
+    )
+    .map_err(|_| "Invalid original refund proof")?;
+    let proof = signer
+        .nip44_encrypt(&account, &request.preimage)
+        .await
+        .map_err(|_| "Refund proof encryption unavailable")?;
+    lease.ensure_current()?;
+    sqlx::query("UPDATE client_refund_attempts SET encrypted_proof=COALESCE(encrypted_proof,?),state=CASE WHEN state='verified' THEN state ELSE 'confirming' END,updated_at=unixepoch() WHERE account_pubkey=? AND processor_url=? AND quote_id=? AND leg_id=? AND attempt_id=?")
+        .bind(proof.as_bytes()).bind(account.to_hex()).bind(&request.server_url).bind(&request.quote_id).bind(&request.leg_id).bind(&request.attempt_id)
+        .execute(state.database.pool()).await.map_err(|_| "Refund proof persistence unavailable")?;
+    lease.ensure_current()?;
+    let processor = request.server_url.clone();
     let client = AdpClient::new(request.server_url, Arc::clone(&state.http_client));
     let response = client
         .confirm_refund(
@@ -2968,8 +3308,15 @@ pub async fn confirm_split_refund(
             &request.preimage,
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "Original refund proof saved; recover without paying again")?;
+    if response["state"] != "verified" {
+        return Err("Processor has not verified the refund".into());
+    }
     ensure_purchase_account_current(&state, account).await?;
+    lease.ensure_current()?;
+    sqlx::query("UPDATE client_refund_attempts SET state='verified',updated_at=unixepoch() WHERE account_pubkey=? AND processor_url=? AND quote_id=? AND leg_id=? AND attempt_id=?")
+        .bind(account.to_hex()).bind(processor).bind(&request.quote_id).bind(&request.leg_id).bind(&request.attempt_id)
+        .execute(state.database.pool()).await.map_err(|_| "Verified refund state persistence unavailable")?;
     arcadestr_core::settlement_repository::SettlementRepository::new(state.database.pool().clone())
         .update_recovery_state(
             &account.to_hex(),
@@ -2979,7 +3326,7 @@ pub async fn confirm_split_refund(
         )
         .await
         .map_err(|error| error.to_string())?;
-    Ok(response)
+    Ok(serde_json::json!({"state": "verified"}))
 }
 
 /// Claim signing is session-bound, but never uses publisher signing checkpoints.
@@ -3170,6 +3517,7 @@ fn listing_coordinate_from_npub(publisher_npub: &str, listing_id: &str) -> Resul
     Ok(format!("30402:{}:{}", merchant_pubkey.to_hex(), listing_id))
 }
 
+#[cfg(test)]
 async fn request_lnurl_invoice_with_http(
     http: &dyn HttpClient,
     request: RequestLnurlInvoiceRequest,
@@ -3194,6 +3542,99 @@ pub(crate) async fn fetch_listing_event_by_coordinate(
     fetch_replaceable_listing_event_by_coordinate(state, coordinate)
         .await?
         .ok_or_else(|| "listing event not found on relays".to_string())
+}
+
+/// Checkout listing evidence for irreversible payments (Arcadestr policy in
+/// `arcadestr_core::checkout_freshness`). `pinned` is the approved revision.
+pub(crate) async fn resolve_checkout_listing(
+    state: &State<'_, AppState>,
+    account: &str,
+    coordinate: &str,
+    pinned: Option<&str>,
+) -> Result<arcadestr_core::checkout_freshness::ListingFreshness, String> {
+    use arcadestr_core::checkout_freshness::{evaluate_checkout_listing, CheckoutFreshnessPolicy};
+    let mut parts = coordinate.splitn(3, ':');
+    let (Some("30402"), Some(developer), Some(d_tag)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err("purchase coordinate must be a kind:30402 listing".into());
+    };
+    let developer =
+        nostr::PublicKey::from_hex(developer).map_err(|_| "invalid coordinate developer")?;
+    let pinned = pinned
+        .map(nostr::EventId::from_hex)
+        .transpose()
+        .map_err(|_| "invalid approved listing revision")?;
+    let manager = {
+        let shared = { state.nostr.lock().await.get_relay_manager().clone() };
+        let manager = shared.lock().await.clone();
+        manager
+    };
+    let coverage = manager
+        .fetch_relay_coverage(
+            nostr::Filter::new()
+                .kind(nostr::Kind::Custom(30402))
+                .author(developer)
+                .identifier(d_tag),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+    // Revisions this device already verified for this account's purchases.
+    let retained: Vec<String> = sqlx::query_scalar(
+        "SELECT listing_event_json FROM purchase_quote_verification WHERE account_pubkey=?",
+    )
+    .bind(account)
+    .fetch_all(state.database.pool())
+    .await
+    .map_err(|_| "Purchase evidence unavailable")?;
+    let retained = retained
+        .iter()
+        .filter_map(|json| serde_json::from_str::<nostr::Event>(json).ok())
+        .collect::<Vec<_>>();
+    Ok(evaluate_checkout_listing(
+        coordinate,
+        pinned,
+        &coverage,
+        &retained,
+        CheckoutFreshnessPolicy::for_configured_relays(coverage.configured()),
+    ))
+}
+
+/// Revalidate the approved revision. A newer or conflicting revision supersedes
+/// an undispatched quote (or halts a partially dispatched one) and requires a
+/// new quote and approval; insufficient evidence only refuses this attempt.
+pub(crate) async fn require_current_checkout_listing(
+    state: &State<'_, AppState>,
+    account: &str,
+    quote_id: &str,
+    coordinate: &str,
+    pinned: &str,
+) -> Result<arcadestr_core::payment_boundary::ListingCheck, String> {
+    use arcadestr_core::checkout_freshness::ListingFreshness;
+    use arcadestr_core::payment_boundary::ListingCheck;
+    let freshness = resolve_checkout_listing(state, account, coordinate, Some(pinned)).await?;
+    Ok(match freshness {
+        ListingFreshness::Current(event) => ListingCheck::Current {
+            listing_event_id: event.id.to_hex(),
+        },
+        changed @ (ListingFreshness::Superseded { .. } | ListingFreshness::Conflicting { .. }) => {
+            let outcome = arcadestr_core::purchase_execution::PurchaseExecutor::new(
+                state.database.pool().clone(),
+            )
+            .supersede_unpaid(account, quote_id)
+            .await
+            .map_err(|e| e.to_string())?;
+            ListingCheck::NotCurrent(format!(
+                "{}. {}",
+                changed.describe(),
+                match outcome {
+                    arcadestr_core::purchase_execution::SupersedeOutcome::Superseded =>
+                        "No payment was sent; this quote was closed and a new purchase can start.",
+                    _ => "Further payments are halted; review the partial settlement.",
+                }
+            ))
+        }
+        other => ListingCheck::NotCurrent(other.describe()),
+    })
 }
 
 async fn fetch_replaceable_listing_event_by_coordinate(
@@ -3221,20 +3662,18 @@ async fn fetch_replaceable_listing_event_by_coordinate(
         let manager = relay_manager.lock().await;
         manager.get_client_arc()
     };
-    let timeout_duration = std::time::Duration::from_secs(10);
-    let events = tokio::time::timeout(
-        timeout_duration,
-        relay_client.fetch_events(
+    // One deadline only: the SDK returns what relays delivered by its timeout.
+    // An outer timeout of the same length raced it and discarded those events.
+    let events = relay_client
+        .fetch_events(
             nostr::Filter::new()
                 .kind(nostr::Kind::Custom(30402))
                 .author(developer_pubkey)
                 .identifier(d_tag),
-            timeout_duration,
-        ),
-    )
-    .await
-    .map_err(|_| "listing event fetch timed out".to_string())?
-    .map_err(|err| err.to_string())?;
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
     let events = events.into_iter().collect::<Vec<_>>();
     Ok(arcadestr_core::marketplace::current_listing_revision(
         &events,
@@ -9186,12 +9625,12 @@ mod tests {
             "ADP_GATE4_STAGE=request_invoice_start nwc={}",
             input.use_nwc_payment
         );
-        let invoice = request_lnurl_invoice(
+        let invoice = request_lnurl_invoice_with_http(
+            input.app.state::<AppState>().http_client.as_ref(),
             RequestLnurlInvoiceRequest {
                 lud16: input.lud16.to_string(),
                 amount_sats: 1,
             },
-            input.app.state::<AppState>(),
         )
         .await
         .expect("LNURL invoice should resolve and request");

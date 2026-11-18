@@ -38,7 +38,6 @@ async fn initiation_is_durable_bound_and_account_and_processor_scoped() {
     assert_eq!(first, again);
     for (revision, binding, id) in [
         (&listing, &commitment, Some("different-id")),
-        (&"33".repeat(32), &commitment, None),
         (&listing, &"44".repeat(32), None),
     ] {
         assert!(

@@ -13,18 +13,17 @@ use crate::models::{
 };
 use crate::store::try_use_profile_store;
 use crate::tauri_bridge::{
-    invoke_add_game_to_library, invoke_claim_entitlement, invoke_confirm_purchase,
-    invoke_discover_campaigns, invoke_enrich_store_page_detail, invoke_get_installed_games,
-    invoke_get_listing_ownership, invoke_get_platform_info, invoke_install_game,
-    invoke_is_game_in_library, invoke_list_retained_packages, invoke_next_split_invoice,
-    invoke_pay_nwc_invoice, invoke_request_lnurl_invoice, invoke_settlement_history,
-    invoke_start_split_purchase, invoke_submit_split_payment, listen_install_progress,
+    invoke_add_game_to_library, invoke_claim_entitlement, invoke_discover_campaigns,
+    invoke_enrich_store_page_detail, invoke_get_installed_games, invoke_get_listing_ownership,
+    invoke_get_platform_info, invoke_install_game, invoke_is_game_in_library,
+    invoke_list_retained_packages, invoke_next_split_invoice, invoke_pay_purchase_leg,
+    invoke_settlement_history, invoke_start_split_purchase, invoke_submit_split_payment,
+    listen_install_progress,
 };
 use crate::tauri_bridge::{
-    CampaignPointerInput, ClaimEntitlementRequest, ConfirmPurchaseRequest,
-    DiscoverCampaignsRequest, DiscoveredCampaign, InstallProgressPayload, InstallProgressPhase,
-    InstalledGame, PayNwcInvoiceRequest, RequestLnurlInvoiceRequest, SplitQuoteRequest,
-    StartSplitPurchaseRequest, SubmitSplitPaymentRequest,
+    CampaignPointerInput, ClaimEntitlementRequest, DiscoverCampaignsRequest, DiscoveredCampaign,
+    InstallProgressPayload, InstallProgressPhase, InstalledGame, PayPurchaseLegRequest,
+    SplitQuoteRequest, StartSplitPurchaseRequest, SubmitSplitPaymentRequest,
 };
 use crate::ui_v2::components::{
     artwork_state_from_url, ArtworkRole, Dialog, DialogCloseAction, DialogCloseButtonPolicy,
@@ -271,19 +270,14 @@ fn install_retry_allowed(action: PrimaryAction) -> bool {
     matches!(action, PrimaryAction::Download | PrimaryAction::Install)
 }
 
-fn account_response_is_current(active_account: Option<&str>, initiating_account: &str) -> bool {
-    active_account == Some(initiating_account)
+/// Check & Update is offered only where the installed copy needs no further
+/// acquisition by the active account (owned, public or active timed access).
+fn update_requires_no_acquisition(action: PrimaryAction) -> bool {
+    matches!(action, PrimaryAction::PlayGame | PrimaryAction::Installed)
 }
 
-fn replay_conflict_presentation(ownership: Result<bool, String>) -> (bool, &'static str) {
-    if matches!(ownership, Ok(true)) {
-        (
-            true,
-            "Purchase already confirmed and ownership verified. You can install this game.",
-        )
-    } else {
-        (false, "The server reports an existing purchase, but local ownership is not verified. Recover or synchronize the original receipt; do not pay again.")
-    }
+fn account_response_is_current(active_account: Option<&str>, initiating_account: &str) -> bool {
+    active_account == Some(initiating_account)
 }
 
 fn active_campaign(campaigns: &[DiscoveredCampaign]) -> Option<DiscoveredCampaign> {
@@ -301,7 +295,7 @@ fn split_settlement_enabled(listing: &GameListing) -> bool {
 }
 
 fn missing_legacy_payment_address(listing: &GameListing) -> bool {
-    !split_settlement_enabled(listing) && listing.lud16.trim().is_empty()
+    !split_settlement_enabled(listing)
 }
 
 fn select_primary_action(
@@ -535,7 +529,7 @@ fn select_primary_action(
         PrimaryAction::NoPaymentAddress => PrimaryActionDecision {
             action: desired,
             label: "Purchase unavailable",
-            explanation: "The seller has not provided a Lightning payment address.",
+            explanation: "This listing does not offer managed paid checkout.",
             enabled: false,
         },
         PrimaryAction::Unavailable => PrimaryActionDecision {
@@ -551,6 +545,13 @@ fn select_primary_action(
             enabled: false,
         },
     }
+}
+
+/// Resume the loaded quote only while it can still be paid. An expired quote
+/// goes back through purchase creation, where the backend supersedes it only
+/// if nothing was dispatched and otherwise requires recovery first.
+fn should_resume_split_quote(payment_expires_at: Option<u64>, now: u64) -> bool {
+    payment_expires_at.is_none_or(|expires_at| now < expires_at)
 }
 
 fn current_unix_secs() -> u64 {
@@ -808,6 +809,7 @@ fn detail_response_is_current(
 
 #[component]
 pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoView {
+    let payment_activation = crate::ui_v2::payment_activation::use_payment_activation();
     let media = valid_image_urls(&listing.images);
     let hero_image = media.first().cloned();
     let gallery_images = media.into_iter().skip(1).collect::<Vec<_>>();
@@ -866,7 +868,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             };
             split_quote_id.set(None);
             split_attempt_id.set(None);
-            invoice.set(None);
             show_invoice.set(false);
             let resume_auth = resume_auth.clone();
             let listing_event_id = listing_event_id.clone();
@@ -929,7 +930,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         if checkout_account.get_untracked() != active || checkout_flow.get_untracked() != epoch {
             checkout_flow.set(epoch);
             checkout_account.set(active);
-            invoice.set(None);
             show_invoice.set(false);
             manual_preimage.set(String::new());
             split_plan.set(None);
@@ -1244,7 +1244,13 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 return;
             }
             if missing_legacy_payment_address(&listing) {
-                buy_error.set(Some("No Lightning address".to_string()));
+                buy_error.set(Some(
+                    "This listing does not offer managed paid checkout.".into(),
+                ));
+                return;
+            }
+            if !payment_activation.buyer_enabled() {
+                buy_error.set(Some(payment_activation.buyer_label().into()));
                 return;
             }
 
@@ -1253,8 +1259,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             success_message.set(None);
             show_invoice.set(false);
 
-            let lud16 = listing.lud16.clone();
-            let amount_sats = listing.price_sats;
             let publisher_npub = listing.publisher_npub.clone();
             let listing_id = listing.id.clone();
             let server_url = adp_server_url(&listing.specs, &listing.download_url);
@@ -1267,7 +1271,14 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                         .ok_or_else(|| "Listing does not include an ADP server URL".to_string());
                     match server_url {
                         Ok(server_url) => {
-                            if let Some(quote_id) = split_quote_id.get_untracked() {
+                            if let Some(quote_id) = split_quote_id.get_untracked().filter(|_| {
+                                should_resume_split_quote(
+                                    split_plan
+                                        .get_untracked()
+                                        .map(|plan| plan.quote.payment_expires_at),
+                                    current_unix_secs(),
+                                )
+                            }) {
                                 invoke_next_split_invoice(SplitQuoteRequest {
                                     server_url,
                                     quote_id,
@@ -1290,7 +1301,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                         next.leg_id, next.amount_msat
                                     )));
                                     plan_refresh.update(|v| *v = v.wrapping_add(1));
-                                    Ok(next.bolt11)
+                                    Ok(())
                                 })
                             } else if refund_address.trim().is_empty() {
                                 Err("Enter a Lightning address for principal refunds before creating the quote.".to_string())
@@ -1327,7 +1338,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                                 next.leg_id, next.amount_msat
                                             )));
                                             plan_refresh.update(|v| *v = v.wrapping_add(1));
-                                            Ok(next.bolt11)
+                                            Ok(())
                                         })
                                     }
                                     Err(error) => Err(error),
@@ -1337,9 +1348,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                         Err(error) => Err(error),
                     }
                 } else {
-                    invoke_request_lnurl_invoice(RequestLnurlInvoiceRequest { lud16, amount_sats })
-                        .await
-                        .map(|response| response.bolt11)
+                    Err("This listing does not support managed paid checkout.".into())
                 };
                 if !account_response_is_current(
                     auth_for_response.npub.get_untracked().as_deref(),
@@ -1349,8 +1358,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     return;
                 }
                 match result {
-                    Ok(bolt11) => {
-                        invoice.set(Some(bolt11));
+                    Ok(()) => {
                         show_invoice.set(true);
                         operation.set(DetailOperation::Idle);
                     }
@@ -1398,7 +1406,6 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                             }) {
                                 ownership_refresh.update(|v| *v = v.wrapping_add(1));
                                 show_invoice.set(false);
-                                invoice.set(None);
                             }
                         }
                     }
@@ -1408,204 +1415,75 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         })
     };
     let plan_server_url = adp_server_url(&listing.specs, &listing.download_url).unwrap_or_default();
-    let on_copy_invoice = Callback::new(move |()| {
-        #[cfg(target_arch = "wasm32")]
-        {
-            if let Some(bolt11) = invoice.get() {
-                if let Some(window) = leptos::web_sys::window() {
-                    let _ = window.navigator().clipboard().write_text(&bolt11);
-                }
+    let refresh_after_payment = Callback::new(
+        move |response: crate::tauri_bridge::SplitSettlementResponse| {
+            plan_refresh.update(|v| *v = v.wrapping_add(1));
+            manual_preimage.set(String::new());
+            split_attempt_id.set(None);
+            show_invoice.set(false);
+            if response.acquisition_complete() {
+                purchase_confirmed.set(true);
+                ownership_refresh.update(|v| *v = v.wrapping_add(1));
+                success_message.set(Some(
+                    "All payment legs settled. Durable ownership is ready for installation.".into(),
+                ));
+            } else if response.state == "settled" {
+                buy_error.set(Some("Payments settled, but a validated receipt is not available. Recover the original purchase; do not pay again.".into()));
+            } else {
+                success_message.set(Some("Payment leg verified. Continue checkout to review the next committed leg, if available.".into()));
             }
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = invoice;
-        }
-    });
-
-    let on_open_wallet = Callback::new(move |()| {
-        #[cfg(target_arch = "wasm32")]
-        {
-            if let Some(bolt11) = invoice.get() {
-                let lightning_uri = format!("lightning:{}", bolt11);
-                if let Some(win) = leptos::web_sys::window() {
-                    let _ = win.location().set_href(&lightning_uri);
-                }
-            }
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = invoice;
-        }
-    });
+        },
+    );
 
     let confirm_auth = auth.clone();
     let confirm_with_preimage = {
-        let listing = listing.clone();
         let confirm_auth = confirm_auth.clone();
+        let server_url = plan_server_url.clone();
         move |preimage: String| {
-            let Some(initiating_account) = confirm_auth.npub.get() else {
-                buy_error.set(Some("Not authenticated".to_string()));
+            let Some(initiating_account) = confirm_auth.npub.get_untracked() else {
                 return;
             };
-            let Some(bolt11) = invoice.get() else {
+            let (Some(quote_id), Some(attempt_id)) = (
+                split_quote_id.get_untracked(),
+                split_attempt_id.get_untracked(),
+            ) else {
                 buy_error.set(Some(
-                    "Request an invoice before confirming purchase".to_string(),
+                    "Open the original purchase attempt before submitting proof.".into(),
                 ));
                 return;
             };
-            let publisher_npub = listing.publisher_npub.clone();
-            let listing_id = listing.id.clone();
-            let server_url = match adp_server_url(&listing.specs, &listing.download_url) {
-                Some(server_url) => server_url,
-                None => {
-                    buy_error.set(Some(
-                        "Listing does not include an ADP server URL".to_string(),
-                    ));
-                    return;
-                }
-            };
-
             operation.set(DetailOperation::ConfirmingPurchase);
             buy_error.set(None);
             success_message.set(None);
-            let auth_for_response = confirm_auth.clone();
-            let auth_epoch = confirm_auth.current_auth_flow();
-            if let (Some(quote_id), Some(attempt_id)) = (
-                split_quote_id.get_untracked(),
-                split_attempt_id.get_untracked(),
-            ) {
-                spawn_local(async move {
-                    let result = invoke_submit_split_payment(SubmitSplitPaymentRequest {
-                        server_url: server_url.clone(),
-                        quote_id: quote_id.clone(),
-                        attempt_id,
-                        preimage,
-                    })
-                    .await;
-                    if !account_response_is_current(
-                        auth_for_response.npub.get_untracked().as_deref(),
-                        &initiating_account,
-                    ) || !auth_for_response.is_current_auth_flow(auth_epoch)
-                    {
-                        return;
-                    }
-                    plan_refresh.update(|v| *v = v.wrapping_add(1));
-                    match result {
-                        Ok(response) if response.acquisition_complete() => {
-                            purchase_confirmed.set(true);
-                            show_invoice.set(false);
-                            success_message.set(Some("All payment legs settled. Durable ownership is ready for installation.".into()));
-                            operation.set(DetailOperation::Idle);
-                        }
-                        Ok(response) if response.state == "settled" => {
-                            buy_error.set(Some("Payments settled, but a validated receipt is not available. Recover the original purchase; do not pay again.".into()));
-                            operation.set(DetailOperation::Idle);
-                        }
-                        Ok(_) => match invoke_next_split_invoice(SplitQuoteRequest {
-                            server_url,
-                            quote_id,
-                        })
-                        .await
-                        {
-                            Ok(next) => {
-                                if !account_response_is_current(
-                                    auth_for_response.npub.get_untracked().as_deref(),
-                                    &initiating_account,
-                                ) || !auth_for_response.is_current_auth_flow(auth_epoch)
-                                {
-                                    return;
-                                }
-                                invoice.set(Some(next.bolt11));
-                                split_attempt_id.set(Some(next.attempt_id));
-                                split_leg_label.set(Some(format!(
-                                    "{} · {} msat",
-                                    next.leg_id, next.amount_msat
-                                )));
-                                plan_refresh.update(|v| *v = v.wrapping_add(1));
-                                manual_preimage.set(String::new());
-                                success_message.set(Some(
-                                    "Payment leg verified. Pay the next committed invoice.".into(),
-                                ));
-                                operation.set(DetailOperation::Idle);
-                            }
-                            Err(error) => {
-                                buy_error.set(Some(error));
-                                operation.set(DetailOperation::Idle);
-                            }
-                        },
-                        Err(error) => {
-                            buy_error.set(Some(error));
-                            operation.set(DetailOperation::Idle);
-                        }
-                    }
-                });
-                return;
-            }
+            let server_url = server_url.clone();
+            let auth = confirm_auth.clone();
+            let epoch = auth.current_auth_flow();
             spawn_local(async move {
-                let request = ConfirmPurchaseRequest {
-                    publisher_npub: publisher_npub.clone(),
-                    listing_id: listing_id.clone(),
+                let result = invoke_submit_split_payment(SubmitSplitPaymentRequest {
                     server_url,
-                    bolt11,
+                    quote_id,
+                    attempt_id,
                     preimage,
-                };
-                let result = invoke_confirm_purchase(request).await;
-                if !account_response_is_current(
-                    auth_for_response.npub.get_untracked().as_deref(),
-                    &initiating_account,
-                ) || !auth_for_response.is_current_auth_flow(auth_epoch)
+                })
+                .await;
+                if !auth.is_current_auth_flow(epoch)
+                    || !account_response_is_current(
+                        auth.npub.get_untracked().as_deref(),
+                        &initiating_account,
+                    )
                 {
                     return;
                 }
+                operation.set(DetailOperation::Idle);
                 match result {
-                    Ok(_) => {
-                        purchase_confirmed.set(true);
-                        success_message.set(Some(
-                            "Payment confirmed. Durable ownership is ready for installation."
-                                .to_string(),
-                        ));
-                        operation.set(DetailOperation::Idle);
-                    }
-                    Err(err) => {
-                        let message = if err.contains("402") {
-                            "Payment proof was rejected. Check the invoice preimage.".to_string()
-                        } else if err.contains("HTTP status 409") {
-                            let owned = invoke_get_listing_ownership(
-                                initiating_account.clone(),
-                                publisher_npub,
-                                listing_id,
-                            )
-                            .await;
-                            if !account_response_is_current(
-                                auth_for_response.npub.get_untracked().as_deref(),
-                                &initiating_account,
-                            ) || !auth_for_response.is_current_auth_flow(auth_epoch)
-                            {
-                                return;
-                            }
-                            let (verified, message) = replay_conflict_presentation(owned);
-                            purchase_confirmed.set(verified);
-                            message.to_string()
-                        } else if err.contains("404") {
-                            "This game is not hosted on the selected ADP server.".to_string()
-                        } else if err.contains("500") {
-                            "The ADP server is not authorized to fulfill this listing.".to_string()
-                        } else {
-                            err
-                        };
-                        buy_error.set(Some(message));
-                        operation.set(DetailOperation::Idle);
-                    }
+                    Ok(response) => refresh_after_payment.run(response),
+                    Err(error) => buy_error.set(Some(error)),
                 }
             });
         }
     };
 
     let on_pay_nwc = {
-        let confirm_with_preimage = confirm_with_preimage.clone();
         let pay_auth = auth.clone();
         Callback::new(move |()| {
             if operation_blocks_dispatch(operation.get_untracked()) {
@@ -1617,8 +1495,16 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                 ));
                 return;
             }
-            let Some(bolt11) = invoice.get() else {
-                buy_error.set(Some("Request an invoice before paying".to_string()));
+            if !payment_activation.buyer_enabled() {
+                return;
+            }
+            let (Some(quote_id), Some(attempt_id)) = (
+                split_quote_id.get_untracked(),
+                split_attempt_id.get_untracked(),
+            ) else {
+                buy_error.set(Some(
+                    "Continue checkout to prepare the next committed leg.".into(),
+                ));
                 return;
             };
             let Some(initiating_account) = pay_auth.npub.get() else {
@@ -1635,12 +1521,12 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             };
             operation.set(DetailOperation::PayingWallet);
             buy_error.set(None);
-            let confirm_with_preimage = confirm_with_preimage.clone();
             let auth_for_response = pay_auth.clone();
             spawn_local(async move {
-                let payment = invoke_pay_nwc_invoice(PayNwcInvoiceRequest {
+                let payment = invoke_pay_purchase_leg(PayPurchaseLegRequest {
                     expected_account_pubkey,
-                    bolt11,
+                    quote_id,
+                    attempt_id,
                 })
                 .await;
                 if !wallet.finish_payment(wallet_generation) {
@@ -1654,16 +1540,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     return;
                 }
                 match payment {
-                    Ok(result) => {
-                        if !account_response_is_current(
-                            auth_for_response.npub.get_untracked().as_deref(),
-                            &initiating_account,
-                        ) {
-                            operation.set(DetailOperation::Idle);
-                            return;
-                        }
-                        manual_preimage.set(result.preimage.clone());
-                        confirm_with_preimage(result.preimage);
+                    Ok(response) => {
+                        operation.set(DetailOperation::Idle);
+                        refresh_after_payment.run(response);
                     }
                     Err(err) => {
                         buy_error.set(Some(err));
@@ -2086,8 +1965,14 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let decision_for_label = primary_decision.clone();
     let decision_for_disabled = primary_decision.clone();
     let decision_for_explanation = primary_decision.clone();
+    let decision_for_action = primary_decision.clone();
+    let primary_action = Signal::derive(move || decision_for_action().action);
     let primary_label = Signal::derive(move || decision_for_label().label);
-    let primary_enabled = Signal::derive(move || decision_for_disabled().enabled);
+    let primary_enabled = Signal::derive(move || {
+        let decision = decision_for_disabled();
+        decision.enabled
+            && (decision.action != PrimaryAction::Buy || payment_activation.buyer_enabled())
+    });
     let primary_explanation = Signal::derive(move || decision_for_explanation().explanation);
     let unowned_access_label = match &listing.acquisition {
         AcquisitionPolicy::Public => "Public access".to_string(),
@@ -2395,6 +2280,9 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     <Show when=move||split_enabled && split_quote_id.get().is_some() && !purchase_confirmed.get()>
                         <button data-testid="detail-safe-recovery" style="padding:10px 14px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.14 195);font:800 11px ui-monospace,monospace;border-radius:4px" disabled=move||operation_blocks_dispatch(operation.get()) on:click=move |_|on_safe_recovery.run(())>"CHECK EXISTING PAYMENT — NO PAYMENT"</button>
                     </Show>
+                    <Show when=move|| split_enabled && !purchase_confirmed.get()>
+                        <p class="v2-social-meta">{move || payment_activation.buyer_label()}</p>
+                    </Show>
                     {move || if operation.get() != DetailOperation::Idle {
                         view! { <p class="v2-detail-status">{operation_status(operation.get())}</p> }.into_any()
                     } else {
@@ -2435,28 +2323,35 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                             })
                             on_recovered=Callback::new(move |()| ownership_refresh.update(|v| *v = v.wrapping_add(1)))/>
                     })}
-                    {move || if show_invoice.get() && !purchase_confirmed.get() {
+                    {move || if !purchase_confirmed.get() && (show_invoice.get() || split_plan.get().is_some_and(|p| p.legs.iter().any(|leg| leg.attempt_id.is_some()))) {
                         view! {
                             <div class="v2-detail-invoice">
                                 <p class="v2-social-meta">{move || split_leg_label.get().map(|leg| format!("Committed payment leg · {leg}")).unwrap_or_else(|| "Lightning invoice".into())}</p>
-                                <crate::ui_v2::components::AdvancedOptions title="INVOICE DETAILS">
-                                    <code style="overflow-wrap:anywhere;word-break:break-all">{move || invoice.get().unwrap_or_default()}</code>
-                                </crate::ui_v2::components::AdvancedOptions>
-                                <div class="v2-detail-action-row">
-                                    <button class="v2-btn-secondary" on:click=move |_| on_copy_invoice.run(())>"Copy invoice"</button>
-                                    <button class="v2-btn-secondary" disabled=arcadestr_core::purchase_contract::require_live_purchase_authorization().is_err() on:click=move |_| on_open_wallet.run(())>"Open wallet"</button>
-                                </div>
                                 <Show when=move || !cfg!(feature = "web")>
                                     <crate::ui_v2::nwc_wallet::NwcWalletPanel />
                                 </Show>
+                                {move || payment_activation.test_build_label().map(|label| view! { <p class="v2-social-meta" data-testid="payment-test-build">{label}</p> })}
                                 <button
                                     class="v2-btn-primary"
                                     on:click=move |_| on_pay_nwc.run(())
-                                    disabled=move || !wallet.payment_available() || operation_blocks_dispatch(operation.get()) || !split_plan.get().is_some_and(|p|p.dispatch_ready(current_unix_secs())) || arcadestr_core::purchase_contract::require_live_purchase_authorization().is_err()
+                                    disabled=move || !show_invoice.get() || !wallet.payment_available() || operation_blocks_dispatch(operation.get()) || !split_plan.get().is_some_and(|p|p.dispatch_ready(current_unix_secs())) || !payment_activation.buyer_enabled()
                                 >
                                     {move || if split_quote_id.get().is_some() { "Pay this part" } else { "Pay and confirm" }}
                                 </button>
                                 <crate::ui_v2::components::AdvancedOptions title="CONFIRM PAYMENT MANUALLY" description="Use this only if your wallet provides a payment proof (preimage) and automatic confirmation has not worked. Paste the proof below; do not pay the invoice again.">
+                                <label for="manual-payment-attempt">"Original payment attempt"</label>
+                                <select id="manual-payment-attempt" class="v2-input"
+                                    prop:value=move || split_attempt_id.get().unwrap_or_default()
+                                    on:change:target=move |event| {
+                                        let value = event.target().value();
+                                        split_attempt_id.set((!value.is_empty()).then_some(value));
+                                        show_invoice.set(false);
+                                    }>
+                                    <option value="">"Select the original attempt"</option>
+                                    {move || split_plan.get().into_iter().flat_map(|plan| plan.legs)
+                                        .filter_map(|leg| leg.attempt_id.map(|id| view! { <option value=id.clone()>{format!("{} · {id}", leg.leg_id)}</option> }))
+                                        .collect_view()}
+                                </select>
                                 <label for="manual-payment-proof">"Payment proof (preimage)"</label>
                                 <input
                                     id="manual-payment-proof"
@@ -3103,17 +2998,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_conflict_is_not_ownership_evidence() {
-        for lookup in [Ok(false), Err("receipt unavailable".to_string())] {
-            let (owned, message) = replay_conflict_presentation(lookup);
-            assert!(!owned);
-            assert!(message.contains("do not pay again"));
-        }
-        assert!(replay_conflict_presentation(Ok(true)).0);
-    }
-
-    #[test]
-    fn nwc_saved_wallet_and_manual_payment_keep_shared_confirmation_routes() {
+    fn managed_checkout_has_no_invoice_export_or_generic_payment_route() {
         let source = include_str!("game_detail.rs");
         let payment = source
             .split("let on_pay_nwc =")
@@ -3123,11 +3008,22 @@ mod tests {
             .next()
             .expect("NWC body");
         assert!(payment.contains("wallet.payment_available()"));
-        assert!(payment.contains("invoke_pay_nwc_invoice(PayNwcInvoiceRequest"));
+        assert!(payment.contains("invoke_pay_purchase_leg(PayPurchaseLegRequest"));
         assert!(payment.contains("expected_account_pubkey"));
         assert!(payment.contains("wallet.finish_payment(wallet_generation)"));
-        assert!(payment.contains("confirm_with_preimage(result.preimage)"));
+        assert!(payment.contains("refresh_after_payment.run(response)"));
         assert!(!payment.contains("connection_string"));
+        for forbidden in [
+            "bolt11",
+            "on_copy_invoice",
+            "on_open_wallet",
+            "invoke_request_lnurl_invoice",
+        ] {
+            assert!(!source
+                .lines()
+                .take_while(|line| *line != "#[cfg(test)]")
+                .any(|line| line.contains(forbidden)));
+        }
         let confirmation = source
             .split("let confirm_with_preimage =")
             .nth(1)
@@ -3136,8 +3032,6 @@ mod tests {
             .next()
             .expect("confirmation body");
         assert!(confirmation.contains("invoke_submit_split_payment(SubmitSplitPaymentRequest"));
-        assert!(confirmation.contains("invoke_next_split_invoice(SplitQuoteRequest"));
-        assert!(confirmation.contains("invoke_confirm_purchase(request)"));
         let manual = source
             .split("let on_confirm_manual =")
             .nth(1)
@@ -3475,6 +3369,15 @@ mod tests {
             "event-1",
             &presentation,
         ));
+    }
+
+    #[test]
+    fn only_a_payable_split_quote_is_resumed() {
+        assert!(should_resume_split_quote(Some(1_000), 999));
+        assert!(!should_resume_split_quote(Some(1_000), 1_000));
+        assert!(!should_resume_split_quote(Some(1_000), 5_000));
+        // Plan not loaded yet: keep the existing quote; never create a new one blindly.
+        assert!(should_resume_split_quote(None, 5_000));
     }
 
     #[test]

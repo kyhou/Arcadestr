@@ -36,6 +36,7 @@ fn RefundCard(
     on_changed: Callback<()>,
 ) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext");
+    let payment_activation = crate::ui_v2::payment_activation::use_payment_activation();
     let expected_generation = generation.get_untracked();
     let confirmed = RwSignal::new(false);
     let busy = RwSignal::new(false);
@@ -79,6 +80,7 @@ fn RefundCard(
                         quote_id: row.quote_id,
                         leg_id: row.leg_id,
                         confirm_payment: mode == "pay",
+                        expected_attempt_id: row.attempt_id,
                     };
                     if mode == "pay" {
                         invoke_pay_split_refund(request).await.map(|_| ())
@@ -114,21 +116,21 @@ fn RefundCard(
         "uncertain" | "proof_checkpointed"
     );
     let amount = row.principal_msat;
-    let invoice = row.invoice.clone();
     view! {
         <article data-testid="recipient-refund-card" style="clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));border:1px solid oklch(0.32 0.01 60);background:#121215;padding:20px;display:grid;gap:14px;font-family:ui-monospace,monospace">
             <strong style="font:800 16px ui-monospace,monospace;color:#fff;overflow-wrap:anywhere">{format!("{} · {} msat",row.leg_id,amount)}</strong>
             <p style=TEXT>{format!("QUOTE {} · ORIGINAL DEADLINE (UNIX) {}",row.quote_id,row.due_at)}</p>
             <p data-testid="refund-state" style=if verified{"font:700 12px ui-monospace,monospace;color:oklch(0.8 0.14 195)"}else if row.state=="overdue"{"font:700 12px ui-monospace,monospace;color:oklch(0.65 0.18 25)"}else{"font:700 12px ui-monospace,monospace;color:oklch(0.8 0.16 60)"}>{format!("{} · {}",row.state.to_uppercase(),row.payment_state.replace('_'," ").to_uppercase())}</p>
-            {invoice.map(|invoice|view!{<textarea data-testid="original-refund-invoice" aria-label="Original persisted refund invoice" readonly rows="3" style="width:100%;box-sizing:border-box;background:#141417;border:1px solid oklch(0.32 0.01 60);color:#fff;font:400 11px/1.5 ui-monospace,monospace;padding:10px;border-radius:4px">{invoice}</textarea>})}
             <Show when=move||!verified>
                 <div style="display:flex;gap:12px;flex-wrap:wrap">
-                    <Show when=move||!awaiting && !unresolved><button data-testid="prepare-refund" style=BUTTON disabled=move||busy.get() on:click=move |_|action.run("prepare")>"PREPARE ORIGINAL INVOICE — NO PAYMENT"</button></Show>
+                    <p data-testid="refund-payment-policy" style=TEXT>{move || payment_activation.refund_label()}</p>
+                    <Show when=move||!awaiting && !unresolved><button data-testid="prepare-refund" style=BUTTON disabled=move||busy.get() || !payment_activation.refund_enabled() on:click=move |_|action.run("prepare")>"PREPARE ORIGINAL INVOICE — NO PAYMENT"</button></Show>
                     <Show when=move||unresolved><button data-testid="recover-refund" style=BUTTON disabled=move||busy.get() on:click=move |_|action.run("recover")>"LOOK UP ORIGINAL REFUND — NO PAYMENT"</button></Show>
                 </div>
                 <Show when=move||awaiting>
-                    <label style=TEXT><input data-testid="confirm-refund-checkbox" type="checkbox" prop:checked=move||confirmed.get() on:change:target=move|event|confirmed.set(event.target().checked()) />{format!(" I authorize one payment of {amount} msat from this account's connected wallet.")}</label>
-                    <button data-testid="pay-refund" style="padding:11px 20px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 13px ui-monospace,monospace;border:0;border-radius:5px" disabled=move||busy.get() || !confirmed.get() on:click=move |_|action.run("pay")>"SEND REFUND PAYMENT"</button>
+                    <label style=TEXT><input data-testid="confirm-refund-checkbox" type="checkbox" prop:checked=move||confirmed.get() on:change:target=move|event|confirmed.set(event.target().checked()) />{format!(" I authorize one refund of {amount} msat, plus wallet routing fees, from this account's connected wallet.")}</label>
+                    <button data-testid="pay-refund" style="padding:11px 20px;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 13px ui-monospace,monospace;border:0;border-radius:5px" disabled=move||busy.get() || !confirmed.get() || !payment_activation.refund_enabled() on:click=move |_|action.run("pay")>"SEND REFUND PAYMENT"</button>
+                    {move || payment_activation.refund_lock_reason().map(|reason| view!{<p data-testid="refund-payment-locked" style=TEXT>{reason}</p>})}{move || payment_activation.test_build_label().map(|label| view!{<p data-testid="payment-test-build" style=TEXT>{label}</p>})}
                 </Show>
             </Show>
             <Show when=move||unresolved><p style=TEXT>"Outcome unresolved or proof awaiting confirmation. The original invoice and payment intent are retained. Do not create a replacement or repay."</p></Show>

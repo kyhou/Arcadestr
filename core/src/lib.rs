@@ -115,6 +115,7 @@ pub mod entitlement_sync_contract;
 pub mod entitlements;
 #[cfg(feature = "native")]
 pub mod entitlements_repository;
+pub mod payment_boundary;
 pub mod publisher_management;
 pub mod publisher_recovery;
 pub mod purchase_contract;
@@ -145,6 +146,8 @@ pub mod adp_publish;
 #[cfg(feature = "native")]
 pub mod nwc_client;
 
+#[cfg(feature = "native")]
+pub mod checkout_freshness;
 #[cfg(feature = "native")]
 pub mod durable_payments;
 #[cfg(feature = "native")]

@@ -52,6 +52,15 @@ pub struct RecoveryAttempt {
     pub has_proof: bool,
 }
 
+/// Binds ?1 account, ?2 quote id. See `SettlementRepository::failed_quote_resolved`.
+const FAILED_QUOTE_RESOLVED_SQL: &str = "SELECT q.state='failed' AND q.failure_at IS NOT NULL \
+     AND NOT EXISTS(SELECT 1 FROM purchase_execution_admissions d WHERE d.account_pubkey=q.account_pubkey AND d.quote_id=q.quote_id \
+         AND (d.state!='verified' OR NOT EXISTS(SELECT 1 FROM settlement_invoice_attempts a WHERE a.account_pubkey=d.account_pubkey \
+             AND a.quote_id=d.quote_id AND a.leg_id=d.leg_id AND a.attempt_id=d.attempt_id AND a.payment_hash=d.payment_hash AND a.state='settled'))) \
+     AND NOT EXISTS(SELECT 1 FROM settlement_invoice_attempts a WHERE a.account_pubkey=q.account_pubkey AND a.quote_id=q.quote_id AND a.state!='settled' \
+         AND (a.encrypted_proof IS NOT NULL OR EXISTS(SELECT 1 FROM nwc_payment_journal p WHERE p.account_pubkey=a.account_pubkey AND p.payment_hash=a.payment_hash))) \
+     FROM settlement_quotes q WHERE q.account_pubkey=?1 AND q.quote_id=?2";
+
 #[derive(Clone)]
 pub struct SettlementRepository {
     pool: SqlitePool,
@@ -93,7 +102,35 @@ impl SettlementRepository {
             let completed:bool=sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM settlement_quotes WHERE account_pubkey=? AND quote_id=? AND state='settled' AND receipt_event_json IS NOT NULL)")
                 .bind(account).bind(id).fetch_one(&mut *tx).await?;
-            if !completed || requested_id == Some(id.as_str()) {
+            // An unresolved initiation may be replaced only when it never produced
+            // a payable local quote. For a changed listing revision: no stored quote
+            // (a lost response leaves only an unpaid remote quote that expires) or a
+            // superseded one. For the same revision: only a superseded quote (an
+            // expired quote closed without dispatch); a lost response keeps its id.
+            let stored_state = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT state FROM settlement_quotes WHERE account_pubkey=? AND quote_id=?",
+            )
+            .bind(account)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+            // A processor-confirmed failed quote with no unresolved payment also
+            // closes: its paid legs are refund obligations tracked on that quote.
+            let failed_resolved = stored_state.as_deref() == Some("failed")
+                && sqlx::query_scalar::<_, bool>(FAILED_QUOTE_RESOLVED_SQL)
+                    .bind(account)
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let replaceable = requested_id.is_none()
+                && match stored_state.as_deref() {
+                    Some("superseded") => true,
+                    Some("failed") => failed_resolved,
+                    None => listing != listing_event_id,
+                    Some(_) => false,
+                };
+            if !replaceable && (!completed || requested_id == Some(id.as_str())) {
                 if listing != listing_event_id
                     || commitment != request_commitment
                     || requested_id.is_some_and(|requested| requested != id)
@@ -115,6 +152,24 @@ impl SettlementRepository {
 
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// True only for this account's quote that the processor reported `failed`
+    /// (synced locally) and that has no unresolved payment: every admission is
+    /// verified and no proof or journaled intent exists outside a settled
+    /// attempt. Such a quote can no longer be paid and no longer blocks a new
+    /// purchase of the same listing; its refund obligations stay tracked on it.
+    pub async fn failed_quote_resolved(
+        &self,
+        account: &str,
+        quote_id: &str,
+    ) -> Result<bool, SettlementRepositoryError> {
+        Ok(sqlx::query_scalar::<_, bool>(FAILED_QUOTE_RESOLVED_SQL)
+            .bind(account)
+            .bind(quote_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or(false))
     }
 
     pub async fn recovery_attempts(
@@ -185,8 +240,17 @@ impl SettlementRepository {
         attempt: &str,
         encrypted: &[u8],
     ) -> Result<bool, SettlementRepositoryError> {
-        Ok(sqlx::query("UPDATE settlement_invoice_attempts SET encrypted_proof=COALESCE(encrypted_proof,?) WHERE account_pubkey=? AND quote_id=? AND attempt_id=?")
-            .bind(encrypted).bind(account).bind(quote).bind(attempt).execute(&self.pool).await?.rows_affected() == 1)
+        let mut tx = self.pool.begin().await?;
+        let saved = sqlx::query("UPDATE settlement_invoice_attempts SET encrypted_proof=COALESCE(encrypted_proof,?) WHERE account_pubkey=? AND quote_id=? AND attempt_id=?")
+            .bind(encrypted).bind(account).bind(quote).bind(attempt).execute(&mut *tx).await?.rows_affected() == 1;
+        if saved {
+            // A valid externally supplied proof can recover ownership, but
+            // cannot establish the wallet fees or replenish the spend reserve.
+            sqlx::query("UPDATE purchase_execution_approvals SET halted=1 WHERE account_pubkey=?1 AND quote_id=?2 AND NOT EXISTS (SELECT 1 FROM purchase_execution_admissions WHERE account_pubkey=?1 AND quote_id=?2 AND attempt_id=?3 AND state='verified' AND fees_paid_msat IS NOT NULL)")
+                .bind(account).bind(quote).bind(attempt).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(saved)
     }
 
     /// Do not replace an expired invoice until any possible old payment is reconciled.

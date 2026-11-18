@@ -184,6 +184,8 @@ async fn pending_payment_or_proof_checkpoint_blocks_replacement_across_restart()
         .has_unreconciled_payment("bob", "durable-q")
         .await
         .expect("account scope"));
+    sqlx::query("INSERT INTO purchase_execution_approvals(account_pubkey,quote_id,snapshot) VALUES ('alice','durable-q','{}')")
+        .execute(db.pool()).await.expect("approval fixture");
     assert!(repository
         .checkpoint_proof("alice", "durable-q", "attempt", b"encrypted preimage")
         .await
@@ -199,6 +201,12 @@ async fn pending_payment_or_proof_checkpoint_blocks_replacement_across_restart()
     drop(repository);
     db.pool().close().await;
     let db = Database::new(&path).await.expect("restart");
+    let halted: i64 = sqlx::query_scalar("SELECT halted FROM purchase_execution_approvals WHERE account_pubkey='alice' AND quote_id='durable-q'")
+        .fetch_one(db.pool()).await.expect("halt checkpoint");
+    assert_eq!(
+        halted, 1,
+        "proof without verified local fee accounting halts further sends"
+    );
     let repository = SettlementRepository::new(db.pool().clone());
     let attempt = repository
         .invoice_attempt("alice", "durable-q", "attempt")

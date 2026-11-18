@@ -190,11 +190,13 @@ const RECEIPT_TIMELINE_UNAVAILABLE: &str =
     "A per-event receipt timeline is not available here. The acquisition list shows one validated durable record per verified purchase; signed receipt chains and verification references are retained locally, without exposing encrypted private evidence.";
 
 fn record_verification_label(record: &DurableAcquisitionRecord) -> &'static str {
-    if let Some(verification)=record.verification {return match verification {
-        crate::tauri_bridge::ReceiptVerification::Verified=>"VERIFIED",
-        crate::tauri_bridge::ReceiptVerification::Indeterminate=>"INDETERMINATE",
-        crate::tauri_bridge::ReceiptVerification::Invalid=>"INVALID",
-    };}
+    if let Some(verification) = record.verification {
+        return match verification {
+            crate::tauri_bridge::ReceiptVerification::Verified => "VERIFIED",
+            crate::tauri_bridge::ReceiptVerification::Indeterminate => "INDETERMINATE",
+            crate::tauri_bridge::ReceiptVerification::Invalid => "INVALID",
+        };
+    }
     if record.validation_error.is_some() {
         "Not verified"
     } else if record.status == DurableCredentialStatus::Unverified {
@@ -209,6 +211,23 @@ fn settlement_state_color(state: &str) -> &'static str {
         "settled" | "verified" => "oklch(0.8 0.14 195)",
         "failed" | "overdue" | "disputed" => "oklch(0.65 0.18 25)",
         _ => "oklch(0.78 0.16 60)",
+    }
+}
+
+/// A failed purchase never reads as ownership. Settled legs become refund
+/// obligations; only processor-verified refunds are reported as refunded.
+fn failed_refund_label(recovery: &[crate::tauri_bridge::RecoveryHistoryItem]) -> &'static str {
+    if recovery.is_empty() {
+        "Purchase failed"
+    } else if recovery.iter().all(|leg| leg.state == "verified") {
+        "Purchase failed — refunds verified"
+    } else if recovery
+        .iter()
+        .any(|leg| matches!(leg.state.as_str(), "overdue" | "disputed"))
+    {
+        "Purchase failed — refund overdue or disputed"
+    } else {
+        "Purchase failed — refund pending"
     }
 }
 
@@ -232,7 +251,9 @@ fn settlement_display_state(record: &SettlementHistoryItem) -> &'static str {
     {
         "Recovery available"
     } else if record.state == "failed" {
-        "Purchase failed"
+        failed_refund_label(&record.recovery)
+    } else if record.state == "superseded" {
+        "Closed without payment — expired or listing changed"
     } else if record.attempts.iter().any(|a| a.state == "settled") {
         "Partially settled"
     } else {
@@ -447,7 +468,7 @@ fn SettlementRecordCard(
                             <span style="font:700 11px ui-monospace,monospace;color:#fff">{format!("LEG {} · {} msat", obligation.leg_id, obligation.principal_msat)}</span>
                             <span style=format!("font:700 11px ui-monospace,monospace;color:{};text-transform:uppercase", settlement_state_color(&obligation.state))>{format!("{} · DUE {}", obligation.state, obligation.due_at)}</span>
                         </div>
-                        <p style="margin:0;color:oklch(0.6 0.01 60);font:400 10.5px/1.5 ui-monospace,monospace">"The obligated recipient must pay and confirm this principal refund. Refresh status to retain late evidence."</p>
+                        <p style="margin:0;color:oklch(0.6 0.01 60);font:400 10.5px/1.5 ui-monospace,monospace">{if obligation.state == "verified" { "The processor confirmed this principal refund." } else { "The obligated recipient must pay and confirm this principal refund. Refresh status to retain late evidence." }}</p>
                     </div>
                 }
             }).collect::<Vec<_>>()}
@@ -492,7 +513,7 @@ pub fn PurchasesView(
     let request_generation = RwSignal::new(0_u64);
     let settlement_generation = RwSignal::new(0_u64);
     let history_refresh = RwSignal::new(0_u64);
-    let receipt_sync=use_context::<crate::ui_v2::receipt_sync::ReceiptSyncContext>();
+    let receipt_sync = use_context::<crate::ui_v2::receipt_sync::ReceiptSyncContext>();
     let selected_filter = Signal::derive(move || purchase_filter_id(filter.get()).to_string());
     let select_filter = Callback::new(move |id: String| {
         if let Some(next) = purchase_filter_from_id(&id) {
@@ -517,8 +538,10 @@ pub fn PurchasesView(
         let load_auth = auth.clone();
         Effect::new(move |_| {
             let _ = history_refresh.get();
-            if let Some(receipts)=receipt_sync {let _=receipts.revision.get();}
-            let _epoch=load_auth.current_auth_flow();
+            if let Some(receipts) = receipt_sync {
+                let _ = receipts.revision.get();
+            }
+            let _epoch = load_auth.current_auth_flow();
             let account = load_auth.npub.get().unwrap_or_default();
             let generation = request_generation.get_untracked().wrapping_add(1);
             request_generation.set(generation);
@@ -548,18 +571,31 @@ pub fn PurchasesView(
         });
         // Receipt discovery/import refreshes ownership only. Do not turn a
         // receipt synchronization notification into ADP proof submission.
-        let settlement_auth=auth.clone();
-        Effect::new(move |_|{
-            let _=history_refresh.get();let _=settlement_auth.current_auth_flow();
-            let account=settlement_auth.npub.get();
-            settlement_generation.update(|v|*v=v.wrapping_add(1));let generation=settlement_generation.get_untracked();
-            if account.is_none(){settlement_state.set(SettlementHistoryState::AccountRequired);return}
+        let settlement_auth = auth.clone();
+        Effect::new(move |_| {
+            let _ = history_refresh.get();
+            let _ = settlement_auth.current_auth_flow();
+            let account = settlement_auth.npub.get();
+            settlement_generation.update(|v| *v = v.wrapping_add(1));
+            let generation = settlement_generation.get_untracked();
+            if account.is_none() {
+                settlement_state.set(SettlementHistoryState::AccountRequired);
+                return;
+            }
             settlement_state.set(SettlementHistoryState::Loading);
-            spawn_local(async move{
-                let _=invoke_reconcile_pending_settlements().await;
-                let result=invoke_settlement_history().await;
-                if !should_apply_response(generation,settlement_generation.get_untracked()){return}
-                match result {Ok(records) if records.is_empty()=>settlement_state.set(SettlementHistoryState::Empty),Ok(records)=>settlement_state.set(SettlementHistoryState::Ready(records)),Err(_)=>settlement_state.set(SettlementHistoryState::Error)}
+            spawn_local(async move {
+                let _ = invoke_reconcile_pending_settlements().await;
+                let result = invoke_settlement_history().await;
+                if !should_apply_response(generation, settlement_generation.get_untracked()) {
+                    return;
+                }
+                match result {
+                    Ok(records) if records.is_empty() => {
+                        settlement_state.set(SettlementHistoryState::Empty)
+                    }
+                    Ok(records) => settlement_state.set(SettlementHistoryState::Ready(records)),
+                    Err(_) => settlement_state.set(SettlementHistoryState::Error),
+                }
             });
         });
     }
@@ -745,6 +781,40 @@ mod tests {
     fn settlement_labels_preserve_uncertainty_and_receipt_precedence() {
         let mut record:crate::tauri_bridge::SettlementHistoryItem=serde_json::from_value(serde_json::json!({"quote_id":"q","processor_url":"https://processor","listing_event_id":"listing","state":"active"})).expect("history fixture");
         assert_eq!(super::settlement_display_state(&record), "Awaiting payment");
+        let mut failed = record.clone();
+        failed.state = "failed".into();
+        assert_eq!(super::settlement_display_state(&failed), "Purchase failed");
+        let leg = |state: &str| crate::tauri_bridge::RecoveryHistoryItem {
+            leg_id: "carol".into(),
+            state: state.into(),
+            principal_msat: 100_000,
+            due_at: 1,
+        };
+        failed.recovery = vec![leg("verified"), leg("refund_owed")];
+        assert_eq!(
+            super::settlement_display_state(&failed),
+            "Purchase failed — refund pending"
+        );
+        failed.recovery = vec![leg("verified"), leg("overdue")];
+        assert_eq!(
+            super::settlement_display_state(&failed),
+            "Purchase failed — refund overdue or disputed"
+        );
+        failed.recovery = vec![leg("verified")];
+        assert_eq!(
+            super::settlement_display_state(&failed),
+            "Purchase failed — refunds verified"
+        );
+        assert_ne!(
+            super::settlement_display_state(&failed),
+            "Purchase completed"
+        );
+        let mut closed = record.clone();
+        closed.state = "superseded".into();
+        assert_eq!(
+            super::settlement_display_state(&closed),
+            "Closed without payment — expired or listing changed"
+        );
         record
             .attempts
             .push(crate::tauri_bridge::RecoveryAttemptView {
@@ -940,10 +1010,24 @@ mod tests {
     }
 
     #[test]
-    fn portable_verification_states_are_explicit_not_implied_ownership(){
-        let mut record=record(DurableAcquisitionKind::Purchase,DurableCredentialStatus::Unverified);
-        for (state,label) in [(crate::tauri_bridge::ReceiptVerification::Verified,"VERIFIED"),(crate::tauri_bridge::ReceiptVerification::Indeterminate,"INDETERMINATE"),(crate::tauri_bridge::ReceiptVerification::Invalid,"INVALID")] {
-            record.verification=Some(state);assert_eq!(record_verification_label(&record),label);
+    fn portable_verification_states_are_explicit_not_implied_ownership() {
+        let mut record = record(
+            DurableAcquisitionKind::Purchase,
+            DurableCredentialStatus::Unverified,
+        );
+        for (state, label) in [
+            (
+                crate::tauri_bridge::ReceiptVerification::Verified,
+                "VERIFIED",
+            ),
+            (
+                crate::tauri_bridge::ReceiptVerification::Indeterminate,
+                "INDETERMINATE",
+            ),
+            (crate::tauri_bridge::ReceiptVerification::Invalid, "INVALID"),
+        ] {
+            record.verification = Some(state);
+            assert_eq!(record_verification_label(&record), label);
         }
     }
 

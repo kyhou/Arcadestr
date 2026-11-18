@@ -1277,17 +1277,6 @@ pub struct HashBuildFileRequest {
     pub file_path: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RequestLnurlInvoiceRequest {
-    pub lud16: String,
-    pub amount_sats: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RequestLnurlInvoiceResponse {
-    pub bolt11: String,
-}
-
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ConnectNwcWalletRequest {
     pub expected_account_pubkey: String,
@@ -1302,15 +1291,10 @@ pub struct ConnectNwcWalletResponse {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PayNwcInvoiceRequest {
+pub struct PayPurchaseLegRequest {
     pub expected_account_pubkey: String,
-    pub bolt11: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PayNwcInvoiceResponse {
-    pub preimage: String,
-    pub fees_paid_msat: Option<u64>,
+    pub quote_id: String,
+    pub attempt_id: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1357,8 +1341,6 @@ pub struct SplitInvoiceResponse {
     pub attempt_id: String,
     pub leg_id: String,
     pub amount_msat: u64,
-    pub payment_hash: String,
-    pub bolt11: String,
     pub expires_at: u64,
 }
 
@@ -1437,7 +1419,6 @@ pub struct RefundHistoryItem {
     pub due_at: u64,
     pub state: String,
     pub attempt_id: Option<String>,
-    pub invoice: Option<String>,
     pub payment_state: String,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1446,6 +1427,7 @@ pub struct RefundPaymentRequest {
     pub quote_id: String,
     pub leg_id: String,
     pub confirm_payment: bool,
+    pub expected_attempt_id: Option<String>,
 }
 
 async fn recovery_invoke<T: serde::de::DeserializeOwned + 'static>(
@@ -1534,7 +1516,6 @@ pub struct SplitRefundInvoiceResponse {
     pub attempt_id: String,
     pub leg_id: String,
     pub amount_msat: u64,
-    pub bolt11: String,
     pub expires_at: u64,
 }
 
@@ -2046,34 +2027,20 @@ pub async fn invoke_connect_nwc_wallet(
 }
 
 #[cfg(not(feature = "web"))]
-pub async fn invoke_request_lnurl_invoice(
-    request: RequestLnurlInvoiceRequest,
-) -> Result<RequestLnurlInvoiceResponse, String> {
+pub async fn invoke_pay_purchase_leg(
+    request: PayPurchaseLegRequest,
+) -> Result<SplitSettlementResponse, String> {
     crate::tauri_invoke::invoke(
-        "request_lnurl_invoice",
+        "pay_purchase_leg",
         serde_json::json!({ "request": request }),
     )
     .await
 }
 
 #[cfg(feature = "web")]
-pub async fn invoke_request_lnurl_invoice(
-    _request: RequestLnurlInvoiceRequest,
-) -> Result<RequestLnurlInvoiceResponse, String> {
-    Err("ADP invoice requests are only available in desktop builds.".to_string())
-}
-
-#[cfg(not(feature = "web"))]
-pub async fn invoke_pay_nwc_invoice(
-    request: PayNwcInvoiceRequest,
-) -> Result<PayNwcInvoiceResponse, String> {
-    crate::tauri_invoke::invoke("pay_nwc_invoice", serde_json::json!({ "request": request })).await
-}
-
-#[cfg(feature = "web")]
-pub async fn invoke_pay_nwc_invoice(
-    _request: PayNwcInvoiceRequest,
-) -> Result<PayNwcInvoiceResponse, String> {
+pub async fn invoke_pay_purchase_leg(
+    _request: PayPurchaseLegRequest,
+) -> Result<SplitSettlementResponse, String> {
     Err("NWC payments are only available in desktop builds.".to_string())
 }
 

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
+use crate::settlement_recovery::WalletDispatchFence;
 use nostr::nips::nip44;
 use nostr::{Event, EventBuilder, EventId, Filter, Keys, Kind, PublicKey, SecretKey, Tag, TagKind};
 use nostr_sdk::{Client, RelayPoolNotification};
@@ -17,6 +18,8 @@ const SECRET_HEX_LEN: usize = 64;
 /// Errors returned by NWC connection and request helpers.
 #[derive(Debug, Error)]
 pub enum NwcClientError {
+    #[error("account or wallet changed before payment dispatch")]
+    StaleWallet,
     #[error("invalid NWC URI")]
     InvalidUri,
     #[error("NWC URI is missing at least one relay")]
@@ -282,6 +285,7 @@ impl NwcConnection {
 pub struct NwcClient {
     connection: NwcConnection,
     timeout: Duration,
+    dispatch_fence: Option<WalletDispatchFence>,
 }
 
 /// A debug-build laboratory transport, never a replacement wallet connection.
@@ -317,7 +321,14 @@ impl NwcClient {
         Self {
             connection,
             timeout: Duration::from_secs(60),
+            dispatch_fence: None,
         }
+    }
+
+    /// Applies only to pay_invoice; get_info and lookup remain non-spending.
+    pub fn with_dispatch_fence(mut self, fence: WalletDispatchFence) -> Self {
+        self.dispatch_fence = Some(fence);
+        self
     }
 
     /// Overrides the wallet response timeout.
@@ -349,6 +360,7 @@ impl NwcClient {
                 serde_json::json!({"method":"lookup_invoice",
             "params":{"payment_hash":payment_hash}})
                 .to_string(),
+                None,
             )
             .await?;
         parse_lookup_payment_response(&response, payment_hash, amount_msat)
@@ -360,7 +372,10 @@ impl NwcClient {
     /// Returns relay, timeout, wallet, encryption, or malformed response errors.
     pub async fn pay_invoice(&self, invoice: &str) -> Result<PayInvoiceResult, NwcClientError> {
         let json = self
-            .request(build_pay_invoice_request_json(invoice)?)
+            .request(
+                build_pay_invoice_request_json(invoice)?,
+                self.dispatch_fence.as_ref(),
+            )
             .await?;
         parse_pay_invoice_response_json(&json)
     }
@@ -370,7 +385,7 @@ impl NwcClient {
         &self,
     ) -> Result<crate::purchase_contract::WalletCapabilities, NwcClientError> {
         let json = self
-            .request(r#"{"method":"get_info","params":{}}"#.into())
+            .request(r#"{"method":"get_info","params":{}}"#.into(), None)
             .await?;
         parse_wallet_capabilities(&json)
     }
@@ -381,7 +396,11 @@ impl NwcClient {
         Ok(())
     }
 
-    async fn request(&self, plaintext: String) -> Result<String, NwcClientError> {
+    async fn request(
+        &self,
+        plaintext: String,
+        fence: Option<&WalletDispatchFence>,
+    ) -> Result<String, NwcClientError> {
         let secret_key = SecretKey::from_hex(&self.connection.secret_hex)
             .map_err(|_| NwcClientError::InvalidSecret)?;
         let keys = Keys::new(secret_key);
@@ -418,10 +437,41 @@ impl NwcClient {
                 .subscribe(filter, None)
                 .await
                 .map_err(|_| NwcClientError::Relay("subscription failed".into()))?;
-            client
-                .send_event(&request)
-                .await
-                .map_err(|_| NwcClientError::Relay("request could not be sent".into()))?;
+            if let Some(fence) = fence {
+                let mut relays = Vec::with_capacity(transport_relays.len());
+                for url in &transport_relays {
+                    relays.push(
+                        client
+                            .pool()
+                            .relay(url.as_str())
+                            .await
+                            .map_err(|_| NwcClientError::Relay("relay unavailable".into()))?,
+                    );
+                }
+                // Enqueue is the dispatch point. Don't hold this lock while
+                // waiting for a reply, or check it again and discard a proof.
+                let sent = fence
+                    .enqueue(|| {
+                        let mut sent = false;
+                        for relay in relays {
+                            sent |= relay
+                                .send_msg(nostr::ClientMessage::Event(std::borrow::Cow::Borrowed(
+                                    &request,
+                                )))
+                                .is_ok();
+                        }
+                        sent
+                    })
+                    .map_err(|_| NwcClientError::StaleWallet)?;
+                if !sent {
+                    return Err(NwcClientError::Relay("request could not be queued".into()));
+                }
+            } else {
+                client
+                    .send_event(&request)
+                    .await
+                    .map_err(|_| NwcClientError::Relay("request could not be sent".into()))?;
+            }
             loop {
                 match notifications.recv().await {
                     Ok(RelayPoolNotification::Event { event, .. }) => {

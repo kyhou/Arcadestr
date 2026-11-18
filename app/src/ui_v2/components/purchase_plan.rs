@@ -101,6 +101,7 @@ pub fn PurchasePlanPanel(
     #[prop(optional)] external_refresh: Option<RwSignal<u64>>,
 ) -> impl IntoView {
     let auth = use_context::<AuthContext>();
+    let payment_activation = crate::ui_v2::payment_activation::use_payment_activation();
     let wallet = use_context::<crate::ui_v2::nwc_wallet::NwcWalletContext>();
     let review = RwSignal::new(None::<PurchasePlanReview>);
     let error = RwSignal::new(None::<String>);
@@ -314,12 +315,13 @@ pub fn PurchasePlanPanel(
     view! {
         <section style=PANEL data-testid="purchase-plan-panel" aria-label="Settlement plan and recovery">
             <h3 style="margin:0 0 12px;font:800 12px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">"◆ SETTLEMENT PLAN"</h3>
-            <p style="color:oklch(0.8 0.14 195)">"Local approval does not unlock the wallet or authorize live payment execution."</p>
+            <p style="color:oklch(0.8 0.14 195)">"Approving the plan does not send a payment or unlock the wallet."</p>
             {move || error.get().map(|e|view!{<p role="alert" style="color:oklch(0.65 0.18 25)">{e}</p>})}
             {move || if busy.get(){Some(view!{<p role="status">"Checking the original plan or payment…"</p>})}else{None}}
             {move || review.get().map(|r|{
                 let can_approve=r.terms_verified && r.wallet_connected && !r.halted && !r.purchase_completed && r.settlement_state=="active" && r.approved_limits.is_none();
                 let immutable=r.approved_limits.is_some();
+                let state_label=plan_state_label(&r, payment_activation.buyer_enabled());
                 let statuses=r.legs.clone();
                 let operator_fees=r.quote.legs.iter().filter(|l|l.role==arcadestr_core::adp_settlement::PaymentRole::Operator).map(|l|l.amount_msat).sum::<u64>();
                 let capabilities=r.wallet_capabilities.as_ref().map(|c|format!("Advertised: pay_invoice {}; lookup_invoice {}. {}",c.supports("pay_invoice"),c.supports("lookup_invoice"),c.network.as_deref().unwrap_or("network unavailable"))).unwrap_or_else(||"Wallet capabilities unavailable; no payment authority inferred.".into());
@@ -331,10 +333,9 @@ pub fn PurchasePlanPanel(
                     <p data-testid="purchase-completion" style="color:oklch(0.8 0.14 195)">{if r.purchase_completed {"PURCHASE COMPLETED — VALIDATED RECEIPT STORED"}else{"PURCHASE NOT COMPLETED — ALL LEGS AND A VALIDATED RECEIPT ARE REQUIRED"}}</p>
                     <p>{if r.terms_verified {"Developer-accepted terms and deterministic split verified locally."}else{"Original listing/term evidence unavailable or unverified. Approval is disabled; read-only recovery remains available."}}</p>
                     <p>{capabilities}</p>
-                    <p>{r.restriction}</p>
                     <p>"Aggregate receipts publicly link the buyer, listing, recipients, amounts and payment hashes. This reveals the revenue split and can correlate payments. Raw invoices, preimages and refund destinations remain encrypted."</p>
                     <p>{format!("Approved fee policy: {:?}",r.approved_fee_policy)}</p>
-                    <p>"Routing fees reported after payment are not a wallet-enforced ceiling. Strict capped execution remains restricted when provider assurance is unavailable. Multiple Lightning payments are not atomic."</p>
+                    <p>"Routing fees reported after payment are not a wallet-enforced ceiling. Multiple Lightning payments are not atomic."</p>
                     <div style="display:grid;gap:10px;margin:14px 0">
                     {r.quote.legs.into_iter().map(|leg|{
                         let status=statuses.iter().find(|s|s.leg_id==leg.leg_id).cloned();
@@ -355,16 +356,19 @@ pub fn PurchasePlanPanel(
                     }).collect_view()}
                     </div>
                     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px">
-                        <label>"MAX ROUTING FEES (MSAT)"<input data-testid="purchase-fee-limit" style=FIELD type="number" min="0" step="1" disabled=immutable prop:value=move||fee.get() on:input:target=move|e|{fee.set(e.target().value());confirmed.set(false);}/></label>
-                        <label>"MAX EXPENDITURE (MSAT)"<input data-testid="purchase-total-limit" style=FIELD type="number" min="0" step="1" disabled=immutable prop:value=move||total.get() on:input:target=move|e|{total.set(e.target().value());confirmed.set(false);}/></label>
+                        <label>"ROUTING FEE RESERVE (MSAT)"<input data-testid="purchase-fee-limit" style=FIELD type="number" min="0" step="1" disabled=immutable prop:value=move||fee.get() on:input:target=move|e|{fee.set(e.target().value());confirmed.set(false);}/></label>
+                        <label>"CHECKOUT ACCOUNTING BUDGET (MSAT)"<input data-testid="purchase-total-limit" style=FIELD type="number" min="0" step="1" disabled=immutable prop:value=move||total.get() on:input:target=move|e|{total.set(e.target().value());confirmed.set(false);}/></label>
                         <label>"INVOICE NETWORK"<select style=FIELD disabled=immutable prop:value=move||network.get().map(|n|format!("{n:?}")).unwrap_or_default() on:change:target=move|e|{network.set(match e.target().value().as_str(){"Bitcoin"=>Some(InvoiceNetwork::Bitcoin),"Testnet"=>Some(InvoiceNetwork::Testnet),"Signet"=>Some(InvoiceNetwork::Signet),"Regtest"=>Some(InvoiceNetwork::Regtest),_=>None});confirmed.set(false);}>
                             <option value="">"Select explicitly"</option><option value="Bitcoin">"Bitcoin"</option><option value="Testnet">"Testnet"</option><option value="Signet">"Signet"</option><option value="Regtest">"Regtest"</option>
                         </select></label>
                     </div>
-                    <p data-testid="purchase-approved-state">{if r.approved {"IMMUTABLE PLAN APPROVED — LIVE EXECUTION STILL LOCKED"}else if immutable {"APPROVAL IS BOUND TO THE ORIGINAL WALLET; RESTORE THAT CONNECTION"}else{"NO BUYER APPROVAL STORED"}}</p>
-                    <label style="display:flex;align-items:flex-start;gap:8px;margin:14px 0"><input data-testid="purchase-fee-risk" type="checkbox" disabled=immutable prop:checked=move||fee_risk.get() on:change:target=move|e|{fee_risk.set(e.target().checked());confirmed.set(false);}/>"Optional reported-fee mode: I accept that this wallet may exceed the desired fee and total limits before reporting costs. Arcadestr can halt later payments, not enforce those limits externally. Leave unchecked for provider-ceiling mode. Neither choice authorizes a live test."</label>
-                    <label style="display:flex;align-items:flex-start;gap:8px;margin:14px 0"><input data-testid="purchase-approval-check" type="checkbox" disabled=move||!can_approve||busy.get() prop:checked=move||confirmed.get() on:change:target=move|e|confirmed.set(e.target().checked())/>"I explicitly approve every recipient, amount, accepted operator fee and maximum expenditure shown. I understand that approval is application-local and the wallet fee guarantee and live execution remain restricted."</label>
-                    <button data-testid="approve-purchase-plan" type="button" style=PRIMARY disabled=move||!can_approve||!confirmed.get()||busy.get() on:click=move |_|approve.run(())>"APPROVE IMMUTABLE PLAN"</button>
+                    <p data-testid="buyer-payment-policy">{move || payment_activation.buyer_label()}</p>
+                    <p data-testid="purchase-approved-state">{state_label}</p>
+                    <p>"Strict fee ceiling: the wallet must demonstrate that it can enforce a ceiling for the actual payment. Standard NWC does not provide this guarantee."</p>
+                    <label style="display:flex;align-items:flex-start;gap:8px;margin:14px 0"><input data-testid="purchase-fee-risk" type="checkbox" disabled=move||immutable||!payment_activation.reported_fees_allowed() prop:checked=move||fee_risk.get() on:change:target=move|e|{fee_risk.set(e.target().checked());confirmed.set(false);}/>"I choose reported-fee accounting. My wallet may charge more than the reserve while a payment is in flight. Arcadestr can halt later payments, but cannot cap or undo that charge."</label>
+                    <p>{move || (!payment_activation.reported_fees_allowed()).then_some("Reported-fee accounting is not enabled in this build.")}</p>
+                    <label style="display:flex;align-items:flex-start;gap:8px;margin:14px 0"><input data-testid="purchase-approval-check" type="checkbox" disabled=move||!can_approve||busy.get()||!payment_activation.buyer_enabled() prop:checked=move||confirmed.get() on:change:target=move|e|confirmed.set(e.target().checked())/>"I approve every recipient, amount, and operator fee shown, and the selected routing-fee policy. Approval alone does not send a payment."</label>
+                    <button data-testid="approve-purchase-plan" type="button" style=PRIMARY disabled=move||!can_approve||!confirmed.get()||busy.get()||!payment_activation.buyer_enabled() on:click=move |_|approve.run(())>"APPROVE IMMUTABLE PLAN"</button>
                 }
             })}
             <button type="button" style=SECONDARY disabled=move||busy.get() on:click=move |_|refresh.update(|v|*v=v.wrapping_add(1))>"REFRESH ORIGINAL STATE"</button>
@@ -404,9 +408,54 @@ pub fn PurchasePlanPreview() -> impl IntoView {
     }
 }
 
+/// The plan's actual state, most terminal fact first. Approval never implies
+/// payment, and nothing short of a stored validated receipt reads as complete.
+pub(crate) fn plan_state_label(r: &PurchasePlanReview, buyer_enabled: bool) -> &'static str {
+    match r.settlement_state.as_str() {
+        _ if r.purchase_completed => "PURCHASE COMPLETED — VALIDATED RECEIPT STORED",
+        "failed" => "PURCHASE FAILED — NO FURTHER PAYMENTS; SETTLED LEGS ARE REFUND OBLIGATIONS",
+        "superseded" => "CLOSED WITHOUT PAYMENT — QUOTE EXPIRED OR LISTING CHANGED",
+        "settled" => "PAYMENTS SETTLED — RECEIPT NOT YET VALIDATED; RECOVER, DO NOT PAY AGAIN",
+        _ if r.halted => "FURTHER PAYMENTS HALTED — RECOVER THE ORIGINAL PURCHASE",
+        _ if r.approved && !buyer_enabled => {
+            "PLAN APPROVED — BUYER PAYMENTS ARE DISABLED IN THIS BUILD"
+        }
+        _ if r.approved => "PLAN APPROVED — EACH PAYMENT REQUIRES YOUR EXPLICIT ACTION",
+        _ if r.approved_limits.is_some() => {
+            "APPROVAL IS BOUND TO THE ORIGINAL WALLET; RESTORE THAT CONNECTION"
+        }
+        _ if !buyer_enabled => "AWAITING APPROVAL — BUYER PAYMENTS ARE DISABLED IN THIS BUILD",
+        _ => "AWAITING YOUR APPROVAL — NO PAYMENT HAS BEEN SENT",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plan_state_reflects_terminal_state_before_approval() {
+        let mut r = review();
+        assert_eq!(
+            plan_state_label(&r, true),
+            "AWAITING YOUR APPROVAL — NO PAYMENT HAS BEEN SENT"
+        );
+        assert!(plan_state_label(&r, false).contains("DISABLED IN THIS BUILD"));
+        r.approved = true;
+        assert!(plan_state_label(&r, true).starts_with("PLAN APPROVED — EACH PAYMENT"));
+        assert!(plan_state_label(&r, false).contains("DISABLED"));
+        for (state, prefix) in [
+            ("failed", "PURCHASE FAILED"),
+            ("superseded", "CLOSED WITHOUT PAYMENT"),
+            ("settled", "PAYMENTS SETTLED — RECEIPT NOT"),
+        ] {
+            r.settlement_state = state.into();
+            assert!(plan_state_label(&r, true).starts_with(prefix), "{state}");
+            assert!(!plan_state_label(&r, true).contains("LOCKED"));
+        }
+        r.purchase_completed = true;
+        assert!(plan_state_label(&r, true).starts_with("PURCHASE COMPLETED"));
+    }
+
     #[test]
     fn amounts_are_exact_and_partial_progress_is_not_ownership() {
         assert_eq!(msat_label(100000), "100 sats");
