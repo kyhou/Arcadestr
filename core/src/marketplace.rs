@@ -1541,6 +1541,7 @@ mod tests {
             malformed_fulfillment_authorization_tags: Vec::new(),
             acquisition: AcquisitionPolicy::Gated,
             campaigns: Vec::new(),
+            #[cfg(debug_assertions)]
             raw_event_json: None,
         }
     }
@@ -1742,6 +1743,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn nip99_listing_preserves_raw_event_json_for_debug_panel() {
         // Arrange
         let event = make_nip99_event(

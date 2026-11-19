@@ -1273,7 +1273,15 @@ async fn standard_wallet_reported_fee_mode_requires_separate_risk_consent() {
         .await
         .expect("second original leg");
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 2);
-    assert!(arcadestr_core::purchase_contract::require_live_purchase_authorization().is_err());
+    // Approval never grants live authorization; only the compiled release
+    // activation does (enabled only in buyer-activated builds).
+    assert_eq!(
+        arcadestr_core::purchase_contract::require_live_purchase_authorization().is_ok(),
+        cfg!(any(
+            feature = "production-buyer-payments",
+            feature = "regtest-buyer-payments"
+        ))
+    );
 }
 
 #[tokio::test]

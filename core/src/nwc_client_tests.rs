@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(debug_assertions)]
 use futures_util::{SinkExt, StreamExt};
 use keyring::credential::CredentialApi;
 use std::sync::Arc;
@@ -222,6 +223,8 @@ fn nwc_metadata_and_debug_hide_secret_and_relay_tokens() {
     assert!(!format!("{connection:?}").contains(SECRET));
 }
 
+// Debug-only: release builds refuse plaintext loopback relays by design.
+#[cfg(debug_assertions)]
 // Private local WebSocket wallet fixture. It decrypts real requests, signs correlated
 // responses and never contacts LND, Alby Hub, ADP, or a public relay.
 async fn local_wallet(unsupported: bool) -> (NwcConnection, tokio::task::JoinHandle<Vec<String>>) {
@@ -305,6 +308,7 @@ async fn local_wallet(unsupported: bool) -> (NwcConnection, tokio::task::JoinHan
     (connection, task)
 }
 
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn nwc_loopback_verification_and_single_and_split_invoice_payments() {
     for unsupported in [false, true] {

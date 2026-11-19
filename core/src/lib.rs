@@ -175,20 +175,38 @@ mod nwc_client_contract_tests {
             "&lud16=buyer%40example.com"
         );
 
-        let connection = NwcConnection::parse(uri).expect("valid NWC URI parses");
+        // Plaintext loopback relays are a debug-only development affordance.
+        #[cfg(not(debug_assertions))]
+        {
+            assert!(matches!(
+                NwcConnection::parse(uri),
+                Err(super::nwc_client::NwcClientError::InvalidRelay)
+            ));
+            let tls_only = uri.replace("&relay=ws%3A%2F%2Flocalhost%3A10547", "");
+            let connection = NwcConnection::parse(&tls_only).expect("TLS relay URI parses");
+            assert_eq!(
+                connection.relay_urls(),
+                &["wss://relay.example.com".to_string()]
+            );
+            assert_eq!(connection.lud16(), Some("buyer@example.com"));
+        }
+        #[cfg(debug_assertions)]
+        {
+            let connection = NwcConnection::parse(uri).expect("valid NWC URI parses");
 
-        assert_eq!(
-            connection.wallet_pubkey_hex(),
-            "0000000000000000000000000000000000000000000000000000000000000001"
-        );
-        assert_eq!(
-            connection.relay_urls(),
-            &[
-                "wss://relay.example.com".to_string(),
-                "ws://localhost:10547".to_string()
-            ]
-        );
-        assert_eq!(connection.lud16(), Some("buyer@example.com"));
+            assert_eq!(
+                connection.wallet_pubkey_hex(),
+                "0000000000000000000000000000000000000000000000000000000000000001"
+            );
+            assert_eq!(
+                connection.relay_urls(),
+                &[
+                    "wss://relay.example.com".to_string(),
+                    "ws://localhost:10547".to_string()
+                ]
+            );
+            assert_eq!(connection.lud16(), Some("buyer@example.com"));
+        }
     }
 
     #[test]
