@@ -265,8 +265,9 @@ arcadestr/
 │   │   ├── settlement_repository.rs # Account-scoped resumable quote/leg/attempt persistence
 │   │   ├── settlement_recovery.rs # Account/session fencing and exclusive recovery leases
 │   │   ├── durable_payments.rs # Journaled NWC dispatch and proof reconciliation
-│   │   ├── purchase_contract.rs # Plan review, explicit approval, network/fee policy wire types
-│   │   ├── purchase_execution.rs # Verified plan approvals, admissions, and guarded leg execution
+│   │   ├── purchase_contract.rs # Plan review, explicit approval, network/fee policy wire types, versioned unknown-routing-fee notice
+│   │   ├── purchase_execution.rs # Verified plan approvals, admissions, guarded leg execution, recorded/unknown fee accounting
+│   │   ├── payment_boundary.rs # Compiled buyer/refund activation, mainnet/regtest network rules, fee-policy and dispatch authorization
 │   │   ├── receipt_portability.rs # Receipt import, relay discovery, and authority verification
 │   │   ├── receipt_sync_contract.rs # Buyer-scoped receipt sync/import request and report types
 │   │   ├── entitlement_reconciliation.rs # Revalidate known grant chains and update projections
@@ -905,7 +906,7 @@ without module qualification are defined or imported in the named source file.
 | `disconnect_nwc_wallet` | `adp_commands.rs` | `expected_account_pubkey: String` | `()` | Removes the expected account's saved wallet connection |
 | `verify_nwc_wallet` | `adp_commands.rs` | `expected_account_pubkey: String` | `String` | Performs a non-paying wallet verification request |
 | `get_purchase_plan` | `adp_commands.rs` | `request: PurchasePlanRequest` | `PurchasePlanReview` | Reviews the original quote and signed terms without dispatching payment |
-| `approve_purchase_plan` | `adp_commands.rs` | `request: ApprovePurchasePlanRequest` | `PurchasePlanReview` | Persists explicit full-plan approval with payment limits, network, and fee policy |
+| `approve_purchase_plan` | `adp_commands.rs` | `request: ApprovePurchasePlanRequest` | `PurchasePlanReview` | Persists explicit immutable full-plan approval (principal, dispatch count, network, wallet, fee policy). New standard-NWC approvals use `unknown_fees_acknowledged`: `accept_unenforced_fee_risk` must be true, `fee_reserve_msat`/`total_msat` must be absent; new `reported_fees` approvals are refused. Approval never dispatches a payment |
 | `resume_split_payment` | `adp_commands.rs` | `request: ResumeSplitPaymentRequest` | `SplitSettlementResponse` | Reconciles an existing attempt; never requests a replacement invoice or dispatches payment |
 | `reconcile_pending_settlements` | `settlement_ui.rs` | None | `RecoveryReport` | Reconciles pending account-scoped payments and refunds without new spending |
 | `recipient_refund_history` | `settlement_ui.rs` | `request: RefundHistoryRequest` | `Vec<RefundHistoryItem>` | Reads processor obligations and merges local recipient payment/proof checkpoints |
@@ -1429,8 +1430,9 @@ Startup also runs interrupted-installation recovery before stale `Installing` ro
 | `core::nip98_client` | Signed HTTP requests | NIP-98 event/header helpers | `build_nip98_auth_header()` |
 | `core::nwc_client` | Nostr Wallet Connect | Wallet connection/payment types | Connect and pay invoice operations |
 | `core::durable_payments` | Restart-safe payment journal | `PaymentWallet`, `DurableNwcPayments`, `DurablePaymentError` | `pay_or_resume_guarded()`, `reconcile()`, `validate_payment_proof()` |
-| `core::purchase_contract` | Explicit purchase-plan review and approval | `PurchasePlanReview`, `ApprovePurchasePlanRequest`, `InvoiceNetwork`, `RoutingFeePolicy` | `dispatch_ready()`, `require_live_purchase_authorization()` |
+| `core::purchase_contract` | Explicit purchase-plan review and approval | `PurchasePlanReview` (incl. `approved_fee_policy`, `approved_fee_notice`), `ApprovePurchasePlanRequest`, `PurchaseLimits` (optional `fee_reserve_msat`/`total_msat`), `InvoiceNetwork`, `RoutingFeePolicy` (`provider_ceiling`, legacy `reported_fees`, `unknown_fees_acknowledged`), `UNKNOWN_ROUTING_FEES_NOTICE`/`_WARNING`/`_ACKNOWLEDGEMENT` | `dispatch_ready()`, `RoutingFeePolicy::uses_fee_reserve()`, `require_live_purchase_authorization()` |
 | `core::purchase_execution` | Verified approvals and irreversible dispatch admissions | `PurchaseExecutor`, `ExecutionError` | `review()`, `verify_sources()`, `approve_verified_with_fee_policy()`, `pay_leg_guarded()`, `reconcile_leg()` |
+| `core::payment_boundary` | Release payment boundary (decides only; never contacts a wallet) | `DispatchActivation`, `PaymentActivationStatus`, `BuyerDispatchCheck`, `RefundDispatchCheck`, `BoundaryRefusal` | `release_activation()`, `require_network()`, `require_approval_fee_policy()`, `require_fee_policy()`, `verify_wallet()`, `authorize_buyer_dispatch()`, `authorize_refund_dispatch()` |
 | `core::settlement_recovery` | Account/session-fenced recovery coordination | `RecoveryCoordinator`, `SessionFence`, `RecoveryLease` | `activate()`, `observe()`, `claim()`, `ensure_current()` |
 | `core::receipt_portability` | Portable receipt discovery and verification | `ReceiptPortability`, `ReceiptSource` | `import_json()`, `ingest()`, `synchronize()` |
 | `core::receipt_sync_contract` | Buyer-scoped receipt IPC | `ReceiptSyncRequest`, `ReceiptImportRequest`, `ReceiptSyncReport`, `ReceiptVerification` | Request/report and chain-verification wire types |
@@ -2287,6 +2289,12 @@ Root `.gitignore` keeps `target/`, `node_modules/`, `desktop/gen/`, `web/dist/`,
 | `csr` | `app` | Client-side rendering mode |
 | `hydrate` | `app` | Hydration mode (available but unused) |
 | `web` | `app` | Empty target marker selecting standalone-browser code paths; NIP-07 support is conditionally compiled in the app |
+| `production-buyer-payments` | `core`, `desktop` | Release-only, mainnet-only buyer dispatch; strict wallet-enforced fee ceiling only (unusable with standard NWC) |
+| `production-refund-payments` | `core`, `desktop` | Release-only, mainnet-only recipient refund dispatch, independent of buyer activation |
+| `production-reported-fees` | `core`, `desktop` | Implies `production-buyer-payments`; permits the warning-only standard-NWC policy (`unknown_fees_acknowledged`) and dispatch/recovery of legacy `reported_fees` approvals. Historical name; it never creates reserve-based approvals |
+| `regtest-buyer-payments` / `regtest-refund-payments` | `core`, `desktop` | Debug-only regtest activation with hard test ceilings; compile error in release or combined with production features |
+
+Payment activation is compiled, never read from env/files/IPC; see `core/src/payment_boundary.rs` and `docs/PRODUCTION_PAYMENTS.md`.
 
 ---
 
@@ -2753,6 +2761,10 @@ Marketplace streams no longer use static event names. Inspect the `requestId` ar
 
 23. **Split settlement remains experimental and desktop-only**: `adp_settlement.rs` validates version-1 fee math, exact currency conversion, coverage, ordering, quote activation, deadlines, signed experimental events, and aggregate commitments; migration 017 and `SettlementRepository` retain account-scoped resumable state. Publisher Studio requires explicit fee consent, game detail drives sequential legs and resume, and Purchases exposes recovery/refund controls. Legacy single-payment, free/public/timed/claim, install, and web behavior remain available; web does not execute or recover split settlements.
 
+24. **Routing fees are wallet-controlled, not capped**: Standard NWC cannot enforce a fee ceiling. New buyer approvals use `RoutingFeePolicy::UnknownFeesAcknowledged`: the checkout (`app/src/ui_v2/components/purchase_plan.rs`) shows the exact game price, the recipient split and `UNKNOWN_ROUTING_FEES_WARNING`, and approval requires the initially unchecked `UNKNOWN_ROUTING_FEES_ACKNOWLEDGEMENT`. The immutable approval snapshot stores the policy and the notice version (`arcadestr/unknown-lightning-routing-fees/v1`); `PurchaseLimits.fee_reserve_msat`/`total_msat` are `None`, and Arcadestr enforces no fee maximum. A wallet-proved preimage makes a leg paid; `fees_paid_msat` is recorded when `pay_invoice` or a read-only `lookup_invoice` reports it (never overwritten by a later missing report) and otherwise stays NULL, shown as "Routing fees not reported", never zero. Missing fees never make a leg uncertain or permit a resend; uncertain payment outcomes are unchanged. Under this policy, admissions store a placeholder `fee_bound_msat = 0` that is not a bound. `checkpoint_proof` and re-approval treat an app-verified unknown-fee leg as accounted for via `json_extract(snapshot,'$.fee_policy')`; external proofs for unverified legs still halt dispatch. Older approval snapshots (`provider_ceiling`, `reported_fees`) are byte-stable (`Some(v)` serializes like the former integer, the notice field is omitted) and keep their reserve, overrun-halt and missing-fee-unresolved semantics; the desktop refuses new `reported_fees` approvals. Strict `provider_ceiling` remains in the executor for a future wallet adapter that can enforce a ceiling; the desktop refuses it today.
+
+25. **Release-only test profile**: Production payment features compile only in release, so their tests run with `cargo test --release`. Debug-only fixtures (NIP-99 `raw_event_json`, plaintext `ws://` loopback NWC relays) are `#[cfg(debug_assertions)]`; the release variant of the NWC URI test asserts loopback `ws://` relays are rejected.
+
 ---
 
 ## 12. Glossary
@@ -2830,6 +2842,9 @@ Marketplace streams no longer use static event names. Inspect the `requestId` ar
 | **Fulfillment mode** | Publishing choice: `none` (buy-only), `direct` (developer signer), or `delegate` (provisioned operator signer) |
 | **Download token** | Expiring ADP credential scoped by buyer pubkey, game coordinate, and server after purchase confirmation or campaign claim |
 | **NWC** | Nostr Wallet Connect, used to connect a wallet and pay a Bolt11 invoice without exposing its connection secret to the UI response |
+| **Warning-only fee policy** | `unknown_fees_acknowledged`: buyer explicitly acknowledges that wallet-chosen Lightning routing fees are unknown before payment and may exceed the game price and not be refunded; no fee estimate, reserve or Arcadestr-enforced maximum |
+| **Routing-fee notice version** | Stable identifier of the acknowledged warning text stored in the immutable approval; changing the text requires a new version |
+| **Recorded vs unknown fees** | `fees_paid_msat` set from a wallet fee report, or NULL when none was reported; unknown is never treated as zero or as payment failure |
 | **Install registry** | SQLite installation records, launch-profile availability, exact manifests, lifecycle/recovery state, and retained-package links committed after verified extraction |
 | **Artifact quarantine** | Preservation of a hash-mismatched download as `.corrupt`, `.corrupt.1`, and so on, without recording an install |
 | **Local account** | Direct-signing account whose nsec is encrypted by Arcadestr rather than held by a NIP-46 signer |
@@ -3008,6 +3023,7 @@ New debug-only UI component in `detail.rs` for inspecting NIP-99 events:
 - **Persistence**: `017_split_settlement.sql` adds account-scoped quotes, ordered legs, encrypted attempts/destination revisions, and recovery rows. `SettlementRepository` supports durable resume and explicitly gates side effects on the initiating account.
 - **Desktop orchestration**: `desktop/src/adp_commands.rs` creates/preflights quotes, discloses one invoice at a time, stores attempts encrypted with signer NIP-44, submits proofs, persists aggregate receipts, refreshes status, and drives recovery/destination/refund endpoints. Every mutating continuation rechecks the active account.
 - **Publisher Studio**: paid listings show the server/operator fee economics and require explicit acceptance of the exact terms roots; edits and typed retries preserve those references, while publication rejects uncovered operators or malformed terms.
+- **Fee policy**: checkout approval is warning-only for standard NWC (explicit, versioned routing-fee acknowledgement; no reserve or maximum), with reported fees recorded and missing reports shown as unknown. Legacy reserve approvals keep their original semantics; strict wallet-enforced ceilings remain for future capable wallets. See Known Gotcha 24 and `docs/PRODUCTION_PAYMENTS.md`.
 - **Buyer UI**: `GameDetailView` resumes active account/listing/processor quotes and advances NWC or manual-preimage legs without replacing legacy checkout. `PurchasesView` presents active/failed/settled states, partial-payment refresh, immutable recovery deadlines, destination replacement, and per-leg refund status; it does not misrepresent recipient-owned refund payment/confirmation as a buyer action. Split execution and recovery remain desktop-only.
 
 ---

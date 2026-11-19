@@ -64,7 +64,7 @@ default. See [Production payment release policy](PRODUCTION_PAYMENTS.md).
 | Authorization | Explicit approval of an immutable verified plan (quote, terms, recipients, amounts, network, wallet, limits) | Authenticated obligation from the processor addressed to the active identity; explicit per-payment confirmation |
 | Binding | Original processor invoice per leg (hash, amount, signing key, attempt) | Original processor-prepared refund invoice (hash, amount, attempt, leg); principal must equal the obligation |
 | Durability | Admission persisted as uncertain before dispatch; one leg at a time; halt on uncertainty | Durable NWC intent before dispatch; uncertain outcome is never repaid |
-| Fees | `ProviderCeiling` needs a wallet-guaranteed bound (standard NWC has none); `ReportedFees` needs separate build approval and explicit buyer acknowledgement | Disclosed, not bounded by the application |
+| Fees | `ProviderCeiling` needs a wallet-guaranteed bound (standard NWC has none); `UnknownFeesAcknowledged` (warning-only, no reserve or cap; reported fees recorded, missing ones unknown) needs separate build approval and explicit buyer acknowledgement stored in the approval; legacy `ReportedFees` approvals keep their reserve semantics but cannot be newly created | Disclosed, not bounded by the application; buyer routing fees are not part of refunded principal |
 | Network | Invoice and wallet network must match the approval and compiled policy | Invoice and wallet network must match the independently compiled policy |
 
 Managed IPC keeps BOLT11 material in the backend. Recovery may submit valid
