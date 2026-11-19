@@ -284,8 +284,8 @@ async fn missing_wallet_permission_never_retries_or_expands_an_existing_admissio
 fn limits() -> PurchaseLimits {
     PurchaseLimits {
         principal_msat: 200000,
-        fee_reserve_msat: 50000,
-        total_msat: 250000,
+        fee_reserve_msat: Some(50000),
+        total_msat: Some(250000),
         maximum_dispatches: 2,
     }
 }
@@ -337,7 +337,7 @@ async fn approval_is_immutable_and_two_original_legs_do_not_redispatch() {
     approve(&f).await;
     let executor = PurchaseExecutor::new(f.db.pool().clone());
     let mut changed = limits();
-    changed.total_msat += 1;
+    changed.total_msat = Some(250001);
     assert!(executor
         .approve(
             &f.signer,
@@ -534,7 +534,7 @@ async fn checked_budgets_reject_expansion_and_fee_violations_halt_remaining_legs
     let executor = PurchaseExecutor::new(f.db.pool().clone());
     for changed in [
         PurchaseLimits {
-            total_msat: 249999,
+            total_msat: Some(249999),
             ..limits()
         },
         PurchaseLimits {
@@ -1333,4 +1333,401 @@ async fn reported_fee_overrun_halts_new_dispatch_but_preserves_paid_evidence() {
         .await
         .is_err());
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+}
+
+// --- Warning-only (unknown routing fees) policy -------------------------------
+
+fn unknown_fee_limits() -> PurchaseLimits {
+    PurchaseLimits {
+        principal_msat: 200000,
+        fee_reserve_msat: None,
+        total_msat: None,
+        maximum_dispatches: 2,
+    }
+}
+
+async fn approve_with_policy(
+    f: &Fixture,
+    limits: PurchaseLimits,
+    policy: arcadestr_core::purchase_contract::RoutingFeePolicy,
+    acknowledged: bool,
+) -> Result<(), arcadestr_core::purchase_execution::ExecutionError> {
+    let executor = PurchaseExecutor::new(f.db.pool().clone());
+    let review = executor
+        .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+        .await
+        .expect("review");
+    executor
+        .approve_verified_with_fee_policy(
+            &f.signer,
+            &f.wallet,
+            &f.quote.quote_id,
+            &review.quote_event_id,
+            &review.commitment,
+            limits,
+            InvoiceNetwork::Regtest,
+            policy,
+            acknowledged,
+            &|| Ok(()),
+        )
+        .await
+}
+
+async fn approve_unknown_fees(f: &Fixture) {
+    approve_with_policy(
+        f,
+        unknown_fee_limits(),
+        arcadestr_core::purchase_contract::RoutingFeePolicy::UnknownFeesAcknowledged,
+        true,
+    )
+    .await
+    .expect("acknowledged warning-only approval");
+}
+
+async fn snapshot(f: &Fixture) -> String {
+    let buyer = f.signer.get_public_key().await.expect("buyer");
+    sqlx::query_scalar(
+        "SELECT snapshot FROM purchase_execution_approvals WHERE account_pubkey=? AND quote_id=?",
+    )
+    .bind(buyer.to_hex())
+    .bind(&f.quote.quote_id)
+    .fetch_one(f.db.pool())
+    .await
+    .expect("snapshot")
+}
+
+#[tokio::test]
+async fn unknown_fee_approval_requires_explicit_acknowledgement_and_invents_no_limits() {
+    use arcadestr_core::purchase_contract::{RoutingFeePolicy, UNKNOWN_ROUTING_FEES_NOTICE};
+    use arcadestr_core::purchase_execution::ExecutionError;
+    let f = verified_fixture().await;
+    f.wallet.known.store(false, Ordering::SeqCst);
+    let policy = RoutingFeePolicy::UnknownFeesAcknowledged;
+    // No acknowledgement: nothing is persisted and nothing is payable.
+    assert!(matches!(
+        approve_with_policy(&f, unknown_fee_limits(), policy, false).await,
+        Err(ExecutionError::FeeRiskAcknowledgementRequired)
+    ));
+    // A numerical reserve or maximum total is refused under this policy.
+    for limits in [
+        limits(),
+        PurchaseLimits {
+            fee_reserve_msat: Some(0),
+            ..unknown_fee_limits()
+        },
+        PurchaseLimits {
+            total_msat: Some(200000),
+            ..unknown_fee_limits()
+        },
+    ] {
+        assert!(approve_with_policy(&f, limits, policy, true).await.is_err());
+    }
+    let executor = PurchaseExecutor::new(f.db.pool().clone());
+    assert!(
+        executor
+            .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+            .await
+            .expect("review")
+            .approved_limits
+            .is_none(),
+        "refused approvals leave no persisted plan"
+    );
+    assert!(executor
+        .pay_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .is_err());
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+    // Reserve policies still require their numerical budget.
+    assert!(approve_with_policy(
+        &f,
+        unknown_fee_limits(),
+        RoutingFeePolicy::ReportedFees,
+        true
+    )
+    .await
+    .is_err());
+
+    approve_unknown_fees(&f).await;
+    // Identical replay is idempotent; the approval is immutable.
+    approve_unknown_fees(&f).await;
+    assert!(
+        approve_with_policy(&f, limits(), RoutingFeePolicy::ReportedFees, true)
+            .await
+            .is_err()
+    );
+    let review = executor
+        .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+        .await
+        .expect("review");
+    assert!(review.approved);
+    assert_eq!(review.approved_fee_policy, Some(policy));
+    assert_eq!(
+        review.approved_fee_notice.as_deref(),
+        Some(UNKNOWN_ROUTING_FEES_NOTICE)
+    );
+    let limits = review.approved_limits.expect("limits");
+    assert_eq!(limits.principal_msat, 200000);
+    assert_eq!(limits.fee_reserve_msat, None);
+    assert_eq!(limits.total_msat, None);
+    let stored: serde_json::Value = serde_json::from_str(&snapshot(&f).await).expect("json");
+    assert_eq!(stored["fee_policy"], "unknown_fees_acknowledged");
+    assert_eq!(stored["fee_risk_notice"], UNKNOWN_ROUTING_FEES_NOTICE);
+    assert!(stored["limits"]["fee_reserve_msat"].is_null());
+    assert!(stored["limits"]["total_msat"].is_null());
+}
+
+#[tokio::test]
+async fn unknown_fee_policy_pays_every_recipient_without_a_reserve_and_records_reported_fees() {
+    let f = verified_fixture().await;
+    f.wallet.known.store(false, Ordering::SeqCst);
+    // Larger than any former default reserve: no hidden cap blocks later legs.
+    f.wallet.fees.store(75_000, Ordering::SeqCst);
+    approve_unknown_fees(&f).await;
+    let executor = PurchaseExecutor::new(f.db.pool().clone());
+    let paid = executor
+        .pay_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .expect("first leg");
+    assert_eq!(paid.fees_paid_msat, Some(75_000));
+    acknowledge(&f, "attempt-0").await;
+    disclose(&f, 1).await;
+    f.wallet.fees.store(1_234, Ordering::SeqCst);
+    executor
+        .pay_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-1")
+        .await
+        .expect("second leg proceeds without a numerical reserve");
+    let review = executor
+        .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+        .await
+        .expect("review");
+    assert!(!review.halted);
+    assert_eq!(review.legs[0].fees_paid_msat, Some(75_000));
+    assert_eq!(review.legs[1].fees_paid_msat, Some(1_234));
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 2);
+    // Fee reports never change the recipient amounts or the approved principal.
+    assert_eq!(
+        review.approved_limits.expect("limits").principal_msat,
+        200000
+    );
+    assert!(review.quote.legs.iter().all(|l| l.amount_msat == 100000));
+}
+
+#[tokio::test]
+async fn missing_fee_report_stays_unknown_without_uncertainty_or_duplicate_sends() {
+    use arcadestr_core::purchase_contract::LegProgress;
+    let f = verified_fixture().await;
+    f.wallet.known.store(false, Ordering::SeqCst);
+    f.wallet.omit_fees.store(true, Ordering::SeqCst);
+    approve_unknown_fees(&f).await;
+    let executor = PurchaseExecutor::new(f.db.pool().clone());
+    let paid = executor
+        .pay_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .expect("valid proof is a paid leg even without a fee report");
+    assert_eq!(paid.fees_paid_msat, None);
+    let review = executor
+        .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+        .await
+        .expect("review");
+    assert_eq!(review.legs[0].progress, LegProgress::Paid);
+    assert_eq!(review.legs[0].fees_paid_msat, None, "unknown, never zero");
+    assert!(!review.halted);
+    let buyer = f.signer.get_public_key().await.expect("buyer");
+    let stored: Option<i64> = sqlx::query_scalar(
+        "SELECT fees_paid_msat FROM purchase_execution_admissions WHERE account_pubkey=? AND attempt_id='attempt-0' AND state='verified'",
+    )
+    .bind(buyer.to_hex())
+    .fetch_one(f.db.pool())
+    .await
+    .expect("verified admission");
+    assert_eq!(stored, None);
+    // Retrying and recovering the same leg returns the original proof only.
+    executor
+        .pay_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .expect("cached original proof");
+    executor
+        .reconcile_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .expect("read-only recovery");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+    // Checkpointing the app-verified proof does not halt the purchase.
+    let repo = SettlementRepository::new(f.db.pool().clone());
+    assert!(repo
+        .checkpoint_proof(&buyer.to_hex(), &f.quote.quote_id, "attempt-0", b"proof")
+        .await
+        .expect("checkpoint"));
+    assert!(
+        !executor
+            .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+            .await
+            .expect("review")
+            .halted
+    );
+    acknowledge(&f, "attempt-0").await;
+    disclose(&f, 1).await;
+    executor
+        .pay_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-1")
+        .await
+        .expect("next leg is not blocked by an unknown fee");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 2);
+    // A fee later exposed by read-only lookup is recorded; a later missing
+    // report never erases a known fee.
+    f.wallet.omit_fees.store(false, Ordering::SeqCst);
+    f.wallet.fees.store(321, Ordering::SeqCst);
+    f.wallet.visible.store(true, Ordering::SeqCst);
+    executor
+        .reconcile_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .expect("lookup");
+    f.wallet.omit_fees.store(true, Ordering::SeqCst);
+    executor
+        .reconcile_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .expect("lookup without report");
+    let review = executor
+        .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+        .await
+        .expect("review");
+    assert_eq!(review.legs[0].fees_paid_msat, Some(321));
+    assert_eq!(review.legs[1].fees_paid_msat, None);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn unknown_fee_policy_keeps_uncertain_outcomes_and_external_proofs_fenced() {
+    use arcadestr_core::purchase_contract::LegProgress;
+    let f = verified_fixture().await;
+    f.wallet.known.store(false, Ordering::SeqCst);
+    approve_unknown_fees(&f).await;
+    disclose(&f, 1).await;
+    // An unknown payment outcome (not merely an unknown fee) remains uncertain.
+    f.wallet.lost.store(true, Ordering::SeqCst);
+    let executor = PurchaseExecutor::new(f.db.pool().clone());
+    assert!(executor
+        .pay_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .is_err());
+    f.wallet.lost.store(false, Ordering::SeqCst);
+    assert!(executor
+        .pay_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-1")
+        .await
+        .is_err());
+    assert!(executor
+        .pay_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .is_err());
+    assert!(executor
+        .reconcile_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .is_err());
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        executor
+            .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+            .await
+            .expect("review")
+            .legs[0]
+            .progress,
+        LegProgress::Uncertain
+    );
+    // A proof for a leg never verified by the app still halts dispatch.
+    let buyer = f.signer.get_public_key().await.expect("buyer");
+    SettlementRepository::new(f.db.pool().clone())
+        .checkpoint_proof(&buyer.to_hex(), &f.quote.quote_id, "attempt-1", b"external")
+        .await
+        .expect("checkpoint");
+    assert!(
+        executor
+            .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+            .await
+            .expect("review")
+            .halted
+    );
+    // Read-only lookup resolves the original payment without paying again.
+    f.wallet.visible.store(true, Ordering::SeqCst);
+    f.wallet.omit_fees.store(true, Ordering::SeqCst);
+    executor
+        .reconcile_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .expect("original proof");
+    let review = executor
+        .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+        .await
+        .expect("review");
+    assert_eq!(review.legs[0].progress, LegProgress::Paid);
+    assert_eq!(review.legs[0].fees_paid_msat, None);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn legacy_reported_fee_approval_keeps_reserve_and_missing_fee_semantics() {
+    use arcadestr_core::purchase_contract::{LegProgress, RoutingFeePolicy};
+    let f = verified_fixture().await;
+    f.wallet.known.store(false, Ordering::SeqCst);
+    f.wallet.omit_fees.store(true, Ordering::SeqCst);
+    approve_with_policy(&f, limits(), RoutingFeePolicy::ReportedFees, true)
+        .await
+        .expect("legacy persisted reserve approval");
+    // Legacy snapshots keep their original shape: numeric reserve, no notice.
+    let stored = snapshot(&f).await;
+    assert!(stored.contains(r#""fee_reserve_msat":50000,"total_msat":250000"#));
+    assert!(!stored.contains("fee_risk_notice"));
+    let review = PurchaseExecutor::new(f.db.pool().clone())
+        .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+        .await
+        .expect("review");
+    assert_eq!(
+        review.approved_fee_policy,
+        Some(RoutingFeePolicy::ReportedFees)
+    );
+    assert_eq!(review.approved_fee_notice, None);
+    let executor = PurchaseExecutor::new(f.db.pool().clone());
+    // A missing fee report stays unresolved under the legacy reserve policy.
+    assert!(executor
+        .pay_leg(&f.signer, &f.wallet, &f.quote.quote_id, "attempt-0")
+        .await
+        .is_err());
+    let review = executor
+        .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+        .await
+        .expect("review");
+    assert_eq!(review.legs[0].progress, LegProgress::Uncertain);
+    let buyer = f.signer.get_public_key().await.expect("buyer");
+    SettlementRepository::new(f.db.pool().clone())
+        .checkpoint_proof(&buyer.to_hex(), &f.quote.quote_id, "attempt-0", b"proof")
+        .await
+        .expect("checkpoint");
+    assert!(
+        executor
+            .review(&f.signer, Some(&f.wallet), &f.quote.quote_id)
+            .await
+            .expect("review")
+            .halted,
+        "legacy plans still halt when fees are not verified"
+    );
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn legacy_snapshots_without_new_fields_still_deserialize() {
+    use arcadestr_core::purchase_contract::RoutingFeePolicy;
+    let limits: PurchaseLimits = serde_json::from_str(
+        r#"{"principal_msat":200000,"fee_reserve_msat":50000,"total_msat":250000,"maximum_dispatches":2}"#,
+    )
+    .expect("legacy limits");
+    assert_eq!(limits.fee_reserve_msat, Some(50000));
+    assert_eq!(
+        serde_json::to_string(&limits).expect("json"),
+        r#"{"principal_msat":200000,"fee_reserve_msat":50000,"total_msat":250000,"maximum_dispatches":2}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<RoutingFeePolicy>(r#""reported_fees""#).expect("legacy"),
+        RoutingFeePolicy::ReportedFees
+    );
+    assert_eq!(
+        serde_json::to_string(&RoutingFeePolicy::UnknownFeesAcknowledged).expect("json"),
+        r#""unknown_fees_acknowledged""#,
+        "persisted SQL predicates depend on this name"
+    );
 }

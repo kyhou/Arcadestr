@@ -1861,18 +1861,35 @@ async fn buyer_dispatch_boundary(
     let current = state.auth.lock().await.public_key().map(|key| key.to_hex());
     let initiating = account.to_hex();
     let fee_policy = review.approved_fee_policy.unwrap_or_default();
-    // Everything already admitted for this account, at its worst-case fee bound.
+    // Everything already admitted for this account, at its worst-case fee bound
+    // (regtest test ceilings only). Warning-only admissions record a 0 placeholder
+    // bound, so their unknown fees add nothing here; no fee is assumed.
     let account_admitted: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(amount_msat+COALESCE(fees_paid_msat,fee_bound_msat)),0) FROM purchase_execution_admissions WHERE account_pubkey=?")
         .bind(&initiating)
         .fetch_one(state.database.pool())
         .await
         .map_err(|_| "Purchase admissions unavailable")?;
     let limits = review.approved_limits.as_ref();
-    // Conservative: this leg's principal plus the whole approved fee reserve.
+    // Conservative: this leg's principal plus the whole approved fee reserve,
+    // when the policy has one. The warning-only policy has no fee reserve.
+    let reserve = if fee_policy.uses_fee_reserve() {
+        limits
+            .map_or(Some(u64::MAX), |l| l.fee_reserve_msat)
+            .unwrap_or(u64::MAX)
+    } else {
+        0
+    };
     let next_leg_msat = invoice
         .amount_milli_satoshis()
         .unwrap_or(u64::MAX)
-        .saturating_add(limits.map_or(u64::MAX, |l| l.fee_reserve_msat));
+        .saturating_add(reserve);
+    let approved_total_msat = limits.map_or(u64::MAX, |l| {
+        if fee_policy.uses_fee_reserve() {
+            l.total_msat.unwrap_or(u64::MAX)
+        } else {
+            l.principal_msat
+        }
+    });
     authorize_buyer_dispatch(
         activation,
         &BuyerDispatchCheck {
@@ -1886,13 +1903,22 @@ async fn buyer_dispatch_boundary(
             approval_halted: review.halted,
             wallet: &verified,
             fee_policy,
-            // The executor refuses to persist a reported-fee approval without it.
-            fee_risk_acknowledged: fee_policy == RoutingFeePolicy::ReportedFees,
+            // The executor refuses to persist either unenforced policy without
+            // explicit acknowledgement; the warning-only approval also stores
+            // the exact notice the buyer acknowledged.
+            fee_risk_acknowledged: match fee_policy {
+                RoutingFeePolicy::ProviderCeiling => false,
+                RoutingFeePolicy::ReportedFees => true,
+                RoutingFeePolicy::UnknownFeesAcknowledged => {
+                    review.approved_fee_notice.as_deref()
+                        == Some(arcadestr_core::purchase_contract::UNKNOWN_ROUTING_FEES_NOTICE)
+                }
+            },
             wallet_fee_ceiling_available: wallet.maximum_fee_msat(bolt11).is_some(),
             pinned_listing_event_id: &review.quote.listing_event_id,
             listing: &listing,
             invoice_network: network,
-            approved_total_msat: limits.map_or(u64::MAX, |l| l.total_msat),
+            approved_total_msat,
             account_admitted_msat: u64::try_from(account_admitted).unwrap_or(u64::MAX),
             next_leg_msat,
         },
@@ -1993,19 +2019,34 @@ pub async fn approve_purchase_plan(
     // A test build approves only regtest plans within its hard ceilings.
     {
         use arcadestr_core::payment_boundary::{
-            release_activation, require_activation, require_fee_policy, require_network,
+            release_activation, require_activation, require_approval_fee_policy, require_network,
             require_test_ceilings, PaymentPurpose,
         };
         let activation = release_activation(PaymentPurpose::BuyerPurchase);
         require_activation(activation, PaymentPurpose::BuyerPurchase).map_err(|r| r.to_string())?;
         require_network(activation, request.network).map_err(|r| r.to_string())?;
-        require_fee_policy(
+        require_approval_fee_policy(
             activation,
             request.fee_policy,
             request.accept_unenforced_fee_risk,
         )
         .map_err(|r| r.to_string())?;
-        require_test_ceilings(activation, request.total_msat, request.total_msat)
+        // Warning-only approvals carry no fee reserve or maximum total; the
+        // regtest test ceiling then applies to the exact principal only.
+        let ceiling_total = if request.fee_policy.uses_fee_reserve() {
+            request
+                .total_msat
+                .ok_or("A fee reserve and total are required for this policy")?
+        } else {
+            if request.fee_reserve_msat.is_some() || request.total_msat.is_some() {
+                return Err(
+                    "Unknown routing fees cannot be combined with a fee reserve or maximum total"
+                        .into(),
+                );
+            }
+            review.quote.gross_msat
+        };
+        require_test_ceilings(activation, ceiling_total, ceiling_total)
             .map_err(|r| r.to_string())?;
     }
     // Approval binds a wallet only after standard get_info shows it can pay and
@@ -2019,6 +2060,7 @@ pub async fn approve_purchase_plan(
     if request.fee_policy == arcadestr_core::purchase_contract::RoutingFeePolicy::ProviderCeiling {
         // This desktop currently constructs only the standard NIP-47 adapter.
         // Do not persist an immutable strict approval for an unsupported wallet.
+        // Strict support stays in the executor for a future capable adapter.
         return Err(
             arcadestr_core::payment_boundary::BoundaryRefusal::FeeCeilingUnavailable.to_string(),
         );
@@ -2050,6 +2092,8 @@ pub async fn approve_purchase_plan(
                 principal_msat: review.quote.gross_msat,
                 fee_reserve_msat: request.fee_reserve_msat,
                 total_msat: request.total_msat,
+                // Executor rejects a reserve/total under the warning-only
+                // policy and requires both for reserve-based policies.
                 maximum_dispatches: review.quote.legs.len(),
             },
             request.network,

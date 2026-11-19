@@ -3,6 +3,7 @@
 pub use crate::purchase_contract::{InvoiceNetwork, PurchaseLimits};
 use crate::purchase_contract::{
     LegProgress, PurchaseLegStatus, PurchasePlanReview, RoutingFeePolicy,
+    UNKNOWN_ROUTING_FEES_NOTICE,
 };
 use crate::{
     adp_client::SettlementInvoiceResponse,
@@ -31,7 +32,9 @@ pub enum ExecutionError {
     Uncertain,
     #[error("Existing wallet capabilities do not establish the approved fee ceiling")]
     FeeBoundUnavailable,
-    #[error("Reported-fee accounting requires explicit acknowledgment that the wallet may exceed the desired maximum")]
+    #[error(
+        "Explicit acknowledgement that additional Lightning routing fees may apply is required"
+    )]
     FeeRiskAcknowledgementRequired,
     #[error("Purchase storage unavailable")]
     Storage(#[from] sqlx::Error),
@@ -68,6 +71,10 @@ struct ApprovedPlan {
     bind_original_disclosures: bool,
     #[serde(default)]
     fee_policy: RoutingFeePolicy,
+    /// Routing-fee notice the buyer explicitly acknowledged. Absent from older
+    /// snapshots (and omitted when absent) so they stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fee_risk_notice: Option<String>,
 }
 
 pub struct PurchaseExecutor {
@@ -140,6 +147,7 @@ impl PurchaseExecutor {
             false,
             RoutingFeePolicy::ProviderCeiling,
             None,
+            None,
         )
         .await
     }
@@ -155,26 +163,41 @@ impl PurchaseExecutor {
         invoice_payees: BTreeMap<String, String>,
         bind_original_disclosures: bool,
         fee_policy: RoutingFeePolicy,
+        fee_risk_notice: Option<&str>,
         guard: Option<&(dyn Fn() -> Result<(), String> + Send + Sync)>,
     ) -> Result<(), ExecutionError> {
+        if fee_policy == RoutingFeePolicy::UnknownFeesAcknowledged
+            && fee_risk_notice != Some(UNKNOWN_ROUTING_FEES_NOTICE)
+        {
+            return Err(ExecutionError::FeeRiskAcknowledgementRequired);
+        }
         let (quote, event_id) = self.quote(signer, quote_id).await?;
+        // Reserve policies need an exact, consistent numerical budget. The
+        // warning-only policy must not carry an invented reserve or maximum.
+        let fee_limits_valid = match (
+            fee_policy.uses_fee_reserve(),
+            limits.fee_reserve_msat,
+            limits.total_msat,
+        ) {
+            (true, Some(reserve), Some(total)) => {
+                limits
+                    .principal_msat
+                    .checked_add(reserve)
+                    .is_some_and(|sum| sum <= total)
+                    && reserve <= i64::MAX as u64
+                    && total <= i64::MAX as u64
+            }
+            (false, None, None) => true,
+            _ => false,
+        };
         if event_id != expected_quote_event_id
             || quote.state != QuoteState::Active
             || quote.legs.is_empty()
             || limits.principal_msat != quote.gross_msat
             || limits.maximum_dispatches != quote.legs.len()
             || (!bind_original_disclosures && invoice_payees.len() != quote.legs.len())
-            || limits
-                .principal_msat
-                .checked_add(limits.fee_reserve_msat)
-                .is_none_or(|sum| sum > limits.total_msat)
-            || [
-                limits.principal_msat,
-                limits.fee_reserve_msat,
-                limits.total_msat,
-            ]
-            .iter()
-            .any(|v| *v > i64::MAX as u64)
+            || !fee_limits_valid
+            || limits.principal_msat > i64::MAX as u64
             || invoice_payees.iter().any(|(id, key)| {
                 !quote.legs.iter().any(|leg| &leg.leg_id == id)
                     || nostr::secp256k1::PublicKey::from_str(key).is_err()
@@ -195,12 +218,17 @@ impl PurchaseExecutor {
             invoice_payees,
             bind_original_disclosures,
             fee_policy,
+            // Legacy policies never stored a notice; keep their snapshots unchanged.
+            fee_risk_notice: (fee_policy == RoutingFeePolicy::UnknownFeesAcknowledged)
+                .then(|| UNKNOWN_ROUTING_FEES_NOTICE.to_owned()),
         };
         let snapshot = serde_json::to_string(&plan).map_err(|_| ExecutionError::Binding)?;
         if let Some(guard) = guard {
             guard().map_err(|_| ExecutionError::Binding)?;
         }
-        let saved=sqlx::query("INSERT INTO purchase_execution_approvals(account_pubkey,quote_id,snapshot) SELECT ?1,?2,?3 WHERE NOT EXISTS (SELECT 1 FROM settlement_invoice_attempts a WHERE a.account_pubkey=?1 AND a.quote_id=?2 AND (a.encrypted_proof IS NOT NULL OR a.state='settled') AND NOT EXISTS (SELECT 1 FROM purchase_execution_admissions p WHERE p.account_pubkey=?1 AND p.quote_id=?2 AND p.attempt_id=a.attempt_id AND p.state='verified' AND p.fees_paid_msat IS NOT NULL)) ON CONFLICT(account_pubkey,quote_id) DO UPDATE SET snapshot=purchase_execution_approvals.snapshot WHERE purchase_execution_approvals.snapshot=excluded.snapshot")
+        // Proofs outside verified app accounting block (re)approval. Under the
+        // warning-only policy a verified leg with unknown fees is accounted for.
+        let saved=sqlx::query("INSERT INTO purchase_execution_approvals(account_pubkey,quote_id,snapshot) SELECT ?1,?2,?3 WHERE NOT EXISTS (SELECT 1 FROM settlement_invoice_attempts a WHERE a.account_pubkey=?1 AND a.quote_id=?2 AND (a.encrypted_proof IS NOT NULL OR a.state='settled') AND NOT EXISTS (SELECT 1 FROM purchase_execution_admissions p WHERE p.account_pubkey=?1 AND p.quote_id=?2 AND p.attempt_id=a.attempt_id AND p.state='verified' AND (p.fees_paid_msat IS NOT NULL OR json_extract(?3,'$.fee_policy')='unknown_fees_acknowledged'))) ON CONFLICT(account_pubkey,quote_id) DO UPDATE SET snapshot=purchase_execution_approvals.snapshot WHERE purchase_execution_approvals.snapshot=excluded.snapshot")
             .bind(&plan.quote.buyer_pubkey).bind(quote_id).bind(snapshot).execute(&self.pool).await?.rows_affected();
         if saved != 1 {
             return Err(ExecutionError::Binding);
@@ -318,6 +346,7 @@ impl PurchaseExecutor {
         let mut halted = false;
         let mut approved_limits = None;
         let mut approved_fee_policy = None;
+        let mut approved_fee_notice = None;
         let mut network = None;
         if let Some((text, flag)) = approval {
             let plan: ApprovedPlan =
@@ -329,6 +358,7 @@ impl PurchaseExecutor {
             halted = flag != 0;
             approved_limits = Some(plan.limits);
             approved_fee_policy = Some(plan.fee_policy);
+            approved_fee_notice = plan.fee_risk_notice;
             network = Some(plan.network);
         }
         let mut statuses = Vec::new();
@@ -432,6 +462,7 @@ impl PurchaseExecutor {
             approved,
             approved_limits,
             approved_fee_policy,
+            approved_fee_notice,
             halted,
             wallet_connected: wallet.is_some(),
             wallet_capabilities: None,
@@ -494,8 +525,12 @@ impl PurchaseExecutor {
         .await
     }
 
-    /// Standard-provider-compatible accounting is deliberately opt-in. It does
-    /// not establish a wallet-enforced fee ceiling or unlock the live release gate.
+    /// Any policy other than the strict ceiling is deliberately opt-in and
+    /// requires the buyer's explicit acknowledgement (`accept_risk`). It does
+    /// not establish a wallet-enforced fee ceiling or unlock the live release
+    /// gate. The warning-only policy records the acknowledged notice in the
+    /// immutable approval and must not be given a fee reserve or total.
+    #[allow(clippy::too_many_arguments)]
     pub async fn approve_verified_with_fee_policy(
         &self,
         signer: &dyn NostrSigner,
@@ -509,7 +544,7 @@ impl PurchaseExecutor {
         accept_risk: bool,
         guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
     ) -> Result<(), ExecutionError> {
-        if fee_policy == RoutingFeePolicy::ReportedFees && !accept_risk {
+        if fee_policy != RoutingFeePolicy::ProviderCeiling && !accept_risk {
             return Err(ExecutionError::FeeRiskAcknowledgementRequired);
         }
         let review = self.review(signer, Some(wallet), quote_id).await?;
@@ -542,6 +577,7 @@ impl PurchaseExecutor {
             payees,
             true,
             fee_policy,
+            accept_risk.then_some(UNKNOWN_ROUTING_FEES_NOTICE),
             Some(guard),
         )
         .await
@@ -705,6 +741,7 @@ impl PurchaseExecutor {
         {
             return Err(ExecutionError::Binding);
         }
+        let unknown_fees = plan.fee_policy == RoutingFeePolicy::UnknownFeesAcknowledged;
         let existing=sqlx::query("SELECT attempt_id,payment_hash,invoice_commitment,fee_bound_msat FROM purchase_execution_admissions WHERE account_pubkey=? AND quote_id=? AND leg_id=?")
             .bind(account).bind(quote_id).bind(&leg.leg_id).fetch_optional(&mut *tx).await?;
         let dispatch = existing.is_none();
@@ -757,34 +794,39 @@ impl PurchaseExecutor {
                 .map_err(|_| ExecutionError::Budget)?;
             let principal = u64::try_from(totals.try_get::<i64, _>("principal")?)
                 .map_err(|_| ExecutionError::Budget)?;
-            let fees = u64::try_from(totals.try_get::<i64, _>("fees")?)
-                .map_err(|_| ExecutionError::Budget)?;
-            let remaining = plan
-                .limits
-                .fee_reserve_msat
-                .checked_sub(fees)
-                .ok_or(ExecutionError::Budget)?;
-            fee_bound = match plan.fee_policy {
-                RoutingFeePolicy::ProviderCeiling => wallet
-                    .maximum_fee_msat(&invoice.bolt11)
-                    .ok_or(ExecutionError::FeeBoundUnavailable)?,
-                RoutingFeePolicy::ReportedFees => wallet
-                    .maximum_fee_msat(&invoice.bolt11)
-                    .unwrap_or(remaining)
-                    .min(remaining),
-            };
             let principal = principal
                 .checked_add(leg.amount_msat)
                 .ok_or(ExecutionError::Budget)?;
-            let fees = fees.checked_add(fee_bound).ok_or(ExecutionError::Budget)?;
-            if n >= plan.limits.maximum_dispatches
-                || principal > plan.limits.principal_msat
-                || fees > plan.limits.fee_reserve_msat
-                || principal
-                    .checked_add(fees)
-                    .is_none_or(|total| total > plan.limits.total_msat)
-            {
+            if n >= plan.limits.maximum_dispatches || principal > plan.limits.principal_msat {
                 return Err(ExecutionError::Budget);
+            }
+            if unknown_fees {
+                // Warning-only: no reserve, no hidden cap. The wallet chooses the
+                // routing fee; recorded `fee_bound_msat` is 0 and is not a bound.
+                if plan.fee_risk_notice.as_deref() != Some(UNKNOWN_ROUTING_FEES_NOTICE) {
+                    return Err(ExecutionError::FeeRiskAcknowledgementRequired);
+                }
+                fee_bound = 0;
+            } else {
+                let fees = u64::try_from(totals.try_get::<i64, _>("fees")?)
+                    .map_err(|_| ExecutionError::Budget)?;
+                let reserve = plan.limits.fee_reserve_msat.ok_or(ExecutionError::Budget)?;
+                let total = plan.limits.total_msat.ok_or(ExecutionError::Budget)?;
+                let remaining = reserve.checked_sub(fees).ok_or(ExecutionError::Budget)?;
+                fee_bound = match plan.fee_policy {
+                    RoutingFeePolicy::ReportedFees => wallet
+                        .maximum_fee_msat(&invoice.bolt11)
+                        .unwrap_or(remaining)
+                        .min(remaining),
+                    RoutingFeePolicy::ProviderCeiling
+                    | RoutingFeePolicy::UnknownFeesAcknowledged => wallet
+                        .maximum_fee_msat(&invoice.bolt11)
+                        .ok_or(ExecutionError::FeeBoundUnavailable)?,
+                };
+                let fees = fees.checked_add(fee_bound).ok_or(ExecutionError::Budget)?;
+                if fees > reserve || principal.checked_add(fees).is_none_or(|sum| sum > total) {
+                    return Err(ExecutionError::Budget);
+                }
             }
             guard().map_err(|_| ExecutionError::Binding)?;
             sqlx::query("INSERT INTO purchase_execution_admissions(account_pubkey,quote_id,leg_id,attempt_id,payment_hash,invoice_commitment,amount_msat,fee_bound_msat,state) VALUES(?,?,?,?,?,?,?,?,'uncertain')")
@@ -799,6 +841,34 @@ impl PurchaseExecutor {
         } else {
             journal.reconcile(signer, wallet, &invoice.bolt11).await?
         };
+        if unknown_fees {
+            // The journal has validated the preimage: the payment outcome is
+            // known. A missing fee report is unknown fee data, never zero and
+            // never a reason to treat the leg as uncertain or to pay again.
+            if result.fees_paid_msat.is_none() {
+                // Best effort, read-only: only adds a report the wallet exposes.
+                if let Ok(Some(found)) = wallet
+                    .lookup(&invoice.payment_hash, invoice.amount_msat)
+                    .await
+                {
+                    if crate::durable_payments::validate_payment_proof(&invoice.bolt11, &found)
+                        .is_ok()
+                    {
+                        result.fees_paid_msat = found.fees_paid_msat;
+                    }
+                }
+            }
+            // An unrepresentable report is malformed: keep the fee unknown.
+            let reported = result
+                .fees_paid_msat
+                .and_then(|fee| i64::try_from(fee).ok());
+            result.fees_paid_msat = reported.and_then(|fee| u64::try_from(fee).ok());
+            guard().map_err(|_| ExecutionError::Binding)?;
+            // A known fee is never replaced by a later missing report.
+            sqlx::query("UPDATE purchase_execution_admissions SET state='verified',fees_paid_msat=COALESCE(fees_paid_msat,?) WHERE account_pubkey=? AND quote_id=? AND leg_id=?")
+                .bind(reported).bind(account).bind(quote_id).bind(&leg.leg_id).execute(&self.pool).await?;
+            return Ok(result);
+        }
         if result.fees_paid_msat.is_none() {
             result = wallet
                 .lookup(&invoice.payment_hash, invoice.amount_msat)

@@ -142,6 +142,10 @@ pub fn require_network(
     }
 }
 
+/// Whether this build permits fee policies without a wallet-enforced ceiling
+/// (standard NWC). Production requires the separately reviewed
+/// `production-reported-fees` feature; the name is historical and now gates
+/// the warning-only policy (and recovery of legacy reserve approvals).
 pub const fn reported_fees_allowed(activation: DispatchActivation) -> bool {
     match activation {
         DispatchActivation::Enabled => cfg!(feature = "production-reported-fees"),
@@ -150,20 +154,39 @@ pub const fn reported_fees_allowed(activation: DispatchActivation) -> bool {
     }
 }
 
+/// Dispatch-time fee-policy check. Applies to new and persisted approvals, so
+/// legacy reserve approvals keep their original semantics.
 pub fn require_fee_policy(
     activation: DispatchActivation,
     policy: RoutingFeePolicy,
     acknowledged: bool,
 ) -> Result<(), BoundaryRefusal> {
-    if policy == RoutingFeePolicy::ReportedFees {
-        if !reported_fees_allowed(activation) {
-            return Err(BoundaryRefusal::ReportedFeesNotEnabled);
-        }
-        if !acknowledged {
-            return Err(BoundaryRefusal::FeeRiskNotAcknowledged);
+    match policy {
+        RoutingFeePolicy::ProviderCeiling => Ok(()),
+        RoutingFeePolicy::ReportedFees | RoutingFeePolicy::UnknownFeesAcknowledged => {
+            if !reported_fees_allowed(activation) {
+                return Err(BoundaryRefusal::ReportedFeesNotEnabled);
+            }
+            if !acknowledged {
+                return Err(BoundaryRefusal::FeeRiskNotAcknowledged);
+            }
+            Ok(())
         }
     }
-    Ok(())
+}
+
+/// Approval-time fee-policy check for a new immutable approval. The reserve-
+/// based reported-fee policy is retired: new standard-wallet approvals use the
+/// warning-only policy; strict wallet-enforced ceilings remain available.
+pub fn require_approval_fee_policy(
+    activation: DispatchActivation,
+    policy: RoutingFeePolicy,
+    acknowledged: bool,
+) -> Result<(), BoundaryRefusal> {
+    if policy == RoutingFeePolicy::ReportedFees {
+        return Err(BoundaryRefusal::ReserveFeePolicyRetired);
+    }
+    require_fee_policy(activation, policy, acknowledged)
 }
 
 /// RegtestOnly ceilings; other activations rely on the approval limits alone.
@@ -201,15 +224,17 @@ pub enum BoundaryRefusal {
     WalletNetworkMissing,
     #[error("This production build pays only on Bitcoin mainnet; no payment was sent")]
     MainnetOnly,
-    #[error("Reported-fee accounting is not enabled in this build")]
+    #[error("Payments with unknown Lightning routing fees are not enabled in this build")]
     ReportedFeesNotEnabled,
+    #[error("Reserve-based fee approvals are retired; review the plan and acknowledge unknown routing fees")]
+    ReserveFeePolicyRetired,
     #[error("This wallet cannot enforce a fee ceiling for this payment")]
     FeeCeilingUnavailable,
     #[error("Explicit approval of the exact purchase plan is required")]
     ApprovalRequired,
     #[error("This purchase is halted; review existing payments before continuing")]
     ApprovalHalted,
-    #[error("The wallet cannot enforce a fee ceiling; acknowledge that risk explicitly")]
+    #[error("Acknowledge explicitly that additional Lightning routing fees may apply")]
     FeeRiskNotAcknowledged,
     #[error("The listing could not be confirmed as the approved revision: {0}")]
     ListingNotCurrent(String),
@@ -317,11 +342,14 @@ pub struct BuyerDispatchCheck<'a> {
     pub pinned_listing_event_id: &'a str,
     pub listing: &'a ListingCheck,
     pub invoice_network: InvoiceNetwork,
-    /// Approved total for this purchase (principal + fee reserve).
+    /// Approved total for this purchase (principal + fee reserve; principal
+    /// alone under the warning-only policy, whose fees are not bounded).
+    /// Only used for RegtestOnly test ceilings.
     pub approved_total_msat: u64,
-    /// Principal + fee bounds already admitted for this account, all purchases.
+    /// Principal + reported fees or fee bounds already admitted for this
+    /// account, all purchases (unknown fees contribute nothing). Test ceilings only.
     pub account_admitted_msat: u64,
-    /// Principal + fee bound of the leg about to be admitted.
+    /// Principal (+ reserve, for reserve policies) of the leg about to be admitted.
     pub next_leg_msat: u64,
 }
 
@@ -712,6 +740,69 @@ mod tests {
         assert_eq!(
             require_fee_policy(activation, RoutingFeePolicy::ReportedFees, true).is_ok(),
             cfg!(feature = "production-reported-fees")
+        );
+    }
+
+    #[test]
+    fn warning_only_policy_requires_acknowledgement_and_reserve_policy_is_retired_for_new_approvals(
+    ) {
+        let unknown = RoutingFeePolicy::UnknownFeesAcknowledged;
+        for activation in [DispatchActivation::RegtestOnly, DispatchActivation::Enabled] {
+            let allowed = reported_fees_allowed(activation);
+            assert_eq!(
+                require_approval_fee_policy(activation, unknown, false),
+                Err(if allowed {
+                    BoundaryRefusal::FeeRiskNotAcknowledged
+                } else {
+                    BoundaryRefusal::ReportedFeesNotEnabled
+                })
+            );
+            assert_eq!(
+                require_approval_fee_policy(activation, unknown, true).is_ok(),
+                allowed
+            );
+            // New reserve approvals are refused even when acknowledged...
+            assert_eq!(
+                require_approval_fee_policy(activation, RoutingFeePolicy::ReportedFees, true),
+                Err(BoundaryRefusal::ReserveFeePolicyRetired)
+            );
+            // ...while persisted legacy approvals keep their dispatch semantics.
+            assert_eq!(
+                require_fee_policy(activation, RoutingFeePolicy::ReportedFees, true).is_ok(),
+                allowed
+            );
+            // The strict policy needs no acknowledgement at either stage.
+            assert!(require_approval_fee_policy(
+                activation,
+                RoutingFeePolicy::ProviderCeiling,
+                false
+            )
+            .is_ok());
+        }
+        assert_eq!(
+            require_approval_fee_policy(DispatchActivation::Disabled, unknown, true),
+            Err(BoundaryRefusal::ReportedFeesNotEnabled)
+        );
+        let wallet = wallet();
+        let current = ListingCheck::Current {
+            listing_event_id: "listing-1".into(),
+        };
+        let ok = BuyerDispatchCheck {
+            fee_policy: unknown,
+            ..buyer(&wallet, &current)
+        };
+        assert_eq!(
+            authorize_buyer_dispatch(DispatchActivation::RegtestOnly, &ok),
+            Ok(())
+        );
+        let missing = BuyerDispatchCheck {
+            fee_policy: unknown,
+            fee_risk_acknowledged: false,
+            ..buyer(&wallet, &current)
+        };
+        assert_eq!(
+            authorize_buyer_dispatch(DispatchActivation::RegtestOnly, &missing),
+            Err(BoundaryRefusal::FeeRiskNotAcknowledged)
         );
     }
 

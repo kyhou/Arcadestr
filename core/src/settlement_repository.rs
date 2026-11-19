@@ -246,7 +246,9 @@ impl SettlementRepository {
         if saved {
             // A valid externally supplied proof can recover ownership, but
             // cannot establish the wallet fees or replenish the spend reserve.
-            sqlx::query("UPDATE purchase_execution_approvals SET halted=1 WHERE account_pubkey=?1 AND quote_id=?2 AND NOT EXISTS (SELECT 1 FROM purchase_execution_admissions WHERE account_pubkey=?1 AND quote_id=?2 AND attempt_id=?3 AND state='verified' AND fees_paid_msat IS NOT NULL)")
+            // Under the warning-only policy an app-verified leg whose fees were
+            // not reported is fully accounted for (fees are unknown by design).
+            sqlx::query("UPDATE purchase_execution_approvals SET halted=1 WHERE account_pubkey=?1 AND quote_id=?2 AND NOT EXISTS (SELECT 1 FROM purchase_execution_admissions p WHERE p.account_pubkey=?1 AND p.quote_id=?2 AND p.attempt_id=?3 AND p.state='verified' AND (p.fees_paid_msat IS NOT NULL OR json_extract(purchase_execution_approvals.snapshot,'$.fee_policy')='unknown_fees_acknowledged'))")
                 .bind(account).bind(quote).bind(attempt).execute(&mut *tx).await?;
         }
         tx.commit().await?;

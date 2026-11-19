@@ -6,6 +6,9 @@ use crate::{
     },
     AuthContext,
 };
+use arcadestr_core::purchase_contract::{
+    UNKNOWN_ROUTING_FEES_ACKNOWLEDGEMENT, UNKNOWN_ROUTING_FEES_WARNING,
+};
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
@@ -39,13 +42,54 @@ fn buyer(auth: &Option<AuthContext>, tracked: bool) -> Option<String> {
     }?;
     super::blossom_media_upload::publisher_hex(&npub)
 }
+/// Routing-fee display for one leg. Missing reports are never shown as zero.
+pub fn leg_fee_label(progress: &LegProgress, fees_paid_msat: Option<u64>) -> String {
+    match (progress, fees_paid_msat) {
+        (LegProgress::Paid | LegProgress::ProofAccepted, Some(fee)) => {
+            format!("Routing fees paid: {}", msat_label(fee))
+        }
+        (LegProgress::Paid | LegProgress::ProofAccepted, None) => {
+            "Routing fees not reported".into()
+        }
+        (LegProgress::Uncertain, _) => {
+            "Payment outcome not yet known; routing fees not reported".into()
+        }
+        (LegProgress::Pending | LegProgress::FailedNotSent, _) => {
+            "No payment sent for this part".into()
+        }
+    }
+}
+
+/// The approved fee policy in buyer language; no estimate is ever derived.
+pub fn fee_policy_label(review: &PurchasePlanReview) -> Option<String> {
+    use arcadestr_core::purchase_contract::RoutingFeePolicy;
+    Some(match review.approved_fee_policy? {
+        RoutingFeePolicy::UnknownFeesAcknowledged => {
+            "Approved: Lightning routing fees are set by your wallet and were not known in advance (acknowledged).".into()
+        }
+        RoutingFeePolicy::ReportedFees => format!(
+            "Approved under the earlier reported-fee policy: reserve {} (accounting only, not a wallet-enforced cap).",
+            review
+                .approved_limits
+                .as_ref()
+                .and_then(|l| l.fee_reserve_msat)
+                .map(msat_label)
+                .unwrap_or_else(|| "unavailable".into())
+        ),
+        RoutingFeePolicy::ProviderCeiling => {
+            "Approved: strict wallet-enforced routing-fee ceiling.".into()
+        }
+    })
+}
+
+/// Builds the warning-only approval. There is no fee estimate, reserve or
+/// maximum total; the buyer must explicitly acknowledge unknown routing fees.
 pub fn approval_request(
     review: &PurchasePlanReview,
     account: &str,
-    fee: &str,
-    total: &str,
     network: Option<InvoiceNetwork>,
     confirmed: bool,
+    fees_acknowledged: bool,
 ) -> Result<ApprovePurchasePlanRequest, String> {
     if !confirmed
         || !review.terms_verified
@@ -58,20 +102,10 @@ pub fn approval_request(
     {
         return Err("Review the verified plan as its original buyer before approving.".into());
     }
-    let fee = fee
-        .parse::<u64>()
-        .map_err(|_| "Enter whole non-negative millisatoshis for the fee reserve")?;
-    let total = total
-        .parse::<u64>()
-        .map_err(|_| "Enter whole non-negative millisatoshis for the maximum expenditure")?;
-    if review
-        .quote
-        .gross_msat
-        .checked_add(fee)
-        .is_none_or(|v| v > total)
-        || total > i64::MAX as u64
-    {
-        return Err("Principal plus the routing-fee reserve exceeds the approved maximum.".into());
+    if !fees_acknowledged {
+        return Err(
+            "Acknowledge that additional Lightning fees may apply before approving.".into(),
+        );
     }
     if review.network.is_some() && review.network != network {
         return Err("Selected network differs from the original invoice.".into());
@@ -82,11 +116,11 @@ pub fn approval_request(
         quote_event_id: review.quote_event_id.clone(),
         commitment: review.commitment.clone(),
         network: network.ok_or("Select the invoice network explicitly")?,
-        fee_reserve_msat: fee,
-        total_msat: total,
+        fee_reserve_msat: None,
+        total_msat: None,
         confirm_complete_plan: true,
-        fee_policy: Default::default(),
-        accept_unenforced_fee_risk: false,
+        fee_policy: arcadestr_core::purchase_contract::RoutingFeePolicy::UnknownFeesAcknowledged,
+        accept_unenforced_fee_risk: true,
     })
 }
 
@@ -107,8 +141,6 @@ pub fn PurchasePlanPanel(
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let confirmed = RwSignal::new(false);
-    let fee = RwSignal::new("50000".to_string());
-    let total = RwSignal::new(String::new());
     let network = RwSignal::new(None::<InvoiceNetwork>);
     let refresh = RwSignal::new(0_u64);
     let generation = RwSignal::new(0_u64);
@@ -174,28 +206,9 @@ pub fn PurchasePlanPanel(
                         error.set(Some("Buyer changed; settlement review discarded.".into()));
                         return;
                     }
-                    fee.set(
-                        plan.approved_limits
-                            .as_ref()
-                            .map(|v| v.fee_reserve_msat)
-                            .unwrap_or(50000)
-                            .to_string(),
-                    );
-                    total.set(
-                        plan.approved_limits
-                            .as_ref()
-                            .map(|v| v.total_msat)
-                            .or_else(|| plan.quote.gross_msat.checked_add(50000))
-                            .map(|v| v.to_string())
-                            .unwrap_or_default(),
-                    );
                     network.set(plan.network);
-                    fee_risk.set(
-                        plan.approved_fee_policy
-                            == Some(
-                                arcadestr_core::purchase_contract::RoutingFeePolicy::ReportedFees,
-                            ),
-                    );
+                    // Reflect only a durable acknowledgement; never preselect.
+                    fee_risk.set(plan.approved_fee_notice.is_some());
                     if let Some(callback) = on_review {
                         callback.run(Some(plan.clone()));
                     }
@@ -216,13 +229,12 @@ pub fn PurchasePlanPanel(
         let Some(plan) = review.get_untracked() else {
             return;
         };
-        let mut request = match approval_request(
+        let request = match approval_request(
             &plan,
             &account,
-            &fee.get_untracked(),
-            &total.get_untracked(),
             network.get_untracked(),
             confirmed.get_untracked(),
+            fee_risk.get_untracked(),
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -230,10 +242,6 @@ pub fn PurchasePlanPanel(
                 return;
             }
         };
-        if fee_risk.get_untracked() {
-            request.fee_policy = arcadestr_core::purchase_contract::RoutingFeePolicy::ReportedFees;
-            request.accept_unenforced_fee_risk = true;
-        }
         let epoch = generation.get_untracked();
         let auth_epoch = approve_auth
             .as_ref()
@@ -326,7 +334,8 @@ pub fn PurchasePlanPanel(
                 let operator_fees=r.quote.legs.iter().filter(|l|l.role==arcadestr_core::adp_settlement::PaymentRole::Operator).map(|l|l.amount_msat).sum::<u64>();
                 let capabilities=r.wallet_capabilities.as_ref().map(|c|format!("Advertised: pay_invoice {}; lookup_invoice {}. {}",c.supports("pay_invoice"),c.supports("lookup_invoice"),c.network.as_deref().unwrap_or("network unavailable"))).unwrap_or_else(||"Wallet capabilities unavailable; no payment authority inferred.".into());
                 view!{
-                    <p style="color:#fff">{format!("Principal: {} · included operator fees: {}",msat_label(r.quote.gross_msat),msat_label(operator_fees))}</p>
+                    <p style="color:#fff" data-testid="purchase-game-price">{format!("Game price: {} · included operator fees: {}",msat_label(r.quote.gross_msat),msat_label(operator_fees))}</p>
+                    <p>"Recipients receive exactly the amounts below. Lightning routing fees are charged by your wallet in addition to the game price."</p>
                     <p>{format!("Maximum payment dispatches: {} — only original plan legs; no atomic batch settlement.",r.quote.legs.len())}</p>
                     <p>{format!("Buyer: {} · purchase: {}",r.quote.buyer_pubkey,r.quote.quote_id)}</p>
                     <p>{format!("Listing: {} · original quote: {}",r.quote.listing_event_id,r.quote_event_id)}</p>
@@ -334,8 +343,8 @@ pub fn PurchasePlanPanel(
                     <p>{if r.terms_verified {"Developer-accepted terms and deterministic split verified locally."}else{"Original listing/term evidence unavailable or unverified. Approval is disabled; read-only recovery remains available."}}</p>
                     <p>{capabilities}</p>
                     <p>"Aggregate receipts publicly link the buyer, listing, recipients, amounts and payment hashes. This reveals the revenue split and can correlate payments. Raw invoices, preimages and refund destinations remain encrypted."</p>
-                    <p>{format!("Approved fee policy: {:?}",r.approved_fee_policy)}</p>
-                    <p>"Routing fees reported after payment are not a wallet-enforced ceiling. Multiple Lightning payments are not atomic."</p>
+                    {fee_policy_label(&r).map(|label|view!{<p data-testid="purchase-fee-policy">{label}</p>})}
+                    <p>"Routing fees go to the Lightning network, not to the publisher or the ADP operator. Refunds return the game price only, not network fees. Multiple Lightning payments are not atomic."</p>
                     <div style="display:grid;gap:10px;margin:14px 0">
                     {r.quote.legs.into_iter().map(|leg|{
                         let status=statuses.iter().find(|s|s.leg_id==leg.leg_id).cloned();
@@ -349,26 +358,24 @@ pub fn PurchasePlanPanel(
                                 <p>{format!("Accepted terms: {}",leg.accepted_terms_id.unwrap_or_else(||"Developer listing policy".into()))}</p>
                                 <p>{format!("Original invoice signing key: {payee}")}</p>
                                 <p data-testid="purchase-leg-progress" style="color:oklch(0.8 0.16 60)">{label}</p>
-                                <p>{status.as_ref().and_then(|s|s.fees_paid_msat).map(|v|format!("Verified routing fee: {}",msat_label(v))).unwrap_or_else(||"Routing fee not independently available.".into())}</p>
+                                <p data-testid="purchase-leg-fee">{status.as_ref().map(|s|leg_fee_label(&s.progress,s.fees_paid_msat)).unwrap_or_else(||leg_fee_label(&LegProgress::Pending,None))}</p>
                                 <button type="button" style=SECONDARY disabled=move||disabled||busy.get() on:click=move |_|{if let Some(id)=attempt.clone(){recover.run(id);}}>"CHECK ORIGINAL PAYMENT — NO REPAYMENT"</button>
                             </article>
                         }
                     }).collect_view()}
                     </div>
                     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px">
-                        <label>"ROUTING FEE RESERVE (MSAT)"<input data-testid="purchase-fee-limit" style=FIELD type="number" min="0" step="1" disabled=immutable prop:value=move||fee.get() on:input:target=move|e|{fee.set(e.target().value());confirmed.set(false);}/></label>
-                        <label>"CHECKOUT ACCOUNTING BUDGET (MSAT)"<input data-testid="purchase-total-limit" style=FIELD type="number" min="0" step="1" disabled=immutable prop:value=move||total.get() on:input:target=move|e|{total.set(e.target().value());confirmed.set(false);}/></label>
                         <label>"INVOICE NETWORK"<select style=FIELD disabled=immutable prop:value=move||network.get().map(|n|format!("{n:?}")).unwrap_or_default() on:change:target=move|e|{network.set(match e.target().value().as_str(){"Bitcoin"=>Some(InvoiceNetwork::Bitcoin),"Testnet"=>Some(InvoiceNetwork::Testnet),"Signet"=>Some(InvoiceNetwork::Signet),"Regtest"=>Some(InvoiceNetwork::Regtest),_=>None});confirmed.set(false);}>
                             <option value="">"Select explicitly"</option><option value="Bitcoin">"Bitcoin"</option><option value="Testnet">"Testnet"</option><option value="Signet">"Signet"</option><option value="Regtest">"Regtest"</option>
                         </select></label>
                     </div>
                     <p data-testid="buyer-payment-policy">{move || payment_activation.buyer_label()}</p>
                     <p data-testid="purchase-approved-state">{state_label}</p>
-                    <p>"Strict fee ceiling: the wallet must demonstrate that it can enforce a ceiling for the actual payment. Standard NWC does not provide this guarantee."</p>
-                    <label style="display:flex;align-items:flex-start;gap:8px;margin:14px 0"><input data-testid="purchase-fee-risk" type="checkbox" disabled=move||immutable||!payment_activation.reported_fees_allowed() prop:checked=move||fee_risk.get() on:change:target=move|e|{fee_risk.set(e.target().checked());confirmed.set(false);}/>"I choose reported-fee accounting. My wallet may charge more than the reserve while a payment is in flight. Arcadestr can halt later payments, but cannot cap or undo that charge."</label>
-                    <p>{move || (!payment_activation.reported_fees_allowed()).then_some("Reported-fee accounting is not enabled in this build.")}</p>
-                    <label style="display:flex;align-items:flex-start;gap:8px;margin:14px 0"><input data-testid="purchase-approval-check" type="checkbox" disabled=move||!can_approve||busy.get()||!payment_activation.buyer_enabled() prop:checked=move||confirmed.get() on:change:target=move|e|confirmed.set(e.target().checked())/>"I approve every recipient, amount, and operator fee shown, and the selected routing-fee policy. Approval alone does not send a payment."</label>
-                    <button data-testid="approve-purchase-plan" type="button" style=PRIMARY disabled=move||!can_approve||!confirmed.get()||busy.get()||!payment_activation.buyer_enabled() on:click=move |_|approve.run(())>"APPROVE IMMUTABLE PLAN"</button>
+                    <p role="note" data-testid="purchase-fee-warning" style="padding:10px 12px;border:1px solid oklch(0.6 0.15 60);color:oklch(0.85 0.12 70)">{UNKNOWN_ROUTING_FEES_WARNING}</p>
+                    <label style="display:flex;align-items:flex-start;gap:8px;margin:14px 0"><input data-testid="purchase-fee-risk" type="checkbox" disabled=move||immutable||busy.get()||!payment_activation.reported_fees_allowed() prop:checked=move||fee_risk.get() on:change:target=move|e|{fee_risk.set(e.target().checked());confirmed.set(false);}/>{UNKNOWN_ROUTING_FEES_ACKNOWLEDGEMENT}</label>
+                    <p>{move || (!immutable && !payment_activation.reported_fees_allowed()).then_some("This build accepts only wallets that enforce a routing-fee ceiling. Standard NWC wallets cannot be used for approval.")}</p>
+                    <label style="display:flex;align-items:flex-start;gap:8px;margin:14px 0"><input data-testid="purchase-approval-check" type="checkbox" disabled=move||!can_approve||!fee_risk.get()||busy.get()||!payment_activation.buyer_enabled() prop:checked=move||confirmed.get() on:change:target=move|e|confirmed.set(e.target().checked())/>"I approve every recipient, amount, and operator fee shown. Approval alone does not send a payment."</label>
+                    <button data-testid="approve-purchase-plan" type="button" style=PRIMARY disabled=move||!can_approve||!fee_risk.get()||!confirmed.get()||busy.get()||!payment_activation.buyer_enabled()||!payment_activation.reported_fees_allowed() on:click=move |_|approve.run(())>"APPROVE IMMUTABLE PLAN"</button>
                 }
             })}
             <button type="button" style=SECONDARY disabled=move||busy.get() on:click=move |_|refresh.update(|v|*v=v.wrapping_add(1))>"REFRESH ORIGINAL STATE"</button>
@@ -470,33 +477,67 @@ mod tests {
         })).expect("UI-only plan fixture")
     }
     #[test]
-    fn complete_plan_confirmation_and_exact_budget_are_required() {
+    fn approval_requires_explicit_fee_acknowledgement_and_invents_no_fee_limits() {
+        use arcadestr_core::purchase_contract::RoutingFeePolicy;
         let r = review();
-        assert!(approval_request(&r, "buyer", "50000", "250000", r.network, false).is_err());
-        let request = approval_request(&r, "buyer", "50000", "250000", r.network, true)
-            .expect("explicit approval");
-        assert_eq!(request.fee_reserve_msat, 50000);
-        assert_eq!(request.total_msat, 250000);
+        // Neither consent may be implied.
+        assert!(approval_request(&r, "buyer", r.network, false, true).is_err());
+        assert!(approval_request(&r, "buyer", r.network, true, false).is_err());
+        let request =
+            approval_request(&r, "buyer", r.network, true, true).expect("explicit approval");
+        assert_eq!(
+            request.fee_policy,
+            RoutingFeePolicy::UnknownFeesAcknowledged
+        );
+        assert!(request.accept_unenforced_fee_risk);
+        assert_eq!(request.fee_reserve_msat, None);
+        assert_eq!(request.total_msat, None);
+        assert!(request.confirm_complete_plan);
         assert_eq!(request.quote_event_id, "signed-quote");
         assert_eq!(request.commitment, "immutable-review");
-        for (fee, total) in [
-            ("50000", "249999"),
-            ("-1", "250000"),
-            ("0.5", "250000"),
-            ("18446744073709551615", "250000"),
-        ] {
-            assert!(approval_request(&r, "buyer", fee, total, r.network, true).is_err());
+        assert!(approval_request(&r, "other-buyer", r.network, true, true).is_err());
+        assert!(approval_request(&r, "buyer", Some(InvoiceNetwork::Bitcoin), true, true).is_err());
+        // The wire request serializes no reserve or maximum total.
+        let json = serde_json::to_value(&request).expect("json");
+        assert!(json["fee_reserve_msat"].is_null() && json["total_msat"].is_null());
+        assert_eq!(json["fee_policy"], "unknown_fees_acknowledged");
+    }
+
+    #[test]
+    fn fee_labels_report_actual_or_unknown_fees_never_zero_or_estimates() {
+        use arcadestr_core::purchase_contract::RoutingFeePolicy;
+        assert_eq!(
+            leg_fee_label(&LegProgress::Paid, Some(1500)),
+            "Routing fees paid: 1.500 sats"
+        );
+        assert_eq!(
+            leg_fee_label(&LegProgress::ProofAccepted, Some(0)),
+            "Routing fees paid: 0 sats"
+        );
+        for progress in [LegProgress::Paid, LegProgress::ProofAccepted] {
+            assert_eq!(leg_fee_label(&progress, None), "Routing fees not reported");
         }
-        assert!(approval_request(&r, "other-buyer", "50000", "250000", r.network, true).is_err());
-        assert!(approval_request(
-            &r,
-            "buyer",
-            "50000",
-            "250000",
-            Some(InvoiceNetwork::Bitcoin),
-            true
-        )
-        .is_err());
+        assert!(!leg_fee_label(&LegProgress::Uncertain, None).contains("0 sats"));
+        assert!(leg_fee_label(&LegProgress::Pending, None).contains("No payment"));
+        let mut r = review();
+        assert_eq!(fee_policy_label(&r), None);
+        r.approved_fee_policy = Some(RoutingFeePolicy::UnknownFeesAcknowledged);
+        let label = fee_policy_label(&r).expect("label");
+        assert!(label.contains("not known in advance"));
+        assert!(!label.contains("sats"), "no estimate or reserve is shown");
+        r.approved_fee_policy = Some(RoutingFeePolicy::ReportedFees);
+        r.approved_limits = Some(arcadestr_core::purchase_contract::PurchaseLimits {
+            principal_msat: 200000,
+            fee_reserve_msat: Some(50000),
+            total_msat: Some(250000),
+            maximum_dispatches: 2,
+        });
+        assert!(fee_policy_label(&r).expect("legacy").contains("50 sats"));
+        assert!(UNKNOWN_ROUTING_FEES_WARNING.contains("may exceed the game price"));
+        assert_eq!(
+            UNKNOWN_ROUTING_FEES_ACKNOWLEDGEMENT,
+            "I understand that additional Lightning fees may apply."
+        );
     }
 
     #[test]
@@ -556,7 +597,7 @@ mod tests {
                 3 => r.settlement_state = "failed".into(),
                 _ => r.purchase_completed = true,
             };
-            assert!(approval_request(&r, "buyer", "50000", "250000", r.network, true).is_err());
+            assert!(approval_request(&r, "buyer", r.network, true, true).is_err());
         }
     }
 }

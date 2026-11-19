@@ -13,18 +13,46 @@ pub enum InvoiceNetwork {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingFeePolicy {
+    /// Strict: dispatch requires a wallet-enforced fee ceiling for the exact
+    /// invoice, within the approved numerical fee reserve.
     #[default]
     ProviderCeiling,
-    /// Application accounting only. The external wallet may exceed the desired
-    /// maximum before reporting fees. Never eligible for a hard-ceiling claim.
+    /// Legacy reserve accounting, retired for new approvals. Retained so that
+    /// persisted approvals keep their original reserve and recovery semantics.
+    /// The external wallet may exceed the reserve before reporting fees.
     ReportedFees,
+    /// Standard-NWC warning-only policy. No fee estimate, reserve or maximum
+    /// total exists: the wallet chooses routing fees, reported fees are
+    /// recorded, and missing reports stay unknown. Requires the buyer's
+    /// explicit acknowledgement of [`UNKNOWN_ROUTING_FEES_NOTICE`].
+    UnknownFeesAcknowledged,
 }
 
+impl RoutingFeePolicy {
+    /// Whether the approval carries a numerical fee reserve and total budget.
+    pub const fn uses_fee_reserve(self) -> bool {
+        !matches!(self, Self::UnknownFeesAcknowledged)
+    }
+}
+
+/// Stable identifier of the routing-fee warning a buyer acknowledged. It is
+/// stored in the immutable approval; changing the text requires a new version.
+pub const UNKNOWN_ROUTING_FEES_NOTICE: &str = "arcadestr/unknown-lightning-routing-fees/v1";
+pub const UNKNOWN_ROUTING_FEES_WARNING: &str = "Your Lightning wallet may charge additional network fees. Their amount is not known before payment, so your final cost may exceed the game price. Network fees may not be recoverable if a refund is necessary.";
+pub const UNKNOWN_ROUTING_FEES_ACKNOWLEDGEMENT: &str =
+    "I understand that additional Lightning fees may apply.";
+
+/// Approved spending limits. `fee_reserve_msat` and `total_msat` exist only for
+/// reserve-based policies; under `UnknownFeesAcknowledged` both are `None` and
+/// no maximum wallet debit is implied. `Some(v)` serializes exactly as the
+/// former plain integer, so persisted approval snapshots remain byte-stable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurchaseLimits {
     pub principal_msat: u64,
-    pub fee_reserve_msat: u64,
-    pub total_msat: u64,
+    #[serde(default)]
+    pub fee_reserve_msat: Option<u64>,
+    #[serde(default)]
+    pub total_msat: Option<u64>,
     pub maximum_dispatches: usize,
 }
 
@@ -71,6 +99,9 @@ pub struct PurchasePlanReview {
     pub approved_limits: Option<PurchaseLimits>,
     #[serde(default)]
     pub approved_fee_policy: Option<RoutingFeePolicy>,
+    /// Routing-fee notice the buyer acknowledged in the immutable approval.
+    #[serde(default)]
+    pub approved_fee_notice: Option<String>,
     pub halted: bool,
     pub purchase_completed: bool,
     pub settlement_state: String,
@@ -118,11 +149,16 @@ pub struct ApprovePurchasePlanRequest {
     pub quote_event_id: String,
     pub commitment: String,
     pub network: InvoiceNetwork,
-    pub fee_reserve_msat: u64,
-    pub total_msat: u64,
+    /// Only for reserve-based policies; must be absent for the warning-only policy.
+    #[serde(default)]
+    pub fee_reserve_msat: Option<u64>,
+    #[serde(default)]
+    pub total_msat: Option<u64>,
     pub confirm_complete_plan: bool,
     #[serde(default)]
     pub fee_policy: RoutingFeePolicy,
+    /// Explicit buyer acknowledgement that routing fees are not wallet-capped.
+    /// Never defaulted to true; required for every policy except the strict one.
     #[serde(default)]
     pub accept_unenforced_fee_risk: bool,
 }
