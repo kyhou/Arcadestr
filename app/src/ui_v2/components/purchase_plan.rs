@@ -15,6 +15,16 @@ use wasm_bindgen_futures::spawn_local;
 const PANEL:&str="padding:18px;border:1px solid oklch(0.32 0.01 60);background:#121215;clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));font:400 12.5px/1.65 ui-monospace,monospace;color:oklch(0.68 0.01 60);overflow-wrap:anywhere";
 const SECONDARY:&str="padding:9px 13px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.8 0.14 195);font:800 11px ui-monospace,monospace;border-radius:4px";
 const PRIMARY:&str="padding:11px 16px;border:0;background:oklch(0.78 0.16 60);color:#0b0b0d;font:800 12px ui-monospace,monospace;border-radius:5px";
+const PRIMARY_DISABLED:&str="padding:11px 16px;border:1px solid rgba(255,255,255,.14);background:#1c1c20;color:oklch(0.5 0.01 60);font:800 12px ui-monospace,monospace;border-radius:5px;cursor:not-allowed";
+
+/// Inline styles cannot target `:disabled`; derive the look from the same state.
+pub(crate) fn primary_style(disabled: bool) -> &'static str {
+    if disabled {
+        PRIMARY_DISABLED
+    } else {
+        PRIMARY
+    }
+}
 const FIELD:&str="padding:9px;border:1px solid rgba(255,255,255,.22);background:#141417;color:#fff;font:400 12px ui-monospace,monospace;border-radius:4px;width:100%;box-sizing:border-box";
 
 pub fn msat_label(value: u64) -> String {
@@ -329,6 +339,7 @@ pub fn PurchasePlanPanel(
             {move || review.get().map(|r|{
                 let can_approve=r.terms_verified && r.wallet_connected && !r.halted && !r.purchase_completed && r.settlement_state=="active" && r.approved_limits.is_none();
                 let immutable=r.approved_limits.is_some();
+                let approve_disabled=move||!can_approve||!fee_risk.get()||!confirmed.get()||busy.get()||!payment_activation.buyer_enabled()||!payment_activation.reported_fees_allowed();
                 let state_label=plan_state_label(&r, payment_activation.buyer_enabled());
                 let statuses=r.legs.clone();
                 let operator_fees=r.quote.legs.iter().filter(|l|l.role==arcadestr_core::adp_settlement::PaymentRole::Operator).map(|l|l.amount_msat).sum::<u64>();
@@ -375,7 +386,7 @@ pub fn PurchasePlanPanel(
                     <label style="display:flex;align-items:flex-start;gap:8px;margin:14px 0"><input data-testid="purchase-fee-risk" type="checkbox" disabled=move||immutable||busy.get()||!payment_activation.reported_fees_allowed() prop:checked=move||fee_risk.get() on:change:target=move|e|{fee_risk.set(e.target().checked());confirmed.set(false);}/>{UNKNOWN_ROUTING_FEES_ACKNOWLEDGEMENT}</label>
                     <p>{move || (!immutable && !payment_activation.reported_fees_allowed()).then_some("This build accepts only wallets that enforce a routing-fee ceiling. Standard NWC wallets cannot be used for approval.")}</p>
                     <label style="display:flex;align-items:flex-start;gap:8px;margin:14px 0"><input data-testid="purchase-approval-check" type="checkbox" disabled=move||!can_approve||!fee_risk.get()||busy.get()||!payment_activation.buyer_enabled() prop:checked=move||confirmed.get() on:change:target=move|e|confirmed.set(e.target().checked())/>"I approve every recipient, amount, and operator fee shown. Approval alone does not send a payment."</label>
-                    <button data-testid="approve-purchase-plan" type="button" style=PRIMARY disabled=move||!can_approve||!fee_risk.get()||!confirmed.get()||busy.get()||!payment_activation.buyer_enabled()||!payment_activation.reported_fees_allowed() on:click=move |_|approve.run(())>"APPROVE IMMUTABLE PLAN"</button>
+                    <button data-testid="approve-purchase-plan" type="button" style=move||primary_style(approve_disabled()) disabled=approve_disabled on:click=move |_|approve.run(())>"APPROVE IMMUTABLE PLAN"</button>
                 }
             })}
             <button type="button" style=SECONDARY disabled=move||busy.get() on:click=move |_|refresh.update(|v|*v=v.wrapping_add(1))>"REFRESH ORIGINAL STATE"</button>
@@ -501,6 +512,18 @@ mod tests {
         let json = serde_json::to_value(&request).expect("json");
         assert!(json["fee_reserve_msat"].is_null() && json["total_msat"].is_null());
         assert_eq!(json["fee_policy"], "unknown_fees_acknowledged");
+    }
+
+    #[test]
+    fn disabled_primary_action_is_visibly_distinct() {
+        assert_eq!(primary_style(false), PRIMARY);
+        let disabled = primary_style(true);
+        assert_ne!(disabled, PRIMARY);
+        assert!(disabled.contains("cursor:not-allowed"));
+        assert!(
+            !disabled.contains("oklch(0.78 0.16 60)"),
+            "no active accent"
+        );
     }
 
     #[test]
