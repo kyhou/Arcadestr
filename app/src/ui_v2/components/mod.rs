@@ -40,9 +40,9 @@ pub use feedback::{
 };
 pub use game_artwork::{artwork_state_from_url, ArtworkRole, ArtworkState, GameArtwork};
 pub use game_card::{
-    GameCard, GameCardAccess, GameCardAction, GameCardActionPresentation, GameCardCampaign,
-    GameCardDensity, GameCardPresentation, GameCardStatus, GameCardVisual, GameCardVisualContent,
-    PlatformCompatibility,
+    free_access_label, listing_price_text, GameCard, GameCardAccess, GameCardAction,
+    GameCardActionPresentation, GameCardCampaign, GameCardDensity, GameCardPresentation,
+    GameCardStatus, GameCardVisual, GameCardVisualContent, PlatformCompatibility,
 };
 pub use logo::ArcadestrLogo;
 pub use modal_background::{scroll_lock_transition, ScrollLockAction, MODAL_OPEN_CLASS};

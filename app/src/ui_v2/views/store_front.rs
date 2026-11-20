@@ -4,10 +4,10 @@ use leptos::prelude::*;
 
 use crate::models::{AcquisitionPolicy, GameListing, StorePageCardPresentation};
 use crate::ui_v2::components::{
-    artwork_state_from_url, ArtworkRole, ArtworkState, EmptyState, GameArtwork, GameCard,
-    GameCardAction, GameCardCampaign, GameCardPresentation, GameCardSkeleton, PartialRelayKind,
-    PartialRelayState, PlatformCompatibility, Skeleton, SkeletonKind, StatusChip, StatusChipSize,
-    StatusChipVariant,
+    artwork_state_from_url, free_access_label, listing_price_text, ArtworkRole, ArtworkState,
+    EmptyState, GameArtwork, GameCard, GameCardAction, GameCardCampaign, GameCardPresentation,
+    GameCardSkeleton, PartialRelayKind, PartialRelayState, PlatformCompatibility, Skeleton,
+    SkeletonKind, StatusChip, StatusChipSize, StatusChipVariant,
 };
 use crate::ui_v2::views::browse_games::{extract_categories, listing_categories, BrowseRequest};
 use crate::ui_v2::views::marketplace_loader::{
@@ -137,12 +137,14 @@ pub fn StoreFrontView(
                                 <h2>{title.clone()}</h2>
                                 <p class="arc-store-hero-publisher">{format!("{publisher} · {platform_label}")}</p>
                                 <div class="arc-store-hero-statuses">
-                                    <StatusChip
-                                        label=access_label
-                                        variant=access_variant
-                                        icon=None
-                                        size=StatusChipSize::Standard
-                                    />
+                                    {access_label.map(|label| view! {
+                                        <StatusChip
+                                            label=label
+                                            variant=access_variant
+                                            icon=None
+                                            size=StatusChipSize::Standard
+                                        />
+                                    })}
                                     {listing.is_owned.then(|| view! {
                                         <StatusChip
                                             label="Owned"
@@ -588,27 +590,23 @@ fn hero_action_label() -> &'static str {
     "View details"
 }
 
+/// The hero has no price slot, so its first chip carries the price or free
+/// access. Owned games show only the separate "Owned" chip: a price or "Paid"
+/// beside it would read as a payment status.
 fn featured_access_label(
     listing: &GameListing,
     campaign: Option<CampaignAvailability>,
     now: u64,
-) -> &'static str {
-    if !listing.is_owned && campaign == Some(CampaignAvailability::Active) {
-        "Claim and keep"
-    } else {
-        match listing.acquisition {
-            AcquisitionPolicy::Public => "Public access",
-            AcquisitionPolicy::TimedAccess { .. } if listing.acquisition.allows_access_at(now) => {
-                "Timed access"
-            }
-            AcquisitionPolicy::TimedAccess { starts_at, .. } if now < starts_at => {
-                "Timed access upcoming"
-            }
-            AcquisitionPolicy::TimedAccess { .. } => "Timed access ended",
-            AcquisitionPolicy::Gated if listing.has_declared_price() => "Paid",
-            AcquisitionPolicy::Gated => "Unavailable",
-        }
+) -> Option<String> {
+    if listing.is_owned {
+        return None;
     }
+    if campaign == Some(CampaignAvailability::Active) {
+        return Some("Claim and keep".to_string());
+    }
+    free_access_label(&listing.acquisition, now)
+        .or_else(|| listing_price_text(listing))
+        .or_else(|| Some("Unavailable".to_string()))
 }
 
 fn featured_access_variant(
@@ -869,12 +867,44 @@ mod tests {
         let mut owned_paid = listing("owned", 1, Vec::new());
         owned_paid.price_sats = 2_100;
         owned_paid.is_owned = true;
-        assert_eq!(featured_access_label(&owned_paid, None, 10), "Paid");
+        assert_eq!(featured_access_label(&owned_paid, None, 10), None);
+        assert!(owned_paid.is_owned);
+
+        let mut for_sale = owned_paid.clone();
+        for_sale.is_owned = false;
         assert_eq!(
-            featured_access_variant(&owned_paid, None, 10),
+            featured_access_label(&for_sale, None, 10).as_deref(),
+            Some("2100 sats")
+        );
+        assert_eq!(
+            featured_access_variant(&for_sale, None, 10),
             StatusChipVariant::Active
         );
-        assert!(owned_paid.is_owned);
+    }
+
+    #[test]
+    fn hero_free_access_says_free_never_paid() {
+        let mut public = listing("public", 1, Vec::new());
+        public.acquisition = AcquisitionPolicy::Public;
+        assert_eq!(
+            featured_access_label(&public, None, 10).as_deref(),
+            Some("Free")
+        );
+        let mut timed = listing("timed", 1, Vec::new());
+        timed.acquisition = AcquisitionPolicy::TimedAccess {
+            starts_at: 0,
+            ends_at: 1_798_761_600,
+        };
+        assert_eq!(
+            featured_access_label(&timed, None, 10).as_deref(),
+            Some("Free until 2027-01-01")
+        );
+        let mut claim = listing("claim", 1, Vec::new());
+        claim.price_sats = 500;
+        assert_eq!(
+            featured_access_label(&claim, Some(CampaignAvailability::Active), 10).as_deref(),
+            Some("Claim and keep")
+        );
     }
 
     #[test]

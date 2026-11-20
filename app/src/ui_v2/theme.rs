@@ -6020,6 +6020,10 @@ dialog.v2-confirm-backdrop::backdrop {
   font-weight: 800;
 }
 
+.arc-game-card-price-owned {
+  color: var(--arc-success-text);
+}
+
 .arc-game-card-summary {
   display: -webkit-box;
   overflow: hidden;

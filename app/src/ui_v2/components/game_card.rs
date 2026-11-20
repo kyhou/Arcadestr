@@ -91,6 +91,8 @@ pub struct GameCardVisualContent {
     pub summary: Option<String>,
     pub secondary_metadata: Vec<String>,
     pub price_or_acquisition: Option<String>,
+    /// The price slot shows ownership ("In your library") rather than a cost.
+    pub price_is_ownership: bool,
     pub statuses: Vec<GameCardStatus>,
 }
 
@@ -226,6 +228,7 @@ pub fn GameCard(
         summary: (!summary.trim().is_empty()).then_some(summary),
         secondary_metadata: tags,
         price_or_acquisition: Some(price),
+        price_is_ownership: presentation.owned,
         statuses,
     };
 
@@ -266,6 +269,7 @@ pub fn GameCardVisual(
     let metadata = content.secondary_metadata.join(" · ");
     let has_metadata = !metadata.is_empty();
     let artwork = artwork_state_from_url(content.artwork_url.clone());
+    let price_is_ownership = content.price_is_ownership;
 
     view! {
         <article class=format!("arc-game-card {}", density.class()) class:arc-game-card-disabled=disabled style="display:flex;flex-direction:column">
@@ -290,7 +294,7 @@ pub fn GameCardVisual(
                     <div class="arc-game-card-meta-row">
                         <span class="arc-game-card-publisher">{content.publisher}</span>
                         {content.price_or_acquisition.map(|label| view! {
-                            <span class="arc-game-card-price">{label}</span>
+                            <span class="arc-game-card-price" class:arc-game-card-price-owned=price_is_ownership>{label}</span>
                         })}
                     </div>
                     {has_metadata.then(|| view! { <span class="arc-game-card-metadata">{metadata}</span> })}
@@ -409,6 +413,44 @@ fn valid_cover_url(images: &[String]) -> Option<String> {
     })
 }
 
+/// Exact declared price, e.g. "1500 sats". `None` when the listing is not priced.
+pub fn listing_price_text(listing: &GameListing) -> Option<String> {
+    if listing.price_sats > 0 {
+        Some(format!("{} sats", listing.price_sats))
+    } else if listing.has_declared_price() {
+        Some(format!("{} {}", listing.price, listing.currency.trim()))
+    } else {
+        None
+    }
+}
+
+/// UTC calendar date (YYYY-MM-DD) for compact card copy.
+pub fn short_date(unix_secs: u64) -> String {
+    i64::try_from(unix_secs)
+        .ok()
+        .and_then(|secs| time::OffsetDateTime::from_unix_timestamp(secs).ok())
+        .map(|at| format!("{}-{:02}-{:02}", at.year(), u8::from(at.month()), at.day()))
+        .unwrap_or_else(|| "an unknown date".to_string())
+}
+
+/// Price-slot wording for free access. `None` for gated (paid or unavailable)
+/// listings, which never claim to be free.
+pub fn free_access_label(acquisition: &AcquisitionPolicy, now: u64) -> Option<String> {
+    match *acquisition {
+        AcquisitionPolicy::Public => Some("Free".to_string()),
+        AcquisitionPolicy::TimedAccess { starts_at, .. } if now < starts_at => {
+            Some(format!("Free from {}", short_date(starts_at)))
+        }
+        AcquisitionPolicy::TimedAccess { ends_at, .. } if now >= ends_at => {
+            Some("Free access ended".to_string())
+        }
+        AcquisitionPolicy::TimedAccess { ends_at, .. } => {
+            Some(format!("Free until {}", short_date(ends_at)))
+        }
+        AcquisitionPolicy::Gated => None,
+    }
+}
+
 fn access_badge(access: GameCardAccess) -> &'static str {
     match access {
         GameCardAccess::Paid => "Paid",
@@ -422,19 +464,25 @@ fn access_badge(access: GameCardAccess) -> &'static str {
 }
 
 fn card_statuses(presentation: GameCardPresentation) -> Vec<GameCardStatus> {
-    let mut statuses = vec![GameCardStatus {
-        label: access_badge(presentation.access).to_string(),
-        variant: match presentation.access {
-            GameCardAccess::Paid => StatusChipVariant::Active,
-            GameCardAccess::Owned => StatusChipVariant::Owned,
-            GameCardAccess::Public => StatusChipVariant::Public,
-            GameCardAccess::TimedActive
-            | GameCardAccess::TimedUpcoming
-            | GameCardAccess::TimedExpired => StatusChipVariant::TimedAccess,
-            GameCardAccess::Gated => StatusChipVariant::Gated,
-        },
-        icon: None,
-    }];
+    let mut statuses = Vec::new();
+    // The price slot already says what a paid or free game costs; a "Paid"
+    // chip beside "Owned" reads as a payment status. Chips describe the
+    // player's state and exceptional access only.
+    let access_variant = match presentation.access {
+        GameCardAccess::Paid | GameCardAccess::Public => None,
+        GameCardAccess::Owned => Some(StatusChipVariant::Owned),
+        GameCardAccess::TimedActive
+        | GameCardAccess::TimedUpcoming
+        | GameCardAccess::TimedExpired => Some(StatusChipVariant::TimedAccess),
+        GameCardAccess::Gated => Some(StatusChipVariant::Gated),
+    };
+    if let Some(variant) = access_variant {
+        statuses.push(GameCardStatus {
+            label: access_badge(presentation.access).to_string(),
+            variant,
+            icon: None,
+        });
+    }
 
     if let Some(campaign) = presentation.campaign {
         statuses.push(GameCardStatus {
@@ -478,27 +526,34 @@ fn card_statuses(presentation: GameCardPresentation) -> Vec<GameCardStatus> {
     statuses
 }
 
+/// What the game costs, or the player's ownership once acquired.
 fn price_label(listing: &GameListing, presentation: GameCardPresentation) -> String {
+    if presentation.owned || presentation.access == GameCardAccess::Owned {
+        return "In your library".to_string();
+    }
     if presentation.campaign == Some(GameCardCampaign::Active) {
         return "Free claim".to_string();
     }
-    if presentation.campaign == Some(GameCardCampaign::Claimed) {
-        return "Claimed".to_string();
-    }
     match presentation.access {
-        GameCardAccess::Public => "Public".to_string(),
-        GameCardAccess::TimedActive => "Available now".to_string(),
-        GameCardAccess::TimedUpcoming => "Upcoming".to_string(),
-        GameCardAccess::TimedExpired => "Ended".to_string(),
+        GameCardAccess::Public => "Free".to_string(),
+        GameCardAccess::TimedExpired => "Free access ended".to_string(),
+        GameCardAccess::TimedActive | GameCardAccess::TimedUpcoming => {
+            match (presentation.access, &listing.acquisition) {
+                (GameCardAccess::TimedActive, AcquisitionPolicy::TimedAccess { ends_at, .. }) => {
+                    format!("Free until {}", short_date(*ends_at))
+                }
+                (
+                    GameCardAccess::TimedUpcoming,
+                    AcquisitionPolicy::TimedAccess { starts_at, .. },
+                ) => format!("Free from {}", short_date(*starts_at)),
+                _ => "Free".to_string(),
+            }
+        }
         GameCardAccess::Gated => "Unavailable".to_string(),
-        GameCardAccess::Paid if listing.price_sats > 0 => {
-            format!("{} sats", listing.price_sats)
+        GameCardAccess::Paid => {
+            listing_price_text(listing).unwrap_or_else(|| "See details".to_string())
         }
-        GameCardAccess::Paid if !listing.currency.is_empty() => {
-            format!("{} {}", listing.price, listing.currency)
-        }
-        GameCardAccess::Paid => "Paid".to_string(),
-        GameCardAccess::Owned => "Owned".to_string(),
+        GameCardAccess::Owned => "In your library".to_string(),
     }
 }
 
@@ -707,7 +762,8 @@ mod tests {
         };
         let statuses = card_statuses(presentation);
 
-        assert!(statuses
+        // Free access is stated in the price slot, not as a chip.
+        assert!(!statuses
             .iter()
             .any(|status| status.variant == StatusChipVariant::Public));
         assert!(statuses
@@ -716,6 +772,77 @@ mod tests {
         assert!(statuses
             .iter()
             .any(|status| status.variant == StatusChipVariant::Error));
+    }
+
+    #[test]
+    fn price_slot_states_cost_or_ownership_and_chips_never_say_paid() {
+        let mut value = listing();
+        value.price_sats = 1_500;
+        let for_sale = GameCardPresentation::from_listing(
+            &value,
+            100,
+            PlatformCompatibility::Compatible,
+            false,
+        );
+        assert_eq!(price_label(&value, for_sale), "1500 sats");
+        assert!(card_statuses(for_sale).is_empty());
+
+        value.is_owned = true;
+        let owned = GameCardPresentation::from_listing(
+            &value,
+            100,
+            PlatformCompatibility::Compatible,
+            false,
+        );
+        assert_eq!(price_label(&value, owned), "In your library");
+        let labels: Vec<_> = card_statuses(owned).into_iter().map(|s| s.label).collect();
+        assert_eq!(labels, vec!["Owned".to_string()]);
+
+        let claimed =
+            GameCardPresentation::claim_and_keep(true, PlatformCompatibility::Compatible, false);
+        assert_eq!(price_label(&listing(), claimed), "In your library");
+        let claim =
+            GameCardPresentation::claim_and_keep(false, PlatformCompatibility::Compatible, false);
+        assert_eq!(price_label(&listing(), claim), "Free claim");
+    }
+
+    #[test]
+    fn free_access_says_free_with_real_dates_only() {
+        let mut value = listing();
+        value.acquisition = AcquisitionPolicy::Public;
+        let public = GameCardPresentation::from_listing(
+            &value,
+            100,
+            PlatformCompatibility::Compatible,
+            false,
+        );
+        assert_eq!(price_label(&value, public), "Free");
+
+        // 2027-01-01T00:00:00Z .. 2027-02-01T00:00:00Z
+        value.acquisition = AcquisitionPolicy::TimedAccess {
+            starts_at: 1_798_761_600,
+            ends_at: 1_801_440_000,
+        };
+        let label_at = |now| {
+            price_label(
+                &value,
+                GameCardPresentation::from_listing(
+                    &value,
+                    now,
+                    PlatformCompatibility::Compatible,
+                    false,
+                ),
+            )
+        };
+        assert_eq!(label_at(1_798_761_599), "Free from 2027-01-01");
+        assert_eq!(label_at(1_798_761_600), "Free until 2027-02-01");
+        assert_eq!(label_at(1_801_440_000), "Free access ended");
+        assert_eq!(
+            free_access_label(&AcquisitionPolicy::Gated, 0),
+            None,
+            "gated listings never claim to be free"
+        );
+        assert_eq!(short_date(u64::MAX), "an unknown date");
     }
 
     #[test]
