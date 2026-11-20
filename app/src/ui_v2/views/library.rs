@@ -711,7 +711,7 @@ pub fn LibraryView(
     let retained_reinstall_refresh = RwSignal::new(None::<u64>);
     let retained_reinstall_error = RwSignal::new(None::<(String, String)>);
     let refresh_generation = RwSignal::new(0_u64);
-    let receipt_sync=use_context::<crate::ui_v2::receipt_sync::ReceiptSyncContext>();
+    let receipt_sync = use_context::<crate::ui_v2::receipt_sync::ReceiptSyncContext>();
     let platform = RwSignal::new(None::<PlatformInfo>);
     let platform_loading = RwSignal::new(!standalone_web);
     let platform_error = RwSignal::new(false);
@@ -750,7 +750,7 @@ pub fn LibraryView(
 
     let saved_auth = auth.clone();
     Effect::new(move |_| {
-        let receipt_epoch=receipt_sync.map(|c|c.revision.get()).unwrap_or(0);
+        let receipt_epoch = receipt_sync.map(|c| c.revision.get()).unwrap_or(0);
         let requested_generation = refresh_generation.get();
         let requested_account = saved_auth.npub.get();
         saved_error.set(None);
@@ -774,7 +774,10 @@ pub fn LibraryView(
         spawn_local(async move {
             let result = invoke_get_library_games().await;
             if refresh_generation.get_untracked() != requested_generation
-                || receipt_sync.map(|c|c.revision.get_untracked()).unwrap_or(0)!=receipt_epoch
+                || receipt_sync
+                    .map(|c| c.revision.get_untracked())
+                    .unwrap_or(0)
+                    != receipt_epoch
                 || auth_for_response.npub.get_untracked().as_deref()
                     != Some(requested_account.as_str())
             {
@@ -924,7 +927,7 @@ pub fn LibraryView(
 
     Effect::new(move |_| {
         let active_npub = auth.npub.get();
-        let _receipt_epoch=receipt_sync.map(|c|c.revision.get());
+        let _receipt_epoch = receipt_sync.map(|c| c.revision.get());
         let current_entries = entries.get();
         ownership_generation.update(|generation| *generation = generation.wrapping_add(1));
         let generation = ownership_generation.get_untracked();
