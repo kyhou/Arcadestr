@@ -1432,6 +1432,23 @@ select option:disabled {
   line-height: 1.6;
 }
 
+/* Text-weight link inside an access note (e.g. "Change in Settings"). */
+.v2-detail-inline-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--arc-accent);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.v2-detail-inline-link:focus-visible {
+  outline: 2px solid var(--arc-focus-ring);
+  outline-offset: 2px;
+}
+
 .v2-detail-status {
   margin: var(--v2-space-1) 0 0;
   color: var(--v2-secondary);

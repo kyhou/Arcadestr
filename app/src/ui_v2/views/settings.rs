@@ -790,6 +790,7 @@ pub fn SettingsView(
 
                 <Show when=move || !standalone_web>
                     <crate::ui_v2::nwc_wallet::NwcWalletPanel />
+                    <crate::ui_v2::refund_address::RefundAddressPanel />
                 </Show>
 
                 <Show when=move || availability.security_and_keys>

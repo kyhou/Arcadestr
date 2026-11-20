@@ -162,9 +162,13 @@ def prepare(root):
             raise RuntimeError('Purchase preparation is one-shot; retain existing records')
     if approval['fixture_listing_event_id'] not in H['js'](root,'return document.body.innerText'):
         raise RuntimeError('Actual GUI is not on the approved new listing')
+    # The refund address is a Settings preference (checked by the backend
+    # before saving); the game page re-reads it whenever it opens.
+    H['js'](root,"return window.__TAURI__.core.invoke('set_refund_address',{expectedAccountPubkey:%s,lud16:'alice@127.0.0.1:18080'}).then(v=>v);" % json.dumps(approval['buyer']))
+    if 'Refunds go to alice@127.0.0.1:18080' not in H['js'](root,'return document.body.innerText'):
+        raise RuntimeError('Refund address saved; reopen the listing so it is shown, then rerun prepare')
     with (private/'purchase-prepare-admitted').open('x') as output:
         output.write('Only approved listing; no payment dispatched by preparation')
-    H['js'](root,"const e=document.getElementById('split-refund-lud16');e.value='alice@127.0.0.1:18080';e.dispatchEvent(new Event('input',{bubbles:true}));return true;")
     H['js'](root,"const b=[...document.querySelectorAll('button')].find(b=>b.innerText.toLowerCase().includes('buy with lightning')&&!b.disabled);if(!b)throw Error('Buy unavailable');b.click();return true;")
     wait(root,lambda: H['js'](root,'return !!document.querySelector(".v2-detail-invoice code")?.innerText'))
     invoice = current_invoice(root,0,nodes)

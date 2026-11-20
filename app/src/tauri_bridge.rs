@@ -1996,6 +1996,52 @@ pub async fn invoke_disconnect_nwc_wallet(_expected_account_pubkey: String) -> R
     Err("NWC is only available on desktop.".into())
 }
 #[cfg(not(feature = "web"))]
+pub async fn invoke_get_refund_address(
+    expected_account_pubkey: String,
+) -> Result<Option<String>, String> {
+    crate::tauri_invoke::invoke(
+        "get_refund_address",
+        serde_json::json!({ "expectedAccountPubkey": expected_account_pubkey }),
+    )
+    .await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_get_refund_address(
+    _expected_account_pubkey: String,
+) -> Result<Option<String>, String> {
+    Ok(None)
+}
+#[cfg(not(feature = "web"))]
+pub async fn invoke_set_refund_address(
+    expected_account_pubkey: String,
+    lud16: String,
+) -> Result<String, String> {
+    crate::tauri_invoke::invoke(
+        "set_refund_address",
+        serde_json::json!({ "expectedAccountPubkey": expected_account_pubkey, "lud16": lud16 }),
+    )
+    .await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_set_refund_address(
+    _expected_account_pubkey: String,
+    _lud16: String,
+) -> Result<String, String> {
+    Err("Refund addresses are only available on desktop.".into())
+}
+#[cfg(not(feature = "web"))]
+pub async fn invoke_clear_refund_address(expected_account_pubkey: String) -> Result<(), String> {
+    crate::tauri_invoke::invoke(
+        "clear_refund_address",
+        serde_json::json!({ "expectedAccountPubkey": expected_account_pubkey }),
+    )
+    .await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_clear_refund_address(_expected_account_pubkey: String) -> Result<(), String> {
+    Err("Refund addresses are only available on desktop.".into())
+}
+#[cfg(not(feature = "web"))]
 pub async fn invoke_verify_nwc_wallet(expected_account_pubkey: String) -> Result<String, String> {
     crate::tauri_invoke::invoke(
         "verify_nwc_wallet",

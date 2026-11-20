@@ -434,6 +434,8 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let wallet = crate::ui_v2::nwc_wallet::NwcWalletContext::new();
     provide_context(wallet);
+    let refund_address = crate::ui_v2::refund_address::RefundAddressContext::new();
+    provide_context(refund_address);
     let receipts = super::receipt_sync::provide_receipt_sync(auth.clone());
     if !cfg!(feature = "web") {
         let wallet_auth = auth.clone();
@@ -444,9 +446,16 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                 .as_deref()
                 .and_then(crate::ui_v2::components::blossom_media_upload::publisher_hex);
             let generation = wallet.select_account(account.clone());
+            let refund_generation = refund_address.select_account(account.clone());
             if let Some(account) = account {
+                let refund_account = account.clone();
                 spawn_local(async move {
                     wallet.load_account(generation, account).await;
+                });
+                spawn_local(async move {
+                    refund_address
+                        .load_account(refund_generation, refund_account)
+                        .await;
                 });
             }
         });
@@ -796,7 +805,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         }
                         .into_any(),
                         UiV2View::Detail(listing, _) => view! {
-                            <GameDetailView listing=listing on_back=on_back_from_detail />
+                            <GameDetailView listing=listing on_back=on_back_from_detail on_open_settings=navigate_settings />
                         }
                         .into_any(),
                         UiV2View::Library => view! {

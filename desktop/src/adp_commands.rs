@@ -1627,6 +1627,91 @@ pub async fn get_nwc_wallet(
         .map_err(nwc_safe_error)
 }
 
+/// Settings-level refund address: only an explicit custom override is stored.
+/// The wallet/profile fallbacks are chosen by the UI, and every address is
+/// resolved again when a purchase commits it.
+#[tauri::command]
+pub async fn get_refund_address(
+    expected_account_pubkey: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let account = {
+        let auth = state.auth.lock().await;
+        nwc_account(&auth, &expected_account_pubkey)?
+    };
+    arcadestr_core::adp_storage::RefundAddressPreferencesRepository::new(
+        state.database.pool().clone(),
+    )
+    .get(&account.to_hex())
+    .await
+    .map_err(|_| "Saved refund address is unavailable.".to_string())
+}
+
+/// Resolve the address before saving it, so Settings never stores an address
+/// that could not receive a refund. Returns the stored form.
+#[tauri::command]
+pub async fn set_refund_address(
+    expected_account_pubkey: String,
+    lud16: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let lud16 = lud16.trim().to_string();
+    let account = {
+        let auth = state.auth.lock().await;
+        nwc_account(&auth, &expected_account_pubkey)?
+    };
+    resolve_lud16(state.http_client.as_ref(), &lud16)
+        .await
+        .map_err(refund_address_error)?;
+    // The account may have changed while the address was being checked.
+    {
+        let auth = state.auth.lock().await;
+        nwc_account(&auth, &expected_account_pubkey)?;
+    }
+    let updated_at = i64::try_from(nostr::Timestamp::now().as_secs())
+        .map_err(|_| "System clock is out of range.".to_string())?;
+    arcadestr_core::adp_storage::RefundAddressPreferencesRepository::new(
+        state.database.pool().clone(),
+    )
+    .set(&account.to_hex(), &lud16, updated_at)
+    .await
+    .map_err(|_| "Could not save the refund address.".to_string())?;
+    Ok(lud16)
+}
+
+#[tauri::command]
+pub async fn clear_refund_address(
+    expected_account_pubkey: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let account = {
+        let auth = state.auth.lock().await;
+        nwc_account(&auth, &expected_account_pubkey)?
+    };
+    arcadestr_core::adp_storage::RefundAddressPreferencesRepository::new(
+        state.database.pool().clone(),
+    )
+    .clear(&account.to_hex())
+    .await
+    .map_err(|_| "Could not remove the refund address.".to_string())
+}
+
+fn refund_address_error(error: arcadestr_core::lnurlp::LnurlError) -> String {
+    use arcadestr_core::lnurlp::LnurlError;
+    match error {
+        LnurlError::MalformedLud16 => {
+            "That is not a Lightning address. Use the form name@domain.".into()
+        }
+        LnurlError::TransportPolicy => {
+            "That Lightning address uses an insecure or invalid payment endpoint.".into()
+        }
+        LnurlError::Http(_) => {
+            "That Lightning address could not be reached. Check it and try again.".into()
+        }
+        _ => "That Lightning address did not return valid payment details.".into(),
+    }
+}
+
 #[tauri::command]
 pub async fn disconnect_nwc_wallet(
     expected_account_pubkey: String,

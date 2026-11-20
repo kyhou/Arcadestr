@@ -520,6 +520,72 @@ impl LaunchProfilePreferencesRepository {
     }
 }
 
+/// Device-local, account-scoped refund Lightning address set in Settings.
+/// Absent means "use the connected wallet or profile address".
+pub struct RefundAddressPreferencesRepository {
+    pool: SqlitePool,
+}
+
+impl RefundAddressPreferencesRepository {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn get(&self, account_pubkey_hex: &str) -> Result<Option<String>, AdpStorageError> {
+        Ok(sqlx::query_scalar(
+            "SELECT lud16 FROM refund_address_preferences WHERE account_pubkey = ?",
+        )
+        .bind(account_pubkey_hex)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Store an address the caller has already validated and resolved.
+    pub async fn set(
+        &self,
+        account_pubkey_hex: &str,
+        lud16: &str,
+        updated_at: i64,
+    ) -> Result<(), AdpStorageError> {
+        if account_pubkey_hex.len() != 64
+            || !account_pubkey_hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(AdpStorageError::InvalidData(
+                "refund address account is not a hex public key".to_string(),
+            ));
+        }
+        if lud16.trim() != lud16 || !(3..=320).contains(&lud16.len()) || !lud16.contains('@') {
+            return Err(AdpStorageError::InvalidData(
+                "refund address is not a Lightning address".to_string(),
+            ));
+        }
+        if !(0..i64::MAX).contains(&updated_at) {
+            return Err(AdpStorageError::OutOfRange("refund address updated_at"));
+        }
+        sqlx::query(
+            r#"INSERT INTO refund_address_preferences (account_pubkey, lud16, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(account_pubkey) DO UPDATE SET
+                    lud16 = excluded.lud16,
+                    updated_at = excluded.updated_at"#,
+        )
+        .bind(account_pubkey_hex)
+        .bind(lud16)
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear(&self, account_pubkey_hex: &str) -> Result<(), AdpStorageError> {
+        sqlx::query("DELETE FROM refund_address_preferences WHERE account_pubkey = ?")
+            .bind(account_pubkey_hex)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
 /// Repository for account-scoped `library_games` rows.
 pub struct LibraryGamesRepository {
     pool: SqlitePool,
@@ -2085,6 +2151,42 @@ mod tests {
     use crate::distribution::{LaunchType, ProfileId, WorkingDir};
     use crate::storage::Database;
     use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    #[tokio::test]
+    async fn refund_address_preferences_are_account_scoped_and_validated() {
+        let db = test_db().await;
+        let repo = RefundAddressPreferencesRepository::new(db.pool().clone());
+        let alice = "a".repeat(64);
+        let bob = "b".repeat(64);
+
+        assert_eq!(repo.get(&alice).await.expect("get"), None);
+        repo.set(&alice, "alice@example.com", 1).await.expect("set");
+        repo.set(&alice, "alice2@example.com", 2)
+            .await
+            .expect("replace");
+        assert_eq!(
+            repo.get(&alice).await.expect("get").as_deref(),
+            Some("alice2@example.com")
+        );
+        assert_eq!(repo.get(&bob).await.expect("get"), None);
+
+        for (account, address) in [
+            (alice.as_str(), "no-at-sign"),
+            (alice.as_str(), " padded@example.com"),
+            (alice.as_str(), ""),
+            ("npub1notahexkey", "alice@example.com"),
+        ] {
+            assert!(repo.set(account, address, 3).await.is_err());
+        }
+        assert_eq!(
+            repo.get(&alice).await.expect("get").as_deref(),
+            Some("alice2@example.com"),
+            "a rejected write leaves the saved address untouched"
+        );
+
+        repo.clear(&alice).await.expect("clear");
+        assert_eq!(repo.get(&alice).await.expect("get"), None);
+    }
 
     async fn test_db() -> Database {
         let path =

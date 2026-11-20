@@ -183,6 +183,8 @@ const MIGRATION_26_QUOTE_INITIATIONS: &str =
     include_str!("../../migrations/026_quote_initiations.sql");
 const MIGRATION_27_PROFILE_METADATA: &str =
     include_str!("../../migrations/027_profile_metadata_events.sql");
+const MIGRATION_28_REFUND_ADDRESS_PREFERENCES: &str =
+    include_str!("../../migrations/028_refund_address_preferences.sql");
 
 #[cfg(test)]
 const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
@@ -268,6 +270,11 @@ const EXTERNAL_MIGRATIONS: &[(usize, &str, &str)] = &[
         27,
         "027_profile_metadata_events.sql",
         MIGRATION_27_PROFILE_METADATA,
+    ),
+    (
+        28,
+        "028_refund_address_preferences.sql",
+        MIGRATION_28_REFUND_ADDRESS_PREFERENCES,
     ),
 ];
 
@@ -386,6 +393,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "027_profile_metadata_events.sql",
         sql: MIGRATION_27_PROFILE_METADATA,
+    },
+    Migration {
+        name: "028_refund_address_preferences.sql",
+        sql: MIGRATION_28_REFUND_ADDRESS_PREFERENCES,
     },
 ];
 
@@ -1431,6 +1442,7 @@ mod tests {
             "receipt_sync_cursors",
             "receipt_sync_events",
             "receipt_sync_leg_lsps",
+            "refund_address_preferences",
             "relay_backups",
             "remote_uris",
             "schema_migrations",

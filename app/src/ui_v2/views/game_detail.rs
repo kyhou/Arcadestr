@@ -843,8 +843,32 @@ fn detail_response_is_current(
         && presentation.listing_event_id == event_id
 }
 
+/// One line telling the buyer where refunds go; the address itself is
+/// managed in Settings.
+fn refund_notice(status: &crate::ui_v2::refund_address::RefundAddressStatus) -> String {
+    use crate::ui_v2::refund_address::RefundAddressStatus;
+    match status {
+        RefundAddressStatus::Loading => "Checking your refund address…".into(),
+        RefundAddressStatus::Unavailable => {
+            "Your saved refund address could not be read. Open Settings to retry.".into()
+        }
+        RefundAddressStatus::Missing => "Add a refund address in Settings to buy this game.".into(),
+        RefundAddressStatus::Ready(address) => format!(
+            "Refunds go to {} ({}).",
+            address.address,
+            address.source.label()
+        ),
+    }
+}
+
 #[component]
-pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoView {
+pub fn GameDetailView(
+    listing: GameListing,
+    on_back: Callback<()>,
+    /// Opens Settings, where the refund address is managed.
+    #[prop(optional)]
+    on_open_settings: Option<Callback<()>>,
+) -> impl IntoView {
     let payment_activation = crate::ui_v2::payment_activation::use_payment_activation();
     let media = valid_image_urls(&listing.images);
     let hero_image = media.first().cloned();
@@ -875,7 +899,13 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
         .expect("NwcWalletContext not provided");
     let manual_preimage = RwSignal::new(String::new());
     let split_enabled = split_settlement_enabled(&listing);
-    let refund_lud16 = RwSignal::new(String::new());
+    // Managed in Settings; split purchases commit it as the refund destination.
+    let refund_status = crate::ui_v2::refund_address::use_refund_address_status();
+    if split_enabled && !cfg!(feature = "web") {
+        if let Some(refund) = use_context::<crate::ui_v2::refund_address::RefundAddressContext>() {
+            spawn_local(async move { refund.refresh().await });
+        }
+    }
     let split_quote_id = RwSignal::new(None::<String>);
     let split_attempt_id = RwSignal::new(None::<String>);
     let split_leg_label = RwSignal::new(None::<String>);
@@ -1298,7 +1328,11 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
             let publisher_npub = listing.publisher_npub.clone();
             let listing_id = listing.id.clone();
             let server_url = adp_server_url(&listing.specs, &listing.download_url);
-            let refund_address = refund_lud16.get();
+            let refund_address = refund_status
+                .get_untracked()
+                .address()
+                .map(|address| address.address.clone())
+                .unwrap_or_default();
             let auth_for_response = buy_auth.clone();
             let auth_epoch = buy_auth.current_auth_flow();
             spawn_local(async move {
@@ -1340,7 +1374,7 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                                     Ok(())
                                 })
                             } else if refund_address.trim().is_empty() {
-                                Err("Enter a Lightning address for principal refunds before creating the quote.".to_string())
+                                Err("Add a refund address in Settings before buying. No payment was sent.".to_string())
                             } else {
                                 match invoke_start_split_purchase(StartSplitPurchaseRequest {
                                     publisher_npub,
@@ -2006,8 +2040,13 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
     let primary_label = Signal::derive(move || decision_for_label().label);
     let primary_enabled = Signal::derive(move || {
         let decision = decision_for_disabled();
+        let buying = decision.action == PrimaryAction::Buy;
         decision.enabled
-            && (decision.action != PrimaryAction::Buy || payment_activation.buyer_enabled())
+            && (!buying || payment_activation.buyer_enabled())
+            && (!buying
+                || !split_enabled
+                || split_quote_id.get().is_some()
+                || refund_status.get().address().is_some())
     });
     let primary_explanation = Signal::derive(move || decision_for_explanation().explanation);
     let unowned_access_label = match &listing.acquisition {
@@ -2250,12 +2289,16 @@ pub fn GameDetailView(listing: GameListing, on_back: Callback<()>) -> impl IntoV
                     <Show
                         when=move || installed_game.get().is_some_and(|game| game.launchable) && primary_action.get() == PrimaryAction::PlayGame
                         fallback=move || view! {
-                            <Show when=move || split_enabled && !purchase_confirmed.get()>
-                                <div style="display:grid;gap:8px;margin-bottom:12px;font-family:ui-monospace,monospace">
-                                    <label for="split-refund-lud16" style="font:800 11px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">"REFUND LIGHTNING ADDRESS"</label>
-                                    <input id="split-refund-lud16" class="v2-input" type="text" placeholder="you@example.com" prop:value=move || refund_lud16.get() on:input:target=move |event| refund_lud16.set(event.target().value()) />
-                                    <span style="color:oklch(0.68 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace">"Enter the Lightning address where you want to receive any refund. It must be checked before you can continue to payment."</span>
-                                </div>
+                            <Show when=move || split_enabled && !purchase_confirmed.get() && split_quote_id.get().is_none() && primary_action.get() == PrimaryAction::Buy>
+                                <p class="v2-detail-access-note" role="note" data-testid="refund-address-notice" style="overflow-wrap:anywhere">
+                                    {move || refund_notice(&refund_status.get())}
+                                    {on_open_settings.map(|open| view! {
+                                        " "
+                                        <button type="button" class="v2-detail-inline-link" on:click=move |_| open.run(())>
+                                            {move || if refund_status.get().address().is_some() { "Change in Settings" } else { "Open Settings" }}
+                                        </button>
+                                    })}
+                                </p>
                             </Show>
                             <button
                                 class="v2-btn-primary"
