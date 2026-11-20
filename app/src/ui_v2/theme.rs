@@ -2548,6 +2548,28 @@ select option:disabled {
   white-space: nowrap;
 }
 
+.arc-launch-status {
+  margin: 6px 0 0;
+  color: var(--arc-text-muted);
+  font: var(--arc-weight-semibold) 10.5px/1.45 var(--arc-font-mono);
+}
+
+.arc-launch-status[hidden] {
+  display: none;
+}
+
+.arc-launch-status[data-tone="running"] {
+  color: var(--arc-success-text);
+}
+
+.arc-launch-status[data-tone="running"]::before {
+  content: "● ";
+}
+
+.arc-launch-status[data-tone="abnormal"] {
+  color: var(--arc-warning-text);
+}
+
 .arc-library-storage-section {
   display: grid;
   gap: 10px;

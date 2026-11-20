@@ -160,16 +160,30 @@ fn preference_revision(persisted: Option<i64>) -> i64 {
 
 fn session_label(session: &LaunchSession) -> String {
     match &session.outcome {
-        None => "Running".into(),
+        None => "Game is running".into(),
+        Some(LaunchOutcome::Exited { code: Some(0), .. }) => "Last session ended normally".into(),
         Some(LaunchOutcome::Exited {
             code: Some(code), ..
-        }) => format!("Exited (code {code})"),
+        }) => format!("Last session ended with exit code {code}"),
         Some(LaunchOutcome::Exited {
             signal: Some(signal),
             ..
-        }) => format!("Exited (signal {signal})"),
-        Some(LaunchOutcome::Exited { .. }) => "Exited".into(),
-        Some(LaunchOutcome::Detached) => "Detached from client".into(),
+        }) => format!("Last session ended by signal {signal}"),
+        Some(LaunchOutcome::Exited { .. }) => "Last session ended".into(),
+        Some(LaunchOutcome::Detached) => "Last session detached from Arcadestr".into(),
+    }
+}
+
+/// Semantic tone of the last session, used to color the status caption.
+fn session_tone(session: &LaunchSession) -> &'static str {
+    match &session.outcome {
+        None => "running",
+        Some(LaunchOutcome::Exited { code: Some(0), .. }) => "ended",
+        Some(LaunchOutcome::Exited { code: Some(_), .. })
+        | Some(LaunchOutcome::Exited {
+            signal: Some(_), ..
+        }) => "abnormal",
+        Some(_) => "ended",
     }
 }
 
@@ -332,7 +346,7 @@ pub fn InstallationLauncher(installation_id: String) -> impl IntoView {
 
     view! {
         <div class="arc-installation-launcher" aria-label="Installed game launch controls">
-            <Show when=move || !loaded.get()><span role="status">"Loading launch profiles…"</span></Show>
+            <Show when=move || !loaded.get()><span class="arc-launch-status" role="status">"Loading launch profiles…"</span></Show>
             <Show when=move || configuration.get().is_some_and(|value| !play_candidates(&value.options).is_empty())>
                 <button class="v2-btn-primary"
                     disabled=move || disabled() || configuration.get().and_then(|value| value.effective_profile_id).is_none()
@@ -357,9 +371,13 @@ pub fn InstallationLauncher(installation_id: String) -> impl IntoView {
                     "Properties"
                 </button>
             </Show>
-            <div role="status" aria-live="polite">{move || session.get().as_ref().map(session_label)}</div>
+            <p class="arc-launch-status" role="status" aria-live="polite"
+                data-tone=move || session.get().as_ref().map(session_tone).unwrap_or("idle")
+                hidden=move || session.get().is_none()>
+                {move || session.get().as_ref().map(session_label)}
+            </p>
             <Show when=move || launcher_error.get().is_some()><p class="arc-library-row-warning" role="alert">{move || launcher_error.get()}</p></Show>
-            <Show when=move || status_error.get().is_some()><p role="status">{move || status_error.get().map(|error| format!("Running state unavailable: {error}"))}</p></Show>
+            <Show when=move || status_error.get().is_some()><p class="arc-launch-status" role="status">{move || status_error.get().map(|error| format!("Running state unavailable: {error}"))}</p></Show>
 
             <Dialog
                 id=dialog_id
@@ -600,7 +618,34 @@ mod tests {
                 signal: None,
             }),
         };
-        assert_eq!(session_label(&session), "Exited (code 7)");
+        assert_eq!(
+            session_label(&session),
+            "Last session ended with exit code 7"
+        );
+        assert_eq!(session_tone(&session), "abnormal");
         assert!(!session.is_running());
+    }
+
+    #[test]
+    fn clean_exit_and_running_sessions_read_as_plain_status() {
+        let mut session = LaunchSession {
+            session_id: "session".into(),
+            installation_id: "installation".into(),
+            profile_id: "game".into(),
+            pid: 1,
+            started_at: 1,
+            ended_at: None,
+            outcome: None,
+        };
+        assert_eq!(session_label(&session), "Game is running");
+        assert_eq!(session_tone(&session), "running");
+
+        session.ended_at = Some(2);
+        session.outcome = Some(LaunchOutcome::Exited {
+            code: Some(0),
+            signal: None,
+        });
+        assert_eq!(session_label(&session), "Last session ended normally");
+        assert_eq!(session_tone(&session), "ended");
     }
 }
