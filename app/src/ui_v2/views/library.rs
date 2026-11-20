@@ -85,10 +85,10 @@ fn storage_command(
 fn recovery_message(discriminator: Option<InstallationRecoveryDiscriminator>) -> &'static str {
     match discriminator {
         Some(InstallationRecoveryDiscriminator::FinalRootPresent) => {
-            "Installation files were preserved, but may be incomplete and are not launchable. Cleanup deletes that tree; any retained installer package remains separate."
+            "Installation files were preserved, but may be incomplete and are not launchable. Cleanup deletes that tree; any offline copy is kept."
         }
         Some(InstallationRecoveryDiscriminator::FinalRootAbsent) | None => {
-            "Installation was interrupted and no installed files remain. Cleanup removes only the failed installation record; any retained installer package remains separate."
+            "Installation was interrupted and no installed files remain. Cleanup removes only the failed installation record; any offline copy is kept."
         }
     }
 }
@@ -99,7 +99,7 @@ fn lifecycle_issue_message(issue: &InstallationLifecycleIssue) -> &'static str {
             "Installation is still marked busy. Retry status after the active operation has had time to finish."
         }
         InstallationState::Uninstalling => {
-            "A previous uninstall was interrupted. Resume uninstall to remove the installation root while conservatively keeping any retained package."
+            "A previous uninstall was interrupted. Resume uninstall to remove the installed files; any offline copy is kept."
         }
         InstallationState::Failed => recovery_message(issue.recovery_discriminator),
         InstallationState::Ready => "Installation is ready.",
@@ -1140,8 +1140,8 @@ pub fn LibraryView(
         destructive_action_generation.set(Some(refresh_generation.get_untracked()));
         destructive_action.set(Some(LibraryDestructiveAction::DeleteRetained(package)));
     });
-    let reinstall_retained = Callback::new(
-        move |(game_coordinate, package_id): (String, String)| {
+    let reinstall_retained =
+        Callback::new(move |(game_coordinate, package_id): (String, String)| {
             if retained_reinstalling.get_untracked().is_some()
                 || destructive_busy.get_untracked()
                 || destructive_action.get_untracked().is_some()
@@ -1156,7 +1156,7 @@ pub fn LibraryView(
                 let succeeded = result.is_ok();
                 match result {
                     Ok(()) => action_message.set(Some(
-                        "Game reinstalled entirely from the retained package. No network or account authorization was used."
+                        "Game reinstalled from its offline copy. Nothing was downloaded."
                             .to_string(),
                     )),
                     Err(error) => retained_reinstall_error.set(Some((game_coordinate, error))),
@@ -1171,8 +1171,7 @@ pub fn LibraryView(
                         .update(|generation| *generation = generation.wrapping_add(1));
                 }
             });
-        },
-    );
+        });
     let marketplace_listings_for_cleanup = marketplace.listings;
     let confirm_destructive = {
         let on_open_listing = on_open_listing.clone();
@@ -1255,18 +1254,18 @@ pub fn LibraryView(
                         match action {
                             LibraryDestructiveAction::Uninstall(_) => action_message.set(Some(
                                 if retain {
-                                    "Game uninstalled. The retained package remains available for an offline reinstall; account ownership was not changed."
+                                    "Game uninstalled. Any offline copy was kept, so you can reinstall it without downloading. Your ownership is unchanged."
                                 } else {
-                                    "Game and retained package deleted from this device; account ownership was not changed."
+                                    "Game and its offline copy were removed from this device. Your ownership is unchanged."
                                 }
                                 .to_string(),
                             )),
                             LibraryDestructiveAction::DeleteRetained(_) => action_message.set(Some(
-                                "Retained package deleted. Installation and ownership records were not changed."
+                                "Offline copy deleted. Installed games and your ownership are unchanged."
                                     .to_string(),
                             )),
                             LibraryDestructiveAction::ResumeUninstall(_) => action_message.set(Some(
-                                "Interrupted uninstall completed. The installation root was removed and the retained package was conservatively kept; account ownership was not changed."
+                                "Interrupted uninstall completed. The installation root was removed and any offline copy was kept. Your ownership is unchanged."
                                     .to_string(),
                             )),
                             LibraryDestructiveAction::RemoveFailed(_) => {
@@ -1274,7 +1273,7 @@ pub fn LibraryView(
                                     on_open_listing.run(listing);
                                 } else {
                                     action_message.set(Some(
-                                        "Failed installation cleaned up. Store metadata is unavailable in the current discovery window, so Library was refreshed; the retained package was not deleted."
+                                        "Failed installation cleaned up. Store metadata is unavailable in the current discovery window, so Library was refreshed; any offline copy was kept."
                                             .to_string(),
                                     ));
                                 }
@@ -1408,15 +1407,15 @@ pub fn LibraryView(
                     <Show when=move || lifecycle_error.get().is_some()>
                         <div class="arc-library-notice" role="status">
                             <span class="material-symbols-outlined" aria-hidden="true">"warning"</span>
-                            <div><strong>"Installation recovery records unavailable"</strong><p>"Ready installations and retained packages remain independently available."</p></div>
+                            <div><strong>"Installation recovery records unavailable"</strong><p>"Installed games and offline copies are still available."</p></div>
                             <button class="v2-btn-secondary" on:click=move |_| retry_refresh.run(()) disabled=move || lifecycle_loading.get()>"Retry recovery records"</button>
                         </div>
                     </Show>
                     <Show when=move || retained_error.get().is_some()>
                         <div class="arc-library-notice" role="status">
                             <span class="material-symbols-outlined" aria-hidden="true">"inventory_2"</span>
-                            <div><strong>"Retained packages unavailable"</strong><p>"Installation rows remain available. No package was automatically deleted."</p></div>
-                            <button class="v2-btn-secondary" on:click=move |_| retry_refresh.run(()) disabled=move || retained_loading.get()>"Retry retained packages"</button>
+                            <div><strong>"Offline copies unavailable"</strong><p>"Installed games are still available. No offline copy was deleted."</p></div>
+                            <button class="v2-btn-secondary" on:click=move |_| retry_refresh.run(()) disabled=move || retained_loading.get()>"Retry offline copies"</button>
                         </div>
                     </Show>
 
@@ -1518,6 +1517,7 @@ pub fn LibraryView(
                                 let launchable = entry.installed.launchable;
                                 let (installed_label, installed_variant) = installed_status(launchable);
                                 let installed_icon = if launchable { "download_done" } else { "warning" };
+                                let offline_copy = retained_packages.get().into_iter().find(|package| package.game_coordinate == coordinate);
                                 view! {
                                     <article class="arc-library-row arc-library-row-installed">
                                         <div class="arc-library-art"><GameArtwork title=title.clone() state=artwork role=ArtworkRole::Thumbnail /></div>
@@ -1530,6 +1530,16 @@ pub fn LibraryView(
                                             } else {
                                                 view! { <span class="arc-library-row-warning" role="status">"No recorded launch profile resolves to this installation. The verified files remain installed and can be uninstalled or reinstalled."</span> }.into_any()
                                             }}
+                                            {offline_copy.map(|package| {
+                                                let size = format_size(package.size_bytes);
+                                                view! {
+                                                    <span class="arc-library-offline-copy">
+                                                        <span class="material-symbols-outlined" aria-hidden="true">"inventory_2"</span>
+                                                        {format!("Offline copy saved · {size} extra")}
+                                                        <button type="button" class="arc-library-link-button" title="Frees disk space. The game stays installed; reinstalling later will need a download." disabled=move || retained_reinstalling.get().is_some() || retained_loading.get() || retained_error.get().is_some() || destructive_busy.get() on:click=move |_| open_retained_delete.run(package.clone())>"Free up space"</button>
+                                                    </span>
+                                                }
+                                            })}
                                             <details class="arc-library-technical"><summary>"Local record details"</summary><dl><div><dt>"Installation directory"</dt><dd>{installation_directory}</dd></div><div><dt>"Listing coordinate"</dt><dd>{stored_coordinate}</dd></div></dl></details>
                                         </div>
                                         <div class="arc-library-row-states" aria-label="Game states">
@@ -1641,56 +1651,74 @@ pub fn LibraryView(
                         </section>
                     </Show>
 
-                    <section class="arc-library-storage-section" aria-labelledby="retained-packages-title">
+                    <section class="arc-library-storage-section" aria-labelledby="offline-copies-title">
                         <div>
-                            <p class="v2-store-kicker">"Retained packages"</p>
-                            <h2 id="retained-packages-title" class="sr-only">"Retained installer packages"</h2>
-                            <p class="arc-library-device-note">"Packages are device-local copies for offline reinstall. Keeping or deleting one does not grant, remove, or prove account ownership."</p>
+                            <p class="v2-store-kicker">"Offline copies"</p>
+                            <h2 id="offline-copies-title" class="sr-only">"Offline copies of uninstalled games"</h2>
+                            <p class="arc-library-device-note">"When you uninstall a game, Arcadestr can keep its download so you can reinstall without internet. Delete a copy to free up space."</p>
                         </div>
                         <Show when=move || retained_loading.get() && retained_packages.get().is_empty()>
-                            <p class="arc-library-result-count" role="status">"Loading retained packages…"</p>
+                            <p class="arc-library-result-count" role="status">"Checking offline copies…"</p>
                         </Show>
-                        <Show when=move || !retained_loading.get() && retained_error.get().is_none() && retained_packages.get().is_empty()>
-                            <p class="arc-library-result-count">"No retained packages on this device."</p>
-                        </Show>
-                        <div class="arc-library-list">
-                            {move || retained_packages.get().into_iter().map(|package| {
-                                let package_for_delete = package.clone();
-                                let reinstall_coordinate = package.game_coordinate.clone();
-                                let reinstall_package_id = package.package_id.clone();
-                                let eligibility = retained_reinstall_eligibility(
-                                    &package.game_coordinate,
-                                    &installed_games.get(),
-                                    &lifecycle_issues.get(),
-                                );
-                                let reinstall_busy_coordinate = retained_reinstalling.get();
-                                let reinstall_busy = reinstall_busy_coordinate.as_deref() == Some(package.game_coordinate.as_str());
-                                let another_reinstall_busy = reinstall_busy_coordinate.is_some() && !reinstall_busy;
-                                let device_state_loading = registry_loading.get() || lifecycle_loading.get();
-                                let device_state_failed = registry_error.get().is_some() || lifecycle_error.get().is_some();
-                                let reinstall_error = retained_reinstall_error.get().and_then(|(coordinate, error)| (coordinate == package.game_coordinate).then_some(error));
-                                let title = listing_for_coordinate(&marketplace.listings.get(), &package.game_coordinate).map(|listing| listing.title).unwrap_or_else(|| parse_game_coordinate(&package.game_coordinate).map(|(_, id)| format!("Retained package: {id}")).unwrap_or_else(|| "Retained package".to_string()));
-                                view! {
-                                    <article class="arc-library-row arc-library-storage-row">
-                                        <div class="arc-library-storage-icon"><span class="material-symbols-outlined" aria-hidden="true">"inventory_2"</span></div>
-                                        <div class="arc-library-row-copy"><h2>{title}</h2><p>{format_size(package.size_bytes)}</p><small>{package.game_coordinate.clone()}</small>{reinstall_error.map(|error| view! { <span class="arc-library-row-warning" role="alert">{format!("Local reinstall failed: {error}")}</span> })}</div>
-                                        <div class="arc-library-row-states" aria-label="Package state"><StatusChip label="Offline reinstall package" variant=StatusChipVariant::Neutral icon=None size=StatusChipSize::Compact /></div>
-                                        <div class="arc-library-row-action">
-                                            {if device_state_loading {
-                                                view! { <span class="arc-library-action-unavailable">"Checking device installation state…"</span> }.into_any()
-                                            } else if device_state_failed {
-                                                view! { <span class="arc-library-action-unavailable">"Device installation state is unavailable; retry Library refresh before reinstalling."</span> }.into_any()
-                                            } else if eligibility == RetainedReinstallEligibility::Available {
-                                                 view! { <button class="v2-btn-secondary" disabled=another_reinstall_busy || reinstall_busy || destructive_busy.get() || destructive_action.get().is_some() on:click=move |_| reinstall_retained.run((reinstall_coordinate.clone(), reinstall_package_id.clone()))>{if reinstall_busy { "Reinstalling from package…" } else { "Reinstall from package" }}</button> }.into_any()
-                                            } else {
-                                                view! { <span class="arc-library-action-unavailable">{retained_reinstall_unavailable_message(eligibility).unwrap_or_default()}</span> }.into_any()
-                                            }}
-                                            <button class="v2-btn-danger" disabled=move || reinstall_busy || retained_reinstalling.get().is_some() || retained_loading.get() || retained_error.get().is_some() || destructive_busy.get() on:click=move |_| open_retained_delete.run(package_for_delete.clone())>"Delete retained package"</button>
-                                        </div>
-                                    </article>
-                                }
-                            }).collect_view()}
-                        </div>
+                        {move || {
+                            let installed = installed_games.get();
+                            let uninstalled_copies = retained_packages
+                                .get()
+                                .into_iter()
+                                .filter(|package| !installed.iter().any(|game| game.game_coordinate == package.game_coordinate))
+                                .collect::<Vec<_>>();
+                            let total_bytes = retained_packages.get().iter().map(|package| package.size_bytes).sum::<u64>();
+                            let summary = (total_bytes > 0).then(|| format!("Offline copies use {} on this device.", format_size(total_bytes)));
+                            let empty = (!retained_loading.get() && retained_error.get().is_none() && uninstalled_copies.is_empty())
+                                .then(|| view! { <p class="arc-library-result-count">"No offline copies of uninstalled games."</p> });
+                            view! {
+                                {summary.map(|summary| view! { <p class="arc-library-result-count">{summary}</p> })}
+                                {empty}
+                                <div class="arc-library-list">
+                                    {uninstalled_copies.into_iter().map(|package| {
+                                        let package_for_delete = package.clone();
+                                        let reinstall_coordinate = package.game_coordinate.clone();
+                                        let reinstall_package_id = package.package_id.clone();
+                                        let eligibility = retained_reinstall_eligibility(
+                                            &package.game_coordinate,
+                                            &installed,
+                                            &lifecycle_issues.get(),
+                                        );
+                                        let reinstall_busy_coordinate = retained_reinstalling.get();
+                                        let reinstall_busy = reinstall_busy_coordinate.as_deref() == Some(package.game_coordinate.as_str());
+                                        let another_reinstall_busy = reinstall_busy_coordinate.is_some() && !reinstall_busy;
+                                        let device_state_loading = registry_loading.get() || lifecycle_loading.get();
+                                        let device_state_failed = registry_error.get().is_some() || lifecycle_error.get().is_some();
+                                        let reinstall_error = retained_reinstall_error.get().and_then(|(coordinate, error)| (coordinate == package.game_coordinate).then_some(error));
+                                        let title = listing_for_coordinate(&marketplace.listings.get(), &package.game_coordinate).map(|listing| listing.title).unwrap_or_else(|| parse_game_coordinate(&package.game_coordinate).map(|(_, id)| format!("Game: {id}")).unwrap_or_else(|| "Unknown game".to_string()));
+                                        view! {
+                                            <article class="arc-library-row arc-library-storage-row">
+                                                <div class="arc-library-storage-icon"><span class="material-symbols-outlined" aria-hidden="true">"inventory_2"</span></div>
+                                                <div class="arc-library-row-copy">
+                                                    <h2>{title}</h2>
+                                                    <p>{format!("Not installed · offline copy uses {}", format_size(package.size_bytes))}</p>
+                                                    {reinstall_error.map(|error| view! { <span class="arc-library-row-warning" role="alert">{format!("Reinstall failed: {error}")}</span> })}
+                                                    <details class="arc-library-technical"><summary>"Technical details"</summary><dl><div><dt>"Listing coordinate"</dt><dd>{package.game_coordinate.clone()}</dd></div><div><dt>"Package ID"</dt><dd>{package.package_id.clone()}</dd></div></dl></details>
+                                                </div>
+                                                <div class="arc-library-row-states" aria-label="Offline copy state"></div>
+                                                <div class="arc-library-row-action">
+                                                    {if device_state_loading {
+                                                        view! { <span class="arc-library-action-unavailable">"Checking this device…"</span> }.into_any()
+                                                    } else if device_state_failed {
+                                                        view! { <span class="arc-library-action-unavailable">"Device state unavailable. Refresh Library to reinstall."</span> }.into_any()
+                                                    } else if eligibility == RetainedReinstallEligibility::Available {
+                                                        view! { <button class="v2-btn-secondary" disabled=another_reinstall_busy || reinstall_busy || destructive_busy.get() || destructive_action.get().is_some() on:click=move |_| reinstall_retained.run((reinstall_coordinate.clone(), reinstall_package_id.clone()))>{if reinstall_busy { "Reinstalling…" } else { "Reinstall" }}</button> }.into_any()
+                                                    } else {
+                                                        view! { <span class="arc-library-action-unavailable">{retained_reinstall_unavailable_message(eligibility).unwrap_or_default()}</span> }.into_any()
+                                                    }}
+                                                    <button class="v2-btn-danger" disabled=move || reinstall_busy || retained_reinstalling.get().is_some() || retained_loading.get() || retained_error.get().is_some() || destructive_busy.get() on:click=move |_| open_retained_delete.run(package_for_delete.clone())>"Delete copy"</button>
+                                                </div>
+                                            </article>
+                                        }
+                                    }).collect_view()}
+                                </div>
+                            }
+                        }}
                     </section>
                 }.into_any()
             }}
@@ -1703,7 +1731,7 @@ pub fn LibraryView(
                     Some(LibraryDestructiveAction::ResumeUninstall(_)) => "Resume uninstall".to_string(),
                     Some(LibraryDestructiveAction::RemoveFailed(issue)) if issue.recovery_discriminator == Some(InstallationRecoveryDiscriminator::FinalRootPresent) => "Delete failed installation files".to_string(),
                     Some(LibraryDestructiveAction::RemoveFailed(_)) => "Remove failed installation record".to_string(),
-                    Some(LibraryDestructiveAction::DeleteRetained(_)) => "Delete retained package".to_string(),
+                    Some(LibraryDestructiveAction::DeleteRetained(_)) => "Delete offline copy".to_string(),
                     None => String::new(),
                 })
                 kicker="Device storage"
@@ -1740,7 +1768,7 @@ pub fn LibraryView(
                             Some(LibraryDestructiveAction::ResumeUninstall(_)) => "Resume uninstall",
                             Some(LibraryDestructiveAction::RemoveFailed(issue)) if issue.recovery_discriminator == Some(InstallationRecoveryDiscriminator::FinalRootPresent) => "Delete files and record",
                             Some(LibraryDestructiveAction::RemoveFailed(_)) => "Remove failed record",
-                            Some(LibraryDestructiveAction::DeleteRetained(_)) => "Delete retained package",
+                            Some(LibraryDestructiveAction::DeleteRetained(_)) => "Delete offline copy",
                             None => "Confirm",
                         } }}
                     </button>
@@ -1752,24 +1780,33 @@ pub fn LibraryView(
                         {if uninstall_sizes_loading.get() {
                             view! { <p class="arc-dialog-status" role="status">"Calculating device storage…"</p> }.into_any()
                         } else if let Some(sizes) = uninstall_sizes.get() {
-                            view! { <dl class="arc-library-size-summary"><div><dt>"Installed game"</dt><dd>{format_size(sizes.installation_size_bytes)}</dd></div><div><dt>"Retained package"</dt><dd>{sizes.retained_package_size_bytes.map(format_size).unwrap_or_else(|| "None".to_string())}</dd></div></dl> }.into_any()
+                            let has_offline_copy = sizes.retained_package_size_bytes.is_some();
+                            view! {
+                                <dl class="arc-library-size-summary"><div><dt>"Installed game"</dt><dd>{format_size(sizes.installation_size_bytes)}</dd></div><div><dt>"Offline copy"</dt><dd>{sizes.retained_package_size_bytes.map(format_size).unwrap_or_else(|| "None".to_string())}</dd></div></dl>
+                                {has_offline_copy.then(|| view! {
+                                    <label class="arc-library-retention-choice"><input type="checkbox" checked=move || retain_package.get() on:change=move |event| retain_package.set(event_target_checked(&event)) /><span><strong>"Keep the offline copy"</strong><small>"Recommended. Lets you reinstall later without downloading. Uncheck to free its space too."</small></span></label>
+                                })}
+                            }.into_any()
                         } else {
                             view! { <p class="arc-dialog-alert" role="alert">"Sizes must load before uninstall can continue."</p> }.into_any()
                         }}
-                        <label class="arc-library-retention-choice"><input type="checkbox" checked=move || retain_package.get() on:change=move |event| retain_package.set(event_target_checked(&event)) /><span><strong>"Keep retained package for offline reinstall"</strong><small>"Recommended. Reinstall uses the previously validated device-local snapshot without checking current account or relay access; the package does not prove ownership."</small></span></label>
                     }.into_any(),
                     LibraryDestructiveAction::ResumeUninstall(_) => view! {
                         <p>"Resume the interrupted uninstall and permanently remove the installation root from this device?"</p>
                         <p class="arc-dialog-alert">"Removing the installation root is destructive and cannot be undone."</p>
-                        <p class="arc-dialog-note">"The previous package-discard choice was not persisted. Resumed uninstall conservatively keeps the retained package for offline reinstall. Account ownership is not changed."</p>
+                        <p class="arc-dialog-note">"The previous package-discard choice was not persisted. Resuming keeps any offline copy so you can reinstall later. Your ownership is unchanged."</p>
                     }.into_any(),
                     LibraryDestructiveAction::RemoveFailed(issue) => view! {
                         <p>{recovery_message(issue.recovery_discriminator)}</p>
-                        <p class="arc-dialog-note">"Cleanup never deletes a retained installer package and never changes account ownership. If store metadata is available, Arcadestr opens the matching game detail afterward so the buyer can retry."</p>
+                        <p class="arc-dialog-note">"Cleanup never deletes an offline copy and never changes your ownership. If store metadata is available, Arcadestr opens the matching game detail afterward so the buyer can retry."</p>
                     }.into_any(),
                     LibraryDestructiveAction::DeleteRetained(package) => view! {
-                        <p>{format!("Delete the {} retained package from this device?", format_size(package.size_bytes))}</p>
-                        <p class="arc-dialog-note">"This deletes only the selected offline-reinstall package. Any installation record and account ownership remain unchanged."</p>
+                        <p>{format!("Delete this offline copy and free {}?", format_size(package.size_bytes))}</p>
+                        <p class="arc-dialog-note">{if installed_games.get_untracked().iter().any(|game| game.game_coordinate == package.game_coordinate) {
+                            "The game stays installed and playable. Repairing or reinstalling it later will need a download. Your ownership is unchanged."
+                        } else {
+                            "Reinstalling this game later will need a download. Your ownership is unchanged."
+                        }}</p>
                     }.into_any(),
                 })}
                 <Show when=move || destructive_error.get().is_some()><p class="arc-dialog-alert" role="alert">{move || destructive_error.get().unwrap_or_default()}</p></Show>
@@ -2273,7 +2310,7 @@ mod tests {
             recovery_message(Some(
                 InstallationRecoveryDiscriminator::FinalRootAbsent
             )),
-            "Installation was interrupted and no installed files remain. Cleanup removes only the failed installation record; any retained installer package remains separate."
+            "Installation was interrupted and no installed files remain. Cleanup removes only the failed installation record; any offline copy is kept."
         );
         let present = recovery_message(Some(InstallationRecoveryDiscriminator::FinalRootPresent));
         assert!(present.contains("files were preserved"));
@@ -2347,7 +2384,7 @@ mod tests {
                 installation_id: "uninstalling-1".into()
             }
         );
-        assert!(lifecycle_issue_message(&uninstalling).contains("retained package"));
+        assert!(lifecycle_issue_message(&uninstalling).contains("offline copy"));
         assert!(lifecycle_issue_message(&uninstalling).contains("Resume uninstall"));
     }
 

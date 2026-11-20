@@ -2671,6 +2671,47 @@ select option:disabled {
   line-height: 1.45;
 }
 
+.arc-library-offline-copy {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  color: var(--arc-text-muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.arc-library-offline-copy .material-symbols-outlined {
+  font-size: 14px;
+}
+
+.arc-library-link-button {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--arc-info);
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.arc-library-link-button:hover:not(:disabled) {
+  color: var(--arc-text-heading);
+}
+
+.arc-library-link-button:focus-visible {
+  outline: 2px solid var(--arc-focus-ring);
+  outline-offset: 2px;
+}
+
+.arc-library-link-button:disabled {
+  color: var(--arc-text-disabled);
+  cursor: not-allowed;
+  text-decoration: none;
+}
+
 .arc-library-action-unavailable,
 .arc-library-row-warning,
 .arc-library-device-note {
