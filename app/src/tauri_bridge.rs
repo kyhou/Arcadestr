@@ -996,6 +996,43 @@ pub async fn invoke_list_retained_packages() -> Result<Vec<RetainedPackage>, Str
     Ok(Vec::new())
 }
 
+#[cfg(not(feature = "web"))]
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct PackageRetentionSettings {
+    keep_packages_after_install: bool,
+}
+
+/// Whether new installs keep their downloaded package for offline reinstall.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_get_keep_packages_after_install() -> Result<bool, String> {
+    let settings: PackageRetentionSettings =
+        crate::tauri_invoke::invoke("get_package_retention_settings", serde_json::json!({}))
+            .await?;
+    Ok(settings.keep_packages_after_install)
+}
+
+/// Package retention is a native-only preference.
+#[cfg(feature = "web")]
+pub async fn invoke_get_keep_packages_after_install() -> Result<bool, String> {
+    Ok(true)
+}
+
+/// Persist whether new installs keep their downloaded package.
+#[cfg(not(feature = "web"))]
+pub async fn invoke_set_keep_packages_after_install(keep: bool) -> Result<(), String> {
+    crate::tauri_invoke::invoke_void(
+        "set_keep_packages_after_install",
+        serde_json::json!({ "keep": keep }),
+    )
+    .await
+}
+
+/// Package retention is a native-only preference.
+#[cfg(feature = "web")]
+pub async fn invoke_set_keep_packages_after_install(_keep: bool) -> Result<(), String> {
+    Err("Offline copies are only available in desktop builds.".to_string())
+}
+
 /// Return installation and retained-package sizes before uninstall.
 #[cfg(not(feature = "web"))]
 pub async fn invoke_get_uninstall_sizes(installation_id: String) -> Result<UninstallSizes, String> {

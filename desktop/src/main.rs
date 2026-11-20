@@ -438,6 +438,77 @@ fn save_network_discovery_settings(settings: &NetworkDiscoverySettings) -> Resul
     std::fs::write(path, json).map_err(|e| format!("Failed to write settings file: {e}"))
 }
 
+/// Device-local storage preferences, kept apart from network settings so
+/// neither writer drops the other's fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct PackageRetentionSettings {
+    /// ADP-01 requires retention by default; buyers may opt out.
+    #[serde(default = "default_keep_packages_after_install")]
+    keep_packages_after_install: bool,
+}
+
+fn default_keep_packages_after_install() -> bool {
+    true
+}
+
+impl Default for PackageRetentionSettings {
+    fn default() -> Self {
+        Self {
+            keep_packages_after_install: default_keep_packages_after_install(),
+        }
+    }
+}
+
+fn storage_settings_file_path() -> std::path::PathBuf {
+    settings_file_path().with_file_name("storage-settings.json")
+}
+
+fn parse_package_retention_settings(content: &str) -> Result<PackageRetentionSettings, String> {
+    serde_json::from_str::<PackageRetentionSettings>(content)
+        .map_err(|error| format!("failed to parse storage-settings.json: {error}"))
+}
+
+/// Unreadable or malformed settings fall back to the retaining default so a
+/// broken file never silently discards purchased packages.
+fn load_package_retention_settings() -> PackageRetentionSettings {
+    match std::fs::read_to_string(storage_settings_file_path()) {
+        Ok(content) => parse_package_retention_settings(&content).unwrap_or_else(|error| {
+            tracing::warn!(%error, "using default package retention settings");
+            PackageRetentionSettings::default()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            PackageRetentionSettings::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "using default package retention settings");
+            PackageRetentionSettings::default()
+        }
+    }
+}
+
+fn save_package_retention_settings(settings: &PackageRetentionSettings) -> Result<(), String> {
+    let path = storage_settings_file_path();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Invalid settings file path".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create settings dir: {e}"))?;
+    let json = serde_json::to_string_pretty(settings)
+        .map_err(|e| format!("Failed to serialize settings: {e}"))?;
+    std::fs::write(path, json).map_err(|e| format!("Failed to write settings file: {e}"))
+}
+
+#[tauri::command]
+async fn get_package_retention_settings() -> Result<PackageRetentionSettings, String> {
+    Ok(load_package_retention_settings())
+}
+
+#[tauri::command]
+async fn set_keep_packages_after_install(keep: bool) -> Result<(), String> {
+    save_package_retention_settings(&PackageRetentionSettings {
+        keep_packages_after_install: keep,
+    })
+}
+
 #[tauri::command]
 async fn get_network_discovery_settings() -> Result<NetworkDiscoverySettings, String> {
     Ok(load_network_discovery_settings())
@@ -1432,6 +1503,55 @@ async fn delete_retained_package_owned(
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// Drops the retained package of a completed installation when the buyer has
+/// opted out of retention. Returns whether a package was deleted.
+///
+/// The package is kept whenever repair could still need it: an update for the
+/// coordinate is pending, or the installation is not `Ready`.
+async fn discard_installed_retained_package(
+    repository: &InstallationsRepository,
+    retained_directory: &Path,
+    coordinate: &str,
+) -> Result<bool, String> {
+    let update_pending = repository
+        .pending_updates()
+        .await
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|update| update.candidate.game_coordinate == coordinate);
+    if update_pending {
+        return Ok(false);
+    }
+    let ready = repository
+        .get_by_coordinate(coordinate)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some_and(|snapshot| snapshot.installation.state == InstallationState::Ready);
+    if !ready {
+        return Ok(false);
+    }
+    let Some(package) = repository
+        .get_retained_package(coordinate)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    delete_retained_package_owned(repository, retained_directory, package).await?;
+    Ok(true)
+}
+
+async fn discard_retained_package_after_install(
+    repository: &InstallationsRepository,
+    app_data: &Path,
+    coordinate: &str,
+) -> Result<bool, String> {
+    let _coordinate_lock = acquire_coordinate_lifecycle_lock(app_data, coordinate).await?;
+    install::recover_updates(repository, app_data, now_unix_i64()?, Some(coordinate)).await?;
+    discard_installed_retained_package(repository, &app_data.join("retained-packages"), coordinate)
+        .await
 }
 
 async fn uninstall_game_owned(
@@ -2986,17 +3106,29 @@ async fn install_game(
         auth: state.auth.clone(),
         signer_state: signer_state.inner().clone(),
     });
+    let coordinate = listing_coordinate_from_app_listing(&listing).ok();
     let result = install_game_with_fetcher_and_signer(
         listing,
         &state,
         Some(signer),
         Some(&app_handle),
-        app_data_dir,
+        app_data_dir.clone(),
         &fetcher,
     )
     .await;
     if let Err(error) = &result {
         tracing::error!(%listing_id, %listing_title, %error, "Game installation failed");
+    } else if !load_package_retention_settings().keep_packages_after_install {
+        if let Some(coordinate) = coordinate {
+            let repository = InstallationsRepository::new(state.database.pool().clone());
+            // The game is installed; a failed discard only leaves extra bytes behind.
+            if let Err(error) =
+                discard_retained_package_after_install(&repository, &app_data_dir, &coordinate)
+                    .await
+            {
+                tracing::warn!(%listing_id, %error, "retained package was kept after install");
+            }
+        }
     }
     result
 }
@@ -5541,6 +5673,87 @@ mod install_game_tests {
                 retain_package
             );
         }
+    }
+
+    #[tokio::test]
+    async fn opted_out_retention_discards_package_of_ready_installation() {
+        let (database, installation, _managed, retained_directory, package) =
+            ready_lifecycle_fixture("discard-ready", true).await;
+        let repository = CoreInstallationsRepository::new(database.pool().clone());
+        let package = package.expect("retained fixture");
+
+        let discarded = discard_installed_retained_package(
+            &repository,
+            &retained_directory,
+            &installation.game_coordinate,
+        )
+        .await
+        .expect("discard succeeds");
+
+        assert!(discarded);
+        assert!(!package.package_path.exists());
+        assert!(repository
+            .get_retained_package(&package.game_coordinate)
+            .await
+            .expect("retained query")
+            .is_none());
+        assert!(installation.installation_root.join("bin/game").exists());
+        let snapshot = repository
+            .get_by_id(&installation.id)
+            .await
+            .expect("installation query")
+            .expect("installation kept");
+        assert_eq!(snapshot.installation.state, InstallationState::Ready);
+    }
+
+    #[tokio::test]
+    async fn opted_out_retention_keeps_package_without_ready_installation() {
+        let (database, installation, managed, retained_directory, package) =
+            ready_lifecycle_fixture("discard-not-ready", true).await;
+        let repository = CoreInstallationsRepository::new(database.pool().clone());
+        let package = package.expect("retained fixture");
+        uninstall_game_owned(
+            &repository,
+            &managed,
+            &retained_directory,
+            &installation.id,
+            true,
+            102,
+        )
+        .await
+        .expect("uninstall keeps package");
+
+        let discarded = discard_installed_retained_package(
+            &repository,
+            &retained_directory,
+            &installation.game_coordinate,
+        )
+        .await
+        .expect("discard check succeeds");
+
+        assert!(!discarded);
+        assert!(package.package_path.exists());
+        assert!(repository
+            .get_retained_package(&package.game_coordinate)
+            .await
+            .expect("retained query")
+            .is_some());
+    }
+
+    #[test]
+    fn package_retention_settings_default_to_keeping_packages() {
+        assert!(PackageRetentionSettings::default().keep_packages_after_install);
+        assert!(
+            parse_package_retention_settings("{}")
+                .expect("empty settings")
+                .keep_packages_after_install
+        );
+        assert!(
+            !parse_package_retention_settings(r#"{"keep_packages_after_install":false}"#)
+                .expect("opt-out settings")
+                .keep_packages_after_install
+        );
+        assert!(parse_package_retention_settings("{not json").is_err());
     }
 
     #[tokio::test]
@@ -8447,6 +8660,8 @@ fn main() {
             get_connected_relay_count,
             get_connected_relays,
             get_network_discovery_settings,
+            get_package_retention_settings,
+            set_keep_packages_after_install,
             set_allow_insecure_public_ws,
             get_extended_network_stats,
             get_relay_hints_for_pubkey,

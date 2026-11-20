@@ -9,13 +9,14 @@ use crate::models::{
     npub_fallback_label, AcquisitionPolicy, GameListing, ListingSource, PlatformInfo,
 };
 use crate::tauri_bridge::{
-    invoke_delete_retained_package, invoke_get_installed_games, invoke_get_library_games,
-    invoke_get_listing_ownership, invoke_get_platform_info, invoke_get_uninstall_sizes,
+    invoke_delete_retained_package, invoke_get_installed_games,
+    invoke_get_keep_packages_after_install, invoke_get_library_games, invoke_get_listing_ownership,
+    invoke_get_platform_info, invoke_get_uninstall_sizes,
     invoke_list_installation_lifecycle_issues, invoke_list_retained_packages,
     invoke_reinstall_retained_package, invoke_remove_failed_installation, invoke_resume_uninstall,
-    invoke_retry_installation_recovery, invoke_uninstall_game, InstallationLifecycleIssue,
-    InstallationRecoveryDiscriminator, InstallationState, InstalledGame, LibraryGame,
-    RetainedPackage, UninstallSizes,
+    invoke_retry_installation_recovery, invoke_set_keep_packages_after_install,
+    invoke_uninstall_game, InstallationLifecycleIssue, InstallationRecoveryDiscriminator,
+    InstallationState, InstalledGame, LibraryGame, RetainedPackage, UninstallSizes,
 };
 use crate::ui_v2::components::{
     artwork_state_from_url, ArtworkRole, Dialog, DialogCloseAction, DialogClosePolicy,
@@ -730,6 +731,10 @@ pub fn LibraryView(
     let uninstall_sizes = RwSignal::new(None::<UninstallSizes>);
     let uninstall_sizes_loading = RwSignal::new(false);
     let retain_package = RwSignal::new(default_retain_package());
+    // `None` while the native preference is loading or unavailable.
+    let keep_offline_copies = RwSignal::new(None::<bool>);
+    let keep_offline_copies_saving = RwSignal::new(false);
+    let keep_offline_copies_error = RwSignal::new(None::<String>);
     let action_message = RwSignal::new(None::<String>);
     let destructive_cancel_ref = NodeRef::<leptos::html::Button>::new();
     let marketplace = use_marketplace_listings_with_limit(LIBRARY_MARKETPLACE_LIMIT);
@@ -893,6 +898,34 @@ pub fn LibraryView(
                 Err(error) => retained_error.set(Some(error)),
             }
             retained_loading.set(false);
+        });
+    });
+
+    Effect::new(move |_| {
+        if availability == LibraryAvailability::DesktopOnly {
+            return;
+        }
+        spawn_local(async move {
+            match invoke_get_keep_packages_after_install().await {
+                Ok(keep) => keep_offline_copies.set(Some(keep)),
+                Err(error) => keep_offline_copies_error.set(Some(error)),
+            }
+        });
+    });
+    let set_keep_offline_copies = Callback::new(move |keep: bool| {
+        if keep_offline_copies_saving.get_untracked() {
+            return;
+        }
+        let previous = keep_offline_copies.get_untracked();
+        keep_offline_copies.set(Some(keep));
+        keep_offline_copies_saving.set(true);
+        keep_offline_copies_error.set(None);
+        spawn_local(async move {
+            if let Err(error) = invoke_set_keep_packages_after_install(keep).await {
+                keep_offline_copies.set(previous);
+                keep_offline_copies_error.set(Some(error));
+            }
+            keep_offline_copies_saving.set(false);
         });
     });
 
@@ -1657,6 +1690,21 @@ pub fn LibraryView(
                             <h2 id="offline-copies-title" class="sr-only">"Offline copies of uninstalled games"</h2>
                             <p class="arc-library-device-note">"When you uninstall a game, Arcadestr can keep its download so you can reinstall without internet. Delete a copy to free up space."</p>
                         </div>
+                        <label class="arc-library-retention-choice">
+                            <input
+                                type="checkbox"
+                                prop:checked=move || keep_offline_copies.get().unwrap_or(true)
+                                disabled=move || keep_offline_copies.get().is_none() || keep_offline_copies_saving.get()
+                                on:change=move |event| set_keep_offline_copies.run(event_target_checked(&event))
+                            />
+                            <span>
+                                <strong>"Keep an offline copy of games I install"</strong>
+                                <small>"Recommended. Lets you reinstall or repair a game without downloading it again, but uses extra disk space. Turn off to delete the download once installation finishes."</small>
+                            </span>
+                        </label>
+                        <Show when=move || keep_offline_copies_error.get().is_some()>
+                            <p class="arc-library-row-warning" role="alert">{move || format!("Offline copy setting unavailable: {}", keep_offline_copies_error.get().unwrap_or_default())}</p>
+                        </Show>
                         <Show when=move || retained_loading.get() && retained_packages.get().is_empty()>
                             <p class="arc-library-result-count" role="status">"Checking offline copies…"</p>
                         </Show>
