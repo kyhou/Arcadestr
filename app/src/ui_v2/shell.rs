@@ -592,13 +592,16 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     });
     let connection_error = Signal::derive(move || auth.connection_error.get());
     let display_name = Signal::derive(move || {
-        auth.profile
-            .get()
-            .map(|profile| profile.display())
+        let non_empty = |value: Option<String>| value.filter(|text| !text.trim().is_empty());
+        let profile = auth.profile.get();
+        non_empty(profile.as_ref().and_then(|profile| profile.display_name.clone()))
+            .or_else(|| non_empty(profile.as_ref().and_then(|profile| profile.name.clone())))
             .or_else(|| {
-                auth.active_account
-                    .get()
-                    .and_then(|account| account.display_name.or(account.name).or(account.username))
+                auth.active_account.get().and_then(|account| {
+                    non_empty(account.display_name)
+                        .or_else(|| non_empty(account.name))
+                        .or_else(|| non_empty(account.username))
+                })
             })
             .or_else(|| auth.npub.get().map(|npub| npub_fallback_label(&npub)))
             .unwrap_or_else(|| "No active account".to_string())
