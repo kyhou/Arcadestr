@@ -1522,6 +1522,11 @@ pub fn LibraryView(
                                             <h2>{title}</h2><p>{publisher}</p><small>{installed_meta}</small>
                                             {if entry.listing.is_none() { view! { <span class="arc-library-row-warning">"Current store metadata was not loaded in the discovery window."</span> }.into_any() } else { view! { <></> }.into_any() }}
                                             {if entry.malformed_coordinate { view! { <span class="arc-library-row-warning">"Stored listing coordinate is malformed."</span> }.into_any() } else { view! { <></> }.into_any() }}
+                                            {if launchable {
+                                                view! { <></> }.into_any()
+                                            } else {
+                                                view! { <span class="arc-library-row-warning" role="status">"No recorded launch profile resolves to this installation. The verified files remain installed and can be uninstalled or reinstalled."</span> }.into_any()
+                                            }}
                                             <details class="arc-library-technical"><summary>"Local record details"</summary><dl><div><dt>"Installation directory"</dt><dd>{installation_directory}</dd></div><div><dt>"Listing coordinate"</dt><dd>{stored_coordinate}</dd></div></dl></details>
                                         </div>
                                         <div class="arc-library-row-states" aria-label="Game states">
@@ -1533,17 +1538,12 @@ pub fn LibraryView(
                                             } else if ownership_failed {
                                                 view! { <StatusChip label="Ownership unknown" variant=StatusChipVariant::Warning icon=None size=StatusChipSize::Compact /> }.into_any()
                                             } else { view! { <></> }.into_any() }}
-                                            {if launchable {
-                                                view! { <></> }.into_any()
-                                            } else {
-                                                view! { <span class="arc-library-row-warning" role="status">"No recorded launch profile resolves to this installation. The verified files remain installed and can be uninstalled or reinstalled."</span> }.into_any()
-                                            }}
                                             <StatusChip label=installed_label variant=installed_variant icon=Some(installed_icon) size=StatusChipSize::Compact />
                                             <StatusChip label=compatibility_state.0 variant=compatibility_state.1 icon=None size=StatusChipSize::Compact />
                                         </div>
-                                        <div class="arc-library-row-action">
+                                        <div class="arc-library-row-action arc-library-row-action-installed">
                                             <crate::ui_v2::components::InstallationLauncher installation_id=entry.installed.installation_id.clone() />
-                                            {match listing { Some(listing) => { let selected = listing.clone(); view! { <button class="v2-btn-primary" on:click=move |_| on_open_listing.run(selected.clone())>"View details"</button> }.into_any() }, None => view! { <span class="arc-library-action-unavailable">"Details unavailable"</span> }.into_any() }}
+                                            {match listing { Some(listing) => { let selected = listing.clone(); view! { <button class="v2-btn-secondary" on:click=move |_| on_open_listing.run(selected.clone())>"View details"<span aria-hidden="true">" >"</span></button> }.into_any() }, None => view! { <span class="arc-library-action-unavailable">"Details unavailable"</span> }.into_any() }}
                                             <button class="v2-btn-danger" disabled=move || registry_loading.get() || registry_error.get().is_some() || destructive_busy.get() || retained_reinstalling.get().is_some() on:click=move |_| open_uninstall.run(installed_for_uninstall.clone())>"Uninstall game"</button>
                                         </div>
                                     </article>

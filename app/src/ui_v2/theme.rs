@@ -2548,6 +2548,25 @@ select option:disabled {
   white-space: nowrap;
 }
 
+/* Installed rows: launcher buttons join the row's single button line, and
+   launcher captions (session status, warnings) wrap to a full-width line
+   beneath the buttons instead of stretching them. */
+.arc-library-row-action-installed {
+  align-items: center;
+  max-width: 460px;
+}
+
+.arc-library-row-action-installed .arc-installation-launcher {
+  display: contents;
+}
+
+.arc-library-row-action-installed .arc-installation-launcher > :is(p, span) {
+  flex-basis: 100%;
+  order: 1;
+  margin: 0;
+  text-align: right;
+}
+
 .arc-launch-status {
   margin: 6px 0 0;
   color: var(--arc-text-muted);
@@ -2932,6 +2951,14 @@ select option:disabled {
 
   .arc-library-row-action :is(.v2-btn-primary, .v2-btn-secondary, .v2-btn-danger) {
     width: 100%;
+  }
+
+  .arc-library-row-action-installed {
+    max-width: none;
+  }
+
+  .arc-library-row-action-installed .arc-installation-launcher > :is(p, span) {
+    text-align: left;
   }
 }
 
