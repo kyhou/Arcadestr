@@ -291,12 +291,15 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
         let acquisition = acquisition_filter.get();
         let platform = active_platform_filter.get();
         let campaign_states = campaign_state.states.get();
+        let presentations = store_pages.presentations.get();
         let mut filtered = listings
             .get()
             .into_iter()
             .filter(|listing| {
                 let campaign = campaign_states.get(&listing_state_key(listing)).copied();
-                matches_search(listing, &query)
+                let store_page = canonical_listing_coordinate(listing)
+                    .and_then(|coordinate| presentations.get(&coordinate));
+                matches_search(listing, store_page, &query)
                     && matches_category(listing, category.as_deref())
                     && matches_acquisition_filter(listing, campaign, acquisition)
                     && listing_matches_platform_filter(&listing.platforms, platform.as_deref())
@@ -756,10 +759,25 @@ fn normalize_filter_value(value: &str) -> String {
     normalize_search(value)
 }
 
-fn matches_search(listing: &GameListing, normalized_query: &str) -> bool {
+/// Match the query against everything a buyer can see on the card: listing
+/// fields plus the Store Page title, summary, genres and features that replace
+/// them on screen. Otherwise a game shown as "Cogmind" cannot be found by name.
+fn matches_search(
+    listing: &GameListing,
+    store_page: Option<&StorePageCardPresentation>,
+    normalized_query: &str,
+) -> bool {
     if normalized_query.is_empty() {
         return true;
     }
+    let store_page_text = store_page.into_iter().flat_map(|page| {
+        page.title
+            .iter()
+            .chain(page.summary.iter())
+            .chain(page.genres.iter())
+            .chain(page.features.iter())
+            .map(String::as_str)
+    });
     let searchable = [
         listing.title.as_str(),
         listing.description.as_str(),
@@ -767,6 +785,7 @@ fn matches_search(listing: &GameListing, normalized_query: &str) -> bool {
         listing.publisher_npub.as_str(),
     ]
     .into_iter()
+    .chain(store_page_text)
     .chain(listing.tags.iter().map(String::as_str))
     .chain(
         listing
@@ -1097,12 +1116,47 @@ mod tests {
         value.description = "Fast cyberpunk racing".into();
         value.tags = vec!["Arcade Racing".into()];
         assert_eq!(normalize_search("  NEON   racing "), "neon racing");
-        assert!(matches_search(&value, &normalize_search("neon racing")));
         assert!(matches_search(
             &value,
+            None,
+            &normalize_search("neon racing")
+        ));
+        assert!(matches_search(
+            &value,
+            None,
             &normalize_search("studio cyberpunk")
         ));
-        assert!(!matches_search(&value, &normalize_search("strategy")));
+        assert!(!matches_search(&value, None, &normalize_search("strategy")));
+    }
+
+    #[test]
+    fn search_finds_games_by_the_store_page_text_shown_on_their_card() {
+        let value = listing("one", "Regtest fixture");
+        let page = StorePageCardPresentation {
+            listing_coordinate: "30402:publisher:one".into(),
+            store_page_coordinate: "30407:publisher:one".into(),
+            event_id: "event".into(),
+            title: Some("Cogmind".into()),
+            summary: Some("Build yourself from salvage".into()),
+            capsule_url: None,
+            hero_url: None,
+            genres: vec!["Roguelike".into()],
+            features: vec!["Single-player".into()],
+            release_date: None,
+        };
+        for query in ["cogmind", "roguelike", "salvage", "single-player"] {
+            assert!(
+                matches_search(&value, Some(&page), &normalize_search(query)),
+                "{query} should match"
+            );
+            assert!(!matches_search(&value, None, &normalize_search(query)));
+        }
+        // Listing fields still match when a Store Page is present.
+        assert!(matches_search(
+            &value,
+            Some(&page),
+            &normalize_search("fixture")
+        ));
     }
 
     #[test]
