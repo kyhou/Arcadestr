@@ -1734,6 +1734,94 @@ select option:disabled {
   margin-bottom: 0;
 }
 
+/* Publisher Markdown. The base reset strips list markers and heading sizes, so
+   restore readable prose here. Two-class selectors outrank .v2-detail-prose and
+   section heading rules regardless of order. */
+.store-page-safe-html.v2-detail-prose {
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.store-page-safe-html.v2-detail-prose :is(p, ul, ol, blockquote, pre) {
+  margin: 0 0 0.9em;
+}
+
+.store-page-safe-html.v2-detail-prose :is(h1, h2, h3, h4, h5, h6) {
+  margin: 1.4em 0 0.5em;
+  color: var(--arc-text-primary);
+  font-weight: 800;
+  line-height: 1.3;
+  letter-spacing: 0.2px;
+  text-transform: none;
+}
+
+.store-page-safe-html.v2-detail-prose :is(h1, h2) {
+  font-size: 16px;
+}
+
+.store-page-safe-html.v2-detail-prose :is(h3, h4, h5, h6) {
+  font-size: 14px;
+}
+
+.store-page-safe-html.v2-detail-prose ul {
+  padding-left: 1.4em;
+  list-style: square;
+}
+
+.store-page-safe-html.v2-detail-prose ol {
+  padding-left: 1.6em;
+  list-style: decimal;
+}
+
+.store-page-safe-html.v2-detail-prose li {
+  margin: 0.25em 0;
+}
+
+.store-page-safe-html.v2-detail-prose li::marker {
+  color: var(--arc-accent);
+}
+
+.store-page-safe-html.v2-detail-prose strong {
+  color: var(--arc-text-primary);
+  font-weight: 700;
+}
+
+.store-page-safe-html.v2-detail-prose em {
+  font-style: italic;
+}
+
+.store-page-safe-html.v2-detail-prose code {
+  padding: 1px 4px;
+  border-radius: var(--arc-radius-xs);
+  background: var(--arc-surface-recessed);
+  font-size: 0.92em;
+}
+
+.store-page-safe-html.v2-detail-prose blockquote {
+  padding-left: 0.9em;
+  border-left: 2px solid var(--arc-accent);
+}
+
+.store-page-safe-html.v2-detail-prose a {
+  color: var(--arc-info-text);
+  text-decoration: underline;
+}
+
+/* Language and accessibility facts: their own responsive grid, not the
+   detail page's two-column layout class. */
+.v2-store-page-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr));
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.v2-store-page-facts > .v2-detail-note {
+  margin-top: 0;
+}
+
 .v2-detail-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;

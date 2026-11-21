@@ -40,6 +40,59 @@ fn label(value: &str) -> String {
         .join(" ")
 }
 
+/// Display name for a BCP 47 language tag. Unknown tags are shown verbatim
+/// rather than mangled into something like "Pt BR".
+pub(crate) fn language_display_name(code: &str) -> String {
+    let name = match code.to_ascii_lowercase().as_str() {
+        "en" => "English",
+        "en-us" => "English (US)",
+        "en-gb" => "English (UK)",
+        "es" => "Spanish",
+        "es-419" => "Spanish (Latin America)",
+        "pt" => "Portuguese",
+        "pt-br" => "Portuguese (Brazil)",
+        "pt-pt" => "Portuguese (Portugal)",
+        "fr" => "French",
+        "de" => "German",
+        "it" => "Italian",
+        "nl" => "Dutch",
+        "pl" => "Polish",
+        "ru" => "Russian",
+        "uk" => "Ukrainian",
+        "tr" => "Turkish",
+        "ja" => "Japanese",
+        "ko" => "Korean",
+        "zh" => "Chinese",
+        "zh-cn" | "zh-hans" => "Chinese (Simplified)",
+        "zh-tw" | "zh-hant" => "Chinese (Traditional)",
+        "ar" => "Arabic",
+        "hi" => "Hindi",
+        "sv" => "Swedish",
+        "cs" => "Czech",
+        _ => return code.to_string(),
+    };
+    name.to_string()
+}
+
+/// Accessibility entries worth showing a buyer: anything supported, plus
+/// unsupported features the publisher explained. A bare "not supported" entry
+/// carries no information and only reads as a list of shortcomings.
+fn buyer_accessibility(
+    entries: &[crate::models::StorePageAccessibility],
+) -> Vec<crate::models::StorePageAccessibility> {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.supported
+                || entry
+                    .notes
+                    .as_deref()
+                    .is_some_and(|notes| !notes.trim().is_empty())
+        })
+        .cloned()
+        .collect()
+}
+
 fn tier_rows(tier: &StorePageRequirementTier) -> Vec<(&'static str, String)> {
     [
         ("Operating system", &tier.os),
@@ -119,8 +172,9 @@ pub fn StorePageRichDetail(
     let requirements_view = presentation.requirements.clone();
     let languages_when = presentation.languages.clone();
     let languages_view = presentation.languages.clone();
-    let accessibility_when = presentation.accessibility.clone();
-    let accessibility_view = presentation.accessibility.clone();
+    let accessibility = buyer_accessibility(&presentation.accessibility);
+    let accessibility_when = accessibility.clone();
+    let accessibility_view = accessibility;
     let links_when = links.clone();
     let links_view = links.clone();
     view! {
@@ -201,13 +255,13 @@ pub fn StorePageRichDetail(
         </Show>
 
         <Show when=move || !languages_when.is_empty()>
-            <section class="v2-detail-section"><p class="v2-store-kicker">"Languages"</p><h2>"Language support"</h2><div class="v2-detail-grid">
-                {languages_view.clone().into_iter().map(|language| view! { <div class="v2-detail-note"><strong>{label(&language.code)}</strong><p class="v2-store-help">{[language.interface.then_some("Interface"), language.audio.then_some("Audio"), language.subtitles.then_some("Subtitles")].into_iter().flatten().collect::<Vec<_>>().join(" · ")}</p></div> }).collect_view()}
+            <section class="v2-detail-section"><p class="v2-store-kicker">"Languages"</p><h2>"Language support"</h2><div class="v2-store-page-facts">
+                {languages_view.clone().into_iter().map(|language| view! { <div class="v2-detail-note"><strong lang=language.code.clone()>{language_display_name(&language.code)}</strong><p class="v2-store-help">{[language.interface.then_some("Interface"), language.audio.then_some("Audio"), language.subtitles.then_some("Subtitles")].into_iter().flatten().collect::<Vec<_>>().join(" · ")}</p></div> }).collect_view()}
             </div></section>
         </Show>
 
         <Show when=move || !accessibility_when.is_empty()>
-            <section class="v2-detail-section"><p class="v2-store-kicker">"Accessibility"</p><h2>"Accessibility features"</h2><p class="v2-store-help">"Accessibility information provided by the publisher."</p><ul class="v2-detail-grid">
+            <section class="v2-detail-section"><p class="v2-store-kicker">"Accessibility"</p><h2>"Accessibility features"</h2><p class="v2-store-help">"Accessibility information provided by the publisher."</p><ul class="v2-store-page-facts">
                 {accessibility_view.clone().into_iter().map(|entry| view! { <li class="v2-detail-note"><strong>{label(&entry.feature)}</strong>{if entry.supported { " · Supported" } else { " · Not supported" }}{entry.notes.map(|notes| view! { <p class="v2-store-help">{notes}</p> })}</li> }).collect_view()}
             </ul></section>
         </Show>
@@ -255,6 +309,41 @@ mod tests {
             .expect("production source precedes the test module");
         assert!(!source.contains("DialogTone"));
         assert!(!source.contains("v2-btn-danger"));
+    }
+
+    #[test]
+    fn languages_show_names_not_mangled_codes() {
+        assert_eq!(language_display_name("en"), "English");
+        assert_eq!(language_display_name("pt-BR"), "Portuguese (Brazil)");
+        assert_eq!(language_display_name("zh-CN"), "Chinese (Simplified)");
+        // Unknown tags stay readable instead of becoming "Tlh Latn".
+        assert_eq!(language_display_name("tlh-Latn"), "tlh-Latn");
+    }
+
+    #[test]
+    fn buyers_never_see_bare_not_supported_accessibility_entries() {
+        let entry = |feature: &str, supported: bool, notes: Option<&str>| {
+            crate::models::StorePageAccessibility {
+                feature: feature.into(),
+                supported,
+                notes: notes.map(Into::into),
+            }
+        };
+        let shown = buyer_accessibility(&[
+            entry("subtitles", true, None),
+            entry("colorblind-modes", false, None),
+            entry("scalable-text", false, Some("  ")),
+            entry(
+                "remappable-controls",
+                false,
+                Some("Planned for a later update"),
+            ),
+        ]);
+        let features = shown
+            .iter()
+            .map(|entry| entry.feature.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(features, ["subtitles", "remappable-controls"]);
     }
 
     #[test]
