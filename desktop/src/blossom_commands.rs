@@ -605,10 +605,7 @@ pub async fn select_blossom_media_file(
     let (sender, receiver) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .add_filter(
-            "Blossom media",
-            &["png", "jpg", "jpeg", "webp", "mp4", "webm"],
-        )
+        .add_filter("Blossom media", MEDIA_EXTENSIONS)
         .pick_file(move |path| {
             let _ = sender.send(path);
         });
@@ -617,6 +614,106 @@ pub async fn select_blossom_media_file(
         return Ok(None);
     };
     verify_publisher(&state.upload_service, publisher).await?;
+    register_media_selection(&state, path, publisher)
+        .await
+        .map(Some)
+}
+
+/// Files accepted by the Blossom media picker.
+const MEDIA_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "mp4", "webm"];
+
+/// Most files one multi-file pick registers. Kept well under the upload
+/// service's selection limit, which evicts the oldest selection when full, so
+/// a batch can never push out its own earlier files.
+pub(crate) const MAX_BATCH_SELECTION: usize = 16;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelectBlossomMediaFilesRequest {
+    pub expected_publisher_hex: String,
+    /// How many files the caller can still use; extra picks are not registered.
+    pub max_files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RejectedBlossomMediaFile {
+    pub filename: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomMediaBatchSelectionDto {
+    pub selections: Vec<BlossomMediaSelectionDto>,
+    /// Files that could not be registered, with the reason.
+    pub rejected: Vec<RejectedBlossomMediaFile>,
+    /// Files picked beyond `max_files`, left unregistered.
+    pub over_limit: usize,
+}
+
+/// Pick several media files at once. Each file is registered and inspected on
+/// its own; one unreadable file does not discard the others.
+#[tauri::command]
+pub async fn select_blossom_media_files(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BlossomManagedState>,
+    request: SelectBlossomMediaFilesRequest,
+) -> Result<BlossomMediaBatchSelectionDto, BlossomCommandError> {
+    let publisher = parse_publisher(&request.expected_publisher_hex)?;
+    verify_publisher(&state.upload_service, publisher).await?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("Blossom media", MEDIA_EXTENSIONS)
+        .pick_files(move |paths| {
+            let _ = sender.send(paths);
+        });
+    let paths = receiver
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| path.into_path().ok())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(BlossomMediaBatchSelectionDto::default());
+    }
+    verify_publisher(&state.upload_service, publisher).await?;
+    let (accepted, over_limit) = split_batch(paths, request.max_files.min(MAX_BATCH_SELECTION));
+    let mut batch = BlossomMediaBatchSelectionDto {
+        over_limit,
+        ..Default::default()
+    };
+    for path in accepted {
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_string();
+        match register_media_selection(&state, path, publisher).await {
+            Ok(selection) => batch.selections.push(selection),
+            Err(error) => batch.rejected.push(RejectedBlossomMediaFile {
+                filename,
+                code: error.code,
+            }),
+        }
+    }
+    Ok(batch)
+}
+
+/// The paths a batch registers, in picked order, and how many were left out.
+fn split_batch(mut paths: Vec<PathBuf>, limit: usize) -> (Vec<PathBuf>, usize) {
+    let over_limit = paths.len().saturating_sub(limit);
+    paths.truncate(limit);
+    (paths, over_limit)
+}
+
+/// Register one picked file, inspect it and build its local preview. A
+/// selection that fails inspection is cleaned up before the error returns.
+async fn register_media_selection(
+    state: &BlossomManagedState,
+    path: PathBuf,
+    publisher: PublicKey,
+) -> Result<BlossomMediaSelectionDto, BlossomCommandError> {
     let preview_path = path.clone();
     let selected = state
         .upload_service
@@ -649,7 +746,7 @@ pub async fn select_blossom_media_file(
             } else {
                 None
             };
-            Ok(Some(BlossomMediaSelectionDto {
+            Ok(BlossomMediaSelectionDto {
                 selection_id: inspected.selection_id.to_string(),
                 filename: inspected.filename,
                 detected_mime: inspected.mime_type,
@@ -657,7 +754,7 @@ pub async fn select_blossom_media_file(
                 width: inspected.width,
                 height: inspected.height,
                 preview_data_url,
-            }))
+            })
         }
         Err(error) => {
             let _ = state
@@ -1094,6 +1191,23 @@ pub async fn resolve_blossom_server_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_batch_registers_at_most_the_requested_files_in_picked_order() {
+        let paths = (0..5)
+            .map(|index| PathBuf::from(format!("/tmp/shot-{index}.png")))
+            .collect::<Vec<_>>();
+        let (accepted, over_limit) = split_batch(paths.clone(), 3);
+        assert_eq!(accepted, paths[..3].to_vec());
+        assert_eq!(over_limit, 2);
+        let (accepted, over_limit) = split_batch(paths.clone(), 10);
+        assert_eq!(accepted.len(), 5);
+        assert_eq!(over_limit, 0);
+        assert!(
+            MAX_BATCH_SELECTION
+                < crate::blossom_upload::BlossomUploadConfig::default().max_selections
+        );
+    }
     use arcadestr_core::signers::LocalSigner;
     use nostr::Keys;
 

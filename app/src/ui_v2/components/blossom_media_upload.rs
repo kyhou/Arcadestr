@@ -16,11 +16,12 @@ use crate::tauri_bridge::{
     invoke_add_blossom_server, invoke_cancel_blossom_upload,
     invoke_discard_blossom_media_selection, invoke_get_blossom_server_settings,
     invoke_remove_blossom_server, invoke_retry_blossom_upload, invoke_select_blossom_media_file,
-    invoke_set_preferred_blossom_server, invoke_start_blossom_upload,
-    listen_blossom_upload_progress, AddBlossomServerRequest, BlossomMediaSelectionDto,
-    BlossomServerOriginRequest, BlossomServerSettingsDto, BlossomUploadProgressDto,
-    BlossomUploadResponse, CancelBlossomUploadRequest, DiscardBlossomMediaRequest,
-    ExpectedBlossomPublisherRequest, SetPreferredBlossomServerRequest, StartBlossomUploadRequest,
+    invoke_select_blossom_media_files, invoke_set_preferred_blossom_server,
+    invoke_start_blossom_upload, listen_blossom_upload_progress, AddBlossomServerRequest,
+    BlossomMediaSelectionDto, BlossomServerOriginRequest, BlossomServerSettingsDto,
+    BlossomUploadProgressDto, BlossomUploadResponse, CancelBlossomUploadRequest,
+    DiscardBlossomMediaRequest, ExpectedBlossomPublisherRequest, SelectBlossomMediaFilesRequest,
+    SetPreferredBlossomServerRequest, StartBlossomUploadRequest,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -336,6 +337,158 @@ pub(crate) fn role_available(draft: &StorePageDraft, role: &str) -> bool {
     !matches!(role, "hero" | "capsule") || !draft.content.media.iter().any(|item| item.role == role)
 }
 
+/// Roles a page can hold several of; their picker selects many files at once.
+pub(crate) fn role_allows_many(role: &str) -> bool {
+    matches!(role, "screenshot" | "feature" | "trailer")
+}
+
+/// How many more files of `role` the page can take, counting files already
+/// queued for upload.
+pub(crate) fn remaining_for_role(draft: &StorePageDraft, role: &str, queued: usize) -> usize {
+    use arcadestr_core::store_page_content_policy::{MAX_MEDIA_ITEMS, MAX_SCREENSHOTS};
+    let media = &draft.content.media;
+    let total = MAX_MEDIA_ITEMS.saturating_sub(media.len() + queued);
+    let role_limit = match role {
+        "hero" | "capsule" => usize::from(role_available(draft, role)),
+        "screenshot" => MAX_SCREENSHOTS.saturating_sub(
+            media
+                .iter()
+                .filter(|item| item.role == "screenshot")
+                .count(),
+        ),
+        _ => total + queued,
+    };
+    total.min(role_limit.saturating_sub(queued))
+}
+
+/// Plural dialog title for a role.
+fn role_title(role: &str) -> String {
+    match role {
+        "screenshot" => "Upload screenshots".into(),
+        "feature" => "Upload feature images".into(),
+        "trailer" => "Upload trailers".into(),
+        other => format!("Upload {other}"),
+    }
+}
+
+/// One picked file waiting in, or done with, the upload queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QueuedMedia {
+    pub selection: BlossomMediaSelectionDto,
+    pub status: QueuedStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum QueuedStatus {
+    Ready,
+    Uploading,
+    Uploaded,
+    Failed(String),
+}
+
+impl QueuedStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::Ready => "Ready to upload".into(),
+            Self::Uploading => "Uploading".into(),
+            Self::Uploaded => "Uploaded".into(),
+            Self::Failed(message) => message.clone(),
+        }
+    }
+}
+
+/// Index of the next file to upload: ready files first in queue order, then
+/// failed files when retrying.
+pub(crate) fn next_upload(queue: &[QueuedMedia], retry_failed: bool) -> Option<usize> {
+    queue
+        .iter()
+        .position(|item| item.status == QueuedStatus::Ready)
+        .or_else(|| {
+            retry_failed
+                .then(|| {
+                    queue
+                        .iter()
+                        .position(|item| matches!(item.status, QueuedStatus::Failed(_)))
+                })
+                .flatten()
+        })
+}
+
+/// Files picked for a role are kept only when the role accepts their type;
+/// the rest are reported by name.
+pub(crate) fn split_compatible(
+    role: &str,
+    picked: Vec<BlossomMediaSelectionDto>,
+) -> (Vec<BlossomMediaSelectionDto>, Vec<BlossomMediaSelectionDto>) {
+    picked
+        .into_iter()
+        .partition(|selection| role_accepts_mime(role, &selection.detected_mime))
+}
+
+struct PickOutcome {
+    selections: Vec<BlossomMediaSelectionDto>,
+    notes: Vec<String>,
+}
+
+/// Run the picker for `role`: several files for roles that allow many, one
+/// otherwise.
+async fn pick_media(
+    role: &str,
+    publisher_hex: &str,
+    remaining: usize,
+) -> Result<PickOutcome, crate::tauri_bridge::BlossomCommandErrorDto> {
+    if role_allows_many(role) {
+        let batch = invoke_select_blossom_media_files(SelectBlossomMediaFilesRequest {
+            expected_publisher_hex: publisher_hex.to_string(),
+            max_files: remaining,
+        })
+        .await?;
+        let mut notes = batch
+            .rejected
+            .into_iter()
+            .map(|file| format!("{}: {}", file.filename, stable_error_message(&file.code)))
+            .collect::<Vec<_>>();
+        if batch.over_limit > 0 {
+            notes.push(format!(
+                "{} more file(s) were not added: the Store Page has room for {remaining} more.",
+                batch.over_limit
+            ));
+        }
+        Ok(PickOutcome {
+            selections: batch.selections,
+            notes,
+        })
+    } else {
+        let picked = invoke_select_blossom_media_file(ExpectedBlossomPublisherRequest {
+            expected_publisher_hex: publisher_hex.to_string(),
+        })
+        .await?;
+        Ok(PickOutcome {
+            selections: selection_after_picker(picked).into_iter().collect(),
+            notes: Vec::new(),
+        })
+    }
+}
+
+async fn discard_selections(selections: Vec<BlossomMediaSelectionDto>, publisher_hex: String) {
+    for selection in selections {
+        let _ = invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
+            selection_id: selection.selection_id,
+            expected_publisher_hex: publisher_hex.clone(),
+        })
+        .await;
+    }
+}
+
+/// Selections in the queue that were never uploaded and must be released.
+fn pending_selections(queue: &[QueuedMedia]) -> Vec<BlossomMediaSelectionDto> {
+    queue
+        .iter()
+        .filter(|item| item.status != QueuedStatus::Uploaded)
+        .map(|item| item.selection.clone())
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) fn remove_draft_media(draft: &mut StorePageDraft, id: &str) -> bool {
     let before = draft.content.media.len();
@@ -397,13 +550,16 @@ pub fn BlossomMediaUpload(
     let opened_role = RwSignal::new(None::<String>);
     let captured_account = RwSignal::new(None::<String>);
     let captured_generation = RwSignal::new(0_u64);
-    let selection = RwSignal::new(None::<BlossomMediaSelectionDto>);
+    // Every file picked in this dialog session, uploaded one after another.
+    let queue = RwSignal::new(Vec::<QueuedMedia>::new());
+    let notes = RwSignal::new(Vec::<String>::new());
     let settings = RwSignal::new(None::<BlossomServerSettingsDto>);
     let selected_server = RwSignal::new(None::<String>);
     let state = RwSignal::new(UploadState::Idle);
     let error = RwSignal::new(None::<String>);
     let status = RwSignal::new(None::<String>);
     let bytes = RwSignal::new((0_u64, 0_u64));
+    let active_selection_id = RwSignal::new(None::<String>);
     let active_request_id = RwSignal::new(None::<String>);
     let active_upload_id = RwSignal::new(None::<String>);
     let request_sequence = RwSignal::new(0_u64);
@@ -413,10 +569,97 @@ pub fn BlossomMediaUpload(
     let listener_alive = Rc::new(Cell::new(true));
     let listener_cleanup: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::new(RefCell::new(None));
 
+    let has_pending = move || {
+        queue
+            .get()
+            .iter()
+            .any(|item| item.status != QueuedStatus::Uploaded)
+    };
+
+    // Pick files for the open role and add them to the queue. A pick that
+    // finishes after the dialog session changed is discarded, never queued.
+    let pick = {
+        let publisher_hex = publisher_hex.clone();
+        move |role: String, replace_single: bool| {
+            let expected_account = captured_account.get_untracked();
+            let expected_generation = captured_generation.get_untracked();
+            let active_session = session.get_untracked();
+            let publisher_hex = publisher_hex.clone();
+            state.set(UploadState::Selecting);
+            error.set(None);
+            notes.set(Vec::new());
+            spawn_local(async move {
+                if replace_single {
+                    let previous = pending_selections(&queue.get_untracked());
+                    queue.set(Vec::new());
+                    discard_selections(previous, publisher_hex.clone()).await;
+                }
+                let queued = queue
+                    .get_untracked()
+                    .iter()
+                    .filter(|item| item.status != QueuedStatus::Uploaded)
+                    .count();
+                let remaining = remaining_for_role(&draft.get_untracked(), &role, queued);
+                if remaining == 0 {
+                    state.set(UploadState::Idle);
+                    error.set(Some(if role_allows_many(&role) {
+                        format!("The Store Page has no room for more {role} files.")
+                    } else {
+                        format!("A {role} item already exists in this draft.")
+                    }));
+                    return;
+                }
+                let picked = pick_media(&role, &publisher_hex, remaining).await;
+                if auth.npub.get_untracked() != expected_account
+                    || context_generation.get_untracked() != expected_generation
+                    || session.get_untracked() != active_session
+                    || dialog_role.get_untracked().as_deref() != Some(role.as_str())
+                {
+                    if let Ok(stale) = picked {
+                        discard_selections(stale.selections, publisher_hex).await;
+                    }
+                    return;
+                }
+                match picked {
+                    Ok(outcome) => {
+                        let (compatible, incompatible) =
+                            split_compatible(&role, outcome.selections);
+                        let mut messages = outcome.notes;
+                        messages.extend(incompatible.iter().map(|selection| {
+                            format!(
+                                "{}: {}",
+                                selection.filename,
+                                stable_error_message("mime_mismatch")
+                            )
+                        }));
+                        notes.set(messages);
+                        queue.update(|items| {
+                            items.extend(compatible.into_iter().map(|selection| QueuedMedia {
+                                selection,
+                                status: QueuedStatus::Ready,
+                            }))
+                        });
+                        state.set(if next_upload(&queue.get_untracked(), false).is_some() {
+                            UploadState::Ready
+                        } else {
+                            UploadState::Idle
+                        });
+                        discard_selections(incompatible, publisher_hex).await;
+                    }
+                    Err(command_error) => {
+                        state.set(UploadState::Failed);
+                        error.set(Some(stable_error_message(&command_error.code).into()));
+                    }
+                }
+            });
+        }
+    };
+
     Effect::new({
         let listener_cleanup = Rc::clone(&listener_cleanup);
         let listener_alive = Rc::clone(&listener_alive);
         let publisher_hex = publisher_hex.clone();
+        let pick = pick.clone();
         move |_| {
             let role = dialog_role.get();
             let Some(role) = role else {
@@ -431,95 +674,46 @@ pub fn BlossomMediaUpload(
             }
             opened_role.set(Some(role.clone()));
             session.update(|value| *value = value.wrapping_add(1));
-            let active_session = session.get_untracked();
-            let account = auth.npub.get_untracked();
-            captured_account.set(account.clone());
+            captured_account.set(auth.npub.get_untracked());
             captured_generation.set(context_generation.get_untracked());
-            state.set(UploadState::Selecting);
+            queue.set(Vec::new());
+            notes.set(Vec::new());
             error.set(None);
             status.set(None);
             bytes.set((0, 0));
+            active_selection_id.set(None);
             active_request_id.set(None);
             active_upload_id.set(None);
             listener_alive.set(true);
             run_cleanup(&listener_cleanup);
-            let expected_account = account.unwrap_or_default();
-            let expected_generation = captured_generation.get_untracked();
+            if captured_account.get_untracked().is_none() {
+                error.set(Some("The publisher account is unavailable.".into()));
+                state.set(UploadState::Failed);
+                return;
+            }
+            if publisher_hex.is_empty() {
+                error.set(Some("The listing publisher key is invalid.".into()));
+                state.set(UploadState::Failed);
+                return;
+            }
             let publisher_hex = publisher_hex.clone();
             spawn_local(async move {
-                if expected_account.is_empty() {
-                    error.set(Some("The publisher account is unavailable.".into()));
-                    state.set(UploadState::Failed);
-                    return;
-                }
-                if publisher_hex.is_empty() {
-                    error.set(Some("The listing publisher key is invalid.".into()));
-                    state.set(UploadState::Failed);
-                    return;
-                }
-                if !role_available(&draft.get_untracked(), &role) {
-                    error.set(Some(format!("A {role} item already exists in this draft.")));
-                    state.set(UploadState::Failed);
-                    return;
-                }
                 match invoke_get_blossom_server_settings(ExpectedBlossomPublisherRequest {
                     expected_publisher_hex: publisher_hex.clone(),
                 })
                 .await
                 {
-                    Ok(value) => {
-                        if value.publisher_pubkey == publisher_hex {
-                            selected_server.set(preferred_candidate(&value));
-                            settings.set(Some(value));
-                        } else {
-                            error.set(Some(stable_error_message("publisher_mismatch").into()));
-                        }
+                    Ok(value) if value.publisher_pubkey == publisher_hex => {
+                        selected_server.set(preferred_candidate(&value));
+                        settings.set(Some(value));
                     }
+                    Ok(_) => error.set(Some(stable_error_message("publisher_mismatch").into())),
                     Err(command_error) => {
-                        error.set(Some(stable_error_message(&command_error.code).into()));
-                    }
-                }
-                let picked = invoke_select_blossom_media_file(ExpectedBlossomPublisherRequest {
-                    expected_publisher_hex: publisher_hex.clone(),
-                })
-                .await;
-                if auth.npub.get_untracked().as_deref() != Some(expected_account.as_str())
-                    || context_generation.get_untracked() != expected_generation
-                    || session.get_untracked() != active_session
-                    || dialog_role.get_untracked().as_deref() != Some(role.as_str())
-                {
-                    if let Ok(Some(stale)) = picked {
-                        let _ =
-                            invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
-                                selection_id: stale.selection_id,
-                                expected_publisher_hex: publisher_hex,
-                            })
-                            .await;
-                    }
-                    return;
-                }
-                match picked {
-                    Ok(picked) => {
-                        selection.set(selection_after_picker(picked));
-                        if let Some(selected) = selection.get_untracked() {
-                            if role_accepts_mime(&role, &selected.detected_mime) {
-                                state.set(UploadState::Ready);
-                                error.set(None);
-                            } else {
-                                state.set(UploadState::Failed);
-                                error.set(Some(stable_error_message("mime_mismatch").into()));
-                            }
-                        } else {
-                            state.set(UploadState::Idle);
-                            error.set(None);
-                        }
-                    }
-                    Err(command_error) => {
-                        state.set(UploadState::Failed);
-                        error.set(Some(stable_error_message(&command_error.code).into()));
+                        error.set(Some(stable_error_message(&command_error.code).into()))
                     }
                 }
             });
+            pick(role, false);
         }
     });
 
@@ -538,7 +732,7 @@ pub fn BlossomMediaUpload(
                 listener_alive.set(false);
                 run_cleanup(&listener_cleanup);
                 let upload_id = active_upload_id.get_untracked();
-                let selected = selection.get_untracked();
+                let pending = pending_selections(&queue.get_untracked());
                 let publisher_hex = publisher_hex.clone();
                 spawn_local(async move {
                     if let Some(upload_id) = upload_id {
@@ -548,225 +742,272 @@ pub fn BlossomMediaUpload(
                         })
                         .await;
                     }
-                    if let Some(selected) = selected {
-                        let _ =
-                            invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
-                                selection_id: selected.selection_id,
-                                expected_publisher_hex: publisher_hex,
-                            })
-                            .await;
-                    }
+                    discard_selections(pending, publisher_hex).await;
                 });
-                selection.set(None);
+                queue.set(Vec::new());
                 dialog_role.set(None);
             }
         }
     });
 
+    // Upload every queued file in order. Each file keeps its own request ID and
+    // correlation, exactly like a single upload; a stale session stops the run.
     let upload = UnsyncCallback::new({
         let listener_cleanup = Rc::clone(&listener_cleanup);
         let listener_alive = Rc::clone(&listener_alive);
         let publisher_hex = publisher_hex.clone();
-        move |retry: bool| {
+        move |retry_failed: bool| {
             let Some(role) = dialog_role.get_untracked() else {
                 return;
             };
-            let Some(selected) = selection.get_untracked() else {
+            if next_upload(&queue.get_untracked(), retry_failed).is_none() {
                 error.set(Some("Choose a media file first.".into()));
                 return;
-            };
+            }
             let Some(server) = selected_server.get_untracked() else {
                 error.set(Some(stable_error_message("no_server").into()));
                 return;
             };
-            if !role_accepts_mime(&role, &selected.detected_mime)
-                || !role_available(&draft.get_untracked(), &role)
-            {
-                error.set(Some(if role_available(&draft.get_untracked(), &role) {
-                    stable_error_message("mime_mismatch").into()
-                } else {
-                    format!("A {role} item already exists in this draft.")
-                }));
-                return;
-            }
             let Some(account) = captured_account.get_untracked() else {
                 error.set(Some("The publisher account is unavailable.".into()));
                 return;
             };
-            request_sequence.update(|value| *value = value.wrapping_add(1));
-            let request_id = fresh_request_id(
-                js_sys::Date::now().max(0.0) as u64,
-                request_sequence.get_untracked(),
-            );
             let expected_generation = captured_generation.get_untracked();
             let expected_session = session.get_untracked();
-            active_request_id.set(Some(request_id.clone()));
-            active_upload_id.set(None);
             state.set(UploadState::Uploading);
             error.set(None);
-            status.set(Some("Preparing file".into()));
-            bytes.set((0, selected.size));
-            listener_alive.set(false);
-            run_cleanup(&listener_cleanup);
-            listener_alive.set(true);
-
             let listener_cleanup = Rc::clone(&listener_cleanup);
             let listener_alive = Rc::clone(&listener_alive);
             let publisher_hex = publisher_hex.clone();
             let listing_publisher_npub = listing_publisher_npub.clone();
             spawn_local(async move {
-                let event_account = account.clone();
-                let event_publisher = publisher_hex.clone();
-                let event_selection = selected.selection_id.clone();
-                let event_request = request_id.clone();
-                let event_cleanup = Rc::clone(&listener_cleanup);
-                let event_alive = Rc::clone(&listener_alive);
-                let registered = listen_blossom_upload_progress(move |event| {
-                    let bound_upload = active_upload_id.get_untracked();
+                let mut retried = std::collections::HashSet::new();
+                loop {
+                    if session.get_untracked() != expected_session {
+                        return;
+                    }
+                    let items = queue.get_untracked();
+                    let Some(index) = next_upload(&items, retry_failed)
+                        .filter(|index| !retried.contains(&items[*index].selection.selection_id))
+                    else {
+                        break;
+                    };
+                    let selected = items[index].selection.clone();
+                    let use_retry = matches!(items[index].status, QueuedStatus::Failed(_));
+                    retried.insert(selected.selection_id.clone());
+                    let status_id = selected.selection_id.clone();
+                    let set_status = move |status: QueuedStatus| {
+                        queue.update(|items| {
+                            if let Some(item) = items
+                                .iter_mut()
+                                .find(|item| item.selection.selection_id == status_id)
+                            {
+                                item.status = status;
+                            }
+                        });
+                    };
+                    if !role_accepts_mime(&role, &selected.detected_mime)
+                        || !role_available(&draft.get_untracked(), &role)
+                    {
+                        set_status(QueuedStatus::Failed(
+                            if role_available(&draft.get_untracked(), &role) {
+                                stable_error_message("mime_mismatch").into()
+                            } else {
+                                format!("A {role} item already exists in this draft.")
+                            },
+                        ));
+                        continue;
+                    }
+                    request_sequence.update(|value| *value = value.wrapping_add(1));
+                    let request_id = fresh_request_id(
+                        js_sys::Date::now().max(0.0) as u64,
+                        request_sequence.get_untracked(),
+                    );
+                    active_selection_id.set(Some(selected.selection_id.clone()));
+                    active_request_id.set(Some(request_id.clone()));
+                    active_upload_id.set(None);
+                    set_status(QueuedStatus::Uploading);
+                    status.set(Some("Preparing file".into()));
+                    bytes.set((0, selected.size));
+                    listener_alive.set(false);
+                    run_cleanup(&listener_cleanup);
+                    listener_alive.set(true);
+
+                    let event_account = account.clone();
+                    let event_publisher = publisher_hex.clone();
+                    let event_selection = selected.selection_id.clone();
+                    let event_request = request_id.clone();
+                    let event_cleanup = Rc::clone(&listener_cleanup);
+                    let event_alive = Rc::clone(&listener_alive);
+                    let registered = listen_blossom_upload_progress(move |event| {
+                        let bound_upload = active_upload_id.get_untracked();
+                        let correlation = UploadCorrelation {
+                            account_npub: &event_account,
+                            publisher_hex: &event_publisher,
+                            generation: expected_generation,
+                            session: expected_session,
+                            selection_id: &event_selection,
+                            request_id: &event_request,
+                            upload_id: bound_upload.as_deref(),
+                        };
+                        if !accepts_progress(
+                            &correlation,
+                            auth.npub.get_untracked().as_deref(),
+                            context_generation.get_untracked(),
+                            session.get_untracked(),
+                            &event,
+                        ) {
+                            return;
+                        }
+                        if bound_upload.is_none() {
+                            active_upload_id.set(Some(event.upload_id.clone()));
+                        }
+                        status.set(Some(phase_label(&event.phase).into()));
+                        bytes.set((event.bytes_completed, event.total_bytes));
+                        if matches!(
+                            event.phase.as_str(),
+                            "complete" | "completed" | "cancelled" | "failed"
+                        ) {
+                            event_alive.set(false);
+                            let deferred_cleanup = Rc::clone(&event_cleanup);
+                            spawn_local(async move {
+                                run_cleanup(&deferred_cleanup);
+                            });
+                        }
+                    })
+                    .await;
+                    let cleanup = match registered {
+                        Ok(cleanup) => cleanup,
+                        Err(command_error) => {
+                            set_status(QueuedStatus::Failed(
+                                stable_error_message(&command_error.code).into(),
+                            ));
+                            state.set(UploadState::Failed);
+                            return;
+                        }
+                    };
+                    if !listener_alive.get()
+                        || session.get_untracked() != expected_session
+                        || dialog_role.get_untracked().as_deref() != Some(role.as_str())
+                    {
+                        cleanup();
+                        return;
+                    }
+                    *listener_cleanup.borrow_mut() = Some(cleanup);
+                    let request = StartBlossomUploadRequest {
+                        selection_id: selected.selection_id.clone(),
+                        expected_publisher_hex: publisher_hex.clone(),
+                        selected_server: Some(server.clone()),
+                        preflight: true,
+                        request_id: request_id.clone(),
+                    };
+                    let result = if use_retry {
+                        invoke_retry_blossom_upload(request).await
+                    } else {
+                        invoke_start_blossom_upload(request).await
+                    };
+                    listener_alive.set(false);
+                    run_cleanup(&listener_cleanup);
+                    let completion_upload_id = active_upload_id.get_untracked();
                     let correlation = UploadCorrelation {
-                        account_npub: &event_account,
-                        publisher_hex: &event_publisher,
+                        account_npub: &account,
+                        publisher_hex: &publisher_hex,
                         generation: expected_generation,
                         session: expected_session,
-                        selection_id: &event_selection,
-                        request_id: &event_request,
-                        upload_id: bound_upload.as_deref(),
+                        selection_id: &selected.selection_id,
+                        request_id: &request_id,
+                        upload_id: completion_upload_id.as_deref(),
                     };
-                    if !accepts_progress(
+                    if !accepts_completion(
                         &correlation,
                         auth.npub.get_untracked().as_deref(),
+                        self::publisher_hex(&listing_publisher_npub).as_deref(),
                         context_generation.get_untracked(),
                         session.get_untracked(),
-                        &event,
+                        dialog_role.get_untracked().as_deref(),
+                        &role,
+                        active_selection_id.get_untracked().as_deref(),
+                        active_request_id.get_untracked().as_deref(),
                     ) {
                         return;
                     }
-                    if bound_upload.is_none() {
-                        active_upload_id.set(Some(event.upload_id.clone()));
-                    }
-                    status.set(Some(phase_label(&event.phase).into()));
-                    bytes.set((event.bytes_completed, event.total_bytes));
-                    if matches!(
-                        event.phase.as_str(),
-                        "complete" | "completed" | "cancelled" | "failed"
-                    ) {
-                        event_alive.set(false);
-                        let deferred_cleanup = Rc::clone(&event_cleanup);
-                        spawn_local(async move {
-                            run_cleanup(&deferred_cleanup);
-                        });
-                    }
-                })
-                .await;
-                let cleanup = match registered {
-                    Ok(cleanup) => cleanup,
-                    Err(command_error) => {
-                        state.set(UploadState::Failed);
-                        error.set(Some(stable_error_message(&command_error.code).into()));
-                        return;
-                    }
-                };
-                if !listener_alive.get()
-                    || session.get_untracked() != expected_session
-                    || dialog_role.get_untracked().as_deref() != Some(role.as_str())
-                {
-                    cleanup();
-                    return;
-                }
-                *listener_cleanup.borrow_mut() = Some(cleanup);
-                let request = StartBlossomUploadRequest {
-                    selection_id: selected.selection_id.clone(),
-                    expected_publisher_hex: publisher_hex.clone(),
-                    selected_server: Some(server),
-                    preflight: true,
-                    request_id: request_id.clone(),
-                };
-                let result = if retry {
-                    invoke_retry_blossom_upload(request).await
-                } else {
-                    invoke_start_blossom_upload(request).await
-                };
-                listener_alive.set(false);
-                run_cleanup(&listener_cleanup);
-                let completion_upload_id = active_upload_id.get_untracked();
-                let correlation = UploadCorrelation {
-                    account_npub: &account,
-                    publisher_hex: &publisher_hex,
-                    generation: expected_generation,
-                    session: expected_session,
-                    selection_id: &selected.selection_id,
-                    request_id: &request_id,
-                    upload_id: completion_upload_id.as_deref(),
-                };
-                if !accepts_completion(
-                    &correlation,
-                    auth.npub.get_untracked().as_deref(),
-                    self::publisher_hex(&listing_publisher_npub).as_deref(),
-                    context_generation.get_untracked(),
-                    session.get_untracked(),
-                    dialog_role.get_untracked().as_deref(),
-                    &role,
-                    selection
-                        .get_untracked()
-                        .as_ref()
-                        .map(|value| value.selection_id.as_str()),
-                    active_request_id.get_untracked().as_deref(),
-                ) {
-                    return;
-                }
-                match result {
-                    Ok(response) => {
-                        if completion_upload_id
-                            .as_deref()
-                            .map_or(false, |upload_id| upload_id != response.upload_id)
-                        {
-                            state.set(UploadState::Failed);
-                            error.set(Some(stable_error_message("invalid_response").into()));
-                            return;
+                    match result {
+                        Ok(response) => {
+                            if completion_upload_id
+                                .as_deref()
+                                .is_some_and(|upload_id| upload_id != response.upload_id)
+                            {
+                                set_status(QueuedStatus::Failed(
+                                    stable_error_message("invalid_response").into(),
+                                ));
+                                continue;
+                            }
+                            if !role_available(&draft.get_untracked(), &role) {
+                                set_status(QueuedStatus::Failed(format!(
+                                    "A {role} item already exists in this draft."
+                                )));
+                                continue;
+                            }
+                            let id = unique_media_id(
+                                &role,
+                                draft
+                                    .get_untracked()
+                                    .content
+                                    .media
+                                    .iter()
+                                    .map(|item| item.id.as_str()),
+                            );
+                            match verified_media_item(&role, &selected, &response, id) {
+                                Some(item) => {
+                                    draft.update(|value| value.content.media.push(item));
+                                    input_dirty.set(true);
+                                    set_status(QueuedStatus::Uploaded);
+                                }
+                                None => set_status(QueuedStatus::Failed(
+                                    stable_error_message("invalid_response").into(),
+                                )),
+                            }
                         }
-                        if !role_available(&draft.get_untracked(), &role) {
-                            state.set(UploadState::Failed);
-                            error.set(Some(format!("A {role} item already exists in this draft.")));
-                            return;
-                        }
-                        let id = unique_media_id(
-                            &role,
-                            draft
-                                .get_untracked()
-                                .content
-                                .media
-                                .iter()
-                                .map(|item| item.id.as_str()),
-                        );
-                        let Some(item) = verified_media_item(&role, &selected, &response, id)
-                        else {
-                            state.set(UploadState::Failed);
-                            error.set(Some(stable_error_message("invalid_response").into()));
-                            return;
-                        };
-                        draft.update(|value| value.content.media.push(item));
-                        input_dirty.set(true);
-                        selection.set(None);
-                        dialog_role.set(None);
-                    }
-                    Err(command_error) => {
-                        let cancelled = matches!(
-                            command_error.code.as_str(),
-                            "cancelled" | "upload_cancelled"
-                        );
-                        state.set(if cancelled {
-                            UploadState::Cancelled
-                        } else {
-                            UploadState::Failed
-                        });
-                        if cancelled {
-                            status.set(Some(
-                                "Upload cancelled. A partial blob may remain on the selected server."
-                                    .into(),
+                        Err(command_error) => {
+                            let cancelled = matches!(
+                                command_error.code.as_str(),
+                                "cancelled" | "upload_cancelled"
+                            );
+                            set_status(QueuedStatus::Failed(
+                                stable_error_message(&command_error.code).into(),
                             ));
+                            if cancelled {
+                                state.set(UploadState::Cancelled);
+                                status.set(Some(
+                                    "Upload cancelled. A partial blob may remain on the selected server."
+                                        .into(),
+                                ));
+                                return;
+                            }
                         }
-                        error.set(Some(stable_error_message(&command_error.code).into()));
                     }
+                }
+                active_selection_id.set(None);
+                active_request_id.set(None);
+                active_upload_id.set(None);
+                let items = queue.get_untracked();
+                if items
+                    .iter()
+                    .all(|item| item.status == QueuedStatus::Uploaded)
+                {
+                    queue.set(Vec::new());
+                    status.set(None);
+                    dialog_role.set(None);
+                } else {
+                    let failed = items
+                        .iter()
+                        .filter(|item| matches!(item.status, QueuedStatus::Failed(_)))
+                        .count();
+                    state.set(UploadState::Failed);
+                    status.set(None);
+                    error.set(Some(format!(
+                        "{failed} file(s) did not upload. Retry them or remove them from the list."
+                    )));
                 }
             });
         }
@@ -781,7 +1022,7 @@ pub fn BlossomMediaUpload(
             run_cleanup(&listener_cleanup);
             session.update(|value| *value = value.wrapping_add(1));
             let upload_id = active_upload_id.get_untracked();
-            let selected = selection.get_untracked();
+            let pending = pending_selections(&queue.get_untracked());
             let publisher_hex = publisher_hex.clone();
             spawn_local(async move {
                 if let Some(upload_id) = upload_id {
@@ -791,15 +1032,10 @@ pub fn BlossomMediaUpload(
                     })
                     .await;
                 }
-                if let Some(selected) = selected {
-                    let _ = invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
-                        selection_id: selected.selection_id,
-                        expected_publisher_hex: publisher_hex,
-                    })
-                    .await;
-                }
+                discard_selections(pending, publisher_hex).await;
             });
-            selection.set(None);
+            queue.set(Vec::new());
+            active_selection_id.set(None);
             active_upload_id.set(None);
             active_request_id.set(None);
             state.set(UploadState::Cancelled);
@@ -813,58 +1049,36 @@ pub fn BlossomMediaUpload(
         }
     });
 
-    let choose_another = Callback::new({
-        let publisher_hex = publisher_hex.clone();
+    let choose_files = Callback::new({
+        let pick = pick.clone();
         move |_| {
-            let current = selection.get_untracked();
-            let expected_account = captured_account.get_untracked();
-            let active_session = session.get_untracked();
-            let role = dialog_role.get_untracked();
-            let publisher_hex = publisher_hex.clone();
-            state.set(UploadState::Selecting);
-            error.set(None);
-            spawn_local(async move {
-                if let Some(current) = current {
-                    let _ = invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
-                        selection_id: current.selection_id,
-                        expected_publisher_hex: publisher_hex.clone(),
-                    })
-                    .await;
-                    selection.set(None);
-                }
-                let picked = invoke_select_blossom_media_file(ExpectedBlossomPublisherRequest {
-                    expected_publisher_hex: publisher_hex.clone(),
+            if let Some(role) = dialog_role.get_untracked() {
+                let replace = !role_allows_many(&role);
+                pick(role, replace);
+            }
+        }
+    });
+
+    let remove_queued = Callback::new({
+        let publisher_hex = publisher_hex.clone();
+        move |selection_id: String| {
+            let mut removed = Vec::new();
+            queue.update(|items| {
+                items.retain(|item| {
+                    let keep = item.selection.selection_id != selection_id
+                        || item.status == QueuedStatus::Uploading;
+                    if !keep {
+                        removed.push(item.selection.clone());
+                    }
+                    keep
                 })
-                .await;
-                if auth.npub.get_untracked() != expected_account
-                    || session.get_untracked() != active_session
-                    || dialog_role.get_untracked() != role
-                {
-                    if let Ok(Some(stale)) = picked {
-                        let _ =
-                            invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
-                                selection_id: stale.selection_id,
-                                expected_publisher_hex: publisher_hex,
-                            })
-                            .await;
-                    }
-                    return;
-                }
-                match picked {
-                    Ok(picked) => {
-                        selection.set(selection_after_picker(picked));
-                        state.set(if selection.get_untracked().is_some() {
-                            UploadState::Ready
-                        } else {
-                            UploadState::Idle
-                        });
-                    }
-                    Err(command_error) => {
-                        state.set(UploadState::Failed);
-                        error.set(Some(stable_error_message(&command_error.code).into()));
-                    }
-                }
             });
+            if next_upload(&queue.get_untracked(), true).is_none() {
+                error.set(None);
+                state.set(UploadState::Idle);
+            }
+            let publisher_hex = publisher_hex.clone();
+            spawn_local(discard_selections(removed, publisher_hex));
         }
     });
 
@@ -964,7 +1178,10 @@ pub fn BlossomMediaUpload(
         teardown_alive.set(false);
         run_cleanup(&teardown_cleanup);
         let upload_id = active_upload_id.get_untracked();
-        let selected = selection.get_untracked();
+        let pending = queue
+            .try_get_untracked()
+            .map(|items| pending_selections(&items))
+            .unwrap_or_default();
         spawn_local(async move {
             if let Some(upload_id) = upload_id {
                 let _ = invoke_cancel_blossom_upload(CancelBlossomUploadRequest {
@@ -973,21 +1190,28 @@ pub fn BlossomMediaUpload(
                 })
                 .await;
             }
-            if let Some(selected) = selected {
-                let _ = invoke_discard_blossom_media_selection(DiscardBlossomMediaRequest {
-                    selection_id: selected.selection_id,
-                    expected_publisher_hex: teardown_publisher,
-                })
-                .await;
-            }
+            discard_selections(pending, teardown_publisher).await;
         });
     });
+
+    let upload_label = move || {
+        let ready = queue
+            .get()
+            .iter()
+            .filter(|item| item.status == QueuedStatus::Ready)
+            .count();
+        if ready > 1 {
+            format!("Upload {ready} files")
+        } else {
+            "Upload".to_string()
+        }
+    };
 
     view! {
         <Dialog
             id="blossom-upload"
             open=Signal::derive(move || dialog_role.get().is_some())
-            title=Signal::derive(move || dialog_role.get().map(|role| format!("Upload {role}")).unwrap_or_else(|| "Upload media".into()))
+            title=Signal::derive(move || dialog_role.get().map(|role| role_title(&role)).unwrap_or_else(|| "Upload media".into()))
             kicker="Store Page media"
             width=DialogWidth::Standard
             // An in-flight upload is never abandoned silently: the existing
@@ -998,8 +1222,8 @@ pub fn BlossomMediaUpload(
             close_label="Close media upload"
             on_close=UnsyncCallback::new(move |request: DialogCloseRequest| {
                 match request.action {
-                    // Unchanged: closing an idle dialog still discards the
-                    // pending selection through the existing teardown path.
+                    // Closing an idle dialog still discards every pending
+                    // selection through the existing teardown path.
                     DialogCloseAction::Dismiss | DialogCloseAction::CancelOperation => {
                         cancel_upload.run(true)
                     }
@@ -1008,19 +1232,68 @@ pub fn BlossomMediaUpload(
                 }
             })
             actions=move || view! {
-                <button type="button" class="v2-btn-primary" disabled=move || selection.get().is_none() || selected_server.get().is_none() || state.get() == UploadState::Uploading on:click=move |_| upload.run(false)>"Upload"</button>
-                <Show when=move || matches!(state.get(), UploadState::Failed | UploadState::Cancelled) && selection.get().is_some()><button type="button" class="v2-btn-secondary" on:click=move |_| upload.run(true)>"Retry"</button></Show>
+                <button type="button" class="v2-btn-primary" disabled=move || next_upload(&queue.get(), false).is_none() || selected_server.get().is_none() || state.get() == UploadState::Uploading on:click=move |_| upload.run(false)>{upload_label}</button>
+                <Show when=move || state.get() != UploadState::Uploading && queue.get().iter().any(|item| matches!(item.status, QueuedStatus::Failed(_)))><button type="button" class="v2-btn-secondary" disabled=move || selected_server.get().is_none() on:click=move |_| upload.run(true)>"Retry failed"</button></Show>
                 <Show when=move || state.get() == UploadState::Uploading><button type="button" class="v2-btn-secondary" on:click=move |_| cancel_upload.run(false)>"Cancel upload"</button></Show>
             }
         >
             <Show when=move || close_confirmation.get()>
-                <section class="v2-store-card" role="alert"><strong>"Cancel active upload and close?"</strong><p>"The upload will be cancelled and its local selection discarded. A partial blob may remain on the server."</p><div class="v2-store-card-actions"><button type="button" on:click=move |_| close_confirmation.set(false)>"Keep uploading"</button><button type="button" on:click=move |_| cancel_upload.run(true)>"Cancel upload and close"</button></div></section>
+                <section class="v2-store-card" role="alert"><strong>"Cancel active upload and close?"</strong><p>"The upload will be cancelled and every file not uploaded yet is discarded. A partial blob may remain on the server."</p><div class="v2-store-card-actions"><button type="button" on:click=move |_| close_confirmation.set(false)>"Keep uploading"</button><button type="button" on:click=move |_| cancel_upload.run(true)>"Cancel upload and close"</button></div></section>
             </Show>
-            {move || selection.get().map(|selected| view! {
-                <section class="v2-store-card" aria-label="Selected media"><strong>{selected.filename}</strong><p>{format!("{} · {}", selected.detected_mime, human_size(selected.size))}</p><p>{match (selected.width, selected.height) { (Some(width), Some(height)) => format!("{width} × {height}"), _ => "Dimensions unavailable".into() }}</p><button type="button" class="v2-btn-secondary" disabled=move || state.get() == UploadState::Uploading on:click=move |_| choose_another.run(())>"Choose different file"</button></section>
-            })}
-            <Show when=move || selection.get().is_none() && state.get() != UploadState::Selecting><button type="button" class="v2-btn-secondary" on:click=move |_| choose_another.run(())>"Choose file"</button></Show>
+            <Show when=move || !queue.get().is_empty()>
+                <ul class="v2-blossom-queue" aria-label="Selected media">
+                    {move || queue.get().into_iter().map(|item| {
+                        let selection_id = item.selection.selection_id.clone();
+                        let uploading = item.status == QueuedStatus::Uploading;
+                        let failed = matches!(item.status, QueuedStatus::Failed(_));
+                        let removable = item.status != QueuedStatus::Uploaded && !uploading;
+                        let status_label = item.status.label();
+                        let detail = format!(
+                            "{} · {}{}",
+                            item.selection.detected_mime,
+                            human_size(item.selection.size),
+                            match (item.selection.width, item.selection.height) {
+                                (Some(width), Some(height)) => format!(" · {width} × {height}"),
+                                _ => String::new(),
+                            }
+                        );
+                        view! {
+                            <li class="v2-blossom-queue-item" class:v2-blossom-queue-failed=failed>
+                                {match item.selection.preview_data_url.clone() {
+                                    Some(src) => view! { <img class="v2-blossom-queue-thumb" src=src alt="" /> }.into_any(),
+                                    None => view! { <span class="v2-blossom-queue-thumb v2-blossom-queue-thumb-empty" aria-hidden="true">"VIDEO"</span> }.into_any(),
+                                }}
+                                <div class="v2-blossom-queue-body">
+                                    <strong>{item.selection.filename.clone()}</strong>
+                                    <span class="v2-store-help">{detail}</span>
+                                    <span class="v2-blossom-queue-status" role=failed.then_some("alert")>{status_label}</span>
+                                </div>
+                                <Show when=move || removable && state.get() != UploadState::Uploading>
+                                    {
+                                        let selection_id = selection_id.clone();
+                                        view! { <button type="button" class="v2-btn-secondary" on:click=move |_| remove_queued.run(selection_id.clone())>"Remove"</button> }
+                                    }
+                                </Show>
+                            </li>
+                        }
+                    }).collect_view()}
+                </ul>
+            </Show>
+            <Show when=move || state.get() != UploadState::Selecting && state.get() != UploadState::Uploading>
+                <button type="button" class="v2-btn-secondary" on:click=move |_| choose_files.run(())>{move || {
+                    let many = dialog_role.get().is_some_and(|role| role_allows_many(&role));
+                    match (many, queue.get().is_empty()) {
+                        (true, true) => "Choose files",
+                        (true, false) => "Add more files",
+                        (false, true) => "Choose file",
+                        (false, false) => "Choose different file",
+                    }
+                }}</button>
+            </Show>
             <Show when=move || state.get() == UploadState::Selecting><p role="status">"Waiting for file selection…"</p></Show>
+            <Show when=move || !notes.get().is_empty()>
+                <ul class="v2-store-help" role="status">{move || notes.get().into_iter().map(|note| view! { <li>{note}</li> }).collect_view()}</ul>
+            </Show>
 
             <section class="v2-store-card"><h3>"Upload server"</h3>
                 {move || {
@@ -1032,13 +1305,13 @@ pub fn BlossomMediaUpload(
                 </details>
             </section>
             <div class="v2-blossom-status">
-                {move || { let presentation = upload_presentation(state.get(), selection.get().is_some(), error.get().as_deref(), status.get().as_deref()); view! { <StatusChip label=presentation.label() variant=presentation.variant() icon=None size=StatusChipSize::Compact /> } }}
+                {move || { let presentation = upload_presentation(state.get(), has_pending(), error.get().as_deref(), status.get().as_deref()); view! { <StatusChip label=presentation.label() variant=presentation.variant() icon=None size=StatusChipSize::Compact /> } }}
                 {move || status.get().map(|value| view! { <span class="v2-blossom-phase" role="status">{value}</span> })}
             </div>
             <Show when=move || state.get() == UploadState::Uploading>
-                {move || { let (done, total) = bytes.get(); let percent = if total == 0 { 0 } else { ((done.saturating_mul(100)) / total).min(100) }; view! {
+                {move || { let (done, total) = bytes.get(); let percent = if total == 0 { 0 } else { ((done.saturating_mul(100)) / total).min(100) }; let items = queue.get(); let position = items.iter().position(|item| item.status == QueuedStatus::Uploading).map(|index| index + 1).unwrap_or_default(); let heading = if items.len() > 1 { format!("File {position} of {} · {} / {}", items.len(), human_size(done), human_size(total)) } else { format!("{} / {}", human_size(done), human_size(total)) }; view! {
                     <div class="v2-create-progress" role="progressbar" aria-label="Blossom upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>
-                        <div class="v2-create-progress-heading"><span>{format!("{} / {}", human_size(done), human_size(total))}</span><span>{format!("{percent}%")}</span></div>
+                        <div class="v2-create-progress-heading"><span>{heading}</span><span>{format!("{percent}%")}</span></div>
                         <div class="v2-create-progress-track"><div class="v2-create-progress-fill" style=format!("width: {percent}%")></div></div>
                     </div>
                 } }}
@@ -1147,6 +1420,80 @@ mod tests {
         // one invented by the dialog layer.
         let source = include_str!("blossom_media_upload.rs");
         assert!(source.contains("invoke_cancel_blossom_upload"));
+    }
+
+    fn queued(id: &str, status: QueuedStatus) -> QueuedMedia {
+        let mut selection = selection("image/png");
+        selection.selection_id = id.into();
+        QueuedMedia { selection, status }
+    }
+
+    #[test]
+    fn only_repeatable_roles_pick_several_files() {
+        for role in ["screenshot", "feature", "trailer"] {
+            assert!(role_allows_many(role), "{role}");
+        }
+        for role in ["hero", "capsule"] {
+            assert!(!role_allows_many(role), "{role}");
+        }
+    }
+
+    #[test]
+    fn room_for_more_files_counts_the_page_and_the_queue() {
+        use arcadestr_core::store_page_content_policy::MAX_SCREENSHOTS;
+        let mut draft = StorePageDraft::new("game".into(), Vec::new());
+        assert_eq!(remaining_for_role(&draft, "capsule", 0), 1);
+        assert_eq!(remaining_for_role(&draft, "capsule", 1), 0);
+        assert_eq!(remaining_for_role(&draft, "screenshot", 0), MAX_SCREENSHOTS);
+        assert_eq!(
+            remaining_for_role(&draft, "screenshot", 3),
+            MAX_SCREENSHOTS - 3
+        );
+        for index in 0..MAX_SCREENSHOTS {
+            let item = verified_media_item(
+                "screenshot",
+                &selection("image/png"),
+                &response("image/png"),
+                format!("shot-{index}"),
+            )
+            .expect("valid item");
+            draft.content.media.push(item);
+        }
+        assert_eq!(remaining_for_role(&draft, "screenshot", 0), 0);
+        assert!(remaining_for_role(&draft, "feature", 0) > 0);
+    }
+
+    #[test]
+    fn the_queue_uploads_ready_files_in_order_and_retries_failed_ones_after() {
+        let queue = vec![
+            queued("done", QueuedStatus::Uploaded),
+            queued("failed", QueuedStatus::Failed("nope".into())),
+            queued("ready", QueuedStatus::Ready),
+        ];
+        assert_eq!(next_upload(&queue, false), Some(2));
+        assert_eq!(next_upload(&queue, true), Some(2));
+        let without_ready = &queue[..2];
+        assert_eq!(next_upload(without_ready, false), None);
+        assert_eq!(next_upload(without_ready, true), Some(1));
+        let pending = pending_selections(&queue)
+            .into_iter()
+            .map(|selection| selection.selection_id)
+            .collect::<Vec<_>>();
+        assert_eq!(pending, ["failed", "ready"]);
+    }
+
+    #[test]
+    fn files_of_the_wrong_type_are_split_out_of_a_batch() {
+        let (kept, rejected) = split_compatible(
+            "screenshot",
+            vec![
+                selection("image/png"),
+                selection("video/mp4"),
+                selection("image/webp"),
+            ],
+        );
+        assert_eq!(kept.len(), 2);
+        assert_eq!(rejected[0].detected_mime, "video/mp4");
     }
 
     #[test]

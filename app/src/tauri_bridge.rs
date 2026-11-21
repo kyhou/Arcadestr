@@ -2638,6 +2638,25 @@ pub struct BlossomUploadResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelectBlossomMediaFilesRequest {
+    pub expected_publisher_hex: String,
+    pub max_files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RejectedBlossomMediaFile {
+    pub filename: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomMediaBatchSelectionDto {
+    pub selections: Vec<BlossomMediaSelectionDto>,
+    pub rejected: Vec<RejectedBlossomMediaFile>,
+    pub over_limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlossomUploadProgressDto {
     pub upload_id: String,
     pub selection_id: String,
@@ -2804,6 +2823,12 @@ blossom_native_wrapper!(
     invoke_discard_blossom_media_selection,
     "discard_blossom_media_selection",
     DiscardBlossomMediaRequest,
+blossom_native_wrapper!(
+    invoke_select_blossom_media_files,
+    "select_blossom_media_files",
+    SelectBlossomMediaFilesRequest,
+    BlossomMediaBatchSelectionDto
+);
     DiscardBlossomMediaResponse
 );
 blossom_native_wrapper!(

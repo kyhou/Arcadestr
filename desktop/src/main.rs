@@ -8540,6 +8540,7 @@ fn main() {
             is_authenticated,
             disconnect,
             blossom_commands::select_blossom_media_file,
+            blossom_commands::select_blossom_media_files,
             blossom_commands::start_blossom_upload,
             blossom_commands::retry_blossom_upload,
             blossom_commands::cancel_blossom_upload,

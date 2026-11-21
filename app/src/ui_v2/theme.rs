@@ -10179,6 +10179,69 @@ dialog.v2-confirm-backdrop::backdrop {
   font-weight: 750;
 }
 
+/* Files picked in one upload dialog, uploaded in order. */
+.v2-blossom-queue {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+  max-height: 340px;
+  overflow-y: auto;
+}
+
+.v2-blossom-queue-item {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px;
+  border: 1px solid var(--arc-border-card);
+  border-radius: 6px;
+  background: #141417;
+}
+
+.v2-blossom-queue-failed {
+  border-color: oklch(0.65 0.18 25 / 0.6);
+}
+
+.v2-blossom-queue-thumb {
+  width: 96px;
+  aspect-ratio: 16 / 9;
+  border-radius: 4px;
+  object-fit: cover;
+  background: repeating-linear-gradient(135deg, #191919 0 10px, #141414 10px 20px);
+}
+
+.v2-blossom-queue-thumb-empty {
+  display: grid;
+  place-items: center;
+  color: oklch(0.5 0.01 60);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 1px;
+}
+
+.v2-blossom-queue-body {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.v2-blossom-queue-body strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.v2-blossom-queue-status {
+  color: oklch(0.6 0.01 60);
+  font-size: 10.5px;
+}
+
+.v2-blossom-queue-failed .v2-blossom-queue-status {
+  color: oklch(0.65 0.18 25);
+}
+
 .v2-store-chip-row,
 .v2-store-add-row,
 .v2-store-section-heading,
