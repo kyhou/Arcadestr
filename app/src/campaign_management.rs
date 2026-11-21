@@ -81,13 +81,17 @@ pub fn can_request_campaign_confirmation(
 }
 
 /// Accept an async result only while both its account and request generation are current.
+///
+/// `current_generation` is `None` once the owning view has been disposed (read it with
+/// `try_get_untracked`), so a late response from an unmounted view is rejected instead of
+/// panicking on a disposed signal.
 pub fn accepts_account_response(
     current_npub: Option<&str>,
     initiating_npub: &str,
-    current_generation: u64,
+    current_generation: Option<u64>,
     request_generation: u64,
 ) -> bool {
-    current_npub == Some(initiating_npub) && current_generation == request_generation
+    current_npub == Some(initiating_npub) && current_generation == Some(request_generation)
 }
 
 impl CampaignForm {
@@ -621,22 +625,39 @@ mod tests {
         assert!(accepts_account_response(
             Some("npub1publisher"),
             "npub1publisher",
-            7,
+            Some(7),
             7,
         ));
         assert!(!accepts_account_response(
             Some("npub1other"),
             "npub1publisher",
-            7,
+            Some(7),
             7,
         ));
         assert!(!accepts_account_response(
             Some("npub1publisher"),
             "npub1publisher",
-            8,
+            Some(8),
             7,
         ));
-        assert!(!accepts_account_response(None, "npub1publisher", 7, 7));
+        assert!(!accepts_account_response(
+            None,
+            "npub1publisher",
+            Some(7),
+            7
+        ));
+    }
+
+    #[test]
+    fn a_response_for_a_disposed_view_is_rejected() {
+        // `try_get_untracked` yields `None` once the view owning the generation
+        // signal is gone; the late response must be dropped, not panic.
+        assert!(!accepts_account_response(
+            Some("npub1publisher"),
+            "npub1publisher",
+            None,
+            7,
+        ));
     }
 
     #[test]

@@ -921,7 +921,7 @@ fn PublishedGamesView(
                     if !accepts_account_response(
                         auth_for_complete.npub.get_untracked().as_deref(),
                         &publisher_for_complete,
-                        listing_generation.get_untracked(),
+                        listing_generation.try_get_untracked(),
                         request_generation,
                     ) {
                         return;
@@ -941,7 +941,7 @@ fn PublishedGamesView(
                     if !accepts_account_response(
                         auth_for_request.npub.get_untracked().as_deref(),
                         &publisher,
-                        listing_generation.get_untracked(),
+                        listing_generation.try_get_untracked(),
                         request_generation,
                     ) {
                         return;
@@ -958,7 +958,7 @@ fn PublishedGamesView(
                     if !accepts_account_response(
                         auth_for_request.npub.get_untracked().as_deref(),
                         &publisher,
-                        listing_generation.get_untracked(),
+                        listing_generation.try_get_untracked(),
                         request_generation,
                     ) {
                         return;
@@ -1080,7 +1080,7 @@ fn PublishedGamesView(
                 if !accepts_account_response(
                     auth_for_request.npub.get_untracked().as_deref(),
                     &publisher_for_request,
-                    campaign_generation.get_untracked(),
+                    campaign_generation.try_get_untracked(),
                     request_generation,
                 ) {
                     return;
@@ -1160,7 +1160,7 @@ fn PublishedGamesView(
             if !accepts_account_response(
                 auth_for_request.npub.get_untracked().as_deref(),
                 &publisher_npub,
-                store_page_generation.get_untracked(),
+                store_page_generation.try_get_untracked(),
                 request_generation,
             ) {
                 return;
@@ -1551,7 +1551,7 @@ fn GameManagementView(
             if !accepts_account_response(
                 auth_for_request.npub.get_untracked().as_deref(),
                 &initiating_npub,
-                discovery_generation.get_untracked(),
+                discovery_generation.try_get_untracked(),
                 request_generation,
             ) {
                 return;
@@ -1613,7 +1613,7 @@ fn GameManagementView(
             if !accepts_account_response(
                 auth_for_request.npub.get_untracked().as_deref(),
                 &account,
-                store_page_generation.get_untracked(),
+                store_page_generation.try_get_untracked(),
                 request_generation,
             ) {
                 return;
@@ -2190,7 +2190,7 @@ fn campaign_row(
                 || !accepts_account_response(
                     auth_for_request.npub.get_untracked().as_deref(),
                     &publisher_npub,
-                    action_generation.get_untracked(),
+                    action_generation.try_get_untracked(),
                     request_generation,
                 )
             {
@@ -2261,7 +2261,7 @@ fn campaign_row(
                 || !accepts_account_response(
                     auth_for_request.npub.get_untracked().as_deref(),
                     &publisher_npub,
-                    action_generation.get_untracked(),
+                    action_generation.try_get_untracked(),
                     request_generation,
                 )
             {
@@ -2501,7 +2501,7 @@ fn CampaignEditorView(
                 || !accepts_account_response(
                     auth_for_request.npub.get_untracked().as_deref(),
                     &publisher_npub,
-                    operation_generation.get_untracked(),
+                    operation_generation.try_get_untracked(),
                     request_generation,
                 )
             {
@@ -2545,7 +2545,7 @@ fn CampaignEditorView(
                             || !accepts_account_response(
                                 auth_for_request.npub.get_untracked().as_deref(),
                                 &publisher_for_pointer_removal,
-                                operation_generation.get_untracked(),
+                                operation_generation.try_get_untracked(),
                                 request_generation,
                             )
                         {
@@ -2647,7 +2647,7 @@ fn CampaignEditorView(
                 || !accepts_account_response(
                     auth_for_request.npub.get_untracked().as_deref(),
                     &publisher_npub,
-                    operation_generation.get_untracked(),
+                    operation_generation.try_get_untracked(),
                     request_generation,
                 )
             {
@@ -2722,7 +2722,7 @@ fn CampaignEditorView(
                 || !accepts_account_response(
                     auth_for_request.npub.get_untracked().as_deref(),
                     &publisher_npub,
-                    operation_generation.get_untracked(),
+                    operation_generation.try_get_untracked(),
                     request_generation,
                 )
             {
@@ -3228,19 +3228,19 @@ mod tests {
         assert!(accepts_account_response(
             Some(TEST_PUBLISHER),
             TEST_PUBLISHER,
-            4,
+            Some(4),
             4
         ));
         assert!(!accepts_account_response(
             Some("npub1other"),
             TEST_PUBLISHER,
-            4,
+            Some(4),
             4
         ));
         assert!(!accepts_account_response(
             Some(TEST_PUBLISHER),
             TEST_PUBLISHER,
-            5,
+            Some(5),
             4
         ));
     }
