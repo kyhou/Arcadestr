@@ -361,6 +361,16 @@ pub struct PublisherStorePageEditorState {
     pub baseline_draft: StorePageDraft,
     pub listings: Vec<PublisherStorePageListingRevision>,
     pub diagnostics: Vec<String>,
+    /// Present when no Store Page existed and the draft was started from the
+    /// listing's own fields.
+    #[serde(default)]
+    pub started_from_listing: Option<StartedFromListing>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct StartedFromListing {
+    pub media_added: usize,
+    pub skipped_images: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1268,6 +1278,18 @@ pub struct PublishAdpListingResult {
     pub fulfillment_pubkey: Option<String>,
     pub file_hash: Option<String>,
     pub uploads: Vec<PublishServerUploadResult>,
+    /// Store Page published in the same operation, when one was bundled.
+    #[serde(default)]
+    pub store_page: Option<BundledStorePageResult>,
+}
+
+/// Outcome of the Store Page published together with a listing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BundledStorePageResult {
+    pub coordinate: String,
+    pub event_id: String,
+    pub propagation_confirmed: bool,
+    pub cache_error: Option<String>,
 }
 
 /// Progress event payload emitted during ADP publishing.
@@ -2616,6 +2638,25 @@ pub struct BlossomMediaSelectionDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelectBlossomMediaFilesRequest {
+    pub expected_publisher_hex: String,
+    pub max_files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RejectedBlossomMediaFile {
+    pub filename: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlossomMediaBatchSelectionDto {
+    pub selections: Vec<BlossomMediaSelectionDto>,
+    pub rejected: Vec<RejectedBlossomMediaFile>,
+    pub over_limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StartBlossomUploadRequest {
     pub selection_id: String,
     pub expected_publisher_hex: String,
@@ -2635,25 +2676,6 @@ pub struct BlossomUploadResponse {
     pub size: u64,
     pub uploaded: u64,
     pub was_existing: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SelectBlossomMediaFilesRequest {
-    pub expected_publisher_hex: String,
-    pub max_files: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RejectedBlossomMediaFile {
-    pub filename: String,
-    pub code: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BlossomMediaBatchSelectionDto {
-    pub selections: Vec<BlossomMediaSelectionDto>,
-    pub rejected: Vec<RejectedBlossomMediaFile>,
-    pub over_limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2802,6 +2824,12 @@ blossom_native_wrapper!(
     Option<BlossomMediaSelectionDto>
 );
 blossom_native_wrapper!(
+    invoke_select_blossom_media_files,
+    "select_blossom_media_files",
+    SelectBlossomMediaFilesRequest,
+    BlossomMediaBatchSelectionDto
+);
+blossom_native_wrapper!(
     invoke_start_blossom_upload,
     "start_blossom_upload",
     StartBlossomUploadRequest,
@@ -2823,12 +2851,6 @@ blossom_native_wrapper!(
     invoke_discard_blossom_media_selection,
     "discard_blossom_media_selection",
     DiscardBlossomMediaRequest,
-blossom_native_wrapper!(
-    invoke_select_blossom_media_files,
-    "select_blossom_media_files",
-    SelectBlossomMediaFilesRequest,
-    BlossomMediaBatchSelectionDto
-);
     DiscardBlossomMediaResponse
 );
 blossom_native_wrapper!(

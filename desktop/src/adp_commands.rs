@@ -147,6 +147,25 @@ pub struct PublishAdpListingResult {
     pub fulfillment_pubkey: Option<String>,
     pub file_hash: Option<String>,
     pub uploads: Vec<PublishServerUploadResult>,
+    /// Store Page published in the same operation, when one was bundled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_page: Option<BundledStorePageResult>,
+}
+
+/// Outcome of the Store Page published together with a listing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundledStorePageResult {
+    pub coordinate: String,
+    pub event_id: String,
+    pub propagation_confirmed: bool,
+    pub cache_error: Option<String>,
+}
+
+/// Point the listing at exactly one Store Page. Any earlier pointer is
+/// replaced rather than duplicated, which pointer parsing would reject.
+fn replace_store_page_pointer(tags: &mut Vec<Vec<String>>, pointer: Vec<String>) {
+    tags.retain(|tag| tag.first().map(String::as_str) != Some("store_page"));
+    tags.push(pointer);
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4773,6 +4792,25 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
         &developer_npub,
         &format!("publish:{}", game.to_coordinate_string()),
     )?;
+    // A bundled Store Page is validated before any upload or provisioning so a
+    // content problem never leaves a half-finished publication behind. A new
+    // page takes the settled game identity; an existing page keeps its own.
+    let bundled_store_page = extension
+        .store_page
+        .clone()
+        .map(|mut page| {
+            if page.loaded_event_id.is_none() {
+                page.presentation_id = game_d_tag.clone();
+                page.listing_coordinates = vec![game.to_coordinate_string()];
+            }
+            crate::store_page_commands::prepare_bundled_store_page(
+                developer_pubkey,
+                &game.to_coordinate_string(),
+                page,
+            )
+        })
+        .transpose()
+        .map_err(|message| PublishAdpListingError::Other { message })?;
     let app = Arc::new(PublicationProgress {
         app,
         operation_id: extension
@@ -5146,14 +5184,52 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
         )?;
     }
 
-    emit_progress(&app, "publish-listing", "pending", None)?;
     ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey, session).await?;
-    let fulfillment_authorizations = new_authorizations;
     // The authoritative listing supplies identity, concurrency and unmanaged
     // metadata only. Every field the form owns is republished from the form's
     // current values, so a retry after a partial publication carries the
     // publisher's latest intent rather than the half-published state.
-    let preserved_tags = preserved_listing_tags(&existing_listing_tags);
+    let mut preserved_tags = preserved_listing_tags(&existing_listing_tags);
+    // The Store Page goes out first so the listing can be signed with its
+    // reciprocal pointer already included: two events, no listing republish.
+    // A page whose listing then fails to publish stays invisible to buyers,
+    // because presentation attaches only through the listing's pointer.
+    let mut store_page_result = None;
+    if let Some(page) = bundled_store_page.as_ref() {
+        emit_progress(&app, "publish-store-page", "pending", None)?;
+        let (outcome, pointer) = crate::store_page_commands::publish_bundled_store_page(
+            &state,
+            signer.as_ref(),
+            developer_pubkey,
+            &game.to_coordinate_string(),
+            page,
+            session,
+        )
+        .await
+        .map_err(|message| {
+            let _ = emit_progress(&app, "publish-store-page", "error", Some(message.clone()));
+            PublishAdpListingError::Other { message }
+        })?;
+        emit_progress(
+            &app,
+            "publish-store-page",
+            "ok",
+            Some(outcome.signed.id.to_hex()),
+        )?;
+        replace_store_page_pointer(&mut preserved_tags, pointer);
+        store_page_result = Some(BundledStorePageResult {
+            coordinate: arcadestr_core::store_page::store_page_coordinate(
+                developer_pubkey,
+                &page.presentation_id,
+            ),
+            event_id: outcome.signed.id.to_hex(),
+            propagation_confirmed: outcome.confirmed,
+            cache_error: outcome.cache_error,
+        });
+    }
+    emit_progress(&app, "publish-listing", "pending", None)?;
+    ensure_publish_account_current(&state, signer_state.inner(), developer_pubkey, session).await?;
+    let fulfillment_authorizations = new_authorizations;
     let mut listing_input = AdpListingInput {
         d_tag: game_d_tag.clone(),
         title: request.title.clone(),
@@ -5563,6 +5639,7 @@ async fn publish_adp_listing_pipeline_inner<R: tauri::Runtime>(
         fulfillment_pubkey,
         file_hash,
         uploads,
+        store_page: store_page_result,
     })
 }
 
@@ -6732,6 +6809,28 @@ mod tests {
     }
 
     #[test]
+    fn a_bundled_store_page_replaces_the_listing_pointer_instead_of_adding_one() {
+        let mut tags = vec![
+            vec!["store_page".to_string(), "30407:pub:old".to_string()],
+            vec!["unknown".to_string(), "kept".to_string()],
+        ];
+        replace_store_page_pointer(
+            &mut tags,
+            vec!["store_page".to_string(), "30407:pub:new".to_string()],
+        );
+        assert_eq!(
+            tags,
+            vec![
+                vec!["unknown".to_string(), "kept".to_string()],
+                vec!["store_page".to_string(), "30407:pub:new".to_string()],
+            ]
+        );
+        // The pointer is preserved metadata, not a form field, so a listing-only
+        // edit keeps an existing Store Page attached.
+        assert!(!FORM_MANAGED_LISTING_TAGS.contains(&"store_page"));
+    }
+
+    #[test]
     fn campaign_pointers_are_owned_by_the_publish_form() {
         // Campaign pointers are republished from the form on every replacement,
         // so they must be filtered out of the preserved tags. Dropping them from
@@ -7812,6 +7911,7 @@ mod tests {
             .map(|profile| profile.id.clone())
             .unwrap_or_else(|| ProfileId::parse("play").expect("test default profile ID"));
         PublishAdpListingRequestExtension {
+            store_page: None,
             authorize_operators: false,
             server_roles: Vec::new(),
             commercial_intent: Default::default(),

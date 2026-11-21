@@ -8909,6 +8909,154 @@ dialog.v2-confirm-backdrop::backdrop {
   padding-top: 18px;
 }
 
+/* Store Page field groups inside a Create/Edit game step: flat sections of the
+   step, separated by the same rule, never nested cards. */
+.v2-store-step-section {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+  border-top: 1px solid var(--arc-border-card);
+  padding-top: 18px;
+}
+
+/* A step made only of Store Page groups starts without a rule. */
+.v2-create-store-step .v2-store-step-section:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.v2-create-store-step {
+  display: grid;
+  gap: 18px;
+  min-width: 0;
+}
+
+.v2-create-workflow .v2-store-step-section h2 {
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.v2-create-workflow .v2-store-step-section .v2-store-card {
+  margin-top: 0;
+}
+
+.v2-store-media-empty {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+}
+
+.v2-store-media-empty-art {
+  display: grid;
+  place-items: center;
+  width: min(100%, 460px);
+  aspect-ratio: 460 / 215;
+  border: 1px solid var(--arc-border-card);
+  border-radius: 6px;
+  background: repeating-linear-gradient(135deg, #191919 0 10px, #141414 10px 20px);
+  color: oklch(0.5 0.01 60);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+}
+
+.v2-store-media-empty-title {
+  margin: 0;
+  color: var(--arc-text-primary);
+  font-size: 12.5px;
+  font-weight: 800;
+}
+
+/* Media items in a step show the image itself instead of the standalone
+   editor's validation placeholder. */
+.v2-store-media-thumb {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.v2-store-media-thumb img,
+.v2-store-media-thumb-pending {
+  width: 160px;
+  aspect-ratio: 16 / 9;
+  flex: none;
+  border: 1px solid var(--arc-border-card);
+  border-radius: 4px;
+  object-fit: cover;
+  background: repeating-linear-gradient(135deg, #191919 0 10px, #141414 10px 20px);
+}
+
+.v2-store-media-thumb-pending {
+  display: grid;
+  place-items: center;
+  color: oklch(0.5 0.01 60);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 1px;
+}
+
+/* Chips match the step's tag chips (.v2-create-chip). */
+.v2-create-workflow .v2-store-step-section .v2-chip {
+  gap: 6px;
+  border: 1px solid var(--arc-border-control);
+  border-radius: var(--arc-radius-xs);
+  padding: 4px 8px;
+  background: var(--arc-surface-recessed);
+  font-size: 10.5px;
+}
+
+/* Field labels match the step's own fields (.v2-create-field-label). */
+.v2-create-workflow .v2-store-step-section label {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+}
+
+.v2-create-workflow .v2-store-step-section label:not(:has(> input[type="checkbox"], > input[type="radio"])),
+.v2-create-workflow .v2-store-step-section .v2-store-field-label,
+.v2-create-workflow .v2-store-step-section legend {
+  color: var(--arc-text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+
+.v2-create-workflow .v2-store-step-section label > .v2-input,
+.v2-create-workflow .v2-store-step-section label > textarea,
+.v2-create-workflow .v2-store-step-section label > select {
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* Body-size text in rows (accessibility capabilities, checkbox labels). */
+.v2-create-workflow .v2-store-step-section strong,
+.v2-create-workflow .v2-store-step-section label:has(> input[type="checkbox"], > input[type="radio"]) {
+  color: var(--arc-text-primary, #fff);
+  font-size: 12.5px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.v2-create-workflow .v2-store-step-section label:has(> input[type="checkbox"], > input[type="radio"]) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 400;
+}
+
+.v2-create-workflow .v2-store-step-section small,
+.v2-create-workflow .v2-store-step-section summary,
+.v2-create-workflow .v2-store-step-section .v2-store-help {
+  color: var(--arc-text-muted);
+  font-size: 10.5px;
+  line-height: 1.5;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
 .v2-create-section-title {
   margin: 0;
   font-family: var(--arc-font-mono);
@@ -10031,6 +10179,106 @@ dialog.v2-confirm-backdrop::backdrop {
   margin-top: 14px;
 }
 
+/* Files picked in one upload dialog, uploaded in order. */
+.v2-blossom-queue {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+  max-height: 340px;
+  overflow-y: auto;
+}
+
+.v2-blossom-queue-item {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px;
+  border: 1px solid var(--arc-border-card);
+  border-radius: 6px;
+  background: #141417;
+}
+
+.v2-blossom-queue-failed {
+  border-color: oklch(0.65 0.18 25 / 0.6);
+}
+
+.v2-blossom-queue-thumb {
+  width: 96px;
+  aspect-ratio: 16 / 9;
+  border-radius: 4px;
+  object-fit: cover;
+  background: repeating-linear-gradient(135deg, #191919 0 10px, #141414 10px 20px);
+}
+
+.v2-blossom-queue-thumb-empty {
+  display: grid;
+  place-items: center;
+  color: oklch(0.5 0.01 60);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 1px;
+}
+
+.v2-blossom-queue-body {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.v2-blossom-queue-body strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.v2-blossom-queue-status {
+  color: oklch(0.6 0.01 60);
+  font-size: 10.5px;
+}
+
+.v2-blossom-queue-failed .v2-blossom-queue-status {
+  color: oklch(0.65 0.18 25);
+}
+
+/* Rarely needed media fields, collapsed under each media item. */
+.v2-store-media-more {
+  margin-top: 10px;
+}
+
+.v2-store-media-more > summary {
+  cursor: pointer;
+  color: oklch(0.8 0.13 210);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.v2-store-media-more[open] > summary {
+  margin-bottom: 10px;
+}
+
+.v2-create-workflow .v2-store-step-section .v2-store-media-thumb {
+  margin: 0;
+}
+
+/* Media item header: thumbnail and status on the left, actions on the right. */
+.v2-store-card:has(> .v2-store-media-thumb) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+  row-gap: 12px;
+  align-items: start;
+}
+
+.v2-store-card:has(> .v2-store-media-thumb) > :not(.v2-store-media-thumb, .v2-store-card-actions) {
+  grid-column: 1 / -1;
+}
+
+.v2-store-card:has(> .v2-store-media-thumb) > .v2-store-card-actions {
+  margin: 0;
+}
+
 .v2-blossom-status {
   display: flex;
   flex-wrap: wrap;
@@ -10179,69 +10427,6 @@ dialog.v2-confirm-backdrop::backdrop {
   font-weight: 750;
 }
 
-/* Files picked in one upload dialog, uploaded in order. */
-.v2-blossom-queue {
-  display: grid;
-  gap: 8px;
-  margin: 0 0 12px;
-  padding: 0;
-  list-style: none;
-  max-height: 340px;
-  overflow-y: auto;
-}
-
-.v2-blossom-queue-item {
-  display: grid;
-  grid-template-columns: 96px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 12px;
-  padding: 8px;
-  border: 1px solid var(--arc-border-card);
-  border-radius: 6px;
-  background: #141417;
-}
-
-.v2-blossom-queue-failed {
-  border-color: oklch(0.65 0.18 25 / 0.6);
-}
-
-.v2-blossom-queue-thumb {
-  width: 96px;
-  aspect-ratio: 16 / 9;
-  border-radius: 4px;
-  object-fit: cover;
-  background: repeating-linear-gradient(135deg, #191919 0 10px, #141414 10px 20px);
-}
-
-.v2-blossom-queue-thumb-empty {
-  display: grid;
-  place-items: center;
-  color: oklch(0.5 0.01 60);
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 1px;
-}
-
-.v2-blossom-queue-body {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.v2-blossom-queue-body strong {
-  overflow-wrap: anywhere;
-  font-size: 12px;
-}
-
-.v2-blossom-queue-status {
-  color: oklch(0.6 0.01 60);
-  font-size: 10.5px;
-}
-
-.v2-blossom-queue-failed .v2-blossom-queue-status {
-  color: oklch(0.65 0.18 25);
-}
-
 .v2-store-chip-row,
 .v2-store-add-row,
 .v2-store-section-heading,
@@ -10298,6 +10483,8 @@ dialog.v2-confirm-backdrop::backdrop {
   border-radius: var(--v2-radius-sm);
   color: var(--v2-on-background);
   background: var(--v2-surface-high);
+  font: 700 11.5px/1.3 ui-monospace, monospace;
+  letter-spacing: 0.4px;
   cursor: pointer;
 }
 
@@ -10321,11 +10508,6 @@ dialog.v2-confirm-backdrop::backdrop {
   flex-wrap: wrap;
   gap: 0.4rem;
   margin-bottom: 0.7rem;
-}
-
-/* Markdown destinations belong to the typed Links fields, never the prose toolbar. */
-.v2-store-toolbar button:nth-child(3) {
-  display: none;
 }
 
 .v2-store-diagnostic-list button {

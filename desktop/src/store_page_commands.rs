@@ -60,6 +60,64 @@ pub struct PublisherStorePageEditorState {
     pub baseline_draft: StorePageDraft,
     pub listings: Vec<StorePageListingRevision>,
     pub diagnostics: Vec<String>,
+    /// Set when no Store Page existed and the draft was started from the
+    /// listing's own title, description, tags and images.
+    pub started_from_listing: Option<StartedFromListing>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StartedFromListing {
+    pub media_added: usize,
+    /// Listing images the published page would reject, left out of the draft.
+    pub skipped_images: Vec<String>,
+}
+
+/// The listing fields a new Store Page starts from, read from the signed event.
+fn listing_presentation_fields(listing: &Event) -> (String, Vec<String>, Vec<String>) {
+    let mut title = String::new();
+    let mut tags = Vec::new();
+    let mut images = Vec::new();
+    for tag in listing.tags.iter() {
+        match tag.as_slice() {
+            [name, value, ..] if name == "title" && title.is_empty() => title = value.clone(),
+            [name, value, ..] if name == "t" => tags.push(value.clone()),
+            [name, value, ..] if name == "image" => images.push(value.clone()),
+            _ => {}
+        }
+    }
+    (title, tags, images)
+}
+
+/// A new Store Page draft started from the signed listing, so the publisher
+/// does not retype what the listing already says.
+fn draft_started_from_listing(
+    presentation_id: String,
+    listing_coordinate: String,
+    listing: &Event,
+) -> (StorePageDraft, StartedFromListing) {
+    let (title, tags, images) = listing_presentation_fields(listing);
+    let (draft, report) = arcadestr_core::store_page_seed::draft_from_listing(
+        presentation_id,
+        listing_coordinate,
+        arcadestr_core::store_page_seed::ListingPresentation {
+            title: &title,
+            description: &listing.content,
+            tags: &tags,
+            images: &images,
+        },
+    );
+    let skipped_images = report
+        .invalid
+        .into_iter()
+        .chain(report.over_limit)
+        .collect();
+    (
+        draft,
+        StartedFromListing {
+            media_added: report.added,
+            skipped_images,
+        },
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,6 +274,7 @@ pub async fn load_publisher_store_page_editor(
         reciprocal: true,
     }];
 
+    let mut started_from_listing = None;
     let requested_existing = request.presentation_id.clone();
     let target_presentation_id = requested_existing.clone().or_else(|| {
         pointer_report
@@ -287,7 +346,14 @@ pub async fn load_publisher_store_page_editor(
             .nth(2)
             .unwrap_or("store-page")
             .to_string();
-        let draft = StorePageDraft::new(presentation_id, vec![request.listing.listing_coordinate]);
+        let (draft, report) = draft_started_from_listing(
+            presentation_id,
+            request.listing.listing_coordinate,
+            &listing,
+        );
+        started_from_listing = Some(report);
+        // The starting draft is reproducible from the listing, so it is also the
+        // baseline: leaving without edits loses nothing and needs no prompt.
         (draft.clone(), draft)
     };
 
@@ -296,6 +362,7 @@ pub async fn load_publisher_store_page_editor(
         baseline_draft,
         listings,
         diagnostics,
+        started_from_listing,
     })
 }
 
@@ -317,12 +384,20 @@ pub async fn validate_store_page_draft_command(
             });
         }
     };
+    let omitted_input = authoring_blockers(&validated.diagnostics);
+    if !omitted_input.is_empty() {
+        return Ok(ValidateStorePageDraftResponse {
+            valid: false,
+            diagnostics: omitted_input,
+            preview: None,
+        });
+    }
     let policy_diagnostics = validated
         .diagnostics
         .iter()
         .map(|diagnostic| StorePageValidationDiagnostic {
             code: "sanitization_adjustment".to_string(),
-            message: format!("{diagnostic:?}"),
+            message: diagnostic.describe(),
         })
         .collect::<Vec<_>>();
     let relay_manager = relay_manager(&state).await;
@@ -587,9 +662,88 @@ async fn publish_store_page_inner(
     }
     ensure_publish_account_current(&state, signer_state.inner(), publisher, &session).await?;
 
+    let StorePageEventOutcome {
+        signed: signed_page,
+        parsed: parsed_page,
+        success_count,
+        failure_count,
+        confirmed: page_confirmed,
+        cache_error,
+    } = publish_store_page_event(
+        &relay_manager,
+        &repository,
+        signer.as_ref(),
+        publisher,
+        &request.draft,
+        current_page.as_ref(),
+        &session,
+    )
+    .await?;
+
+    let listing_updates = publish_pointer_updates(
+        &state,
+        signer_state.inner(),
+        &relay_manager,
+        &repository,
+        signer.as_ref(),
+        publisher,
+        &parsed_page,
+        &request.listing_mutations,
+    )
+    .await;
+    let complete = page_confirmed
+        && cache_error.is_none()
+        && listing_updates
+            .iter()
+            .all(|outcome| outcome.published && outcome.propagation_confirmed);
+    let retryable = !complete;
+    session.ensure_current()?;
+    Ok(PublishStorePageResponse {
+        store_page_coordinate: store_page_coordinate(publisher, &request.draft.presentation_id),
+        store_page: Some(EventPublishOutcome {
+            event_id: signed_page.id.to_hex(),
+            success_count,
+            failure_count,
+            propagation_confirmed: page_confirmed,
+        }),
+        listing_updates,
+        complete,
+        retryable,
+        cache_error,
+        retry_scope_complete: false,
+    })
+}
+
+/// Result of signing and publishing one Store Page event.
+pub(crate) struct StorePageEventOutcome {
+    pub signed: Event,
+    pub parsed: ParsedStorePage,
+    pub success_count: usize,
+    pub failure_count: usize,
+    pub confirmed: bool,
+    pub cache_error: Option<String>,
+}
+
+/// Sign and publish `draft` as the next revision of its Store Page.
+///
+/// Shared by the standalone Store Page publication and the combined game
+/// publication. Under a publisher journal the signature is retained before it
+/// leaves the device, and a retained signature's timestamp is reused so a
+/// recovered operation republishes the same revision instead of a new one.
+/// `current_page` is the revision the caller validated the draft against; a
+/// concurrent replacement detected after signing aborts without publishing.
+pub(crate) async fn publish_store_page_event(
+    relay_manager: &arcadestr_core::relay_manager::RelayManager,
+    repository: &StorePageRepository,
+    signer: &dyn NostrSigner,
+    publisher: PublicKey,
+    draft: &StorePageDraft,
+    current_page: Option<&ParsedStorePage>,
+    session: &arcadestr_core::settlement_recovery::SessionFence,
+) -> Result<StorePageEventOutcome, String> {
     let retained_timestamp = if let Some(journal) = crate::publisher_commands::journal() {
         journal
-            .step(&format!("signed:30407:{}", request.draft.presentation_id))
+            .step(&format!("signed:30407:{}", draft.presentation_id))
             .await?
             .map(|step| serde_json::from_value::<Event>(step.intent))
             .transpose()
@@ -600,9 +754,9 @@ async fn publish_store_page_inner(
     };
     let signed_page = signer
         .sign_event(
-            build_store_page_event_builder(&request.draft.build_params(publisher))
+            build_store_page_event_builder(&draft.build_params(publisher))
                 .map_err(|error| error.to_string())?
-                .custom_created_at(match (retained_timestamp, current_page.as_ref()) {
+                .custom_created_at(match (retained_timestamp, current_page) {
                     (Some(timestamp), _) => timestamp,
                     (None, Some(page)) => {
                         arcadestr_core::marketplace::listing_replacement_timestamp(
@@ -616,19 +770,12 @@ async fn publish_store_page_inner(
         )
         .await
         .map_err(|error| error.to_string())?;
-    let parsed_page = parse_store_page_event(&signed_page).map_err(|error| error.to_string())?;
-    let latest_page = fetch_current_store_page(
-        &relay_manager,
-        &repository,
-        publisher,
-        &request.draft.presentation_id,
-    )
-    .await?;
+    let parsed = parse_store_page_event(&signed_page).map_err(|error| error.to_string())?;
+    let latest_page =
+        fetch_current_store_page(relay_manager, repository, publisher, &draft.presentation_id)
+            .await?;
     validate_store_page_revision(
-        current_page
-            .as_ref()
-            .map(|page| page.event.id.to_hex())
-            .as_deref(),
+        current_page.map(|page| page.event.id.to_hex()).as_deref(),
         latest_page
             .as_ref()
             .map(|page| page.event.id.to_hex())
@@ -669,54 +816,138 @@ async fn publish_store_page_inner(
         }
         (send.success_count, send.failure_count)
     };
-    let page_confirmed = confirm_exact_event(
-        &relay_manager,
-        store_page_filter(publisher, &request.draft.presentation_id),
+    let confirmed = confirm_exact_event(
+        relay_manager,
+        store_page_filter(publisher, &draft.presentation_id),
         &signed_page.id.to_hex(),
     )
     .await;
-    let cache_error = if page_confirmed {
+    let cache_error = if confirmed {
         repository
-            .upsert_valid(&parsed_page)
+            .upsert_valid(&parsed)
             .await
             .err()
             .map(|error| error.to_string())
     } else {
         None
     };
+    Ok(StorePageEventOutcome {
+        signed: signed_page,
+        parsed,
+        success_count,
+        failure_count,
+        confirmed,
+        cache_error,
+    })
+}
 
-    let listing_updates = publish_pointer_updates(
-        &state,
-        signer_state.inner(),
+/// Validate a Store Page draft that is published together with its listing.
+///
+/// The page must be associated with `listing_coordinate`; `draft` is returned
+/// with that association added when missing and its compact tags synced. Any
+/// draft input the published page would drop is rejected, exactly like the
+/// standalone publication.
+pub(crate) fn prepare_bundled_store_page(
+    publisher: PublicKey,
+    listing_coordinate: &str,
+    mut draft: StorePageDraft,
+) -> Result<StorePageDraft, String> {
+    if !draft
+        .listing_coordinates
+        .iter()
+        .any(|coordinate| coordinate == listing_coordinate)
+    {
+        draft
+            .listing_coordinates
+            .push(listing_coordinate.to_string());
+    }
+    draft.sync_compact_tags();
+    let validated = validate_store_page_draft(&draft.build_params(publisher))
+        .map_err(|error| format!("Store Page: {error}"))?;
+    if let Some(blocker) = authoring_blockers(&validated.diagnostics)
+        .into_iter()
+        .next()
+    {
+        return Err(format!("Store Page: {}", blocker.message));
+    }
+    Ok(draft)
+}
+
+/// The combined game publication edits Store Page content only. A new page is
+/// associated with exactly the listing being published; an existing page keeps
+/// its current associations (plus this listing). Changing which listings share
+/// a page stays an explicit action in the Store Page association tools.
+fn bundled_associations_unchanged(
+    draft_coordinates: &[String],
+    current_coordinates: Option<&[String]>,
+    listing_coordinate: &str,
+) -> Result<(), String> {
+    let expected = current_coordinates
+        .unwrap_or_default()
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(listing_coordinate))
+        .collect::<HashSet<_>>();
+    let requested = draft_coordinates
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if requested == expected {
+        Ok(())
+    } else {
+        Err("Store Page: listing associations changed. Use the Store Page association tools to link or unlink other listings.".to_string())
+    }
+}
+
+/// Publish a bundled Store Page before its listing and return the reciprocal
+/// pointer tag the listing must carry.
+pub(crate) async fn publish_bundled_store_page(
+    state: &tauri::State<'_, AppState>,
+    signer: &dyn NostrSigner,
+    publisher: PublicKey,
+    listing_coordinate: &str,
+    draft: &StorePageDraft,
+    session: &arcadestr_core::settlement_recovery::SessionFence,
+) -> Result<(StorePageEventOutcome, Vec<String>), String> {
+    let relay_manager = relay_manager(state).await;
+    let repository = StorePageRepository::new(state.database.pool().clone());
+    let current_page = fetch_current_store_page(
         &relay_manager,
         &repository,
-        signer.as_ref(),
         publisher,
-        &parsed_page,
-        &request.listing_mutations,
+        &draft.presentation_id,
     )
-    .await;
-    let complete = page_confirmed
-        && cache_error.is_none()
-        && listing_updates
-            .iter()
-            .all(|outcome| outcome.published && outcome.propagation_confirmed);
-    let retryable = !complete;
-    session.ensure_current()?;
-    Ok(PublishStorePageResponse {
-        store_page_coordinate: store_page_coordinate(publisher, &request.draft.presentation_id),
-        store_page: Some(EventPublishOutcome {
-            event_id: signed_page.id.to_hex(),
-            success_count,
-            failure_count,
-            propagation_confirmed: page_confirmed,
-        }),
-        listing_updates,
-        complete,
-        retryable,
-        cache_error,
-        retry_scope_complete: false,
-    })
+    .await?;
+    validate_store_page_revision(
+        draft.loaded_event_id.as_deref(),
+        current_page
+            .as_ref()
+            .map(|page| page.event.id.to_hex())
+            .as_deref(),
+    )
+    .map_err(|error| format!("Store Page: {error}"))?;
+    bundled_associations_unchanged(
+        &draft.listing_coordinates,
+        current_page
+            .as_ref()
+            .map(|page| page.listing_coordinates.as_slice()),
+        listing_coordinate,
+    )?;
+    let outcome = publish_store_page_event(
+        &relay_manager,
+        &repository,
+        signer,
+        publisher,
+        draft,
+        current_page.as_ref(),
+        session,
+    )
+    .await?;
+    let pointer = vec![
+        "store_page".to_string(),
+        store_page_coordinate(publisher, &draft.presentation_id),
+    ];
+    Ok((outcome, pointer))
 }
 
 #[tauri::command]
@@ -1013,9 +1244,32 @@ fn validate_publish_request(
     publisher: PublicKey,
     request: &PublishStorePageRequest,
 ) -> Result<(), String> {
-    validate_store_page_draft(&request.draft.build_params(publisher))
+    let validated = validate_store_page_draft(&request.draft.build_params(publisher))
         .map_err(|error| error.to_string())?;
+    // Publishing must not go around Preview: refuse a draft whose publisher
+    // input would be silently dropped from the published page.
+    if let Some(blocker) = authoring_blockers(&validated.diagnostics)
+        .into_iter()
+        .next()
+    {
+        return Err(blocker.message);
+    }
     validate_association_mutations(&request.draft, &request.listing_mutations)
+}
+
+/// Diagnostics that mean the published page would differ from the publisher's
+/// input, as blocking validation messages.
+fn authoring_blockers(
+    diagnostics: &[arcadestr_core::store_page::StorePageDiagnostic],
+) -> Vec<StorePageValidationDiagnostic> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.blocks_authoring())
+        .map(|diagnostic| StorePageValidationDiagnostic {
+            code: "omitted_input".to_string(),
+            message: diagnostic.describe(),
+        })
+        .collect()
 }
 
 fn validate_association_mutations(
@@ -1275,15 +1529,26 @@ async fn publish_pointer_update(
         &listing.id.to_hex(),
     )
     .map_err(|error| error.to_string())?;
-    if mutation.action == ListingPointerMutation::Unlink {
+    if matches!(
+        mutation.action,
+        ListingPointerMutation::Unlink | ListingPointerMutation::Link
+    ) {
         let expected_page = store_page_coordinate(publisher, &page.presentation_id);
         let current_pointer = parse_store_page_pointers(&listing)
             .map_err(|error| error.to_string())?
             .active;
-        if current_pointer
+        let points_here = current_pointer
             .as_ref()
-            .is_none_or(|pointer| pointer.coordinate != expected_page)
-        {
+            .is_some_and(|pointer| pointer.coordinate == expected_page);
+        // Already in the requested state: re-signing the listing would only
+        // churn its revision (and any purchase references to it) for nothing.
+        let already_done = match mutation.action {
+            ListingPointerMutation::Link => {
+                points_here && validate_store_page_association(&listing, page).is_ok()
+            }
+            _ => !points_here,
+        };
+        if already_done {
             let (_, author, identifier) = parse_coordinate(&mutation.listing_coordinate, 30402)?;
             let confirmed = confirm_exact_event(
                 relay_manager,
@@ -1528,6 +1793,117 @@ mod tests {
         assert_eq!(
             validate_publish_request(keys.public_key(), &request),
             Err("Store Page associations must exactly match requested listing links".to_string())
+        );
+    }
+
+    #[test]
+    fn a_listing_without_a_store_page_starts_one_from_its_own_fields() {
+        let keys = Keys::generate();
+        let listing = EventBuilder::new(Kind::Custom(30402), "Build robots.\n\nMore detail.")
+            .tags([
+                nostr::Tag::parse(["d", "game"]).expect("tag"),
+                nostr::Tag::parse(["title", "Cogmind"]).expect("tag"),
+                nostr::Tag::parse(["t", "Roguelike"]).expect("tag"),
+                nostr::Tag::parse(["image", "https://cdn.example/cover.png"]).expect("tag"),
+                nostr::Tag::parse(["image", "https://cdn.example/shot.png"]).expect("tag"),
+                nostr::Tag::parse(["image", "http://insecure.example/old.png"]).expect("tag"),
+            ])
+            .sign_with_keys(&keys)
+            .expect("signed listing");
+        let coordinate = format!("30402:{}:game", keys.public_key().to_hex());
+
+        let (draft, report) =
+            draft_started_from_listing("game".to_string(), coordinate.clone(), &listing);
+
+        assert_eq!(draft.listing_coordinates, vec![coordinate]);
+        assert_eq!(draft.content.basic.title.as_deref(), Some("Cogmind"));
+        assert_eq!(
+            draft.content.basic.summary.as_deref(),
+            Some("Build robots.")
+        );
+        assert_eq!(
+            draft.content.discovery.genres,
+            Some(vec!["Roguelike".to_string()])
+        );
+        let roles = draft
+            .content
+            .media
+            .iter()
+            .map(|item| item.role.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, ["capsule", "hero", "screenshot"]);
+        assert_eq!(report.media_added, 3);
+        assert_eq!(
+            report.skipped_images,
+            vec!["http://insecure.example/old.png"]
+        );
+    }
+
+    #[test]
+    fn bundled_page_is_associated_with_its_listing_and_validated_like_a_standalone_one() {
+        let keys = Keys::generate();
+        let listing = format!("30402:{}:game", keys.public_key().to_hex());
+        let mut draft = StorePageDraft::new("game".to_string(), Vec::new());
+        draft.content.basic.title = Some("Bundled".to_string());
+
+        let prepared = prepare_bundled_store_page(keys.public_key(), &listing, draft.clone())
+            .expect("valid bundled page");
+        assert_eq!(prepared.listing_coordinates, vec![listing.clone()]);
+        assert_eq!(prepared.compact_tags.title.as_deref(), Some("Bundled"));
+
+        draft.content.links.support = Some("not a url".to_string());
+        let error = prepare_bundled_store_page(keys.public_key(), &listing, draft)
+            .expect_err("dropped input blocks the whole publication");
+        assert!(error.starts_with("Store Page: The Support link"), "{error}");
+    }
+
+    #[test]
+    fn bundled_publication_never_changes_which_listings_share_a_page() {
+        let mine = "30402:pub:mine".to_string();
+        let other = "30402:pub:other".to_string();
+        // New page: exactly this listing.
+        assert!(bundled_associations_unchanged(&[mine.clone()], None, &mine).is_ok());
+        assert!(
+            bundled_associations_unchanged(&[mine.clone(), other.clone()], None, &mine).is_err()
+        );
+        // Existing shared page: its listings stay, this one may be added.
+        let current = [other.clone()];
+        assert!(bundled_associations_unchanged(
+            &[other.clone(), mine.clone()],
+            Some(&current),
+            &mine
+        )
+        .is_ok());
+        assert!(bundled_associations_unchanged(&[mine.clone()], Some(&current), &mine).is_err());
+    }
+
+    #[test]
+    fn publish_request_refuses_a_link_that_would_be_silently_dropped() {
+        let keys = Keys::generate();
+        let coordinate = format!("30402:{}:game", keys.public_key().to_hex());
+        let mut draft = StorePageDraft::new("page".to_string(), vec![coordinate.clone()]);
+        draft.content.links.support = Some("not a url".to_string());
+        let mut request = PublishStorePageRequest {
+            operation_id: None,
+            expected_publisher_npub: "unused".to_string(),
+            draft,
+            listing_mutations: vec![StorePageListingMutation {
+                listing_coordinate: coordinate,
+                expected_event_id: "event".to_string(),
+                action: ListingPointerMutation::Link,
+                relay_hint: None,
+                published_event_id: None,
+            }],
+        };
+
+        let error = validate_publish_request(keys.public_key(), &request)
+            .expect_err("invalid support link must block publishing");
+        assert!(error.starts_with("The Support link is not a valid HTTPS address"));
+
+        request.draft.content.links.support = Some("https://example.com/help".to_string());
+        assert_eq!(
+            validate_publish_request(keys.public_key(), &request),
+            Ok(())
         );
     }
 

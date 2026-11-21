@@ -40,6 +40,11 @@ pub struct PublishAdpListingRequestExtension {
     pub commercial_intent: crate::adp_settlement::PublisherCommercialIntent,
     pub launch_tier: Option<AdpLaunchTierIntent>,
     pub acknowledged_removed_profile_ids: Vec<ProfileId>,
+    /// Store Page published in the same operation as the listing. The backend
+    /// associates it with the listing coordinate, publishes it first and signs
+    /// the listing with the reciprocal `store_page` pointer already included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_page: Option<crate::store_page::StorePageDraft>,
 }
 
 /// Structured core-builder or exact-final-tag publication violation.
@@ -504,6 +509,7 @@ mod tests {
 
     fn extension() -> PublishAdpListingRequestExtension {
         PublishAdpListingRequestExtension {
+            store_page: None,
             authorize_operators: false,
             server_roles: Vec::new(),
             commercial_intent: Default::default(),

@@ -2305,6 +2305,7 @@ mod tests {
         let prepared = prepare_publish(
             request(),
             PublishAdpListingRequestExtension {
+                store_page: None,
                 authorize_operators: false,
                 server_roles: Vec::new(),
                 commercial_intent: Default::default(),

@@ -214,6 +214,24 @@ impl StorePageDraft {
             compact_tags: self.compact_tags.clone(),
         }
     }
+
+    /// Mirror the content fields into the compact discovery tags. Content stays
+    /// authoritative; the tags let clients that only read tags show a summary.
+    pub fn sync_compact_tags(&mut self) {
+        let content = &self.content;
+        self.compact_tags = StorePageCompactTags {
+            title: content.basic.title.clone(),
+            summary: content.basic.summary.clone(),
+            developer: content.basic.developer.clone(),
+            publisher: content.basic.publisher.clone(),
+            release_date: content.basic.release_date.clone(),
+            genres: content.discovery.genres.clone().unwrap_or_default(),
+            features: content.discovery.features.clone().unwrap_or_default(),
+            languages: content.languages.clone().unwrap_or_default(),
+            website: content.links.website.clone(),
+            support: content.links.support.clone(),
+        };
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +375,103 @@ pub enum StorePageDiagnostic {
         field: String,
         issue: MarkdownDiagnostic,
     },
+}
+
+impl StorePageDiagnostic {
+    /// Whether publishing a draft with this diagnostic would silently discard
+    /// something the publisher entered.
+    ///
+    /// Reading relay-derived pages stays lenient (invalid optional fields are
+    /// dropped), but authoring must not publish a page that differs from what
+    /// the publisher typed without telling them.
+    pub fn blocks_authoring(&self) -> bool {
+        matches!(self, Self::OptionalFieldOmitted { .. })
+    }
+
+    /// Plain-language explanation suitable for showing to a publisher.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::ContentOverridesTag(tag) => format!(
+                "The {} in the page content replaces the compact {tag} tag.",
+                tag.replace('_', " ")
+            ),
+            Self::OptionalFieldOmitted { field, reason } => {
+                let subject = describe_field(field);
+                let problem = match reason {
+                    OptionalFieldReason::InvalidUrl => {
+                        "is not a valid HTTPS address (for example https://example.com/page)"
+                    }
+                    OptionalFieldReason::UnsupportedMediaType => {
+                        "has a media type that does not match its role"
+                    }
+                    OptionalFieldReason::UnsupportedVideoFormat => {
+                        "must be a direct .mp4 or .webm video file"
+                    }
+                    OptionalFieldReason::DuplicateSingletonRole => {
+                        "repeats a role that only one media item may have"
+                    }
+                    OptionalFieldReason::MissingMediaReference => {
+                        "refers to media that is not in the page"
+                    }
+                    OptionalFieldReason::UnsupportedLayout => "uses an unsupported layout",
+                };
+                format!("{subject} {problem}. Fix or clear it before publishing.")
+            }
+            Self::MarkdownSanitized { field, issue } => {
+                let removed = match issue {
+                    MarkdownDiagnostic::RawHtmlRemoved => "Raw HTML",
+                    MarkdownDiagnostic::UnsafeLinkRemoved => "A link",
+                    MarkdownDiagnostic::UnsafeImageRemoved => "An image",
+                };
+                format!(
+                    "{removed} in {} will be removed when the page is shown.",
+                    describe_field(field).to_lowercase()
+                )
+            }
+        }
+    }
+}
+
+/// Human label for a diagnostic field path such as `links.support`,
+/// `media[hero].url` or `sections[intro].body_markdown`.
+fn describe_field(field: &str) -> String {
+    let link_label = |name: &str| match name {
+        "website" => "Website",
+        "support" => "Support",
+        "documentation" => "Documentation",
+        "source" => "Source",
+        "community" => "Community",
+        "privacy_policy" => "Privacy policy",
+        _ => "A",
+    };
+    if let Some(name) = field.strip_prefix("links.") {
+        return format!("The {} link", link_label(name));
+    }
+    let indexed = |prefix: &str| {
+        field.strip_prefix(prefix).and_then(|rest| {
+            rest.split_once(']')
+                .map(|(id, tail)| (id.to_string(), tail.trim_start_matches('.').to_string()))
+        })
+    };
+    if let Some((id, tail)) = indexed("media[") {
+        return match tail.as_str() {
+            "url" => format!("The URL of media ‘{id}’"),
+            "thumbnail_url" => format!("The thumbnail URL of media ‘{id}’"),
+            _ => format!("Media ‘{id}’"),
+        };
+    }
+    if let Some((id, tail)) = indexed("sections[") {
+        return match tail.as_str() {
+            "body_markdown" => format!("The text of section ‘{id}’"),
+            "media_id" => format!("The media choice of section ‘{id}’"),
+            "layout" => format!("The layout of section ‘{id}’"),
+            _ => format!("Section ‘{id}’"),
+        };
+    }
+    match field {
+        "description_markdown" => "The description".to_string(),
+        other => format!("The {} field", other.replace(['_', '.'], " ")),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -2404,6 +2519,63 @@ mod tests {
         assert!(cloned.listing_coordinates.is_empty());
         assert_eq!(cloned.loaded_event_id, None);
         assert_eq!(cloned.content, draft.content);
+    }
+
+    #[test]
+    fn authoring_flags_publisher_input_the_sanitizer_would_drop() {
+        let keys = Keys::generate();
+        let mut draft = StorePageDraft::new("page".to_string(), vec![coordinate(&keys, "listing")]);
+        draft.content = content("Arcade One");
+        draft.content.links.website = Some("https://example.com/game".to_string());
+        draft.content.links.support = Some("not a url".to_string());
+
+        let validated = validate_store_page_draft(&draft.build_params(keys.public_key()))
+            .expect("structurally valid draft");
+        let blocking = validated
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.blocks_authoring())
+            .collect::<Vec<_>>();
+
+        assert_eq!(blocking.len(), 1, "only the invalid support link blocks");
+        let message = blocking[0].describe();
+        assert!(message.starts_with("The Support link is not a valid HTTPS address"));
+        assert!(!message.contains("OptionalFieldOmitted"));
+        assert!(!message.contains("links.support"));
+    }
+
+    #[test]
+    fn diagnostic_descriptions_name_media_and_sections_without_debug_syntax() {
+        let media = StorePageDiagnostic::OptionalFieldOmitted {
+            field: "media[hero].url".to_string(),
+            reason: OptionalFieldReason::InvalidUrl,
+        };
+        assert!(media
+            .describe()
+            .starts_with("The URL of media ‘hero’ is not"));
+        assert!(media.blocks_authoring());
+
+        let section = StorePageDiagnostic::MarkdownSanitized {
+            field: "sections[intro].body_markdown".to_string(),
+            issue: MarkdownDiagnostic::RawHtmlRemoved,
+        };
+        assert_eq!(
+            section.describe(),
+            "Raw HTML in the text of section ‘intro’ will be removed when the page is shown."
+        );
+        assert!(!section.blocks_authoring());
+
+        for field in ["", "media[", "sections[]", "links.", "weird.field_name"] {
+            let unknown = StorePageDiagnostic::OptionalFieldOmitted {
+                field: field.to_string(),
+                reason: OptionalFieldReason::UnsupportedLayout,
+            };
+            let text = unknown.describe();
+            assert!(
+                !text.contains('{') && !text.contains("OptionalField"),
+                "{text}"
+            );
+        }
     }
 
     #[test]

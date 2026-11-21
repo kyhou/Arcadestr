@@ -128,6 +128,7 @@ pub mod store_page_content_policy;
 pub mod store_page_discovery;
 #[cfg(feature = "native")]
 pub mod store_page_repository;
+pub mod store_page_seed;
 
 #[cfg(feature = "native")]
 pub mod lnurlp;
