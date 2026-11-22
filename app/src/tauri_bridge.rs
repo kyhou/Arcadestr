@@ -1704,6 +1704,33 @@ pub async fn invoke_save_publisher_draft(
     Err("Publisher drafts require the desktop app".into())
 }
 #[cfg(not(feature = "web"))]
+pub async fn invoke_delete_publisher_draft(
+    publisher: String,
+    draft_id: String,
+    kind: String,
+    expected_revision: u64,
+) -> Result<(), String> {
+    crate::tauri_invoke::invoke(
+        "delete_publisher_draft",
+        serde_json::json!({"request":{
+            "expected_publisher_npub":publisher,
+            "draft_id":draft_id,
+            "kind":kind,
+            "expected_revision":expected_revision,
+        }}),
+    )
+    .await
+}
+#[cfg(feature = "web")]
+pub async fn invoke_delete_publisher_draft(
+    _: String,
+    _: String,
+    _: String,
+    _: u64,
+) -> Result<(), String> {
+    Err("Publisher drafts require the desktop app".into())
+}
+#[cfg(not(feature = "web"))]
 pub async fn invoke_resume_publisher_operation(
     publisher: String,
     operation_id: String,

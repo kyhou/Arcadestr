@@ -147,6 +147,25 @@ pub mod repository {
             Ok(next as u64)
         }
 
+        /// Removes one draft only when the caller observed its current revision,
+        /// so a stale editor cannot delete a newer draft written elsewhere.
+        pub async fn delete_draft(
+            &self,
+            publisher: &str,
+            draft_id: &str,
+            kind: &str,
+            expected: u64,
+        ) -> Result<(), String> {
+            let expected = i64::try_from(expected).map_err(|_| "Invalid draft revision")?;
+            let changed = sqlx::query("DELETE FROM publisher_drafts WHERE publisher=? AND draft_id=? AND kind=? AND revision=?")
+                .bind(publisher).bind(draft_id).bind(kind).bind(expected)
+                .execute(&self.pool).await.map_err(db)?.rows_affected();
+            if changed != 1 {
+                return Err("Draft changed on this device or no longer exists".into());
+            }
+            Ok(())
+        }
+
         pub async fn drafts(&self, publisher: &str) -> Result<Vec<PublisherDraft>, String> {
             sqlx::query("SELECT draft_id,kind,payload_json,revision FROM publisher_drafts WHERE publisher=? ORDER BY updated_at DESC")
                 .bind(publisher).fetch_all(&self.pool).await.map_err(db)?.into_iter().map(|row| Ok(PublisherDraft {

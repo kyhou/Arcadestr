@@ -326,6 +326,33 @@ pub async fn save_publisher_draft(
     Ok(revision)
 }
 
+#[derive(Deserialize)]
+pub struct DeletePublisherDraftRequest {
+    pub expected_publisher_npub: String,
+    pub draft_id: String,
+    pub kind: String,
+    pub expected_revision: u64,
+}
+
+#[tauri::command]
+pub async fn delete_publisher_draft(
+    request: DeletePublisherDraftRequest,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (publisher, session) = account(&state, &request.expected_publisher_npub).await?;
+    let repo = PublisherRepository::new(state.database.pool().clone());
+    session.ensure_current()?;
+    repo.delete_draft(
+        &publisher,
+        &request.draft_id,
+        &request.kind,
+        request.expected_revision,
+    )
+    .await?;
+    session.ensure_current()?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn publisher_recovery_state(
     expected_publisher_npub: String,

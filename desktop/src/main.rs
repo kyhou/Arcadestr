@@ -8557,6 +8557,7 @@ fn main() {
             adp_commands::check_adp_server,
             adp_commands::preview_publisher_terms,
             publisher_commands::save_publisher_draft,
+            publisher_commands::delete_publisher_draft,
             publisher_commands::publisher_recovery_state,
             publisher_management::publisher_distribution_state,
             publisher_management::review_publisher_credential,

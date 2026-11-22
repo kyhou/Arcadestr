@@ -65,6 +65,52 @@ async fn drafts_survive_restart_are_account_scoped_and_reject_stale_writers() {
 }
 
 #[tokio::test]
+async fn deleting_a_draft_requires_owner_kind_and_current_revision() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let db = Database::new(&temp.path().join("publisher.db"))
+        .await
+        .expect("database");
+    let repo = PublisherRepository::new(db.pool().clone());
+    let draft = PublisherDraft {
+        draft_id: "local:game".into(),
+        kind: "listing".into(),
+        payload: json!({"title":"Draft"}),
+        revision: 0,
+    };
+    repo.save_draft("alice", &draft, None).await.expect("save");
+    repo.save_draft("alice", &draft, Some(1))
+        .await
+        .expect("update");
+
+    assert!(repo
+        .delete_draft("bob", "local:game", "listing", 2)
+        .await
+        .is_err());
+    assert!(repo
+        .delete_draft("alice", "local:game", "store_page", 2)
+        .await
+        .is_err());
+    assert!(repo
+        .delete_draft("alice", "local:game", "listing", 1)
+        .await
+        .is_err());
+    assert!(repo
+        .delete_draft("alice", "unknown", "listing", 2)
+        .await
+        .is_err());
+    assert_eq!(repo.drafts("alice").await.expect("kept").len(), 1);
+
+    repo.delete_draft("alice", "local:game", "listing", 2)
+        .await
+        .expect("delete");
+    assert!(repo.drafts("alice").await.expect("deleted").is_empty());
+    assert!(repo
+        .delete_draft("alice", "local:game", "listing", 2)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn interruption_before_and_after_each_side_effect_retains_uncertainty_without_execution() {
     let temp = tempfile::tempdir().expect("temporary directory");
     for (index, kind) in [
