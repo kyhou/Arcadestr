@@ -51,10 +51,7 @@ pub use page_container::{ClippedPanel, PageContainer};
 pub use page_header::PageHeader;
 pub use status_chip::{StatusChip, StatusChipSize, StatusChipVariant};
 pub use store_page_detail::StorePageRichDetail;
-pub use tabs::{
-    PageTabItem, PageTabSemantics, PageTabTarget, PageTabs, PublisherDestination, PublisherTabItem,
-    PublisherTabs,
-};
+pub use tabs::{PageTabItem, PageTabSemantics, PageTabTarget, PageTabs};
 pub use topbar::TopBar;
 pub use transient::{
     close_transient_on_outside_pointer, close_transient_when_modal_opens, focus_transient_invoker,

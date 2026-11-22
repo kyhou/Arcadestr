@@ -274,83 +274,6 @@ pub fn PageTabs(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PublisherDestination {
-    Dashboard,
-    CreateGame,
-    ManageGame,
-    StorePage,
-    Releases,
-    Promotions,
-    Activity,
-}
-
-impl PublisherDestination {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Dashboard => "Dashboard",
-            Self::CreateGame => "Create Game",
-            Self::ManageGame => "Manage Game",
-            Self::StorePage => "Store Page",
-            Self::Releases => "Releases",
-            Self::Promotions => "Promotions",
-            Self::Activity => "Activity",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PublisherTabItem {
-    pub destination: PublisherDestination,
-    pub enabled: bool,
-    pub unavailable_reason: Option<&'static str>,
-}
-
-#[component]
-pub fn PublisherTabs(
-    items: Vec<PublisherTabItem>,
-    active: Signal<PublisherDestination>,
-    on_select: Callback<PublisherDestination>,
-    #[prop(optional, into)] aria_label: Option<String>,
-) -> impl IntoView {
-    let page_items = items
-        .iter()
-        .map(|item| {
-            let id = format!("{:?}", item.destination);
-            let mut tab = PageTabItem::local(id, item.destination.label());
-            if !item.enabled {
-                tab = tab.disabled_with_reason(
-                    item.unavailable_reason
-                        .unwrap_or("This destination is unavailable."),
-                );
-            }
-            tab
-        })
-        .collect::<Vec<_>>();
-    let selected = Signal::derive(move || format!("{:?}", active.get()));
-    let destination_items = items.clone();
-    let activate = Callback::new(move |id: String| {
-        if let Some(item) = destination_items
-            .iter()
-            .find(|item| format!("{:?}", item.destination) == id && item.enabled)
-        {
-            on_select.run(item.destination);
-        }
-    });
-
-    view! {
-        <div class="arc-publisher-tabs">
-            <PageTabs
-                items=page_items
-                selected=selected
-                on_select=activate
-                aria_label=aria_label.unwrap_or_else(|| "Publisher navigation".to_string())
-                semantics=PageTabSemantics::Navigation
-            />
-        </div>
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,13 +298,5 @@ mod tests {
         assert_eq!(tab_move_for_key("ArrowRight"), Some(TabMove::Next));
         assert_eq!(tab_move_for_key("ArrowLeft"), Some(TabMove::Previous));
         assert_eq!(tab_move_for_key("Enter"), None);
-    }
-
-    #[test]
-    fn publisher_destinations_have_stable_truthful_labels() {
-        assert_eq!(PublisherDestination::Dashboard.label(), "Dashboard");
-        assert_eq!(PublisherDestination::StorePage.label(), "Store Page");
-        assert_eq!(PublisherDestination::Promotions.label(), "Promotions");
-        assert_eq!(PublisherDestination::Activity.label(), "Activity");
     }
 }

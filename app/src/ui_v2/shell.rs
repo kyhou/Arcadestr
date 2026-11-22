@@ -43,9 +43,11 @@ fn unsaved_work_for_route(
     store_page_dirty: bool,
 ) -> Option<UnsavedWork> {
     match view {
-        UiV2View::Publish(
-            PublishViewState::NewPublication | PublishViewState::EditPublication(_),
-        ) if publish_game_is_dirty => Some(UnsavedWork::PublishGame),
+        UiV2View::Publish(PublishViewState::NewGame { .. } | PublishViewState::Game { .. })
+            if publish_game_is_dirty =>
+        {
+            Some(UnsavedWork::PublishGame)
+        }
         UiV2View::Publish(PublishViewState::StorePage(_)) if store_page_dirty => {
             Some(UnsavedWork::StorePage)
         }
@@ -125,7 +127,7 @@ mod tests {
 
     #[test]
     fn leaving_a_dirty_create_game_form_is_guarded() {
-        let view = UiV2View::Publish(PublishViewState::NewPublication);
+        let view = UiV2View::Publish(PublishViewState::NewGame { draft_id: None });
         assert_eq!(
             unsaved_work_for_route(&view, true, false),
             Some(UnsavedWork::PublishGame)
@@ -137,8 +139,8 @@ mod tests {
     }
 
     #[test]
-    fn leaving_a_dirty_edit_game_form_is_guarded() {
-        let view = UiV2View::Publish(PublishViewState::EditPublication(listing()));
+    fn leaving_a_live_game_with_unsaved_edits_is_guarded() {
+        let view = UiV2View::Publish(PublishViewState::game(listing()));
         assert_eq!(
             unsaved_work_for_route(&view, true, false),
             Some(UnsavedWork::PublishGame)
@@ -162,7 +164,7 @@ mod tests {
     fn clean_editors_never_block_navigation() {
         assert_eq!(
             unsaved_work_for_route(
-                &UiV2View::Publish(PublishViewState::NewPublication),
+                &UiV2View::Publish(PublishViewState::NewGame { draft_id: None }),
                 false,
                 false
             ),
@@ -170,7 +172,7 @@ mod tests {
         );
         assert_eq!(
             unsaved_work_for_route(
-                &UiV2View::Publish(PublishViewState::EditPublication(listing())),
+                &UiV2View::Publish(PublishViewState::game(listing())),
                 false,
                 false
             ),
@@ -190,7 +192,7 @@ mod tests {
     #[test]
     fn dirty_state_in_one_editor_does_not_block_navigation_from_another_screen() {
         // Dirty editor state must not guard the Library, Store, Games list, or
-        // a game's manage route.
+        // a promotion editor.
         assert_eq!(unsaved_work_for_route(&UiV2View::Library, true, true), None);
         assert_eq!(unsaved_work_for_route(&UiV2View::Store, true, true), None);
         assert_eq!(
@@ -199,7 +201,10 @@ mod tests {
         );
         assert_eq!(
             unsaved_work_for_route(
-                &UiV2View::Publish(PublishViewState::Game(listing())),
+                &UiV2View::Publish(PublishViewState::Campaign {
+                    listing: listing(),
+                    campaign: None
+                }),
                 true,
                 true
             ),
@@ -217,7 +222,7 @@ mod tests {
     fn signing_out_of_a_dirty_editor_is_guarded_like_any_other_navigation() {
         // Sign-out routes through the same interception point, so the guard
         // decision is identical to a route change.
-        let view = UiV2View::Publish(PublishViewState::NewPublication);
+        let view = UiV2View::Publish(PublishViewState::NewGame { draft_id: None });
         assert_eq!(
             guard_navigation(unsaved_work_for_route(&view, true, false)),
             NavigationGuard::Confirm(UnsavedWork::PublishGame)
@@ -387,7 +392,7 @@ mod tests {
     fn account_switch_resets_contextual_publisher_routes() {
         assert!(should_reset_publisher_route(
             true,
-            &UiV2View::Publish(PublishViewState::NewPublication)
+            &UiV2View::Publish(PublishViewState::NewGame { draft_id: None })
         ));
         assert!(!should_reset_publisher_route(
             true,

@@ -38,7 +38,8 @@ use crate::ui_v2::components::aria::aria_bool;
 use crate::ui_v2::components::blossom_media_upload::publisher_hex;
 use crate::ui_v2::components::{
     Button, ButtonVariant, Dialog, DialogCloseAction, DialogClosePolicy, DialogCloseRequest,
-    DialogDismissal, DialogInitialFocus, DialogTone, DialogWidth,
+    DialogDismissal, DialogInitialFocus, DialogTone, DialogWidth, GameCard, GameCardPresentation,
+    PlatformCompatibility, StatusChip, StatusChipSize, StorePageRichDetail,
 };
 use crate::ui_v2::views::publish::{
     publisher_signer_state, signer_can_publish, PublisherSignerState,
@@ -81,164 +82,373 @@ enum AcquisitionKind {
     TimedAccess,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum PublishStage {
-    Details,
-    Media,
+/// A part of the game hub. `Overview` is the hub itself; the other sections are
+/// the independently editable parts a game is assembled from, opened in any order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum HubSection {
+    #[default]
+    Overview,
+    Basics,
     StorePage,
-    Pricing,
-    Builds,
-    Review,
+    PriceAccess,
+    Delivery,
 }
 
-impl PublishStage {
-    const ALL: [Self; 6] = [
-        Self::Details,
-        Self::Media,
+impl HubSection {
+    pub(crate) const EDITABLE: [Self; 4] = [
+        Self::Basics,
         Self::StorePage,
-        Self::Pricing,
-        Self::Builds,
-        Self::Review,
+        Self::PriceAccess,
+        Self::Delivery,
     ];
 
-    fn index(self) -> usize {
-        match self {
-            Self::Details => 0,
-            Self::Media => 1,
-            Self::StorePage => 2,
-            Self::Pricing => 3,
-            Self::Builds => 4,
-            Self::Review => 5,
-        }
-    }
-
-    /// The step that owns a Store Page field group.
+    /// The section that owns a Store page field group.
     fn for_store_page_group(group: &str) -> Self {
         match group {
-            "basic" | "description" => Self::Details,
-            "media" => Self::Media,
-            "requirements" => Self::Builds,
+            "basic" => Self::Basics,
             _ => Self::StorePage,
         }
     }
 
-    fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         match self {
-            Self::Details => "Game details",
-            Self::Media => "Media",
+            Self::Overview => "Overview",
+            Self::Basics => "Basics",
             Self::StorePage => "Store page",
-            Self::Pricing => "Pricing and access",
-            Self::Builds => "Builds and distribution",
-            Self::Review => "Review and publish",
+            Self::PriceAccess => "Price & access",
+            Self::Delivery => "Delivery & builds",
         }
     }
 
-    fn next(self) -> Option<Self> {
-        Self::ALL.get(self.index() + 1).copied()
+    fn description(self) -> &'static str {
+        match self {
+            Self::Overview => "Everything your game needs, in any order.",
+            Self::Basics => "The title, summary and tags players see on game cards.",
+            Self::StorePage => {
+                "Your store page: description, media, feature sections, system requirements, languages, accessibility and links."
+            }
+            Self::PriceAccess => "Whether players pay for the game or get it for free.",
+            Self::Delivery => "How players get your game, and the build they receive.",
+        }
     }
 
-    fn previous(self) -> Option<Self> {
-        self.index()
-            .checked_sub(1)
-            .and_then(|index| Self::ALL.get(index).copied())
+    fn dom_id(self) -> &'static str {
+        match self {
+            Self::Overview => "game-hub-overview",
+            Self::Basics => "game-hub-basics",
+            Self::StorePage => "game-hub-store-page",
+            Self::PriceAccess => "game-hub-price",
+            Self::Delivery => "game-hub-delivery",
+        }
     }
 }
 
-/// Drafts are explicitly saved to account-scoped native storage, not localStorage.
-const SUPPORTS_DRAFTS: bool = true;
+/// Tabs of the Store page section, each with the field groups it renders.
+const STORE_PAGE_TABS: [(&str, &str, &[&str]); 7] = [
+    ("description", "Description", &["description"]),
+    ("media", "Media", &["media"]),
+    ("sections", "Feature sections", &["sections"]),
+    ("requirements", "System requirements", &["requirements"]),
+    ("languages", "Languages", &["languages"]),
+    ("accessibility", "Accessibility", &["accessibility"]),
+    ("links", "Links", &["links"]),
+];
 
-/// Truthful state of a single stage in the indicator.
-///
-/// `Complete` is never inferred from "was visited": a passed stage whose fields
-/// were later broken reports `NeedsAttention`.
+/// Truthful state of one checklist row. A section is only `Ready` when its
+/// current values validate; having been visited never counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StageStatus {
-    Complete,
+enum SectionStatus {
+    Ready,
+    /// Publishable, but missing things players benefit from.
+    Suggestions,
     NeedsAttention,
-    Current,
-    Upcoming,
 }
 
-fn stage_status(stage: PublishStage, current: PublishStage, valid: bool) -> StageStatus {
-    if stage == current {
-        StageStatus::Current
-    } else if stage.index() < current.index() {
-        if valid {
-            StageStatus::Complete
-        } else {
-            StageStatus::NeedsAttention
-        }
-    } else {
-        StageStatus::Upcoming
+/// Blocking problems win; otherwise outstanding suggestions keep a section
+/// from claiming it is finished.
+fn section_status(result: &Result<(), String>, suggestions: usize) -> SectionStatus {
+    match (result, suggestions) {
+        (Err(_), _) => SectionStatus::NeedsAttention,
+        (Ok(()), 0) => SectionStatus::Ready,
+        (Ok(()), _) => SectionStatus::Suggestions,
     }
 }
 
-/// Forward jumping stays blocked: a stage is only reachable once the workflow has
-/// already validated its way there.
-fn stage_reachable(stage: PublishStage, current: PublishStage) -> bool {
-    stage.index() <= current.index()
-}
-
-impl StageStatus {
+impl SectionStatus {
     fn class(self) -> &'static str {
         match self {
-            Self::Complete => "v2-create-stage-complete",
-            Self::NeedsAttention => "v2-create-stage-attention",
-            Self::Current => "v2-create-stage-current",
-            Self::Upcoming => "v2-create-stage-upcoming",
+            Self::Ready => "v2-hub-row-ready",
+            Self::Suggestions => "v2-hub-row-suggestions",
+            Self::NeedsAttention => "v2-hub-row-attention",
         }
     }
 
     fn label(self) -> &'static str {
         match self {
-            Self::Complete => "Complete",
+            Self::Ready => "Ready",
+            Self::Suggestions => "Can be improved",
             Self::NeedsAttention => "Needs attention",
-            Self::Current => "Current",
-            Self::Upcoming => "Not started",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Ready => "✓",
+            Self::Suggestions => "○",
+            Self::NeedsAttention => "!",
+        }
+    }
+
+    fn action(self) -> &'static str {
+        match self {
+            Self::Ready => "Edit >",
+            Self::Suggestions => "Improve >",
+            Self::NeedsAttention => "Fix >",
         }
     }
 }
 
-/// Blocking issues gathered across stages for the review summary, in stage order.
-fn blocking_stage_errors(
-    results: &[(PublishStage, Result<(), String>)],
-) -> Vec<(PublishStage, String)> {
+/// Store page suggestions, most useful first: an empty description and the
+/// images on game cards matter more than a trailer.
+fn prioritized_suggestions(recommendations: &[String]) -> Vec<String> {
+    let rank = |item: &String| {
+        if item.starts_with("Add a description") {
+            0
+        } else if item.starts_with("Add a capsule") {
+            1
+        } else if item.starts_with("Add a hero") {
+            2
+        } else {
+            3
+        }
+    };
+    let mut items = recommendations.to_vec();
+    items.sort_by_key(rank);
+    items
+}
+
+/// Blocking issues gathered across sections, in checklist order.
+fn blocking_section_errors(
+    results: &[(HubSection, Result<(), String>)],
+) -> Vec<(HubSection, String)> {
     results
         .iter()
-        .filter_map(|(stage, result)| result.as_ref().err().map(|error| (*stage, error.clone())))
+        .filter_map(|(section, result)| {
+            result.as_ref().err().map(|error| (*section, error.clone()))
+        })
         .collect()
 }
 
-/// Where the workflow stands for the author, kept separate from publication
-/// outcome so a local edit is never described as a published listing.
+/// How players get the game. One explicit choice replaces the separate
+/// "automated installation" toggle and download-only/launchable switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryChoice {
+    Install,
+    DownloadOnly,
+    StorePageOnly,
+}
+
+impl DeliveryChoice {
+    const ALL: [Self; 3] = [Self::Install, Self::DownloadOnly, Self::StorePageOnly];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Install => "Arcadestr installs it",
+            Self::DownloadOnly => "Download only",
+            Self::StorePageOnly => "Store page only",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Install => {
+                "Recommended. Upload your game; players install it and press Play in their library."
+            }
+            Self::DownloadOnly => "Upload your game; players download the file and run it themselves.",
+            Self::StorePageOnly => {
+                "No build yet. Publish the store page now (for example, coming soon) and add a build later."
+            }
+        }
+    }
+
+    fn uses_build(self) -> bool {
+        !matches!(self, Self::StorePageOnly)
+    }
+}
+
+/// The delivery choice the current form expresses, or `None` until a new game
+/// has made one. Existing games always have a choice.
+fn delivery_choice(chosen: bool, build_enabled: bool, launchable: bool) -> Option<DeliveryChoice> {
+    if !chosen {
+        None
+    } else if !build_enabled {
+        Some(DeliveryChoice::StorePageOnly)
+    } else if launchable {
+        Some(DeliveryChoice::Install)
+    } else {
+        Some(DeliveryChoice::DownloadOnly)
+    }
+}
+
+/// Apply a delivery choice to the settings the publish request is built from.
+/// Returns whether the distribution settings and the launch mode changed.
+fn apply_delivery_choice(
+    choice: DeliveryChoice,
+    fulfillment_enabled: &mut bool,
+    fulfillment_mode: &mut FulfillmentMode,
+    state: &mut PublishState,
+    platforms: &str,
+) -> (bool, bool) {
+    let enable = choice.uses_build();
+    let distribution_changed = enable != *fulfillment_enabled;
+    if distribution_changed {
+        *fulfillment_enabled = enable;
+        if enable && *fulfillment_mode == FulfillmentMode::None {
+            *fulfillment_mode = FulfillmentMode::Delegate;
+        } else if !enable {
+            *fulfillment_mode = FulfillmentMode::None;
+        }
+    }
+    let launch_changed = super::publish_launch::apply_launch_choice(
+        state,
+        choice == DeliveryChoice::Install,
+        platforms,
+    );
+    (distribution_changed, launch_changed)
+}
+
+/// What publishing a live game's changes has to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateScope {
+    /// The whole game: listing, store page, build and distribution.
+    FullGame,
+    /// Only the store page; the game itself is unchanged.
+    StorePageOnly,
+}
+
+/// Choose the smallest publish that carries every change. Anything the game
+/// itself publishes (basics, price, delivery, or the card and screenshot
+/// images, which are also the game's images) needs the full publish, as does
+/// a store page the game doesn't point to yet. When unsure, publish it all.
+fn update_scope(
+    editing: bool,
+    distribution_settled: bool,
+    game_fields_changed: bool,
+    distribution_changed: bool,
+    game_images_changed: bool,
+    store_page_changed: bool,
+    store_page_linked: bool,
+) -> UpdateScope {
+    if editing
+        && distribution_settled
+        && store_page_linked
+        && store_page_changed
+        && !game_fields_changed
+        && !distribution_changed
+        && !game_images_changed
+    {
+        UpdateScope::StorePageOnly
+    } else {
+        UpdateScope::FullGame
+    }
+}
+
+/// Where the game stands for the author, kept separate from publication
+/// outcome so a local edit is never described as published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthoringState {
-    NotStarted,
-    UnsavedChanges,
-    Blocked,
-    ReadyToPublish,
+    DraftIncomplete,
+    DraftReady,
+    Live,
+    LiveChanged,
+    LiveChangedBlocked,
 }
 
 fn authoring_state(editing: bool, dirty: bool, blocking_issues: usize) -> AuthoringState {
-    if blocking_issues == 0 {
-        AuthoringState::ReadyToPublish
-    } else if dirty {
-        AuthoringState::UnsavedChanges
-    } else if editing {
-        AuthoringState::Blocked
-    } else {
-        AuthoringState::NotStarted
+    match (editing, dirty, blocking_issues == 0) {
+        (false, _, false) => AuthoringState::DraftIncomplete,
+        (false, _, true) => AuthoringState::DraftReady,
+        (true, false, _) => AuthoringState::Live,
+        (true, true, true) => AuthoringState::LiveChanged,
+        (true, true, false) => AuthoringState::LiveChangedBlocked,
     }
 }
 
 impl AuthoringState {
     fn label(self) -> &'static str {
         match self {
-            Self::NotStarted => "Nothing entered yet",
-            Self::UnsavedChanges => "Unsaved changes · not publishable yet",
-            Self::Blocked => "Required information is missing",
-            Self::ReadyToPublish => "Ready to publish",
+            Self::DraftIncomplete => "Draft · not ready to publish",
+            Self::DraftReady => "Draft · ready to publish",
+            Self::Live => "Live",
+            Self::LiveChanged => "Live · changes not published yet",
+            Self::LiveChangedBlocked => "Live · changes need attention",
         }
+    }
+
+    fn chip(self) -> crate::ui_v2::components::StatusChipVariant {
+        use crate::ui_v2::components::StatusChipVariant;
+        match self {
+            Self::DraftIncomplete | Self::DraftReady => StatusChipVariant::Draft,
+            Self::Live => StatusChipVariant::Published,
+            Self::LiveChanged => StatusChipVariant::Draft,
+            Self::LiveChangedBlocked => StatusChipVariant::Warning,
+        }
+    }
+}
+
+/// Autosave state of the game's local draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DraftSaveStatus {
+    Idle,
+    Pending,
+    Saving,
+    Saved,
+    Failed(String),
+    Conflict,
+}
+
+impl DraftSaveStatus {
+    fn label(&self) -> Option<String> {
+        match self {
+            Self::Idle => None,
+            Self::Pending | Self::Saving => Some("Saving draft…".into()),
+            Self::Saved => Some("Draft saved on this device".into()),
+            Self::Failed(error) => Some(format!("Couldn't save draft: {error}")),
+            Self::Conflict => {
+                Some("This draft was changed in another window. Reload it to keep editing.".into())
+            }
+        }
+    }
+
+    /// Leaving would lose edits that are not yet in the local draft.
+    fn unsaved(&self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Saving | Self::Failed(_) | Self::Conflict
+        )
+    }
+}
+
+/// Local draft key of a game: the published identifier when there is one,
+/// otherwise the id minted when the draft was created.
+pub(crate) fn game_draft_id(published_d_tag: Option<&str>, local_id: Option<&str>) -> String {
+    match (published_d_tag, local_id) {
+        (Some(d_tag), _) => format!("listing:{d_tag}"),
+        (None, Some(local)) if local.starts_with("local:") => local.to_string(),
+        (None, Some(local)) => format!("local:{local}"),
+        (None, None) => format!("local:{}", uuid::Uuid::new_v4()),
+    }
+}
+
+/// Run `callback` once after `delay_ms` in the browser event loop.
+pub(crate) fn after_delay(delay_ms: i32, callback: impl FnOnce() + 'static) {
+    use wasm_bindgen::JsCast;
+    let closure = wasm_bindgen::closure::Closure::once_into_js(callback);
+    if let Some(window) = web_sys::window() {
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.unchecked_ref(),
+            delay_ms,
+        );
     }
 }
 
@@ -299,17 +509,15 @@ impl PublicationPhase {
 /// publisher signer state so both publisher surfaces gate identically.
 fn signer_requirement_message(state: PublisherSignerState) -> &'static str {
     match state {
-        PublisherSignerState::Available => {
-            "Network publication is authorized by the active account signer."
-        }
+        PublisherSignerState::Available => "Publishing is signed by your active account.",
         PublisherSignerState::Connecting => {
-            "Network publication is unavailable while the remote signer connects."
+            "Publishing is unavailable while your signing app connects. You can keep editing."
         }
         PublisherSignerState::Unavailable => {
-            "Network publication requires an available signer for the active account."
+            "Reconnect your signing app in Settings to publish. You can keep editing."
         }
         PublisherSignerState::Unknown => {
-            "Network publication stays unavailable until signer availability is resolved."
+            "Publishing is unavailable until your signing app is checked. You can keep editing."
         }
     }
 }
@@ -352,6 +560,9 @@ struct DurableListingDraft {
     /// The Store Page edited with the game, including its media.
     #[serde(default)]
     store_page: Option<StorePageDraft>,
+    /// Whether the author has chosen how players get the game.
+    #[serde(default)]
+    delivery_chosen: bool,
 }
 
 fn reviewed_commercial_intent(
@@ -366,33 +577,49 @@ fn reviewed_commercial_intent(
             Some(review) if &review.context == context => {
                 Ok(PublisherCommercialIntent::ReplaceAfterReview { review })
             }
-            _ => Err("Commercial review is stale; retrieve exact signed terms again".into()),
+            _ => Err(
+                "The price or services changed since you reviewed the fee terms. Get the service's terms again."
+                    .into(),
+            ),
         },
-        "replace" => {
-            Err("Review the signed terms and explicitly approve their allocation first".into())
-        }
-        _ => {
-            Err("Operator retirement is unavailable pending an agreed prospective workflow".into())
-        }
+        "replace" => Err("Review and accept the distribution service's fee terms first.".into()),
+        _ => Err("Stopping a distribution service isn't available yet.".into()),
+    }
+}
+
+/// Millisatoshis as sats, keeping sub-sat precision only when it exists.
+fn msat_text(msat: u64) -> String {
+    if msat % 1000 == 0 {
+        format!("{} sats", msat / 1000)
+    } else {
+        let fraction = format!("{:03}", msat % 1000);
+        format!("{}.{} sats", msat / 1000, fraction.trim_end_matches('0'))
     }
 }
 
 fn fee_policy_label(policy: &FeePolicy) -> String {
     match policy {
-        FeePolicy::None => "No operator fee".into(),
-        FeePolicy::Fixed { amount_msat } => format!("Fixed {amount_msat} msat"),
+        FeePolicy::None => "No service fee".into(),
+        FeePolicy::Fixed { amount_msat } => format!("{} per sale", msat_text(*amount_msat)),
         FeePolicy::BasisPoints {
             basis_points,
             minimum_msat,
             maximum_msat,
         } => {
-            let minimum = minimum_msat
-                .map(|amount| format!("{amount} msat"))
-                .unwrap_or_else(|| "none".into());
-            let maximum = maximum_msat
-                .map(|amount| format!("{amount} msat"))
-                .unwrap_or_else(|| "none".into());
-            format!("{basis_points} basis points · minimum {minimum} · maximum {maximum}")
+            let percent = if basis_points % 100 == 0 {
+                format!("{}%", basis_points / 100)
+            } else {
+                let fraction = format!("{:02}", basis_points % 100);
+                format!("{}.{}%", basis_points / 100, fraction.trim_end_matches('0'))
+            };
+            let mut label = format!("{percent} of each sale");
+            if let Some(minimum) = minimum_msat {
+                label.push_str(&format!(" · at least {}", msat_text(*minimum)));
+            }
+            if let Some(maximum) = maximum_msat {
+                label.push_str(&format!(" · at most {}", msat_text(*maximum)));
+            }
+            label
         }
     }
 }
@@ -604,7 +831,7 @@ fn publication_progress(
     if state.listing_published && event.step == "upload" && event.status == "error" {
         state.outcome = PublicationOutcome::Partial;
         state.message = Some(
-            "The game page exists on the network, but automated installation is incomplete because an upload failed. Targeted upload retry is not supported by the current backend."
+            "Your game is live, but uploading the build didn't finish. Select Finish publishing below to retry the upload."
                 .to_string(),
         );
     }
@@ -735,6 +962,180 @@ fn store_page_problems(page: &StorePageDraft, publisher_hex: &str) -> Vec<String
     }
 }
 
+/// The store page exactly as buyers will see it: the draft synced with the
+/// game's basics, validated and sanitized by the same core rules publishing
+/// uses. Requirements only show for platforms the game declares, as on the
+/// published page.
+fn buyer_preview_page(
+    page: &StorePageDraft,
+    publisher_hex: &str,
+    platforms: &[String],
+) -> Result<crate::models::GameDetailPresentation, String> {
+    use crate::models::{
+        GameDetailPresentation, SafeStorePageHtml, StorePageAccessibility, StorePageDetailSection,
+        StorePageLanguage, StorePageLinks, StorePageMedia, StorePagePlatformRequirements,
+        StorePageRequirementTier,
+    };
+    let publisher = nostr::PublicKey::from_hex(publisher_hex)
+        .map_err(|_| "The active publisher key is invalid.".to_string())?;
+    let mut page = page.clone();
+    if page.presentation_id.trim().is_empty() {
+        page.presentation_id = "preview".to_string();
+    }
+    if page.listing_coordinates.is_empty() {
+        page.listing_coordinates = vec![format!("30402:{publisher_hex}:{}", page.presentation_id)];
+    }
+    page.sync_compact_tags();
+    let params = page.build_params(publisher);
+    let validated = arcadestr_core::store_page::validate_store_page_draft(&params)
+        .map_err(|error| error.to_string())?;
+    if let Some(problem) = validated
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.blocks_authoring())
+    {
+        return Err(problem.describe());
+    }
+    let content = &params.content;
+    let normalized = &validated.normalized;
+    let sanitized = validated.sanitized_content();
+    let tier = |tier: &arcadestr_core::store_page::RequirementTier| StorePageRequirementTier {
+        os: tier.os.clone(),
+        processor: tier.processor.clone(),
+        memory: tier.memory.clone(),
+        graphics: tier.graphics.clone(),
+        storage: tier.storage.clone(),
+        additional: tier.additional.clone(),
+    };
+    Ok(GameDetailPresentation {
+        listing_coordinate: page.listing_coordinates[0].clone(),
+        listing_event_id: String::new(),
+        store_page_coordinate: String::new(),
+        event_id: "draft-preview".to_string(),
+        title: normalized.title.clone(),
+        summary: normalized.summary.clone(),
+        description_html: (!sanitized.description_html.as_str().is_empty()).then(|| {
+            SafeStorePageHtml::from_backend(sanitized.description_html.as_str().to_string())
+        }),
+        media: sanitized
+            .media
+            .iter()
+            .map(|item| StorePageMedia {
+                id: item.id.clone(),
+                media_type: item.media_type.clone(),
+                role: item.role.clone(),
+                url: item.url.clone(),
+                thumbnail_url: item.thumbnail_url.clone(),
+                alt: item.alt.clone(),
+                caption: item.caption.clone(),
+            })
+            .collect(),
+        sections: sanitized
+            .sections
+            .iter()
+            .map(|section| StorePageDetailSection {
+                id: section.id.clone(),
+                heading: section.heading.clone(),
+                body_html: SafeStorePageHtml::from_backend(section.body_html.as_str().to_string()),
+                media_id: section.media_id.clone(),
+                layout: section.layout.clone(),
+            })
+            .collect(),
+        genres: normalized.genres.clone(),
+        features: normalized.features.clone(),
+        languages: content
+            .languages
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|language| StorePageLanguage {
+                code: language.code,
+                interface: language.interface,
+                audio: language.audio,
+                subtitles: language.subtitles,
+            })
+            .collect(),
+        requirements: content
+            .requirements
+            .iter()
+            .filter(|(platform, _)| platforms.contains(platform))
+            .map(|(platform, requirement)| StorePagePlatformRequirements {
+                platform: platform.clone(),
+                minimum: requirement.minimum.as_ref().map(tier),
+                recommended: requirement.recommended.as_ref().map(tier),
+            })
+            .collect(),
+        accessibility: content
+            .accessibility
+            .iter()
+            .map(|entry| StorePageAccessibility {
+                feature: entry.feature.clone(),
+                supported: entry.supported,
+                notes: entry.notes.clone(),
+            })
+            .collect(),
+        links: StorePageLinks {
+            website: sanitized.links.website.clone(),
+            support: sanitized.links.support.clone(),
+            documentation: sanitized.links.documentation.clone(),
+            source: sanitized.links.source.clone(),
+            community: sanitized.links.community.clone(),
+            privacy_policy: sanitized.links.privacy_policy.clone(),
+        },
+        developer: normalized.developer.clone(),
+        publisher: normalized.publisher.clone(),
+        release_date: normalized.release_date.clone(),
+    })
+}
+
+/// The game card buyers see in the store and search results, built from the
+/// same listing values and store page the request will publish.
+fn buyer_preview_card(
+    publisher_npub: &str,
+    title: &str,
+    description: &str,
+    price_sats: u64,
+    acquisition: &AcquisitionPolicy,
+    page: &crate::models::GameDetailPresentation,
+    images: Vec<String>,
+    platforms: &[String],
+) -> Option<(GameListing, crate::models::StorePageCardPresentation)> {
+    let listing: GameListing = serde_json::from_value(serde_json::json!({
+        "id": "draft-preview",
+        "source": "nip99_listing",
+        "title": title.trim(),
+        "description": description.trim(),
+        "publisher_npub": publisher_npub,
+        "created_at": 0,
+        "price_sats": price_sats,
+        "price": price_sats as f64,
+        "currency": "SATS",
+        "images": images,
+        "platforms": platforms,
+        "acquisition": serde_json::to_value(acquisition).ok()?,
+    }))
+    .ok()?;
+    let media_url = |role: &str| {
+        page.media
+            .iter()
+            .find(|item| item.role == role && item.media_type == "image")
+            .map(|item| item.url.clone())
+    };
+    let card = crate::models::StorePageCardPresentation {
+        listing_coordinate: page.listing_coordinate.clone(),
+        store_page_coordinate: String::new(),
+        event_id: page.event_id.clone(),
+        title: page.title.clone(),
+        summary: page.summary.clone(),
+        capsule_url: media_url("capsule"),
+        hero_url: media_url("hero"),
+        genres: page.genres.clone(),
+        features: page.features.clone(),
+        release_date: page.release_date.clone(),
+    };
+    Some((listing, card))
+}
+
 /// Once the bundled Store Page is published the form edits that revision, so
 /// a retry after a failed listing replaces it instead of conflicting with it.
 /// A new page takes the game's identity, exactly as the backend assigned it.
@@ -766,19 +1167,19 @@ fn publication_completed(
             state.listing_published = true;
             state.outcome = PublicationOutcome::Partial;
             state.message = Some(
-                "The game page exists on the network, but automated installation is incomplete because an upload failed. Targeted upload retry is not supported by the current backend."
+                "Your game is live, but uploading the build didn't finish. Select Finish publishing below to retry the upload."
                     .to_string(),
             );
         }
         Ok((event_id, false)) => {
             state.listing_published = true;
             state.outcome = PublicationOutcome::Complete;
-            state.message = Some(format!("Network publication completed: {event_id}"));
+            state.message = Some(format!("Your game is published. (event {event_id})"));
         }
         Err(error) if state.listing_published => {
             state.outcome = PublicationOutcome::Partial;
             state.message = Some(format!(
-                "The game page exists on the network, but the remaining publication work failed: {error}. Targeted upload retry is not supported by the current backend."
+                "Your game is live, but the rest of publishing failed: {error} Select Finish publishing below to retry."
             ));
         }
         Err(error) => {
@@ -820,17 +1221,18 @@ fn accepts_publication_progress(
 
 fn progress_label(event: &PublishProgressPayload) -> String {
     let stage = match event.step.as_str() {
-        "hash-file" => "Build verification",
-        "check-operator" => "Distribution provider check",
-        "provision" => "Publishing authorization",
-        "publish-listing" => "Game page publication",
-        "confirm-propagation" => "Network publication confirmation",
-        "upload" => "Build upload",
-        _ => "Publication",
+        "hash-file" => "Checking your build",
+        "check-operator" => "Contacting the distribution service",
+        "provision" => "Setting up the distribution service",
+        "publish-listing" => "Publishing your game",
+        "publish-store-page" => "Publishing your store page",
+        "confirm-propagation" => "Confirming it reached the network",
+        "upload" => "Uploading your build",
+        _ => "Publishing",
     };
     let status = match event.status.as_str() {
         "pending" => "in progress",
-        "ok" => "completed",
+        "ok" => "done",
         "error" => "failed",
         other => other,
     };
@@ -841,9 +1243,11 @@ fn progress_label(event: &PublishProgressPayload) -> String {
             .as_ref()
             .map(|url| format!(" for {url}"))
             .unwrap_or_default(),
+        // Successful steps report identifiers, not something to read.
         event
             .message
             .as_ref()
+            .filter(|_| event.status != "ok")
             .map(|message| format!(" — {message}"))
             .unwrap_or_default()
     )
@@ -872,16 +1276,6 @@ fn when_fulfillment_enabled<T>(enabled: bool, value: T) -> Option<T> {
     enabled.then_some(value)
 }
 
-fn advance_stage(
-    current: PublishStage,
-    validation: Result<(), String>,
-) -> Result<PublishStage, String> {
-    validation?;
-    current
-        .next()
-        .ok_or_else(|| "Already at the review stage".to_string())
-}
-
 pub(super) fn archive_request_id() -> Result<ArchiveRequestId, ArchiveSelectionError> {
     ArchiveRequestId::parse(&uuid::Uuid::new_v4().to_string())
         .map_err(|_| ArchiveSelectionError::ContractMismatch)
@@ -899,12 +1293,12 @@ pub(super) fn publish_error_message(error: &PublishAdpListingError) -> String {
     match error {
         PublishAdpListingError::Archive { error } => archive_error_message(error),
         PublishAdpListingError::PartialPublication { cause, successful_servers } => format!(
-            "Publication is incomplete ({} server(s) accepted it): {} Review the incomplete operation in publisher recovery; do not start a new publication.",
+            "Publishing didn't finish ({} server(s) accepted it): {} Use Finish publishing on the game instead of publishing again.",
             successful_servers.len(),
             publish_error_message(cause)
         ),
         PublishAdpListingError::StaleExpectedEventId { .. } => {
-            "A concurrent listing revision was detected. Your local work is preserved and publication is blocked. Leave this workflow, return to Published games, and reopen the latest revision before publishing."
+            "This game was updated somewhere else since you opened it. Your changes are saved as a draft. Go back to Your games, refresh, and open the game again before publishing."
                 .to_string()
         }
         _ => error.to_string(),
@@ -957,17 +1351,6 @@ pub(super) fn archive_error_message(error: &ArchiveSelectionError) -> String {
     }
 }
 
-fn build_capability_message() -> &'static str {
-    #[cfg(feature = "web")]
-    {
-        "Build file selection, hashing, and network publication require the desktop app."
-    }
-    #[cfg(not(feature = "web"))]
-    {
-        "This desktop app can select, hash, and publish build files."
-    }
-}
-
 impl ServerStatus {
     fn label(self) -> &'static str {
         match self {
@@ -1011,13 +1394,13 @@ fn validate_listing(
         return Err("Title must be 100 characters or less".to_string());
     }
     if description.is_empty() {
-        return Err("Description is required".to_string());
+        return Err("Summary is required".to_string());
     }
     if description.len() > 2000 {
-        return Err("Description must be 2000 characters or less".to_string());
+        return Err("Summary must be 2000 characters or less".to_string());
     }
     if price_sats > 0 && lud16.is_empty() {
-        return Err("Lightning address (lud16) is required for priced listings".to_string());
+        return Err("Add a Lightning address so you can be paid.".to_string());
     }
     if !lud16.is_empty() {
         let parts: Vec<&str> = lud16.split('@').collect();
@@ -1027,7 +1410,7 @@ fn validate_listing(
     }
     if fulfillment_enabled {
         if servers.is_empty() {
-            return Err("Add at least one distribution server for fulfillment".to_string());
+            return Err("Add at least one upload server under Advanced options.".to_string());
         }
         if let Some(bad_url) = servers
             .iter()
@@ -1040,10 +1423,7 @@ fn validate_listing(
         }
         match file_hash.as_deref() {
             None => {
-                return Err(
-                    "Select a build file and wait for its hash before publishing fulfillment"
-                        .to_string(),
-                );
+                return Err("Choose your build file and wait for it to be checked.".to_string());
             }
             Some(hash) if !is_sha256_hex(hash) => {
                 return Err(
@@ -1054,18 +1434,23 @@ fn validate_listing(
             Some(_) => {}
         }
         if version.trim().is_empty() {
-            return Err("Version is required for fulfillment".to_string());
+            return Err("Enter a version for your build.".to_string());
         }
         match fulfillment_mode {
             FulfillmentMode::None => {
-                return Err("Choose a fulfillment signing mode".to_string());
+                return Err(
+                    "Choose a distribution service, or sign with your own account.".to_string(),
+                );
             }
             FulfillmentMode::Direct => {}
             FulfillmentMode::Delegate => {
                 // Metadata edits preserve signed authority without a local operator row.
                 // The backend requires an operator when explicit new provisioning is needed.
                 if !operator_url.trim().is_empty() && !is_http_url(operator_url) {
-                    return Err("Operator URL must start with http:// or https://".to_string());
+                    return Err(
+                        "The distribution service address must start with http:// or https://"
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -1253,13 +1638,16 @@ fn readiness_checklist(
             && !operator_url.trim().is_empty());
     let mut warnings = Vec::new();
     if !fulfillment_enabled {
-        warnings.push("No build will be uploaded; this publishes game-page metadata only.".into());
+        warnings.push(
+            "No build: players can see the store page but can't get the game until you add one."
+                .into(),
+        );
     }
     if servers
         .iter()
         .any(|server| server.reachability == ServerStatus::Failed)
     {
-        warnings.push("At least one distribution provider could not be reached.".into());
+        warnings.push("One of your upload servers couldn't be reached.".into());
     }
     ReadinessChecklist {
         metadata,
@@ -1457,6 +1845,213 @@ fn operator_prefill_update(
         Ok(Some(url)) => Some(url),
         Ok(None) | Err(_) => None,
     }
+}
+
+/// Everything the editor holds when Publish is pressed. Plain values, so the
+/// request built from them can be tested without the reactive form.
+#[derive(Clone, Debug)]
+struct PublishFormInput {
+    initiating_npub: String,
+    title: String,
+    description: String,
+    tags: String,
+    lud16: String,
+    acquisition: AcquisitionKind,
+    price: String,
+    starts_at: String,
+    ends_at: String,
+    fulfillment_enabled: bool,
+    fulfillment_mode: FulfillmentMode,
+    servers: Vec<ServerEntry>,
+    operator_url: String,
+    server_roles: Vec<arcadestr_core::publisher_management::ServerRoleIntent>,
+    authorize_operators: bool,
+    file_hash: Option<String>,
+    version: String,
+    platforms: String,
+    publish_state: PublishState,
+    store_page_loaded: bool,
+    store_page: StorePageDraft,
+    commercial_mode: String,
+    commercial_review: Option<PublisherTermsReview>,
+    commercial_approved: bool,
+    acknowledged_removed_profile_ids: Vec<ProfileId>,
+    identity: PublishedIdentity,
+    existing_fulfillment_pubkey: Option<String>,
+    existing_campaigns: Vec<CampaignPointerInput>,
+    existing_nip94_event_id: Option<String>,
+    authoritative_file_hash: Option<String>,
+}
+
+/// Why Publish was refused before anything was sent.
+#[derive(Clone, Debug, PartialEq)]
+enum PublishBlocked {
+    Message(String),
+    /// A Store page problem; the editor opens the field that owns it.
+    StorePage(String),
+    /// A typed failure the publish attempt records, so a retry sees it.
+    Attempt(PublishAdpListingError),
+}
+
+/// Build the exact request the backend signs and publishes. Pure: the same
+/// input always produces the same request, whichever screen collected it.
+fn build_publish_request(input: PublishFormInput) -> Result<PreparedPublish, PublishBlocked> {
+    use PublishBlocked::{Attempt, Message};
+    let title = input.title.trim().to_string();
+    let description = input.description.trim().to_string();
+    let lud16 = input.lud16.trim().to_string();
+    let price = price_for_acquisition(input.acquisition, &input.price, &lud16).map_err(Message)?;
+    let fulfillment_mode = if input.fulfillment_enabled {
+        input.fulfillment_mode
+    } else {
+        FulfillmentMode::None
+    };
+    let acquisition =
+        acquisition_policy_from_form(input.acquisition, &input.starts_at, &input.ends_at)
+            .map_err(Message)?;
+    validate_listing(
+        &title,
+        &description,
+        price,
+        &lud16,
+        input.fulfillment_enabled,
+        &input.servers,
+        &None,
+        &input.file_hash,
+        &input.version,
+        &fulfillment_mode,
+        &input.operator_url,
+    )
+    .map_err(Message)?;
+    let platforms = parse_platform_tags(&input.platforms).map_err(Message)?;
+    let publisher_hex = publisher_hex(&input.initiating_npub)
+        .ok_or_else(|| Message("The active publisher key is invalid.".into()))?;
+    if !input.store_page_loaded {
+        return Err(Message(
+            "Wait for the store page to load before publishing.".into(),
+        ));
+    }
+    let store_page = synced_store_page(input.store_page, &title, &description, &input.tags);
+    if let Some(problem) = store_page_problems(&store_page, &publisher_hex)
+        .into_iter()
+        .next()
+    {
+        return Err(PublishBlocked::StorePage(problem));
+    }
+    // The cover and screenshots on the Store Page are the listing images.
+    let images =
+        arcadestr_core::store_page_seed::listing_images_from_media(&store_page.content.media);
+
+    let selected_build = input
+        .fulfillment_enabled
+        .then(|| input.publish_state.archive.selected_build.clone())
+        .flatten();
+    let selection_id = selected_build.as_ref().map(|build| &build.selection_id);
+    let launch_tier = input
+        .publish_state
+        .launch
+        .to_wire_result(selection_id)
+        .map_err(|violation| {
+            Attempt(PublishAdpListingError::CoreValidation {
+                violation,
+                message: "Finish the launch settings before publishing.".into(),
+            })
+        })?;
+    let commercial_intent = reviewed_commercial_intent(
+        &input.commercial_mode,
+        &PublisherTermsContext {
+            publisher_pubkey: publisher_hex,
+            servers: if input.fulfillment_enabled {
+                input.servers.iter().map(|s| s.url.clone()).collect()
+            } else {
+                Vec::new()
+            },
+            price_sats: price,
+            developer_destination: if input.acquisition == AcquisitionKind::Gated {
+                lud16.clone()
+            } else {
+                String::new()
+            },
+        },
+        input.commercial_review,
+        input.commercial_approved,
+    )
+    .map_err(Message)?;
+    let extension = PublishAdpListingRequestExtension {
+        store_page: Some(store_page),
+        authorize_operators: input.authorize_operators,
+        server_roles: input
+            .servers
+            .iter()
+            .map(|server| {
+                input
+                    .server_roles
+                    .iter()
+                    .find(|role| role.server_url == server.url)
+                    .cloned()
+                    .unwrap_or(arcadestr_core::publisher_management::ServerRoleIntent {
+                        server_url: server.url.clone(),
+                        issue_receipt: server.url == input.operator_url,
+                        issue_grant: server.url == input.operator_url,
+                    })
+            })
+            .collect(),
+        operation_id: None,
+        commercial_intent,
+        launch_tier,
+        acknowledged_removed_profile_ids: input.acknowledged_removed_profile_ids,
+    };
+    let enabled = input.fulfillment_enabled;
+    let operator_url = input.operator_url;
+    let version = input.version;
+    let request = PublishAdpListingRequest {
+        expected_publisher_npub: input.initiating_npub,
+        existing_event_id: input.identity.event_id,
+        existing_d_tag: input.identity.d_tag,
+        pending_d_tag: input.identity.pending_d_tag,
+        title,
+        description,
+        price_sats: price,
+        lud16: (input.acquisition == AcquisitionKind::Gated).then_some(lud16),
+        tags: parse_csv_values(&input.tags),
+        images,
+        fulfillment_mode,
+        operator_url: when_fulfillment_enabled(
+            enabled,
+            (!operator_url.trim().is_empty()).then_some(operator_url),
+        )
+        .flatten(),
+        servers: when_fulfillment_enabled(
+            enabled,
+            input.servers.into_iter().map(|entry| entry.url).collect(),
+        )
+        .unwrap_or_default(),
+        accepted_terms: Vec::new(),
+        file_path: None,
+        selected_build: selected_build.clone(),
+        existing_file_hash: (enabled && selected_build.is_none())
+            .then_some(input.file_hash)
+            .flatten(),
+        existing_fulfillment_pubkey: when_fulfillment_enabled(
+            enabled,
+            input.existing_fulfillment_pubkey,
+        )
+        .flatten(),
+        version: when_fulfillment_enabled(enabled, (!version.trim().is_empty()).then_some(version))
+            .flatten(),
+        acquisition,
+        platforms,
+        campaigns: input.existing_campaigns,
+        nip94_event_id: input.existing_nip94_event_id,
+    };
+    prepare_publish(
+        request,
+        extension,
+        selected_build,
+        enabled,
+        input.authoritative_file_hash.as_deref(),
+    )
+    .map_err(|error| Attempt(PublishAdpListingError::Archive { error }))
 }
 
 #[cfg(test)]
@@ -1729,9 +2324,9 @@ mod tests {
             actual_event_id: "actual".into(),
         });
 
-        assert!(message.contains("local work is preserved"));
-        assert!(message.contains("publication is blocked"));
-        assert!(message.contains("reopen the latest revision"));
+        assert!(message.contains("changes are saved as a draft"));
+        assert!(message.contains("before publishing"));
+        assert!(message.contains("open the game again"));
     }
 
     #[test]
@@ -2114,24 +2709,13 @@ mod tests {
     }
 
     #[test]
-    fn stage_navigation_validates_forward_and_keeps_form_values_external() {
-        let title = String::from("Preserved game");
-        assert_eq!(
-            advance_stage(PublishStage::Details, Err("missing".into())),
-            Err("missing".into())
-        );
-        assert_eq!(
-            advance_stage(PublishStage::Details, Ok(())),
-            Ok(PublishStage::Media)
-        );
-        assert_eq!(title, "Preserved game");
-    }
-
-    #[test]
-    fn drafts_use_explicit_account_scoped_database_actions() {
-        assert!(SUPPORTS_DRAFTS);
-        assert!(include_str!("publish.rs").contains("invoke_save_publisher_draft"));
-        assert!(include_str!("publish.rs").contains("RESTORE SAVED DRAFT (REPLACES FORM)"));
+    fn drafts_are_autosaved_to_the_account_scoped_database() {
+        let source = include_str!("publish.rs");
+        assert!(source.contains("invoke_save_publisher_draft"));
+        assert!(source.contains("invoke_delete_publisher_draft"));
+        // Manual save/restore controls were replaced by autosave.
+        assert!(!source.contains(concat!("SAVE ", "DRAFT\"")));
+        assert!(!source.contains(concat!("RESTORE SAVED ", "DRAFT")));
     }
 
     #[test]
@@ -2223,7 +2807,7 @@ mod tests {
         assert!(checklist
             .warnings
             .iter()
-            .any(|warning| warning.contains("could not be reached")));
+            .any(|warning| warning.contains("couldn't be reached")));
     }
 
     #[test]
@@ -2260,7 +2844,7 @@ mod tests {
         assert!(partial
             .message
             .as_deref()
-            .is_some_and(|message| message.contains("game page exists")));
+            .is_some_and(|message| message.contains("Your game is live")));
 
         let command_failure = publication_completed(partial, Err("upload failed".into()));
         assert_eq!(command_failure.outcome, PublicationOutcome::Partial);
@@ -2298,120 +2882,251 @@ mod tests {
     }
 
     #[test]
-    fn capability_message_matches_the_build_target() {
-        #[cfg(feature = "web")]
-        assert!(build_capability_message().contains("require the desktop app"));
-        #[cfg(not(feature = "web"))]
-        assert!(build_capability_message().contains("desktop app can"));
-    }
-
-    #[test]
-    fn four_production_stages_keep_their_real_names_and_order() {
-        assert_eq!(PublishStage::ALL.len(), 6);
+    fn hub_sections_keep_their_names_and_checklist_order() {
         assert_eq!(
-            PublishStage::ALL.map(PublishStage::title),
+            HubSection::EDITABLE.map(HubSection::title),
             [
-                "Game details",
-                "Media",
+                "Basics",
                 "Store page",
-                "Pricing and access",
-                "Builds and distribution",
-                "Review and publish",
+                "Price & access",
+                "Delivery & builds"
             ]
         );
-        assert_eq!(PublishStage::Details.next(), Some(PublishStage::Media));
-        assert_eq!(PublishStage::StorePage.next(), Some(PublishStage::Pricing));
+        assert_eq!(HubSection::default(), HubSection::Overview);
+        // Every Store page group has exactly one owning section; requirements now
+        // live with the rest of the store page instead of the build settings.
         assert_eq!(
-            PublishStage::for_store_page_group("requirements"),
-            PublishStage::Builds
+            HubSection::for_store_page_group("basic"),
+            HubSection::Basics
         );
-        assert_eq!(
-            PublishStage::for_store_page_group("links"),
-            PublishStage::StorePage
-        );
-        assert_eq!(PublishStage::Review.next(), None);
-        assert_eq!(PublishStage::Details.previous(), None);
+        for group in [
+            "description",
+            "media",
+            "sections",
+            "requirements",
+            "languages",
+            "accessibility",
+            "links",
+        ] {
+            assert_eq!(
+                HubSection::for_store_page_group(group),
+                HubSection::StorePage,
+                "{group}"
+            );
+        }
     }
 
     #[test]
-    fn visiting_a_stage_never_marks_it_complete_on_its_own() {
-        // Behind the current stage, completeness follows live validation only.
+    fn store_page_tabs_cover_every_store_page_group_once() {
+        let mut groups = STORE_PAGE_TABS
+            .iter()
+            .flat_map(|(_, _, groups)| groups.iter().copied())
+            .collect::<Vec<_>>();
+        groups.sort_unstable();
         assert_eq!(
-            stage_status(PublishStage::Details, PublishStage::Builds, true),
-            StageStatus::Complete
+            groups,
+            [
+                "accessibility",
+                "description",
+                "languages",
+                "links",
+                "media",
+                "requirements",
+                "sections"
+            ]
         );
+        for (id, _, groups) in STORE_PAGE_TABS {
+            assert_eq!(groups, [id]);
+        }
+    }
+
+    #[test]
+    fn section_status_follows_live_validation_only() {
+        assert_eq!(section_status(&Ok(()), 0), SectionStatus::Ready);
+        // An empty but valid store page is not "Ready".
+        assert_eq!(section_status(&Ok(()), 3), SectionStatus::Suggestions);
+        // Blocking problems outrank suggestions.
         assert_eq!(
-            stage_status(PublishStage::Details, PublishStage::Builds, false),
-            StageStatus::NeedsAttention
+            section_status(&Err("Title is required".into()), 3),
+            SectionStatus::NeedsAttention
         );
-        assert_eq!(
-            stage_status(PublishStage::Builds, PublishStage::Builds, false),
-            StageStatus::Current
-        );
-        assert_eq!(
-            stage_status(PublishStage::Review, PublishStage::Builds, true),
-            StageStatus::Upcoming
+        assert_ne!(
+            SectionStatus::Suggestions.label(),
+            SectionStatus::Ready.label()
         );
     }
 
     #[test]
-    fn forward_jumping_stays_blocked_while_backward_navigation_is_safe() {
-        assert!(stage_reachable(PublishStage::Details, PublishStage::Builds));
-        assert!(stage_reachable(PublishStage::Builds, PublishStage::Builds));
-        assert!(!stage_reachable(PublishStage::Review, PublishStage::Builds));
-        assert!(advance_stage(PublishStage::Details, Err("blocked".into())).is_err());
+    fn only_store_page_edits_on_a_linked_live_game_skip_the_game_publish() {
+        // editing, settled, game fields, distribution, images, page, linked
         assert_eq!(
-            advance_stage(PublishStage::Details, Ok(())),
-            Ok(PublishStage::Media)
+            update_scope(true, true, false, false, false, true, true),
+            UpdateScope::StorePageOnly
         );
-    }
-
-    #[test]
-    fn blocking_issues_are_reported_in_stage_order_with_actionable_text() {
-        let issues = blocking_stage_errors(&[
-            (PublishStage::Details, Err("Title is required".to_string())),
-            (PublishStage::Media, Ok(())),
-            (PublishStage::Pricing, Ok(())),
+        for (case, scope) in [
             (
-                PublishStage::Builds,
+                "new game",
+                update_scope(false, true, false, false, false, true, true),
+            ),
+            (
+                "launch settings still loading",
+                update_scope(true, false, false, false, false, true, true),
+            ),
+            (
+                "basics or price changed",
+                update_scope(true, true, true, false, false, true, true),
+            ),
+            (
+                "build or delivery changed",
+                update_scope(true, true, false, true, false, true, true),
+            ),
+            (
+                "card or screenshot images changed",
+                update_scope(true, true, false, false, true, true, true),
+            ),
+            (
+                "store page not linked to the game yet",
+                update_scope(true, true, false, false, false, true, false),
+            ),
+            (
+                "nothing changed on the store page",
+                update_scope(true, true, false, false, false, false, true),
+            ),
+        ] {
+            assert_eq!(scope, UpdateScope::FullGame, "{case}");
+        }
+    }
+
+    #[test]
+    fn suggestions_put_the_description_and_card_image_first() {
+        let ordered = prioritized_suggestions(&[
+            "Add a trailer.".into(),
+            "Add a hero image (the banner at the top of the store page).".into(),
+            "Add a capsule image (shown on game cards).".into(),
+            "Add a description.".into(),
+        ]);
+        assert_eq!(ordered[0], "Add a description.");
+        assert!(ordered[1].starts_with("Add a capsule"));
+        assert!(ordered[2].starts_with("Add a hero"));
+        assert_eq!(ordered[3], "Add a trailer.");
+    }
+
+    #[test]
+    fn blocking_issues_are_reported_in_checklist_order_with_actionable_text() {
+        let issues = blocking_section_errors(&[
+            (HubSection::Basics, Err("Title is required".to_string())),
+            (HubSection::StorePage, Ok(())),
+            (HubSection::PriceAccess, Ok(())),
+            (
+                HubSection::Delivery,
                 Err("Version is required for fulfillment".to_string()),
             ),
         ]);
         assert_eq!(
             issues,
             vec![
-                (PublishStage::Details, "Title is required".to_string()),
+                (HubSection::Basics, "Title is required".to_string()),
                 (
-                    PublishStage::Builds,
+                    HubSection::Delivery,
                     "Version is required for fulfillment".to_string()
                 ),
             ]
         );
-        assert!(blocking_stage_errors(&[(PublishStage::Details, Ok(()))]).is_empty());
+        assert!(blocking_section_errors(&[(HubSection::Basics, Ok(()))]).is_empty());
     }
 
     #[test]
-    fn authoring_state_separates_untouched_dirty_blocked_and_ready() {
-        assert_eq!(authoring_state(false, false, 2), AuthoringState::NotStarted);
-        assert_eq!(authoring_state(true, false, 2), AuthoringState::Blocked);
+    fn delivery_choice_is_explicit_for_new_games_and_derived_for_existing_ones() {
+        // A new game has no delivery until the author picks one.
+        assert_eq!(delivery_choice(false, true, true), None);
+        assert_eq!(delivery_choice(false, false, false), None);
         assert_eq!(
-            authoring_state(false, true, 2),
-            AuthoringState::UnsavedChanges
+            delivery_choice(true, true, true),
+            Some(DeliveryChoice::Install)
         );
         assert_eq!(
-            authoring_state(false, true, 0),
-            AuthoringState::ReadyToPublish
+            delivery_choice(true, true, false),
+            Some(DeliveryChoice::DownloadOnly)
         );
-        // Nothing in this workflow may describe itself as a saved draft.
-        for state in [
-            AuthoringState::NotStarted,
-            AuthoringState::UnsavedChanges,
-            AuthoringState::Blocked,
-            AuthoringState::ReadyToPublish,
-        ] {
-            assert!(!state.label().to_ascii_lowercase().contains("draft"));
-            assert!(!state.label().to_ascii_lowercase().contains("published"));
+        assert_eq!(
+            delivery_choice(true, false, false),
+            Some(DeliveryChoice::StorePageOnly)
+        );
+        assert!(DeliveryChoice::Install.uses_build());
+        assert!(DeliveryChoice::DownloadOnly.uses_build());
+        assert!(!DeliveryChoice::StorePageOnly.uses_build());
+    }
+
+    #[test]
+    fn authoring_state_separates_drafts_from_live_games() {
+        assert_eq!(
+            authoring_state(false, false, 2),
+            AuthoringState::DraftIncomplete
+        );
+        assert_eq!(authoring_state(false, true, 0), AuthoringState::DraftReady);
+        assert_eq!(authoring_state(true, false, 2), AuthoringState::Live);
+        assert_eq!(authoring_state(true, true, 0), AuthoringState::LiveChanged);
+        assert_eq!(
+            authoring_state(true, true, 1),
+            AuthoringState::LiveChangedBlocked
+        );
+        // A draft is never described as live, and local edits never as published.
+        for state in [AuthoringState::DraftIncomplete, AuthoringState::DraftReady] {
+            assert!(state.label().starts_with("Draft"));
         }
+        assert!(AuthoringState::LiveChanged
+            .label()
+            .contains("not published"));
+    }
+
+    #[test]
+    fn only_edits_not_yet_in_the_local_draft_block_leaving() {
+        assert!(!DraftSaveStatus::Idle.unsaved());
+        assert!(!DraftSaveStatus::Saved.unsaved());
+        assert!(DraftSaveStatus::Pending.unsaved());
+        assert!(DraftSaveStatus::Saving.unsaved());
+        assert!(DraftSaveStatus::Failed("disk full".into()).unsaved());
+        assert!(DraftSaveStatus::Conflict.unsaved());
+        assert_eq!(DraftSaveStatus::Idle.label(), None);
+        assert!(DraftSaveStatus::Failed("disk full".into())
+            .label()
+            .is_some_and(|label| label.contains("disk full")));
+    }
+
+    #[test]
+    fn draft_ids_follow_the_published_game_or_a_local_id() {
+        assert_eq!(game_draft_id(Some("abc"), Some("local:old")), "listing:abc");
+        assert_eq!(game_draft_id(None, Some("local:xyz")), "local:xyz");
+        assert_eq!(game_draft_id(None, Some("xyz")), "local:xyz");
+        let minted = game_draft_id(None, None);
+        assert!(minted.starts_with("local:"));
+        assert_ne!(minted, game_draft_id(None, None));
+    }
+
+    #[test]
+    fn fee_labels_use_sats_and_percentages() {
+        assert_eq!(fee_policy_label(&FeePolicy::None), "No service fee");
+        assert_eq!(
+            fee_policy_label(&FeePolicy::Fixed { amount_msat: 5_000 }),
+            "5 sats per sale"
+        );
+        assert_eq!(
+            fee_policy_label(&FeePolicy::BasisPoints {
+                basis_points: 250,
+                minimum_msat: Some(1_500),
+                maximum_msat: None,
+            }),
+            "2.5% of each sale · at least 1.5 sats"
+        );
+        assert_eq!(
+            fee_policy_label(&FeePolicy::BasisPoints {
+                basis_points: 1_000,
+                minimum_msat: None,
+                maximum_msat: Some(100_000),
+            }),
+            "10% of each sale · at most 100 sats"
+        );
+        assert_eq!(msat_text(1), "0.001 sats");
     }
 
     #[test]
@@ -2905,22 +3620,560 @@ mod tests {
             ["Short", " summary"].concat(),
             ["Live", " on the store now"].concat(),
             ["Step 1 of ", "5"].concat(),
+            ["Continue ", ">\""].concat(),
+            ["Not saved ", "anywhere"].concat(),
+            // Leaving a section is navigation, not completion.
+            ["\"Do", "ne\""].concat(),
         ] {
             assert!(!source.contains(&absent), "unsupported control rendered");
         }
-        assert!(source.contains("does not store Create Game drafts"));
     }
 }
 
-/// Publish view component - form for creating NIP-99 listings with optional ADP fulfillment.
+#[cfg(test)]
+mod buyer_preview_tests {
+    use super::*;
+
+    const PUBLISHER_HEX: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    fn page(description: &str) -> StorePageDraft {
+        synced_store_page(
+            StorePageDraft::new(String::new(), Vec::new()),
+            "Neon Drifter",
+            "A racing game.",
+            "Racing",
+        )
+        .tap(|page| page.content.description_markdown = description.into())
+    }
+
+    trait Tap: Sized {
+        fn tap(mut self, edit: impl FnOnce(&mut Self)) -> Self {
+            edit(&mut self);
+            self
+        }
+    }
+    impl Tap for StorePageDraft {}
+
+    #[test]
+    fn the_preview_shows_the_basics_and_sanitized_description() {
+        let preview = buyer_preview_page(
+            &page("**Fast** cars <script>alert(1)</script>"),
+            PUBLISHER_HEX,
+            &[],
+        )
+        .expect("previewable page");
+        assert_eq!(preview.title.as_deref(), Some("Neon Drifter"));
+        assert_eq!(preview.summary.as_deref(), Some("A racing game."));
+        let html = preview.description_html.expect("description");
+        assert!(html.as_str().contains("<strong>Fast</strong>"));
+        assert!(!html.as_str().to_ascii_lowercase().contains("<script"));
+    }
+
+    #[test]
+    fn requirements_only_show_for_platforms_the_game_declares() {
+        let mut draft = page("");
+        for platform in ["linux-x86_64", "windows-x86_64"] {
+            draft
+                .content
+                .requirements
+                .entry(platform.into())
+                .or_default()
+                .minimum = Some(arcadestr_core::store_page::RequirementTier {
+                os: Some(platform.into()),
+                ..Default::default()
+            });
+        }
+        let preview = buyer_preview_page(&draft, PUBLISHER_HEX, &["linux-x86_64".to_string()])
+            .expect("previewable page");
+        assert_eq!(preview.requirements.len(), 1);
+        assert_eq!(preview.requirements[0].platform, "linux-x86_64");
+    }
+
+    #[test]
+    fn the_card_uses_the_published_price_and_store_page_images() {
+        use nostr::nips::nip19::ToBech32;
+        let npub = nostr::PublicKey::from_hex(PUBLISHER_HEX)
+            .expect("key")
+            .to_bech32()
+            .expect("npub");
+        let mut draft = page("");
+        draft
+            .content
+            .media
+            .push(arcadestr_core::store_page::StorePageMediaItem {
+                id: "capsule".into(),
+                media_type: "image".into(),
+                role: "capsule".into(),
+                url: "https://media.test/capsule.png".into(),
+                sha256: None,
+                mime_type: None,
+                size: None,
+                thumbnail_url: None,
+                alt: None,
+                caption: None,
+                width: None,
+                height: None,
+            });
+        let preview = buyer_preview_page(&draft, PUBLISHER_HEX, &[]).expect("page");
+        let (listing, card) = buyer_preview_card(
+            &npub,
+            " Neon Drifter ",
+            "A racing game.",
+            2100,
+            &AcquisitionPolicy::Gated,
+            &preview,
+            vec!["https://media.test/capsule.png".into()],
+            &["linux-x86_64".to_string()],
+        )
+        .expect("card");
+        assert_eq!(listing.title, "Neon Drifter");
+        assert_eq!(listing.price_sats, 2100);
+        assert_eq!(listing.acquisition, AcquisitionPolicy::Gated);
+        assert_eq!(
+            card.capsule_url.as_deref(),
+            Some("https://media.test/capsule.png")
+        );
+    }
+
+    #[test]
+    fn a_store_page_that_would_be_rejected_has_no_preview() {
+        let mut draft = page("");
+        draft.content.links.website = Some("http://not-https.test".into());
+        assert!(buyer_preview_page(&draft, PUBLISHER_HEX, &[]).is_err());
+    }
+
+    #[test]
+    fn publishing_always_goes_through_the_preview() {
+        let source = include_str!("publish.rs");
+        let view = source
+            .split(concat!("id=\"publish-buyer-", "preview\""))
+            .next()
+            .expect("view before the preview dialog");
+        // The header's Publish button opens the preview; only the preview's
+        // confirm action runs the submit.
+        assert!(!view.contains(concat!("on:click=move |_| on_", "submit.run(())")));
+        assert!(source.contains("UpdateScope::FullGame => on_submit.run(())"));
+        assert!(source.contains("UpdateScope::StorePageOnly => publish_store_page_only.run(())"));
+    }
+}
+
+/// The request the backend signs, built from the editor's values after each
+/// delivery choice, a restored draft, and stale leftover values.
+#[cfg(test)]
+mod publish_request_tests {
+    use super::*;
+    use arcadestr_core::adp_settlement::PublisherCommercialIntent;
+    use arcadestr_core::archive_inspection_contract::ArchiveSelectionId;
+    use arcadestr_core::distribution::{RelativePath, Sha256Digest, WorkingDir};
+
+    const OLD_BUILD: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const NEW_BUILD: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const SERVICE: &str = "https://service.test";
+
+    fn publisher() -> String {
+        use nostr::nips::nip19::ToBech32;
+        nostr::PublicKey::from_hex(
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .expect("fixture key")
+        .to_bech32()
+        .expect("fixture npub")
+    }
+
+    fn server(url: &str) -> ServerEntry {
+        ServerEntry {
+            url: url.into(),
+            label: url.into(),
+            reachability: ServerStatus::Ok,
+            upload: ServerStatus::Idle,
+            auto_operator: false,
+        }
+    }
+
+    /// A new game with only the basics filled in and no delivery chosen yet.
+    fn new_game() -> PublishFormInput {
+        let npub = publisher();
+        PublishFormInput {
+            initiating_npub: npub.clone(),
+            title: "  Neon Drifter ".into(),
+            description: "A racing game.".into(),
+            tags: "Racing, Arcade".into(),
+            lud16: String::new(),
+            acquisition: AcquisitionKind::Public,
+            price: String::new(),
+            starts_at: String::new(),
+            ends_at: String::new(),
+            fulfillment_enabled: false,
+            fulfillment_mode: FulfillmentMode::None,
+            servers: Vec::new(),
+            operator_url: String::new(),
+            server_roles: Vec::new(),
+            authorize_operators: false,
+            file_hash: None,
+            version: String::new(),
+            platforms: "linux-x86_64".into(),
+            publish_state: PublishState {
+                archive: ArchiveSelectionState::new(npub),
+                launch: LaunchMode::DownloadOnly,
+            },
+            store_page_loaded: true,
+            store_page: StorePageDraft::new(String::new(), Vec::new()),
+            commercial_mode: "preserve".into(),
+            commercial_review: None,
+            commercial_approved: false,
+            acknowledged_removed_profile_ids: Vec::new(),
+            identity: PublishedIdentity::default(),
+            existing_fulfillment_pubkey: None,
+            existing_campaigns: Vec::new(),
+            existing_nip94_event_id: None,
+            authoritative_file_hash: None,
+        }
+    }
+
+    /// A live game delivered through a service, with a published build and promotion.
+    fn live_game() -> PublishFormInput {
+        let mut input = new_game();
+        input.fulfillment_enabled = true;
+        input.fulfillment_mode = FulfillmentMode::Delegate;
+        input.servers = vec![server(SERVICE)];
+        input.operator_url = SERVICE.into();
+        input.file_hash = Some(OLD_BUILD.into());
+        input.authoritative_file_hash = Some(OLD_BUILD.into());
+        input.version = "1.0".into();
+        input.existing_fulfillment_pubkey = Some("22".repeat(32));
+        input.existing_campaigns = vec![CampaignPointerInput {
+            root_event_id: "33".repeat(32),
+            relay_hint: None,
+        }];
+        input.existing_nip94_event_id = Some("44".repeat(32));
+        input.identity = PublishedIdentity {
+            event_id: Some("11".repeat(32)),
+            d_tag: Some("neon-drifter".into()),
+            coordinate: None,
+            pending_d_tag: None,
+        };
+        input
+    }
+
+    fn choose(input: &mut PublishFormInput, choice: DeliveryChoice) {
+        apply_delivery_choice(
+            choice,
+            &mut input.fulfillment_enabled,
+            &mut input.fulfillment_mode,
+            &mut input.publish_state,
+            &input.platforms.clone(),
+        );
+    }
+
+    /// Launch settings that are complete, using paths already published.
+    fn complete_launch(input: &mut PublishFormInput) {
+        let LaunchMode::Launchable(tier) = &mut input.publish_state.launch else {
+            panic!("launch options expected");
+        };
+        tier.package_format.text = "zip".into();
+        let row = tier.add_profile();
+        let profile = tier
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.row_id == row)
+            .expect("added profile");
+        profile.profile_id = "default".into();
+        profile.display_name = "Play".into();
+        profile.executable.authoritative_value =
+            Some(RelativePath::parse("bin/game").expect("executable"));
+        profile.working_dir.authoritative_value = Some(WorkingDir::parse("bin").expect("dir"));
+        assert!(tier.set_publisher_default_profile(row, true));
+    }
+
+    fn select_new_build(input: &mut PublishFormInput) {
+        input.publish_state.archive.selected_build = Some(BuildSelectionRef {
+            selection_id: ArchiveSelectionId::parse("2f9a1c34-5b6d-4e7f-8a9b-0c1d2e3f4a5b")
+                .expect("selection"),
+            sha256: Sha256Digest::parse(NEW_BUILD).expect("digest"),
+        });
+        input.file_hash = Some(NEW_BUILD.into());
+    }
+
+    fn built(input: PublishFormInput) -> PreparedPublish {
+        build_publish_request(input).expect("publishable input")
+    }
+
+    #[test]
+    fn store_page_only_sends_no_build_or_distribution_even_with_leftover_values() {
+        // A live game whose author switches to store page only: every build and
+        // distribution value left in the form must stay out of the request.
+        let mut input = live_game();
+        choose(&mut input, DeliveryChoice::StorePageOnly);
+        assert!(!input.fulfillment_enabled);
+        assert_eq!(input.fulfillment_mode, FulfillmentMode::None);
+        let PreparedPublish { request, extension } = built(input);
+        assert_eq!(request.fulfillment_mode, FulfillmentMode::None);
+        assert!(request.servers.is_empty());
+        assert_eq!(request.operator_url, None);
+        assert_eq!(request.version, None);
+        assert_eq!(request.selected_build, None);
+        assert_eq!(request.existing_file_hash, None);
+        assert_eq!(request.existing_fulfillment_pubkey, None);
+        assert_eq!(extension.launch_tier, None);
+        // Everything unrelated to delivery is kept.
+        assert_eq!(request.title, "Neon Drifter");
+        assert_eq!(request.campaigns.len(), 1);
+        assert_eq!(request.existing_d_tag.as_deref(), Some("neon-drifter"));
+    }
+
+    #[test]
+    fn download_only_reuses_the_published_build_without_launch_settings() {
+        let mut input = live_game();
+        choose(&mut input, DeliveryChoice::DownloadOnly);
+        let PreparedPublish { request, extension } = built(input);
+        assert_eq!(request.fulfillment_mode, FulfillmentMode::Delegate);
+        assert_eq!(request.servers, vec![SERVICE.to_string()]);
+        assert_eq!(request.operator_url.as_deref(), Some(SERVICE));
+        assert_eq!(request.version.as_deref(), Some("1.0"));
+        assert_eq!(request.selected_build, None);
+        assert_eq!(request.existing_file_hash.as_deref(), Some(OLD_BUILD));
+        assert_eq!(request.existing_fulfillment_pubkey, Some("22".repeat(32)));
+        assert_eq!(extension.launch_tier, None);
+    }
+
+    #[test]
+    fn choosing_a_build_option_on_a_new_game_turns_on_a_distribution_service() {
+        for choice in [DeliveryChoice::Install, DeliveryChoice::DownloadOnly] {
+            let mut input = new_game();
+            choose(&mut input, choice);
+            assert!(input.fulfillment_enabled);
+            assert_eq!(input.fulfillment_mode, FulfillmentMode::Delegate);
+            assert_eq!(
+                matches!(input.publish_state.launch, LaunchMode::Launchable(_)),
+                choice == DeliveryChoice::Install
+            );
+        }
+        // Switching back keeps the author's signing choice.
+        let mut input = live_game();
+        input.fulfillment_mode = FulfillmentMode::Direct;
+        choose(&mut input, DeliveryChoice::Install);
+        assert_eq!(input.fulfillment_mode, FulfillmentMode::Direct);
+    }
+
+    #[test]
+    fn a_build_option_without_a_build_file_is_refused() {
+        for choice in [DeliveryChoice::Install, DeliveryChoice::DownloadOnly] {
+            let mut input = new_game();
+            choose(&mut input, choice);
+            input.servers = vec![server(SERVICE)];
+            input.operator_url = SERVICE.into();
+            input.version = "1.0".into();
+            assert!(
+                matches!(build_publish_request(input), Err(PublishBlocked::Message(message)) if message.contains("build file")),
+                "{choice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_launch_settings_are_refused_and_recorded_for_retry() {
+        let mut input = live_game();
+        choose(&mut input, DeliveryChoice::Install);
+        assert!(matches!(
+            build_publish_request(input),
+            Err(PublishBlocked::Attempt(
+                PublishAdpListingError::CoreValidation { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn install_publishes_complete_launch_settings_with_the_build() {
+        let mut input = live_game();
+        choose(&mut input, DeliveryChoice::Install);
+        complete_launch(&mut input);
+        let PreparedPublish { request, extension } = built(input);
+        let tier = extension.launch_tier.expect("launch settings published");
+        assert_eq!(tier.launch_profiles[0].id.as_str(), "default");
+        assert_eq!(tier.launch_profiles[0].executable.as_str(), "bin/game");
+        assert_eq!(request.existing_file_hash.as_deref(), Some(OLD_BUILD));
+        assert_eq!(request.fulfillment_mode, FulfillmentMode::Delegate);
+    }
+
+    #[test]
+    fn a_newly_selected_build_replaces_the_published_one() {
+        let mut input = live_game();
+        choose(&mut input, DeliveryChoice::DownloadOnly);
+        select_new_build(&mut input);
+        let PreparedPublish { request, .. } = built(input);
+        assert_eq!(
+            request
+                .selected_build
+                .as_ref()
+                .map(|build| build.sha256.as_str()),
+            Some(NEW_BUILD)
+        );
+        assert_eq!(request.existing_file_hash, None);
+        assert_eq!(request.file_path, None);
+    }
+
+    #[test]
+    fn a_restored_draft_with_a_new_build_must_reselect_the_file() {
+        // Restoring keeps the new build's fingerprint but not the file itself
+        // (`consume_success` drops the selection), so publishing must refuse
+        // rather than publish the old build under the new fingerprint.
+        let mut input = live_game();
+        choose(&mut input, DeliveryChoice::DownloadOnly);
+        input.file_hash = Some(NEW_BUILD.into());
+        input.publish_state.archive.consume_success();
+        assert!(matches!(
+            build_publish_request(input),
+            Err(PublishBlocked::Attempt(PublishAdpListingError::Archive {
+                error: ArchiveSelectionError::SelectedBuildRequired
+            }))
+        ));
+    }
+
+    #[test]
+    fn a_restored_draft_rebuilds_the_same_request() {
+        // The autosaved draft is JSON; values that survive it must yield the
+        // same request as the editor they were saved from.
+        let mut input = live_game();
+        choose(&mut input, DeliveryChoice::DownloadOnly);
+        input.acquisition = AcquisitionKind::Gated;
+        input.price = "2100".into();
+        input.lud16 = "dev@example.com".into();
+        let saved = DurableListingDraft {
+            server_roles: input.server_roles.clone(),
+            form: FormSnapshot {
+                title: input.title.clone(),
+                description: input.description.clone(),
+                tags: input.tags.clone(),
+                price: input.price.clone(),
+                lud16: input.lud16.clone(),
+                platforms: input.platforms.clone(),
+                version: input.version.clone(),
+                operator_url: input.operator_url.clone(),
+                acquisition: format!("{:?}", input.acquisition),
+                starts_at: input.starts_at.clone(),
+                ends_at: input.ends_at.clone(),
+                fulfillment_enabled: input.fulfillment_enabled,
+                commercial: String::new(),
+            },
+            identity: input.identity.clone(),
+            launch: input.publish_state.launch.clone(),
+            servers: input
+                .servers
+                .iter()
+                .map(|server| server.url.clone())
+                .collect(),
+            mode: input.fulfillment_mode,
+            acquisition: input.acquisition,
+            artifact_hash: input.file_hash.clone(),
+            commercial_intent: input.commercial_mode.clone(),
+            commercial_review: None,
+            accepted_terms: Vec::new(),
+            authorization_references: Vec::new(),
+            store_page: Some(input.store_page.clone()),
+            delivery_chosen: true,
+        };
+        let json = serde_json::to_value(&saved).expect("encode draft");
+        let restored: DurableListingDraft = serde_json::from_value(json).expect("decode draft");
+
+        let mut from_draft = new_game();
+        from_draft.title = restored.form.title;
+        from_draft.description = restored.form.description;
+        from_draft.tags = restored.form.tags;
+        from_draft.price = restored.form.price;
+        from_draft.lud16 = restored.form.lud16;
+        from_draft.platforms = restored.form.platforms;
+        from_draft.version = restored.form.version;
+        from_draft.operator_url = restored.form.operator_url;
+        from_draft.fulfillment_enabled = restored.form.fulfillment_enabled;
+        from_draft.acquisition = restored.acquisition;
+        from_draft.fulfillment_mode = restored.mode;
+        from_draft.servers = restored.servers.iter().map(|url| server(url)).collect();
+        from_draft.identity = restored.identity;
+        from_draft.publish_state.launch = restored.launch;
+        from_draft.file_hash = restored.artifact_hash;
+        from_draft.store_page = restored.store_page.expect("store page saved");
+        from_draft.commercial_mode = restored.commercial_intent;
+        // Values that come from the published game, not the draft.
+        from_draft.authoritative_file_hash = input.authoritative_file_hash.clone();
+        from_draft.existing_fulfillment_pubkey = input.existing_fulfillment_pubkey.clone();
+        from_draft.existing_campaigns = input.existing_campaigns.clone();
+        from_draft.existing_nip94_event_id = input.existing_nip94_event_id.clone();
+
+        assert_eq!(built(from_draft), built(input));
+    }
+
+    #[test]
+    fn price_access_and_fee_terms_reach_the_request_exactly() {
+        let mut paid = live_game();
+        paid.acquisition = AcquisitionKind::Gated;
+        paid.price = "2100".into();
+        paid.lud16 = " dev@example.com ".into();
+        let PreparedPublish { request, extension } = built(paid);
+        assert_eq!(request.price_sats, 2100);
+        assert_eq!(request.lud16.as_deref(), Some("dev@example.com"));
+        assert!(matches!(
+            extension.commercial_intent,
+            PublisherCommercialIntent::Preserve
+        ));
+
+        // A free game never sends a price or payout address left in the form.
+        let mut free = live_game();
+        free.price = "2100".into();
+        free.lud16 = "dev@example.com".into();
+        let PreparedPublish { request, .. } = built(free);
+        assert_eq!(request.price_sats, 0);
+        assert_eq!(request.lud16, None);
+
+        // New fee terms without an approved review are never sent.
+        let mut unreviewed = live_game();
+        unreviewed.commercial_mode = "replace".into();
+        assert!(matches!(
+            build_publish_request(unreviewed),
+            Err(PublishBlocked::Message(_))
+        ));
+    }
+
+    #[test]
+    fn service_permissions_default_to_the_chosen_service_only() {
+        let mut input = live_game();
+        input.servers.push(server("https://mirror.test"));
+        let PreparedPublish { extension, .. } = built(input);
+        let roles = extension.server_roles;
+        assert_eq!(roles.len(), 2);
+        assert!(roles[0].issue_receipt && roles[0].issue_grant);
+        assert!(!roles[1].issue_receipt && !roles[1].issue_grant);
+    }
+
+    #[test]
+    fn nothing_is_sent_until_the_store_page_has_loaded() {
+        let mut input = live_game();
+        input.store_page_loaded = false;
+        assert!(matches!(
+            build_publish_request(input),
+            Err(PublishBlocked::Message(message)) if message.contains("store page to load")
+        ));
+    }
+}
+
+/// Game hub: the overview checklist of a draft or live game plus its
+/// independently editable sections. Publishes the listing, Store page, build
+/// and distribution authorization through one pipeline.
 #[component]
 pub fn PublishView(
     #[prop(optional)] listing: Option<GameListing>,
+    /// Local draft of a game that has not been published yet.
+    #[prop(optional)]
+    draft_id: Option<String>,
+    #[prop(optional)] initial_section: Option<HubSection>,
+    /// Extra overview content for a live game (promotions, access management).
+    #[prop(optional)]
+    overview_extra: Option<ViewFn>,
     #[prop(optional)] on_published: Option<Callback<GameListing>>,
     #[prop(optional)] on_back: Option<Callback<()>>,
 ) -> impl IntoView {
     let auth = use_context::<AuthContext>().expect("AuthContext not provided");
     let editing = listing.is_some();
+    let restoring_draft = draft_id.is_some();
     let editing_publisher = listing.as_ref().map(|item| item.publisher_npub.clone());
     // Identity of the game page under edit. Both stay `None` for a first
     // publication until the backend reports what it minted, after which a retry
@@ -2947,6 +4200,7 @@ pub fn PublishView(
     let authoritative_file_hash = existing_file_hash.clone();
     let authoritative_file_hash_for_account = authoritative_file_hash.clone();
     let authoritative_file_hash_for_submit = authoritative_file_hash.clone();
+    let authoritative_file_hash_for_restore = authoritative_file_hash.clone();
     let existing_fulfillment_pubkey = listing.as_ref().and_then(listing_fulfillment_pubkey);
     let operator_resolution = listing.as_ref().and_then(operator_resolution_request);
     let initial_acquisition = listing
@@ -2974,13 +4228,18 @@ pub fn PublishView(
     let draft_message = RwSignal::new(None::<String>);
     let draft_busy = RwSignal::new(false);
     let restored_artifact_hash = RwSignal::new(None::<String>);
-    let durable_draft_id = StoredValue::new(format!(
-        "listing:{}",
-        listing
-            .as_ref()
-            .map(|listing| listing.id.as_str())
-            .unwrap_or("new")
+    let durable_draft_id = StoredValue::new(game_draft_id(
+        listing.as_ref().map(|listing| listing.id.as_str()),
+        draft_id.as_deref(),
     ));
+    let draft_save_status = RwSignal::new(DraftSaveStatus::Idle);
+    // Reloads this game's unfinished publishes after each attempt.
+    let recovery_refresh = RwSignal::new(0_u64);
+    let last_saved_fingerprint = RwSignal::new(None::<String>);
+    let autosave_tick = RwSignal::new(0_u64);
+    // Autosave waits until any saved draft has been restored, so an empty form
+    // never overwrites it.
+    let draft_ready = RwSignal::new(false);
     let durable_draft_owner = StoredValue::new(
         listing
             .as_ref()
@@ -3042,10 +4301,13 @@ pub fn PublishView(
     let store_page_status = RwSignal::new((!editing).then_some(Ok::<(), String>(())));
     let store_page_note = RwSignal::new(None::<String>);
     let store_page_input_dirty = RwSignal::new(false);
-    let store_page_tab = RwSignal::new("basic");
+    let store_page_tab = RwSignal::new("description");
     let store_page_diagnostics = RwSignal::new(Vec::<String>::new());
     let store_page_form_error = RwSignal::new(None::<String>);
     let store_page_upload_generation = RwSignal::new(0_u64);
+    // The store page is published and the game already points to it, so a
+    // store-page-only edit can be published without touching the game.
+    let store_page_linked = RwSignal::new(false);
     let load_store_page = {
         let target = listing.as_ref().and_then(|item| {
             item.event_id.clone().map(|event_id| {
@@ -3065,7 +4327,7 @@ pub fn PublishView(
                 let result = invoke_load_publisher_store_page_editor(
                     publisher,
                     StorePageListingRef {
-                        listing_coordinate: coordinate,
+                        listing_coordinate: coordinate.clone(),
                         listing_event_id: event_id,
                     },
                     None,
@@ -3073,11 +4335,16 @@ pub fn PublishView(
                 .await;
                 match result {
                     Ok(state) => {
+                        let linked = state.draft.loaded_event_id.is_some()
+                            && state.listings.iter().any(|listing| {
+                                listing.reciprocal && listing.listing_coordinate == coordinate
+                            });
+                        let _ = store_page_linked.try_set(linked);
                         let note = state.started_from_listing.map(|started| {
-                            let mut note = "This game has no Store Page yet. It starts from the game details and images; it is published with the game.".to_string();
+                            let mut note = "This game had no store page yet, so one was started from its details and images. It's published with the game.".to_string();
                             if !started.skipped_images.is_empty() {
                                 note.push_str(&format!(
-                                    " {} listing image(s) were left out because the page would reject them.",
+                                    " {} image(s) were left out because the store page can't use them.",
                                     started.skipped_images.len()
                                 ));
                             }
@@ -3159,6 +4426,9 @@ pub fn PublishView(
     } else {
         FulfillmentMode::Delegate
     });
+    // A new game has no delivery until the author picks one, so nothing silently
+    // requires a build the author never asked for.
+    let delivery_chosen = RwSignal::new(editing);
     let commercial_mode = RwSignal::new("preserve".to_string());
     let commercial_review = RwSignal::new(None::<PublisherTermsReview>);
     let commercial_approved = RwSignal::new(false);
@@ -3178,7 +4448,7 @@ pub fn PublishView(
                     .join("; ")
             })
             .filter(|text| !text.is_empty())
-            .unwrap_or_else(|| "No accepted roots; legacy fee-free configuration".into()),
+            .unwrap_or_else(|| "None. No service fee terms have been accepted.".into()),
     );
     let discovered_servers = RwSignal::new(Vec::<AdpServerAnnouncement>::new());
     let discovery_error = RwSignal::new(None::<String>);
@@ -3187,7 +4457,7 @@ pub fn PublishView(
         default_provider
             .map(|url| ServerEntry {
                 url: url.to_string(),
-                label: "Arcadestr distribution provider".into(),
+                label: "Arcadestr distribution service".into(),
                 reachability: ServerStatus::Pending,
                 upload: ServerStatus::Idle,
                 auto_operator: true,
@@ -3236,19 +4506,19 @@ pub fn PublishView(
             .unwrap_or_default(),
     );
 
-    let current_stage = RwSignal::new(PublishStage::Details);
-    let stage_error = RwSignal::new(None::<String>);
-    // A "still loading" block is stale once the Store Page has arrived.
-    Effect::new(move |_| {
-        if store_page_status.get().is_some() {
-            stage_error.update(|error| {
-                if error.as_deref() == Some("The Store Page is still loading.") {
-                    *error = None;
-                }
-            });
-        }
-    });
+    // A brand-new game opens on its first fields; anything else opens the hub.
+    let current_section = RwSignal::new(initial_section.unwrap_or(if editing || restoring_draft {
+        HubSection::Overview
+    } else {
+        HubSection::Basics
+    }));
     let can_exit = on_back.is_some();
+    let open_section = move |section: HubSection| {
+        current_section.set(section);
+        if let Some(window) = web_sys::window() {
+            window.scroll_to_with_x_and_y(0.0, 0.0);
+        }
+    };
 
     let is_publishing = RwSignal::new(false);
     let is_hashing = RwSignal::new(false);
@@ -3391,7 +4661,7 @@ pub fn PublishView(
             return;
         }
         operator_auto_added.set(Some(new_url.clone()));
-        add_server(new_url, "Distribution provider".to_string(), true);
+        add_server(new_url, "Distribution service".to_string(), true);
     };
 
     Effect::new(move |_| {
@@ -3401,9 +4671,9 @@ pub fn PublishView(
                     discovered_servers.set(found);
                     discovery_error.set(None);
                 }
-                Err(err) => {
-                    discovery_error.set(Some(format!("Couldn't reach relays for discovery: {err}")))
-                }
+                Err(err) => discovery_error.set(Some(format!(
+                    "Couldn't look up distribution services: {err}"
+                ))),
             }
         });
     });
@@ -3644,7 +4914,7 @@ pub fn PublishView(
                     state.archive.consume_success();
                     state.launch.mark_bindings_stale();
                 });
-                error_message.set(Some("The reselected archive does not match the saved draft digest. The saved artifact reference was not changed.".into()));
+                error_message.set(Some("This isn't the same build file you chose before. Select the original file, or remove the build and choose a new one.".into()));
                 is_hashing.set(false);
                 return;
             }
@@ -3664,11 +4934,11 @@ pub fn PublishView(
         });
     };
 
-    // Single source of stage validation, reused by forward navigation, the stage
-    // indicator, and the review summary so no surface can disagree about whether a
-    // stage is actually satisfied.
-    // First Store Page problem in the fields a step owns.
-    let store_page_blocker = move |stage: PublishStage| -> Result<(), String> {
+    // Single source of section validation, reused by the checklist, the
+    // section headers and the publish button, so no surface can disagree about
+    // whether a section is actually satisfied.
+    // First Store page problem in the fields a section owns.
+    let store_page_blocker = move |section: HubSection| -> Result<(), String> {
         let platforms = parse_platform_tags(&platforms_input.get()).unwrap_or_default();
         let state = embedded_readiness(
             &store_page_draft.get(),
@@ -3676,17 +4946,32 @@ pub fn PublishView(
             &store_page_diagnostics.get(),
         );
         match state.blockers().iter().find(|blocker| {
-            PublishStage::for_store_page_group(
+            HubSection::for_store_page_group(
                 crate::ui_v2::views::store_page_publish::diagnostic_tab(blocker),
-            ) == stage
+            ) == section
         }) {
             Some(blocker) => Err(blocker.clone()),
             None => Ok(()),
         }
     };
-    let validate_stage = move |stage: PublishStage| -> Result<(), String> {
-        match stage {
-            PublishStage::Details => validate_listing(
+    // Non-blocking improvements; only the Store page has them.
+    let section_suggestions = move |section: HubSection| -> Vec<String> {
+        if section != HubSection::StorePage || store_page_status.get() != Some(Ok(())) {
+            return Vec::new();
+        }
+        let platforms = parse_platform_tags(&platforms_input.get()).unwrap_or_default();
+        prioritized_suggestions(
+            embedded_readiness(
+                &store_page_draft.get(),
+                &platforms,
+                &store_page_diagnostics.get(),
+            )
+            .recommendations(),
+        )
+    };
+    let validate_section = move |section: HubSection| -> Result<(), String> {
+        match section {
+            HubSection::Basics => validate_listing(
                 &title.get(),
                 &description.get(),
                 0,
@@ -3699,13 +4984,13 @@ pub fn PublishView(
                 &FulfillmentMode::None,
                 "",
             )
-            .and_then(|_| match store_page_status.get() {
-                None => Err("The Store Page is still loading.".into()),
-                Some(Err(error)) => Err(format!("The Store Page did not load: {error}")),
-                Some(Ok(())) => store_page_blocker(PublishStage::Details),
-            }),
-            PublishStage::Media | PublishStage::StorePage => store_page_blocker(stage),
-            PublishStage::Pricing => {
+            .and_then(|_| store_page_blocker(HubSection::Basics)),
+            HubSection::StorePage => match store_page_status.get() {
+                None => Err("The store page is still loading.".into()),
+                Some(Err(error)) => Err(format!("The store page did not load: {error}")),
+                Some(Ok(())) => store_page_blocker(HubSection::StorePage),
+            },
+            HubSection::PriceAccess => {
                 price_for_acquisition(acquisition_kind.get(), &price_input.get(), &lud16.get())
                     .and_then(|_| {
                         acquisition_policy_from_form(
@@ -3716,11 +5001,14 @@ pub fn PublishView(
                         .map(|_| ())
                     })
             }
-            PublishStage::Builds => {
+            HubSection::Delivery => {
+                if !delivery_chosen.get() {
+                    return Err("Choose how players get your game.".to_string());
+                }
                 let draft = publish_draft.get();
                 if matches!(draft.launch, LaunchMode::Launchable(_)) && !fulfillment_enabled.get() {
                     return Err(
-                        "Enable automated installation, or explicitly choose download-only."
+                        "Launch settings need a build. Choose \"Arcadestr installs it\" or \"Download only\"."
                             .to_string(),
                     );
                 }
@@ -3734,7 +5022,7 @@ pub fn PublishView(
                     .to_wire_result(selection_id)
                     .map(|_| ())
                     .map_err(|_| {
-                        "Complete the launchable tier, or explicitly choose download-only."
+                        "Finish the launch settings: every launch option needs a name and a program to run."
                             .to_string()
                     })
                     .and_then(|_| parse_platform_tags(&platforms_input.get()).map(|_| ()))
@@ -3756,18 +5044,26 @@ pub fn PublishView(
                             &operator_url.get(),
                         )
                     })
-                    .and_then(|_| store_page_blocker(PublishStage::Builds))
+                    .and_then(|_| {
+                        if fulfillment_enabled.get()
+                            && commercial_mode.get() == "replace"
+                            && !(commercial_review.get().is_some() && commercial_approved.get())
+                        {
+                            Err("Review and approve the distribution service's fee terms.".into())
+                        } else {
+                            Ok(())
+                        }
+                    })
             }
-            PublishStage::Review => Err("Already at the review stage".to_string()),
+            HubSection::Overview => Ok(()),
         }
     };
 
     let blocking_issues = move || {
-        let mut issues = blocking_stage_errors(
-            &PublishStage::ALL
+        let mut issues = blocking_section_errors(
+            &HubSection::EDITABLE
                 .into_iter()
-                .filter(|stage| *stage != PublishStage::Review)
-                .map(|stage| (stage, validate_stage(stage)))
+                .map(|section| (section, validate_section(section)))
                 .collect::<Vec<_>>(),
         );
         if editing
@@ -3780,23 +5076,12 @@ pub fn PublishView(
             })
         {
             issues.push((
-                PublishStage::Builds,
-                "Authoritative launch metadata must load before publishing this edit.".to_string(),
+                HubSection::Delivery,
+                "Your game's current launch settings must finish loading before you can update it."
+                    .to_string(),
             ));
         }
         issues
-    };
-
-    let on_next = move |_| {
-        let stage = current_stage.get_untracked();
-        let validation = validate_stage(stage);
-        match advance_stage(stage, validation) {
-            Ok(next) => {
-                current_stage.set(next);
-                stage_error.set(None);
-            }
-            Err(error) => stage_error.set(Some(error)),
-        }
     };
 
     let commercial_context_auth = auth.clone();
@@ -3895,50 +5180,57 @@ pub fn PublishView(
             commercial_approved.get()
         ),
     };
+    // Everything the local draft stores. Tracked reads, so the autosave effect
+    // reruns on any change; callbacks call it outside a reactive context.
+    let draft_snapshot = full_form_snapshot.clone();
+    let build_durable_draft = move || DurableListingDraft {
+        server_roles: server_roles.get(),
+        form: draft_snapshot(),
+        identity: published_identity.get(),
+        launch: publish_draft.get().launch,
+        servers: servers.get().into_iter().map(|server| server.url).collect(),
+        mode: fulfillment_mode.get(),
+        acquisition: acquisition_kind.get(),
+        artifact_hash: file_hash.get(),
+        commercial_intent: commercial_mode.get(),
+        commercial_review: commercial_review.get(),
+        accepted_terms: durable_accepted_terms.get_value(),
+        authorization_references: durable_authorizations.get_value(),
+        store_page: Some(store_page_draft.get()),
+        delivery_chosen: delivery_chosen.get(),
+    };
     let save_auth = auth.clone();
-    let save_snapshot = full_form_snapshot.clone();
+    let save_build = build_durable_draft.clone();
     let on_save_draft = Callback::new(move |_: ()| {
         let Some(publisher) = save_auth.npub.get_untracked() else {
+            draft_save_status.set(DraftSaveStatus::Failed("sign in to save drafts".into()));
             return;
         };
         if durable_draft_owner.get_value().as_deref() != Some(publisher.as_str()) {
-            draft_message.set(Some(
-                "Switch back to this editor's publisher before saving its draft".into(),
+            draft_save_status.set(DraftSaveStatus::Failed(
+                "switch back to the account that owns this game".into(),
             ));
             return;
         }
+        if draft_save_status.get_untracked() == DraftSaveStatus::Conflict {
+            return;
+        }
         if draft_busy.get_untracked() || is_publishing.get_untracked() {
+            // The autosave effect reschedules once the running work finishes.
             return;
         }
         let epoch = save_auth.current_auth_flow();
         let response_auth = save_auth.clone();
-        let form = save_snapshot();
-        let snapshot = DurableListingDraft {
-            server_roles: server_roles.get_untracked(),
-            form,
-            identity: published_identity.get_untracked(),
-            launch: publish_draft.get_untracked().launch,
-            servers: servers
-                .get_untracked()
-                .into_iter()
-                .map(|server| server.url)
-                .collect(),
-            mode: fulfillment_mode.get_untracked(),
-            acquisition: acquisition_kind.get_untracked(),
-            artifact_hash: file_hash.get_untracked(),
-            commercial_intent: commercial_mode.get_untracked(),
-            commercial_review: commercial_review.get_untracked(),
-            accepted_terms: durable_accepted_terms.get_value(),
-            authorization_references: durable_authorizations.get_value(),
-            store_page: Some(store_page_draft.get_untracked()),
-        };
-        let payload = match serde_json::to_value(snapshot) {
+        let payload = match serde_json::to_value(untrack(|| save_build())) {
             Ok(payload) => payload,
             Err(_) => {
-                draft_message.set(Some("Draft could not be encoded".into()));
+                draft_save_status.set(DraftSaveStatus::Failed(
+                    "the draft could not be encoded".into(),
+                ));
                 return;
             }
         };
+        let saved_fingerprint = payload.to_string();
         let draft = arcadestr_core::publisher_recovery::PublisherDraft {
             draft_id: durable_draft_id.get_value(),
             kind: "listing".into(),
@@ -3946,6 +5238,7 @@ pub fn PublishView(
             revision: draft_revision.get_untracked().unwrap_or(0),
         };
         draft_busy.set(true);
+        draft_save_status.set(DraftSaveStatus::Saving);
         spawn_local(async move {
             let result = crate::tauri_bridge::invoke_save_publisher_draft(
                 publisher,
@@ -3956,25 +5249,33 @@ pub fn PublishView(
             if !response_auth.is_current_auth_flow(epoch) {
                 return;
             }
-            draft_busy.set(false);
+            let _ = draft_busy.try_set(false);
             match result {
                 Ok(revision) => {
-                    draft_revision.set(Some(revision));
-                    draft_message.set(Some("Draft saved to this account's database, including the Store Page. The archive must be reselected after restart.".into()));
+                    let _ = draft_revision.try_set(Some(revision));
+                    let _ = last_saved_fingerprint.try_set(Some(saved_fingerprint));
+                    let _ = draft_save_status.try_set(DraftSaveStatus::Saved);
+                    // Edits made while saving are picked up by the next run.
+                    let _ = autosave_tick.try_update(|tick| *tick = tick.wrapping_add(1));
                 }
-                Err(error) => draft_message.set(Some(error)),
+                Err(error) if error.contains("Draft changed") => {
+                    let _ = draft_save_status.try_set(DraftSaveStatus::Conflict);
+                }
+                Err(error) => {
+                    let _ = draft_save_status.try_set(DraftSaveStatus::Failed(error));
+                }
             }
         });
     });
     let restore_auth = auth.clone();
+    let restore_build = build_durable_draft.clone();
     let on_restore_draft = Callback::new(move |_: ()| {
         let Some(publisher) = restore_auth.npub.get_untracked() else {
+            draft_ready.set(true);
             return;
         };
         if durable_draft_owner.get_value().as_deref() != Some(publisher.as_str()) {
-            draft_message.set(Some(
-                "Switch back to this editor's publisher before restoring its draft".into(),
-            ));
+            draft_ready.set(true);
             return;
         }
         if draft_busy.get_untracked() || is_publishing.get_untracked() || is_hashing.get_untracked()
@@ -3983,34 +5284,46 @@ pub fn PublishView(
         }
         let epoch = restore_auth.current_auth_flow();
         let response_auth = restore_auth.clone();
+        let restore_build = restore_build.clone();
+        let published_build = authoritative_file_hash_for_restore.clone();
         draft_busy.set(true);
         spawn_local(async move {
             let result = crate::tauri_bridge::invoke_publisher_recovery_state(publisher).await;
             if !response_auth.is_current_auth_flow(epoch) {
                 return;
             }
-            draft_busy.set(false);
+            let _ = draft_busy.try_set(false);
+            let _ = draft_ready.try_set(true);
             let stored = match result {
                 Ok(state) => state
                     .drafts
                     .into_iter()
                     .find(|draft| draft.draft_id == durable_draft_id.get_value()),
                 Err(error) => {
-                    draft_message.set(Some(error));
+                    let _ = draft_save_status.try_set(DraftSaveStatus::Failed(error));
                     return;
                 }
             };
             let Some(stored) = stored else {
-                draft_message.set(Some("No saved draft for this editor and publisher".into()));
+                // Nothing saved yet; a later save creates the draft.
+                let _ = draft_revision.try_set(None);
+                let _ = draft_save_status.try_set(DraftSaveStatus::Idle);
                 return;
             };
             let snapshot: DurableListingDraft = match serde_json::from_value(stored.payload) {
                 Ok(snapshot) => snapshot,
                 Err(_) => {
-                    draft_message.set(Some("Saved draft is invalid".into()));
+                    // Keep the revision so the next save replaces the unreadable draft.
+                    let _ = draft_revision.try_set(Some(stored.revision));
+                    let _ = draft_message.try_set(Some(
+                        "The saved draft could not be read and will be replaced by your next edit."
+                            .into(),
+                    ));
                     return;
                 }
             };
+            let had_build =
+                snapshot.artifact_hash.is_some() && snapshot.artifact_hash != published_build;
             title.set(snapshot.form.title);
             description.set(snapshot.form.description);
             tag_input.set(snapshot.form.tags);
@@ -4055,8 +5368,19 @@ pub fn PublishView(
             commercial_approved.set(false);
             durable_accepted_terms.set_value(snapshot.accepted_terms);
             durable_authorizations.set_value(snapshot.authorization_references);
+            delivery_chosen.set(snapshot.delivery_chosen || editing);
             draft_revision.set(Some(stored.revision));
-            draft_message.set(Some("Draft restored locally, not published. Reselect the pinned archive, revalidate launch paths and review commercial changes before publishing.".into()));
+            last_saved_fingerprint.set(
+                serde_json::to_value(untrack(|| restore_build()))
+                    .ok()
+                    .map(|value| value.to_string()),
+            );
+            draft_save_status.set(DraftSaveStatus::Saved);
+            draft_message.set(Some(if had_build {
+                "Restored your unpublished changes. Select your build file again before publishing; it must match the one you chose before.".into()
+            } else {
+                "Restored your unpublished changes.".into()
+            }));
         });
     });
     let form_snapshot = {
@@ -4266,7 +5590,7 @@ pub fn PublishView(
                         *active_operation.borrow_mut() = None;
                         is_publishing.set(false);
                         initiating_account.set(None);
-                        error_message.set(Some("An earlier operation is incomplete. Save edits as a draft, then use Publisher recovery to reconcile and resume its exact signed events.".into()));
+                        error_message.set(Some("An earlier publish of this game didn't finish. Your changes are saved as a draft. Select Finish publishing above to complete it, then publish your changes.".into()));
                         return;
                     }
                 }
@@ -4300,7 +5624,7 @@ pub fn PublishView(
                         },
                         listing_published: current.listing_published,
                         message: Some(if current.listing_published {
-                            "The Game page was published before the active account changed, but later results were ignored. Switch to the initiating account and refresh Published games to reconcile uploads."
+                            "Your game was published, but you switched accounts before publishing finished. Switch back and open the game from Your games to check it."
                                 .into()
                         } else {
                             "The active account changed during publication. The stale response was ignored; check Published games with the initiating account before retrying."
@@ -4403,6 +5727,26 @@ pub fn PublishView(
                 };
                 is_publishing.set(false);
                 initiating_account.set(None);
+                recovery_refresh.update(|value| *value = value.wrapping_add(1));
+                if published.is_some() {
+                    // Everything in the draft is now live; drop the local copy.
+                    if let Some(revision) = draft_revision.get_untracked() {
+                        let draft_id = durable_draft_id.get_value();
+                        let publisher = initiating_npub.clone();
+                        spawn_local(async move {
+                            let _ = crate::tauri_bridge::invoke_delete_publisher_draft(
+                                publisher,
+                                draft_id,
+                                "listing".into(),
+                                revision,
+                            )
+                            .await;
+                        });
+                    }
+                    draft_revision.set(None);
+                    last_saved_fingerprint.set(None);
+                    draft_save_status.set(DraftSaveStatus::Idle);
+                }
                 if let (Some(on_published), Some(listing)) = (on_published, published) {
                     on_published.run(listing);
                 }
@@ -4422,227 +5766,65 @@ pub fn PublishView(
         };
         if !publication_account_allowed(editing_publisher_for_submit.as_deref(), &initiating_npub) {
             error_message.set(Some(
-                "Switch to the developer account that published this Game page before updating it."
-                    .to_string(),
+                "Switch to the account that published this game before updating it.".to_string(),
             ));
             return;
         }
 
-        let title_val = title.get().trim().to_string();
-        let description_val = description.get().trim().to_string();
-        let lud16_val = lud16.get().trim().to_string();
-        let acquisition_kind_val = acquisition_kind.get();
-        let price_val =
-            match price_for_acquisition(acquisition_kind_val, &price_input.get(), &lud16_val) {
-                Ok(price) => price,
-                Err(msg) => {
-                    error_message.set(Some(msg));
-                    return;
+        let input = PublishFormInput {
+            initiating_npub: initiating_npub.clone(),
+            title: title.get_untracked(),
+            description: description.get_untracked(),
+            tags: tag_input.get_untracked(),
+            lud16: lud16.get_untracked(),
+            acquisition: acquisition_kind.get_untracked(),
+            price: price_input.get_untracked(),
+            starts_at: acquisition_starts_at.get_untracked(),
+            ends_at: acquisition_ends_at.get_untracked(),
+            fulfillment_enabled: fulfillment_enabled.get_untracked(),
+            fulfillment_mode: fulfillment_mode.get_untracked(),
+            servers: servers.get_untracked(),
+            operator_url: operator_url.get_untracked(),
+            server_roles: server_roles.get_untracked(),
+            authorize_operators: authorize_operators.get_untracked(),
+            file_hash: file_hash.get_untracked(),
+            version: version.get_untracked(),
+            platforms: platforms_input.get_untracked(),
+            publish_state: publish_draft.get_untracked(),
+            store_page_loaded: store_page_status.get_untracked() == Some(Ok(())),
+            store_page: store_page_draft.get_untracked(),
+            commercial_mode: commercial_mode.get_untracked(),
+            commercial_review: commercial_review.get_untracked(),
+            commercial_approved: commercial_approved.get_untracked(),
+            acknowledged_removed_profile_ids: acknowledged_removed_profile_ids.get_untracked(),
+            identity: published_identity.get_untracked(),
+            existing_fulfillment_pubkey: existing_fulfillment_key_for_submit.clone(),
+            existing_campaigns: existing_campaigns_for_submit.clone(),
+            existing_nip94_event_id: existing_nip94_for_submit.clone(),
+            authoritative_file_hash: authoritative_file_hash_for_submit.clone(),
+        };
+        let PreparedPublish { request, extension } = match build_publish_request(input) {
+            Ok(prepared) => prepared,
+            Err(PublishBlocked::Message(message)) => {
+                error_message.set(Some(message));
+                return;
+            }
+            Err(PublishBlocked::StorePage(problem)) => {
+                let tab = crate::ui_v2::views::store_page_publish::diagnostic_tab(&problem);
+                let section = HubSection::for_store_page_group(tab);
+                if section == HubSection::StorePage {
+                    store_page_tab.set(tab);
                 }
-            };
-        let servers_val = servers.get();
-        let file_hash_val = file_hash.get();
-        let version_val = version.get();
-        let fulfillment_enabled_val = fulfillment_enabled.get();
-        let fulfillment_mode_val = if fulfillment_enabled_val {
-            fulfillment_mode.get()
-        } else {
-            FulfillmentMode::None
-        };
-        let operator_url_val = operator_url.get();
-        let acquisition = match acquisition_policy_from_form(
-            acquisition_kind_val,
-            &acquisition_starts_at.get(),
-            &acquisition_ends_at.get(),
-        ) {
-            Ok(policy) => policy,
-            Err(msg) => {
-                error_message.set(Some(msg));
+                current_section.set(section);
+                error_message.set(Some(format!("Store page: {problem}")));
                 return;
             }
-        };
-
-        if let Err(msg) = validate_listing(
-            &title_val,
-            &description_val,
-            price_val,
-            &lud16_val,
-            fulfillment_enabled_val,
-            &servers_val,
-            &None,
-            &file_hash_val,
-            &version_val,
-            &fulfillment_mode_val,
-            &operator_url_val,
-        ) {
-            error_message.set(Some(msg));
-            return;
-        }
-
-        let platforms = match parse_platform_tags(&platforms_input.get()) {
-            Ok(platforms) => platforms,
-            Err(msg) => {
-                error_message.set(Some(msg));
-                return;
-            }
-        };
-        let image_publisher_hex = match publisher_hex(&initiating_npub) {
-            Some(value) => value,
-            None => {
-                error_message.set(Some("The active publisher key is invalid.".into()));
-                return;
-            }
-        };
-        if store_page_status.get_untracked() != Some(Ok(())) {
-            error_message.set(Some(
-                "Wait for the Store Page to load before publishing.".into(),
-            ));
-            return;
-        }
-        let store_page = synced_store_page(
-            store_page_draft.get_untracked(),
-            &title_val,
-            &description_val,
-            &tag_input.get_untracked(),
-        );
-        if let Some(problem) = store_page_problems(&store_page, &image_publisher_hex)
-            .into_iter()
-            .next()
-        {
-            current_stage.set(PublishStage::Details);
-            error_message.set(Some(format!("Store Page: {problem}")));
-            return;
-        }
-        // The cover and screenshots on the Store Page are the listing images.
-        let images =
-            arcadestr_core::store_page_seed::listing_images_from_media(&store_page.content.media);
-
-        let draft_state = publish_draft.get_untracked();
-        let selected_build = fulfillment_enabled_val
-            .then(|| draft_state.archive.selected_build.clone())
-            .flatten();
-        let selection_id = selected_build.as_ref().map(|build| &build.selection_id);
-        let launch_tier = match draft_state.launch.to_wire_result(selection_id) {
-            Ok(launch_tier) => launch_tier,
-            Err(violation) => {
-                let error = PublishAdpListingError::CoreValidation {
-                    violation,
-                    message: "Complete every launch-tier field before publishing.".into(),
-                };
+            Err(PublishBlocked::Attempt(error)) => {
                 publish_attempt.update(|attempt| attempt.fail(error.clone()));
                 error_message.set(Some(publish_error_message(&error)));
                 return;
             }
         };
-        let extension = PublishAdpListingRequestExtension {
-            store_page: Some(store_page),
-            authorize_operators: authorize_operators.get_untracked(),
-            server_roles: servers_val
-                .iter()
-                .map(|server| {
-                    server_roles
-                        .get_untracked()
-                        .into_iter()
-                        .find(|role| role.server_url == server.url)
-                        .unwrap_or(arcadestr_core::publisher_management::ServerRoleIntent {
-                            server_url: server.url.clone(),
-                            issue_receipt: server.url == operator_url.get_untracked(),
-                            issue_grant: server.url == operator_url.get_untracked(),
-                        })
-                })
-                .collect(),
-            operation_id: None,
-            commercial_intent: match reviewed_commercial_intent(
-                &commercial_mode.get_untracked(),
-                &PublisherTermsContext {
-                    publisher_pubkey: image_publisher_hex.clone(),
-                    servers: if fulfillment_enabled_val {
-                        servers_val.iter().map(|s| s.url.clone()).collect()
-                    } else {
-                        Vec::new()
-                    },
-                    price_sats: price_val,
-                    developer_destination: if acquisition_kind_val == AcquisitionKind::Gated {
-                        lud16_val.clone()
-                    } else {
-                        String::new()
-                    },
-                },
-                commercial_review.get_untracked(),
-                commercial_approved.get_untracked(),
-            ) {
-                Ok(intent) => intent,
-                Err(error) => {
-                    error_message.set(Some(error));
-                    return;
-                }
-            },
-            launch_tier,
-            acknowledged_removed_profile_ids: acknowledged_removed_profile_ids.get_untracked(),
-        };
-        let mut request = PublishAdpListingRequest {
-            expected_publisher_npub: initiating_npub.clone(),
-            existing_event_id: published_identity.get_untracked().event_id,
-            existing_d_tag: published_identity.get_untracked().d_tag,
-            pending_d_tag: published_identity.get_untracked().pending_d_tag,
-            title: title_val,
-            description: description_val,
-            price_sats: price_val,
-            lud16: (acquisition_kind_val == AcquisitionKind::Gated).then_some(lud16_val),
-            tags: parse_csv_values(&tag_input.get()),
-            images,
-            fulfillment_mode: fulfillment_mode_val,
-            operator_url: when_fulfillment_enabled(
-                fulfillment_enabled_val,
-                (!operator_url_val.trim().is_empty()).then_some(operator_url_val),
-            )
-            .flatten(),
-            servers: when_fulfillment_enabled(
-                fulfillment_enabled_val,
-                servers_val.into_iter().map(|entry| entry.url).collect(),
-            )
-            .unwrap_or_default(),
-            accepted_terms: Vec::new(),
-            file_path: None,
-            selected_build: selected_build.clone(),
-            existing_file_hash: (fulfillment_enabled_val && selected_build.is_none())
-                .then_some(file_hash_val)
-                .flatten(),
-            existing_fulfillment_pubkey: when_fulfillment_enabled(
-                fulfillment_enabled_val,
-                existing_fulfillment_key_for_submit.clone(),
-            )
-            .flatten(),
-            version: when_fulfillment_enabled(
-                fulfillment_enabled_val,
-                (!version_val.trim().is_empty()).then_some(version_val),
-            )
-            .flatten(),
-            acquisition,
-            platforms,
-            campaigns: existing_campaigns_for_submit.clone(),
-            nip94_event_id: existing_nip94_for_submit.clone(),
-        };
-        let prepared = match prepare_publish(
-            request,
-            extension,
-            selected_build,
-            fulfillment_enabled_val,
-            authoritative_file_hash_for_submit.as_deref(),
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let typed = PublishAdpListingError::Archive { error };
-                publish_attempt.update(|attempt| attempt.fail(typed.clone()));
-                error_message.set(Some(publish_error_message(&typed)));
-                return;
-            }
-        };
-        let PreparedPublish {
-            request: next_request,
-            extension,
-        } = prepared;
-        request = next_request;
 
         is_publishing.set(true);
         initiating_account.set(Some(initiating_npub.clone()));
@@ -4722,7 +5904,7 @@ pub fn PublishView(
                 .update(|generation| *generation = generation.wrapping_add(1));
             pending_removal_confirmation.set(None);
             error_message.set(Some(
-                "The form, archive, distribution settings, account, or authoritative revision changed after the backend check. The frozen confirmation was voided; submit again."
+                "Something changed after the check, so publishing was cancelled. Publish again to review it."
                     .into(),
             ));
         }
@@ -4748,7 +5930,7 @@ pub fn PublishView(
         ) {
             dismiss_removal_confirmation.run(());
             error_message.set(Some(
-                "The form, archive, distribution settings, account, or authoritative revision changed after the backend check. The frozen confirmation was voided; submit again."
+                "Something changed after the check, so publishing was cancelled. Publish again to review it."
                     .into(),
             ));
             return;
@@ -4833,6 +6015,27 @@ pub fn PublishView(
         }
     });
     let distribution_snapshot_for_dirty = distribution_snapshot.clone();
+    let form_snapshot_for_scope = form_snapshot.clone();
+    let distribution_snapshot_for_scope = distribution_snapshot.clone();
+    let publish_scope = move || {
+        let images = |page: StorePageDraft| {
+            arcadestr_core::store_page_seed::listing_images_from_media(&page.content.media)
+        };
+        let synced = |page: StorePageDraft| {
+            synced_store_page(page, &title.get(), &description.get(), &tag_input.get())
+        };
+        let current = store_page_draft.get();
+        let baseline = store_page_baseline.get();
+        update_scope(
+            editing,
+            authority_rebased.get(),
+            form_snapshot_for_scope() != initial_form_snapshot.get_value(),
+            distribution_snapshot_for_scope() != initial_distribution_snapshot.get(),
+            images(current.clone()) != images(baseline.clone()),
+            synced(current) != synced(baseline),
+            store_page_linked.get(),
+        )
+    };
     let is_dirty = move || {
         form_snapshot() != initial_form_snapshot.get_value()
             || distribution_snapshot_for_dirty() != initial_distribution_snapshot.get()
@@ -4840,11 +6043,57 @@ pub fn PublishView(
             || store_page_input_dirty.get()
     };
 
-    // Publish Game has no draft persistence. Share the complete create/edit
-    // dirty snapshot with the shell and clear it when this form unmounts.
-    let is_dirty_for_guard = is_dirty.clone();
+    // Restore the saved draft once the published state it edits has loaded, so
+    // a late Store page or launch-metadata load cannot overwrite restored edits.
+    let restore_started = StoredValue::new(false);
     Effect::new(move |_| {
-        crate::ui_v2::components::set_publish_game_dirty(is_dirty_for_guard());
+        if restore_started.get_value() {
+            return;
+        }
+        let page_loaded = store_page_status.get().is_some();
+        let authority_settled = !editing
+            || (operator_initialized.get()
+                && authoritative_edit
+                    .get()
+                    .is_some_and(|model| !matches!(model.state, AuthoritativeEditState::Loading)));
+        if page_loaded && authority_settled {
+            restore_started.set_value(true);
+            on_restore_draft.run(());
+        }
+    });
+
+    // Autosave: a short pause after the last edit writes the local draft.
+    let autosave_generation = StoredValue::new(0_u64);
+    let autosave_build = build_durable_draft.clone();
+    let is_dirty_for_autosave = is_dirty.clone();
+    Effect::new(move |_| {
+        autosave_tick.track();
+        let fingerprint = serde_json::to_value(autosave_build())
+            .ok()
+            .map(|value| value.to_string());
+        let wanted = draft_ready.get()
+            && !is_publishing.get()
+            && (is_dirty_for_autosave() || draft_revision.get_untracked().is_some())
+            && fingerprint.is_some()
+            && fingerprint != last_saved_fingerprint.get_untracked();
+        if !wanted || draft_save_status.get_untracked() == DraftSaveStatus::Conflict {
+            return;
+        }
+        autosave_generation.update_value(|value| *value = value.wrapping_add(1));
+        let generation = autosave_generation.get_value();
+        draft_save_status.set(DraftSaveStatus::Pending);
+        after_delay(800, move || {
+            if autosave_generation.try_get_value() == Some(generation) {
+                on_save_draft.run(());
+            }
+        });
+    });
+
+    // Leaving is only guarded while edits are not yet in the local draft.
+    Effect::new(move |_| {
+        crate::ui_v2::components::set_publish_game_dirty(
+            is_publishing.get() || draft_save_status.get().unsaved(),
+        );
     });
     on_cleanup(|| crate::ui_v2::components::set_publish_game_dirty(false));
 
@@ -4876,15 +6125,15 @@ pub fn PublishView(
             {move || store_page_note.get().filter(|_| groups.contains(&"basic") || groups.contains(&"media")).map(|note| view! { <p class="v2-create-inline-note" role="status">{note}</p> })}
             {move || store_page_form_error.get().map(|error| view! { <p class="v2-create-inline-note" role="status">{error}</p> })}
             {move || match store_page_status.get() {
-                None => view! { <p class="v2-create-help" role="status">"Loading the Store Page…"</p> }.into_any(),
+                None => view! { <p class="v2-create-help" role="status">"Loading the store page…"</p> }.into_any(),
                 Some(Err(error)) => view! {
                     <div role="alert" class="v2-create-alert v2-create-alert-error">
-                        <p>{format!("The Store Page did not load: {error}")}</p>
+                        <p>{format!("The store page didn't load: {error}")}</p>
                         <button type="button" class="v2-btn-secondary" on:click=move |_| load_store_page.run(())>"Retry"</button>
                     </div>
                 }.into_any(),
                 Some(Ok(())) => match auth.npub.get() {
-                    None => view! { <p class="v2-create-help">"Sign in to edit the Store Page."</p> }.into_any(),
+                    None => view! { <p class="v2-create-help">"Sign in to edit the store page."</p> }.into_any(),
                     Some(npub) => {
                         let hex = publisher_hex(&npub).unwrap_or_default();
                         let check_hex = hex.clone();
@@ -4897,9 +6146,9 @@ pub fn PublishView(
                             );
                             let problems = store_page_problems(&page, &check_hex);
                             store_page_form_error.set(Some(if problems.is_empty() {
-                                "Store Page check passed.".to_string()
+                                "No problems found.".to_string()
                             } else {
-                                format!("Store Page check found {} problem(s).", problems.len())
+                                format!("Found {} problem(s) to fix.", problems.len())
                             }));
                             store_page_diagnostics.set(problems);
                         });
@@ -4928,73 +6177,578 @@ pub fn PublishView(
             }}
         }
     };
-    let workflow_kind = if editing {
-        "Update game page"
-    } else {
-        "Create game"
+    let header_title = move || {
+        let value = title.get();
+        if value.trim().is_empty() {
+            "Untitled game".to_string()
+        } else {
+            value.trim().to_string()
+        }
+    };
+    let launchable = move || matches!(publish_draft.get().launch, LaunchMode::Launchable(_));
+    let current_delivery = move || {
+        delivery_choice(
+            delivery_chosen.get(),
+            fulfillment_enabled.get(),
+            launchable(),
+        )
+    };
+    // A published distribution authorization can't be dropped by an ordinary
+    // update, so a live game with a build can't switch to store-page-only.
+    let delivery_option_locked = move |choice: DeliveryChoice| {
+        existing_fulfillment_locked && choice.uses_build() != fulfillment_enabled.get()
+    };
+    let choose_delivery = move |choice: DeliveryChoice| {
+        if is_publishing.get_untracked() || delivery_option_locked(choice) {
+            return;
+        }
+        delivery_chosen.set(true);
+        let mut enabled = fulfillment_enabled.get_untracked();
+        let mut mode = fulfillment_mode.get_untracked();
+        let mut state = publish_draft.get_untracked();
+        let platforms = platforms_input.get_untracked();
+        let (distribution_changed, launch_changed) =
+            apply_delivery_choice(choice, &mut enabled, &mut mode, &mut state, &platforms);
+        if distribution_changed {
+            fulfillment_enabled.set(enabled);
+            fulfillment_mode.set(mode);
+            distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
+        }
+        if launch_changed {
+            publish_draft.set(state);
+            distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
+            if choice != DeliveryChoice::Install {
+                platform_user_revision.update(|revision| *revision = revision.wrapping_add(1));
+            }
+        }
+    };
+    let section_summary = move |section: HubSection| -> String {
+        match section {
+            HubSection::Overview => String::new(),
+            HubSection::Basics => {
+                let tags = parse_csv_values(&tag_input.get()).len();
+                format!(
+                    "{} · {}",
+                    header_title(),
+                    match tags {
+                        0 => "no tags".to_string(),
+                        1 => "1 tag".to_string(),
+                        count => format!("{count} tags"),
+                    }
+                )
+            }
+            HubSection::StorePage => {
+                let page = store_page_draft.get();
+                let media = page.content.media.len();
+                let has_description = !page.content.description_markdown.trim().is_empty();
+                format!(
+                    "{} · {}",
+                    if has_description {
+                        "Description written"
+                    } else {
+                        "No description yet"
+                    },
+                    match media {
+                        0 => "no images or videos".to_string(),
+                        1 => "1 image or video".to_string(),
+                        count => format!("{count} images and videos"),
+                    }
+                )
+            }
+            HubSection::PriceAccess => match acquisition_kind.get() {
+                AcquisitionKind::Gated => {
+                    let price = price_input.get();
+                    if price.trim().is_empty() {
+                        "Paid · no price set yet".to_string()
+                    } else {
+                        format!("Paid · {} sats", price.trim())
+                    }
+                }
+                AcquisitionKind::Public => "Free".to_string(),
+                AcquisitionKind::TimedAccess => "Free for a limited time".to_string(),
+            },
+            HubSection::Delivery => match current_delivery() {
+                None => "Not chosen yet".to_string(),
+                Some(choice) if choice.uses_build() => {
+                    let version = version.get();
+                    let build = if publish_draft.get().archive.selection.is_some() {
+                        "new build selected"
+                    } else if file_hash.get().is_some() {
+                        "current build"
+                    } else {
+                        "no build yet"
+                    };
+                    if version.trim().is_empty() {
+                        format!("{} · {build}", choice.title())
+                    } else {
+                        format!("{} · v{} · {build}", choice.title(), version.trim())
+                    }
+                }
+                Some(choice) => choice.title().to_string(),
+            },
+        }
+    };
+    let is_dirty_for_button = is_dirty.clone();
+    let is_dirty_for_hint = is_dirty.clone();
+    let publish_disabled = Signal::derive(move || {
+        is_hashing.get()
+            || is_publishing.get()
+            || !can_publish_now.get()
+            // A live game with nothing new to publish has nothing to update,
+            // unless an earlier attempt needs finishing.
+            || (editing
+                && !is_dirty_for_button()
+                && matches!(phase(), PublicationPhase::Idle | PublicationPhase::Published))
+    });
+    let publish_label = move || {
+        if is_publishing.get() {
+            "Publishing…"
+        } else if editing {
+            "Publish changes"
+        } else {
+            "Publish game"
+        }
+    };
+    // Publishing always goes through a buyer's-view preview first.
+    let preview_open = RwSignal::new(false);
+    let preview_auth = auth.clone();
+    let buyer_preview = move || -> Result<
+        (
+            crate::models::GameDetailPresentation,
+            Option<(GameListing, crate::models::StorePageCardPresentation)>,
+            String,
+        ),
+        String,
+    > {
+        let npub = preview_auth
+            .npub
+            .get()
+            .ok_or_else(|| "Sign in to preview your game.".to_string())?;
+        let hex = publisher_hex(&npub).ok_or_else(|| "The active publisher key is invalid.".to_string())?;
+        let platforms = parse_platform_tags(&platforms_input.get()).unwrap_or_default();
+        let page = synced_store_page(
+            store_page_draft.get(),
+            &title.get(),
+            &description.get(),
+            &tag_input.get(),
+        );
+        let presentation = buyer_preview_page(&page, &hex, &platforms)?;
+        let kind = acquisition_kind.get();
+        let price = price_for_acquisition(kind, &price_input.get(), &lud16.get()).unwrap_or(0);
+        let policy = acquisition_policy_from_form(
+            kind,
+            &acquisition_starts_at.get(),
+            &acquisition_ends_at.get(),
+        )
+        .unwrap_or_default();
+        let price_text = match kind {
+            AcquisitionKind::Gated => format!("{price} sats · players pay once and keep it"),
+            AcquisitionKind::Public => "Free".to_string(),
+            AcquisitionKind::TimedAccess => {
+                format!("Free from {} to {} (your local time)", acquisition_starts_at.get(), acquisition_ends_at.get())
+            }
+        };
+        let card = buyer_preview_card(
+            &npub,
+            &title.get(),
+            &description.get(),
+            price,
+            &policy,
+            &presentation,
+            arcadestr_core::store_page_seed::listing_images_from_media(&page.content.media),
+            &platforms,
+        );
+        Ok((presentation, card, price_text))
+    };
+    // A live game whose only changes are on its store page publishes just the
+    // store page: the game, its build and its distribution stay as they are.
+    let store_page_publish_auth = auth.clone();
+    let publish_store_page_only = Callback::new(move |()| {
+        if !can_dispatch(is_hashing.get_untracked(), is_publishing.get_untracked()) {
+            return;
+        }
+        let auth = store_page_publish_auth.clone();
+        let Some(npub) = auth.npub.get_untracked() else {
+            error_message.set(Some("Sign in before publishing.".into()));
+            return;
+        };
+        if durable_draft_owner.get_value().as_deref() != Some(npub.as_str()) {
+            error_message.set(Some(
+                "Switch to the account that published this game before updating it.".into(),
+            ));
+            return;
+        }
+        let Some(hex) = publisher_hex(&npub) else {
+            error_message.set(Some("The active publisher key is invalid.".into()));
+            return;
+        };
+        let page = synced_store_page(
+            store_page_draft.get_untracked(),
+            &title.get_untracked(),
+            &description.get_untracked(),
+            &tag_input.get_untracked(),
+        );
+        if let Some(problem) = store_page_problems(&page, &hex).into_iter().next() {
+            let tab = crate::ui_v2::views::store_page_publish::diagnostic_tab(&problem);
+            store_page_tab.set(tab);
+            current_section.set(HubSection::StorePage);
+            error_message.set(Some(format!("Store page: {problem}")));
+            return;
+        }
+        let epoch = auth.current_auth_flow();
+        is_publishing.set(true);
+        initiating_account.set(Some(npub.clone()));
+        publication_account_stale.set(false);
+        error_message.set(None);
+        progress_events.set(Vec::new());
+        upload_progress.set(None);
+        publication_state.set(PublicationState {
+            outcome: PublicationOutcome::Publishing,
+            ..PublicationState::default()
+        });
+        spawn_local(async move {
+            let result = crate::tauri_bridge::invoke_publish_store_page(
+                npub.clone(),
+                page.clone(),
+                Vec::new(),
+            )
+            .await;
+            if !auth.is_current_auth_flow(epoch)
+                || !publication_account_matches(&npub, auth.npub.get_untracked().as_deref())
+            {
+                let _ = is_publishing.try_set(false);
+                let _ = initiating_account.try_set(None);
+                let _ = publication_account_stale.try_set(true);
+                return;
+            }
+            let _ = is_publishing.try_set(false);
+            let _ = initiating_account.try_set(None);
+            recovery_refresh.update(|value| *value = value.wrapping_add(1));
+            let published_page = |event_id: &str| {
+                let mut next = page.clone();
+                next.loaded_event_id = Some(event_id.to_string());
+                next
+            };
+            match result {
+                Ok(response) => {
+                    // Later edits revise the revision that was just published.
+                    if let Some(outcome) = response.store_page.as_ref() {
+                        let next = published_page(&outcome.event_id);
+                        store_page_draft.set(next.clone());
+                        store_page_baseline.set(next);
+                    }
+                    if response.complete {
+                        publication_state.set(PublicationState {
+                            outcome: PublicationOutcome::Complete,
+                            listing_published: true,
+                            message: Some(
+                                "Your store page is updated. The rest of your game didn't change."
+                                    .into(),
+                            ),
+                        });
+                        if let Some(revision) = draft_revision.get_untracked() {
+                            let draft_id = durable_draft_id.get_value();
+                            spawn_local(async move {
+                                let _ = crate::tauri_bridge::invoke_delete_publisher_draft(
+                                    npub,
+                                    draft_id,
+                                    "listing".into(),
+                                    revision,
+                                )
+                                .await;
+                            });
+                        }
+                        draft_revision.set(None);
+                        last_saved_fingerprint.set(None);
+                        draft_save_status.set(DraftSaveStatus::Idle);
+                    } else {
+                        publication_state.set(PublicationState {
+                            outcome: PublicationOutcome::Partial,
+                            listing_published: true,
+                            message: Some(
+                                "Your store page was published but hasn't reached every server yet. Select Finish publishing below to retry."
+                                    .into(),
+                            ),
+                        });
+                    }
+                }
+                Err(error) => publication_state.set(PublicationState {
+                    outcome: PublicationOutcome::Failed,
+                    listing_published: false,
+                    message: Some(error),
+                }),
+            }
+        });
+    });
+    let publish_scope_for_confirm = publish_scope.clone();
+    let publish_scope_for_preview = publish_scope.clone();
+    let confirm_publish = Callback::new(move |()| {
+        preview_open.set(false);
+        match untrack(|| publish_scope_for_confirm()) {
+            UpdateScope::StorePageOnly => publish_store_page_only.run(()),
+            UpdateScope::FullGame => on_submit.run(()),
+        }
+    });
+    let leave = move || {
+        if let Some(on_back) = on_back {
+            on_back.run(());
+        }
+    };
+    let section_header = move |section: HubSection| {
+        let status = move || {
+            section_status(
+                &validate_section(section),
+                section_suggestions(section).len(),
+            )
+        };
+        view! {
+            <header class="v2-hub-section-header">
+                <div>
+                    <h2 id=format!("{}-title", section.dom_id()) class="v2-hub-section-title">{section.title()}</h2>
+                    <p class="v2-create-help">{section.description()}</p>
+                </div>
+                <span class=move || format!("v2-hub-section-status {}", status().class())>{move || status().label()}</span>
+            </header>
+            {move || validate_section(section).err().map(|issue| view! {
+                <p class="v2-hub-section-issue" role="status">{issue}</p>
+            })}
+            {move || {
+                let suggestions = section_suggestions(section);
+                (validate_section(section).is_ok() && !suggestions.is_empty()).then(|| view! {
+                    <div class="v2-hub-section-suggestions" role="note">
+                        <p>"Optional, but these help players decide:"</p>
+                        <ul>{suggestions.into_iter().map(|item| view! { <li>{item}</li> }).collect_view()}</ul>
+                    </div>
+                })
+            }}
+        }
     };
 
     view! {
-        <main class="v2-publisher-studio v2-create-workflow">
-            <header class="v2-create-header">
-                <h1 class="v2-create-title">{move || format!("{workflow_kind} · Step {} of {} — {}", current_stage.get().index() + 1, PublishStage::ALL.len(), current_stage.get().title())}</h1>
-                <p class="v2-create-subtitle">{move || match current_stage.get() {
-                    PublishStage::Details => "What players see first: the title, summary and tags on game cards, and the opening of the Store Page.",
-                    PublishStage::Media => "The cover and screenshots are also the listing images shown on game cards.",
-                    PublishStage::StorePage => "Optional Store Page content: feature sections, languages, accessibility and links.",
-                    PublishStage::Pricing => "A zero price never enables public access on its own — choose the access model explicitly.",
-                    PublishStage::Builds => "Build verification is computed from the selected file; there is no freeform hash field.",
-                    PublishStage::Review => "Review the authored values and active-account authorization before network publication.",
-                }}</p>
-            </header>
-
-            <nav class="v2-create-stages" aria-label="Create Game stages">
+        <main class="v2-publisher-studio v2-create-workflow v2-game-hub">
+            <nav class="v2-hub-breadcrumb" aria-label="Breadcrumb">
                 <ol>
-                    {PublishStage::ALL.into_iter().map(|stage| {
-                        let status = move || stage_status(stage, current_stage.get(), validate_stage(stage).is_ok());
-                        view! {
-                            <li>
-                                <button
-                                    type="button"
-                                    class=move || format!("v2-create-stage {}", status().class())
-                                    aria-current=move || (current_stage.get() == stage).then_some("step")
-                                    disabled=move || !stage_reachable(stage, current_stage.get()) || is_publishing.get()
-                                    title=move || (!stage_reachable(stage, current_stage.get())).then_some("Complete the current stage first.")
-                                    on:click=move |_| { current_stage.set(stage); stage_error.set(None); }
-                                >
-                                    <span class="v2-create-stage-index">{format!("Step {}", stage.index() + 1)}</span>
-                                    <span class="v2-create-stage-title">{stage.title()}</span>
-                                    <span class="v2-create-stage-status">{move || status().label()}</span>
-                                </button>
-                            </li>
-                        }
-                    }).collect_view()}
+                    <li><button type="button" class="v2-hub-crumb" disabled=move || !can_exit on:click=move |_| leave()>"Publish"</button></li>
+                    <li>
+                        <button
+                            type="button"
+                            class="v2-hub-crumb"
+                            aria-current=move || (current_section.get() == HubSection::Overview).then_some("page")
+                            on:click=move |_| open_section(HubSection::Overview)
+                        >{header_title}</button>
+                    </li>
+                    {move || (current_section.get() != HubSection::Overview).then(|| view! {
+                        <li><span class="v2-hub-crumb-current" aria-current="page">{current_section.get().title()}</span></li>
+                    })}
                 </ol>
             </nav>
 
-            {move || stage_error.get().map(|msg| view! { <div id="publish-stage-error" role="alert" class="v2-create-alert v2-create-alert-error">{msg}</div> })}
-            {move || error_message.get().map(|msg| view! { <div role="alert" class="v2-create-alert v2-create-alert-error">{msg}</div> })}
-            <section style="padding:14px;border:1px solid oklch(0.32 0.01 60);background:#121215;font:400 12.5px/1.6 ui-monospace,monospace;color:#fff">
-                <button type="button" style="padding:10px;color:oklch(0.8 0.13 210);background:transparent;border:1px solid oklch(0.5 0.13 210);font-family:ui-monospace,monospace" disabled=move || draft_busy.get() || is_publishing.get() on:click=move |_| on_save_draft.run(())>"SAVE DRAFT"</button>
-                <button type="button" style="padding:10px;color:oklch(0.8 0.13 210);background:transparent;border:1px solid oklch(0.5 0.13 210);font-family:ui-monospace,monospace" disabled=move || draft_busy.get() || is_publishing.get() || is_hashing.get() on:click=move |_| on_restore_draft.run(())>"RESTORE SAVED DRAFT (REPLACES FORM)"</button>
-                {move || draft_message.get().map(|message| view! { <p role="status">{message}</p> })}
-            </section>
-            {(!SUPPORTS_DRAFTS).then(|| view! {
-                <p class="v2-create-persistence-note">"Arcadestr does not store Create Game drafts. Nothing here is saved locally or on a relay until network publication succeeds; leaving this workflow discards it."</p>
+            <header class="v2-hub-header">
+                <div class="v2-hub-identity">
+                    <p class="v2-publisher-kicker">{if editing { "Live game" } else { "Draft game" }}</p>
+                    <h1 class="v2-create-title">{header_title}</h1>
+                    <div class="v2-hub-header-status">
+                        {move || {
+                            let state = authoring();
+                            view! { <StatusChip label=state.label() variant=state.chip() icon=None size=StatusChipSize::Compact /> }
+                        }}
+                        <span class="v2-hub-save-status" role="status" aria-live="polite">{move || draft_save_status.get().label()}</span>
+                        {move || matches!(draft_save_status.get(), DraftSaveStatus::Failed(_)).then(|| view! {
+                            <button type="button" class="v2-hub-link" on:click=move |_| on_save_draft.run(())>"Retry"</button>
+                        })}
+                        {move || (draft_save_status.get() == DraftSaveStatus::Conflict).then(|| view! {
+                            <button type="button" class="v2-hub-link" on:click=move |_| {
+                                draft_save_status.set(DraftSaveStatus::Idle);
+                                on_restore_draft.run(());
+                            }>"Reload draft"</button>
+                        })}
+                    </div>
+                </div>
+                <div class="v2-hub-header-actions">
+                    <button type="button" class="v2-btn-primary" aria-describedby="publish-signer-requirement" on:click=move |_| preview_open.set(true) disabled=move || publish_disabled.get()>
+                        {publish_label}
+                    </button>
+                    <p class="v2-create-help" id="publish-signer-requirement">{move || {
+                        let issues = blocking_issues().len();
+                        if !signed_in.get() {
+                            "Sign in to publish.".to_string()
+                        } else if !signer_can_publish(signer_state.get()) {
+                            signer_requirement_message(signer_state.get()).to_string()
+                        } else if issues > 0 {
+                            if issues == 1 { "1 thing to finish before publishing.".to_string() } else { format!("{issues} things to finish before publishing.") }
+                        } else if editing && !is_dirty_for_hint() {
+                            "No unpublished changes.".to_string()
+                        } else {
+                            signer_requirement_message(signer_state.get()).to_string()
+                        }
+                    }}</p>
+                </div>
+            </header>
+
+            {move || draft_message.get().map(|message| view! {
+                <p class="v2-create-inline-note" role="status">
+                    {message}
+                    " "
+                    <button type="button" class="v2-hub-link" on:click=move |_| draft_message.set(None)>"Dismiss"</button>
+                </p>
             })}
+            {move || error_message.get().map(|msg| view! { <div role="alert" class="v2-create-alert v2-create-alert-error">{msg}</div> })}
+
+            <Show when=move || phase() != PublicationPhase::Idle>
+            <section class="v2-hub-card v2-hub-publication" aria-labelledby="publication-status-title">
+                <div class="v2-create-status-heading">
+                    <h2 id="publication-status-title" class="v2-create-section-title">"Publishing"</h2>
+                    <span role="status" aria-live="polite" aria-atomic="true" class=move || format!("v2-create-phase {}", phase().class())>{move || phase().label()}</span>
+                </div>
+                <p class="v2-create-help">{move || match phase() {
+                    PublicationPhase::Idle => "",
+                    PublicationPhase::Publishing => "Publishing your game. Keep Arcadestr open until this finishes.",
+                    PublicationPhase::Partial => "Your game is live, but some of the remaining work didn't finish. Use Finish publishing below.",
+                    PublicationPhase::Published => "Your game is live.",
+                    PublicationPhase::Failed => "Nothing was published. Fix the problem below and try again.",
+                    PublicationPhase::StaleAccount => "You switched accounts while publishing, so the result was ignored. Switch back to check whether the game was published.",
+                }}</p>
+                <div aria-live="polite" aria-atomic="true">
+                {move || publication_state.get().message.map(|msg| {
+                    let class = match publication_state.get().outcome { PublicationOutcome::Complete => "v2-create-status-ok", PublicationOutcome::Partial | PublicationOutcome::Failed => "v2-create-status-error", _ => "v2-create-status-neutral" };
+                    view! { <p class={class}>{msg}</p> }
+                })}
+                {move || upload_progress.get().and_then(|event| {
+                    let bytes_uploaded = event.bytes_uploaded?;
+                    let total_bytes = event.total_bytes?;
+                    let percent = progress_percent(bytes_uploaded, total_bytes);
+                    let server = event.server_url.unwrap_or_else(|| "the upload server".to_string());
+                    Some(view! {
+                        <div class="v2-create-progress" role="progressbar" aria-label="Build upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>
+                            <div class="v2-create-progress-heading">
+                                <span>{format!("Uploading your build to {server}")}</span>
+                                <span>{format!("{percent}%")}</span>
+                            </div>
+                            <div class="v2-create-progress-track">
+                                <div class="v2-create-progress-fill" style=format!("width: {percent}%")></div>
+                            </div>
+                        </div>
+                    })
+                })}
+                <ul class="v2-create-progress-log">
+                    {move || progress_events.get().into_iter().map(|event| view! {
+                        <li>{progress_label(&event)}</li>
+                    }).collect_view()}
+                </ul>
+                </div>
+            </section>
+            </Show>
+
+            <crate::components::publisher_recovery::PublisherRecoveryPanel
+                game_d_tag=Signal::derive(move || {
+                    let identity = published_identity.get();
+                    identity.d_tag.or(identity.pending_d_tag)
+                })
+                refresh_key=Signal::derive(move || recovery_refresh.get())
+                current_build=Signal::derive(move || publish_draft.get().archive.selected_build)
+                on_finished=Callback::new(move |()| {
+                    publication_state.set(PublicationState::default());
+                    error_message.set(None);
+                    draft_message.set(Some(if editing {
+                        "Publishing finished. Go back to Your games and open the game again to see its latest version.".into()
+                    } else {
+                        "Publishing finished. Your game is live; find it under Your games.".into()
+                    }));
+                })
+            />
+
+            <Dialog
+                id="publish-buyer-preview"
+                open=Signal::derive(move || preview_open.get())
+                title=Signal::derive(move || format!("Preview · {}", header_title()))
+                kicker="Before publishing"
+                description=Signal::derive(move || if editing {
+                    "This is how your game will look to buyers after these changes. Nothing is published until you confirm.".to_string()
+                } else {
+                    "This is how your game will look to buyers. Nothing is published until you confirm.".to_string()
+                })
+                width=DialogWidth::Wide
+                policy=DialogClosePolicy::Dismissible
+                dismissal=DialogDismissal::keyboard_and_button()
+                initial_focus=DialogInitialFocus::CloseButton
+                close_label="Keep editing"
+                on_close=UnsyncCallback::new(move |_: DialogCloseRequest| preview_open.set(false))
+                actions=move || view! {
+                    <Button
+                        variant=ButtonVariant::Secondary
+                        on_click=Callback::new(move |_| preview_open.set(false))
+                    >"Keep editing"</Button>
+                    <Button
+                        variant=ButtonVariant::Primary
+                        disabled=Signal::derive(move || publish_disabled.get() || buyer_preview().is_err())
+                        on_click=Callback::new(move |_| confirm_publish.run(()))
+                    >{move || if editing { "Confirm and publish changes" } else { "Confirm and publish" }}</Button>
+                }
+            >
+                {move || preview_open.get().then(|| match buyer_preview() {
+                    Err(problem) => view! {
+                        <div role="alert" class="v2-create-alert v2-create-alert-error">
+                            <p>{format!("The store page can't be previewed yet: {problem}")}</p>
+                            <p>"Fix it in the Store page section, then preview again."</p>
+                        </div>
+                    }.into_any(),
+                    Ok((presentation, card, price_text)) => {
+                        let delivery = match current_delivery() {
+                            Some(DeliveryChoice::StorePageOnly) | None => "Store page only: players can't get the game until you add a build.".to_string(),
+                            Some(choice) => {
+                                let version = version.get();
+                                if version.trim().is_empty() { choice.title().to_string() } else { format!("{} · version {}", choice.title(), version.trim()) }
+                            }
+                        };
+                        let now = (js_sys::Date::now() / 1000.0) as u64;
+                        view! {
+                            <div class="v2-buyer-preview" data-testid="buyer-preview">
+                                <section class="v2-buyer-preview-card" aria-labelledby="buyer-preview-card-title">
+                                    <h3 id="buyer-preview-card-title" class="v2-hub-kicker">"Game card"</h3>
+                                    <p class="v2-create-help">"Shown in the store, search and the library."</p>
+                                    {card.map(|(listing, store_page)| {
+                                        let presentation = GameCardPresentation::from_listing(&listing, now, PlatformCompatibility::Unknown, false);
+                                        view! {
+                                            <div class="v2-buyer-preview-card-frame">
+                                                <GameCard listing=listing presentation=presentation on_open=Callback::new(|_| {}) store_page=Some(store_page) />
+                                            </div>
+                                        }
+                                    })}
+                                    <dl class="v2-create-review-facts">
+                                        <div><dt>"Price & access"</dt><dd>{price_text}</dd></div>
+                                        <div><dt>"How players get it"</dt><dd>{delivery}</dd></div>
+                                        {editing.then(|| view! {
+                                            <div><dt>"What will be published"</dt><dd data-testid="publish-scope">{match publish_scope_for_preview() {
+                                                UpdateScope::StorePageOnly => "Only your store page. The price, build and game details stay as they are.",
+                                                UpdateScope::FullGame => "Your game and its store page.",
+                                            }}</dd></div>
+                                        })}
+                                    </dl>
+                                </section>
+                                <section class="v2-buyer-preview-page" aria-labelledby="buyer-preview-page-title">
+                                    <h3 id="buyer-preview-page-title" class="v2-hub-kicker">"Store page"</h3>
+                                    <h2 class="v2-hub-section-title">{presentation.title.clone().unwrap_or_else(header_title)}</h2>
+                                    {presentation.summary.clone().map(|summary| view! { <p class="v2-create-help">{summary}</p> })}
+                                    <StorePageRichDetail presentation=presentation preview=true />
+                                </section>
+                            </div>
+                        }.into_any()
+                    }
+                })}
+            </Dialog>
 
             <Dialog
                 id="publish-profile-removal-confirmation"
                 open=Signal::derive(move || pending_removal_confirmation.get().is_some())
                 title=Signal::derive(move || pending_removal_confirmation.get().map(|pending| {
                     (if pending.abort_count > 1 {
-                        "Removal set changed — confirm again"
+                        "Removed launch options changed — confirm again"
                     } else {
-                        "Confirm removed launch profiles"
+                        "Remove launch options?"
                     })
                     .to_string()
                 }).unwrap_or_default())
-                kicker="Publication blocked"
+                kicker="Before publishing"
                 description=Signal::derive(move || pending_removal_confirmation.get().map(|pending| removal_confirmation_copy(&pending.removed_profile_ids, pending.abort_count)).unwrap_or_default())
                 width=DialogWidth::Compact
                 tone=DialogTone::Destructive
@@ -5016,24 +6770,61 @@ pub fn PublishView(
                         variant=ButtonVariant::Danger
                         disabled=Signal::derive(move || is_publishing.get())
                         on_click=Callback::new(move |_| confirm_profile_removal.run(()))
-                    >"Confirm removals and publish"</Button>
+                    >"Remove and publish"</Button>
                 }
             >
                 <div role="alert" class="v2-create-alert v2-create-alert-error">
-                    <p>"The backend stopped before publication. Confirming resubmits the exact frozen review payload and only acknowledges these removals:"</p>
+                    <p>"This update removes launch options players may already use. Nothing has been published yet. Players who chose one of these will switch to the default launch option:"</p>
                     <ul>
                         {move || pending_removal_confirmation.get().map(|pending| pending.removed_profile_ids.into_iter().map(|id| view! {
-                            <li><strong>{id.as_str().to_string()}</strong>": installed clients may have this profile ID pinned and will fall back after publication."</li>
+                            <li><strong>{id.as_str().to_string()}</strong></li>
                         }).collect_view())}
                     </ul>
-                    <p>"Closing this dialog voids this confirmation. Any form, archive, profile, distribution, account, or revision change requires a new submit and backend check."</p>
+                    <p>"Closing this dialog cancels publishing. If you change anything else, you'll be asked again."</p>
                 </div>
             </Dialog>
 
             <div class="v2-create-surface">
-                    <Show when=move || current_stage.get() == PublishStage::Details>
-                    <section class="v2-create-stage-panel" aria-labelledby="publish-details-title">
-                        <h2 id="publish-details-title" class="v2-create-section-title">"Game details"</h2>
+                    <Show when=move || current_section.get() == HubSection::Overview>
+                    <section class="v2-hub-overview" aria-labelledby="game-hub-checklist-title">
+                        <h2 id="game-hub-checklist-title" class="v2-hub-kicker">{if editing { "Your game" } else { "Before you publish" }}</h2>
+                        <ol class="v2-hub-checklist">
+                            {HubSection::EDITABLE.into_iter().map(|section| {
+                                let status = move || section_status(&validate_section(section), section_suggestions(section).len());
+                                view! {
+                                    <li class=move || format!("v2-hub-row {}", status().class())>
+                                        <button type="button" class="v2-hub-row-button" on:click=move |_| open_section(section)>
+                                            <span class="v2-hub-row-icon" aria-hidden="true">{move || status().icon()}</span>
+                                            <span class="v2-hub-row-body">
+                                                <span class="v2-hub-row-title">{section.title()}</span>
+                                                <span class="v2-hub-row-summary">{move || section_summary(section)}</span>
+                                                {move || match validate_section(section) {
+                                                    Err(issue) => Some(view! { <span class="v2-hub-row-issue">{issue}</span> }.into_any()),
+                                                    Ok(()) => {
+                                                        let suggestions = section_suggestions(section);
+                                                        suggestions.first().map(|first| view! {
+                                                            <span class="v2-hub-row-suggestion">{match suggestions.len() {
+                                                                1 => format!("Suggestion: {first}"),
+                                                                count => format!("{count} suggestions · {first}"),
+                                                            }}</span>
+                                                        }.into_any())
+                                                    }
+                                                }}
+                                            </span>
+                                            <span class="v2-hub-row-status">{move || status().label()}</span>
+                                            <span class="v2-hub-row-action" aria-hidden="true">{move || status().action()}</span>
+                                        </button>
+                                    </li>
+                                }
+                            }).collect_view()}
+                        </ol>
+                    </section>
+                    {overview_extra.clone().map(|extra| extra.run())}
+                    </Show>
+
+                    <Show when=move || current_section.get() == HubSection::Basics>
+                    <section class="v2-create-stage-panel" id=HubSection::Basics.dom_id() aria-labelledby="game-hub-basics-title">
+                        {section_header(HubSection::Basics)}
                         <div class="v2-create-fields">
                             <div>
                                 <label for="publish-title" class="v2-create-field-label">"Title (required)"</label>
@@ -5042,7 +6833,7 @@ pub fn PublishView(
                             <div>
                                 <label for="publish-description" class="v2-create-field-label">"Summary (required)"</label>
                                 <textarea id="publish-description" required=true class="v2-input" rows=3 aria-describedby="publish-description-help" placeholder="One or two sentences about your game." prop:value={move || description.get()} on:input:target=move |ev| description.set(ev.target().value()) disabled={move || is_publishing.get()} />
-                                <p id="publish-description-help" class="v2-create-help">"Shown on game cards and at the top of the Store Page."</p>
+                                <p id="publish-description-help" class="v2-create-help">"Shown on game cards and at the top of your store page."</p>
                             </div>
                             <div>
                                     <label for="publish-tag-choice" class="v2-create-field-label">"Tags"</label>
@@ -5073,40 +6864,130 @@ pub fn PublishView(
                             </div>
                         </div>
                     </section>
-
-                    {store_page_step(&["basic", "description"])}
+                    {store_page_step(&["basic"])}
                     </Show>
 
-                    <Show when=move || current_stage.get() == PublishStage::Media>
-                    <div class="v2-create-store-step">{store_page_step(&["media"])}</div>
+                    <Show when=move || current_section.get() == HubSection::StorePage>
+                    <section class="v2-create-stage-panel" id=HubSection::StorePage.dom_id() aria-labelledby="game-hub-store-page-title">
+                        {section_header(HubSection::StorePage)}
+                        <nav class="v2-hub-tabs" role="tablist" aria-label="Store page parts">
+                            {STORE_PAGE_TABS.into_iter().map(|(id, label, _)| {
+                                let blocked = move || {
+                                    let platforms = parse_platform_tags(&platforms_input.get()).unwrap_or_default();
+                                    embedded_readiness(&store_page_draft.get(), &platforms, &store_page_diagnostics.get())
+                                        .blockers()
+                                        .iter()
+                                        .any(|blocker| crate::ui_v2::views::store_page_publish::diagnostic_tab(blocker) == id)
+                                };
+                                view! {
+                                    <button
+                                        type="button"
+                                        role="tab"
+                                        aria-selected=move || aria_bool(store_page_tab.get() == id)
+                                        class=move || format!(
+                                            "v2-hub-tab{}{}",
+                                            if store_page_tab.get() == id { " v2-hub-tab-active" } else { "" },
+                                            if blocked() { " v2-hub-tab-attention" } else { "" },
+                                        )
+                                        on:click=move |_| store_page_tab.set(id)
+                                    >
+                                        {label}
+                                        {move || blocked().then(|| view! { <span class="v2-hub-tab-flag" aria-hidden="true">" !"</span><span class="sr-only">" needs attention"</span> })}
+                                    </button>
+                                }
+                            }).collect_view()}
+                        </nav>
+                        {STORE_PAGE_TABS.into_iter().map(|(id, _, groups)| view! {
+                            <Show when=move || store_page_tab.get() == id>
+                                <div class="v2-create-store-step" role="tabpanel">{store_page_step(groups)}</div>
+                            </Show>
+                        }).collect_view()}
+                        // Platforms are set with the build; say so where requirements are edited.
+                        <Show when=move || store_page_tab.get() == "requirements">
+                            <div class="v2-create-inline-note v2-create-row-between" role="note">
+                                <span>{move || {
+                                    let platforms = parse_platform_tags(&platforms_input.get()).unwrap_or_default();
+                                    if platforms.is_empty() {
+                                        "Platforms are set in Delivery & builds.".to_string()
+                                    } else {
+                                        format!("Platforms: {} · set in Delivery & builds.", platform_summary(&platforms_input.get()))
+                                    }
+                                }}</span>
+                                <button type="button" class="v2-btn-secondary" on:click=move |_| open_section(HubSection::Delivery)>"Edit platforms >"</button>
+                            </div>
+                        </Show>
+                    </section>
                     </Show>
 
-                    <Show when=move || current_stage.get() == PublishStage::StorePage>
-                    <div class="v2-create-store-step">{store_page_step(&["sections", "languages", "accessibility", "links"])}</div>
-                    </Show>
+                    <Show when=move || current_section.get() == HubSection::Delivery>
+                    <section class="v2-create-stage-panel" id=HubSection::Delivery.dom_id() aria-labelledby="game-hub-delivery-title">
+                        {section_header(HubSection::Delivery)}
+                        <div class="v2-hub-choice-grid" role="radiogroup" aria-label="How players get your game">
+                            {DeliveryChoice::ALL.into_iter().map(|choice| {
+                                let selected = move || current_delivery() == Some(choice);
+                                view! {
+                                    <button
+                                        type="button"
+                                        role="radio"
+                                        aria-checked=move || aria_bool(selected())
+                                        class=move || if selected() { "v2-create-mode-option v2-create-mode-selected" } else { "v2-create-mode-option" }
+                                        disabled=move || is_publishing.get() || delivery_option_locked(choice)
+                                        on:click=move |_| choose_delivery(choice)
+                                    >
+                                        <span class="v2-create-row-between">
+                                            <span class=move || if selected() { "v2-create-mode-title v2-create-mode-title-active" } else { "v2-create-mode-title" }>{choice.title()}</span>
+                                            <Show when=selected>
+                                                <span class="v2-create-selected-badge">"Selected"</span>
+                                            </Show>
+                                        </span>
+                                        <span class="v2-create-help">{choice.description()}</span>
+                                    </button>
+                                }
+                            }).collect_view()}
+                        </div>
+                        {existing_fulfillment_locked.then(|| view! { <p class="v2-create-help">"This game already has a distribution service authorized, so it can't switch back to store page only."</p> })}
 
-                    <Show when=move || current_stage.get() == PublishStage::Builds>
-                    <section class="v2-create-stage-panel" aria-labelledby="publish-builds-title">
-                        <h2 id="publish-builds-title" class="v2-create-section-title">"Builds and distribution"</h2>
-                        <p class="v2-create-help">"Enable automated installation only when you have a build and distribution provider. Otherwise this remains a metadata-only game page."</p>
-                        <p class="v2-create-help">{build_capability_message()}</p>
-                        <label class="v2-create-toggle">
-                             <input type="checkbox" checked={move || fulfillment_enabled.get()} disabled=move || is_publishing.get() || existing_fulfillment_locked on:change:target=move |ev| {
-                                 let enabled = ev.target().checked();
-                                 fulfillment_enabled.set(enabled);
-                                  if enabled && fulfillment_mode.get_untracked() == FulfillmentMode::None {
-                                     fulfillment_mode.set(FulfillmentMode::Delegate);
-                                  } else if !enabled {
-                                     fulfillment_mode.set(FulfillmentMode::None);
-                                  }
-                                  distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
-                             } />
-                            <span class="v2-create-toggle-label">"Enable automated installation"</span>
-                        </label>
-                        {existing_fulfillment_locked.then(|| view! { <p class="v2-create-help">"This existing publishing authorization cannot be removed by an ordinary Game page update. Keep the current mode to reuse its key, or deliberately choose another mode to replace the authorization."</p> })}
-
-                        <Show when=move || fulfillment_enabled.get()>
+                        <Show when=move || fulfillment_enabled.get() && delivery_chosen.get()>
                             <div class="v2-create-fields">
+                                <h3 class="v2-create-subsection-title">"Your build"</h3>
+                                <div class="v2-create-field-pair">
+                                    <div>
+                                        <span id="publish-build-label" class="v2-create-field-label">"Build file (required)"</span>
+                                        <button type="button" aria-labelledby="publish-build-label" aria-describedby="publish-hash-status" class="v2-create-file-button" on:click={on_select_file} disabled={move || is_hashing.get() || is_publishing.get()}>
+                                            {move || if is_hashing.get() { "Checking the file…".to_string() } else { publish_draft.get().archive.selection.map(|selection| selection.safe_filename.as_str().to_string()).unwrap_or_else(|| if file_hash.get().is_some() { "Current build · choose a new file".to_string() } else { "Choose file (ZIP, tar.gz or tar.zst)".to_string() }) }}
+                                        </button>
+                                        <p id="publish-hash-status" aria-live="polite" class="v2-create-help">{move || if is_hashing.get() { "Checking the archive's contents and fingerprint…".to_string() } else if file_hash.get().is_some() { "Build checked.".to_string() } else { "Choose the archive players will receive.".to_string() }}</p>
+                                    </div>
+                                    <div>
+                                        <label for="publish-version" class="v2-create-field-label">"Version (required)"</label>
+                                        <input id="publish-version" required=true class="v2-input" placeholder="1.0.0" prop:value={move || version.get()} on:input:target=move |ev| {
+                                            version.set(ev.target().value());
+                                            distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
+                                        } />
+                                    </div>
+                                </div>
+                            </div>
+                        </Show>
+
+                        <Show when=move || delivery_chosen.get()>
+                            <super::publish_launch::PublishLaunchEditor
+                                state=publish_draft
+                                authoritative=authoritative_edit
+                                defect_review=defect_review
+                                platforms_input=platforms_input
+                                distribution_revision=distribution_user_revision
+                                platform_revision=platform_user_revision
+                                surfaced_warnings=surfaced_archive_warnings
+                                disabled=Signal::derive(move || is_publishing.get() || is_hashing.get() || (editing && !operator_initialized.get()))
+                            />
+                        </Show>
+
+                        <Show when=move || fulfillment_enabled.get() && delivery_chosen.get()>
+                            <div class="v2-create-fields">
+                                <div>
+                                    <h3 class="v2-create-subsection-title">"Distribution service"</h3>
+                                    <p class="v2-create-help">"A distribution service stores your build and gives copies to players who have access to the game."</p>
+                                </div>
                                 <button type="button" aria-pressed=move || aria_bool(fulfillment_mode.get() == FulfillmentMode::Delegate) class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate {
                                     "v2-create-mode-option v2-create-mode-selected"
                                 } else {
@@ -5121,26 +7002,76 @@ pub fn PublishView(
                                     }
                                 }>
                                     <span class="v2-create-row-between">
-                                        <span class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "v2-create-mode-title v2-create-mode-title-active" } else { "v2-create-mode-title" }>"Authorize a distribution provider"</span>
+                                        <span class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "v2-create-mode-title v2-create-mode-title-active" } else { "v2-create-mode-title" }>"Use a distribution service"</span>
                                         <span class=move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "v2-create-selected-badge" } else { "v2-create-selected-badge v2-create-selected-badge-idle" }>
-                                            {move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "Selected" } else { "Switch to provider" }}
+                                            {move || if fulfillment_mode.get() == FulfillmentMode::Delegate { "Selected" } else { "Use a service" }}
                                         </span>
                                     </span>
-                                    <span class="v2-create-help">"Recommended. The provider manages fulfillment authorization and build distribution for this game."</span>
+                                    <span class="v2-create-help">"Recommended. The service handles downloads and access for this game, so your own account doesn't need to be online."</span>
                                     <Show when=move || fulfillment_mode.get() == FulfillmentMode::Delegate>
                                         <span class="v2-create-mono-value">{move || {
                                             let url = operator_url.get();
-                                            if url.trim().is_empty() { "No provider selected. Choose one under Advanced distribution options.".to_string() } else { url }
+                                            if url.trim().is_empty() { "No service chosen yet. Pick one under Advanced options below.".to_string() } else { url }
                                         }}</span>
-                                        <Show when=move || operator_auto_added.get().is_some()>
-                                            <span class="v2-create-help">"This provider is also included as a distribution server."</span>
-                                        </Show>
                                     </Show>
                                 </button>
 
+                                <section class="v2-hub-card" aria-labelledby="publish-fee-terms-title">
+                                    <h3 id="publish-fee-terms-title" class="v2-create-subsection-title">"Service fee terms"</h3>
+                                    <p class="v2-create-help">"Distribution services may take a fee from each sale. Keep the terms you already accepted, or review and accept new ones."</p>
+                                    <div>
+                                        <label for="publish-fee-terms" class="v2-create-field-label">"Fee terms"</label>
+                                        <select id="publish-fee-terms" class="v2-input" prop:value=move || commercial_mode.get() disabled=move || is_publishing.get() on:change:target=move |event| {
+                                            commercial_mode.set(event.target().value());
+                                            commercial_review.set(None);
+                                            commercial_approved.set(false);
+                                            commercial_loading.set(false);
+                                            commercial_generation.update(|value| *value = value.wrapping_add(1));
+                                        }>
+                                            <option value="preserve">"Keep the terms already accepted"</option>
+                                            <option value="replace">"Review and accept new terms"</option>
+                                            <option value="retire" disabled=true>"Stop using a service (not available yet)"</option>
+                                        </select>
+                                    </div>
+                                    <Show when=move || commercial_mode.get() == "replace">
+                                        <button type="button" class="v2-btn-secondary" disabled=move || commercial_loading.get() || is_publishing.get() on:click=move |_| on_review_terms.run(())>{move || if commercial_loading.get() { "Checking the service's terms…" } else { "Get the service's terms" }}</button>
+                                        {move || commercial_review.get().map(|review| view! {
+                                            <div class="v2-create-fields" aria-live="polite">
+                                                <dl class="v2-create-review-facts">
+                                                    <div><dt>"Sale price"</dt><dd>{format!("{} sats", review.context.price_sats)}</dd></div>
+                                                    {review.offers.iter().map(|offer| view! {
+                                                        <div><dt>"Service fee"</dt><dd>{fee_policy_label(&offer.fee)}</dd></div>
+                                                        <div><dt>"Limitations"</dt><dd>{if offer.limitations.is_empty() { "None".to_string() } else { offer.limitations.join("; ") }}</dd></div>
+                                                    }).collect_view()}
+                                                    {review.legs.iter().map(|leg| view! {
+                                                        <div><dt>{format!("Payout · {:?}", leg.role)}</dt><dd>{format!("{} to {}", msat_text(leg.amount_msat), leg.destination)}</dd></div>
+                                                    }).collect_view()}
+                                                </dl>
+                                                <details class="v2-create-disclosure">
+                                                    <summary class="v2-create-disclosure-summary">"Technical details"</summary>
+                                                    {review.offers.into_iter().zip(review.accepted_terms).map(|(offer, reference)| view! {
+                                                        <p class="v2-create-mono-value">{format!("Service {} · terms {} · settlement v{} · paid to {}", offer.operator_pubkey, reference.terms_event_id, offer.version, offer.payment_destination)}</p>
+                                                    }).collect_view()}
+                                                    {review.legs.into_iter().map(|leg| view! { <p class="v2-create-mono-value">{format!("{:?}: {} → {} · {} msat", leg.role, leg.recipient_pubkey, leg.destination, leg.amount_msat)}</p> }).collect_view()}
+                                                </details>
+                                            </div>
+                                        })}
+                                        <label class="v2-create-checkbox-row">
+                                            <input type="checkbox" disabled=move || commercial_review.get().is_none() || is_publishing.get() prop:checked=move || commercial_approved.get() on:change:target=move |event| commercial_approved.set(event.target().checked()) />
+                                            "I accept these fee terms and this payout split for this game. Any later change needs a new review."
+                                        </label>
+                                    </Show>
+                                    {move || commercial_error.get().map(|error| view! { <p role="alert" class="v2-hub-section-issue">{error}</p> })}
+                                    <p class="v2-create-help">"Keeping your current terms never accepts new ones. Past sales and purchases are not affected."</p>
+                                    <details class="v2-create-disclosure">
+                                        <summary class="v2-create-disclosure-summary">"Currently accepted terms"</summary>
+                                        <p class="v2-create-mono-value">{move || preserved_terms_label.get_value()}</p>
+                                    </details>
+                                </section>
+
                                 <details class="v2-create-disclosure">
                                     <summary class="v2-create-disclosure-summary">
-                                        {move || if fulfillment_mode.get() == FulfillmentMode::Direct { "Advanced distribution options - direct account signing selected" } else { "Advanced distribution options" }}
+                                        {move || if fulfillment_mode.get() == FulfillmentMode::Direct { "Advanced options · signing with your own account" } else { "Advanced options" }}
                                     </summary>
                                     <div class="v2-create-fields">
                                         <button type="button" aria-pressed=move || aria_bool(fulfillment_mode.get() == FulfillmentMode::Direct) class=move || if fulfillment_mode.get() == FulfillmentMode::Direct {
@@ -5152,25 +7083,25 @@ pub fn PublishView(
                                             distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
                                         }>
                                             <span class="v2-create-row-between">
-                                                <span class=move || if fulfillment_mode.get() == FulfillmentMode::Direct { "v2-create-mode-title v2-create-mode-title-active" } else { "v2-create-mode-title" }>"Use my active account instead"</span>
+                                                <span class=move || if fulfillment_mode.get() == FulfillmentMode::Direct { "v2-create-mode-title v2-create-mode-title-active" } else { "v2-create-mode-title" }>"Sign with my own account instead"</span>
                                                 <Show when=move || fulfillment_mode.get() == FulfillmentMode::Direct>
                                                     <span class="v2-create-selected-badge">"Selected"</span>
                                                 </Show>
                                             </span>
-                                            <span class="v2-create-help">"Sign fulfillment directly without provisioning a provider key."</span>
+                                            <span class="v2-create-help">"Your account approves each player's access itself instead of a distribution service."</span>
                                         </button>
 
                                         <Show when=move || matches!(fulfillment_mode.get(), FulfillmentMode::Delegate)>
                                             <div class="v2-create-subpanel v2-create-fields">
-                                                <label for="publish-provider-url" class="v2-create-field-label">"Use a different distribution provider"</label>
+                                                <label for="publish-provider-url" class="v2-create-field-label">"Use a different distribution service"</label>
                                                 <div class="v2-create-inline-row">
-                                                    <input id="publish-provider-url" class="v2-input" placeholder="https://provider.example.com" prop:value={move || operator_url.get()} on:input:target=move |ev| {
+                                                    <input id="publish-provider-url" class="v2-input" placeholder="https://service.example.com" prop:value={move || operator_url.get()} on:input:target=move |ev| {
                                                          let next = ev.target().value();
                                                          operator_url.set(next.clone());
                                                          distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
                                                         if operator_auto_added.get_untracked().is_some() { sync_operator_server(next); }
                                                     } />
-                                                    <select aria-label="Copy provider URL from a selected server" class="v2-input" on:change:target=move |ev| {
+                                                    <select aria-label="Use the address of a listed server" class="v2-input" on:change:target=move |ev| {
                                                         let selected = ev.target().value();
                                                         if !selected.is_empty() {
                                                              operator_url.set(selected.clone());
@@ -5178,7 +7109,7 @@ pub fn PublishView(
                                                             if operator_auto_added.get_untracked().is_some() { sync_operator_server(selected); }
                                                         }
                                                     }>
-                                                        <option value="">"Copy from server"</option>
+                                                        <option value="">"Copy from a server below"</option>
                                                         {move || servers.get().into_iter().map(|server| {
                                                             let url = server.url.clone();
                                                             let text = url.clone();
@@ -5196,183 +7127,114 @@ pub fn PublishView(
                                                              distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
                                                         }
                                                     } />
-                                                    "Also add this provider as a distribution server"
+                                                    "Also upload the build to this service"
                                                 </label>
                                             </div>
                                         </Show>
 
-                                <div class="v2-create-subpanel v2-create-fields">
-                                    <div class="v2-create-row-between">
-                                         <h3 class="v2-create-subsection-title">"Discovered distribution providers"</h3>
-                                        <span class="v2-create-help">"Live relay query; manual entry still works if discovery fails."</span>
-                                    </div>
-                                    {move || discovery_error.get().map(|msg| view! { <div class="v2-create-alert v2-create-alert-error">{msg}</div> })}
-                                    <div class="v2-create-list">
-                                        {move || discovered_servers.get().into_iter().map(|server| {
-                                            let checked_url = server.url.clone();
-                                            let label = server.name.clone().unwrap_or_else(|| server.url.clone());
-                                            let url_for_checked = checked_url.clone();
-                                            let url_for_change = checked_url.clone();
-                                            let label_for_change = label.clone();
-                                            let label_display = label.clone();
-                                            view! {
-                                                <label class="v2-create-server-row">
-                                                    <span><input type="checkbox" class="v2-create-checkbox" checked={move || servers.get().iter().any(|entry| entry.url == url_for_checked)} on:change:target=move |ev| {
-                                                        if ev.target().checked() { add_server(url_for_change.clone(), label_for_change.clone(), false); }
-                                                        else { remove_server(url_for_change.clone()); }
-                                                    } />{label_display}</span>
-                                                    <span class="v2-create-help">{server.supported_adp.unwrap_or_default()}</span>
-                                                </label>
-                                            }
-                                        }).collect_view()}
-                                    </div>
-                                    <div class="v2-create-inline-row">
-                                        <label for="publish-custom-server" class="sr-only">"Custom distribution server URL"</label>
-                                        <input id="publish-custom-server" class="v2-input" placeholder="Add custom server URL" prop:value={move || custom_server.get()} on:input:target=move |ev| custom_server.set(ev.target().value()) />
-                                        <button type="button" class="v2-btn-secondary" on:click={on_add_custom_server}>"Add"</button>
-                                    </div>
-                                    <div class="v2-create-list">
-                                        {move || servers.get().into_iter().map(|server| {
-                                            let reachability = server.reachability;
-                                            let upload = server.upload;
-                                            let url = server.url.clone();
-                                            view! {
-                                                <div class="v2-create-server-row">
-                                                    <div>
-                                                        <p class="v2-create-server-name">{server.label}</p>
-                                                        <p class="v2-create-help">{server.url}</p>
-                                                    </div>
-                                                    <div class="v2-create-server-status">
-                                                         <p class={reachability.class()}>{format!("Provider check: {}", reachability.label())}</p>
-                                                         <p class={upload.class()}>{format!("Build upload: {}", upload.label())}</p>
-                                                    </div>
-                                                    <button type="button" class="v2-create-media-link v2-create-media-remove" on:click=move |_| remove_server(url.clone())>"Remove"</button>
-                                                </div>
-                                            }
-                                        }).collect_view()}
-                                    </div>
-                                    <Show when=move || fulfillment_mode.get() == FulfillmentMode::Delegate>
-                                        <div style="padding:14px;background:#121215;border:1px solid oklch(0.32 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace;color:#fff">
-                                            <p style="color:oklch(0.8 0.16 60);font-weight:800">"OPERATOR ISSUING ROLES"</p>
-                                            <p>"Every selected operator gets upload-build only unless you authorize receipt or grant issuance below. Aliases of the same operator must use identical roles. Metadata edits preserve existing authority; use management to cancel it."</p>
-                                            <label><input type="checkbox" prop:checked=move || authorize_operators.get() on:change:target=move |event| authorize_operators.set(event.target().checked()) />" AUTHORIZE NEW OPERATORS ON THIS EDIT (does not renew cancelled authority or expand existing capabilities)"</label>
-                                            {move || servers.get().into_iter().map(|server| {
-                                                let url = server.url;
-                                                let display = url.clone();
-                                                let receipt_url = url.clone(); let grant_url = url.clone();
-                                                let receipt_checked = url.clone(); let grant_checked = url.clone();
-                                                view! { <div style="border-top:1px solid oklch(0.32 0.01 60);padding:10px;overflow-wrap:anywhere">
-                                                    <p>{display}</p>
-                                                    <label><input type="checkbox" prop:checked=move || server_roles.get().iter().find(|role| role.server_url == receipt_checked).map(|role| role.issue_receipt).unwrap_or_else(|| receipt_checked == operator_url.get()) on:change:target=move |event| { let checked=event.target().checked(); server_roles.update(|roles| { if let Some(role)=roles.iter_mut().find(|role| role.server_url == receipt_url) { role.issue_receipt=checked; } else { roles.push(arcadestr_core::publisher_management::ServerRoleIntent { server_url:receipt_url.clone(),issue_receipt:checked,issue_grant:receipt_url==operator_url.get_untracked() }); } }); } />" ISSUE RECEIPTS "</label>
-                                                    <label><input type="checkbox" prop:checked=move || server_roles.get().iter().find(|role| role.server_url == grant_checked).map(|role| role.issue_grant).unwrap_or_else(|| grant_checked == operator_url.get()) on:change:target=move |event| { let checked=event.target().checked(); server_roles.update(|roles| { if let Some(role)=roles.iter_mut().find(|role| role.server_url == grant_url) { role.issue_grant=checked; } else { roles.push(arcadestr_core::publisher_management::ServerRoleIntent { server_url:grant_url.clone(),issue_receipt:grant_url==operator_url.get_untracked(),issue_grant:checked }); } }); } />" ISSUE GRANTS"</label>
-                                                </div> }
-                                            }).collect_view()}
-                                        </div>
-                                    </Show>
-                                    <div style="clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));border:1px solid oklch(0.32 0.01 60);background:#121215;padding:18px;display:grid;gap:12px;font-family:ui-monospace,monospace">
-                                        <div style="display:flex;align-items:center;gap:10px">
-                                            <span style="font:800 12px ui-monospace,monospace;letter-spacing:1.5px;color:oklch(0.8 0.16 60)">"◆ SERVICE FEE CONSENT"</span>
-                                            <span style="flex:1;height:1px;background:repeating-linear-gradient(90deg,oklch(0.4 0.03 60 / .6) 0 4px,transparent 4px 8px)"></span>
-                                        </div>
-                                        <label style="color:#fff;font:600 12.5px/1.6 ui-monospace,monospace">"COMMERCIAL INTENTION"
-                                            <select aria-label="Commercial intention" style="display:block;width:100%;background:#141417;color:#fff;border:1px solid oklch(0.32 0.01 60);padding:10px;font-family:ui-monospace,monospace" prop:value=move || commercial_mode.get() disabled=move || is_publishing.get() on:change:target=move |event| {
-                                                commercial_mode.set(event.target().value());
-                                                commercial_review.set(None);
-                                                commercial_approved.set(false);
-                                                commercial_loading.set(false);
-                                                commercial_generation.update(|value| *value = value.wrapping_add(1));
-                                            }>
-                                                <option value="preserve">"PRESERVE EXACT ACCEPTANCE"</option>
-                                                <option value="replace">"REPLACE AFTER REVIEW"</option>
-                                                <option value="retire" disabled=true>"RETIRE — UNAVAILABLE"</option>
-                                            </select>
-                                        </label>
-                                        <p style="margin:0;color:oklch(0.68 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace;overflow-wrap:anywhere">{move || format!("Existing acceptance: {}", preserved_terms_label.get_value())}</p>
-                                        <Show when=move || commercial_mode.get() == "replace">
-                                            <button type="button" style="padding:10px;background:transparent;border:1px solid oklch(0.5 0.13 210);color:oklch(0.8 0.13 210);font:800 12px ui-monospace,monospace" disabled=move || commercial_loading.get() || is_publishing.get() on:click=move |_| on_review_terms.run(())>{move || if commercial_loading.get() { "VERIFYING TERMS…" } else { "RETRIEVE SIGNED TERMS >" }}</button>
-                                            {move || commercial_review.get().map(|review| view! {
-                                                <div style="display:grid;gap:10px;color:oklch(0.68 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace;overflow-wrap:anywhere" aria-live="polite">
-                                                    <p>{format!("Gross: {} msat", review.context.price_sats.saturating_mul(1000))}</p>
-                                                    {review.offers.into_iter().zip(review.accepted_terms).map(|(offer, reference)| view! {
-                                                        <div style="border-top:1px solid oklch(0.4 0.03 60 / .3);padding-top:8px">
-                                                            <p>{format!("Operator {} · terms {} · settlement v{}", offer.operator_pubkey, reference.terms_event_id, offer.version)}</p>
-                                                            <p>{format!("{} · destination {}", fee_policy_label(&offer.fee), offer.payment_destination)}</p>
-                                                            <p>{format!("Operator limitations: {}", if offer.limitations.is_empty() { "None advertised".into() } else { offer.limitations.join("; ") })}</p>
+                                        <div class="v2-create-subpanel v2-create-fields">
+                                            <div class="v2-create-row-between">
+                                                <h3 class="v2-create-subsection-title">"Upload servers"</h3>
+                                                <span class="v2-create-help">"Your build is uploaded to every server listed here."</span>
+                                            </div>
+                                            {move || discovery_error.get().map(|msg| view! { <div class="v2-create-alert v2-create-alert-error">{msg}</div> })}
+                                            <div class="v2-create-list">
+                                                {move || discovered_servers.get().into_iter().map(|server| {
+                                                    let checked_url = server.url.clone();
+                                                    let label = server.name.clone().unwrap_or_else(|| server.url.clone());
+                                                    let url_for_checked = checked_url.clone();
+                                                    let url_for_change = checked_url.clone();
+                                                    let label_for_change = label.clone();
+                                                    let label_display = label.clone();
+                                                    view! {
+                                                        <label class="v2-create-server-row">
+                                                            <span><input type="checkbox" class="v2-create-checkbox" checked={move || servers.get().iter().any(|entry| entry.url == url_for_checked)} on:change:target=move |ev| {
+                                                                if ev.target().checked() { add_server(url_for_change.clone(), label_for_change.clone(), false); }
+                                                                else { remove_server(url_for_change.clone()); }
+                                                            } />{label_display}</span>
+                                                            <span class="v2-create-help">{server.url.clone()}</span>
+                                                        </label>
+                                                    }
+                                                }).collect_view()}
+                                            </div>
+                                            <div class="v2-create-inline-row">
+                                                <label for="publish-custom-server" class="sr-only">"Server address"</label>
+                                                <input id="publish-custom-server" class="v2-input" placeholder="Add a server address" prop:value={move || custom_server.get()} on:input:target=move |ev| custom_server.set(ev.target().value()) />
+                                                <button type="button" class="v2-btn-secondary" on:click={on_add_custom_server}>"Add"</button>
+                                            </div>
+                                            <div class="v2-create-list">
+                                                {move || servers.get().into_iter().map(|server| {
+                                                    let reachability = server.reachability;
+                                                    let upload = server.upload;
+                                                    let url = server.url.clone();
+                                                    view! {
+                                                        <div class="v2-create-server-row">
+                                                            <div>
+                                                                <p class="v2-create-server-name">{server.label}</p>
+                                                                <p class="v2-create-help">{server.url}</p>
+                                                            </div>
+                                                            <div class="v2-create-server-status">
+                                                                 <p class={reachability.class()}>{format!("Connection: {}", reachability.label())}</p>
+                                                                 <p class={upload.class()}>{format!("Upload: {}", upload.label())}</p>
+                                                            </div>
+                                                            <button type="button" class="v2-create-media-link v2-create-media-remove" on:click=move |_| remove_server(url.clone())>"Remove"</button>
                                                         </div>
-                                                    }).collect_view()}
-                                                    {review.legs.into_iter().map(|leg| view! { <p>{format!("{:?}: {} → {} · {} msat", leg.role, leg.recipient_pubkey, leg.destination, leg.amount_msat)}</p> }).collect_view()}
-                                                </div>
-                                            })}
-                                            <label style="display:flex;align-items:flex-start;gap:10px;color:#fff;font:600 12.5px/1.6 ui-monospace,monospace">
-                                                <input type="checkbox" disabled=move || commercial_review.get().is_none() || is_publishing.get() prop:checked=move || commercial_approved.get() on:change:target=move |event| commercial_approved.set(event.target().checked()) />
-                                                <span>"I approve these exact signed terms, recipients and allocation for this listing. Changes require a new review."</span>
-                                            </label>
+                                                    }
+                                                }).collect_view()}
+                                            </div>
+                                        </div>
+
+                                        <Show when=move || fulfillment_mode.get() == FulfillmentMode::Delegate>
+                                            <div class="v2-create-subpanel v2-create-fields">
+                                                <h3 class="v2-create-subsection-title">"What each service may do"</h3>
+                                                <p class="v2-create-help">"By default a service can only receive your build. Allow it to record purchases or give players access below. Updating the game keeps permissions a service already has; to take them away, use Revoke access on the game overview."</p>
+                                                <label class="v2-create-checkbox-row"><input type="checkbox" prop:checked=move || authorize_operators.get() on:change:target=move |event| authorize_operators.set(event.target().checked()) />"Give newly added services these permissions when I publish"</label>
+                                                {move || servers.get().into_iter().map(|server| {
+                                                    let url = server.url;
+                                                    let display = url.clone();
+                                                    let receipt_url = url.clone(); let grant_url = url.clone();
+                                                    let receipt_checked = url.clone(); let grant_checked = url.clone();
+                                                    view! { <div class="v2-hub-role-row">
+                                                        <p class="v2-create-mono-value">{display}</p>
+                                                        <label class="v2-create-checkbox-row"><input type="checkbox" prop:checked=move || server_roles.get().iter().find(|role| role.server_url == receipt_checked).map(|role| role.issue_receipt).unwrap_or_else(|| receipt_checked == operator_url.get()) on:change:target=move |event| { let checked=event.target().checked(); server_roles.update(|roles| { if let Some(role)=roles.iter_mut().find(|role| role.server_url == receipt_url) { role.issue_receipt=checked; } else { roles.push(arcadestr_core::publisher_management::ServerRoleIntent { server_url:receipt_url.clone(),issue_receipt:checked,issue_grant:receipt_url==operator_url.get_untracked() }); } }); } />"Record purchases"</label>
+                                                        <label class="v2-create-checkbox-row"><input type="checkbox" prop:checked=move || server_roles.get().iter().find(|role| role.server_url == grant_checked).map(|role| role.issue_grant).unwrap_or_else(|| grant_checked == operator_url.get()) on:change:target=move |event| { let checked=event.target().checked(); server_roles.update(|roles| { if let Some(role)=roles.iter_mut().find(|role| role.server_url == grant_url) { role.issue_grant=checked; } else { roles.push(arcadestr_core::publisher_management::ServerRoleIntent { server_url:grant_url.clone(),issue_receipt:grant_url==operator_url.get_untracked(),issue_grant:checked }); } }); } />"Give players access"</label>
+                                                    </div> }
+                                                }).collect_view()}
+                                            </div>
                                         </Show>
-                                        {move || commercial_error.get().map(|error| view! { <p role="alert" style="color:oklch(0.65 0.18 25);font:400 12.5px/1.6 ui-monospace,monospace">{error}</p> })}
-                                        <p style="margin:0;color:oklch(0.68 0.01 60);font:400 12.5px/1.6 ui-monospace,monospace">"Preserve never accepts new advertisements. Withdrawal checks cover available configured-relay evidence, not global history. Historical sales and receipts are unchanged. Operator retirement is unavailable pending an agreed prospective workflow."</p>
-                                    </div>
-                                </div>
                                     </div>
                                 </details>
-
-                                 <div class="v2-create-field-pair">
-                                    <div>
-                                        <span id="publish-build-label" class="v2-create-field-label">"Build file (required for automated installation)"</span>
-                                        <button type="button" aria-labelledby="publish-build-label" aria-describedby="publish-hash-status" class="v2-create-file-button" on:click={on_select_file} disabled={move || is_hashing.get() || is_publishing.get()}>
-                                            {move || if is_hashing.get() { "Inspecting and hashing…".to_string() } else { publish_draft.get().archive.selection.map(|selection| selection.safe_filename.as_str().to_string()).unwrap_or_else(|| if file_hash.get().is_some() { "Using existing build — select replacement".to_string() } else { "Select archive".to_string() }) }}
-                                        </button>
-                                        <p id="publish-hash-status" aria-live="polite" class="v2-create-help">{move || if is_hashing.get() { "Inspecting the backend-owned archive and computing SHA-256…".to_string() } else { file_hash.get().map(|hash| format!("Read-only SHA-256: {}", format_sha256(&hash))).unwrap_or_else(|| "Hash appears after archive inspection.".to_string()) }}</p>
-                                    </div>
-                                    <div>
-                                        <label for="publish-version" class="v2-create-field-label">"Version (required)"</label>
-                                        <input id="publish-version" required=true class="v2-input" placeholder="1.0.0" prop:value={move || version.get()} on:input:target=move |ev| {
-                                            version.set(ev.target().value());
-                                            distribution_user_revision.update(|revision| *revision = revision.wrapping_add(1));
-                                        } />
-                                 </div>
-                                 </div>
                             </div>
                         </Show>
-                        <super::publish_launch::PublishLaunchEditor
-                            state=publish_draft
-                            authoritative=authoritative_edit
-                            defect_review=defect_review
-                            platforms_input=platforms_input
-                            distribution_revision=distribution_user_revision
-                            platform_revision=platform_user_revision
-                            surfaced_warnings=surfaced_archive_warnings
-                            disabled=Signal::derive(move || is_publishing.get() || is_hashing.get() || (editing && !operator_initialized.get()))
-                        />
                     </section>
-                    {store_page_step(&["requirements"])}
                     </Show>
 
-                    <Show when=move || current_stage.get() == PublishStage::Pricing>
-                    <section class="v2-create-stage-panel" aria-labelledby="publish-pricing-title">
-                        <h2 id="publish-pricing-title" class="v2-create-section-title">"Pricing and access"</h2>
-                        <p class="v2-create-help">"Paid access is the default. Select public or timed access only when the game should be available without an entitlement."</p>
+                    <Show when=move || current_section.get() == HubSection::PriceAccess>
+                    <section class="v2-create-stage-panel" id=HubSection::PriceAccess.dom_id() aria-labelledby="game-hub-price-title">
+                        {section_header(HubSection::PriceAccess)}
                         <div class="v2-create-fields">
                             <div>
-                                <label class="v2-create-field-label" for="acquisition-policy">"Access model"</label>
+                                <label class="v2-create-field-label" for="acquisition-policy">"How players get access"</label>
                                 <select id="acquisition-policy" class="v2-input" on:change:target=move |ev| acquisition_kind.set(AcquisitionKind::from_value(&ev.target().value())) disabled=move || is_publishing.get()>
-                                    <option value="gated" selected=move || acquisition_kind.get() == AcquisitionKind::Gated>"Paid access (default)"</option>
-                                    <option value="public" selected=move || acquisition_kind.get() == AcquisitionKind::Public>"Public access"</option>
-                                    <option value="timed-access" selected=move || acquisition_kind.get() == AcquisitionKind::TimedAccess>"Timed public access"</option>
+                                    <option value="gated" selected=move || acquisition_kind.get() == AcquisitionKind::Gated>"Paid"</option>
+                                    <option value="public" selected=move || acquisition_kind.get() == AcquisitionKind::Public>"Free"</option>
+                                    <option value="timed-access" selected=move || acquisition_kind.get() == AcquisitionKind::TimedAccess>"Free for a limited time"</option>
                                 </select>
                                 <p class="v2-create-help">{move || match acquisition_kind.get() {
-                                    AcquisitionKind::Gated => "A positive price and Lightning address are required.",
-                                    AcquisitionKind::Public => "Anyone can access the game. Its published price is 0 sats.",
-                                    AcquisitionKind::TimedAccess => "Anyone can access the game during the selected window. Its published price is 0 sats.",
+                                    AcquisitionKind::Gated => "Players pay once to own the game. Payments go to your Lightning address.",
+                                    AcquisitionKind::Public => "Anyone can get the game at no cost.",
+                                    AcquisitionKind::TimedAccess => "Anyone can get the game at no cost between the times you choose.",
                                 }}</p>
                             </div>
                             <Show when=move || acquisition_kind.get() == AcquisitionKind::Gated>
                                 <div>
                                     <label for="publish-price" class="v2-create-field-label">"Price in sats (required)"</label>
-                                    <input id="publish-price" required=true class="v2-input" type="number" min=1 step=1 prop:value={move || price_input.get()} on:input:target=move |ev| price_input.set(ev.target().value()) />
+                                    <input id="publish-price" required=true class="v2-input" type="number" min=1 step=1 prop:value={move || price_input.get()} on:input:target=move |ev| price_input.set(ev.target().value()) disabled=move || is_publishing.get() />
                                 </div>
                                 <div>
                                     <label for="publish-lud16" class="v2-create-field-label">"Lightning address (required)"</label>
-                                    <input id="publish-lud16" required=true class="v2-input" placeholder="you@example.com" prop:value={move || lud16.get()} on:input:target=move |ev| lud16.set(ev.target().value()) />
+                                    <input id="publish-lud16" required=true class="v2-input" placeholder="you@example.com" aria-describedby="publish-lud16-help" prop:value={move || lud16.get()} on:input:target=move |ev| lud16.set(ev.target().value()) disabled=move || is_publishing.get() />
+                                    <p id="publish-lud16-help" class="v2-create-help">"Where payments for this game are sent."</p>
                                 </div>
                             </Show>
                             <Show when=move || matches!(acquisition_kind.get(), AcquisitionKind::TimedAccess)>
@@ -5391,43 +7253,33 @@ pub fn PublishView(
                     </section>
                     </Show>
 
-                    <Show when=move || current_stage.get() == PublishStage::Review>
-                    <section class="v2-create-stage-panel" aria-labelledby="publish-review-title">
-                        <h2 id="publish-review-title" class="v2-create-section-title">"Review and publish"</h2>
-
-                        <article class="v2-create-summary-card">
-                            <p class="v2-create-summary-title">{move || { let value = title.get(); if value.trim().is_empty() { "Untitled game page".to_string() } else { value } }}</p>
-                            <p class="v2-create-summary-meta">{move || format!(
-                                "{} · {} · {}",
-                                match acquisition_kind.get() {
-                                    AcquisitionKind::Gated => format!("{} sats", price_input.get()),
-                                    AcquisitionKind::Public => "Public access".to_string(),
-                                    AcquisitionKind::TimedAccess => "Timed public access".to_string(),
-                                },
-                                if version.get().trim().is_empty() { "no version declared".to_string() } else { format!("v{}", version.get().trim()) },
-                                platform_summary(&platforms_input.get()),
-                            )}</p>
-                        </article>
-
+                    <Show when=move || current_section.get() == HubSection::Overview>
+                    {move || {
+                        let warnings = if delivery_chosen.get() { checklist().warnings } else { Vec::new() };
+                        (!warnings.is_empty()).then(|| view! {
+                            <ul class="v2-create-warnings">{warnings.into_iter().map(|warning| view! { <li>{warning}</li> }).collect_view()}</ul>
+                        })
+                    }}
+                    <details class="v2-create-disclosure v2-hub-technical">
+                        <summary class="v2-create-disclosure-summary">"Technical details"</summary>
                         <dl class="v2-create-review-facts">
                             {move || {
                                 let identity = published_identity.get();
-                                identity.d_tag.or(identity.pending_d_tag).map(|d_tag| view! {
-                                    <div><dt>"Identifier"</dt><dd>{d_tag}</dd></div>
+                                identity.coordinate.or(identity.d_tag.or(identity.pending_d_tag)).map(|id| view! {
+                                    <div><dt>"Game address"</dt><dd class="v2-create-mono-value">{id}</dd></div>
                                 })
                             }}
-                            <div><dt>"Metadata"</dt><dd>{move || format!("{} tags · {} images", parse_csv_values(&tag_input.get()).len(), arcadestr_core::store_page_seed::listing_images_from_media(&store_page_draft.get().content.media).len())}</dd></div>
-                            <div><dt>"Description"</dt><dd class="v2-create-review-prewrap">{move || description.get()}</dd></div>
-                            <div><dt>"Pricing"</dt><dd>{move || match acquisition_kind.get() { AcquisitionKind::Gated => format!("{} sats via {}", price_input.get(), lud16.get()), AcquisitionKind::Public | AcquisitionKind::TimedAccess => "Not for sale (0 sats)".to_string() }}</dd></div>
-                            <div><dt>"Current access"</dt><dd>{move || match acquisition_kind.get() { AcquisitionKind::Gated => "Paid".to_string(), AcquisitionKind::Public => "Public".to_string(), AcquisitionKind::TimedAccess => format!("Timed from {} to {} (local)", acquisition_starts_at.get(), acquisition_ends_at.get()) }}</dd></div>
-                            <div><dt>"Platforms / version"</dt><dd>{move || format!("{} / {}", platform_summary(&platforms_input.get()), version.get())}</dd></div>
-                            <div><dt>"Distribution provider/server"</dt><dd>{move || if fulfillment_enabled.get() { format!("{} server(s); {}", servers.get().len(), operator_url.get()) } else { "Metadata only".to_string() }}</dd></div>
-                            <div><dt>"Build archive / hash"</dt><dd>{move || format!("{} / {}", publish_draft.get().archive.selection.map(|selection| selection.safe_filename.as_str().to_string()).unwrap_or_else(|| "existing or none".into()), file_hash.get().map(|hash| format_sha256(&hash)).unwrap_or_else(|| "none".into()))}</dd></div>
-                            <div><dt>"Authorization"</dt><dd>{move || match fulfillment_mode.get() { FulfillmentMode::None => "Game page only", FulfillmentMode::Direct => "Active account", FulfillmentMode::Delegate => "Distribution provider" }}</dd></div>
-                            <div><dt>"Promotion links"</dt><dd>{format!("{} preserved", existing_campaigns.len())}</dd></div>
-                            <div><dt>"Publishing authorization key"</dt><dd>{existing_fulfillment_pubkey.clone().unwrap_or_else(|| "Prepared during publication when required".into())}</dd></div>
+                            {move || published_identity.get().event_id.map(|id| view! {
+                                <div><dt>"Current game event"</dt><dd class="v2-create-mono-value">{id}</dd></div>
+                            })}
+                            <div><dt>"Publishing account"</dt><dd class="v2-create-mono-value">{move || auth.npub.get().unwrap_or_else(|| "Not signed in".to_string())}</dd></div>
+                            <div><dt>"Platforms / version"</dt><dd>{move || format!("{} / {}", platform_summary(&platforms_input.get()), if version.get().trim().is_empty() { "none".to_string() } else { version.get() })}</dd></div>
+                            <div><dt>"Distribution"</dt><dd class="v2-create-mono-value">{move || if fulfillment_enabled.get() { format!("{} upload server(s) · service {}", servers.get().len(), if operator_url.get().trim().is_empty() { "none".to_string() } else { operator_url.get() }) } else { "None (store page only)".to_string() }}</dd></div>
+                            <div><dt>"Access signed by"</dt><dd>{move || match fulfillment_mode.get() { FulfillmentMode::None => "Nobody (no build)", FulfillmentMode::Direct => "Your account", FulfillmentMode::Delegate => "Distribution service" }}</dd></div>
+                            <div><dt>"Build fingerprint (SHA-256)"</dt><dd class="v2-create-mono-value">{move || file_hash.get().map(|hash| format_sha256(&hash)).unwrap_or_else(|| "none".into())}</dd></div>
+                            <div><dt>"Distribution key"</dt><dd class="v2-create-mono-value">{existing_fulfillment_pubkey.clone().unwrap_or_else(|| "Created when you publish, if needed".into())}</dd></div>
+                            <div><dt>"Promotion links kept"</dt><dd>{existing_campaigns.len()}</dd></div>
                         </dl>
-
                         <super::publish_launch::PublishLaunchReview
                             state=publish_draft
                             artifact_enabled=Signal::derive(move || fulfillment_enabled.get())
@@ -5436,107 +7288,27 @@ pub fn PublishView(
                             })
                             surfaced_warnings=surfaced_archive_warnings
                         />
-
-                        <div class="v2-create-authorization">
-                            <p class="v2-create-field-label">"Publishing authorization"</p>
-                            <p class="v2-create-account">{move || auth.npub.get().unwrap_or_else(|| "Not signed in".to_string())}</p>
-                            <p class="v2-create-help" id="publish-signer-requirement">{move || signer_requirement_message(signer_state.get())}</p>
-                            {move || (!signed_in.get()).then(|| view! { <p class="v2-create-alert v2-create-alert-error" role="alert">"Sign in before starting network publication."</p> })}
-                        </div>
-
-                        <p class="v2-create-kicker">"Readiness checklist"</p>
-                        <ul class="v2-create-checklist">
-                            <li class=move || if checklist().metadata { "v2-create-check-ok" } else { "v2-create-check-blocked" }>{move || if checklist().metadata { "Game details complete" } else { "Game details need attention" }}</li>
-                            <li class=move || if checklist().pricing_and_access { "v2-create-check-ok" } else { "v2-create-check-blocked" }>{move || if checklist().pricing_and_access { "Pricing and access complete" } else { "Pricing or access needs attention" }}</li>
-                            <li class=move || if checklist().distribution { "v2-create-check-ok" } else { "v2-create-check-blocked" }>{move || if checklist().distribution { "Builds and distribution complete" } else { "Builds or distribution needs attention" }}</li>
-                            <li class=move || if checklist().authorization { "v2-create-check-ok" } else { "v2-create-check-blocked" }>{move || if checklist().authorization { "Publishing authorization complete" } else { "Publishing authorization needs attention" }}</li>
-                        </ul>
-                        <ul class="v2-create-warnings">{move || checklist().warnings.into_iter().map(|warning| view! { <li>{format!("Warning: {warning}")}</li> }).collect_view()}</ul>
-
-                        {move || {
-                            let issues = blocking_issues();
-                            (!issues.is_empty()).then(|| view! {
-                                <div class="v2-create-alert v2-create-alert-error" role="alert">
-                                    <strong>{format!("{} blocking issue(s) must be resolved before publication", issues.len())}</strong>
-                                    <ul>{issues.into_iter().map(|(stage, error)| view! {
-                                        <li><button type="button" class="v2-create-issue-link" on:click=move |_| { current_stage.set(stage); stage_error.set(None); }>{format!("{}: {}", stage.title(), error)}</button></li>
-                                    }).collect_view()}</ul>
-                                </div>
-                            })
-                        }}
-                    </section>
-                    </Show>
-
-                    <Show when=move || current_stage.get() == PublishStage::Review || phase() != PublicationPhase::Idle>
-                    <section class="v2-create-stage-panel" aria-labelledby="publication-status-title">
-                        <div class="v2-create-status-heading">
-                            <h2 id="publication-status-title" class="v2-create-section-title">"Publication status"</h2>
-                            <span role="status" aria-live="polite" aria-atomic="true" class=move || format!("v2-create-phase {}", phase().class())>{move || phase().label()}</span>
-                        </div>
-                        <p class="v2-create-help">{move || match phase() {
-                            PublicationPhase::Idle => "Nothing has been sent to the network from this workflow yet.",
-                            PublicationPhase::Publishing => "The publication command is running. Relay acceptance is only reported once the command returns.",
-                            PublicationPhase::Partial => "The game page exists on the network, but the remaining publication work did not complete.",
-                            PublicationPhase::Published => "The listing event was accepted; the workflow can continue into management.",
-                            PublicationPhase::Failed => "Publication failed. Nothing partial is claimed for this attempt.",
-                            PublicationPhase::StaleAccount => "The active account changed during publication. Results from the previous account are rejected.",
-                        }}</p>
-                        <div aria-live="polite" aria-atomic="true">
-                        {move || publication_state.get().message.map(|msg| {
-                            let class = match publication_state.get().outcome { PublicationOutcome::Complete => "v2-create-status-ok", PublicationOutcome::Partial | PublicationOutcome::Failed => "v2-create-status-error", _ => "v2-create-status-neutral" };
-                            view! { <p class={class}>{msg}</p> }
-                        })}
-                        {move || upload_progress.get().and_then(|event| {
-                            let bytes_uploaded = event.bytes_uploaded?;
-                            let total_bytes = event.total_bytes?;
-                            let percent = progress_percent(bytes_uploaded, total_bytes);
-                            let server = event.server_url.unwrap_or_else(|| "distribution server".to_string());
-                            Some(view! {
-                                <div class="v2-create-progress" role="progressbar" aria-label="Build upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow=percent>
-                                    <div class="v2-create-progress-heading">
-                                        <span>{format!("Uploading to {server}")}</span>
-                                        <span>{format!("{percent}%")}</span>
-                                    </div>
-                                    <div class="v2-create-progress-track">
-                                        <div class="v2-create-progress-fill" style=format!("width: {percent}%")></div>
-                                    </div>
-                                </div>
-                            })
-                        })}
-                        <ul class="v2-create-progress-log">
-                            {move || progress_events.get().into_iter().map(|event| view! {
-                                <li>{progress_label(&event)}</li>
-                            }).collect_view()}
-                        </ul>
-                        </div>
-                    </section>
+                    </details>
                     </Show>
             </div>
 
-            <div class="v2-create-actions">
-                <div class="v2-create-actions-state">
-                    <span class="v2-create-authoring">{move || authoring().label()}</span>
-                    {move || is_dirty().then(|| view! { <span class="v2-create-authoring-dirty">"Not saved anywhere"</span> })}
+            <Show when=move || current_section.get() != HubSection::Overview>
+                // Leaving a section is only navigation: nothing is finalized,
+                // and the section can be reopened any time.
+                <div class="v2-create-actions">
+                    <div class="v2-create-actions-buttons">
+                        <button type="button" class="v2-btn-secondary" on:click=move |_| open_section(HubSection::Overview)>"< Back to overview"</button>
+                    </div>
+                    <div class="v2-create-actions-state">
+                        <span class="v2-create-authoring" role="status">{move || draft_save_status.get().label().unwrap_or_else(|| "Changes are saved as you type.".to_string())}</span>
+                        <span class="v2-create-help">{if editing {
+                            "They go live only when you select Publish changes."
+                        } else {
+                            "You can come back to any section at any time."
+                        }}</span>
+                    </div>
                 </div>
-                <div class="v2-create-actions-buttons">
-                    <button type="button" class="v2-btn-secondary" disabled=move || (!can_exit && current_stage.get() == PublishStage::Details) || is_publishing.get() on:click=move |_| {
-                        if let Some(previous) = current_stage.get_untracked().previous() {
-                            current_stage.set(previous);
-                            stage_error.set(None);
-                        } else if let Some(on_back) = on_back {
-                            on_back.run(());
-                        }
-                    }>{move || if current_stage.get() == PublishStage::Details { "Leave without publishing" } else { "Back" }}</button>
-                    <Show when=move || current_stage.get() != PublishStage::Review>
-                        <button type="button" class="v2-btn-primary" on:click=on_next disabled=move || is_publishing.get()>"Continue >"</button>
-                    </Show>
-                    <Show when=move || current_stage.get() == PublishStage::Review>
-                        <button type="button" class="v2-btn-primary" aria-describedby="publish-signer-requirement" on:click=move |_| on_submit.run(()) disabled=move || is_hashing.get() || is_publishing.get() || !can_publish_now.get()>
-                            {move || if is_publishing.get() { "Publishing to network…".to_string() } else { match (editing, fulfillment_enabled.get()) { (true, true) => "Update game page and distribution", (true, false) => "Update game page", (false, true) => "Publish game page and build", (false, false) => "Publish game page" }.to_string() }}
-                        </button>
-                    </Show>
-                </div>
-            </div>
+            </Show>
         </main>
     }
 }

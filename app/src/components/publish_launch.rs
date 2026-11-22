@@ -556,6 +556,37 @@ fn selected_platforms(state: &PublishState, platforms_input: &str) -> Vec<String
     }
 }
 
+/// Switch between download-only and launchable, keeping the declared targets
+/// and the detected package format. Returns whether the mode changed.
+pub(super) fn apply_launch_choice(
+    state: &mut PublishState,
+    launchable: bool,
+    platforms_input: &str,
+) -> bool {
+    match (&state.launch, launchable) {
+        (LaunchMode::DownloadOnly, true) => {
+            let platforms = selected_platforms(state, platforms_input);
+            let mut tier = crate::publish_state::LaunchTierDraft::default();
+            if let Some(summary) = state.archive.summary.as_ref() {
+                tier.package_format.text = match &summary.detected_format {
+                    PackageFormat::Zip => "zip",
+                    PackageFormat::TarZstd => "tar.zst",
+                    PackageFormat::TarGz => "tar.gz",
+                }
+                .to_string();
+            }
+            tier.replace_platforms(platforms);
+            state.launch = LaunchMode::Launchable(tier);
+            true
+        }
+        (LaunchMode::Launchable(_), false) => {
+            state.launch = LaunchMode::DownloadOnly;
+            true
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ReviewArtifact {
     Selected { filename: String, digest: String },
@@ -916,8 +947,7 @@ pub(super) fn PublishLaunchEditor(
                         .or_else(|| snapshot.launch_platforms().first().cloned());
                     let Some(platform) = target.and_then(|raw| parse_platform_tag(&raw)) else {
                         picker_error.set(Some(
-                            "Declare a canonical target before requesting executable candidates."
-                                .into(),
+                            "Add a platform first, then choose the program to run.".into(),
                         ));
                         picker_loading.set(false);
                         return;
@@ -1078,36 +1108,13 @@ pub(super) fn PublishLaunchEditor(
 
     view! {
         <section class="v2-create-launch" aria-labelledby="publish-launch-title">
-            <div class="v2-create-row-between">
-                <div>
-                    <h3 id="publish-launch-title" class="v2-create-subsection-title">"Launch behavior"</h3>
-                    <p class="v2-create-help">"Choose one complete publication tier. Partial launch metadata is never published."</p>
-                </div>
-                <div class="v2-create-launch-mode" role="group" aria-label="Launch behavior">
-                    <button type="button" class="v2-btn-secondary" aria-pressed=move || matches!(state.get().launch, LaunchMode::DownloadOnly) disabled=move || disabled.get() || authoritative.get().is_some_and(|model| matches!(model.state, AuthoritativeEditState::Loading)) on:click=move |_| {
-                        state.update(|state| state.launch = LaunchMode::DownloadOnly);
-                        distribution_revision.update(|revision| *revision = revision.wrapping_add(1));
-                        platform_revision.update(|revision| *revision = revision.wrapping_add(1));
-                    }>"Download-only"</button>
-                    <button type="button" class="v2-btn-secondary" aria-pressed=move || matches!(state.get().launch, LaunchMode::Launchable(_)) disabled=move || disabled.get() || authoritative.get().is_some_and(|model| matches!(model.state, AuthoritativeEditState::Loading)) on:click=move |_| {
-                        let platforms = selected_platforms(&state.get_untracked(), &platforms_input.get_untracked());
-                        state.update(|state| {
-                            if matches!(&state.launch, LaunchMode::DownloadOnly) {
-                                let mut tier = crate::publish_state::LaunchTierDraft::default();
-                                if let Some(summary) = state.archive.summary.as_ref() {
-                                    tier.package_format.text = match &summary.detected_format {
-                                        PackageFormat::Zip => "zip",
-                                        PackageFormat::TarZstd => "tar.zst",
-                                        PackageFormat::TarGz => "tar.gz",
-                                    }.to_string();
-                                }
-                                tier.replace_platforms(platforms);
-                                state.launch = LaunchMode::Launchable(tier);
-                            }
-                        });
-                        distribution_revision.update(|revision| *revision = revision.wrapping_add(1));
-                    }>"Launchable"</button>
-                </div>
+            <div>
+                <h3 id="publish-launch-title" class="v2-create-subsection-title">{move || if matches!(state.get().launch, LaunchMode::Launchable(_)) { "Platforms and launch options" } else { "Platforms" }}</h3>
+                <p class="v2-create-help">{move || if matches!(state.get().launch, LaunchMode::Launchable(_)) {
+                    "Which systems the build runs on, and what Play starts. Incomplete launch options are never published."
+                } else {
+                    "Which systems the build runs on."
+                }}</p>
             </div>
 
             {move || authoritative.get().map(|model| view! {
@@ -1118,11 +1125,11 @@ pub(super) fn PublishLaunchEditor(
                 <span class="v2-create-field-label">"Detected package format"</span>
                 <p class="v2-create-mono-value">{move || state.get().archive.summary.map(|summary| package_format_label(&summary.detected_format).to_string()).or_else(|| {
                     match state.get().launch {
-                        LaunchMode::Launchable(tier) if !tier.package_format.text.is_empty() => Some(format!("{} (authoritative listing)", tier.package_format.text)),
+                        LaunchMode::Launchable(tier) if !tier.package_format.text.is_empty() => Some(format!("{} (current build)", tier.package_format.text)),
                         _ => None,
                     }
                 }).unwrap_or_else(|| "Select and inspect an archive".to_string())}</p>
-                <p class="v2-create-help">"Archive contents determine replacement formats. Download-only omits the launch package tag; existing authoritative metadata remains visible until replacement."</p>
+                <p class="v2-create-help">"Detected from the archive's contents."</p>
             </div>
 
             <ArchiveSafety state=state hazard_pages=hazard_pages warning_pages=warning_pages loading=hazard_loading error=hazard_error />
@@ -1130,21 +1137,21 @@ pub(super) fn PublishLaunchEditor(
             <PlatformEditor state=state platforms_input=platforms_input distribution_revision=distribution_revision platform_revision=platform_revision os_choice=os_choice arch_choice=arch_choice disabled=disabled />
 
             <Show when=move || matches!(state.get().launch, LaunchMode::DownloadOnly)>
-                <p class="v2-create-inline-note">"Download-only: buyers can acquire and verify the archive, but no Play action is offered."</p>
+                <p class="v2-create-inline-note">"Players download the file and run it themselves; there's no Play button."</p>
             </Show>
 
             <Show when=move || matches!(state.get().launch, LaunchMode::Launchable(_))>
                 <div class="v2-create-fields">
                     <div id="publish-launch-profiles" class="v2-create-fields">
                         <div class="v2-create-row-between">
-                            <div><h4 class="v2-create-subsection-title">"Launch profiles"</h4><p class="v2-create-help">"At least one canonical game profile is required."</p></div>
+                            <div><h4 class="v2-create-subsection-title">"Launch options"</h4><p class="v2-create-help">"What players can start from their library. You need at least one of type \"game\"."</p></div>
                             <button type="button" class="v2-btn-secondary" disabled=move || disabled.get() on:click=move |_| {
                                 state.update(|state| if let LaunchMode::Launchable(tier) = &mut state.launch { tier.add_profile(); });
                                 distribution_revision.update(|revision| *revision = revision.wrapping_add(1));
                             }>"Add profile"</button>
                         </div>
                         <Show when=move || matches!(state.get().launch, LaunchMode::Launchable(tier) if !tier.profiles.is_empty() && tier.platforms.iter().any(|target| !tier.publisher_default_assignments.iter().any(|assignment| &assignment.target == target)))>
-                            <p class="v2-create-inline-error" role="alert">"Assign every canonical target to an Automatic Play Game profile before publishing."</p>
+                            <p class="v2-create-inline-error" role="alert">"Choose what Play starts on every platform before publishing."</p>
                         </Show>
                         {move || {
                             let (profiles, validations) = match state.get().launch {
@@ -1157,7 +1164,7 @@ pub(super) fn PublishLaunchEditor(
                             let archive_ready = state.get().archive.summary.is_some();
                             let archive_hint = (!archive_ready && !profiles.is_empty()).then(|| view! { <p class="v2-create-help" role="note">"Select the build file to confirm each profile's executable and working directory."</p> });
                             if profiles.is_empty() {
-                                view! { <p class="v2-create-empty">"No profiles yet. Add a Game profile, then assign its Automatic Play targets."</p> }.into_any()
+                                view! { <p class="v2-create-empty">"No launch options yet. Add one, then choose the platforms where Play starts it."</p> }.into_any()
                             } else {
                                 let count = profiles.len();
                                 view! { <div>{archive_hint}{
@@ -1176,7 +1183,7 @@ pub(super) fn PublishLaunchEditor(
                                                 </div>
                                             </div>
                                             <div class="v2-create-field-pair">
-                                                <label><span class="v2-create-field-label">"Profile ID"</span><input class="v2-input" prop:value=profile.profile_id on:input:target=move |event| state.update(|state| if let LaunchMode::Launchable(tier) = &mut state.launch { if let Some(profile) = tier.profiles.iter_mut().find(|profile| profile.row_id == row_id) { profile.profile_id = event.target().value(); } }) disabled=move || disabled.get() /></label>
+                                                <label><span class="v2-create-field-label">"ID (letters, numbers, - and _)"</span><input class="v2-input" prop:value=profile.profile_id on:input:target=move |event| state.update(|state| if let LaunchMode::Launchable(tier) = &mut state.launch { if let Some(profile) = tier.profiles.iter_mut().find(|profile| profile.row_id == row_id) { profile.profile_id = event.target().value(); } }) disabled=move || disabled.get() /></label>
                                                 <label><span class="v2-create-field-label">"Display name"</span><input class="v2-input" prop:value=profile.display_name on:input:target=move |event| state.update(|state| if let LaunchMode::Launchable(tier) = &mut state.launch { if let Some(profile) = tier.profiles.iter_mut().find(|profile| profile.row_id == row_id) { profile.display_name = event.target().value(); } }) disabled=move || disabled.get() /></label>
                                             </div>
                                             <label><span class="v2-create-field-label">"Type"</span><select class="v2-input" prop:value=launch_type_value(&profile.launch_type) on:change:target=move |event| state.update(|state| if let LaunchMode::Launchable(tier) = &mut state.launch { tier.set_profile_launch_type(row_id, parse_launch_type(&event.target().value())); }) disabled=move || disabled.get()><option value="game">"game"</option><option value="config">"config"</option><option value="server">"server"</option><option value="editor">"editor"</option><option value="tool">"tool"</option></select></label>
@@ -1192,11 +1199,11 @@ pub(super) fn PublishLaunchEditor(
                                                             on:change:target=move |event| state.update(|state| if let LaunchMode::Launchable(tier) = &mut state.launch { tier.set_publisher_default_profile(row_id, event.target().checked()); })
                                                             disabled=move || disabled.get()
                                                         />
-                                                        "Automatic Play profile"
+                                                        "Play starts this option"
                                                     </label>
                                                     <Show when=move || matches!(state.get().launch, LaunchMode::Launchable(tier) if tier.profile_has_publisher_defaults(row_id))>
                                                         <fieldset class="v2-create-fields">
-                                                            <legend class="v2-create-help">"Targets using this profile for Automatic Play"</legend>
+                                                            <legend class="v2-create-help">"Platforms where Play starts this option"</legend>
                                                             {move || match state.get().launch {
                                                                 LaunchMode::Launchable(tier) => tier.platforms.into_iter().map(|target| {
                                                                     let checked_target = target.clone();
@@ -1263,14 +1270,14 @@ pub(super) fn PublishLaunchReview(
                 Err(error) => view! { <p class="v2-create-alert v2-create-alert-error" role="alert">{error}</p> }.into_any(),
                 Ok(review) => {
                     let artifact = match review.artifact {
-                        ReviewArtifact::Selected { filename, digest } => format!("Selected archive: {filename}; full SHA-256: {digest}"),
-                        ReviewArtifact::Existing { digest } => format!("Existing authoritative artifact reused; full SHA-256: {digest}"),
+                        ReviewArtifact::Selected { filename, digest } => format!("New build: {filename} (SHA-256 {digest})"),
+                        ReviewArtifact::Existing { digest } => format!("Current build kept (SHA-256 {digest})"),
                         ReviewArtifact::None => "No distribution artifact".to_string(),
                     };
                     match review.launch_tier {
                         None => view! {
                             <div class="v2-create-fields">
-                                <p><strong>"Download-only."</strong> " Buyers can acquire the artifact, but no Play action is signed."</p>
+                                <p><strong>"Download only."</strong> " Players download the file; there's no Play button."</p>
                                 <p class="v2-create-mono-value">{artifact}</p>
                                 <ReviewWarnings warnings=review.warnings />
                             </div>
@@ -1291,12 +1298,12 @@ pub(super) fn PublishLaunchReview(
                             let profiles = tier.launch_profiles;
                             view! {
                                 <div class="v2-create-fields">
-                                    <p><strong>"Launchable."</strong> " The following canonical values are the validated values that will be signed."</p>
+                                    <p><strong>"Installs and plays."</strong> " These launch settings will be published."</p>
                                     <dl class="v2-create-review-facts">
                                         <div><dt>"Package"</dt><dd>{package}</dd></div>
                                         <div><dt>"Targets"</dt><dd>{targets}</dd></div>
                                         <div><dt>"Artifact"</dt><dd>{artifact}</dd></div>
-                                        <div><dt>"Automatic Play mapping"</dt><dd>
+                                        <div><dt>"What Play starts"</dt><dd>
                                             <ul>{publisher_defaults.into_iter().flat_map(|default| {
                                                 let profile_id = default.profile_id.as_str().to_string();
                                                 default.targets.into_iter().map(move |target| {
@@ -1317,7 +1324,7 @@ pub(super) fn PublishLaunchReview(
                                             view! {
                                                 <li class="v2-create-profile-card">
                                                     <dl class="v2-create-review-facts">
-                                                        <div><dt>"Profile ID"</dt><dd>{profile_id}</dd></div>
+                                                        <div><dt>"ID"</dt><dd>{profile_id}</dd></div>
                                                         <div><dt>"Display name"</dt><dd>{display_name}</dd></div>
                                                         <div><dt>"Type"</dt><dd>{launch_type}</dd></div>
                                                         <div><dt>"Executable"</dt><dd>{executable}</dd></div>
@@ -1392,7 +1399,7 @@ fn PlatformEditor(
 ) -> impl IntoView {
     view! {
         <div id="publish-launch-platforms" class="v2-create-subpanel">
-            <span class="v2-create-field-label">"Canonical targets"</span>
+            <span class="v2-create-field-label">"Platforms"</span>
             <div class="v2-create-platform-controls">
                 <label><span class="v2-create-help">"Operating system"</span><select class="v2-input" prop:value=move || os_choice.get() on:change:target=move |event| os_choice.set(event.target().value()) disabled=move || disabled.get()><option value="windows">"windows"</option><option value="linux">"linux"</option><option value="macos">"macos"</option></select></label>
                 <label><span class="v2-create-help">"Architecture"</span><select class="v2-input" prop:value=move || arch_choice.get() on:change:target=move |event| arch_choice.set(event.target().value()) disabled=move || disabled.get()><option value="x86_64">"x86_64"</option><option value="aarch64">"aarch64"</option></select></label>
@@ -1409,16 +1416,16 @@ fn PlatformEditor(
                 }>"Add target"</button>
             </div>
             <div class="v2-create-chip-row">{move || selected_platforms(&state.get(), &platforms_input.get()).into_iter().map(|target| { let removed = target.clone(); view! { <span class="v2-create-chip">{target}<button type="button" class="v2-create-chip-remove" aria-label=format!("Remove {removed}") disabled=move || disabled.get() on:click=move |_| { let values = selected_platforms(&state.get_untracked(), &platforms_input.get_untracked()).into_iter().filter(|value| value != &removed).collect::<Vec<_>>(); state.update(|state| if let LaunchMode::Launchable(tier) = &mut state.launch { tier.replace_platforms(values.clone()); }); platforms_input.set(values.join(", ")); distribution_revision.update(|revision| *revision = revision.wrapping_add(1)); platform_revision.update(|revision| *revision = revision.wrapping_add(1)); }>"Remove"</button></span> } }).collect_view()}</div>
-            <p class="v2-create-help">"Launchable listings require at least one target. Platform tags are optional for download-only listings. Candidate ranking uses the selected target in the executable picker."</p>
+            <p class="v2-create-help">"Games that Arcadestr installs need at least one platform. For download-only games, platforms are optional."</p>
         </div>
     }
 }
 
 fn download_only_capability_copy(reason: &NoLaunchTierReason) -> Option<&'static str> {
     match reason {
-        NoLaunchTierReason::DownloadOnly => Some(
-            "Downloadable, not launchable. This listing does not claim the optional launch tier.",
-        ),
+        NoLaunchTierReason::DownloadOnly => {
+            Some("Download only: this game currently has no Play button.")
+        }
         _ => None,
     }
 }
@@ -1430,13 +1437,13 @@ fn AuthoritativeLaunchStatus(
     disabled: Signal<bool>,
 ) -> impl IntoView {
     match model.state {
-        AuthoritativeEditState::Loading => view! { <div class="v2-create-alert">"Loading authoritative signed launch metadata…"</div> }.into_any(),
+        AuthoritativeEditState::Loading => view! { <div class="v2-create-alert">"Loading the game's current launch settings…"</div> }.into_any(),
         AuthoritativeEditState::Absent => {
             let copy = download_only_capability_copy(&NoLaunchTierReason::DownloadOnly)
                 .expect("download-only has capability copy");
             view! { <div class="v2-create-inline-note">{copy}</div> }.into_any()
         },
-        AuthoritativeEditState::PresentValid(_) => view! { <div class="v2-create-inline-note">"Valid profiles were preloaded from the authoritative signed listing."</div> }.into_any(),
+        AuthoritativeEditState::PresentValid(_) => view! { <div class="v2-create-inline-note">"Loaded the game's current launch settings."</div> }.into_any(),
         AuthoritativeEditState::PresentDefective(metadata) => {
             let defect_count = metadata.defects.len();
             let defect_views = metadata
@@ -1449,21 +1456,21 @@ fn AuthoritativeLaunchStatus(
                 .collect_view();
             view! {
                 <section class="v2-create-defects" aria-labelledby="publish-launch-defects-title">
-                    <h4 id="publish-launch-defects-title" class="v2-create-field-label">"Authoritative listing defects — repair before publishing"</h4>
+                    <h4 id="publish-launch-defects-title" class="v2-create-field-label">"Problems in the current launch settings — fix before publishing"</h4>
                     <p class="v2-create-help">"Malformed signed tags are shown as evidence and are not silently repaired or preloaded."</p>
                     <ul>{defect_views}</ul>
-                    <label class="v2-create-checkbox-row"><input type="checkbox" checked=move || defect_review.get().reviewed disabled=move || disabled.get() on:change:target=move |event| defect_review.update(|review| { review.reviewed = event.target().checked(); review.accepted_defect_indices = if review.reviewed { (0..defect_count).collect() } else { Vec::new() }; }) />"I reviewed every authoritative defect and will replace the malformed launch metadata with the editor values below."</label>
+                    <label class="v2-create-checkbox-row"><input type="checkbox" checked=move || defect_review.get().reviewed disabled=move || disabled.get() on:change:target=move |event| defect_review.update(|review| { review.reviewed = event.target().checked(); review.accepted_defect_indices = if review.reviewed { (0..defect_count).collect() } else { Vec::new() }; }) />"I've reviewed these problems; publish the settings below instead."</label>
                 </section>
             }.into_any()
         },
-        AuthoritativeEditState::RelayError(error) | AuthoritativeEditState::NotFound(error) => view! { <div class="v2-create-alert v2-create-alert-error" role="alert">{format!("Authoritative launch metadata is unavailable: {error}")}</div> }.into_any(),
+        AuthoritativeEditState::RelayError(error) | AuthoritativeEditState::NotFound(error) => view! { <div class="v2-create-alert v2-create-alert-error" role="alert">{format!("The game's current launch settings couldn't be loaded: {error}")}</div> }.into_any(),
         AuthoritativeEditState::Stale(error) => view! {
             <div class="v2-create-alert v2-create-alert-error" role="alert">
-                <strong>"A concurrent listing revision was detected. Publication is blocked."</strong>
+                <strong>"This game was updated somewhere else. Publishing is blocked."</strong>
                 <p>{format!("Your local work is preserved and was not overwritten ({error}). Leave this workflow, return to Published games, and reopen the latest revision before publishing.")}</p>
             </div>
         }.into_any(),
-        AuthoritativeEditState::InvalidAuthority(error) => view! { <div class="v2-create-alert v2-create-alert-error" role="alert">{format!("Authoritative launch metadata is invalid: {error:?}")}</div> }.into_any(),
+        AuthoritativeEditState::InvalidAuthority(error) => view! { <div class="v2-create-alert v2-create-alert-error" role="alert">{format!("The game's current launch settings are invalid: {error:?}")}</div> }.into_any(),
     }
 }
 
@@ -1479,7 +1486,7 @@ fn ArchiveSafety(
         <Show when=move || state.get().archive.summary.is_some()>
             <section class="v2-create-archive-safety" aria-labelledby="publish-archive-safety-title">
                 <h4 id="publish-archive-safety-title" class="v2-create-subsection-title">"Archive safety inspection"</h4>
-                {move || state.get().archive.summary.map(|summary| if summary.blocking_hazards { view! { <p class="v2-create-alert v2-create-alert-error" role="alert">"This archive has blocking hazards. They cannot be overridden; the backend blocks publication. Fix and re-export the archive."</p> }.into_any() } else { view! { <p class="v2-create-inline-note">"No blocking archive hazards were detected."</p> }.into_any() })}
+                {move || state.get().archive.summary.map(|summary| if summary.blocking_hazards { view! { <p class="v2-create-alert v2-create-alert-error" role="alert">"This archive has problems that block publishing. Fix them and export the archive again."</p> }.into_any() } else { view! { <p class="v2-create-inline-note">"No blocking problems found in the archive."</p> }.into_any() })}
                 <Show when=move || loading.get()><p class="v2-create-help">"Loading every nonzero hazard and warning category…"</p></Show>
                 {move || error.get().map(|error| view! { <p class="v2-create-inline-error" role="alert">{error}</p> })}
                 {move || hazard_pages.get().into_iter().map(|group| view! { <div class="v2-create-hazard-group"><strong>{format!("{} — showing {} of {}", group.label, group.page.items.len(), group.page.total)}</strong><ul>{group.page.items.iter().map(|detail| view! { <li>{hazard_copy(detail)}</li> }).collect_view()}</ul>{group.page.next_offset.is_some().then(|| view! { <p class="v2-create-help">{format!("Details are capped at {DETAIL_PAGE_SIZE} for this category. Fix the named entries, then reselect the archive to inspect again.")}</p> })}</div> }).collect_view()}
@@ -1594,7 +1601,7 @@ mod tests {
 
         assert_eq!(
             copy,
-            "Downloadable, not launchable. This listing does not claim the optional launch tier."
+            "Download only: this game currently has no Play button."
         );
         for defect_word in ["error", "defect", "broken", "missing"] {
             assert!(!copy.to_lowercase().contains(defect_word));

@@ -26,4 +26,4 @@ pub use detail::DetailView;
 pub use profile::ProfileView;
 pub use profile_avatar::ProfileAvatar;
 pub use profile_display::{ProfileDisplayName, ProfileRow};
-pub use publish::PublishView;
+pub use publish::{HubSection, PublishView};
