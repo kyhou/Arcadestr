@@ -125,7 +125,7 @@ pub fn PublisherManagementPanel(
         let operation_id = match super::publish::archive_request_id() {
             Ok(id) => id.as_str().to_owned(),
             Err(_) => {
-                message.set(Some("Cannot create a durable operation ID".into()));
+                message.set(Some("Couldn't start this change. Try again.".into()));
                 return;
             }
         };
@@ -155,33 +155,50 @@ pub fn PublisherManagementPanel(
                 return;
             }
             busy.set(false);
-            message.set(Some(match result {Ok(event)=>format!("Selected relay acknowledged transition {}. This does not prove global propagation. Refresh credential evidence before further action.",event.id),Err(error)=>format!("Operation {operation_id}: {error}. If retained, reconcile this exact operation in Publisher recovery; do not start a replacement cancellation.")}));
+            message.set(Some(match result {Ok(event)=>format!("Done. The change was accepted and may take a moment to reach everyone. Select Check again before making another change. (event {})",event.id),Err(error)=>format!("{error}. If this stopped partway, use Finish publishing on this game instead of starting again. (operation {operation_id})")}));
         });
     });
     let render_auth = auth.clone();
     view! {
-        <section style="max-width:1440px;margin:18px auto;padding:18px;background:#121215;border:1px solid oklch(0.32 0.01 60);clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));font:400 12.5px/1.6 ui-monospace,monospace;color:#fff;overflow-wrap:anywhere">
-            <h2 style="font:800 12px ui-monospace,monospace;color:oklch(0.8 0.16 60);letter-spacing:1.5px">"DISTRIBUTION & CREDENTIAL MANAGEMENT"</h2>
-            <p>"Declared servers and historical operation evidence are not current download availability. Health checks do not prove registration or availability."</p>
-            <Show when=move ||servers.get_value().is_empty() && evidence.get().is_empty()><p>"No declared servers or local distribution checkpoints. Select distribution servers in the listing editor to begin a reviewed publication."</p></Show>
-            <button type="button" style="padding:10px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.78 0.13 210);font-family:ui-monospace,monospace" disabled=move || busy.get() on:click=move |_|refresh.update(|value|*value=value.wrapping_add(1))>"REFRESH LOCAL EVIDENCE"</button>
+        <section class="v2-create-fields v2-publisher-access" aria-label="Revoke access" style="min-width:0;overflow-wrap:anywhere">
+            <div class="v2-create-row-between">
+                <h3 class="v2-create-subsection-title">"Upload servers"</h3>
+                <button type="button" class="v2-btn-secondary" disabled=move || busy.get() on:click=move |_|refresh.update(|value|*value=value.wrapping_add(1))>"Check again"</button>
+            </div>
+            <p class="v2-create-help">"What this device has recorded about each server. This doesn't confirm a server is online right now."</p>
+            <Show when=move ||servers.get_value().is_empty() && evidence.get().is_empty()><p class="v2-create-help">"This game has no upload servers."</p></Show>
             {move || {let mut urls=servers.get_value();for row in evidence.get() {if !urls.contains(&row.server_url){urls.push(row.server_url);}} urls.into_iter().map(|url| {
                 let rows=evidence.get().into_iter().filter(|row|row.server_url==url).collect::<Vec<_>>();
-                view! {<div style="padding:10px;border-top:1px solid oklch(0.32 0.01 60)"><strong>{url}</strong>
-                    {if rows.is_empty(){view!{<p>"Declared · no local operation evidence; registration and availability unknown."</p>}.into_any()}else{rows.into_iter().map(|row|view!{<p>{format!("{} · operation {} · operator {} · intended capabilities {}{}",row.state.label(),row.operation_id,row.operator.unwrap_or_else(||"unknown".into()),row.capabilities.join(", "),row.diagnostic.map(|value|format!(" · previous attempt: {value}")).unwrap_or_default())}</p>}).collect_view().into_any()}}
+                view! {<div class="v2-hub-role-row"><p class="v2-create-mono-value">{url}</p>
+                    {if rows.is_empty(){view!{<p class="v2-create-help">"Listed for this game · nothing recorded on this device."</p>}.into_any()}else{rows.into_iter().map(|row|view!{<p class="v2-create-help">{format!("{} · permissions: {}{}",row.state.label(),row.capabilities.join(", "),row.diagnostic.map(|value|format!(" · last problem: {value}")).unwrap_or_default())}</p><details class="v2-create-disclosure"><summary class="v2-create-disclosure-summary">"Technical details"</summary><p class="v2-create-mono-value">{format!("Operation {} · service {}",row.operation_id,row.operator.unwrap_or_else(||"unknown".into()))}</p></details>}).collect_view().into_any()}}
                 </div>}
             }).collect_view()}}
-            <p>"Authority cancellation stops future issuance; receipts and grants issued before cancellation retain their historical validation rules. Individual grant revocation affects only that entitlement, not an independent purchase or another grant. Campaign cancellation stops claims, listing removal changes discovery, and operator offboarding is a separate unresolved workflow. None is performed implicitly here."</p>
-            <label>"ACTION "<select aria-label="Credential action" prop:value=move ||if grant.get(){"grant"}else{"authority"} style="background:#141417;color:#fff;padding:10px;font-family:ui-monospace,monospace" disabled=move || busy.get() on:change:target=move |event|{grant.set(event.target().value()=="grant");review.set(None);confirm.set(false);revision.update(|value|*value=value.wrapping_add(1));}>
-                <option value="authority">"CANCEL FULFILLMENT AUTHORITY"</option><option value="grant">"REVOKE ONE ENTITLEMENT GRANT"</option>
-            </select></label>
-            <label style="display:block">"CREDENTIAL ROOT EVENT ID"<input aria-label="Credential root event ID" style="display:block;width:100%;box-sizing:border-box;background:#141417;color:#fff;padding:10px;border:1px solid oklch(0.32 0.01 60);font-family:ui-monospace,monospace" prop:value=move ||root.get() disabled=move ||busy.get() on:input:target=move |event|{root.set(event.target().value());review.set(None);confirm.set(false);revision.update(|value|*value=value.wrapping_add(1));}/></label>
-            {authority_roots.into_iter().map(|id|{let display=id.clone();view!{<button type="button" style="padding:8px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.78 0.13 210);font-family:ui-monospace,monospace;overflow-wrap:anywhere;max-width:100%" disabled=move ||busy.get() on:click=move |_|{root.set(id.clone());grant.set(false);review.set(None);confirm.set(false);revision.update(|value|*value=value.wrapping_add(1));}>{format!("SELECT LISTED AUTHORITY {display}")}</button>}}).collect_view()}
-            <button type="button" style="padding:10px;border:1px solid oklch(0.5 0.13 210);background:transparent;color:oklch(0.78 0.13 210);font-family:ui-monospace,monospace" disabled=move ||busy.get() on:click=move |_|inspect.run(())>"REVIEW CURRENT CREDENTIAL >"</button>
-            {move ||review.get().map(|value|view!{<p>{format!("{} · root {} · current tip {} · terminal {}",value.subject,value.root_event_id,value.tip_event_id,value.terminal)}</p>})}
-            <label style="display:block"><input type="checkbox" prop:checked=move ||confirm.get() disabled=move ||busy.get() || review.get().is_none() || attempted.get() on:change:target=move |event|confirm.set(event.target().checked())/>" I authorize this exact developer-signed transition for the reviewed credential. This is not listing removal or operator offboarding."</label>
-            <button type="button" style="padding:10px;border:1px solid oklch(0.65 0.18 25);background:transparent;color:oklch(0.65 0.18 25);font-family:ui-monospace,monospace" disabled=move ||busy.get() || attempted.get() || !confirm.get() || review.get().is_none_or(|value|value.terminal) || render_auth.npub.get()!=Some(publisher.get_value()) on:click=move |_|revoke.run(())>"CONFIRM REVIEWED TRANSITION"</button>
-            {move ||message.get().map(|text|view!{<p role="status">{text}</p>})}
+
+            <div>
+                <label for="revoke-action" class="v2-create-field-label">"What do you want to do?"</label>
+                <select id="revoke-action" aria-label="Credential action" class="v2-input" style="max-width:100%" prop:value=move ||if grant.get(){"grant"}else{"authority"} disabled=move || busy.get() on:change:target=move |event|{grant.set(event.target().value()=="grant");review.set(None);confirm.set(false);revision.update(|value|*value=value.wrapping_add(1));}>
+                    <option value="authority">"Stop new copies from a service"</option>
+                    <option value="grant">"Take away a player's access"</option>
+                </select>
+                <p class="v2-create-help">{move || if grant.get() {
+                    "Only that player loses access. Their payment isn't refunded, and other purchases aren't affected."
+                } else {
+                    "Players who already have the game keep it. The service stops giving out new copies."
+                }}</p>
+            </div>
+            <div>
+                <label for="revoke-root" class="v2-create-field-label">{move || if grant.get() { "Access record ID" } else { "Service authorization ID" }}</label>
+                <input id="revoke-root" aria-label="Credential root event ID" class="v2-input v2-create-mono-value" style="max-width:100%;box-sizing:border-box" prop:value=move ||root.get() disabled=move ||busy.get() on:input:target=move |event|{root.set(event.target().value());review.set(None);confirm.set(false);revision.update(|value|*value=value.wrapping_add(1));}/>
+            </div>
+            {authority_roots.into_iter().map(|id|{let display=id.chars().take(16).collect::<String>();view!{<button type="button" class="v2-btn-secondary" disabled=move ||busy.get() on:click=move |_|{root.set(id.clone());grant.set(false);review.set(None);confirm.set(false);revision.update(|value|*value=value.wrapping_add(1));}>{format!("Use this game's service authorization ({display}…)")}</button>}}).collect_view()}
+            <button type="button" class="v2-btn-secondary" disabled=move ||busy.get() on:click=move |_|inspect.run(())>"Check"</button>
+            {move ||review.get().map(|value|view!{
+                <p class="v2-create-help">{if value.terminal { format!("{} · already revoked", value.subject) } else { format!("{} · active", value.subject) }}</p>
+                <details class="v2-create-disclosure"><summary class="v2-create-disclosure-summary">"Technical details"</summary><p class="v2-create-mono-value">{format!("root {} · current {}",value.root_event_id,value.tip_event_id)}</p></details>
+            })}
+            <label class="v2-create-checkbox-row"><input type="checkbox" prop:checked=move ||confirm.get() disabled=move ||busy.get() || review.get().is_none() || attempted.get() on:change:target=move |event|confirm.set(event.target().checked())/>"I understand this can't be undone. It doesn't remove the game from the store."</label>
+            <button type="button" class="v2-btn-danger" disabled=move ||busy.get() || attempted.get() || !confirm.get() || review.get().is_none_or(|value|value.terminal) || render_auth.npub.get()!=Some(publisher.get_value()) on:click=move |_|revoke.run(())>{move || if grant.get() { "Take away access" } else { "Stop new copies" }}</button>
+            {move ||message.get().map(|text|view!{<p class="v2-create-inline-note" role="status">{text}</p>})}
         </section>
     }
 }
