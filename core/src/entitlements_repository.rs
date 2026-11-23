@@ -7,8 +7,9 @@ use thiserror::Error;
 use crate::authorization::ResolvedAuthorization;
 use crate::campaign::ResolvedCampaign;
 use crate::entitlements::{
-    parse_entitlement_event, resolve_entitlement_grant, validate_adp_entitlement, EntitlementError,
-    GrantStatus, ParsedEntitlementGrant, ResolvedEntitlementGrant,
+    parse_entitlement_event, resolve_entitlement_grant, validate_adp_entitlement,
+    validate_campaignless_entitlement, EntitlementError, GrantStatus, ParsedEntitlementGrant,
+    ResolvedEntitlementGrant,
 };
 
 #[derive(Debug, Error)]
@@ -116,7 +117,7 @@ impl EntitlementsRepository {
         ensure_current()?;
         sqlx::query("INSERT INTO entitlement_events (event_id,grant_id,buyer_pubkey,game_coordinate,campaign_root_id,issuer_pubkey,status,predecessor_event_id,created_at,raw_event_json,validated) VALUES (?,?,?,?,?,?,?,?,?,?,1) ON CONFLICT(event_id) DO NOTHING")
             .bind(revocation.event.id.to_hex()).bind(grant_id).bind(buyer.to_hex()).bind(coordinate)
-            .bind(revocation.source_event.to_hex()).bind(developer.to_hex()).bind(GrantStatus::Revoked.as_str())
+            .bind(source_column(revocation.source_event)).bind(developer.to_hex()).bind(GrantStatus::Revoked.as_str())
             .bind(root_id.to_hex()).bind(revocation.event.created_at.as_secs() as i64)
             .bind(serde_json::to_string(&revocation.event).map_err(|e|e.to_string())?)
             .execute(&mut *tx).await.map_err(|e|e.to_string())?;
@@ -147,6 +148,36 @@ impl EntitlementsRepository {
         nodes.push(parsed.clone());
         let resolved = resolve_entitlement_grant(&nodes)?;
         validate_adp_entitlement(&resolved, campaign, authorization)?;
+        self.insert_validated(event, &parsed).await
+    }
+
+    /// Stores a publisher-signed grant issued without a campaign
+    /// (ADP-01 §Entitlement Grants). The grant and its stored chain must pass
+    /// [`validate_campaignless_entitlement`].
+    pub async fn ingest_campaignless_event(
+        &self,
+        event: &Event,
+    ) -> Result<(), EntitlementsRepositoryError> {
+        let parsed = parse_entitlement_event(event)
+            .map_err(|error| EntitlementsRepositoryError::InvalidEvent(error.to_string()))?;
+        let mut nodes = self
+            .parsed_events(
+                &parsed.recipient.to_hex(),
+                &parsed.coordinate,
+                Some(&parsed.grant_id),
+            )
+            .await?;
+        nodes.push(parsed.clone());
+        let resolved = resolve_entitlement_grant(&nodes)?;
+        validate_campaignless_entitlement(&resolved)?;
+        self.insert_validated(event, &parsed).await
+    }
+
+    async fn insert_validated(
+        &self,
+        event: &Event,
+        parsed: &crate::entitlements::ParsedEntitlementGrant,
+    ) -> Result<(), EntitlementsRepositoryError> {
         let raw_event_json = serde_json::to_string(event)?;
 
         sqlx::query(
@@ -164,7 +195,7 @@ impl EntitlementsRepository {
         .bind(&parsed.grant_id)
         .bind(parsed.recipient.to_hex())
         .bind(&parsed.coordinate)
-        .bind(parsed.source_event.to_hex())
+        .bind(source_column(parsed.source_event))
         .bind(event.pubkey.to_hex())
         .bind(parsed.status.as_str())
         .bind(parsed.predecessor.map(|id| id.to_hex()))
@@ -326,7 +357,7 @@ fn map_entitlement_history(
                 || parsed.grant_id != grant_id
                 || parsed.recipient.to_hex() != *buyer
                 || parsed.coordinate != *coordinate
-                || parsed.source_event.to_hex() != *campaign
+                || source_column(parsed.source_event) != *campaign
             {
                 return Err(());
             }
@@ -376,10 +407,17 @@ fn map_entitlement_history(
     EntitlementHistoryRecord {
         grant_id,
         game_coordinate: root.coordinate.clone(),
-        campaign_id: Some(root.source_event.to_hex()),
+        campaign_id: root.source_event.map(|id| id.to_hex()),
         event_id,
         acquired_at: root.event.created_at.as_secs(),
         status: resolved.status(),
         validation_error: None,
     }
+}
+
+/// `entitlement_events.campaign_root_id` is `NOT NULL`. A grant issued without
+/// a campaign (ADP-01 §Entitlement Grants) stores the empty string, which can
+/// never equal a hex event ID.
+fn source_column(source_event: Option<nostr::EventId>) -> String {
+    source_event.map(|id| id.to_hex()).unwrap_or_default()
 }

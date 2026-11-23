@@ -32,7 +32,9 @@ pub struct ParsedEntitlementGrant {
     pub grant_id: String,
     pub recipient: PublicKey,
     pub coordinate: String,
-    pub source_event: EventId,
+    /// Campaign root that authorized issuance. Absent only on developer-signed
+    /// grants issued without a campaign (ADP-01 §Entitlement Grants).
+    pub source_event: Option<EventId>,
     pub authorization: Option<EventId>,
     pub reason: Option<String>,
     pub status: GrantStatus,
@@ -73,6 +75,8 @@ pub enum EntitlementError {
     UnauthorizedIssuer,
     #[error("only the publisher may revoke an entitlement")]
     UnauthorizedRevoker,
+    #[error("a grant without a campaign must be signed directly by the publisher")]
+    CampaignlessGrantNotPublisherSigned,
 }
 
 pub fn parse_entitlement_event(
@@ -99,11 +103,12 @@ pub fn parse_entitlement_event(
     if coordinate_publisher(&coordinate).is_none() {
         return Err(ProtocolEventError::MalformedTag(TAG_COORDINATE.into()));
     }
-    let source_event = EventId::from_hex(
-        &exact_tag(event, TAG_SOURCE_EVENT, true)?
-            .ok_or(ProtocolEventError::MissingTag(TAG_SOURCE_EVENT))?,
-    )
-    .map_err(|_| ProtocolEventError::MalformedTag(TAG_SOURCE_EVENT.into()))?;
+    let source_event = exact_tag(event, TAG_SOURCE_EVENT, false)?
+        .map(|value| {
+            EventId::from_hex(&value)
+                .map_err(|_| ProtocolEventError::MalformedTag(TAG_SOURCE_EVENT.into()))
+        })
+        .transpose()?;
     let authorization_event = exact_tag(event, TAG_AUTHORIZATION_EVENT, false)?
         .map(|value| {
             EventId::from_hex(&value)
@@ -236,7 +241,7 @@ pub fn validate_adp_entitlement(
     let root = resolved.events.first().ok_or(ChainError::Empty)?;
     let publisher =
         coordinate_publisher(&root.coordinate).ok_or(EntitlementError::InvalidCoordinate)?;
-    if campaign.root_event_id != root.source_event
+    if root.source_event != Some(campaign.root_event_id)
         || campaign.publisher_pubkey != publisher
         || campaign.coordinate != root.coordinate
     {
@@ -264,6 +269,37 @@ pub fn validate_adp_entitlement(
             }
         }
         (false, None) => return Err(EntitlementError::MissingAuthorizationEvent),
+    }
+    if resolved
+        .events
+        .iter()
+        .skip(1)
+        .any(|event| event.event.pubkey != publisher)
+    {
+        return Err(EntitlementError::UnauthorizedRevoker);
+    }
+    Ok(())
+}
+
+/// Validates a publisher-signed grant issued without a campaign
+/// (ADP-01 §Entitlement Grants). Valid on the publisher's signature and the
+/// chain rules alone; it must carry neither `source_event` nor an
+/// `authorization` anchor, and every status update must be publisher-signed.
+pub fn validate_campaignless_entitlement(
+    grant: &ResolvedEntitlementGrant,
+) -> Result<(), EntitlementError> {
+    let resolved = resolve_entitlement_grant(&grant.events)?;
+    if resolved != *grant {
+        return Err(ChainError::InvariantMutation("resolved grant metadata").into());
+    }
+    let root = resolved.events.first().ok_or(ChainError::Empty)?;
+    let publisher =
+        coordinate_publisher(&root.coordinate).ok_or(EntitlementError::InvalidCoordinate)?;
+    if root.source_event.is_some() {
+        return Err(EntitlementError::CampaignMismatch);
+    }
+    if root.event.pubkey != publisher || root.authorization.is_some() {
+        return Err(EntitlementError::CampaignlessGrantNotPublisherSigned);
     }
     if resolved
         .events

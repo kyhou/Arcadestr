@@ -3590,7 +3590,8 @@ pub async fn claim_entitlement(
     if parsed.coordinate != game_coordinate {
         return Err("invalid grant response: coordinate mismatch".into());
     }
-    if parsed.source_event != campaign_root_id {
+    // A claim response must be anchored to the exact campaign that was claimed.
+    if parsed.source_event != Some(campaign_root_id) {
         return Err("invalid grant response: campaign source mismatch".into());
     }
     let grant = arcadestr_core::entitlements::resolve_entitlement_grant(&[parsed.clone()])

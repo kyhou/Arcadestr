@@ -455,7 +455,12 @@ mod tests {
         .bind(parsed.grant_id)
         .bind(parsed.recipient.to_hex())
         .bind(parsed.coordinate)
-        .bind(parsed.source_event.to_hex())
+        .bind(
+            parsed
+                .source_event
+                .map(|id| id.to_hex())
+                .unwrap_or_default(),
+        )
         .bind(grant.pubkey.to_hex())
         .bind(parsed.status.as_str())
         .bind(parsed.predecessor.map(|id| id.to_hex()))
@@ -537,6 +542,127 @@ mod tests {
             raw_event: serde_json::to_string(&update).expect("update JSON"),
             ..paid.clone()
         }
+    }
+
+    fn campaignless_grant(
+        recipient: &Keys,
+        signer: &Keys,
+        publisher: &Keys,
+        status: &str,
+        predecessor: Option<EventId>,
+        created_at: u64,
+    ) -> Event {
+        let mut tags = vec![
+            Tag::custom(TagKind::d(), ["review-copy"]),
+            Tag::custom(TagKind::p(), [recipient.public_key().to_hex()]),
+            Tag::custom(TagKind::a(), [coordinate(publisher, "game")]),
+            Tag::custom(TagKind::custom("reason"), ["review-copy"]),
+            Tag::custom(TagKind::custom("status"), [status]),
+        ];
+        if let Some(predecessor) = predecessor {
+            tags.push(Tag::custom(TagKind::e(), [predecessor.to_hex()]));
+        }
+        EventBuilder::new(Kind::Custom(ENTITLEMENT_GRANT_KIND), "")
+            .tags(tags)
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(signer)
+            .expect("grant should sign")
+    }
+
+    /// ADP-01 §Entitlement Grants (gap C3): a publisher-signed grant without a
+    /// campaign parses, validates, persists, and grants ownership.
+    #[tokio::test]
+    async fn a_publisher_grant_without_a_campaign_is_owned_and_listed() {
+        let (_temp, database, service, _purchases) = setup("campaignless-grant").await;
+        let buyer = Keys::generate();
+        let publisher = Keys::generate();
+        let grant = campaignless_grant(&buyer, &publisher, &publisher, "granted", None, 10);
+        let parsed = crate::entitlements::parse_entitlement_event(&grant).expect("parses");
+        assert_eq!(parsed.source_event, None);
+
+        EntitlementsRepository::new(database.pool().clone())
+            .ingest_campaignless_event(&grant)
+            .await
+            .expect("campaignless grant persists");
+        let buyer_hex = buyer.public_key().to_hex();
+        let game = coordinate(&publisher, "game");
+
+        assert_eq!(
+            service
+                .source_for(&buyer_hex, &game)
+                .await
+                .expect("ownership"),
+            OwnershipSource::EntitlementGrant
+        );
+        let records = service
+            .durable_records_for(&buyer_hex)
+            .await
+            .expect("history");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, DurableCredentialStatus::Active);
+        assert_eq!(records[0].campaign_id, None);
+        assert!(records[0].validation_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_campaignless_grant_not_signed_by_the_publisher_is_rejected() {
+        let (_temp, database, service, _purchases) = setup("campaignless-delegated").await;
+        let buyer = Keys::generate();
+        let publisher = Keys::generate();
+        let other = Keys::generate();
+        let grant = campaignless_grant(&buyer, &other, &publisher, "granted", None, 10);
+
+        assert!(EntitlementsRepository::new(database.pool().clone())
+            .ingest_campaignless_event(&grant)
+            .await
+            .is_err());
+        assert!(!service
+            .is_owned(
+                &buyer.public_key().to_hex(),
+                &coordinate(&publisher, "game")
+            )
+            .await
+            .expect("ownership"));
+    }
+
+    #[tokio::test]
+    async fn a_campaign_anchored_grant_is_rejected_by_the_campaignless_path() {
+        let (_temp, database, _service, _purchases) = setup("campaignless-anchored").await;
+        let buyer = Keys::generate();
+        let publisher = Keys::generate();
+        let anchored = grant_event(&buyer, &publisher, "grant", "game", "granted", None, 10);
+
+        assert!(EntitlementsRepository::new(database.pool().clone())
+            .ingest_campaignless_event(&anchored)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_publisher_revocation_ends_a_campaignless_grant() {
+        let (_temp, database, service, _purchases) = setup("campaignless-revoke").await;
+        let buyer = Keys::generate();
+        let publisher = Keys::generate();
+        let root = campaignless_grant(&buyer, &publisher, &publisher, "granted", None, 10);
+        let revoke =
+            campaignless_grant(&buyer, &publisher, &publisher, "revoked", Some(root.id), 20);
+        let repository = EntitlementsRepository::new(database.pool().clone());
+        repository
+            .ingest_campaignless_event(&root)
+            .await
+            .expect("root");
+        repository
+            .ingest_campaignless_event(&revoke)
+            .await
+            .expect("revocation");
+
+        assert!(!service
+            .is_owned(
+                &buyer.public_key().to_hex(),
+                &coordinate(&publisher, "game")
+            )
+            .await
+            .expect("ownership"));
     }
 
     /// ADP-01 §Receipt status under ADP (gap C2): `disputed` retains ownership.

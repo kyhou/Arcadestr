@@ -126,7 +126,11 @@ pub async fn review_publisher_credential(
             coordinate,
             subject: format!(
                 "Grant {} · recipient {} · source {}",
-                tip.grant_id, tip.recipient, tip.source_event
+                tip.grant_id,
+                tip.recipient,
+                tip.source_event
+                    .map(|id| id.to_hex())
+                    .unwrap_or_else(|| "none (publisher-issued)".into())
             ),
             terminal: tip.status == arcadestr_core::entitlements::GrantStatus::Revoked,
         }
@@ -270,13 +274,21 @@ pub(crate) async fn revoke_recoverable(
                 // Reuse historical campaign/authorization verification; neither a
                 // cancelled campaign nor prospective authority cancellation revokes old grants.
                 let source = resolved.events.first().ok_or("Missing grant root")?;
+                // ADP-01 permits publisher-signed grants without a campaign. This
+                // flow verifies revocations against campaign evidence, so it does
+                // not yet support them; fail closed rather than guess.
+                let Some(source_campaign) = source.source_event else {
+                    return Err(
+                        "Revoking a grant issued without a campaign is not supported yet".into(),
+                    );
+                };
                 let manager = { state.nostr.lock().await.get_relay_manager().clone() };
                 let manager = { manager.lock().await.clone() };
                 let report =
                     arcadestr_core::campaign_discovery::CampaignDiscoveryService::new(&manager)
                         .discover(
                             &[arcadestr_core::marketplace::CampaignPointer {
-                                root_event_id: source.source_event,
+                                root_event_id: source_campaign,
                                 relay_hint: None,
                             }],
                             public,
@@ -288,7 +300,7 @@ pub(crate) async fn revoke_recoverable(
                 let campaign = report
                     .campaigns
                     .into_iter()
-                    .find(|item| item.campaign.root_event_id == source.source_event)
+                    .find(|item| item.campaign.root_event_id == source_campaign)
                     .ok_or("Grant campaign evidence unavailable")?
                     .campaign;
                 let authorization = if let Some(id) = source.authorization {
