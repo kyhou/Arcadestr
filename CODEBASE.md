@@ -154,14 +154,14 @@ arcadestr/
 ├── CLAUDE.md               # Development guidelines for Claude Code
 ├── AGENTS.md               # Agent-specific build/test commands
 ├── RUST_GUIDELINES.md      # Microsoft Rust Guidelines reference
-├── ADP-01.md               # ADP protocol specification
-├── ADP-01-amendment-free-acquisitions.md # Explicit access/campaign amendment
-├── ADP-01-amendment-launch-profiles.md # Signed package, platform, launch profile/default amendment
+├── ADP-01.md               # Canonical consolidated ADP spec 0.3.0; mirrored byte-for-byte to ../adp-server
 ├── NIP-102.md              # Purchase receipt specification used by ownership
 ├── NIP-103.md              # Experimental entitlement/campaign proposal notes
 ├── Arcadestr_UI_Screen_Inventory_Revised.md # Maintained acquisition-aware inventory
 ├── docs/README.md           # Documentation status and repository contents policy
 ├── docs/archive/            # Original inventory, client integration plans, NIP-46 report
+├── docs/protocol-history/   # Superseded ADP-01 amendments (consolidated into ADP-01.md)
+├── docs/protocol-implementation-gaps.md # Open client conformance gaps against ADP-01
 ├── opencode.json           # Repository-local OpenCode MCP/watch configuration
 ├── COMMANDS.md             # Available CLI commands
 ├── test_nostrconnect.sh    # Test script for NIP-46
@@ -1816,7 +1816,7 @@ pub trait NostrSigner: Send + Sync {
 
 This allows the same `AuthState` to work with local and remote signers. `SdkSignerAdapter` and `ActiveSigner::Sdk` synchronize restored NIP-46 clients into shared command state. `login_with_nsec` persists the encrypted account through `AccountManager`, clears active NIP-46 retry/client state, decrypts the key into a zeroizing value, and activates the local signer. Logout clears the active database flag without deleting saved accounts, then disconnects shared auth.
 
-Signer-adjacent authorization checks distinguish writer and observer clocks. A kind-30406 attestation observed from the network may have `valid_from` up to 300 seconds in the reader's future, but that skew applies only to activation. Revocation is effective immediately at `revoked_at`; it is never delayed by the observer allowance. NIP-98 similarly signs the **exact URL sent on the wire**, including the percent-encoded coordinate/raw request target, so decoded and encoded forms cannot drift between the `u` tag and HTTP request.
+Signer-adjacent authorization checks distinguish writer and observer clocks. A kind-30406 attestation observed from the network may have `valid_from` up to 300 seconds in the reader's future, but that skew applies only to activation. Revocation is effective immediately at `revoked_at`; it is never delayed by the observer allowance. ADP-01 §No early activation now forbids this allowance; it remains in code as open gap C1 in `docs/protocol-implementation-gaps.md`. NIP-98 similarly signs the **exact URL sent on the wire**, including the percent-encoded coordinate/raw request target, so decoded and encoded forms cannot drift between the `u` tag and HTTP request.
 
 ### 8.2 Feature-Gated Compilation
 
@@ -2743,7 +2743,7 @@ Marketplace streams no longer use static event names. Inspect the `requestId` ar
 
 14. **Offline policy cache is fail-closed**: `MarketplaceCache::load_listings()` currently reconstructs cached listings as gated with no campaign pointers. Public/timed access and campaign links return only after relay refresh.
 
-15. **Provisional campaign/grant kinds**: Kinds `1030` and `1031` are experimental allocations, not finalized interoperable NIP numbers. Grant parsing validates signed tags and context but does not inspect encrypted event content.
+15. **Provisional campaign/grant kinds**: Kinds `1030` and `1031` are experimental provisional values, not finalized interoperable NIP numbers; ADP-01 uses symbolic placeholders for them. Grant parsing validates signed tags and context but does not inspect encrypted event content.
 
 16. **Preserved edit tags are caller-filtered**: The core builder appends `preserved_tags` verbatim. Callers must remove form-managed tags or they can produce duplicates.
 
@@ -3014,7 +3014,7 @@ New debug-only UI component in `detail.rs` for inspecting NIP-99 events:
 - **Ownership**: `OwnershipService` resolves `PurchaseReceipt | EntitlementGrant | None`. Public and timed access are current access modes, not stored ownership.
 - **ADP route**: `AdpClient::entitlement_claim` calls exact `POST /entitlement/claim` with NIP-98 and typed campaign, coordinate, grant, distribution, and protocol errors.
 - **Commands/bridges**: Discovery, summary, publish, pointer-repair, claim, ownership, and purchase-history commands cover buyer and publisher flows; campaign publication reports pointer-update partial success explicitly.
-- **Publisher authority**: Campaign create/update/cancel requires the active publisher identity signer. A fulfillment key may issue grants only when both the historical listing delegation and referenced kind `30406` authorization lifecycle were active at issuance; either source alone fails closed. Direct publisher grants require neither proof. Fulfillment keys cannot control campaigns or revoke grants.
+- **Publisher authority**: Campaign create/update/cancel requires the active publisher identity signer. A fulfillment key may issue grants only when both the historical listing delegation and referenced kind `30406` authorization lifecycle were active at issuance; either source alone fails closed. (Needs re-verification: ADP-01 anchors historical validity only on kind `30406`; see `docs/protocol-implementation-gaps.md`.) Direct publisher grants require neither proof. Fulfillment keys cannot control campaigns or revoke grants.
 - **Install trust boundary**: The current signed listing controls server, hash, version, and current access policy. Historical validated grants/receipts remain durable after price, policy, version, or campaign cancellation changes, and cached tokens are buyer-scoped.
 
 ### Experimental ADP Split-Settlement Groundwork

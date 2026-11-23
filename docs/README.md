@@ -12,10 +12,26 @@
 - [Regression scripts](../scripts/README.md) and
   [crossflow acceptance](../tests/gate7_crossflow/README.md): test setup and scope.
 
-Root `ADP-01.md`, its amendments, `NIP-102.md`, and `NIP-103.md` are protocol
-references. The sibling server has separate copies: `ADP-01.md` and the launch
-profile amendment currently differ. Reconcile requirements explicitly before
-synchronizing; never replace one with the other as a housekeeping change.
+Root [ADP-01.md](../ADP-01.md), [NIP-102.md](../NIP-102.md), and
+[NIP-103.md](../NIP-103.md) are protocol references. `ADP-01.md` is the single
+authoritative ADP specification; its former amendments are superseded records in
+[protocol-history/](protocol-history/README.md).
+
+**This repository's `ADP-01.md` is the canonical source.** The sibling
+`../adp-server/ADP-01.md` is a byte-for-byte mirror, maintained by the process in
+`../adp-server/docs/README.md` §Protocol Synchronization:
+
+1. Make protocol changes here only.
+2. Copy unchanged to `../adp-server/ADP-01.md`.
+3. Confirm `sha256sum ADP-01.md ../adp-server/ADP-01.md` prints one hash twice.
+4. Record new conformance gaps in each repository's
+   `docs/protocol-implementation-gaps.md`.
+
+`NIP-102.md` and `NIP-103.md` are independent specifications, mirrored only by
+explicit decision. A CI hash comparison is recommended to prevent drift; none
+exists yet. Client conformance gaps are tracked in
+[protocol-implementation-gaps.md](protocol-implementation-gaps.md). They remain
+open until code changes; synchronizing documentation does not resolve them.
 
 ## Planning and Historical Material
 
