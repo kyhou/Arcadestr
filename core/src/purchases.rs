@@ -680,6 +680,14 @@ fn resolve_receipt_structure(events: &[Event], developer: PublicKey) -> Result<&
     if parsed.len() != events.len() {
         return Err(PurchaseError::ProofInvalid("malformed receipt chain member".into()));
     }
+    // ADP-01 §Receipt status under ADP: only the developer controls status
+    // transitions; no status-update capability is defined. A status update
+    // signed by any other key is not evidence about this purchase: it is
+    // dropped, so it can neither change the status nor invalidate the chain.
+    let parsed = parsed
+        .into_iter()
+        .filter(|(event, receipt)| receipt.predecessor.is_none() || event.pubkey == developer)
+        .collect::<Vec<_>>();
     let roots = parsed
         .iter()
         .filter(|(_, receipt)| is_paid_receipt_root(receipt))
@@ -694,7 +702,6 @@ fn resolve_receipt_structure(events: &[Event], developer: PublicKey) -> Result<&
         || (root_event.pubkey == developer && root.authorization.is_some()) {
         return Err(PurchaseError::ProofInvalid("invalid root authorization binding".into()));
     }
-    let delegated = root_event.pubkey != developer;
     let mut current_event = *root_event;
     let mut current = root.clone();
     let mut visited = HashSet::from([current_event.id]);
@@ -713,8 +720,7 @@ fn resolve_receipt_structure(events: &[Event], developer: PublicKey) -> Result<&
                     && candidate.settled_at.is_none()
                     && candidate.proofs.is_empty()
                     && candidate.aggregate.is_none()
-                    && (event.pubkey == developer
-                        || (delegated && event.pubkey == root_event.pubkey))
+                    && event.pubkey == developer
                     && current.status != "refunded"
                     && candidate.status != STATUS_PAID
                     && candidate.predecessor != Some(event.id)
@@ -895,8 +901,10 @@ fn tag_value(event: &Event, tag_name: &str) -> Option<String> {
     })
 }
 
-fn status_grants_ownership(status: &str) -> bool {
-    matches!(status, STATUS_PAID | STATUS_FULFILLED)
+/// ADP-01 §Receipt status under ADP: `paid`, `fulfilled`, and `disputed` tips
+/// retain ownership; `refunded` does not.
+pub(crate) fn status_grants_ownership(status: &str) -> bool {
+    matches!(status, STATUS_PAID | STATUS_FULFILLED | "disputed")
 }
 
 #[cfg(any())]

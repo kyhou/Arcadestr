@@ -114,8 +114,12 @@ impl OwnershipService {
             .map(|e| (e.game_coordinate.clone(), e))
             .collect::<std::collections::BTreeMap<_, _>>();
         for record in self.durable_records_for(buyer_pubkey).await? {
-            if record.status != DurableCredentialStatus::Active
-                || entries.contains_key(&record.game_coordinate)
+            // ADP-01 §Receipt status under ADP: a disputed purchase still
+            // retains ownership, so it stays in Library.
+            if !matches!(
+                record.status,
+                DurableCredentialStatus::Active | DurableCredentialStatus::Disputed
+            ) || entries.contains_key(&record.game_coordinate)
                 || !self.is_owned(buyer_pubkey, &record.game_coordinate).await?
             {
                 continue;
@@ -504,6 +508,121 @@ mod tests {
             record.status == DurableCredentialStatus::Active
                 && record.record_id == separate.event_id
         }));
+    }
+
+    fn status_update(
+        paid: &StoredReceipt,
+        buyer: &Keys,
+        merchant: &Keys,
+        signer: &Keys,
+        status: &str,
+        created_at: u64,
+    ) -> StoredReceipt {
+        let update = EventBuilder::new(Kind::Custom(1020), "")
+            .tags([
+                Tag::custom(TagKind::p(), [buyer.public_key().to_hex()]),
+                Tag::custom(TagKind::a(), [coordinate(merchant, "game")]),
+                Tag::custom(TagKind::custom("order"), ["order"]),
+                Tag::custom(TagKind::custom("status"), [status]),
+                Tag::custom(TagKind::e(), [paid.event_id.clone()]),
+            ])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(signer)
+            .expect("status update should sign");
+        StoredReceipt {
+            event_id: update.id.to_hex(),
+            payment_hash: None,
+            status: status.into(),
+            created_at,
+            raw_event: serde_json::to_string(&update).expect("update JSON"),
+            ..paid.clone()
+        }
+    }
+
+    /// ADP-01 §Receipt status under ADP (gap C2): `disputed` retains ownership.
+    #[tokio::test]
+    async fn a_disputed_purchase_retains_ownership_and_stays_in_library() {
+        let (_temp, _database, service, purchases) = setup("disputed-ownership").await;
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let paid = receipt(&buyer, &merchant, "game", "order", "paid", 10);
+        let disputed = status_update(&paid, &buyer, &merchant, &merchant, "disputed", 20);
+        for stored in [&paid, &disputed] {
+            purchases
+                .upsert_receipt(stored)
+                .await
+                .expect("receipt should persist");
+        }
+        let buyer_hex = buyer.public_key().to_hex();
+        let game = coordinate(&merchant, "game");
+
+        assert!(service
+            .is_owned(&buyer_hex, &game)
+            .await
+            .expect("ownership"));
+        let records = service
+            .durable_records_for(&buyer_hex)
+            .await
+            .expect("history");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, DurableCredentialStatus::Disputed);
+        let library = service
+            .library_entries_for(&buyer_hex, Vec::new())
+            .await
+            .expect("library");
+        assert_eq!(library.len(), 1, "a disputed purchase stays in Library");
+        assert_eq!(library[0].game_coordinate, game);
+    }
+
+    /// ADP-01 §Receipt status under ADP: `refunded` does not retain ownership.
+    #[tokio::test]
+    async fn a_refunded_purchase_does_not_retain_ownership() {
+        let (_temp, _database, service, purchases) = setup("refunded-ownership").await;
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let paid = receipt(&buyer, &merchant, "game", "order", "paid", 10);
+        let refunded = status_update(&paid, &buyer, &merchant, &merchant, "refunded", 20);
+        for stored in [&paid, &refunded] {
+            purchases
+                .upsert_receipt(stored)
+                .await
+                .expect("receipt should persist");
+        }
+        let buyer_hex = buyer.public_key().to_hex();
+
+        assert!(!service
+            .is_owned(&buyer_hex, &coordinate(&merchant, "game"))
+            .await
+            .expect("ownership"));
+        assert!(service
+            .library_entries_for(&buyer_hex, Vec::new())
+            .await
+            .expect("library")
+            .is_empty());
+    }
+
+    /// ADP-01 §Receipt status under ADP (gap C9): only the developer controls
+    /// status transitions, so an update signed by any other key, including a
+    /// fulfillment key, neither changes the status nor invalidates the chain.
+    #[tokio::test]
+    async fn a_status_update_not_signed_by_the_developer_is_ignored() {
+        let (_temp, _database, service, purchases) = setup("foreign-status").await;
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let other_key = Keys::generate();
+        let paid = receipt(&buyer, &merchant, "game", "order", "paid", 10);
+        let foreign_refund = status_update(&paid, &buyer, &merchant, &other_key, "refunded", 20);
+        for stored in [&paid, &foreign_refund] {
+            purchases
+                .upsert_receipt(stored)
+                .await
+                .expect("receipt should persist");
+        }
+
+        assert!(service
+            .is_owned(&buyer.public_key().to_hex(), &coordinate(&merchant, "game"))
+            .await
+            .expect("ownership"));
     }
 
     #[tokio::test]

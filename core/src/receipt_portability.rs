@@ -726,6 +726,11 @@ fn member_authority(
     let Ok(receipt) = parse_receipt_event(event) else {
         return Unauthorized;
     };
+    // ADP-01 §Receipt status under ADP: a fulfillment key may sign a root
+    // receipt but has no status-update authority.
+    if receipt.predecessor.is_some() {
+        return Unauthorized;
+    }
     let Some(id) = receipt.authorization else {
         return Unauthorized;
     };
