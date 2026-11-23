@@ -1,14 +1,12 @@
 # ADP-01 implementation gaps (Arcadestr client)
 
-**Status:** open. Consolidating and synchronizing `ADP-01.md` changed
-documentation only and does **not** resolve any item here. Close an item only
-when code and tests change, and link the change.
+**Status:** tracked. Close an item only when code changes **and** a targeted test
+passes. Consolidating or synchronizing `ADP-01.md` resolves nothing here.
 
 This record compares the Arcadestr client with the consolidated ADP-01 (`0.3.0`).
-Each item was checked against the source cited when ADP-01 was consolidated.
 Server-side gaps are tracked in `../adp-server/docs/protocol-implementation-gaps.md`.
 
-## Verified discrepancies
+## Open
 
 | # | ADP-01 requirement | Current client behavior | Evidence |
 |---|---|---|---|
@@ -16,14 +14,20 @@ Server-side gaps are tracked in `../adp-server/docs/protocol-implementation-gaps
 | C2 | `disputed` receipt tips retain ownership (§Receipt status under ADP). | `disputed` is grouped with `refunded` in the non-owning branch. | `core/src/ownership.rs:186` |
 | C3 | Developer-signed grants may omit `source_event` (§Entitlement Grants). | The parsed grant type has a required `source_event: EventId`, so a grant without one cannot be represented. | `core/src/entitlements.rs:35`, `:102` |
 | C4 | Public and active timed-access downloads are anonymous (§`GET /game/:game_coordinate`). | Native install resolves a signer before checking public/timed policy. The reference server also requires NIP-98 (server gap S1). | `docs/design-handoff/IMPLEMENTATION_PLAN.md` (code-audit note) |
-| C5 | Implementations SHOULD prioritize the publisher's NIP-65 write relays (§Relay selection). | Not verified as implemented; no NIP-65 prioritization of listing reads was identified. | Needs confirmation |
+| C5 | Implementations SHOULD prioritize the publisher's NIP-65 write relays (§Relay selection). This is an optimization, never an authorization requirement. | No NIP-65 prioritization of listing reads was identified. | Needs confirmation |
+| C6 | Consumers MUST reject non-lowercase hex (§Canonical Hex Encoding). | Shared `is_sha256_hex` accepts uppercase; `file_hash` from reused listing metadata can be emitted unchanged. Stricter helpers exist (`blossom::is_lowercase_sha256_hex`, `nostr::is_lower_hex_with_len`) but are not used everywhere. | `core/src/hash_validation.rs`; `.tmp/issues/file-hash-uppercase-interop.md` |
+| C7 | Duplicate `acquisition` tags make the policy invalid, granting no access (§Malformed acquisition policy). | The listing parser keeps the **first** `acquisition` tag and ignores the rest (`Some("acquisition") if !acquisition_seen`), so `public` followed by a duplicate still parses as `Public`. The server rejects this, so it is a client display/eligibility mismatch, not a server bypass. | `core/src/marketplace.rs` (listing parser) |
+| C8 | A gated listing has **no** `acquisition` tag (§Acquisition policy). | The publisher emits `["acquisition", "gated"]`. ADP-01 classifies an unknown mode as invalid, which still denies access, so behavior is safe, but the emitted form is non-canonical. | `core/src/adp_publish.rs` (`AcquisitionPolicy::Gated` arm) |
 
-## Not yet verified
+## Closed
 
-- Terminal handling of `kind:30406` cancellation, campaign cancellation, and grant revocation (any successor invalid). `core/src/campaign.rs` and `core/src/entitlements.rs` need targeted tests.
-- Typed handling of `503` from `/entitlement/claim`, `/purchase/confirm`, and `/game` as indeterminate rather than as a definitive failure.
-- Canonical-hex enforcement on every ADP-defined hex input (see `.tmp/issues/file-hash-uppercase-interop.md`), with UUID and opaque identifiers left unconstrained.
+None yet.
 
-## Documentation statements needing re-verification
+## Verified conformant (no change needed)
 
-- `CODEBASE.md` §NIP-103 Entitlements (Publisher authority) says delegated grants need both historical listing delegation and the `kind:30406` lifecycle. ADP-01 anchors historical validity only on `kind:30406`, and no listing-delegation check for grants was found in `core/src/entitlements.rs`. Confirm the code path, then correct the statement.
+- **Terminal states:** campaign chains skip successors once cancelled (`core/src/campaign.rs`). Grant chains admit only `granted → revoked` (`core/src/entitlements.rs`).
+- **`503` handling:** `/game`, `/entitlement/claim`, and `/purchase/confirm` map `503` to the typed `AuthorizationUnavailable` error (`core/src/adp_client.rs`), not to a definitive failure.
+
+## Unrelated pre-existing failure
+
+`core/tests/publisher_projection.rs::additive_projection_migration_preserves_existing_rows_and_allows_verified_refresh` fails on the `HEAD` commit before any of this work (`core/tests/publisher_projection.rs:224`). It concerns migration 25 and the marketplace cache, not ADP conformance.
