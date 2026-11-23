@@ -1816,7 +1816,7 @@ pub trait NostrSigner: Send + Sync {
 
 This allows the same `AuthState` to work with local and remote signers. `SdkSignerAdapter` and `ActiveSigner::Sdk` synchronize restored NIP-46 clients into shared command state. `login_with_nsec` persists the encrypted account through `AccountManager`, clears active NIP-46 retry/client state, decrypts the key into a zeroizing value, and activates the local signer. Logout clears the active database flag without deleting saved accounts, then disconnects shared auth.
 
-Signer-adjacent authorization checks distinguish writer and observer clocks. A kind-30406 attestation observed from the network may have `valid_from` up to 300 seconds in the reader's future, but that skew applies only to activation. Revocation is effective immediately at `revoked_at`; it is never delayed by the observer allowance. ADP-01 §No early activation now forbids this allowance; it remains in code as open gap C1 in `docs/protocol-implementation-gaps.md`. NIP-98 similarly signs the **exact URL sent on the wire**, including the percent-encoded coordinate/raw request target, so decoded and encoded forms cannot drift between the `u` tag and HTTP request.
+Signer-adjacent authorization checks use exact boundaries (ADP-01 §No early activation). A kind-30404 attestation is active from `valid_from` and stops at `revoked_at`, with no observer clock allowance. A reader whose clock trails the operator's gets a distinct, retryable "not active yet" error rather than a revocation error. NIP-98 similarly signs the **exact URL sent on the wire**, including the percent-encoded coordinate/raw request target, so decoded and encoded forms cannot drift between the `u` tag and HTTP request.
 
 ### 8.2 Feature-Gated Compilation
 

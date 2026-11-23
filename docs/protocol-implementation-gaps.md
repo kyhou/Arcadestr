@@ -10,7 +10,6 @@ Server-side gaps are tracked in `../adp-server/docs/protocol-implementation-gaps
 
 | # | ADP-01 requirement | Current client behavior | Evidence |
 |---|---|---|---|
-| C1 | No clock-skew allowance may activate a `kind:30406` authorization or `kind:30404` attestation before `valid_from` (§No early activation). | `ATTESTATION_OBSERVER_SKEW_SECS = 300` lets `valid_from` sit up to 300 s in the reader's future. | `core/src/authorization.rs:75`, `:91`; described in `CODEBASE.md` §8.1 |
 | C2 | `disputed` receipt tips retain ownership (§Receipt status under ADP). | `disputed` is grouped with `refunded` in the non-owning branch. | `core/src/ownership.rs:186` |
 | C3 | Developer-signed grants may omit `source_event` (§Entitlement Grants). | The parsed grant type has a required `source_event: EventId`, so a grant without one cannot be represented. | `core/src/entitlements.rs:35`, `:102` |
 | C4 | Public and active timed-access downloads are anonymous (§`GET /game/:game_coordinate`). | Native install resolves a signer before checking public/timed policy. The reference server also requires NIP-98 (server gap S1). | `docs/design-handoff/IMPLEMENTATION_PLAN.md` (code-audit note) |
@@ -21,7 +20,10 @@ Server-side gaps are tracked in `../adp-server/docs/protocol-implementation-gaps
 
 ## Closed
 
-None yet.
+| # | Resolution | Tests |
+|---|---|---|
+| C1 | Removed `ATTESTATION_OBSERVER_SKEW_SECS` and `allows_new_operations_observed_at`. `kind:30404` activation and revocation are exact. A reader whose clock trails the operator gets a distinct, retryable "not active yet" error instead of a revocation message. | `core/tests/authorization.rs` exact-boundary tests (`--features native`); `desktop/src/adp_commands.rs`: `a_reader_trailing_the_operator_clock_gets_a_retryable_not_yet_active_error` |
+
 
 ## Verified conformant (no change needed)
 

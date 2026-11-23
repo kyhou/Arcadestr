@@ -5700,8 +5700,18 @@ fn ensure_attestation_covers_provisioning(
     {
         return Err("operator attestation does not cover this fulfillment key".into());
     }
-    if !parsed.allows_new_operations_observed_at(now) {
+    // ADP-01 §No early activation: `valid_from` is honoured exactly. A reader
+    // whose clock trails the operator's sees a just-minted attestation as not
+    // yet active; that is retryable and must not be reported as revocation.
+    if parsed.is_revoked_at(now) {
         return Err("operator no longer attests possession of this fulfillment key".into());
+    }
+    if parsed.is_not_yet_active_at(now) {
+        return Err(format!(
+            "operator attestation is not active yet (starts at {}, this device's clock reads {now}); \
+             check this device's clock and retry",
+            parsed.valid_from
+        ));
     }
     Ok(())
 }
@@ -10364,10 +10374,28 @@ mod tests {
                 &provisioned.row,
                 provisioned.operator,
                 &provisioned.event,
-                999,
+                1_000,
             ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn a_reader_trailing_the_operator_clock_gets_a_retryable_not_yet_active_error() {
+        // ADP-01 §No early activation: no skew allowance. One second before
+        // `valid_from` is not active, and must not be reported as revocation.
+        let provisioned = provisioned_attestation("f47ac10b-58cc-4372-a567-0e02b2c3d479", 1_000);
+
+        let error = ensure_attestation_covers_provisioning(
+            &provisioned.row,
+            provisioned.operator,
+            &provisioned.event,
+            999,
+        )
+        .expect_err("an attestation is not in force before valid_from");
+
+        assert!(error.contains("not active yet"), "{error}");
+        assert!(!error.contains("no longer attests"), "{error}");
     }
 
     #[test]
@@ -10399,6 +10427,6 @@ mod tests {
         )
         .expect_err("an attestation that is not yet in force must not be accepted");
 
-        assert!(error.contains("no longer attests possession"));
+        assert!(error.contains("not active yet"), "{error}");
     }
 }

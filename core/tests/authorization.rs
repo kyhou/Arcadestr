@@ -410,30 +410,40 @@ fn attestation(
     parse_attestation_event(&event).expect("attestation parses")
 }
 
+// ADP-01 §No early activation (gap C1): `valid_from` is an exact boundary.
+
 #[test]
-fn a_just_minted_attestation_is_usable_by_a_reader_whose_clock_trails_the_operator() {
-    // The operator stamps `valid_from` from its own clock while provisioning;
-    // the developer reads the attestation moments later, off a clock that may
-    // sit a little behind.
+fn an_attestation_is_not_active_even_one_second_before_valid_from() {
     let attestation = attestation(1_000, None);
 
     assert!(!attestation.allows_new_operations_at(999));
-    assert!(attestation.allows_new_operations_observed_at(999));
-    assert!(attestation.allows_new_operations_observed_at(1_000));
+    assert!(attestation.is_not_yet_active_at(999));
+    assert!(!attestation.is_revoked_at(999));
 }
 
 #[test]
-fn an_attestation_far_in_the_readers_future_stays_unusable() {
-    let attestation = attestation(10_000, None);
+fn an_attestation_activates_exactly_at_valid_from() {
+    let attestation = attestation(1_000, None);
 
-    assert!(!attestation.allows_new_operations_observed_at(1_000));
+    assert!(attestation.allows_new_operations_at(1_000));
+    assert!(!attestation.is_not_yet_active_at(1_000));
 }
 
 #[test]
-fn clock_tolerance_never_revives_a_revoked_attestation() {
+fn no_clock_tolerance_applies_to_a_future_attestation() {
+    // Formerly accepted by a 300-second observer allowance.
+    let attestation = attestation(1_300, None);
+
+    assert!(!attestation.allows_new_operations_at(1_000));
+    assert!(!attestation.allows_new_operations_at(1_299));
+}
+
+#[test]
+fn revocation_takes_effect_exactly_at_revoked_at() {
     let attestation = attestation(100, Some(150));
 
-    assert!(!attestation.allows_new_operations_observed_at(150));
-    assert!(!attestation.allows_new_operations_observed_at(200));
-    assert!(attestation.allows_new_operations_observed_at(149));
+    assert!(attestation.allows_new_operations_at(149));
+    assert!(!attestation.allows_new_operations_at(150));
+    assert!(attestation.is_revoked_at(150));
+    assert!(!attestation.allows_new_operations_at(200));
 }

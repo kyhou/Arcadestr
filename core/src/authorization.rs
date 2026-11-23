@@ -70,26 +70,24 @@ pub struct ParsedAttestation {
     pub scope: Option<String>,
 }
 
-/// How far an operator's clock may lead the clock of the party reading its
-/// attestation before the attestation is treated as not yet in force.
-pub const ATTESTATION_OBSERVER_SKEW_SECS: u64 = 300;
-
 impl ParsedAttestation {
+    /// Whether the attestation is in force at `at`.
+    ///
+    /// Activation is exact (ADP-01 §No early activation): no clock-skew
+    /// allowance may treat the attestation as active before `valid_from`.
     pub fn allows_new_operations_at(&self, at: u64) -> bool {
-        self.valid_from <= at && self.revoked_at.is_none_or(|revoked| at < revoked)
+        !self.is_not_yet_active_at(at) && !self.is_revoked_at(at)
     }
 
-    /// Decides new-operation eligibility from a clock that is not the
-    /// operator's own.
-    ///
-    /// An attestation is normally read moments after the operator minted it,
-    /// so its `valid_from` can sit marginally in the reader's future without
-    /// the operator having promised anything about the future. Only that edge
-    /// is widened: a revoked key stays unusable the moment the reader's clock
-    /// passes the revocation.
-    pub fn allows_new_operations_observed_at(&self, at: u64) -> bool {
-        self.valid_from <= at.saturating_add(ATTESTATION_OBSERVER_SKEW_SECS)
-            && self.revoked_at.is_none_or(|revoked| at < revoked)
+    /// Whether `valid_from` is still in the future at `at`. This is a
+    /// retryable condition, distinct from revocation.
+    pub fn is_not_yet_active_at(&self, at: u64) -> bool {
+        at < self.valid_from
+    }
+
+    /// Whether the operator's revocation is in effect at `at`.
+    pub fn is_revoked_at(&self, at: u64) -> bool {
+        self.revoked_at.is_some_and(|revoked| revoked <= at)
     }
 }
 
