@@ -12,6 +12,17 @@ use std::{
     sync::Arc,
 };
 
+/// Who is downloading. `Anonymous` is used only when no account is signed in
+/// and the current signed listing grants public or active timed access.
+#[derive(Clone, Copy)]
+pub enum DownloadIdentity<'a> {
+    Account {
+        buyer: &'a str,
+        signer: &'a dyn NostrSigner,
+    },
+    Anonymous,
+}
+
 pub struct DownloadCandidate {
     pub server_url: String,
     pub token: Option<String>,
@@ -128,8 +139,7 @@ fn safe_error(error: AdpClientError) -> AdpClientError {
 pub async fn download_verified(
     http: Arc<dyn HttpClient>,
     coordinate: &str,
-    buyer: &str,
-    signer: &dyn NostrSigner,
+    identity: DownloadIdentity<'_>,
     candidates: Vec<DownloadCandidate>,
     mut file: File,
     digest: Sha256Digest,
@@ -142,18 +152,21 @@ pub async fn download_verified(
         "No eligible authorized download source".into(),
     ));
     for candidate in candidates {
-        if signer
-            .get_public_key()
-            .await
-            .map_err(|_| {
-                AdpClientError::DownloadProtocol("Active download signer unavailable".into())
-            })?
-            .to_hex()
-            != buyer
-        {
-            return Err(
-                AdpClientError::DownloadProtocol("Active download account changed".into()).into(),
-            );
+        if let DownloadIdentity::Account { buyer, signer } = identity {
+            if signer
+                .get_public_key()
+                .await
+                .map_err(|_| {
+                    AdpClientError::DownloadProtocol("Active download signer unavailable".into())
+                })?
+                .to_hex()
+                != buyer
+            {
+                return Err(AdpClientError::DownloadProtocol(
+                    "Active download account changed".into(),
+                )
+                .into());
+            }
         }
         file.set_len(0)
             .and_then(|_| file.seek(SeekFrom::Start(0)))
@@ -162,9 +175,10 @@ pub async fn download_verified(
                     "Private download candidate could not be reset".into(),
                 )
             })?;
-        let auth = match candidate.token {
-            Some(token) => DownloadAuth::Token(token),
-            None => DownloadAuth::Nip98 { signer },
+        let auth = match (candidate.token, identity) {
+            (Some(token), _) => DownloadAuth::Token(token),
+            (None, DownloadIdentity::Account { signer, .. }) => DownloadAuth::Nip98 { signer },
+            (None, DownloadIdentity::Anonymous) => DownloadAuth::Anonymous,
         };
         progress(0, None);
         let result = AdpClient::new(candidate.server_url, http.clone())

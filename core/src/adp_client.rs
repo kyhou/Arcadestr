@@ -363,7 +363,12 @@ pub struct EntitlementClaimResponse {
 /// Download authentication strategy for game archive fetches.
 pub enum DownloadAuth<'a> {
     Token(String),
-    Nip98 { signer: &'a dyn NostrSigner },
+    Nip98 {
+        signer: &'a dyn NostrSigner,
+    },
+    /// No credential. ADP-01 permits this only when the current signed listing
+    /// grants public or active timed access; the server decides.
+    Anonymous,
 }
 
 /// Result of an ADP download operation in a later gate.
@@ -978,6 +983,7 @@ impl AdpClient {
                 let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
                 (url, vec![("Authorization".to_string(), auth_header)])
             }
+            DownloadAuth::Anonymous => (endpoint, Vec::new()),
         };
 
         let outcome = self
@@ -1033,6 +1039,7 @@ impl AdpClient {
                 let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
                 (url, vec![("Authorization".to_string(), auth_header)])
             }
+            DownloadAuth::Anonymous => (endpoint, Vec::new()),
         };
 
         self.http
@@ -1069,6 +1076,7 @@ impl AdpClient {
                 let auth_header = build_nip98_auth_header(signer, &url, "GET").await?;
                 (url, vec![("Authorization".to_string(), auth_header)])
             }
+            DownloadAuth::Anonymous => (endpoint, Vec::new()),
         };
         self.http
             .download_to_open_retained_file_with_preflight(

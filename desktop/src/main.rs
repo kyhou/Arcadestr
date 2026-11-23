@@ -2470,20 +2470,29 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
     app_data_dir: PathBuf,
     fresh_listing_fetcher: &dyn FreshListingFetcher,
 ) -> Result<(), InstallCommandError> {
-    let signer = if let Some(signer) = active_signer {
-        signer
-    } else {
-        let auth = state.auth.lock().await;
-        auth.signer()
-            .cloned()
-            .map(|signer| Arc::new(signer) as Arc<dyn NostrSigner>)
-            .ok_or_else(|| "not authenticated".to_string())?
+    // ADP-01 §GET /game: a signed-in account is optional. Without one, the
+    // install proceeds only if the freshly fetched, signature-verified listing
+    // grants public or active timed access (checked below), and downloads
+    // anonymously.
+    let signer = match active_signer {
+        Some(signer) => Some(signer),
+        None => {
+            let auth = state.auth.lock().await;
+            auth.signer()
+                .cloned()
+                .map(|signer| Arc::new(signer) as Arc<dyn NostrSigner>)
+        }
     };
-    let buyer_pubkey_hex = signer
-        .get_public_key()
-        .await
-        .map_err(|error| format!("failed to get active signer pubkey: {error}"))?
-        .to_hex();
+    let buyer_pubkey_hex = match &signer {
+        Some(signer) => Some(
+            signer
+                .get_public_key()
+                .await
+                .map_err(|error| format!("failed to get active signer pubkey: {error}"))?
+                .to_hex(),
+        ),
+        None => None,
+    };
 
     let coordinate = listing_coordinate_from_app_listing(&listing)?;
     let fresh_listing = fresh_listing_fetcher.fetch(&coordinate).await?;
@@ -2514,17 +2523,20 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
     }
     let tokens = DownloadTokensRepository::new(state.database.pool().clone());
     let mut cached_tokens = Vec::new();
-    for server_url in &metadata.server_urls {
-        if let Some(token) = tokens
-            .valid_token(&buyer_pubkey_hex, &coordinate, server_url, now_unix_i64()?)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            cached_tokens.push((server_url.clone(), token.token));
+    // Download tokens are buyer-scoped; an anonymous install has none.
+    if let Some(buyer_pubkey_hex) = &buyer_pubkey_hex {
+        for server_url in &metadata.server_urls {
+            if let Some(token) = tokens
+                .valid_token(buyer_pubkey_hex, &coordinate, server_url, now_unix_i64()?)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                cached_tokens.push((server_url.clone(), token.token));
+            }
         }
     }
 
-    let has_durable_ownership = {
+    let has_durable_ownership = if let Some(buyer_pubkey_hex) = &buyer_pubkey_hex {
         let ownership = arcadestr_core::ownership::OwnershipService::new(
             arcadestr_core::purchases::PurchasesRepository::new(state.database.pool().clone()),
             arcadestr_core::entitlements_repository::EntitlementsRepository::new(
@@ -2532,10 +2544,18 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
             ),
         );
         ownership
-            .is_owned(&buyer_pubkey_hex, &coordinate)
+            .is_owned(buyer_pubkey_hex, &coordinate)
             .await
             .map_err(|error| error.to_string())?
+    } else {
+        false
     };
+    let policy_allows = metadata
+        .acquisition
+        .allows_access_at(now_unix_i64()? as u64);
+    if buyer_pubkey_hex.is_none() && !policy_allows {
+        return Err("not authenticated: sign in to install this game".into());
+    }
     if cached_tokens.is_empty()
         && !has_durable_ownership
         && !metadata
@@ -2842,15 +2862,26 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
     let mut package_persisted = false;
     let mut candidate_lease = None;
     let install_result = async {
-        let current_pubkey = signer
-            .get_public_key()
-            .await
-            .map_err(|error| format!("active signer could not be rechecked: {error}"))?;
-        if current_pubkey.to_hex() != buyer_pubkey_hex {
-            return Err(InstallCommandError::from(
-                "active account changed while installation was being prepared",
-            ));
+        if let (Some(signer), Some(buyer_pubkey_hex)) = (&signer, &buyer_pubkey_hex) {
+            let current_pubkey = signer
+                .get_public_key()
+                .await
+                .map_err(|error| format!("active signer could not be rechecked: {error}"))?;
+            if &current_pubkey.to_hex() != buyer_pubkey_hex {
+                return Err(InstallCommandError::from(
+                    "active account changed while installation was being prepared",
+                ));
+            }
         }
+        let identity = match (&signer, &buyer_pubkey_hex) {
+            (Some(signer), Some(buyer)) => {
+                arcadestr_core::adp_download::DownloadIdentity::Account {
+                    buyer,
+                    signer: signer.as_ref(),
+                }
+            }
+            _ => arcadestr_core::adp_download::DownloadIdentity::Anonymous,
+        };
         emit_install_progress(app, &coordinate, "downloading", 0, None);
         let preflight_root = final_root.clone();
         let progress_coordinate = coordinate.clone();
@@ -2869,8 +2900,7 @@ async fn install_game_with_fetcher_and_signer<R: tauri::Runtime>(
         let verified_download = arcadestr_core::adp_download::download_verified(
             Arc::clone(&state.http_client),
             &coordinate,
-            &buyer_pubkey_hex,
-            signer.as_ref(),
+            identity,
             candidates,
             download_file,
             plan.artifact.digest.clone(),
@@ -5085,6 +5115,87 @@ mod install_game_tests {
         .expect_err("caller zero price must not bypass ownership");
 
         assert!(error.contains("own") || error.contains("access"));
+        assert_eq!(http.call_count(&download_url), 0);
+    }
+
+    /// ADP-01 §GET /game (gap C4): without a signed-in account, an install
+    /// succeeds only under the fresh signed listing's public or active timed
+    /// policy, and the download carries no credential.
+    async fn anonymous_install(
+        acquisition: Option<&[&str]>,
+        name: &str,
+    ) -> (Result<(), InstallCommandError>, MockHttpClient, String) {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let artifact_bytes = b"anonymous artifact";
+        let file_hash = sha256_hex(artifact_bytes).await;
+        let server_url = "https://dist.example.com";
+        let coordinate = coordinate(&merchant, name);
+        let download_url = format!("{server_url}/game/{}", urlencoding::encode(&coordinate));
+        let http = MockHttpClient::new().with_download_response(&download_url, artifact_bytes);
+        let state = app_state_with_http(&buyer, test_db(name).await, Arc::new(http.clone())).await;
+        state.auth.lock().await.disconnect();
+        let event = match acquisition {
+            Some(values) => {
+                listing_event_with_acquisition(&merchant, name, server_url, &file_hash, values)
+            }
+            None => listing_event(&merchant, name, server_url, &file_hash, "1.0.0"),
+        };
+        let fetcher = StaticFreshListingFetcher {
+            event,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let result = install_game_with_fetcher_and_signer(
+            app_listing(&merchant, name),
+            &state,
+            None,
+            None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
+            unique_test_path(&format!("{name}-data"), "dir"),
+            &fetcher,
+        )
+        .await;
+        (result, http, download_url)
+    }
+
+    #[tokio::test]
+    async fn signed_out_install_of_a_public_listing_downloads_without_credentials() {
+        let (result, http, download_url) =
+            anonymous_install(Some(&["public"]), "anon-public").await;
+        result.expect("public policy permits a signed-out install");
+        assert_eq!(http.call_count(&download_url), 1);
+        assert!(!http
+            .last_download_headers(&download_url)
+            .expect("download headers should be captured")
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization")));
+    }
+
+    #[tokio::test]
+    async fn signed_out_install_during_active_timed_access_is_allowed() {
+        let now = now_unix_i64().expect("clock") as u64;
+        let (starts, ends) = ((now - 100).to_string(), (now + 100).to_string());
+        let (result, http, download_url) =
+            anonymous_install(Some(&["timed-access", &starts, &ends]), "anon-timed").await;
+        result.expect("active timed access permits a signed-out install");
+        assert_eq!(http.call_count(&download_url), 1);
+    }
+
+    #[tokio::test]
+    async fn signed_out_install_after_timed_access_ends_is_refused_before_download() {
+        let now = now_unix_i64().expect("clock") as u64;
+        let (starts, ends) = ((now - 100).to_string(), (now - 10).to_string());
+        let (result, http, download_url) =
+            anonymous_install(Some(&["timed-access", &starts, &ends]), "anon-expired").await;
+        let error = result.expect_err("expired timed access must not install");
+        assert!(format!("{error:?}").contains("sign in"), "{error:?}");
+        assert_eq!(http.call_count(&download_url), 0);
+    }
+
+    #[tokio::test]
+    async fn signed_out_install_of_a_gated_listing_is_refused_before_download() {
+        let (result, http, download_url) = anonymous_install(None, "anon-gated").await;
+        let error = result.expect_err("a gated listing requires an account");
+        assert!(format!("{error:?}").contains("sign in"), "{error:?}");
         assert_eq!(http.call_count(&download_url), 0);
     }
 
