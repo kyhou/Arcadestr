@@ -42,6 +42,13 @@ jobs:
           repository: ${{ env.ADP_SERVER_REPOSITORY }}
           ref: ${{ env.ADP_SERVER_REF }}
           path: adp-server
+          # Only what Cargo reads (root manifests are included by cone mode;
+          # migrations/ is read at compile time by sqlx::migrate!). This also
+          # skips archived drafts whose names are invalid on Windows.
+          sparse-checkout: |
+            adp-core
+            adp-server
+            migrations
 
       - name: Read workspace MSRV
         shell: bash
@@ -106,6 +113,13 @@ jobs:
           repository: ${{ env.ADP_SERVER_REPOSITORY }}
           ref: ${{ env.ADP_SERVER_REF }}
           path: adp-server
+          # Only what Cargo reads (root manifests are included by cone mode;
+          # migrations/ is read at compile time by sqlx::migrate!). This also
+          # skips archived drafts whose names are invalid on Windows.
+          sparse-checkout: |
+            adp-core
+            adp-server
+            migrations
 
       - name: Read workspace MSRV
         shell: pwsh
@@ -147,6 +161,13 @@ jobs:
           repository: ${{ env.ADP_SERVER_REPOSITORY }}
           ref: ${{ env.ADP_SERVER_REF }}
           path: adp-server
+          # Only what Cargo reads (root manifests are included by cone mode;
+          # migrations/ is read at compile time by sqlx::migrate!). This also
+          # skips archived drafts whose names are invalid on Windows.
+          sparse-checkout: |
+            adp-core
+            adp-server
+            migrations
 
       - name: Read workspace MSRV
         shell: bash
