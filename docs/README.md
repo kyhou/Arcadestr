@@ -21,15 +21,17 @@ authoritative ADP specification; its former amendments are superseded records in
 `../adp-server/ADP-01.md` is a byte-for-byte mirror, maintained by the process in
 `../adp-server/docs/README.md` §Protocol Synchronization:
 
-1. Make protocol changes here only.
-2. Copy unchanged to `../adp-server/ADP-01.md`.
-3. Confirm `sha256sum ADP-01.md ../adp-server/ADP-01.md` prints one hash twice.
+1. Make protocol changes here only, and commit them.
+2. Copy unchanged to `../adp-server/ADP-01.md` and update
+   `../adp-server/docs/ADP-01.sync` with this repository's commit and the hash.
+3. Run `../adp-server/scripts/check-adp-sync.sh`; it must pass.
 4. Record new conformance gaps in each repository's
    `docs/protocol-implementation-gaps.md`.
 
 `NIP-102.md` and `NIP-103.md` are independent specifications, mirrored only by
-explicit decision. A CI hash comparison is recommended to prevent drift; none
-exists yet. Client conformance gaps are tracked in
+explicit decision. adp-server CI (`adp-spec-sync`) fetches this repository's
+`ADP-01.md` from GitHub: it fails on an edited or unfaithful mirror and warns on
+sync lag. Push this repository's spec changes so that check can see them. Client conformance gaps are tracked in
 [protocol-implementation-gaps.md](protocol-implementation-gaps.md). They remain
 open until code changes; synchronizing documentation does not resolve them.
 
