@@ -43,6 +43,29 @@ pub struct RelayCoverage {
 }
 
 impl RelayCoverage {
+    /// Restricts coverage to the trusted relay set (ADP-01 §Relay availability).
+    ///
+    /// Relays outside `trusted` (for example NIP-65 relays discovered from
+    /// another user's relay list) are where to look, not evidence about
+    /// completeness: their events are kept as positive evidence in
+    /// `partial_events`, so a newer or conflicting revision they hold still
+    /// fails closed, but they never count toward or against the quorum.
+    pub fn restricted_to(mut self, trusted: &std::collections::HashSet<String>) -> Self {
+        let untrusted = self
+            .completed
+            .keys()
+            .filter(|url| !trusted.contains(*url))
+            .cloned()
+            .collect::<Vec<_>>();
+        for url in untrusted {
+            if let Some(events) = self.completed.remove(&url) {
+                self.partial_events.extend(events);
+            }
+        }
+        self.incomplete.retain(|url| trusted.contains(url));
+        self
+    }
+
     pub fn configured(&self) -> usize {
         self.completed.len() + self.incomplete.len()
     }
@@ -322,6 +345,102 @@ mod tests {
         assert_eq!(
             evaluate_checkout_listing("30402:not-a-key:game", None, &both, &[], policy),
             ListingFreshness::NotFound
+        );
+    }
+}
+
+#[cfg(test)]
+mod trusted_coverage_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+    use std::collections::HashSet;
+
+    fn listing(keys: &Keys, at: u64) -> Event {
+        EventBuilder::new(Kind::Custom(30402), "")
+            .tags([Tag::parse(["d", "game"]).expect("d")])
+            .custom_created_at(Timestamp::from_secs(at))
+            .sign_with_keys(keys)
+            .expect("listing")
+    }
+
+    fn trusted() -> HashSet<String> {
+        ["wss://a.example", "wss://b.example", "wss://c.example"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// ADP-01 §Relay availability (gap C5): relays learned from someone else's
+    /// NIP-65 list must not raise or lower the quorum.
+    #[test]
+    fn unreachable_discovered_relays_do_not_count_against_the_quorum() {
+        let keys = Keys::generate();
+        let event = listing(&keys, 100);
+        let mut coverage = RelayCoverage::default();
+        for url in ["wss://a.example", "wss://b.example"] {
+            coverage.completed.insert(url.into(), vec![event.clone()]);
+        }
+        coverage.incomplete.push("wss://c.example".into());
+        for i in 0..10 {
+            coverage
+                .incomplete
+                .push(format!("wss://planted-{i}.example"));
+        }
+        let coverage = coverage.restricted_to(&trusted());
+        assert_eq!(coverage.configured(), 3);
+        let policy = CheckoutFreshnessPolicy::for_configured_relays(coverage.configured());
+        assert_eq!(policy.minimum_completed_relays, 2);
+        assert!(coverage.completed.len() >= policy.minimum_completed_relays);
+    }
+
+    #[test]
+    fn discovered_relays_cannot_satisfy_the_quorum_on_their_own() {
+        let keys = Keys::generate();
+        let event = listing(&keys, 100);
+        let mut coverage = RelayCoverage::default();
+        coverage.incomplete.extend(trusted());
+        for i in 0..5 {
+            coverage
+                .completed
+                .insert(format!("wss://planted-{i}.example"), vec![event.clone()]);
+        }
+        let coverage = coverage.restricted_to(&trusted());
+        assert!(coverage.completed.is_empty());
+        assert_eq!(coverage.configured(), 3);
+        assert_eq!(
+            coverage.partial_events.len(),
+            5,
+            "kept as positive evidence"
+        );
+    }
+
+    #[test]
+    fn a_newer_revision_on_a_discovered_relay_is_still_seen() {
+        let keys = Keys::generate();
+        let (old, newer) = (listing(&keys, 100), listing(&keys, 200));
+        let mut coverage = RelayCoverage::default();
+        coverage
+            .completed
+            .insert("wss://a.example".into(), vec![old.clone()]);
+        coverage
+            .completed
+            .insert("wss://publisher-outbox.example".into(), vec![newer.clone()]);
+        coverage
+            .completed
+            .insert("wss://b.example".into(), vec![old.clone()]);
+        let coverage = coverage.restricted_to(&trusted());
+        assert!(coverage.partial_events.iter().any(|e| e.id == newer.id));
+        let coordinate = format!("30402:{}:game", keys.public_key().to_hex());
+        let result = evaluate_checkout_listing(
+            &coordinate,
+            Some(old.id),
+            &coverage,
+            &[],
+            CheckoutFreshnessPolicy::for_configured_relays(coverage.configured()),
+        );
+        assert!(
+            matches!(result, ListingFreshness::Superseded { newer: id, .. } if id == newer.id),
+            "{result:?}"
         );
     }
 }

@@ -710,7 +710,26 @@ impl RelayManager {
                 }
             }
         }
-        coverage
+        // Discovered relays never decide whether evidence is sufficient.
+        coverage.restricted_to(&self.trusted_relay_urls().await)
+    }
+
+    /// URLs of relays the application chose (defaults, indexers, the built-in
+    /// discovery relays, and debug relays), normalized the same way as the
+    /// client's relay keys. Relays learned at runtime from NIP-65 lists or hints
+    /// are excluded.
+    pub async fn trusted_relay_urls(&self) -> std::collections::HashSet<String> {
+        self.pool
+            .trusted_relays()
+            .await
+            .into_iter()
+            .chain(DISCOVERY_RELAYS.iter().map(|url| url.to_string()))
+            .map(|url| {
+                nostr_sdk::RelayUrl::parse(&url)
+                    .map(|parsed| parsed.to_string())
+                    .unwrap_or(url)
+            })
+            .collect()
     }
 
     /// Fetch events from a specific subset of relays.

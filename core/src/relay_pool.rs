@@ -71,6 +71,19 @@ impl RelayPool {
         relays.iter().cloned().collect()
     }
 
+    /// Relays the application configured itself (defaults and indexers), as
+    /// opposed to relays discovered from NIP-65 lists or hints. Only these
+    /// count toward relay-evidence quorums.
+    pub async fn trusted_relays(&self) -> HashSet<String> {
+        self.relay_info
+            .read()
+            .await
+            .iter()
+            .filter(|info| !matches!(info.source, RelaySource::Discovered))
+            .map(|info| info.url.clone())
+            .collect()
+    }
+
     /// Get profile ID
     pub fn profile_id(&self) -> &str {
         &self.profile_id
@@ -120,6 +133,37 @@ mod tests {
         let relays = pool.get_relays().await;
         assert_eq!(relays.len(), 1);
         assert!(relays.contains(&url));
+    }
+
+    #[tokio::test]
+    async fn trusted_relays_exclude_runtime_discoveries() {
+        let pool = RelayPool::new("test".into());
+        pool.add_relay("wss://default.example".into(), RelaySource::Default)
+            .await;
+        pool.add_relay("wss://indexer.example".into(), RelaySource::Indexer)
+            .await;
+        pool.add_relay("wss://outbox.example".into(), RelaySource::Discovered)
+            .await;
+        let trusted = pool.trusted_relays().await;
+        assert!(trusted.contains("wss://default.example"));
+        assert!(trusted.contains("wss://indexer.example"));
+        assert!(!trusted.contains("wss://outbox.example"));
+    }
+
+    #[test]
+    fn trusted_url_normalization_matches_client_relay_keys() {
+        // Coverage keys are `RelayUrl` strings; trusted URLs must use the same form.
+        for raw in [
+            "wss://relay.example",
+            "wss://relay.example/",
+            "wss://Relay.Example",
+        ] {
+            let key = nostr_sdk::RelayUrl::parse(raw)
+                .expect("relay url")
+                .to_string();
+            let normalized = nostr_sdk::RelayUrl::parse(&key).expect("again").to_string();
+            assert_eq!(key, normalized, "{raw}");
+        }
     }
 
     #[tokio::test]

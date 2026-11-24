@@ -316,3 +316,65 @@ async fn gate7_campaignless_grant_discovery_and_revocation_across_clients() {
     .await
     .is_err());
 }
+
+/// ADP-01 §Relay selection (gap C5): a listing held only by the publisher's
+/// NIP-65 write relay is found, because that relay is preferred for reads.
+/// The outbox relay is a discovered relay, so it never counts toward the
+/// checkout quorum. Loopback relays only.
+#[tokio::test]
+async fn publisher_nip65_write_relay_is_preferred_without_counting_as_evidence() {
+    let temp = tempfile::tempdir_in("/tmp/opencode").expect("isolated root");
+    let configured: Events = Arc::new(Mutex::new(vec![]));
+    let outbox: Events = Arc::new(Mutex::new(vec![]));
+    let (configured_url, _configured) = relay(configured.clone()).await;
+    let (outbox_url, _outbox) = relay(outbox.clone()).await;
+    let http: Arc<dyn HttpClient> = Arc::new(IsolatedHttp {
+        real: ReqwestHttpClient::new(Duration::from_secs(5)).expect("HTTP"),
+        urls: vec![],
+    });
+    let publisher = Keys::generate();
+    let coordinate = format!("30402:{}:outbox-game", publisher.public_key());
+    let relay_list = EventBuilder::new(Kind::Custom(10002), "")
+        .tags([tag(&["r", &outbox_url, "write"])])
+        .sign_with_keys(&publisher)
+        .expect("relay list");
+    let listing = EventBuilder::new(Kind::Custom(30402), "")
+        .tags([tag(&["d", "outbox-game"]), tag(&["title", "Outbox Game"])])
+        .sign_with_keys(&publisher)
+        .expect("listing");
+    configured.lock().expect("configured").push(relay_list);
+    outbox.lock().expect("outbox").push(listing.clone());
+
+    let app = test_app_with_relay_discovery(
+        vec![configured_url.clone()],
+        temp.path().join("buyer.db"),
+        http,
+        true,
+    )
+    .await;
+    let found = fetch_listing_event_by_coordinate(&app.state(), &coordinate)
+        .await
+        .expect("listing found on the publisher's write relay");
+    assert_eq!(found.id, listing.id);
+
+    let state = app.state::<AppState>();
+    let manager = {
+        let shared = { state.nostr.lock().await.get_relay_manager().clone() };
+        let manager = shared.lock().await.clone();
+        manager
+    };
+    let coverage = manager
+        .fetch_relay_coverage(
+            nostr::Filter::new()
+                .kind(nostr::Kind::Custom(30402))
+                .author(publisher.public_key())
+                .identifier("outbox-game"),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert_eq!(coverage.configured(), 1, "only the configured relay counts");
+    assert!(
+        coverage.partial_events.iter().any(|e| e.id == listing.id),
+        "the outbox relay still contributes positive evidence"
+    );
+}

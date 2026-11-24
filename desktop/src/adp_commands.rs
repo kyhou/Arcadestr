@@ -3709,6 +3709,7 @@ pub(crate) async fn resolve_checkout_listing(
     };
     let developer =
         nostr::PublicKey::from_hex(developer).map_err(|_| "invalid coordinate developer")?;
+    prefer_publisher_relays(state, developer).await;
     let pinned = pinned
         .map(nostr::EventId::from_hex)
         .transpose()
@@ -3786,6 +3787,57 @@ pub(crate) async fn require_current_checkout_listing(
     })
 }
 
+/// Publishers whose NIP-65 relay list was already looked up this session.
+static PREFERRED_RELAY_LOOKUPS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<nostr::PublicKey>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Maximum publisher write relays added per publisher.
+const MAX_PREFERRED_PUBLISHER_RELAYS: usize = 5;
+
+/// ADP-01 §Relay selection: prefer the publisher's NIP-65 write relays when
+/// reading their listing. This is an optimization only. It runs once per
+/// publisher per session, is bounded in time, never fails the caller, and adds
+/// relays as *discovered* relays, which never count toward evidence quorums
+/// (see `RelayCoverage::restricted_to`). Relay discovery policy (including the
+/// debug block) is enforced by the existing discovery path.
+async fn prefer_publisher_relays(state: &State<'_, AppState>, publisher: nostr::PublicKey) {
+    let first_lookup = PREFERRED_RELAY_LOOKUPS
+        .lock()
+        .map(|mut seen| seen.insert(publisher))
+        .unwrap_or(false);
+    if !first_lookup {
+        return;
+    }
+    let Ok(npub) = publisher.to_bech32() else {
+        return;
+    };
+    let client = { state.nostr.lock().await.clone() };
+    let lookup = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        client.fetch_relay_list(&npub),
+    )
+    .await;
+    let Ok(Ok(relay_list)) = lookup else {
+        tracing::debug!("No NIP-65 relay list for publisher {npub}; using configured relays");
+        return;
+    };
+    let manager = {
+        let shared = { state.nostr.lock().await.get_relay_manager().clone() };
+        let manager = shared.lock().await.clone();
+        manager
+    };
+    for url in relay_list
+        .write_relays
+        .into_iter()
+        .take(MAX_PREFERRED_PUBLISHER_RELAYS)
+    {
+        if let Err(error) = manager.add_discovered_relay(url.clone()).await {
+            tracing::debug!("Publisher relay {url} not added: {error}");
+        }
+    }
+}
+
 async fn fetch_replaceable_listing_event_by_coordinate(
     state: &State<'_, AppState>,
     coordinate: &str,
@@ -3806,6 +3858,7 @@ async fn fetch_replaceable_listing_event_by_coordinate(
 
     let developer_pubkey = nostr::PublicKey::from_hex(developer)
         .map_err(|err| format!("invalid coordinate developer pubkey: {err}"))?;
+    prefer_publisher_relays(state, developer_pubkey).await;
     let relay_client = {
         let relay_manager = { state.nostr.lock().await.get_relay_manager().clone() };
         let manager = relay_manager.lock().await;
@@ -8708,13 +8761,24 @@ mod tests {
         db_path: PathBuf,
         http_client: Arc<dyn HttpClient>,
     ) -> tauri::App<tauri::test::MockRuntime> {
+        test_app_with_relay_discovery(relays, db_path, http_client, false).await
+    }
+
+    /// Like `test_app_with_http`, optionally allowing runtime relay discovery.
+    /// Relays still start from the given loopback set only.
+    async fn test_app_with_relay_discovery(
+        relays: Vec<String>,
+        db_path: PathBuf,
+        http_client: Arc<dyn HttpClient>,
+        allow_discovery: bool,
+    ) -> tauri::App<tauri::test::MockRuntime> {
         let database = Database::new(&db_path)
             .await
             .expect("live test database should open");
         let user_cache = Arc::new(UserCache::new(database.pool().clone()));
         let relay_config = RelayManagerConfig {
             debug_relays: Some(relays),
-            block_discovery: true,
+            block_discovery: !allow_discovery,
             ..RelayManagerConfig::default()
         };
         let nostr = NostrClient::new_with_cache(
