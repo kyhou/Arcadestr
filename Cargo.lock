@@ -31,6 +31,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
+ "async-wsocket",
  "axum 0.7.9",
  "base64 0.22.1",
  "futures-util",
@@ -45,9 +46,11 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
