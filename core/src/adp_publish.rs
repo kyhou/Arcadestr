@@ -1807,7 +1807,8 @@ pub fn build_adp_listing_event_builder<'a>(
 
     for authorization in &input.fulfillment_authorizations {
         if crate::canonical_hex::canonical_event_id(&authorization.root_event_id).is_none()
-            || crate::canonical_hex::canonical_public_key(&authorization.fulfillment_pubkey).is_none()
+            || crate::canonical_hex::canonical_public_key(&authorization.fulfillment_pubkey)
+                .is_none()
             || authorization
                 .relay_hint
                 .as_deref()

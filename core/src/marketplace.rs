@@ -1098,16 +1098,18 @@ pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
                                 relay_hint: None,
                             }
                         }),
-                    [_, root, pubkey, relay] if !relay.is_empty() => crate::canonical_hex::canonical_event_id(root)
-                        .zip(crate::canonical_hex::canonical_public_key(pubkey))
-                        .zip(nostr::RelayUrl::parse(relay).ok())
-                        .map(|((root_event_id, fulfillment_pubkey), _)| {
-                            FulfillmentAuthorizationReference {
-                                root_event_id,
-                                fulfillment_pubkey,
-                                relay_hint: Some(relay.clone()),
-                            }
-                        }),
+                    [_, root, pubkey, relay] if !relay.is_empty() => {
+                        crate::canonical_hex::canonical_event_id(root)
+                            .zip(crate::canonical_hex::canonical_public_key(pubkey))
+                            .zip(nostr::RelayUrl::parse(relay).ok())
+                            .map(|((root_event_id, fulfillment_pubkey), _)| {
+                                FulfillmentAuthorizationReference {
+                                    root_event_id,
+                                    fulfillment_pubkey,
+                                    relay_hint: Some(relay.clone()),
+                                }
+                            })
+                    }
                     _ => None,
                 };
                 if let Some(reference) = parsed {
