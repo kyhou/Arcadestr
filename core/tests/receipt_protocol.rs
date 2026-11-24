@@ -119,7 +119,24 @@ fn delegated_receipt_uses_exact_root_time_even_when_update_is_after_cancellation
         "paid",
         199,
     );
+    // ADP-01 §Receipt status under ADP: status updates are developer-signed.
     let update = receipt(
+        &developer,
+        &developer,
+        buyer,
+        Some(auth_root.id),
+        Some(root.id),
+        "fulfilled",
+        201,
+    );
+    let events = [root.clone(), update.clone()];
+    let tip = resolve_receipt_chain(&events, developer.public_key(), Some(&authorization))
+        .expect("root authorization is evaluated at root time");
+    assert_eq!(tip.id, update.id);
+
+    // A fulfillment-key update is not transition-authorized: it is ignored,
+    // neither changing the status nor invalidating the chain.
+    let delegated_update = receipt(
         &fulfillment,
         &developer,
         buyer,
@@ -128,10 +145,10 @@ fn delegated_receipt_uses_exact_root_time_even_when_update_is_after_cancellation
         "fulfilled",
         201,
     );
-    let events = [root, update.clone()];
+    let events = [root.clone(), delegated_update];
     let tip = resolve_receipt_chain(&events, developer.public_key(), Some(&authorization))
-        .expect("root authorization is evaluated at root time");
-    assert_eq!(tip.id, update.id);
+        .expect("the root still resolves");
+    assert_eq!(tip.id, root.id);
 }
 
 #[test]
