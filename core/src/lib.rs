@@ -43,6 +43,8 @@ pub mod relay_defaults;
 
 mod hash_validation;
 pub use hash_validation::is_sha256_hex;
+/// ADP-01 §Canonical Hex Encoding helpers: reject, never normalize.
+pub mod canonical_hex;
 
 #[cfg(feature = "native")]
 pub mod relay_cache;

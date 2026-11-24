@@ -1059,8 +1059,8 @@ pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
             }
             Some("adp_terms") => match v.as_slice() {
                 [_, operator, root]
-                    if nostr::PublicKey::from_hex(operator).is_ok()
-                        && nostr::EventId::from_hex(root).is_ok() =>
+                    if crate::canonical_hex::canonical_public_key(operator).is_some()
+                        && crate::canonical_hex::canonical_event_id(root).is_some() =>
                 {
                     accepted_terms.push(crate::adp_settlement::AcceptedTermsRef {
                         operator_pubkey: operator.clone(),
@@ -1070,8 +1070,13 @@ pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
                 _ => malformed_accepted_terms_tags.push(v),
             },
             Some("file_hash") => {
+                // ADP-01 §Canonical Hex Encoding: only a canonical digest is
+                // accepted; an uppercase or malformed value is not normalized.
                 if file_hash.is_none() {
-                    file_hash = v.get(1).filter(|hash| !hash.is_empty()).cloned();
+                    file_hash = v
+                        .get(1)
+                        .filter(|hash| crate::canonical_hex::is_canonical_sha256(hash))
+                        .cloned();
                 }
             }
             Some("version") => {
@@ -1084,9 +1089,8 @@ pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
                     continue;
                 }
                 let parsed = match v.as_slice() {
-                    [_, root, pubkey] => nostr::EventId::from_hex(root)
-                        .ok()
-                        .zip(nostr::PublicKey::from_hex(pubkey).ok())
+                    [_, root, pubkey] => crate::canonical_hex::canonical_event_id(root)
+                        .zip(crate::canonical_hex::canonical_public_key(pubkey))
                         .map(|(root_event_id, fulfillment_pubkey)| {
                             FulfillmentAuthorizationReference {
                                 root_event_id,
@@ -1094,9 +1098,8 @@ pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
                                 relay_hint: None,
                             }
                         }),
-                    [_, root, pubkey, relay] if !relay.is_empty() => nostr::EventId::from_hex(root)
-                        .ok()
-                        .zip(nostr::PublicKey::from_hex(pubkey).ok())
+                    [_, root, pubkey, relay] if !relay.is_empty() => crate::canonical_hex::canonical_event_id(root)
+                        .zip(crate::canonical_hex::canonical_public_key(pubkey))
                         .zip(nostr::RelayUrl::parse(relay).ok())
                         .map(|((root_event_id, fulfillment_pubkey), _)| {
                             FulfillmentAuthorizationReference {
@@ -1122,7 +1125,7 @@ pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
                     _ => None,
                 };
                 if let (Some(root), Some(relay_hint)) = (v.get(1), relay_hint) {
-                    if let Ok(root_event_id) = nostr::EventId::from_hex(root) {
+                    if let Some(root_event_id) = crate::canonical_hex::canonical_event_id(root) {
                         campaigns.push(CampaignPointer {
                             root_event_id,
                             relay_hint,
@@ -1809,7 +1812,7 @@ mod tests {
                 vec!["d", "managed-game"],
                 vec!["title", "Managed Game"],
                 vec!["server", "http://localhost:9099"],
-                vec!["file_hash", "abc123"],
+                vec!["file_hash", &"ab".repeat(32)],
                 vec!["version", "1.4.2"],
                 vec!["fulfillment_pubkey", "delegate-key", "1700000000", ""],
             ],
@@ -1820,7 +1823,7 @@ mod tests {
 
         assert_eq!(listing.event_id, event_id);
         assert_eq!(listing.servers, vec!["http://localhost:9099"]);
-        assert_eq!(listing.file_hash.as_deref(), Some("abc123"));
+        assert_eq!(listing.file_hash, Some("ab".repeat(32)));
         assert_eq!(listing.version.as_deref(), Some("1.4.2"));
         assert!(listing.fulfillment_authorizations.is_empty());
         assert!(listing.malformed_fulfillment_authorization_tags.is_empty());

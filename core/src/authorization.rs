@@ -178,8 +178,8 @@ pub fn parse_attestation_event(event: &Event) -> Result<ParsedAttestation, Proto
             "fulfillment_pubkey".into(),
         ));
     }
-    let fulfillment_pubkey = PublicKey::from_hex(&values[1])
-        .map_err(|_| ProtocolEventError::MalformedTag("fulfillment_pubkey".into()))?;
+    let fulfillment_pubkey = crate::canonical_hex::canonical_public_key(&values[1])
+        .ok_or_else(|| ProtocolEventError::MalformedTag("fulfillment_pubkey".into()))?;
     let valid_from = values[2]
         .parse::<u64>()
         .map_err(|_| ProtocolEventError::MalformedTag("fulfillment_pubkey".into()))?;
@@ -225,11 +225,11 @@ pub fn parse_authorization_event(event: &Event) -> Result<AuthorizationEvent, Pr
         &exact_tag(event, "p", true)?.ok_or(ProtocolEventError::MissingTag("p"))?,
     )
     .map_err(|_| ProtocolEventError::MalformedTag("p".into()))?;
-    let fulfillment_pubkey = PublicKey::from_hex(
+    let fulfillment_pubkey = crate::canonical_hex::canonical_public_key(
         &exact_tag(event, "fulfillment_pubkey", true)?
             .ok_or(ProtocolEventError::MissingTag("fulfillment_pubkey"))?,
     )
-    .map_err(|_| ProtocolEventError::MalformedTag("fulfillment_pubkey".into()))?;
+    .ok_or_else(|| ProtocolEventError::MalformedTag("fulfillment_pubkey".into()))?;
     let capabilities = capabilities(event)?;
     let valid_from = exact_tag(event, "valid_from", true)?
         .ok_or(ProtocolEventError::MissingTag("valid_from"))?

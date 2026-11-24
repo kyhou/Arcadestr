@@ -105,14 +105,14 @@ pub fn parse_entitlement_event(
     }
     let source_event = exact_tag(event, TAG_SOURCE_EVENT, false)?
         .map(|value| {
-            EventId::from_hex(&value)
-                .map_err(|_| ProtocolEventError::MalformedTag(TAG_SOURCE_EVENT.into()))
+            crate::canonical_hex::canonical_event_id(&value)
+                .ok_or_else(|| ProtocolEventError::MalformedTag(TAG_SOURCE_EVENT.into()))
         })
         .transpose()?;
     let authorization_event = exact_tag(event, TAG_AUTHORIZATION_EVENT, false)?
         .map(|value| {
-            EventId::from_hex(&value)
-                .map_err(|_| ProtocolEventError::MalformedTag(TAG_AUTHORIZATION_EVENT.into()))
+            crate::canonical_hex::canonical_event_id(&value)
+                .ok_or_else(|| ProtocolEventError::MalformedTag(TAG_AUTHORIZATION_EVENT.into()))
         })
         .transpose()?;
     let reason = exact_tag(event, TAG_REASON, false)?;

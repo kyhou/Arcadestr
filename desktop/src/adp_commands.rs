@@ -9075,7 +9075,7 @@ mod tests {
         };
         let one = info("https://one.test");
         let two = info("https://two.test");
-        let response = |key: nostr::PublicKey| json!({"fulfillment_pubkey":key.to_hex(),"attestation_event_id":"fixture","scope":"game"});
+        let response = |key: nostr::PublicKey| json!({"fulfillment_pubkey":key.to_hex(),"attestation_event_id":"abababababababababababababababababababababababababababababababab","scope":"game"});
         let first_http = Arc::new(LocalMockHttpClient::default().with_json_post_response(
             "https://one.test/provision",
             response(Keys::generate().public_key()),
@@ -9227,7 +9227,7 @@ mod tests {
             provision_url,
             json!({
                 "fulfillment_pubkey": "b0822d6340862b961e88b983b9c3b434e1fc750a36e796ee10825e8778badacf",
-                "attestation_event_id": "attestation-id",
+                "attestation_event_id": "abababababababababababababababababababababababababababababababab",
                 "scope": "game"
             }),
         ));

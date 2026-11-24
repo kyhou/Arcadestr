@@ -1685,8 +1685,8 @@ pub fn apply_managed_adp_terms(
 ) -> Result<(), crate::adp_settlement::SettlementError> {
     let accepted = crate::adp_settlement::validate_terms_coverage(servers, accepted)?;
     for reference in &accepted {
-        if nostr::PublicKey::from_hex(&reference.operator_pubkey).is_err()
-            || nostr::EventId::from_hex(&reference.terms_event_id).is_err()
+        if crate::canonical_hex::canonical_public_key(&reference.operator_pubkey).is_none()
+            || crate::canonical_hex::canonical_event_id(&reference.terms_event_id).is_none()
         {
             return Err(crate::adp_settlement::SettlementError::TermsCoverage(
                 reference.operator_pubkey.clone(),
@@ -1796,7 +1796,7 @@ pub fn build_adp_listing_event_builder<'a>(
     }
 
     for (root_event_id, relay_hint) in &input.campaigns {
-        if nostr::EventId::from_hex(root_event_id).is_err()
+        if crate::canonical_hex::canonical_event_id(root_event_id).is_none()
             || relay_hint
                 .as_deref()
                 .is_some_and(|relay| nostr::RelayUrl::parse(relay).is_err())
@@ -1806,8 +1806,8 @@ pub fn build_adp_listing_event_builder<'a>(
     }
 
     for authorization in &input.fulfillment_authorizations {
-        if nostr::EventId::from_hex(&authorization.root_event_id).is_err()
-            || nostr::PublicKey::from_hex(&authorization.fulfillment_pubkey).is_err()
+        if crate::canonical_hex::canonical_event_id(&authorization.root_event_id).is_none()
+            || crate::canonical_hex::canonical_public_key(&authorization.fulfillment_pubkey).is_none()
             || authorization
                 .relay_hint
                 .as_deref()

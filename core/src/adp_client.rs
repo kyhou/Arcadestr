@@ -27,6 +27,11 @@ pub enum AdpClientError {
     #[error("ADP response decode failed: {0}")]
     Decode(#[from] serde_json::Error),
 
+    /// A server response carried a non-canonical value in an ADP hex field
+    /// (ADP-01 §Canonical Hex Encoding). It is rejected, never normalized.
+    #[error("ADP response field {0} must be 64 lowercase hex characters")]
+    NonCanonicalHex(&'static str),
+
     /// NIP-98 authentication could not be built.
     #[error("ADP authentication failed: {0}")]
     Auth(#[from] Nip98ClientError),
@@ -129,6 +134,18 @@ pub struct ProvisionResponse {
     #[serde(default)]
     pub attestation: Option<Event>,
     pub scope: Option<String>,
+}
+
+/// Rejects a provision response whose identifiers are not canonical lowercase
+/// hex, before anything compares or stores them (ADP-01 §Canonical Hex Encoding).
+pub fn validate_provision_response(response: &ProvisionResponse) -> Result<(), AdpClientError> {
+    if crate::canonical_hex::canonical_public_key(&response.fulfillment_pubkey).is_none() {
+        return Err(AdpClientError::NonCanonicalHex("fulfillment_pubkey"));
+    }
+    if crate::canonical_hex::canonical_event_id(&response.attestation_event_id).is_none() {
+        return Err(AdpClientError::NonCanonicalHex("attestation_event_id"));
+    }
+    Ok(())
 }
 
 /// Response returned by `POST /provision/revoke`.
@@ -538,7 +555,9 @@ impl AdpClient {
             .post_json(&url, body, vec![("Authorization".to_string(), auth_header)])
             .await?;
 
-        Ok(serde_json::from_value(value)?)
+        let response: ProvisionResponse = serde_json::from_value(value)?;
+        validate_provision_response(&response)?;
+        Ok(response)
     }
 
     /// Revokes a provisioned fulfillment key on the operator.
@@ -2085,8 +2104,8 @@ mod tests {
         let http = Arc::new(MockHttpClient::new().with_json_post_response(
             "https://dist.example.com/provision",
             json!({
-                "fulfillment_pubkey": "fulfillment-key",
-                "attestation_event_id": "attestation-id",
+                "fulfillment_pubkey": "b0822d6340862b961e88b983b9c3b434e1fc750a36e796ee10825e8778badacf",
+                "attestation_event_id": "abababababababababababababababababababababababababababababababab",
                 "scope": "my-game"
             }),
         ));
@@ -2101,8 +2120,14 @@ mod tests {
             .await
             .expect("provision should succeed");
 
-        assert_eq!(response.fulfillment_pubkey, "fulfillment-key");
-        assert_eq!(response.attestation_event_id, "attestation-id");
+        assert_eq!(
+            response.fulfillment_pubkey,
+            "b0822d6340862b961e88b983b9c3b434e1fc750a36e796ee10825e8778badacf"
+        );
+        assert_eq!(
+            response.attestation_event_id,
+            "abababababababababababababababababababababababababababababababab"
+        );
         assert_eq!(response.scope.as_deref(), Some("my-game"));
         assert_eq!(
             http.post_call_count("https://dist.example.com/provision"),
@@ -2118,6 +2143,34 @@ mod tests {
         assert!(headers
             .iter()
             .any(|(name, value)| { name == "Authorization" && value.starts_with("Nostr ") }));
+    }
+
+    /// ADP-01 §Canonical Hex Encoding (gap C6): a provision response with an
+    /// uppercase key is rejected at the client boundary, never stored.
+    #[tokio::test]
+    async fn provision_rejects_a_non_canonical_response() {
+        let http = Arc::new(MockHttpClient::new().with_json_post_response(
+            "https://dist.example.com/provision",
+            json!({
+                "fulfillment_pubkey": "B0822D6340862B961E88B983B9C3B434E1FC750A36E796EE10825E8778BADACF",
+                "attestation_event_id": "abababababababababababababababababababababababababababababababab",
+                "scope": "my-game"
+            }),
+        ));
+        let signer = crate::signers::LocalSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("test private key should be valid");
+        let client = AdpClient::new("https://dist.example.com", http);
+
+        let error = client
+            .provision(&signer, Some("my-game"))
+            .await
+            .expect_err("uppercase key must be rejected");
+        assert!(matches!(
+            error,
+            AdpClientError::NonCanonicalHex("fulfillment_pubkey")
+        ));
     }
 
     #[tokio::test]
