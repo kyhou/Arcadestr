@@ -1,4 +1,5 @@
-//! Known-grant revocation reconciliation. Reads configured relays only.
+//! Known-grant revocation reconciliation and discovery of publisher-signed
+//! grants issued without a campaign. Reads configured relays only.
 use crate::AppState;
 use arcadestr_core::{
     entitlement_reconciliation::{EntitlementEvidence, EntitlementSource},
@@ -59,8 +60,8 @@ pub async fn reconcile_known_entitlements(
 ) -> Result<EntitlementSyncReport, String> {
     let buyer = PublicKey::from_hex(&request.expected_account_pubkey)
         .map_err(|_| "Invalid entitlement account")?;
-    let report = reconcile_for_account(buyer, &state).await?;
-    if report.revoked > 0 {
+    let (report, discovered) = sync_for_account(buyer, &state).await?;
+    if report.revoked > 0 || discovered > 0 {
         let _ = app.emit(
             "receipt-ownership-updated",
             serde_json::json!({"account":buyer.to_hex()}),
@@ -73,6 +74,17 @@ pub(crate) async fn reconcile_for_account(
     buyer: PublicKey,
     state: &AppState,
 ) -> Result<EntitlementSyncReport, String> {
+    sync_for_account(buyer, state)
+        .await
+        .map(|(report, _)| report)
+}
+
+/// Discovers campaignless grants addressed to `buyer`, then reconciles every
+/// known grant. Returns the merged report and the number of newly stored grants.
+pub(crate) async fn sync_for_account(
+    buyer: PublicKey,
+    state: &AppState,
+) -> Result<(EntitlementSyncReport, usize), String> {
     let (session, lease) = {
         let auth = state.auth.lock().await;
         if auth.public_key() != Some(buyer) {
@@ -96,14 +108,25 @@ pub(crate) async fn reconcile_for_account(
         .map(|url| url.to_string())
         .collect();
     let source = RelayEntitlementSource { manager, urls };
-    let report = EntitlementsRepository::new(state.database.pool().clone())
-        .reconcile_known_grants(buyer, &source, &|| {
-            session.ensure_current()?;
-            lease.ensure_current()
-        })
+    let repository = EntitlementsRepository::new(state.database.pool().clone());
+    let ensure_current = || {
+        session.ensure_current()?;
+        lease.ensure_current()
+    };
+    // Discovery first, so a newly found grant is also checked for revocations.
+    let discovery = repository
+        .discover_campaignless_grants(buyer, &source, &ensure_current)
         .await?;
+    let mut report = repository
+        .reconcile_known_grants(buyer, &source, &ensure_current)
+        .await?;
+    report.checked += discovery.examined;
+    report.revoked += discovery.revoked;
+    report.rejected_events += discovery.rejected_chains + discovery.malformed_events;
+    report.indeterminate += usize::from(discovery.unavailable);
+    report.incomplete |= discovery.incomplete;
     session.ensure_current()?;
-    Ok(report)
+    Ok((report, discovery.discovered))
 }
 
 #[cfg(test)]

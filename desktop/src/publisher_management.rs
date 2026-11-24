@@ -274,59 +274,70 @@ pub(crate) async fn revoke_recoverable(
                 // Reuse historical campaign/authorization verification; neither a
                 // cancelled campaign nor prospective authority cancellation revokes old grants.
                 let source = resolved.events.first().ok_or("Missing grant root")?;
-                // ADP-01 permits publisher-signed grants without a campaign. This
-                // flow verifies revocations against campaign evidence, so it does
-                // not yet support them; fail closed rather than guess.
-                let Some(source_campaign) = source.source_event else {
-                    return Err(
-                        "Revoking a grant issued without a campaign is not supported yet".into(),
-                    );
-                };
-                let manager = { state.nostr.lock().await.get_relay_manager().clone() };
-                let manager = { manager.lock().await.clone() };
-                let report =
-                    arcadestr_core::campaign_discovery::CampaignDiscoveryService::new(&manager)
-                        .discover(
-                            &[arcadestr_core::marketplace::CampaignPointer {
-                                root_event_id: source_campaign,
-                                relay_hint: None,
-                            }],
-                            public,
-                            &request.coordinate,
-                            now,
-                        )
-                        .await
-                        .map_err(|e| e.to_string())?;
-                let campaign = report
-                    .campaigns
-                    .into_iter()
-                    .find(|item| item.campaign.root_event_id == source_campaign)
-                    .ok_or("Grant campaign evidence unavailable")?
-                    .campaign;
-                let authorization = if let Some(id) = source.authorization {
-                    Some(
-                        arcadestr_core::authorization::discover_authorization(&manager, id, public)
+                // ADP-01 §Entitlement Grants: a publisher-signed grant may have no
+                // campaign. It is verified on the publisher's signature and the chain
+                // rules alone; revocation authority stays publisher-only either way.
+                let evidence = match source.source_event {
+                    None => {
+                        arcadestr_core::entitlements::validate_campaignless_entitlement(&resolved)
+                            .map_err(|e| e.to_string())?;
+                        GrantEvidence::Campaignless
+                    }
+                    Some(source_campaign) => {
+                        let manager = { state.nostr.lock().await.get_relay_manager().clone() };
+                        let manager = { manager.lock().await.clone() };
+                        let report =
+                            arcadestr_core::campaign_discovery::CampaignDiscoveryService::new(
+                                &manager,
+                            )
+                            .discover(
+                                &[arcadestr_core::marketplace::CampaignPointer {
+                                    root_event_id: source_campaign,
+                                    relay_hint: None,
+                                }],
+                                public,
+                                &request.coordinate,
+                                now,
+                            )
                             .await
-                            .map_err(|e| e.to_string())?,
-                    )
-                } else {
-                    None
+                            .map_err(|e| e.to_string())?;
+                        let campaign = report
+                            .campaigns
+                            .into_iter()
+                            .find(|item| item.campaign.root_event_id == source_campaign)
+                            .ok_or("Grant campaign evidence unavailable")?
+                            .campaign;
+                        let authorization = if let Some(id) = source.authorization {
+                            Some(
+                                arcadestr_core::authorization::discover_authorization(
+                                    &manager, id, public,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())?,
+                            )
+                        } else {
+                            None
+                        };
+                        arcadestr_core::entitlements::validate_adp_entitlement(
+                            &resolved,
+                            &campaign,
+                            authorization.as_ref(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        GrantEvidence::Campaign {
+                            campaign,
+                            authorization,
+                        }
+                    }
                 };
-                arcadestr_core::entitlements::validate_adp_entitlement(
-                    &resolved,
-                    &campaign,
-                    authorization.as_ref(),
-                )
-                .map_err(|e| e.to_string())?;
                 if let Some(saved) = &saved {
                     if resolved.events.last().map(|tip| tip.event.id) == Some(saved.id) {
                         session.ensure_current()?;
-                        persist_grant(&state, &root, saved, &campaign, authorization.as_ref())
-                            .await?;
+                        persist_grant(&state, &root, saved, &evidence).await?;
                         return finish(&journal, saved).await;
                     }
                 }
-                grant_evidence = Some((campaign, authorization));
+                grant_evidence = Some(evidence);
                 revoke_grant_builder(&resolved, public, expected_tip, now)?
             };
             session.ensure_current()?;
@@ -388,31 +399,51 @@ pub(crate) async fn revoke_recoverable(
             )
             .await?;
             crate::adp_commands::publish_event(&state, &event, &session).await?;
-            if let Some((campaign, authorization)) = grant_evidence {
+            if let Some(evidence) = grant_evidence {
                 session.ensure_current()?;
-                persist_grant(&state, &root, &event, &campaign, authorization.as_ref()).await?;
+                persist_grant(&state, &root, &event, &evidence).await?;
             }
             finish(&journal, &event).await
         })
         .await
 }
 
+/// Verified evidence for the grant being revoked.
+enum GrantEvidence {
+    /// Issued under a campaign, possibly by a delegated fulfillment key.
+    Campaign {
+        campaign: arcadestr_core::campaign::ResolvedCampaign,
+        authorization: Option<arcadestr_core::authorization::ResolvedAuthorization>,
+    },
+    /// Publisher-signed without a campaign (ADP-01 §Entitlement Grants).
+    Campaignless,
+}
+
 async fn persist_grant(
     state: &State<'_, AppState>,
     root: &Event,
     event: &Event,
-    campaign: &arcadestr_core::campaign::ResolvedCampaign,
-    authorization: Option<&arcadestr_core::authorization::ResolvedAuthorization>,
+    evidence: &GrantEvidence,
 ) -> Result<(), String> {
     let repo = arcadestr_core::entitlements_repository::EntitlementsRepository::new(
         state.database.pool().clone(),
     );
-    repo.ingest_event(root, campaign, authorization)
-        .await
-        .map_err(|e| e.to_string())?;
-    repo.ingest_event(event, campaign, authorization)
-        .await
-        .map_err(|e| e.to_string())
+    for transition in [root, event] {
+        match evidence {
+            GrantEvidence::Campaign {
+                campaign,
+                authorization,
+            } => repo
+                .ingest_event(transition, campaign, authorization.as_ref())
+                .await
+                .map_err(|e| e.to_string())?,
+            GrantEvidence::Campaignless => repo
+                .ingest_campaignless_event(transition)
+                .await
+                .map_err(|e| e.to_string())?,
+        }
+    }
+    Ok(())
 }
 
 async fn finish(journal: &PublisherJournal, event: &Event) -> Result<Event, String> {

@@ -170,7 +170,30 @@ impl EntitlementsRepository {
         nodes.push(parsed.clone());
         let resolved = resolve_entitlement_grant(&nodes)?;
         validate_campaignless_entitlement(&resolved)?;
+        // Store only events that are members of the resolved chain. An event the
+        // chain rules ignore (for example a revocation signed by another key) is
+        // not evidence about this grant.
+        if !resolved
+            .events
+            .iter()
+            .any(|member| member.event.id == event.id)
+        {
+            return Err(EntitlementsRepositoryError::InvalidEvent(
+                "event is not part of the resolved grant chain".into(),
+            ));
+        }
         self.insert_validated(event, &parsed).await
+    }
+
+    /// Validated events already stored for one grant.
+    pub(crate) async fn stored_grant_events(
+        &self,
+        buyer_pubkey: &str,
+        game_coordinate: &str,
+        grant_id: &str,
+    ) -> Result<Vec<ParsedEntitlementGrant>, EntitlementsRepositoryError> {
+        self.parsed_events(buyer_pubkey, game_coordinate, Some(grant_id))
+            .await
     }
 
     async fn insert_validated(

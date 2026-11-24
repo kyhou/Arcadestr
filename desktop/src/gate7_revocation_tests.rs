@@ -144,3 +144,175 @@ async fn gate7_native_independent_revocation_reconnect_restart_and_download_deni
         .await
         .expect("durable revocation"));
 }
+
+/// ADP-01 §Entitlement Grants (gaps C10, C11): a publisher-signed grant with no
+/// campaign is discovered through `#p` by two independent buyer clients that
+/// never claimed it. A forged revocation and a forged grant are ignored. The
+/// developer then revokes it with the real revocation command, and both
+/// clients lose ownership on their next sync. Loopback relay and disposable
+/// databases only.
+#[tokio::test]
+async fn gate7_campaignless_grant_discovery_and_revocation_across_clients() {
+    use arcadestr_core::{
+        adp_protocol::ENTITLEMENT_GRANT_KIND,
+        entitlements_repository::EntitlementsRepository,
+        ownership::{DurableCredentialStatus, OwnershipService},
+        purchases::PurchasesRepository,
+    };
+    let temp = tempfile::tempdir_in("/tmp/opencode").expect("isolated root");
+    let events: Events = Arc::new(Mutex::new(vec![]));
+    let (url, _relay) = relay(events.clone()).await;
+    let http: Arc<dyn HttpClient> = Arc::new(IsolatedHttp {
+        real: ReqwestHttpClient::new(Duration::from_secs(5)).expect("HTTP"),
+        urls: vec![],
+    });
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let attacker = Keys::generate();
+    let coordinate = format!("30402:{}:game", developer.public_key());
+    let now = Timestamp::now().as_secs();
+    let grant_tags = |grant_id: &str| {
+        vec![
+            tag(&["d", grant_id]),
+            tag(&["a", &coordinate]),
+            tag(&["p", &buyer.public_key().to_hex()]),
+            tag(&["reason", "review-copy"]),
+            tag(&["status", "granted"]),
+        ]
+    };
+    // Issued by the developer outside Arcadestr: no campaign, no source_event.
+    let root = EventBuilder::new(Kind::Custom(ENTITLEMENT_GRANT_KIND), "")
+        .tags(grant_tags("review-copy"))
+        .custom_created_at(Timestamp::from_secs(now - 60))
+        .sign_with_keys(&developer)
+        .expect("grant");
+    let forged_revocation = EventBuilder::new(Kind::Custom(ENTITLEMENT_GRANT_KIND), "")
+        .tags([
+            tag(&["d", "review-copy"]),
+            tag(&["a", &coordinate]),
+            tag(&["p", &buyer.public_key().to_hex()]),
+            tag(&["e", &root.id.to_hex()]),
+            tag(&["status", "revoked"]),
+        ])
+        .custom_created_at(Timestamp::from_secs(now - 30))
+        .sign_with_keys(&attacker)
+        .expect("forged revocation");
+    let forged_grant = EventBuilder::new(Kind::Custom(ENTITLEMENT_GRANT_KIND), "")
+        .tags(grant_tags("forged"))
+        .custom_created_at(Timestamp::from_secs(now - 60))
+        .sign_with_keys(&attacker)
+        .expect("forged grant");
+    events
+        .lock()
+        .expect("relay store")
+        .extend([root.clone(), forged_revocation, forged_grant]);
+
+    let mut clients = Vec::new();
+    for name in ["buyer-laptop", "buyer-desktop"] {
+        let app = test_app_with_http(
+            vec![url.clone()],
+            temp.path().join(format!("{name}.db")),
+            http.clone(),
+        )
+        .await;
+        switch(&app, &buyer.secret_key().to_secret_hex()).await;
+        clients.push(app);
+    }
+    let ownership = |app: &tauri::App<tauri::test::MockRuntime>| {
+        let pool = app.state::<AppState>().database.pool().clone();
+        OwnershipService::new(
+            PurchasesRepository::new(pool.clone()),
+            EntitlementsRepository::new(pool),
+        )
+    };
+    for app in &clients {
+        let (report, discovered) =
+            crate::entitlement_commands::sync_for_account(buyer.public_key(), &app.state())
+                .await
+                .expect("discovery");
+        assert_eq!(discovered, 1, "found through #p without a prior claim");
+        assert!(report.rejected_events >= 1, "the forged grant is rejected");
+        assert!(ownership(app)
+            .is_owned(&buyer.public_key().to_hex(), &coordinate)
+            .await
+            .expect("ownership"));
+    }
+
+    // The developer revokes it from a third client, with the real command.
+    let publisher_app = test_app_with_http(
+        vec![url.clone()],
+        temp.path().join("publisher.db"),
+        http.clone(),
+    )
+    .await;
+    switch(&publisher_app, &developer.secret_key().to_secret_hex()).await;
+    let revocation = crate::publisher_management::revoke_publisher_credential(
+        RevokePublisherCredentialRequest {
+            expected_publisher_npub: developer.public_key().to_bech32().expect("npub"),
+            coordinate: coordinate.clone(),
+            root_event_id: root.id.to_hex(),
+            expected_tip_event_id: root.id.to_hex(),
+            action: RevocationAction::RevokeGrant,
+            operation_id: Uuid::new_v4().to_string(),
+            confirm: true,
+        },
+        publisher_app.state(),
+        publisher_app.state(),
+    )
+    .await
+    .expect("developer revokes a grant issued without a campaign");
+    let parsed = arcadestr_core::entitlements::parse_entitlement_event(&revocation)
+        .expect("revocation parses");
+    assert_eq!(
+        parsed.status,
+        arcadestr_core::entitlements::GrantStatus::Revoked
+    );
+    assert_eq!(parsed.source_event, None, "invariant absence is preserved");
+    assert!(
+        events
+            .lock()
+            .expect("relay")
+            .iter()
+            .any(|e| e.id == revocation.id),
+        "revocation was published"
+    );
+
+    for app in &clients {
+        let (report, _) =
+            crate::entitlement_commands::sync_for_account(buyer.public_key(), &app.state())
+                .await
+                .expect("reconcile");
+        assert_eq!(report.revoked, 1);
+        let service = ownership(app);
+        assert!(!service
+            .is_owned(&buyer.public_key().to_hex(), &coordinate)
+            .await
+            .expect("ownership"));
+        assert_eq!(
+            service
+                .durable_records_for(&buyer.public_key().to_hex())
+                .await
+                .expect("history")[0]
+                .status,
+            DurableCredentialStatus::Revoked
+        );
+    }
+
+    // Only the developer may revoke: the buyer's own key is refused.
+    switch(&publisher_app, &buyer.secret_key().to_secret_hex()).await;
+    assert!(crate::publisher_management::revoke_publisher_credential(
+        RevokePublisherCredentialRequest {
+            expected_publisher_npub: buyer.public_key().to_bech32().expect("npub"),
+            coordinate: coordinate.clone(),
+            root_event_id: root.id.to_hex(),
+            expected_tip_event_id: revocation.id.to_hex(),
+            action: RevocationAction::RevokeGrant,
+            operation_id: Uuid::new_v4().to_string(),
+            confirm: true,
+        },
+        publisher_app.state(),
+        publisher_app.state(),
+    )
+    .await
+    .is_err());
+}
