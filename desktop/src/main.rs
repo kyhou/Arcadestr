@@ -2353,29 +2353,10 @@ fn extract_fresh_listing_metadata(event: &nostr::Event) -> Result<FreshListingMe
     if server_urls.is_empty() {
         return Err("fresh listing is missing server tag".to_string());
     }
-    let acquisition = event
-        .tags
-        .iter()
-        .find_map(|tag| {
-            let values = tag.clone().to_vec();
-            (values.first().map(String::as_str) == Some("acquisition")).then_some(values)
-        })
-        .map(|values| match values.as_slice() {
-            [_, mode] if mode == "public" => arcadestr_core::marketplace::AcquisitionPolicy::Public,
-            [_, mode, starts, ends] if mode == "timed-access" => {
-                match (starts.parse::<u64>(), ends.parse::<u64>()) {
-                    (Ok(starts_at), Ok(ends_at)) if starts_at < ends_at => {
-                        arcadestr_core::marketplace::AcquisitionPolicy::TimedAccess {
-                            starts_at,
-                            ends_at,
-                        }
-                    }
-                    _ => arcadestr_core::marketplace::AcquisitionPolicy::Gated,
-                }
-            }
-            _ => arcadestr_core::marketplace::AcquisitionPolicy::Gated,
-        })
-        .unwrap_or_default();
+    // One shared parser: duplicate or malformed policy grants no access.
+    let acquisition = arcadestr_core::marketplace::AcquisitionPolicy::from_tags(
+        event.tags.iter().map(|tag| tag.as_slice()),
+    );
 
     Ok(FreshListingMetadata {
         server_urls,
@@ -5187,6 +5168,51 @@ mod install_game_tests {
         let (result, http, download_url) =
             anonymous_install(Some(&["timed-access", &starts, &ends]), "anon-expired").await;
         let error = result.expect_err("expired timed access must not install");
+        assert!(format!("{error:?}").contains("sign in"), "{error:?}");
+        assert_eq!(http.call_count(&download_url), 0);
+    }
+
+    /// ADP-01 §Malformed acquisition policy (gap C7): duplicate tags are
+    /// invalid on the install path too, so a signed-out install is refused.
+    #[tokio::test]
+    async fn signed_out_install_with_duplicate_public_tags_is_refused_before_download() {
+        let buyer = Keys::generate();
+        let merchant = Keys::generate();
+        let name = "anon-duplicate";
+        let artifact_bytes = b"anonymous artifact";
+        let file_hash = sha256_hex(artifact_bytes).await;
+        let server_url = "https://dist.example.com";
+        let coordinate = coordinate(&merchant, name);
+        let download_url = format!("{server_url}/game/{}", urlencoding::encode(&coordinate));
+        let http = MockHttpClient::new().with_download_response(&download_url, artifact_bytes);
+        let state = app_state_with_http(&buyer, test_db(name).await, Arc::new(http.clone())).await;
+        state.auth.lock().await.disconnect();
+        let template =
+            listing_event_with_acquisition(&merchant, name, server_url, &file_hash, &["public"]);
+        let duplicated = EventBuilder::new(Kind::Custom(30402), "")
+            .tags(
+                template
+                    .tags
+                    .iter()
+                    .cloned()
+                    .chain([Tag::custom(TagKind::custom("acquisition"), ["public"])]),
+            )
+            .sign_with_keys(&merchant)
+            .expect("duplicate-policy listing");
+        let fetcher = StaticFreshListingFetcher {
+            event: duplicated,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let error = install_game_with_fetcher_and_signer(
+            app_listing(&merchant, name),
+            &state,
+            None,
+            None::<&tauri::AppHandle<tauri::test::MockRuntime>>,
+            unique_test_path(&format!("{name}-data"), "dir"),
+            &fetcher,
+        )
+        .await
+        .expect_err("duplicate policy tags grant nothing");
         assert!(format!("{error:?}").contains("sign in"), "{error:?}");
         assert_eq!(http.call_count(&download_url), 0);
     }

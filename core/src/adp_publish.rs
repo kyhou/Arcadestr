@@ -1851,18 +1851,23 @@ pub fn build_adp_listing_event_builder<'a>(
         tags.push(Tag::parse(values.clone()).map_err(|_| AdpPublishError::MalformedPreservedTag)?);
     }
 
-    tags.push(match &input.acquisition {
-        AcquisitionPolicy::Gated => Tag::custom(TagKind::Custom("acquisition".into()), ["gated"]),
-        AcquisitionPolicy::Public => Tag::custom(TagKind::Custom("acquisition".into()), ["public"]),
-        AcquisitionPolicy::TimedAccess { starts_at, ends_at } => Tag::custom(
+    // ADP-01 §Acquisition policy: a gated listing has no `acquisition` tag.
+    // `["acquisition", "gated"]` is not a defined mode.
+    match &input.acquisition {
+        AcquisitionPolicy::Gated => {}
+        AcquisitionPolicy::Public => tags.push(Tag::custom(
+            TagKind::Custom("acquisition".into()),
+            ["public"],
+        )),
+        AcquisitionPolicy::TimedAccess { starts_at, ends_at } => tags.push(Tag::custom(
             TagKind::Custom("acquisition".into()),
             [
                 "timed-access".to_string(),
                 starts_at.to_string(),
                 ends_at.to_string(),
             ],
-        ),
-    });
+        )),
+    }
 
     for image in &input.images {
         if !image.is_empty() {
@@ -2935,10 +2940,8 @@ mod tests {
             .expect("event should sign");
 
         assert_eq!(event.kind, Kind::Custom(30402));
-        assert_eq!(
-            tag_values(&event, "acquisition")[0],
-            vec!["acquisition", "gated"]
-        );
+        // ADP-01 §Acquisition policy (gap C8): gated means no acquisition tag.
+        assert!(tag_values(&event, "acquisition").is_empty());
         assert_eq!(tag_values(&event, "d")[0], vec!["d", "my-game"]);
         assert_eq!(tag_values(&event, "title")[0], vec!["title", "My Game"]);
         assert_eq!(

@@ -245,6 +245,34 @@ pub enum AcquisitionPolicy {
 }
 
 impl AcquisitionPolicy {
+    /// Parses a listing's acquisition policy (ADP-01 §Acquisition policy and
+    /// §Malformed acquisition policy). No `acquisition` tag is gated. Exactly one
+    /// tag that is exactly `["acquisition", "public"]` or
+    /// `["acquisition", "timed-access", <starts_at>, <ends_at>]` with
+    /// `starts_at < ends_at` is that policy. Anything else, including duplicate
+    /// tags, an unknown mode, or the wrong element count, is invalid and grants
+    /// no access; it is reported as gated without invalidating the listing.
+    pub fn from_tags<'a>(tags: impl IntoIterator<Item = &'a [String]>) -> Self {
+        let mut policies = tags
+            .into_iter()
+            .filter(|values| values.first().map(String::as_str) == Some("acquisition"));
+        let (Some(only), None) = (policies.next(), policies.next()) else {
+            return Self::Gated;
+        };
+        match only {
+            [_, mode] if mode == "public" => Self::Public,
+            [_, mode, starts, ends] if mode == "timed-access" => {
+                match (starts.parse::<u64>(), ends.parse::<u64>()) {
+                    (Ok(starts_at), Ok(ends_at)) if starts_at < ends_at => {
+                        Self::TimedAccess { starts_at, ends_at }
+                    }
+                    _ => Self::Gated,
+                }
+            }
+            _ => Self::Gated,
+        }
+    }
+
     pub fn allows_access_at(&self, now: u64) -> bool {
         match self {
             Self::Gated => false,
@@ -944,8 +972,7 @@ pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
     let mut fulfillment_authorizations = Vec::new();
     let mut malformed_fulfillment_authorization_tags = Vec::new();
     let mut seen_fulfillment_authorization_tags = HashSet::new();
-    let mut acquisition = AcquisitionPolicy::Gated;
-    let mut acquisition_seen = false;
+    let acquisition = AcquisitionPolicy::from_tags(event.tags.iter().map(|tag| tag.as_slice()));
     let mut campaigns = Vec::new();
 
     for tag in event.tags.iter() {
@@ -1085,21 +1112,6 @@ pub fn parse_listing(event: Event) -> Result<Nip99Listing, String> {
                 } else {
                     malformed_fulfillment_authorization_tags.push(v);
                 }
-            }
-            Some("acquisition") if !acquisition_seen => {
-                acquisition_seen = true;
-                acquisition = match v.as_slice() {
-                    [_, mode] if mode == "public" => AcquisitionPolicy::Public,
-                    [_, mode, starts, ends] if mode == "timed-access" => {
-                        match (starts.parse::<u64>(), ends.parse::<u64>()) {
-                            (Ok(starts_at), Ok(ends_at)) if starts_at < ends_at => {
-                                AcquisitionPolicy::TimedAccess { starts_at, ends_at }
-                            }
-                            _ => AcquisitionPolicy::Gated,
-                        }
-                    }
-                    _ => AcquisitionPolicy::Gated,
-                };
             }
             Some("campaign") => {
                 let relay_hint = match v.as_slice() {
@@ -2310,6 +2322,70 @@ mod tests {
             let listing = parse_listing(event).expect("listing remains parseable");
             assert_eq!(listing.acquisition, AcquisitionPolicy::Gated);
         }
+    }
+
+    fn policy(tags: &[&[&str]]) -> AcquisitionPolicy {
+        let owned = tags
+            .iter()
+            .map(|tag| tag.iter().map(|v| v.to_string()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        AcquisitionPolicy::from_tags(owned.iter().map(Vec::as_slice))
+    }
+
+    /// ADP-01 §Malformed acquisition policy (gap C7): exactly one well-formed
+    /// tag is a policy; duplicates and malformed tags grant nothing.
+    #[test]
+    fn acquisition_policy_requires_exactly_one_well_formed_tag() {
+        assert_eq!(policy(&[]), AcquisitionPolicy::Gated);
+        assert_eq!(
+            policy(&[&["acquisition", "public"]]),
+            AcquisitionPolicy::Public
+        );
+        assert_eq!(
+            policy(&[&["acquisition", "timed-access", "100", "200"]]),
+            AcquisitionPolicy::TimedAccess {
+                starts_at: 100,
+                ends_at: 200
+            }
+        );
+        for invalid in [
+            &[
+                &["acquisition", "public"][..],
+                &["acquisition", "public"][..],
+            ][..],
+            &[
+                &["acquisition", "public"][..],
+                &["acquisition", "timed-access", "1", "2"][..],
+            ],
+            &[
+                &["acquisition", "timed-access", "1", "2"][..],
+                &["acquisition", "public"][..],
+            ],
+            &[&["acquisition", "gated"][..]],
+            &[&["acquisition", "unknown"][..]],
+            &[&["acquisition", "public", "extra"][..]],
+            &[&["acquisition"][..]],
+            &[&["acquisition", "timed-access", "200", "100"][..]],
+            &[&["acquisition", "timed-access", "100", "100"][..]],
+        ] {
+            assert_eq!(policy(invalid), AcquisitionPolicy::Gated, "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn duplicate_public_tags_do_not_make_a_parsed_listing_public() {
+        let event = make_nip99_event(
+            30402,
+            "Description",
+            vec![
+                vec!["d", "game"],
+                vec!["title", "Game"],
+                vec!["acquisition", "public"],
+                vec!["acquisition", "public"],
+            ],
+        );
+        let listing = parse_listing(event).expect("listing still parses");
+        assert_eq!(listing.acquisition, AcquisitionPolicy::Gated);
     }
 
     #[test]
