@@ -419,30 +419,117 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
         .purchase_confirm(&legacy_signer, legacy_request(hex::encode([90; 32])))
         .await
         .expect("actual legacy BOLT11/preimage verification");
-    // A same-buyer replay never creates another receipt. ADP-01 §Replay
-    // protection says "reject"; adp-server returns the original receipt to
-    // its own buyer (its documented gap S3, pending spec clarification).
-    // Either is accepted here; a different receipt is not.
-    match client_a
+    // ADP-01 §Replay protection: a retry of the original purchase (same
+    // buyer, coordinate and payment_hash) returns the original signed receipt
+    // with its event ID and never signs a second one. This server issues a
+    // fresh token while the buyer remains entitled.
+    let retried = client_a
         .purchase_confirm(&legacy_signer, legacy_request(hex::encode([90; 32])))
         .await
-    {
-        Err(_) => {}
-        Ok(replayed) => assert_eq!(
-            replayed.receipt.id, legacy.receipt.id,
-            "legacy replay must not create another receipt"
-        ),
-    }
-    assert_eq!(events.lock().expect("local relay evidence").iter().filter(|event|event.kind.as_u16()==1020 && event.tags.iter().any(|tag|matches!(tag.as_slice(),[name,value] if name=="p" && value==&legacy_buyer.public_key().to_hex()))).count(),1,"original legacy receipt remains recoverable on the local relays");
+        .expect("retry of the original purchase returns its receipt");
+    assert_eq!(
+        retried.receipt, legacy.receipt,
+        "retry returns the original signed receipt unchanged"
+    );
+    assert_ne!(
+        retried.download_token, legacy.download_token,
+        "retry token is freshly issued"
+    );
+    client_a
+        .download(
+            &legacy_coordinate,
+            DownloadAuth::Token(retried.download_token.clone()),
+            &dir.path().join("retry-token.zip"),
+            |_, _| {},
+        )
+        .await
+        .expect("fresh retry token authorizes the entitled buyer");
+    let legacy_receipts = || {
+        events
+            .lock()
+            .expect("local relay evidence")
+            .iter()
+            .filter(|event| {
+                event.kind.as_u16() == 1020
+                    && event.tags.iter().any(|tag| {
+                        matches!(tag.as_slice(), [name, value]
+                            if name == "p" && value == &legacy_buyer.public_key().to_hex())
+                    })
+            })
+            .map(|event| event.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        legacy_receipts(),
+        vec![legacy.receipt.id],
+        "exactly the original receipt is on the local relays"
+    );
+    // Any other reuse of the accepted payment_hash is 409, never ownership.
+    let is_conflict = |result: &Result<_, arcadestr_core::adp_client::AdpClientError>| {
+        matches!(
+            result,
+            Err(arcadestr_core::adp_client::AdpClientError::PurchaseProtocol(message))
+                if message.starts_with("HTTP status 409")
+        )
+    };
+    let other_buyer = client_a
+        .purchase_confirm(
+            &signer(&Keys::generate()),
+            legacy_request(hex::encode([90; 32])),
+        )
+        .await
+        .map(|_| ());
     assert!(
-        client_a
-            .purchase_confirm(
-                &signer(&Keys::generate()),
-                legacy_request(hex::encode([90; 32]))
-            )
+        is_conflict(&other_buyer),
+        "reuse by another buyer is 409: {other_buyer:?}"
+    );
+    let other_coordinate = format!("30402:{}:legacy-game-two", developer.public_key());
+    let (other_authorities, other_references) =
+        authorize(&other_coordinate, "legacy-two-authority");
+    let other_sale =
+        build_adp_listing_event_builder(arcadestr_core::adp_publish::AdpListingPublishInput {
+            listing: &AdpListingInput {
+                d_tag: "legacy-game-two".into(),
+                fulfillment_authorizations: other_references,
+                ..input.clone()
+            },
+            launch_tier: Some(&tier),
+        })
+        .expect("second legacy listing")
+        .sign_with_keys(&developer)
+        .expect("second legacy listing signature");
+    for event in other_authorities.iter().chain([&other_sale]) {
+        publisher
+            .send_event(event)
             .await
-            .is_err(),
-        "settlement proof cannot be reused by another buyer"
+            .expect("local second legacy publication");
+    }
+    let other_game = client_a
+        .purchase_confirm(
+            &legacy_signer,
+            confirm_request(&other_coordinate, &other_sale, hex::encode([90; 32])),
+        )
+        .await
+        .map(|_| ());
+    assert!(
+        is_conflict(&other_game),
+        "reuse for another game is 409: {other_game:?}"
+    );
+    assert!(client_a
+        .download(
+            &other_coordinate,
+            DownloadAuth::Nip98 {
+                signer: &legacy_signer
+            },
+            &dir.path().join("reused-payment.zip"),
+            |_, _| {}
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        legacy_receipts(),
+        vec![legacy.receipt.id],
+        "rejected reuse publishes no receipt"
     );
     let legacy_db = Database::new(&dir.path().join("legacy-portable-buyer.db"))
         .await
