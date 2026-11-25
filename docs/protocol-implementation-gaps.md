@@ -8,7 +8,9 @@ Server-side gaps are tracked in `../adp-server/docs/protocol-implementation-gaps
 
 ## Open
 
-None. Every tracked client gap is closed below.
+| # | Gap | Spec |
+|---|---|---|
+| C13 | `PurchaseConfirmResponse` requires `download_token` and `token_expires_at`. ADP-01 now lets a retry of an already-accepted purchase return the original receipt **without** a token, when the buyer is no longer entitled or the server is no longer authorized. Such a response fails to deserialize, so the client cannot recover the original receipt from it. Fix: make both fields optional, persist the receipt regardless, and treat a missing token as "no download from this response". | §Replay protection, `POST /purchase/confirm` response |
 
 ## Closed
 
