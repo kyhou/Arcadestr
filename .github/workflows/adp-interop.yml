@@ -1,0 +1,91 @@
+name: ADP interop
+
+# Cross-implementation tests against the adp-server reference implementation.
+# Ordinary Arcadestr CI (msrv.yml) never needs adp-server; only this workflow
+# checks it out, beside Arcadestr, at the revision pinned in
+# tests/interop/adp-server.rev. See tests/interop/README.md to update the pin.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      adp_server_revision:
+        description: adp-server commit to test instead of the pinned revision
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adp-interop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ADP_SERVER_REPOSITORY: kyhou/adp-server
+
+defaults:
+  run:
+    working-directory: Arcadestr
+
+jobs:
+  interop:
+    name: ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [black-box, crossflow, regtest-harness]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: Arcadestr
+
+      - name: Select adp-server revision
+        id: revision
+        shell: bash
+        env:
+          OVERRIDE: ${{ github.event.inputs.adp_server_revision }}
+        run: |
+          revision="${OVERRIDE:-$(tr -d '[:space:]' < tests/interop/adp-server.rev)}"
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "adp-server revision must be a full commit SHA: $revision" >&2
+            exit 1
+          fi
+          echo "sha=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Check out adp-server beside Arcadestr
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.ADP_SERVER_REPOSITORY }}
+          ref: ${{ steps.revision.outputs.sha }}
+          path: adp-server
+          # Only what Cargo reads (root manifests are included by cone mode;
+          # migrations/ is read at compile time by sqlx::migrate!).
+          sparse-checkout: |
+            adp-core
+            adp-server
+            migrations
+
+      - name: Install toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential libssl-dev pkg-config
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: adp-interop-${{ matrix.suite }}
+          workspaces: |
+            Arcadestr/tests/gate7_crossflow -> ../../target/interop
+            Arcadestr/tests/regtest_harness -> ../../target/interop
+
+      - name: Run ${{ matrix.suite }}
+        run: scripts/interop-test --revision "${{ steps.revision.outputs.sha }}" "${{ matrix.suite }}"

@@ -13,18 +13,6 @@ concurrency:
   group: msrv-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# arcadestr-core has a path dev-dependency on the sibling adp-server repository
-# (`../../adp-server/adp-server`), so both are checked out side by side:
-# Arcadestr into `Arcadestr/` and adp-server into `adp-server/`. Every step runs
-# in `Arcadestr/`. Push adp-server changes that Arcadestr depends on first.
-env:
-  ADP_SERVER_REPOSITORY: kyhou/adp-server
-  ADP_SERVER_REF: main
-
-defaults:
-  run:
-    working-directory: Arcadestr
-
 jobs:
   native:
     name: Native
@@ -33,21 +21,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          path: Arcadestr
-
-      - name: Check out sibling adp-server
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: ${{ env.ADP_SERVER_REPOSITORY }}
-          ref: ${{ env.ADP_SERVER_REF }}
-          path: adp-server
-          # Only what Cargo reads (root manifests are included by cone mode;
-          # migrations/ is read at compile time by sqlx::migrate!).
-          sparse-checkout: |
-            adp-core
-            adp-server
-            migrations
 
       - name: Read workspace MSRV
         shell: bash
@@ -83,7 +56,6 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: msrv-native
-          workspaces: Arcadestr
 
       - name: Verify compiler floor
         run: |
@@ -103,22 +75,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          path: Arcadestr
-
-      # Git for Windows rejects adp-server's archived drafts, whose names
-      # contain ':', even under sparse checkout. Download the tree instead and
-      # skip docs/, rather than disabling Git's NTFS path protection.
-      - name: Fetch sibling adp-server
-        shell: pwsh
-        working-directory: ${{ github.workspace }}
-        run: |
-          curl.exe --fail --silent --show-error --location `
-            "https://codeload.github.com/$env:ADP_SERVER_REPOSITORY/tar.gz/$env:ADP_SERVER_REF" `
-            --output adp-server.tar.gz
-          New-Item -ItemType Directory -Path adp-server | Out-Null
-          tar -xzf adp-server.tar.gz -C adp-server --strip-components=1 --exclude "*/docs/*" --exclude "*/docs"
-          if (-not (Test-Path adp-server/adp-server/Cargo.toml)) { throw "adp-server was not extracted" }
 
       - name: Read workspace MSRV
         shell: pwsh
@@ -134,7 +90,6 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: msrv-windows
-          workspaces: Arcadestr
 
       - name: Verify compiler floor
         run: |
@@ -151,21 +106,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          path: Arcadestr
-
-      - name: Check out sibling adp-server
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: ${{ env.ADP_SERVER_REPOSITORY }}
-          ref: ${{ env.ADP_SERVER_REF }}
-          path: adp-server
-          # Only what Cargo reads (root manifests are included by cone mode;
-          # migrations/ is read at compile time by sqlx::migrate!).
-          sparse-checkout: |
-            adp-core
-            adp-server
-            migrations
 
       - name: Read workspace MSRV
         shell: bash
@@ -187,7 +127,6 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: msrv-wasm
-          workspaces: Arcadestr
 
       - name: Verify compiler floor
         run: |

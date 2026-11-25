@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Explicit cross-implementation suite: Arcadestr against the adp-server reference
+# implementation. Never part of ordinary Arcadestr builds or tests.
+#
+# The interop workspaces (tests/gate7_crossflow, tests/regtest_harness) resolve
+# adp-server as the sibling checkout `<Arcadestr>/../adp-server`. This script
+# verifies that checkout is at the pinned revision in tests/interop/adp-server.rev
+# (or an explicitly selected one) and never modifies an existing checkout.
+#
+# Usage: scripts/interop-test [options] [suite...]
+#   suites: black-box crossflow regtest-harness   (default: all three)
+#   --revision REV   test REV instead of the pinned revision
+#   --any-revision   test whatever the sibling has checked out (reported)
+#   --fetch          clone adp-server beside Arcadestr at the selected
+#                    revision when the sibling checkout is absent
+# Environment: ADP_SERVER_REPOSITORY (clone URL for --fetch; default
+# https://github.com/kyhou/adp-server.git).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ADP_DIR="$(dirname "$ROOT")/adp-server"
+PIN_FILE="$ROOT/tests/interop/adp-server.rev"
+TARGET_DIR="$ROOT/target/interop"
+REPOSITORY="${ADP_SERVER_REPOSITORY:-https://github.com/kyhou/adp-server.git}"
+
+revision="$(tr -d '[:space:]' <"$PIN_FILE")"
+any_revision=0
+fetch=0
+suites=()
+while (($#)); do
+  case "$1" in
+    --revision) revision="${2:?--revision needs a value}"; shift 2 ;;
+    --any-revision) any_revision=1; shift ;;
+    --fetch) fetch=1; shift ;;
+    -h | --help) sed -n '2,18p' "$0"; exit 0 ;;
+    black-box | crossflow | regtest-harness) suites+=("$1"); shift ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+((${#suites[@]})) || suites=(black-box crossflow regtest-harness)
+
+if [[ ! -e "$ADP_DIR" ]]; then
+  if ((fetch)) && ((!any_revision)); then
+    echo "Cloning adp-server into $ADP_DIR at $revision"
+    git clone --quiet --no-checkout "$REPOSITORY" "$ADP_DIR"
+    git -C "$ADP_DIR" checkout --quiet --detach "$revision"
+  else
+    echo "adp-server checkout not found at $ADP_DIR" >&2
+    echo "Clone it there at $revision, or rerun with --fetch." >&2
+    exit 2
+  fi
+fi
+
+actual="$(git -C "$ADP_DIR" rev-parse HEAD)"
+if ((any_revision)); then
+  echo "Testing adp-server at checked-out revision $actual (pin: $revision)"
+else
+  expected="$(git -C "$ADP_DIR" rev-parse --verify --quiet "$revision^{commit}" || true)"
+  if [[ -z "$expected" || "$actual" != "$expected" ]]; then
+    echo "adp-server is at $actual, not the selected revision $revision." >&2
+    echo "Check out $revision in $ADP_DIR, or pass --any-revision." >&2
+    exit 2
+  fi
+  echo "Testing adp-server at pinned revision $actual"
+fi
+if [[ -n "$(git -C "$ADP_DIR" status --porcelain --untracked-files=no)" ]]; then
+  echo "WARNING: adp-server has uncommitted changes; results are not for $actual alone" >&2
+fi
+
+# The binary is built into an interop-only target directory, so cleanup can
+# match its exact path without touching any other adp-server process.
+SERVER_BIN="$TARGET_DIR/debug/adp-server"
+cleanup() { pkill -f -x "$SERVER_BIN" 2>/dev/null || true; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+failures=()
+run() {
+  local name="$1"; shift
+  echo "==> $name"
+  if ! "$@"; then failures+=("$name"); fi
+}
+
+for suite in "${suites[@]}"; do
+  case "$suite" in
+    black-box)
+      run "build adp-server" cargo build --locked \
+        --manifest-path "$ADP_DIR/Cargo.toml" --target-dir "$TARGET_DIR" \
+        -p adp-server --bin adp-server
+      run "black-box (real adp-server process)" env ADP_SERVER_BIN="$SERVER_BIN" \
+        cargo test --locked --manifest-path "$ROOT/tests/gate7_crossflow/Cargo.toml" \
+        --target-dir "$TARGET_DIR" --test black_box -- --test-threads=1
+      ;;
+    crossflow)
+      run "crossflow (actual router, in-process)" cargo test --locked \
+        --manifest-path "$ROOT/tests/gate7_crossflow/Cargo.toml" \
+        --target-dir "$TARGET_DIR" --test crossflow -- --test-threads=1
+      ;;
+    regtest-harness)
+      # Running the drivers needs Polar/Lightning (scripts/regtest); here they
+      # are compiled and their unit tests run.
+      run "regtest harness" cargo test --locked --no-fail-fast \
+        --manifest-path "$ROOT/tests/regtest_harness/Cargo.toml" \
+        --target-dir "$TARGET_DIR" --examples
+      ;;
+  esac
+done
+
+if ((${#failures[@]})); then
+  printf 'FAILED: %s\n' "${failures[@]}" >&2
+  exit 1
+fi
+echo "Interop suites passed against adp-server $actual"
