@@ -8,6 +8,11 @@ autotests = false
 name = "crossflow"
 path = "tests/crossflow.rs"
 
+# Real adp-server process; HTTP and Nostr only. Requires ADP_SERVER_BIN.
+[[test]]
+name = "black_box"
+path = "tests/black_box.rs"
+
 # Deliberately separate: the sibling reference server is test infrastructure,
 # never a dependency of the shipped Arcadestr application.
 [workspace]
