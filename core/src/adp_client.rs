@@ -325,14 +325,21 @@ impl SettlementProofResponse {
         if self.state == "settled" && self.receipt.is_none() {
             return Err(AdpClientError::PurchaseProtocol("Payments settled, but the receipt is unavailable. Recover the original proof; do not pay again.".into()));
         }
-        if self.receipt.is_some()
-            && (self.state != "settled"
-                || self.download_token.as_deref().is_none_or(str::is_empty)
-                || self.token_expires_at.is_none())
-        {
+        if self.receipt.is_some() && self.state != "settled" {
             return Err(AdpClientError::PurchaseProtocol("Inconsistent settlement receipt response. Recover the original purchase; do not pay again.".into()));
         }
         Ok(())
+    }
+
+    /// The freshly issued download token and its expiry, if any. Recovery of
+    /// a settled quote can return the receipt without one when current
+    /// distribution or entitlement is not established; that still completes
+    /// the purchase but grants no download authorization.
+    pub fn issued_token(&self) -> Option<(&str, i64)> {
+        match (self.download_token.as_deref(), self.token_expires_at) {
+            (Some(token), Some(expires_at)) if !token.is_empty() => Some((token, expires_at)),
+            _ => None,
+        }
     }
 }
 
@@ -1311,8 +1318,19 @@ mod tests {
         assert!(response.validate_completion_fields().is_err());
         response.state = "settled".into();
         assert!(response.validate_completion_fields().is_ok());
-        response.download_token = Some(String::new());
-        assert!(response.validate_completion_fields().is_err());
+        assert_eq!(response.issued_token(), Some(("mock-token", 2000)));
+        // A recovered receipt without a usable token still completes the
+        // purchase, but carries no download authorization.
+        for (token, expires_at) in [
+            (None, None),
+            (Some(String::new()), Some(2000)),
+            (Some("t".into()), None),
+        ] {
+            response.download_token = token;
+            response.token_expires_at = expires_at;
+            assert!(response.validate_completion_fields().is_ok());
+            assert_eq!(response.issued_token(), None);
+        }
     }
     use std::sync::Arc;
 

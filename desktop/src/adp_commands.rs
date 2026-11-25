@@ -2975,13 +2975,7 @@ pub(crate) async fn submit_split_payment_inner(
             buyer,
             &stored,
             receipt,
-            response
-                .download_token
-                .as_deref()
-                .ok_or_else(|| "settled response omitted download token".to_string())?,
-            response
-                .token_expires_at
-                .ok_or_else(|| "settled response omitted token expiry".to_string())?,
+            response.issued_token(),
         )
         .await?;
         repository
@@ -2995,12 +2989,16 @@ pub(crate) async fn submit_split_payment_inner(
             .await
             .map_err(|error| error.to_string())?;
     }
+    // Report only a token that was actually issued and stored.
+    let issued = response
+        .issued_token()
+        .map(|(token, expires_at)| (token.to_string(), expires_at));
     Ok(SplitSettlementResponse {
         state: response.state,
         settled_leg: response.settled_leg,
         receipt: response.receipt,
-        download_token: response.download_token,
-        token_expires_at: response.token_expires_at,
+        download_token: issued.as_ref().map(|(token, _)| token.clone()),
+        token_expires_at: issued.map(|(_, expires_at)| expires_at),
     })
 }
 
@@ -4001,12 +3999,12 @@ async fn persist_purchase_confirmation(
     )
     .await?;
     // The receipt is archived above regardless of download authorization.
-    let issued = store_issued_purchase_token(
+    let issued = sync_issued_download_token(
         &DownloadTokensRepository::new(state.database.pool().clone()),
         buyer_pubkey,
         game_coordinate,
         server_url,
-        &response,
+        response.issued_token(),
     )
     .await?;
 
@@ -4017,18 +4015,18 @@ async fn persist_purchase_confirmation(
     })
 }
 
-/// Stores the download token a purchase confirmation issued, if any, and
-/// returns it. A receipt-only response means the server declined to renew
-/// download authorization, so any token cached for this buyer, game and
-/// server is deleted rather than reused until it expires.
-async fn store_issued_purchase_token(
+/// Stores the download token a purchase or settlement response issued, if
+/// any, and returns it. A receipt-only response means the server declined to
+/// renew download authorization, so any token cached for this buyer, game
+/// and server is deleted rather than reused until it expires.
+async fn sync_issued_download_token(
     tokens: &DownloadTokensRepository,
     buyer_pubkey: &str,
     game_coordinate: &str,
     server_url: &str,
-    response: &CorePurchaseConfirmResponse,
+    issued: Option<(&str, i64)>,
 ) -> Result<Option<(String, i64)>, String> {
-    let Some((token, expires_at)) = response.issued_token() else {
+    let Some((token, expires_at)) = issued else {
         tokens
             .delete(buyer_pubkey, game_coordinate, server_url)
             .await
@@ -4054,8 +4052,7 @@ async fn persist_split_receipt(
     buyer: nostr::PublicKey,
     stored: &arcadestr_core::settlement_repository::StoredSettlement,
     receipt_event: &nostr::Event,
-    download_token: &str,
-    token_expires_at: i64,
+    issued_token: Option<(&str, i64)>,
 ) -> Result<(), String> {
     let quote_event: nostr::Event = serde_json::from_str(&stored.quote_event_json)
         .map_err(|error| format!("stored quote event is corrupt: {error}"))?;
@@ -4149,16 +4146,15 @@ async fn persist_split_receipt(
         authorization.as_ref(),
     )
     .await?;
-    DownloadTokensRepository::new(state.database.pool().clone())
-        .upsert(&DownloadToken {
-            buyer_pubkey: buyer.to_hex(),
-            game_coordinate: quote.listing_coordinate,
-            server_url: stored.processor_url.clone(),
-            token: download_token.to_string(),
-            expires_at: token_expires_at,
-        })
-        .await
-        .map_err(|error| error.to_string())?;
+    // The receipt is archived above regardless of download authorization.
+    sync_issued_download_token(
+        &DownloadTokensRepository::new(state.database.pool().clone()),
+        &buyer.to_hex(),
+        &quote.listing_coordinate,
+        &stored.processor_url,
+        issued_token,
+    )
+    .await?;
     Ok(())
 }
 
@@ -6253,9 +6249,15 @@ mod tests {
 
         // A retry that recovers only the receipt stores no token.
         let recovered = response(serde_json::json!({ "receipt": receipt }));
-        let stored = store_issued_purchase_token(&tokens, buyer, coordinate, server, &recovered)
-            .await
-            .expect("receipt-only response");
+        let stored = sync_issued_download_token(
+            &tokens,
+            buyer,
+            coordinate,
+            server,
+            recovered.issued_token(),
+        )
+        .await
+        .expect("receipt-only response");
         assert_eq!(stored, None);
         assert_eq!(
             tokens
@@ -6271,9 +6273,10 @@ mod tests {
             "download_token": "fresh-token",
             "token_expires_at": 2_000_000_000i64
         }));
-        let stored = store_issued_purchase_token(&tokens, buyer, coordinate, server, &issued)
-            .await
-            .expect("token response");
+        let stored =
+            sync_issued_download_token(&tokens, buyer, coordinate, server, issued.issued_token())
+                .await
+                .expect("token response");
         assert_eq!(stored, Some(("fresh-token".to_string(), 2_000_000_000)));
         let saved = tokens
             .valid_token(buyer, coordinate, server, 0)
@@ -6283,15 +6286,27 @@ mod tests {
         assert_eq!(saved.token, "fresh-token");
 
         // A token cached for another server is unaffected below.
-        store_issued_purchase_token(&tokens, buyer, coordinate, "https://other.test", &issued)
-            .await
-            .expect("other server token");
+        sync_issued_download_token(
+            &tokens,
+            buyer,
+            coordinate,
+            "https://other.test",
+            issued.issued_token(),
+        )
+        .await
+        .expect("other server token");
 
         // A later receipt-only retry invalidates the cached token for this
         // buyer, game and server: the server declined to renew it.
-        let stored = store_issued_purchase_token(&tokens, buyer, coordinate, server, &recovered)
-            .await
-            .expect("receipt-only response");
+        let stored = sync_issued_download_token(
+            &tokens,
+            buyer,
+            coordinate,
+            server,
+            recovered.issued_token(),
+        )
+        .await
+        .expect("receipt-only response");
         assert_eq!(stored, None);
         assert_eq!(
             tokens
