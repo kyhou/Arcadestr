@@ -550,7 +550,7 @@ mod tests {
 
     use super::generate_login_qr;
     use super::handle_nip46_connect_event;
-    use crate::signers::{load_or_create_client_keys, reset_client_keys, set_keys_dir};
+    use crate::signers::{load_or_create_client_keys, reset_client_keys};
     use crate::test_helpers::nip46_mocks::MockNip46Relay;
     use nostr::{Event, EventBuilder, Keys, Kind, SecretKey};
 
@@ -579,12 +579,16 @@ mod tests {
 
     #[tokio::test]
     async fn nostrconnect_client_pubkey_not_derived_from_stored_key_material() {
-        let temp_dir = tempfile::tempdir().expect("tempdir creation must succeed");
-        set_keys_dir(temp_dir.path().to_path_buf());
-
-        reset_client_keys().expect("reset_client_keys must succeed");
-        let (stored_client_keys, _) =
-            load_or_create_client_keys().expect("load_or_create_client_keys must succeed");
+        // The key directory is process-global; share it and hold its lock for
+        // the synchronous key operations only. `generate_login_qr` does not
+        // read the persisted key, so the lock is released before awaiting.
+        let stored_client_keys = {
+            let _guard = crate::signers::nip46_test_keys::lock();
+            reset_client_keys().expect("reset_client_keys must succeed");
+            load_or_create_client_keys()
+                .expect("load_or_create_client_keys must succeed")
+                .0
+        };
 
         let (uri, _app_keys, _secret) = generate_login_qr(None)
             .await

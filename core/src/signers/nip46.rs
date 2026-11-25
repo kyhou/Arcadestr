@@ -813,22 +813,13 @@ mod tests {
         assert!(matches!(unrelated, super::SignerError::SigningFailed(_)));
     }
     use super::*;
-    use std::sync::{Mutex, Once};
-
-    static INIT: Once = Once::new();
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn setup_test_keys_dir() {
-        INIT.call_once(|| {
-            let temp_dir = std::env::temp_dir().join("arcadestr_test_keys");
-            let _ = std::fs::remove_dir_all(&temp_dir);
-            let _ = std::fs::create_dir_all(&temp_dir);
-            set_keys_dir(temp_dir);
-        });
+        super::test_keys::ensure_dir();
     }
 
     fn lock_nip46_test_state() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().expect("nip46 test lock mutex poisoned")
+        super::test_keys::lock()
     }
 
     #[test]
@@ -935,5 +926,37 @@ mod tests {
         // Check all URIs are unique (different keypairs = different pubkeys in URI)
         let unique_uris: std::collections::HashSet<_> = uris.iter().collect();
         assert_eq!(uris.len(), unique_uris.len());
+    }
+}
+
+/// Test-only access to the process-global NIP-46 client key directory.
+///
+/// `set_keys_dir` sets a process-wide `OnceLock`, so every test in this crate
+/// that touches the persisted client key must use this one directory and
+/// hold [`lock`] while it reads, resets or writes the key. A test that set its
+/// own directory would race the others for the `OnceLock` and could leave the
+/// global pointing at a deleted directory.
+#[cfg(test)]
+pub(crate) mod test_keys {
+    use std::sync::{Mutex, MutexGuard, Once};
+
+    static INIT: Once = Once::new();
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    /// Points the global key directory at the shared test directory.
+    pub(crate) fn ensure_dir() {
+        INIT.call_once(|| {
+            let dir = std::env::temp_dir().join("arcadestr_test_keys");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::create_dir_all(&dir);
+            super::set_keys_dir(dir);
+        });
+    }
+
+    /// Serializes access to the persisted client key. Synchronous only: do
+    /// not hold the guard across an `.await`.
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        ensure_dir();
+        LOCK.lock().expect("nip46 test key lock poisoned")
     }
 }

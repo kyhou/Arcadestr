@@ -8,6 +8,8 @@
 
 mod local;
 mod nip46;
+#[cfg(test)]
+pub(crate) use nip46::test_keys as nip46_test_keys;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod lazy_nip46;
