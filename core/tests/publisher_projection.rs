@@ -197,20 +197,29 @@ async fn additive_projection_migration_preserves_existing_rows_and_allows_verifi
     // Recreate a complete version-24 database in this isolated DB: roll back
     // every later migration's schema and identity row, so the unchanged
     // identity validation sees a consistent pre-25 ledger.
-    for rollback in [
+    // One rollback per migration after 24, newest first (028 down to 025).
+    let rollbacks = [
+        "DROP TABLE refund_address_preferences",
         "DROP TABLE profile_metadata_events",
         "DROP TABLE quote_initiations",
         "ALTER TABLE marketplace_listings DROP COLUMN campaigns_json",
-    ] {
+    ];
+    for rollback in rollbacks {
         sqlx::query(rollback)
             .execute(db.pool())
             .await
             .expect("pre-25 schema");
     }
-    sqlx::query("DELETE FROM schema_migrations WHERE version > 24")
+    let removed = sqlx::query("DELETE FROM schema_migrations WHERE version > 24")
         .execute(db.pool())
         .await
-        .expect("pre-25 ledger");
+        .expect("pre-25 ledger")
+        .rows_affected();
+    assert_eq!(
+        removed,
+        rollbacks.len() as u64,
+        "every migration after 24 needs a schema rollback in this fixture"
+    );
     let (latest,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM schema_migrations")
         .fetch_one(db.pool())
         .await
