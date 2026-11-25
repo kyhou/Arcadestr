@@ -34,11 +34,22 @@ binary alone does not rebuild the frontend. Tauri configuration is under
 | Whitespace validation | `git diff --check` |
 | Frontend target checks | `./scripts/check-frontend-targets.sh` |
 
-Run focused checks first. Cross-repository tests require the `adp-server` checkout
-beside Arcadestr because test dependencies use sibling paths. For the standalone
-acceptance crate and network-dependent scenarios, follow
-[tests/gate7_crossflow/README.md](tests/gate7_crossflow/README.md) and
-[scripts/README.md](scripts/README.md).
+Run focused checks first. None of the commands above need the `adp-server`
+repository.
+
+## Cross-implementation (adp-server) Tests
+
+| Task | Command |
+|---|---|
+| All interop suites at the pinned adp-server revision | `scripts/interop-test` |
+| Real adp-server process over HTTP/Nostr only | `scripts/interop-test black-box` |
+| Gate 7 acceptance flows | `scripts/interop-test crossflow` |
+| Compile regtest drivers and run their unit tests | `scripts/interop-test regtest-harness` |
+
+These suites use independent Cargo workspaces and need adp-server checked out
+beside Arcadestr at the revision in `tests/interop/adp-server.rev`
+(`--fetch` clones it). Follow [tests/interop/README.md](tests/interop/README.md);
+for Lightning regtest scenarios, see [scripts/README.md](scripts/README.md).
 
 ## Debugging and Analysis
 

@@ -29,6 +29,20 @@ The [corrected Gate 3 scope](regtest-gate3-arcadestr-scope.md) owns purchase saf
 in Arcadestr, abandons the wallet fork, and keeps all live spending/configuration paused.
 Do **not** use the data-clearing script below to repair this environment.
 
+### interop-test
+
+```bash
+./scripts/interop-test                 # black-box, crossflow, regtest-harness
+./scripts/interop-test black-box --fetch
+./scripts/interop-test --help
+```
+
+Runs the explicit cross-implementation suites against the adp-server reference
+implementation at the revision pinned in `tests/interop/adp-server.rev`. It
+needs adp-server checked out beside Arcadestr; `--fetch` clones it when absent,
+and an existing checkout is never modified. Ordinary Arcadestr builds and tests
+do not use it. See [tests/interop/README.md](../tests/interop/README.md).
+
 ### clear-arcadestr-data
 
 Wipes every local Arcadestr trace so the app starts from a clean state: databases and master key in `~/.local/share/arcadestr`, installed games/retained packages/webview cache in `~/.local/share/com.arcadestr.app`, archive-selection caches in `~/.cache/arcadestr`, any legacy `~/.config/arcadestr`, and the signer/NWC secrets in the OS keyring (`arcadestr-auth`, `arcadestr-nip49`, `arcadestr-nwc`). Paths honor the `XDG_*` env vars.

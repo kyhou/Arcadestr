@@ -78,6 +78,12 @@ The web target requires a NIP-07 browser extension for authentication.
 cargo test -p arcadestr-core
 ```
 
+Arcadestr builds and tests on its own. The [adp-server](https://github.com/kyhou/adp-server)
+reference implementation is needed only for the explicitly invoked
+cross-implementation suites (`scripts/interop-test`). These run in
+independent Cargo workspaces against a pinned server revision; see
+[tests/interop/README.md](tests/interop/README.md).
+
 ## Authentication
 
 Arcadestr supports two authentication flows depending on your target:

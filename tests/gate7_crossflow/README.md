@@ -1,15 +1,20 @@
 # Gate 7 cross-repository acceptance fixtures
 
-Run from the Arcadestr root, with the `adp-server` repository beside Arcadestr:
+This is an independent Cargo workspace, outside Arcadestr's ordinary workspace.
+It needs the `adp-server` repository beside Arcadestr at the revision pinned in
+[`tests/interop/adp-server.rev`](../interop/adp-server.rev). Run it through
+the interop runner (see [`tests/interop/README.md`](../interop/README.md)):
 
 ```sh
-cargo test -j 1 --offline --locked \
-  --manifest-path tests/gate7_crossflow/Cargo.toml \
-  --target-dir ../adp-server/target --test crossflow -- \
-  --nocapture --test-threads=1
+scripts/interop-test crossflow    # this file's four acceptance tests
+scripts/interop-test black-box    # real adp-server process, HTTP and Nostr only
 cargo test -j 1 -p arcadestr-core --features native --locked --test quote_initiation
 cargo test -j 1 -p arcadestr-core --features native --locked --lib storage::db::tests
 ```
+
+`tests/black_box.rs` is a separate test target. It spawns the actual
+`adp-server` binary (`ADP_SERVER_BIN`) and imports no server code. The rest of
+this document describes `crossflow`.
 
 This separate test workspace depends on the **actual** core and ADP Server
 crates. It uses actual HTTP routers, persistent server storage, the server's

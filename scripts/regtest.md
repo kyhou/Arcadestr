@@ -22,6 +22,13 @@ All builds use these current local working trees: `Arcadestr` and sibling
 creation, new Nostr identity, or new NWC connection is used. Existing unrelated
 working-tree edits are retained.
 
+Drivers that embed adp-server (`regtest_refunds`, `regtest_gate1`,
+`regtest_gate2*`, and the Gate 3 servers built on `regtest_refunds`) live in the
+independent [`tests/regtest_harness`](../tests/regtest_harness/README.md)
+workspace. They compile against the sibling `../adp-server`, so keep `adp_repo`
+pointed at that same checkout. The script builds them into Arcadestr's
+`target/`. Arcadestr's own workspace never needs adp-server.
+
 ## Commands (Zsh / Arch Linux)
 
 From `Arcadestr`:

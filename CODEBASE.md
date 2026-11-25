@@ -170,11 +170,16 @@ arcadestr/
 ├── xtask/                  # BINARY: reproducible project automation
 │   ├── Cargo.toml
 │   └── src/main.rs         # `frontend-build [--release]`: Trunk build + atomic stamp
-├── .github/workflows/msrv.yml # Rust 1.89 native, Windows, and WASM checks
+├── .github/workflows/msrv.yml # Rust 1.89 native, Windows, and WASM checks; Arcadestr-only checkout
+├── .github/workflows/adp-interop.yml # Cross-implementation suites against the pinned adp-server revision
 ├── scripts/clear_arcadestr_data.sh # Comprehensive local DB/files/cache/keyring reset
+├── scripts/interop-test    # Explicit runner for the adp-server interop suites (verifies the pin)
 ├── tests/fixtures/
 │   ├── a3-launch-profiles/ # Valid and adversarial archive/extraction fixtures
 │   └── launch/fixture.rs   # Launcher process fixture
+├── tests/interop/          # Interop architecture docs and adp-server.rev (pinned server commit)
+├── tests/gate7_crossflow/  # INDEPENDENT workspace: black_box (real server process) + crossflow (in-process router)
+├── tests/regtest_harness/  # INDEPENDENT workspace: regtest drivers embedding adp-server (refunds, Gate 1/2/3)
 ├── .vscode/                # VS Code workspace config and debug launcher
 │   ├── launch.json         # LLDB backend launch and attach configurations
 │   ├── tasks.json          # Build tasks for debugging
@@ -2204,6 +2209,28 @@ cargo test -p arcadestr-desktop
 cargo test -p arcadestr-app
 ```
 
+**Independent builds and interop tests**: The Arcadestr workspace has no Cargo
+dependency on adp-server, whether ordinary, dev-only, optional, a feature or a
+workspace member. Clones build and test with no sibling repository present.
+Cross-implementation coverage lives in two independent Cargo workspaces, each
+with its own `[workspace]` and `Cargo.lock`, that resolve adp-server from
+`../adp-server`:
+
+- `tests/gate7_crossflow` holds the `black_box` and `crossflow` suites.
+  `black_box` spawns the real `adp-server` binary and asserts only through ADP
+  HTTP and Nostr. `crossflow` hosts the server's router in-process.
+- `tests/regtest_harness` holds the Polar regtest drivers that embed the server,
+  inject its settlement clock and decrypt its refund state. The shared
+  `core/examples/regtest_split_purchase.rs` is included by `#[path]`.
+
+```bash
+scripts/interop-test            # all suites at tests/interop/adp-server.rev
+scripts/interop-test black-box  # or: crossflow | regtest-harness; --fetch clones the sibling
+```
+
+`.github/workflows/adp-interop.yml` runs the same suites with adp-server checked
+out at the pinned SHA. `tests/interop/README.md` documents how to move the pin.
+
 **Linting & Formatting**:
 ```bash
 # Format code
@@ -2274,7 +2301,7 @@ dist = "dist"
 public_url = "/"
 ```
 
-`build-support/frontend_fingerprint.rs` hashes tracked app/core/web sources and manifests separately from `web/dist`. The xtask runs Trunk, computes both hashes, and atomically writes `FrontendBuildStamp` to `web/.arcadestr-frontend-build.txt` with build profile and timestamp. `desktop/build.rs` rejects a missing, debug-profile, source-stale, or distribution-stale stamp in release; debug embedded builds compile but print a prominent freshness diagnostic, while `trunk serve` development bypasses embedded assets. The build script also embeds `windows-app-manifest.xml` with `longPathAware=true`, and Tauri bundles the checked-in PNG/ICO icons. `.github/workflows/msrv.yml` reads Rust 1.89 from the workspace and checks native, Windows, xtask, and WASM targets with `--locked`.
+`build-support/frontend_fingerprint.rs` hashes tracked app/core/web sources and manifests separately from `web/dist`. The xtask runs Trunk, computes both hashes, and atomically writes `FrontendBuildStamp` to `web/.arcadestr-frontend-build.txt` with build profile and timestamp. `desktop/build.rs` rejects a missing, debug-profile, source-stale, or distribution-stale stamp in release; debug embedded builds compile but print a prominent freshness diagnostic, while `trunk serve` development bypasses embedded assets. The build script also embeds `windows-app-manifest.xml` with `longPathAware=true`, and Tauri bundles the checked-in PNG/ICO icons. `.github/workflows/msrv.yml` reads Rust 1.89 from the workspace and checks native, Windows, xtask, and WASM targets with `--locked`, from an Arcadestr-only checkout. `.github/workflows/adp-interop.yml` separately checks out adp-server at `tests/interop/adp-server.rev` and runs `scripts/interop-test`.
 
 The desktop manifest additionally carries the native archive/extraction and disk-capacity dependencies, `tauri-plugin-dialog = "2"` for archive selection, and debug-only `tauri-plugin-mcp-bridge`. The app manifest uses unconditional `nostr = "0.44"`, `url = "2"`, `HtmlDialogElement`, and `send_wrapper = "0.6"`; its `web` feature is an empty target marker. `desktop/capabilities/default.json` grants dialog/event and MCP capabilities; only MCP registration is compile-time debug-gated. `web/tailwind.config.js` scans `../app/src/**/*.rs`. Root `opencode.json` excludes generated/build/database artifacts from watching.
 
@@ -2873,6 +2900,7 @@ Marketplace streams no longer use static event names. Inspect the `requestId` ar
 | **Partial relay result** | Signature/filter-verified events retained from an incomplete multi-relay fetch that still returns `FetchIncomplete` and no completion/freshness signal |
 | **Frontend build stamp** | Source fingerprint, distribution fingerprint, profile, and timestamp written only by `arcadestr-xtask frontend-build` |
 | **MSRV** | Minimum supported Rust version, currently 1.89 and checked on native, Windows, and WASM CI jobs |
+| **Interop suite** | Explicit cross-implementation tests against the adp-server reference implementation, in independent workspaces at a pinned server revision (`scripts/interop-test`) |
 | **Blossom policy** | Account-scoped ordered/preferred HTTPS server configuration; debug alone permits explicit loopback HTTP and seeds localhost |
 | **Noir theme** | OKLCH token-based visual system implemented by Tailwind configuration, global CSS, and `UI_V2_STYLES` |
 
