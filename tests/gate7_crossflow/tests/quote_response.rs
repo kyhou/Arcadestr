@@ -113,7 +113,7 @@ async fn dropped_quote_response_reuses_durable_identity_after_restart_without_li
         .lock()
         .expect("local relay store")
         .extend([sale.clone(), terms.clone()]);
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("buyer database");
+    let dir = tempfile::tempdir().expect("buyer database");
     let db_path = dir.path().join("buyer.db");
     let db = Database::new(&db_path).await.expect("fresh DB");
     let repo = SettlementRepository::new(db.pool().clone());

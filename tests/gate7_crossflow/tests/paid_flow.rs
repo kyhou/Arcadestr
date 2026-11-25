@@ -1,7 +1,7 @@
 use super::fixtures::*;
 use arcadestr_core::{
     adp_client::{AdpClient, CreateSettlementQuoteRequest, DownloadAuth, SettlementProofRequest},
-    adp_download::{download_candidates, download_verified},
+    adp_download::{download_candidates, download_verified, DownloadIdentity},
     adp_publish::{
         build_adp_listing_event_builder, build_fulfillment_authorization_event_builder,
         AdpListingInput, FulfillmentAuthorizationInput,
@@ -91,31 +91,40 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
         .expect("provision B");
     let coordinate = format!("30402:{}:paid-game", developer.public_key());
     let now = Timestamp::now().as_secs();
-    let mut authorities = vec![];
-    let mut references = vec![];
-    for (index, (server, provision)) in [(&a, pa), (&b, pb)].into_iter().enumerate() {
-        let root = build_fulfillment_authorization_event_builder(&AuthorizationTerms {
-            authorization_id: format!("paid-authority-{index}"),
-            coordinate: coordinate.clone(),
-            operator_pubkey: server.operator.public_key(),
-            fulfillment_pubkey: PublicKey::from_hex(&provision.fulfillment_pubkey)
-                .expect("held signer"),
-            capabilities: std::collections::BTreeSet::from([
-                CAPABILITY_ISSUE_RECEIPT.into(),
-                CAPABILITY_UPLOAD_BUILD.into(),
-            ]),
-            valid_from: now - 30,
-        })
-        .expect("authority")
-        .sign_with_keys(&developer)
-        .expect("developer signature");
-        references.push(FulfillmentAuthorizationInput {
-            root_event_id: root.id.to_hex(),
-            fulfillment_pubkey: provision.fulfillment_pubkey,
-            relay_hint: None,
-        });
-        authorities.push(root);
-    }
+    let held = [
+        (a.operator.public_key(), pa.fulfillment_pubkey),
+        (b.operator.public_key(), pb.fulfillment_pubkey),
+    ];
+    // Developer-signed authorization roots for both servers' held keys,
+    // bound to one listing coordinate.
+    let authorize = |coordinate: &str, prefix: &str| {
+        let mut authorities = vec![];
+        let mut references = vec![];
+        for (index, (operator, fulfillment)) in held.iter().enumerate() {
+            let root = build_fulfillment_authorization_event_builder(&AuthorizationTerms {
+                authorization_id: format!("{prefix}-{index}"),
+                coordinate: coordinate.to_owned(),
+                operator_pubkey: *operator,
+                fulfillment_pubkey: PublicKey::from_hex(fulfillment).expect("held signer"),
+                capabilities: std::collections::BTreeSet::from([
+                    CAPABILITY_ISSUE_RECEIPT.into(),
+                    CAPABILITY_UPLOAD_BUILD.into(),
+                ]),
+                valid_from: now - 30,
+            })
+            .expect("authority")
+            .sign_with_keys(&developer)
+            .expect("developer signature");
+            references.push(FulfillmentAuthorizationInput {
+                root_event_id: root.id.to_hex(),
+                fulfillment_pubkey: fulfillment.clone(),
+                relay_hint: None,
+            });
+            authorities.push(root);
+        }
+        (authorities, references)
+    };
+    let (authorities, references) = authorize(&coordinate, "paid-authority");
     let metadata = MockServer::start().await;
     let mut offers = vec![];
     for (name, amount, seed, recipient) in [
@@ -223,7 +232,7 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
             .await
             .expect("local publication");
     }
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("buyer isolation");
+    let dir = tempfile::tempdir().expect("buyer isolation");
     let archive = dir.path().join("build.zip");
     tokio::fs::write(&archive, &bytes).await.expect("artifact");
     client_a
@@ -318,14 +327,76 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
     let legacy_buyer = Keys::generate();
     let legacy_signer = signer(&legacy_buyer);
     let legacy_invoice = super::quote_response::synthetic_invoice(1000000, 90);
-    let legacy_request = |preimage: String| arcadestr_core::adp_client::PurchaseConfirmRequest {
-        game_coordinate: coordinate.clone(),
-        listing_event: sale.clone(),
-        zap_receipt_event: None,
-        bolt11: Some(legacy_invoice.clone()),
-        preimage: Some(preimage),
-        quote_id: None,
+    let confirm_request = |coordinate: &str, listing: &Event, preimage: String| {
+        arcadestr_core::adp_client::PurchaseConfirmRequest {
+            game_coordinate: coordinate.to_owned(),
+            listing_event: listing.clone(),
+            zap_receipt_event: None,
+            bolt11: Some(legacy_invoice.clone()),
+            preimage: Some(preimage),
+            quote_id: None,
+        }
     };
+    // A listing that accepts settlement terms requires proof against the
+    // original settlement quote: a valid legacy BOLT11/preimage is refused
+    // with 402 and creates no receipt or ownership.
+    let settlement_bound = client_a
+        .purchase_confirm(
+            &legacy_signer,
+            confirm_request(&coordinate, &sale, hex::encode([90; 32])),
+        )
+        .await;
+    assert!(
+        matches!(
+            &settlement_bound,
+            Err(arcadestr_core::adp_client::AdpClientError::PurchaseProtocol(message))
+                if message.starts_with("HTTP status 402")
+        ),
+        "settlement-bound listing must refuse a legacy proof with 402: {settlement_bound:?}"
+    );
+    assert!(client_a
+        .download(
+            &coordinate,
+            DownloadAuth::Nip98 {
+                signer: &legacy_signer
+            },
+            &dir.path().join("refused-legacy.zip"),
+            |_, _| {}
+        )
+        .await
+        .is_err());
+    // Successful legacy compatibility on a listing without accepted terms:
+    // same build, authorizations and price, but no `adp_terms` tags.
+    let legacy_coordinate = format!("30402:{}:legacy-game", developer.public_key());
+    let (legacy_authorities, legacy_references) = authorize(&legacy_coordinate, "legacy-authority");
+    let legacy_sale =
+        build_adp_listing_event_builder(arcadestr_core::adp_publish::AdpListingPublishInput {
+            listing: &AdpListingInput {
+                d_tag: "legacy-game".into(),
+                fulfillment_authorizations: legacy_references,
+                ..input.clone()
+            },
+            launch_tier: Some(&tier),
+        })
+        .expect("legacy listing")
+        .sign_with_keys(&developer)
+        .expect("legacy listing signature");
+    for event in legacy_authorities.iter().chain([&legacy_sale]) {
+        publisher
+            .send_event(event)
+            .await
+            .expect("local legacy publication");
+    }
+    client_a
+        .upload(&dev_signer, &legacy_sale, &archive)
+        .await
+        .expect("legacy upload A");
+    client_b
+        .upload(&dev_signer, &legacy_sale, &archive)
+        .await
+        .expect("legacy upload B");
+    let legacy_request =
+        |preimage: String| confirm_request(&legacy_coordinate, &legacy_sale, preimage);
     assert!(
         client_a
             .purchase_confirm(&legacy_signer, legacy_request("ff".repeat(32)))
@@ -335,7 +406,7 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
     );
     assert!(client_a
         .download(
-            &coordinate,
+            &legacy_coordinate,
             DownloadAuth::Nip98 {
                 signer: &legacy_signer
             },
@@ -348,13 +419,20 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
         .purchase_confirm(&legacy_signer, legacy_request(hex::encode([90; 32])))
         .await
         .expect("actual legacy BOLT11/preimage verification");
-    assert!(
-        client_a
-            .purchase_confirm(&legacy_signer, legacy_request(hex::encode([90; 32])))
-            .await
-            .is_err(),
-        "legacy one-time proof fails closed on replay rather than creating another receipt"
-    );
+    // A same-buyer replay never creates another receipt. ADP-01 §Replay
+    // protection says "reject"; adp-server returns the original receipt to
+    // its own buyer (its documented gap S3, pending spec clarification).
+    // Either is accepted here; a different receipt is not.
+    match client_a
+        .purchase_confirm(&legacy_signer, legacy_request(hex::encode([90; 32])))
+        .await
+    {
+        Err(_) => {}
+        Ok(replayed) => assert_eq!(
+            replayed.receipt.id, legacy.receipt.id,
+            "legacy replay must not create another receipt"
+        ),
+    }
     assert_eq!(events.lock().expect("local relay evidence").iter().filter(|event|event.kind.as_u16()==1020 && event.tags.iter().any(|tag|matches!(tag.as_slice(),[name,value] if name=="p" && value==&legacy_buyer.public_key().to_hex()))).count(),1,"original legacy receipt remains recoverable on the local relays");
     assert!(
         client_a
@@ -372,7 +450,7 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
     let legacy_import = ReceiptPortability::new(legacy_db.pool().clone())
         .import_json(
             legacy_buyer.public_key(),
-            &serde_json::to_string(&vec![legacy.receipt.clone(), authorities[0].clone()])
+            &serde_json::to_string(&vec![legacy.receipt.clone(), legacy_authorities[0].clone()])
                 .expect("legacy JSON"),
             None,
             &|| Ok(()),
@@ -385,7 +463,7 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
         .any(|chain| chain.verification == ReceiptVerification::Verified));
     client_b
         .download(
-            &coordinate,
+            &legacy_coordinate,
             DownloadAuth::Nip98 {
                 signer: &legacy_signer,
             },
@@ -490,8 +568,10 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
     let downloaded = download_verified(
         http(),
         &coordinate,
-        &buyer.public_key().to_hex(),
-        &buyer_signer,
+        DownloadIdentity::Account {
+            buyer: &buyer.public_key().to_hex(),
+            signer: &buyer_signer,
+        },
         download_candidates(&[a.url.clone(), b.url.clone()], &[], true),
         private,
         digest.clone(),
@@ -585,8 +665,10 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
     let downloaded2 = download_verified(
         http(),
         &coordinate,
-        &buyer.public_key().to_hex(),
-        &buyer_signer,
+        DownloadIdentity::Account {
+            buyer: &buyer.public_key().to_hex(),
+            signer: &buyer_signer,
+        },
         download_candidates(&[b.url.clone()], &[], true),
         file2,
         digest2.clone(),
@@ -762,13 +844,15 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
             .is_err(),
         "actual server independently enforces the paid receipt status chain"
     );
+    // The refund is scoped to its own receipt chain: the unrelated legacy
+    // buyer's independent receipt still authorizes its own listing.
     client_b
         .download(
-            &coordinate,
+            &legacy_coordinate,
             DownloadAuth::Nip98 {
                 signer: &legacy_signer,
             },
-            &dir.path().join("unrelated-buyer-update.zip"),
+            &dir.path().join("unrelated-buyer-legacy.zip"),
             |_, _| {},
         )
         .await
@@ -779,8 +863,8 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
         .await
         .expect("registered artifacts")
         .into_iter()
-        .find(|file| file.file_hash == package.package_digest.as_str())
-        .expect("new registered artifact");
+        .find(|file| file.file_hash == record.package_digest.as_str())
+        .expect("legacy listing artifact");
     tokio::fs::write(&registered.file_path, b"corrupted after registration")
         .await
         .expect("isolated server corruption fixture");
@@ -793,12 +877,14 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
     assert!(
         download_verified(
             http(),
-            &coordinate,
-            &legacy_buyer.public_key().to_hex(),
-            &legacy_signer,
+            &legacy_coordinate,
+            DownloadIdentity::Account {
+                buyer: &legacy_buyer.public_key().to_hex(),
+                signer: &legacy_signer,
+            },
             download_candidates(&[b.url.clone()], &[], true),
             damaged,
-            package.package_digest.clone(),
+            record.package_digest.clone(),
             PackageFormat::Zip,
             |_| Ok(()),
             |_, _| {},

@@ -117,7 +117,7 @@ pub struct Server {
 }
 impl Server {
     pub async fn start(relays: &[String]) -> Self {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("private server");
+        let dir = tempfile::tempdir().expect("private server");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("HTTP listener");

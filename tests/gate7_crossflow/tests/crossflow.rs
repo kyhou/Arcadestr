@@ -72,12 +72,16 @@ async fn publisher_registration_public_and_timed_access_use_actual_servers_and_n
     );
     let info = client_a.well_known().await.expect("operator metadata");
     assert_eq!(info.pubkey, a.operator.public_key().to_hex());
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("buyer files");
+    // Actual server that no listing names in its `server` tags.
+    let unlisted = Server::start(&relays).await;
+    let dir = tempfile::tempdir().expect("buyer files");
     let bytes = b"synthetic game build";
     let path = dir.path().join("build.zip");
     tokio::fs::write(&path, bytes).await.expect("artifact");
+    let file_hash = hex::encode(Sha256::digest(bytes));
     for (id, policy, allowed) in [
         ("public", AcquisitionPolicy::Public, true),
+        ("gated", AcquisitionPolicy::Gated, false),
         (
             "timed",
             AcquisitionPolicy::TimedAccess {
@@ -168,13 +172,54 @@ async fn publisher_registration_public_and_timed_access_use_actual_servers_and_n
                 bytes
             );
         }
-        let anonymous = reqwest::get(format!("{}/game/{}", a.url, coordinate.replace(':', "%3A")))
+        // ADP-01 §Access evaluation: public and active timed access serve
+        // anonymous requests; gated, expired and upcoming policies grant no
+        // anonymous access and answer 401.
+        let game_path = format!("/game/{}", coordinate.replace(':', "%3A"));
+        let anonymous = reqwest::get(format!("{}{game_path}", a.url))
             .await
             .expect("anonymous local request");
+        if allowed {
+            assert_eq!(
+                anonymous.status(),
+                reqwest::StatusCode::OK,
+                "{id}: explicit policy serves anonymous downloads"
+            );
+            let body = anonymous.bytes().await.expect("anonymous archive");
+            assert_eq!(&body[..], bytes, "{id}: anonymous archive bytes");
+            assert_eq!(
+                hex::encode(Sha256::digest(&body)),
+                file_hash,
+                "{id}: anonymous archive matches the signed file hash"
+            );
+        } else {
+            assert_eq!(
+                anonymous.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "{id}: policy grants no anonymous access"
+            );
+        }
+        // An invalid NIP-98 token is rejected, never downgraded to anonymous.
+        let forged = reqwest::Client::new()
+            .get(format!("{}{game_path}", a.url))
+            .header("Authorization", "Nostr bm90LWEtbmlwOTgtZXZlbnQ=")
+            .send()
+            .await
+            .expect("forged-auth local request");
         assert_eq!(
-            anonymous.status(),
+            forged.status(),
             reqwest::StatusCode::UNAUTHORIZED,
-            "public/timed policy does not silently enable anonymous transport"
+            "{id}: invalid NIP-98 is not treated as anonymous"
+        );
+        // Distribution authorization applies to every access basis: a server
+        // absent from the listing's `server` tags never serves it (451).
+        let foreign = reqwest::get(format!("{}{game_path}", unlisted.url))
+            .await
+            .expect("unlisted-server request");
+        assert_eq!(
+            foreign.status(),
+            reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            "{id}: unlisted server must not serve"
         );
         assert!(b
             .storage
@@ -182,6 +227,29 @@ async fn publisher_registration_public_and_timed_access_use_actual_servers_and_n
             .await
             .expect("server B artifact query")
             .iter()
-            .any(|f| f.file_hash == hex::encode(Sha256::digest(bytes))));
+            .any(|f| f.file_hash == file_hash));
     }
+
+    // Hosted-file integrity applies to anonymous policy access too: once
+    // server B's stored bytes no longer match the signed hash, it must not
+    // serve them.
+    let stored = b
+        .storage
+        .file_path_for_hash(&file_hash)
+        .await
+        .expect("server B file lookup")
+        .expect("server B hosts the artifact");
+    tokio::fs::write(&stored, b"tampered game build")
+        .await
+        .expect("corrupt server B copy");
+    let coordinate = format!("30402:{}:public", developer.public_key());
+    let tampered = reqwest::get(format!("{}/game/{}", b.url, coordinate.replace(':', "%3A")))
+        .await
+        .expect("anonymous request to corrupted server");
+    assert!(
+        !tampered.status().is_success(),
+        "corrupted hosted file must not be served anonymously"
+    );
+    let body = tampered.bytes().await.expect("error body");
+    assert_ne!(&body[..], b"tampered game build");
 }

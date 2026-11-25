@@ -161,7 +161,7 @@ async fn actual_nostr_store_page_claim_cancel_and_independent_grant_revocation()
             .await
             .expect("local signed publication");
     }
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("separate databases");
+    let dir = tempfile::tempdir().expect("separate databases");
     let artifact = dir.path().join("build.zip");
     tokio::fs::write(&artifact, bytes).await.expect("artifact");
     client
