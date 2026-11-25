@@ -109,7 +109,6 @@ pub async fn relay(events: Events) -> (String, Task) {
 
 pub struct Server {
     pub url: String,
-    pub state: AppState,
     pub operator: Keys,
     pub storage: Storage,
     pub _dir: tempfile::TempDir,
@@ -157,7 +156,7 @@ impl Server {
             keystore: Arc::new(keystore),
             relay: Arc::new(relay),
         };
-        let router = adp_server::routes::router(state.clone());
+        let router = adp_server::routes::router(state);
         let task = Task(tokio::spawn(async move {
             axum::serve(listener, router)
                 .await
@@ -165,7 +164,6 @@ impl Server {
         }));
         Self {
             url,
-            state,
             operator,
             storage,
             _dir: dir,
