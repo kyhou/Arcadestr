@@ -988,16 +988,15 @@ impl ExtendedNetworkRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn create_test_repo() -> (ExtendedNetworkRepository, Arc<SocialGraphDb>, PathBuf) {
+    /// The returned `TempDir` owns the database directory; keep it alive.
+    fn create_test_repo() -> (ExtendedNetworkRepository, Arc<SocialGraphDb>, TempDir) {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("social.db");
         let social_graph = Arc::new(SocialGraphDb::new(&db_path).unwrap());
-        let temp_path = temp.keep();
         let repo = ExtendedNetworkRepository::new(social_graph.clone());
-        (repo, social_graph, temp_path)
+        (repo, social_graph, temp)
     }
 
     #[test]

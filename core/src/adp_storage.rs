@@ -2189,8 +2189,7 @@ mod tests {
     }
 
     async fn test_db() -> Database {
-        let path =
-            std::env::temp_dir().join(format!("arcadestr-adp-storage-{}.db", uuid::Uuid::new_v4()));
+        let path = crate::test_helpers::scratch::scratch_path("arcadestr-adp-storage", "db");
         Database::new(&path)
             .await
             .expect("test database should open")
@@ -3432,13 +3431,7 @@ mod tests {
 
     #[tokio::test]
     async fn retained_reinstall_snapshot_round_trips_after_database_restart() {
-        let path = std::env::temp_dir().join(format!(
-            "arcadestr-retained-restart-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
-        ));
+        let path = crate::test_helpers::scratch::scratch_path("arcadestr-retained-restart", "db");
         let installation = installation("retained-restart", InstallationState::Installing);
         let package = RetainedPackage {
             game_coordinate: installation.game_coordinate.clone(),

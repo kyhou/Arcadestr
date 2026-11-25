@@ -78,6 +78,8 @@ mod receipt_commands;
 mod settlement_ui;
 mod startup_runtime;
 mod store_page_commands;
+#[cfg(test)]
+mod test_scratch;
 
 use arcadestr_app::models::GameListing as AppGameListing;
 use command_contracts::{
@@ -3782,14 +3784,9 @@ mod install_game_tests {
             .expect("test database should open")
     }
 
+    /// A fresh path removed with this test's scratch directory.
     fn unique_test_path(prefix: &str, extension: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "{prefix}-{}.{extension}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after epoch")
-                .as_nanos()
-        ))
+        crate::test_scratch::scratch_path(prefix, extension)
     }
 
     async fn app_state_with_http(
@@ -3821,14 +3818,8 @@ mod install_game_tests {
         let mut auth = AuthState::new();
         auth.connect_with_key(&buyer.secret_key().to_secret_hex())
             .expect("test buyer should authenticate");
-        let relay_cache = Arc::new(
-            RelayCache::new(unique_test_path("install-game-relay-cache", "db"))
-                .expect("relay cache should open"),
-        );
-        let relay_hints = Arc::new(
-            RelayHints::new(unique_test_path("install-game-relay-hints", "db"))
-                .expect("relay hints should open"),
-        );
+        let relay_cache = Arc::new(RelayCache::new(":memory:").expect("relay cache should open"));
+        let relay_hints = Arc::new(RelayHints::new(":memory:").expect("relay hints should open"));
         let marketplace_cache = Arc::new(MarketplaceCache::new(database.pool().clone()));
         let purchases = Arc::new(arcadestr_core::purchases::PurchasesRepository::new(
             database.pool().clone(),

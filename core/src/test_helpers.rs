@@ -2,3 +2,4 @@
 
 pub mod http_mocks;
 pub mod nip46_mocks;
+pub mod scratch;

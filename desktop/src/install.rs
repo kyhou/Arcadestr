@@ -1579,7 +1579,7 @@ mod tests {
 
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::Instant;
 
     use arcadestr_core::adp_storage::{
         InstallationProfile, InstallationState, ManifestEntryType, ProfileAvailability,
@@ -1594,14 +1594,9 @@ mod tests {
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use tempfile::TempDir;
 
+    /// A fresh directory path removed with this test's scratch directory.
     fn unique_test_dir(test_name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "arcadestr-desktop-install-{test_name}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after epoch")
-                .as_nanos()
-        ))
+        crate::test_scratch::scratch_path(&format!("arcadestr-desktop-install-{test_name}"), "dir")
     }
 
     #[test]

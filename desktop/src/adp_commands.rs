@@ -8726,13 +8726,7 @@ mod tests {
     }
 
     async fn test_db() -> Database {
-        let path = std::env::temp_dir().join(format!(
-            "arcadestr-adp-command-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after epoch")
-                .as_nanos()
-        ));
+        let path = crate::test_scratch::scratch_path("arcadestr-adp-command", "db");
         Database::new(&path)
             .await
             .expect("test database should open")
@@ -8849,13 +8843,7 @@ mod tests {
     }
 
     fn unique_test_path(prefix: &str, extension: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "{prefix}-{}.{extension}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after epoch")
-                .as_nanos()
-        ))
+        crate::test_scratch::scratch_path(prefix, extension)
     }
 
     fn live_relays_from_env() -> Vec<String> {
