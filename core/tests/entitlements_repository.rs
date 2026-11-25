@@ -19,7 +19,7 @@ fn tag(values: &[&str]) -> Tag {
 
 #[tokio::test]
 async fn gate7_independent_buyer_reconciles_developer_revocation() {
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("isolated databases");
+    let dir = tempfile::tempdir().expect("isolated databases");
     let publisher_db = Database::new(&dir.path().join("publisher.db"))
         .await
         .expect("publisher");

@@ -58,7 +58,7 @@ async fn gate7_historical_campaign_and_delegation_survive_cancellation_but_allow
         adp_protocol::FULFILLMENT_AUTHORIZATION_KIND,
         authorization::{resolve_authorization_at, CAPABILITY_ISSUE_GRANT},
     };
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("directory");
+    let dir = tempfile::tempdir().expect("directory");
     let db = Database::new(&dir.path().join("buyer.db"))
         .await
         .expect("db");
@@ -206,7 +206,7 @@ async fn gate7_paid_ownership_other_grants_and_other_accounts_are_untouched() {
     use arcadestr_core::{
         receipt_portability::ReceiptPortability, receipt_sync_contract::ReceiptVerification,
     };
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("directory");
+    let dir = tempfile::tempdir().expect("directory");
     let db = Database::new(&dir.path().join("buyer.db"))
         .await
         .expect("db");
@@ -384,7 +384,7 @@ async fn gate7_adversarial_revocation_batches_never_invent_or_remove_ownership()
         "valid-partial",
         "valid-duplicates",
     ] {
-        let dir = tempfile::tempdir_in("/tmp/opencode").expect("db directory");
+        let dir = tempfile::tempdir().expect("db directory");
         let db = Database::new(&dir.path().join("buyer.db"))
             .await
             .expect("database");
@@ -583,7 +583,7 @@ impl EntitlementSource for DelayedEvidence {
 
 #[tokio::test]
 async fn gate7_delayed_old_snapshot_cannot_restore_a_concurrently_revoked_grant() {
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("directory");
+    let dir = tempfile::tempdir().expect("directory");
     let db = Database::new(&dir.path().join("buyer.db"))
         .await
         .expect("database");
@@ -663,7 +663,7 @@ impl EntitlementSource for SwitchingSource {
 #[tokio::test]
 async fn gate7_session_changes_and_precommit_cancellation_rollback_reconciliation() {
     use arcadestr_core::settlement_recovery::RecoveryCoordinator;
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("directory");
+    let dir = tempfile::tempdir().expect("directory");
     let db = Database::new(&dir.path().join("buyer.db"))
         .await
         .expect("db");

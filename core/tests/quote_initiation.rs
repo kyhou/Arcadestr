@@ -4,7 +4,7 @@ use nostr::Keys;
 
 #[tokio::test]
 async fn initiation_is_durable_bound_and_account_and_processor_scoped() {
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("directory");
+    let dir = tempfile::tempdir().expect("directory");
     let path = dir.path().join("buyer.db");
     let db = Database::new(&path).await.expect("DB");
     let repo = SettlementRepository::new(db.pool().clone());
@@ -119,7 +119,7 @@ async fn initiation_is_durable_bound_and_account_and_processor_scoped() {
 
 #[tokio::test]
 async fn concurrent_reservations_never_allocate_two_remote_identities() {
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("directory");
+    let dir = tempfile::tempdir().expect("directory");
     let db = Database::new(&dir.path().join("db")).await.expect("DB");
     let repo = SettlementRepository::new(db.pool().clone());
     let buyer = Keys::generate().public_key().to_hex();
@@ -169,7 +169,7 @@ async fn concurrent_reservations_never_allocate_two_remote_identities() {
 
 #[tokio::test]
 async fn only_a_completed_local_receipt_checkpoint_permits_a_new_initiation() {
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("directory");
+    let dir = tempfile::tempdir().expect("directory");
     let db = Database::new(&dir.path().join("db")).await.expect("DB");
     let repo = SettlementRepository::new(db.pool().clone());
     let buyer = Keys::generate().public_key().to_hex();

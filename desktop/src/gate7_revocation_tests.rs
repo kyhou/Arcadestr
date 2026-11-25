@@ -9,7 +9,7 @@ async fn gate7_native_independent_revocation_reconnect_restart_and_download_deni
         purchases::PurchasesRepository,
         storage::Database,
     };
-    let temp = tempfile::tempdir_in("/tmp/opencode").expect("isolated root");
+    let temp = tempfile::tempdir().expect("isolated root");
     let publisher_db = Database::new(&temp.path().join("publisher.db"))
         .await
         .expect("publisher DB");
@@ -159,7 +159,7 @@ async fn gate7_campaignless_grant_discovery_and_revocation_across_clients() {
         ownership::{DurableCredentialStatus, OwnershipService},
         purchases::PurchasesRepository,
     };
-    let temp = tempfile::tempdir_in("/tmp/opencode").expect("isolated root");
+    let temp = tempfile::tempdir().expect("isolated root");
     let events: Events = Arc::new(Mutex::new(vec![]));
     let (url, _relay) = relay(events.clone()).await;
     let http: Arc<dyn HttpClient> = Arc::new(IsolatedHttp {
@@ -323,7 +323,7 @@ async fn gate7_campaignless_grant_discovery_and_revocation_across_clients() {
 /// checkout quorum. Loopback relays only.
 #[tokio::test]
 async fn publisher_nip65_write_relay_is_preferred_without_counting_as_evidence() {
-    let temp = tempfile::tempdir_in("/tmp/opencode").expect("isolated root");
+    let temp = tempfile::tempdir().expect("isolated root");
     let configured: Events = Arc::new(Mutex::new(vec![]));
     let outbox: Events = Arc::new(Mutex::new(vec![]));
     let (configured_url, _configured) = relay(configured.clone()).await;

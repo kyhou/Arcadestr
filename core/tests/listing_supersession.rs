@@ -17,7 +17,7 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
-    let dir = tempfile::tempdir_in("/tmp/opencode").expect("directory");
+    let dir = tempfile::tempdir().expect("directory");
     let db = Database::new(&dir.path().join("buyer.db"))
         .await
         .expect("DB");

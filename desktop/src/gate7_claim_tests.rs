@@ -38,7 +38,7 @@ impl HttpClient for ClaimHttp {
 }
 
 async fn claim_response_case(transition: &str) {
-    let temp = tempfile::tempdir_in("/tmp/opencode").expect("isolated claim root");
+    let temp = tempfile::tempdir().expect("isolated claim root");
     let developer = Keys::generate();
     let buyer = Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
         .expect("synthetic buyer");

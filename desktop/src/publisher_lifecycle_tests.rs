@@ -489,7 +489,7 @@ mod isolated_lifecycle {
 
     #[tokio::test]
     async fn gate6_native_publisher_lifecycle_isolated_end_to_end() {
-        let temp = tempfile::tempdir_in("/tmp/opencode").expect("isolated root");
+        let temp = tempfile::tempdir().expect("isolated root");
         let db_path = temp.path().join("publisher.db");
         let events: Events = Arc::new(Mutex::new(Vec::new()));
         let (relay_one, _relay_one) = relay(events.clone()).await;
