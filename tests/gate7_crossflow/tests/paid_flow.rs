@@ -373,7 +373,7 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
         build_adp_listing_event_builder(arcadestr_core::adp_publish::AdpListingPublishInput {
             listing: &AdpListingInput {
                 d_tag: "legacy-game".into(),
-                fulfillment_authorizations: legacy_references,
+                fulfillment_authorizations: legacy_references.clone(),
                 ..input.clone()
             },
             launch_tier: Some(&tier),
@@ -431,14 +431,18 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
         retried.receipt, legacy.receipt,
         "retry returns the original signed receipt unchanged"
     );
+    let (retry_token, _) = retried
+        .issued_token()
+        .expect("an entitled, distributed retry carries a fresh token");
     assert_ne!(
-        retried.download_token, legacy.download_token,
+        Some(retry_token),
+        legacy.issued_token().map(|(token, _)| token),
         "retry token is freshly issued"
     );
     client_a
         .download(
             &legacy_coordinate,
-            DownloadAuth::Token(retried.download_token.clone()),
+            DownloadAuth::Token(retry_token.to_owned()),
             &dir.path().join("retry-token.zip"),
             |_, _| {},
         )
@@ -559,6 +563,52 @@ async fn aggregate_paid_receipt_discovery_portability_actual_server_failover_and
         )
         .await
         .expect("actual other-server legacy receipt ownership");
+    // Receipt recovery is independent of download authorization: once the
+    // publisher drops server A, a retry there still returns the original
+    // receipt, but without a token. Server B, still listed, keeps serving.
+    let narrowed =
+        build_adp_listing_event_builder(arcadestr_core::adp_publish::AdpListingPublishInput {
+            listing: &AdpListingInput {
+                d_tag: "legacy-game".into(),
+                servers: vec![b.url.clone()],
+                fulfillment_authorizations: legacy_references,
+                ..input.clone()
+            },
+            launch_tier: Some(&tier),
+        })
+        .expect("narrowed legacy listing")
+        .custom_created_at(Timestamp::from_secs(legacy_sale.created_at.as_secs() + 1))
+        .sign_with_keys(&developer)
+        .expect("narrowed listing signature");
+    publisher
+        .send_event(&narrowed)
+        .await
+        .expect("local narrowed listing publication");
+    let recovered = client_a
+        .purchase_confirm(&legacy_signer, legacy_request(hex::encode([90; 32])))
+        .await
+        .expect("receipt recovery survives withdrawn distribution");
+    assert_eq!(
+        recovered.receipt, legacy.receipt,
+        "original receipt recovered"
+    );
+    assert_eq!(
+        recovered.issued_token(),
+        None,
+        "no download authorization from a server the listing no longer names"
+    );
+    assert_eq!(legacy_receipts(), vec![legacy.receipt.id]);
+    client_b
+        .download(
+            &legacy_coordinate,
+            DownloadAuth::Nip98 {
+                signer: &legacy_signer,
+            },
+            &dir.path().join("legacy-still-distributed.zip"),
+            |_, _| {},
+        )
+        .await
+        .expect("the still-listed server keeps serving the owner");
     assert!(
         client_b
             .download(
