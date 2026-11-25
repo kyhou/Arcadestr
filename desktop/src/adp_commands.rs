@@ -4018,8 +4018,9 @@ async fn persist_purchase_confirmation(
 }
 
 /// Stores the download token a purchase confirmation issued, if any, and
-/// returns it. A receipt-only response stores nothing; any token previously
-/// stored for this buyer, game and server is left to its own expiry.
+/// returns it. A receipt-only response means the server declined to renew
+/// download authorization, so any token cached for this buyer, game and
+/// server is deleted rather than reused until it expires.
 async fn store_issued_purchase_token(
     tokens: &DownloadTokensRepository,
     buyer_pubkey: &str,
@@ -4028,6 +4029,10 @@ async fn store_issued_purchase_token(
     response: &CorePurchaseConfirmResponse,
 ) -> Result<Option<(String, i64)>, String> {
     let Some((token, expires_at)) = response.issued_token() else {
+        tokens
+            .delete(buyer_pubkey, game_coordinate, server_url)
+            .await
+            .map_err(|err| err.to_string())?;
         return Ok(None);
     };
     tokens
@@ -6277,16 +6282,30 @@ mod tests {
             .expect("stored token");
         assert_eq!(saved.token, "fresh-token");
 
-        // A later receipt-only retry neither overwrites nor clears it.
-        store_issued_purchase_token(&tokens, buyer, coordinate, server, &recovered)
+        // A token cached for another server is unaffected below.
+        store_issued_purchase_token(&tokens, buyer, coordinate, "https://other.test", &issued)
+            .await
+            .expect("other server token");
+
+        // A later receipt-only retry invalidates the cached token for this
+        // buyer, game and server: the server declined to renew it.
+        let stored = store_issued_purchase_token(&tokens, buyer, coordinate, server, &recovered)
             .await
             .expect("receipt-only response");
-        let saved = tokens
-            .valid_token(buyer, coordinate, server, 0)
+        assert_eq!(stored, None);
+        assert_eq!(
+            tokens
+                .valid_token(buyer, coordinate, server, 0)
+                .await
+                .expect("token lookup"),
+            None,
+            "declined authorization is not reused"
+        );
+        assert!(tokens
+            .valid_token(buyer, coordinate, "https://other.test", 0)
             .await
             .expect("token lookup")
-            .expect("token kept");
-        assert_eq!(saved.token, "fresh-token");
+            .is_some());
     }
 
     struct CountingSigner {
