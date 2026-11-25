@@ -868,11 +868,14 @@ pub struct ConfirmPurchaseRequest {
     pub preimage: String,
 }
 
+/// The confirmed receipt, plus a download token only when the server issued
+/// one. A retry of an accepted purchase can recover the receipt without
+/// current download authorization (ADP-01 §Replay protection).
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfirmPurchaseResponse {
     pub receipt: nostr::Event,
-    pub download_token: String,
-    pub token_expires_at: i64,
+    pub download_token: Option<String>,
+    pub token_expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3997,23 +4000,47 @@ async fn persist_purchase_confirmation(
         authorization.as_ref(),
     )
     .await?;
-    let tokens = DownloadTokensRepository::new(state.database.pool().clone());
+    // The receipt is archived above regardless of download authorization.
+    let issued = store_issued_purchase_token(
+        &DownloadTokensRepository::new(state.database.pool().clone()),
+        buyer_pubkey,
+        game_coordinate,
+        server_url,
+        &response,
+    )
+    .await?;
+
+    Ok(ConfirmPurchaseResponse {
+        receipt: response.receipt,
+        download_token: issued.as_ref().map(|(token, _)| token.clone()),
+        token_expires_at: issued.map(|(_, expires_at)| expires_at),
+    })
+}
+
+/// Stores the download token a purchase confirmation issued, if any, and
+/// returns it. A receipt-only response stores nothing; any token previously
+/// stored for this buyer, game and server is left to its own expiry.
+async fn store_issued_purchase_token(
+    tokens: &DownloadTokensRepository,
+    buyer_pubkey: &str,
+    game_coordinate: &str,
+    server_url: &str,
+    response: &CorePurchaseConfirmResponse,
+) -> Result<Option<(String, i64)>, String> {
+    let Some((token, expires_at)) = response.issued_token() else {
+        return Ok(None);
+    };
     tokens
         .upsert(&DownloadToken {
             buyer_pubkey: buyer_pubkey.to_string(),
             game_coordinate: game_coordinate.to_string(),
             server_url: server_url.to_string(),
-            token: response.download_token.clone(),
-            expires_at: response.token_expires_at,
+            token: token.to_string(),
+            expires_at,
         })
         .await
         .map_err(|err| err.to_string())?;
-
-    Ok(ConfirmPurchaseResponse {
-        receipt: response.receipt,
-        download_token: response.download_token,
-        token_expires_at: response.token_expires_at,
-    })
+    Ok(Some((token.to_string(), expires_at)))
 }
 
 async fn persist_split_receipt(
@@ -6203,6 +6230,64 @@ mod tests {
     use arcadestr_core::subscriptions::SubscriptionRegistry;
     use arcadestr_core::user_cache::UserCache;
     use nostr::{nips::nip19::ToBech32, EventBuilder, Keys, Kind, Tag, TagKind, Timestamp};
+
+    #[tokio::test]
+    async fn receipt_recovery_without_a_token_stores_no_download_authorization() {
+        let dir = tempfile::tempdir().expect("private test directory");
+        let database = Database::new(&dir.path().join("tokens.db"))
+            .await
+            .expect("test database");
+        let tokens = DownloadTokensRepository::new(database.pool().clone());
+        let receipt = EventBuilder::new(Kind::Custom(1020), "receipt")
+            .sign_with_keys(&Keys::generate())
+            .expect("receipt");
+        let (buyer, coordinate, server) = ("buyer", "30402:developer:game", "https://adp.test");
+        let response = |body: serde_json::Value| -> CorePurchaseConfirmResponse {
+            serde_json::from_value(body).expect("confirm response")
+        };
+
+        // A retry that recovers only the receipt stores no token.
+        let recovered = response(serde_json::json!({ "receipt": receipt }));
+        let stored = store_issued_purchase_token(&tokens, buyer, coordinate, server, &recovered)
+            .await
+            .expect("receipt-only response");
+        assert_eq!(stored, None);
+        assert_eq!(
+            tokens
+                .valid_token(buyer, coordinate, server, 0)
+                .await
+                .expect("token lookup"),
+            None
+        );
+
+        // An issued token is stored and returned.
+        let issued = response(serde_json::json!({
+            "receipt": receipt,
+            "download_token": "fresh-token",
+            "token_expires_at": 2_000_000_000i64
+        }));
+        let stored = store_issued_purchase_token(&tokens, buyer, coordinate, server, &issued)
+            .await
+            .expect("token response");
+        assert_eq!(stored, Some(("fresh-token".to_string(), 2_000_000_000)));
+        let saved = tokens
+            .valid_token(buyer, coordinate, server, 0)
+            .await
+            .expect("token lookup")
+            .expect("stored token");
+        assert_eq!(saved.token, "fresh-token");
+
+        // A later receipt-only retry neither overwrites nor clears it.
+        store_issued_purchase_token(&tokens, buyer, coordinate, server, &recovered)
+            .await
+            .expect("receipt-only response");
+        let saved = tokens
+            .valid_token(buyer, coordinate, server, 0)
+            .await
+            .expect("token lookup")
+            .expect("token kept");
+        assert_eq!(saved.token, "fresh-token");
+    }
 
     struct CountingSigner {
         keys: Keys,
@@ -10079,8 +10164,14 @@ mod tests {
         })
         .await;
         eprintln!("ADP_GATE4_STAGE=primary_confirm_ok");
-        assert!(!primary.download_token.is_empty());
-        assert!(primary.token_expires_at > 0);
+        let primary_token = primary
+            .download_token
+            .clone()
+            .expect("a first purchase issues a download token");
+        assert!(!primary_token.is_empty());
+        assert!(primary
+            .token_expires_at
+            .is_some_and(|expires_at| expires_at > 0));
 
         let buyer_pubkey = {
             let state = app.state::<AppState>();
@@ -10109,8 +10200,8 @@ mod tests {
             .await
             .expect("download token lookup should succeed")
             .expect("download token should be stored");
-        assert_eq!(token.token, primary.download_token);
-        println!("ADP_GATE4_DOWNLOAD_TOKEN={}", primary.download_token);
+        assert_eq!(token.token, primary_token);
+        println!("ADP_GATE4_DOWNLOAD_TOKEN={primary_token}");
 
         let manual = live_confirm_purchase_pass(LiveConfirmPurchaseInput {
             app: &app,
@@ -10122,7 +10213,10 @@ mod tests {
         })
         .await;
         eprintln!("ADP_GATE4_STAGE=manual_confirm_ok");
-        assert!(!manual.download_token.is_empty());
+        assert!(manual
+            .download_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty()));
     }
 
     #[tokio::test]
@@ -10157,8 +10251,13 @@ mod tests {
         .await
         .expect("manual preimage purchase confirmation should persist receipt and token");
         eprintln!("ADP_GATE4_STAGE=manual_confirm_purchase_ok");
-        assert!(!response.download_token.is_empty());
-        assert!(response.token_expires_at > 0);
+        assert!(response
+            .download_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty()));
+        assert!(response
+            .token_expires_at
+            .is_some_and(|expires_at| expires_at > 0));
 
         let buyer_pubkey = {
             let state = app.state::<AppState>();
@@ -10187,10 +10286,10 @@ mod tests {
             .await
             .expect("download token lookup should succeed")
             .expect("download token should be stored");
-        assert_eq!(token.token, response.download_token);
+        assert_eq!(Some(token.token), response.download_token);
         println!(
             "ADP_GATE4_MANUAL_DOWNLOAD_TOKEN={}",
-            response.download_token
+            response.download_token.as_deref().unwrap_or_default()
         );
     }
 
@@ -10252,8 +10351,13 @@ mod tests {
         .await
         .expect("manual preimage purchase confirmation should persist receipt and token");
         eprintln!("ADP_GATE5_STAGE=manual_confirm_purchase_ok");
-        assert!(!response.download_token.is_empty());
-        assert!(response.token_expires_at > 0);
+        assert!(response
+            .download_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty()));
+        assert!(response
+            .token_expires_at
+            .is_some_and(|expires_at| expires_at > 0));
 
         let token_repo =
             DownloadTokensRepository::new(app.state::<AppState>().database.pool().clone());
@@ -10267,7 +10371,7 @@ mod tests {
             .await
             .expect("download token lookup should succeed")
             .expect("download token should be stored before Path A");
-        assert_eq!(cached_token.token, response.download_token);
+        assert_eq!(Some(cached_token.token), response.download_token);
         println!("ADP_GATE5_PATH_A_TOKEN_PRESENT=true");
 
         eprintln!("ADP_GATE5_STAGE=path_a_install_start");

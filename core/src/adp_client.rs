@@ -238,12 +238,30 @@ pub struct PurchaseConfirmRequest {
     pub quote_id: Option<String>,
 }
 
-/// Response returned by `POST /purchase/confirm` in a later gate.
+/// Response returned by `POST /purchase/confirm`.
+///
+/// The receipt is always present. A retry of an already-accepted purchase may
+/// return it without a download token when the buyer is no longer entitled or
+/// the server is no longer authorized (ADP-01 §Replay protection), so receipt
+/// recovery never depends on download authorization.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PurchaseConfirmResponse {
     pub receipt: Event,
-    pub download_token: String,
-    pub token_expires_at: i64,
+    #[serde(default)]
+    pub download_token: Option<String>,
+    #[serde(default)]
+    pub token_expires_at: Option<i64>,
+}
+
+impl PurchaseConfirmResponse {
+    /// The freshly issued download token and its expiry, if any. A token
+    /// without an expiry, or an empty token, is not usable and yields `None`.
+    pub fn issued_token(&self) -> Option<(&str, i64)> {
+        match (self.download_token.as_deref(), self.token_expires_at) {
+            (Some(token), Some(expires_at)) if !token.is_empty() => Some((token, expires_at)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2246,8 +2264,10 @@ mod tests {
             .await
             .expect("purchase confirm should succeed");
 
-        assert_eq!(response.download_token, "download-token-1");
-        assert_eq!(response.token_expires_at, 1_800_000_000);
+        assert_eq!(
+            response.issued_token(),
+            Some(("download-token-1", 1_800_000_000))
+        );
         assert_eq!(response.receipt.id, receipt_event.id);
         assert_eq!(
             http.last_json_post_body("https://dist.example.com/purchase/confirm"),
@@ -2264,6 +2284,62 @@ mod tests {
         assert!(headers
             .iter()
             .any(|(name, value)| { name == "Authorization" && value.starts_with("Nostr ") }));
+    }
+
+    async fn confirm_with_response(body: serde_json::Value) -> PurchaseConfirmResponse {
+        let buyer = crate::signers::LocalSigner::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .expect("test private key should be valid");
+        let merchant = nostr::Keys::generate();
+        let listing_event = nostr::EventBuilder::new(nostr::Kind::Custom(30402), "listing")
+            .tag(nostr::Tag::custom(nostr::TagKind::d(), ["game-1"]))
+            .sign_with_keys(&merchant)
+            .expect("listing");
+        let http = Arc::new(
+            MockHttpClient::new()
+                .with_json_post_response("https://dist.example.com/purchase/confirm", body),
+        );
+        AdpClient::new("https://dist.example.com", http)
+            .purchase_confirm(
+                &buyer,
+                PurchaseConfirmRequest {
+                    game_coordinate: "30402:merchant:game-1".to_string(),
+                    listing_event,
+                    zap_receipt_event: None,
+                    bolt11: Some("lnbc1fixedamountinvoice".to_string()),
+                    preimage: Some("feedface".to_string()),
+                    quote_id: None,
+                },
+            )
+            .await
+            .expect("a receipt-bearing response must parse")
+    }
+
+    #[tokio::test]
+    async fn a_retry_response_without_a_token_still_recovers_the_receipt() {
+        let receipt = nostr::EventBuilder::new(nostr::Kind::Custom(1020), "receipt")
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("receipt");
+        let response = confirm_with_response(json!({ "receipt": receipt })).await;
+        assert_eq!(response.receipt, receipt, "original receipt recovered");
+        assert_eq!(response.issued_token(), None, "no download authorization");
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_or_empty_token_is_not_download_authorization() {
+        let receipt = nostr::EventBuilder::new(nostr::Kind::Custom(1020), "receipt")
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("receipt");
+        for body in [
+            json!({ "receipt": receipt, "download_token": "token" }),
+            json!({ "receipt": receipt, "token_expires_at": 1_800_000_000i64 }),
+            json!({ "receipt": receipt, "download_token": "", "token_expires_at": 1i64 }),
+        ] {
+            let response = confirm_with_response(body).await;
+            assert_eq!(response.receipt, receipt);
+            assert_eq!(response.issued_token(), None);
+        }
     }
 
     #[tokio::test]

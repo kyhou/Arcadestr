@@ -1368,8 +1368,12 @@ pub struct ConfirmPurchaseRequest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ConfirmPurchaseResponse {
     pub receipt: serde_json::Value,
-    pub download_token: String,
-    pub token_expires_at: i64,
+    /// Absent when a retry recovered the receipt without current download
+    /// authorization (ADP-01 §Replay protection).
+    #[serde(default)]
+    pub download_token: Option<String>,
+    #[serde(default)]
+    pub token_expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
