@@ -80,24 +80,11 @@ required-features = ["native"]
 name = "regtest_split_purchase"
 required-features = ["native"]
 
-[[example]]
-name = "regtest_refunds"
-required-features = ["native"]
-
-[[example]]
-name = "regtest_gate1"
-required-features = ["native"]
-
-[[example]]
-name = "regtest_gate2_preflight"
-required-features = ["native"]
-
-[[example]]
-name = "regtest_gate2"
-required-features = ["native"]
+# Regtest drivers that embed or inspect the adp-server reference implementation
+# live in the independent `tests/regtest_harness` workspace, so this workspace
+# never needs the adp-server repository.
 
 [dev-dependencies]
-adp-server = { path = "../../adp-server/adp-server" }
 axum = "0.7"
 futures-util = "0.3"
 tokio-tungstenite = "0.28"

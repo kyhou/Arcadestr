@@ -1,7 +1,8 @@
 //! Gate 2: one three-recipient purchase and an isolated real third-leg failure.
 //! Production ADP/NWC/durable storage paths; independent persistent Dave process.
 #[allow(dead_code)]
-#[path = "regtest_split_purchase.rs"]
+// Shared with the Arcadestr-only `regtest_split_purchase` example in core.
+#[path = "../../../core/examples/regtest_split_purchase.rs"]
 mod common;
 #[allow(dead_code)]
 #[path = "regtest_gate2_preflight.rs"]

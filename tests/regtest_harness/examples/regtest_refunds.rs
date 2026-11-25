@@ -2,7 +2,8 @@
 //! HTTP server, databases and deterministic deadline clock. Nostr is a controlled
 //! test adapter, not a claim of live-relay timeout testing.
 #[allow(dead_code)]
-#[path = "regtest_split_purchase.rs"]
+// Shared with the Arcadestr-only `regtest_split_purchase` example in core.
+#[path = "../../../core/examples/regtest_split_purchase.rs"]
 pub(crate) mod common;
 
 use adp_server::{

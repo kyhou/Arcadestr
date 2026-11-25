@@ -26,6 +26,10 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 HOME = Path.home()
 CONFIG = HOME / '.config/arcadestr-regtest'
+# Drivers that embed adp-server live in an independent Cargo workspace beside
+# the sibling adp-server checkout; their binaries still land in ROOT/target.
+HARNESS = ['--manifest-path', str(ROOT / 'tests/regtest_harness/Cargo.toml'),
+           '--target-dir', str(ROOT / 'target')]
 STATE = Path(os.environ.get('XDG_STATE_HOME', HOME / '.local/state')) / 'arcadestr-regtest'
 NODES = ('alice', 'bob', 'carol', 'dave')
 # Established Polar network 1 identities, not Docker addresses or LND aliases.
@@ -1085,7 +1089,7 @@ def refund_scenarios(budget):
     log = STATE/'refund-build.log'
     with open(log, 'wb') as out:
         os.chmod(log, 0o600)
-        result = subprocess.run(['cargo','build','--locked','-p','arcadestr-core','--features','native',
+        result = subprocess.run(['cargo','build','--locked',*HARNESS,
                                  '--example','regtest_refunds'], cwd=ROOT, stdout=out, stderr=out)
     if result.returncode:
         raise Blocked(f'refund driver build failed; inspect private {log}')
@@ -1176,7 +1180,7 @@ def gate1_scenarios(budget, continuation=False, verification=False):
     log = STATE/'gate1-build.log'
     with open(log,'wb') as out:
         os.chmod(log,0o600)
-        result = subprocess.run(['cargo','build','--locked','-p','arcadestr-core','--features','native','--example','regtest_gate1'],cwd=ROOT,stdout=out,stderr=out)
+        result = subprocess.run(['cargo','build','--locked',*HARNESS,'--example','regtest_gate1'],cwd=ROOT,stdout=out,stderr=out)
     if result.returncode:
         raise Blocked(f'Gate 1 build failed; inspect private {log}')
     root = Path(previous['report']).parent if continuation or verification else STATE/'gate1-runs'/str(time.time_ns())
@@ -1241,7 +1245,7 @@ def gate2_scenarios(budget, verification=False, continuation=False):
     log = STATE/'gate2-build.log'
     with open(log,'wb') as out:
         os.chmod(log,0o600)
-        result = subprocess.run(['cargo','build','--locked','-p','arcadestr-core','--features','native',
+        result = subprocess.run(['cargo','build','--locked',*HARNESS,
                                  '--example','regtest_gate2','--example','regtest_gate2_preflight'],cwd=ROOT,stdout=out,stderr=out)
     if result.returncode: raise Blocked(f'Gate 2 build failed; inspect private {log}')
     env = gate2_environment()
@@ -1416,10 +1420,10 @@ def test(args):
             ('Arcadestr aggregate ownership', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--test', 'aggregate_ownership']),
             ('Arcadestr receipt protocol', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--test', 'receipt_protocol']),
             ('ADP live driver safety', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--example', 'regtest_split_purchase']),
-            ('Refund driver compilation', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--example', 'regtest_refunds']),
-            ('Gate 1 driver compilation', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--example', 'regtest_gate1']),
+            ('Refund driver compilation', ROOT, [*HARNESS, '--example', 'regtest_refunds']),
+            ('Gate 1 driver compilation', ROOT, [*HARNESS, '--example', 'regtest_gate1']),
             ('Gate 2 domain negatives', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--test', 'multi_operator_gate2']),
-            ('Gate 2 drivers', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--example', 'regtest_gate2', '--example', 'regtest_gate2_preflight']),
+            ('Gate 2 drivers', ROOT, [*HARNESS, '--example', 'regtest_gate2', '--example', 'regtest_gate2_preflight']),
             ('Payment durability', ROOT, ['-p','arcadestr-core','--features','native','--test','payment_durability']),
             ('Arcadestr LNURL policy', ROOT, ['-p', 'arcadestr-core', '--features', 'native', '--lib', 'lnurlp::tests']),
         ]

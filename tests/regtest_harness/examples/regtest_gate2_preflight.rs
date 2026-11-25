@@ -12,10 +12,11 @@ pub(crate) fn private_file(path: &Path) -> Result<Zeroizing<String>> {
     let canonical = path
         .canonicalize()
         .context("private signer path unavailable")?;
+    // This harness lives at `<Arcadestr>/tests/regtest_harness`.
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .context("workspace")?
-        .canonicalize()?;
+        .join("../..")
+        .canonicalize()
+        .context("workspace")?;
     let sibling = workspace
         .parent()
         .context("repository parent")?
