@@ -166,9 +166,15 @@ impl OwnershipService {
                     .cmp(&left.created_at)
                     .then_with(|| right.event_id.cmp(&left.event_id))
             });
-            let events = chain.iter().filter_map(|r|serde_json::from_str::<nostr::Event>(&r.raw_event).ok()).collect::<Vec<_>>();
+            let events = chain
+                .iter()
+                .filter_map(|r| serde_json::from_str::<nostr::Event>(&r.raw_event).ok())
+                .collect::<Vec<_>>();
             let tip = resolve_persisted_receipt_tip(&events);
-            let Some(receipt) = tip.and_then(|e|chain.iter().find(|r|r.event_id==e.id.to_hex())).or_else(||chain.first()) else {
+            let Some(receipt) = tip
+                .and_then(|e| chain.iter().find(|r| r.event_id == e.id.to_hex()))
+                .or_else(|| chain.first())
+            else {
                 continue;
             };
             let mut validation_error = chain
@@ -255,15 +261,40 @@ impl OwnershipService {
             .bind(buyer_pubkey).fetch_all(self.purchases.database()).await.map_err(PurchaseError::from)?;
         for check in checks {
             use crate::receipt_sync_contract::ReceiptVerification;
-            let coordinate:String=check.get("listing_coordinate");let order:String=check.get("order_id");
-            let verification=match check.get::<String,_>("verification").as_str(){"verified"=>ReceiptVerification::Verified,"invalid"=>ReceiptVerification::Invalid,_=>ReceiptVerification::Indeterminate};
+            let coordinate: String = check.get("listing_coordinate");
+            let order: String = check.get("order_id");
+            let verification = match check.get::<String, _>("verification").as_str() {
+                "verified" => ReceiptVerification::Verified,
+                "invalid" => ReceiptVerification::Invalid,
+                _ => ReceiptVerification::Indeterminate,
+            };
             let event_ids=sqlx::query_scalar::<_,String>("SELECT event_id FROM purchases WHERE buyer_pubkey=? AND listing_coordinate=? AND order_id=?")
                 .bind(buyer_pubkey).bind(&coordinate).bind(&order).fetch_all(self.purchases.database()).await.map_err(PurchaseError::from)?;
-            if let Some(record)=records.iter_mut().find(|r|r.record_type==DurableAcquisitionKind::Purchase && event_ids.contains(&r.record_id)) {
-                record.verification=Some(verification);
-                if verification!=ReceiptVerification::Verified {record.status=DurableCredentialStatus::Unverified;record.validation_error=Some(check.get("reason"));}
+            if let Some(record) = records.iter_mut().find(|r| {
+                r.record_type == DurableAcquisitionKind::Purchase
+                    && event_ids.contains(&r.record_id)
+            }) {
+                record.verification = Some(verification);
+                if verification != ReceiptVerification::Verified {
+                    record.status = DurableCredentialStatus::Unverified;
+                    record.validation_error = Some(check.get("reason"));
+                }
             } else {
-                records.push(DurableAcquisitionRecord{record_type:DurableAcquisitionKind::Purchase,game_coordinate:coordinate,listing_title:None,amount:None,currency:None,acquired_at:check.get::<i64,_>("acquired_at").max(0) as u64,status:DurableCredentialStatus::Unverified,record_id:check.get::<Option<String>,_>("root_event_id").unwrap_or_else(||format!("order:{order}")),validation_error:Some(check.get("reason")),campaign_id:None,verification:Some(verification)});
+                records.push(DurableAcquisitionRecord {
+                    record_type: DurableAcquisitionKind::Purchase,
+                    game_coordinate: coordinate,
+                    listing_title: None,
+                    amount: None,
+                    currency: None,
+                    acquired_at: check.get::<i64, _>("acquired_at").max(0) as u64,
+                    status: DurableCredentialStatus::Unverified,
+                    record_id: check
+                        .get::<Option<String>, _>("root_event_id")
+                        .unwrap_or_else(|| format!("order:{order}")),
+                    validation_error: Some(check.get("reason")),
+                    campaign_id: None,
+                    verification: Some(verification),
+                });
             }
         }
         for record in &mut records {
@@ -481,12 +512,22 @@ mod tests {
         let update = EventBuilder::new(Kind::Custom(1020), "")
             .tags([
                 Tag::custom(TagKind::p(), [buyer.public_key().to_hex()]),
-                Tag::custom(TagKind::a(), [coordinate(&merchant,"game")]),
+                Tag::custom(TagKind::a(), [coordinate(&merchant, "game")]),
                 Tag::custom(TagKind::custom("order"), ["order"]),
                 Tag::custom(TagKind::custom("status"), ["refunded"]),
                 Tag::custom(TagKind::e(), [paid.event_id.clone()]),
-            ]).custom_created_at(Timestamp::from(20)).sign_with_keys(&merchant).expect("valid refund update");
-        let refunded = StoredReceipt { event_id:update.id.to_hex(),payment_hash:None,status:"refunded".into(),created_at:20,raw_event:serde_json::to_string(&update).expect("update JSON"),..paid.clone() };
+            ])
+            .custom_created_at(Timestamp::from(20))
+            .sign_with_keys(&merchant)
+            .expect("valid refund update");
+        let refunded = StoredReceipt {
+            event_id: update.id.to_hex(),
+            payment_hash: None,
+            status: "refunded".into(),
+            created_at: 20,
+            raw_event: serde_json::to_string(&update).expect("update JSON"),
+            ..paid.clone()
+        };
         let separate = receipt(&buyer, &merchant, "other-game", "order", "paid", 15);
         let other_paid = receipt(&other, &merchant, "game", "other-order", "paid", 30);
         for stored in [&paid, &refunded, &refunded, &separate, &other_paid] {

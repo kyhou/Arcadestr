@@ -228,7 +228,15 @@ pub(crate) fn stored_receipt_validation_error(receipt: &StoredReceipt) -> Option
     let Ok(event) = serde_json::from_str::<Event>(&receipt.raw_event) else {
         return Some("Stored purchase receipt could not be verified.");
     };
-    let is_update=parse_receipt_event(&event).is_ok_and(|r|r.predecessor.is_some() && r.status!=STATUS_PAID && r.payment_hash.is_none() && r.amount_msat.is_none() && r.settled_at.is_none() && r.proofs.is_empty() && r.aggregate.is_none());
+    let is_update = parse_receipt_event(&event).is_ok_and(|r| {
+        r.predecessor.is_some()
+            && r.status != STATUS_PAID
+            && r.payment_hash.is_none()
+            && r.amount_msat.is_none()
+            && r.settled_at.is_none()
+            && r.proofs.is_empty()
+            && r.aggregate.is_none()
+    });
     // Aggregate receipts deliberately have no singular bolt11/preimage tags.
     // Use the same parser/root completeness checks as persisted ownership.
     let aggregate = match parse_aggregate(&event) {
@@ -479,11 +487,20 @@ fn parse_aggregate(event: &Event) -> Result<Option<AggregateReceipt>, PurchaseEr
                 .map_err(|_| PurchaseError::ProofInvalid("malformed accepted terms".into()))?;
             Some(terms.clone())
         };
-        let canonical_hash=|value:&str|value.len()==64 && value.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b));
-        if !canonical_hash(payment_hash) || !canonical_hash(proof_reference)
-            || !matches!(proof_type.as_str(),"bolt11-preimage"|"zap")
-            || (proof_type=="bolt11-preimage" && proof_reference!=payment_hash) {
-            return Err(PurchaseError::ProofInvalid("invalid aggregate proof declaration or public binding".into()));
+        let canonical_hash = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if !canonical_hash(payment_hash)
+            || !canonical_hash(proof_reference)
+            || !matches!(proof_type.as_str(), "bolt11-preimage" | "zap")
+            || (proof_type == "bolt11-preimage" && proof_reference != payment_hash)
+        {
+            return Err(PurchaseError::ProofInvalid(
+                "invalid aggregate proof declaration or public binding".into(),
+            ));
         }
         legs.push(crate::adp_settlement::AggregateProofLeg {
             leg_id: leg_id.clone(),
@@ -500,8 +517,15 @@ fn parse_aggregate(event: &Event) -> Result<Option<AggregateReceipt>, PurchaseEr
     }
     let calculated = crate::adp_settlement::aggregate_commitment(gross_msat, &legs)
         .map_err(|error| PurchaseError::ProofInvalid(error.to_string()))?;
-    if legs.is_empty() || legs.windows(2).any(|p|(&p[0].amount_msat,&p[0].role,&p[0].recipient_pubkey)>(&p[1].amount_msat,&p[1].role,&p[1].recipient_pubkey)) {
-        return Err(PurchaseError::ProofInvalid("empty or unordered aggregate payment legs".into()));
+    if legs.is_empty()
+        || legs.windows(2).any(|p| {
+            (&p[0].amount_msat, &p[0].role, &p[0].recipient_pubkey)
+                > (&p[1].amount_msat, &p[1].role, &p[1].recipient_pubkey)
+        })
+    {
+        return Err(PurchaseError::ProofInvalid(
+            "empty or unordered aggregate payment legs".into(),
+        ));
     }
     if &calculated != commitment {
         return Err(PurchaseError::ProofInvalid(
@@ -610,7 +634,7 @@ pub fn validate_adp_receipt_root(
     authorization: Option<&ResolvedAuthorization>,
 ) -> Result<(), PurchaseError> {
     let legacy_complete = receipt.payment_hash.is_some()
-        && receipt.amount_msat.is_some_and(|amount|amount>0)
+        && receipt.amount_msat.is_some_and(|amount| amount > 0)
         && !receipt.proofs.is_empty()
         && receipt.aggregate.is_none();
     let aggregate_complete = receipt.aggregate.is_some()
@@ -661,14 +685,20 @@ pub fn resolve_receipt_chain<'a>(
     authorization: Option<&ResolvedAuthorization>,
 ) -> Result<&'a Event, PurchaseError> {
     let tip = resolve_receipt_structure(events, developer)?;
-    let root = events.iter().filter_map(|event|parse_receipt_event(event).ok())
-        .find(is_paid_receipt_root).ok_or_else(||PurchaseError::ProofInvalid("missing paid root".into()))?;
+    let root = events
+        .iter()
+        .filter_map(|event| parse_receipt_event(event).ok())
+        .find(is_paid_receipt_root)
+        .ok_or_else(|| PurchaseError::ProofInvalid("missing paid root".into()))?;
     validate_adp_receipt_root(&root, developer, authorization)?;
     validate_receipt_evidence(&root, ReceiptEvidence::default())?;
     Ok(tip)
 }
 
-fn resolve_receipt_structure(events: &[Event], developer: PublicKey) -> Result<&Event, PurchaseError> {
+fn resolve_receipt_structure(
+    events: &[Event],
+    developer: PublicKey,
+) -> Result<&Event, PurchaseError> {
     let parsed = events
         .iter()
         .filter_map(|event| {
@@ -678,7 +708,9 @@ fn resolve_receipt_structure(events: &[Event], developer: PublicKey) -> Result<&
         })
         .collect::<Vec<_>>();
     if parsed.len() != events.len() {
-        return Err(PurchaseError::ProofInvalid("malformed receipt chain member".into()));
+        return Err(PurchaseError::ProofInvalid(
+            "malformed receipt chain member".into(),
+        ));
     }
     // ADP-01 §Receipt status under ADP: only the developer controls status
     // transitions; no status-update capability is defined. A status update
@@ -699,8 +731,11 @@ fn resolve_receipt_structure(events: &[Event], developer: PublicKey) -> Result<&
     }
     let (root_event, root) = roots[0];
     if (root_event.pubkey != developer && root.authorization.is_none())
-        || (root_event.pubkey == developer && root.authorization.is_some()) {
-        return Err(PurchaseError::ProofInvalid("invalid root authorization binding".into()));
+        || (root_event.pubkey == developer && root.authorization.is_some())
+    {
+        return Err(PurchaseError::ProofInvalid(
+            "invalid root authorization binding".into(),
+        ));
     }
     let mut current_event = *root_event;
     let mut current = root.clone();
@@ -744,7 +779,9 @@ fn resolve_receipt_structure(events: &[Event], developer: PublicKey) -> Result<&
         current = next.clone();
     }
     if visited.len() != parsed.len() {
-        return Err(PurchaseError::ProofInvalid("receipt chain has unreachable or contradictory members".into()));
+        return Err(PurchaseError::ProofInvalid(
+            "receipt chain has unreachable or contradictory members".into(),
+        ));
     }
     Ok(current_event)
 }
@@ -874,7 +911,10 @@ fn is_paid_receipt_root(receipt: &ParsedReceipt) -> bool {
 }
 
 pub(crate) fn resolve_persisted_receipt_tip(events: &[Event]) -> Option<&Event> {
-    let root = events.iter().filter_map(|event|parse_receipt_event(event).ok()).find(is_paid_receipt_root)?;
+    let root = events
+        .iter()
+        .filter_map(|event| parse_receipt_event(event).ok())
+        .find(is_paid_receipt_root)?;
     resolve_receipt_structure(events, coordinate_publisher(&root.coordinate)?).ok()
 }
 
