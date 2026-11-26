@@ -121,6 +121,17 @@ jobs:
           }
           Get-WindowsCapability -Online -Name 'VBSCRIPT*' | Format-Table Name, State
 
+      # The WASM frontend compiles C code (secp256k1-sys) for wasm32; Apple's
+      # clang has no WebAssembly target, so use Homebrew LLVM for that target.
+      - name: Use LLVM clang for wasm32 C dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+          prefix="$(brew --prefix llvm)"
+          "$prefix/bin/clang" --print-targets | grep -q wasm32
+          echo "CC_wasm32_unknown_unknown=$prefix/bin/clang" >>"$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$prefix/bin/llvm-ar" >>"$GITHUB_ENV"
+
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with the WASM target
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
