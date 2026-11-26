@@ -1,92 +1,162 @@
 # Arcadestr
 
-A decentralized game marketplace built on NOSTR with Lightning payments.
+A decentralized indie game marketplace and desktop launcher built on
+[Nostr](https://nostr.com/) with Lightning payments.
 
-Development commands: [COMMANDS.md](COMMANDS.md). Documentation status and
-repository contents policy: [docs/README.md](docs/README.md).
+Publishers sign their listings, choose where to host their builds, and sell
+directly to players. Players can discover games, collect verifiable access
+credentials, and install and launch games from one desktop app.
 
-## What is Arcadestr?
+**Status:** active development, with desktop pre-releases available. Arcadestr
+and its distribution protocol have not entered production. **Buyer and refund
+payment dispatch are disabled in default desktop builds**; activation requires
+separately reviewed release features. See the
+[payment release policy](docs/PRODUCTION_PAYMENTS.md).
 
-Arcadestr is a decentralized marketplace for indie games that runs entirely on the NOSTR protocol. Unlike traditional game stores, Arcadestr has no central server, no custodial payments, and no platform fees. Publishers maintain full custody of their games and earnings, while buyers pay sellers directly via Lightning Network zaps.
+## For Players and Publishers
 
-What makes Arcadestr different is its commitment to decentralization at every layer. Game listings are NOSTR events (kind 30078) broadcast to public relays, making them censorship-resistant and permanently available. Payments flow directly from buyer to seller through Lightning Network invoices generated via LNURL-pay, with no intermediary holding funds. The entire application logic runs client-side, with your private key never leaving your signer app.
+### Players
 
-## Architecture
+- Browse games, search currently loaded listings and Store Page text, and filter
+  by platform.
+- Explore publisher profiles and rich Store Pages with screenshots,
+  descriptions, requirements, and links.
+- Acquire games through Lightning purchases, claim-and-keep promotions, or
+  explicitly public and timed access.
+- Keep account access records separate from device installations. Install
+  verified packages, launch games, uninstall, and optionally keep offline copies
+  for reinstalling without another download.
+- Sign in with a remote signer on desktop, a browser extension on web, or an
+  encrypted local Nostr key.
 
-Arcadestr is organized as a Rust workspace with four crates:
+### Publishers
 
-- **`core`** — Business logic: NOSTR event handling, Lightning/NIP-57 zap payments, signer abstraction (NIP-46/NIP-07), and relay communication.
+- Manage games through a per-game publishing hub, with drafts and listing updates.
+- Publish Store Pages and upload media to configurable Blossom servers.
+- Inspect build archives, declare supported platforms, and define signed launch
+  profiles and defaults.
+- Provision distribution through ADP servers, upload builds, and retry partial
+  publications.
+- Manage promotional campaigns, fulfillment authorizations, and access
+  credentials.
 
-- **`app`** — Leptos UI components shared between desktop and web targets. Contains the marketplace interface, publish form, detail view with buy flow, and all styling.
+Zero price alone does **not** grant download access. Public access, timed access,
+and claim-and-keep promotions are explicit policies; public or timed access does
+not create durable ownership.
 
-- **`desktop`** — Tauri v2 shell that exposes native Tauri commands for NOSTR operations. Targets Windows, macOS, and Linux with native system integration.
+## How It Works
 
-- **`web`** — WASM entry point for browser deployment via Trunk. Uses the same `app` components but runs entirely in the browser.
+Arcadestr separates discovery, payments, and file delivery rather than relying
+on one central storefront backend:
 
-## NOSTR Protocol Usage
+1. **Discovery:** publishers sign NIP-99 game listings (`kind:30402`) and
+   Arcadestr Store Pages (`kind:30407`) and publish them to Nostr relays.
+2. **Acquisition:** paid acquisitions use verifiable marketplace receipts;
+   non-payment acquisitions can use entitlement grants. Lightning checkout
+   supports managed payment plans, including experimental split settlement and
+   recovery for partial payments.
+3. **Delivery:** publisher-selected servers implement the
+   [Arcadestr Distribution Protocol (ADP-01)](ADP-01.md). The desktop app checks
+   signed listing metadata and package hashes before extracting and installing
+   builds, then starts the selected game profile without a shell.
 
-Arcadestr implements several NIPs to provide a complete decentralized marketplace experience:
+ADP operators may charge disclosed distribution fees. Lightning wallets may
+also charge routing fees; standard NWC does not provide an enforced fee ceiling.
+A partial payment without a validated receipt does not establish ownership.
+See [payment guarantees and recovery](docs/PRODUCTION_PAYMENTS.md).
 
-- **NIP-07** — Browser extension signer support for the web target. Users authenticate via extensions like Alby or nos2x.
+### Protocols
 
-- **NIP-46** — Remote signer / Nostr Connect support for the desktop target. Connects to signer apps like Nsec.app or Amber via `nostrconnect://` URIs.
+| Protocol | Role |
+|---|---|
+| NIP-07 / NIP-46 | Browser-extension signing / desktop remote signing |
+| NIP-47 (NWC) | Desktop Lightning wallet connection |
+| NIP-57 | Zap payment proofs |
+| NIP-65 | Publisher write-relay discovery |
+| NIP-98 | Authenticated HTTP requests to ADP services |
+| NIP-99 | Classified listings (`kind:30402`) |
+| NIP-58 | Profile badges and achievements |
+| [NIP-102 draft](NIP-102.md) | Marketplace receipts (`kind:1020`) |
+| [NIP-103 draft](NIP-103.md) | Non-monetary entitlement grants |
+| [ADP-01 draft](ADP-01.md) | Distribution, fulfillment authorization, access policies, packages, and launch metadata |
+| Blossom | Store Page media hosting |
 
-- **NIP-57** — Zap payments for purchases. Generates Lightning invoices via LNURL-pay and publishes zap receipt events (kind 9735) to confirm payment.
+Store Pages, entitlements, and split-settlement extensions use experimental or
+provisional event kinds, not established interoperable standards. The
+consolidated `ADP-01.md` is the canonical specification; former amendments are
+historical records, not additional requirements.
 
-- **NIP-65** — Relay List Metadata (Outbox Model) for efficient relay discovery. Clients discover where followed users publish their notes and send replies to the correct relays.
+## Desktop and Web
 
-- **NIP-78** — Parameterized replaceable events for game listings. Uses kind 30078 with a `d` tag for the listing ID, enabling updates and preventing duplicates.
+Both targets share a Rust/Leptos UI, but the browser is not a replacement for
+the native client.
+
+| Capability | Desktop (Tauri v2) | Standalone web (WASM) |
+|---|---|---|
+| Marketplace browsing and Store Pages | Yes | Yes |
+| Sign-in | NIP-46 or encrypted local key | NIP-07 or browser-encrypted local key |
+| Native build inspection and ADP publishing | Yes | Desktop required |
+| Managed NWC checkout and settlement recovery | Subject to build payment policy | Desktop required |
+| Install, launch, uninstall, and offline copies | Yes | Desktop required |
 
 ## Downloads
 
-Prebuilt desktop installers for Linux (AppImage, DEB, RPM), Windows (setup
+Prebuilt desktop installers for Linux (DEB, RPM), Windows (setup
 EXE, MSI) and macOS (Intel and Apple Silicon DMG) are published on
 [GitHub Releases](https://github.com/kyhou/Arcadestr/releases) with a
-`SHA256SUMS` file. They are pre-releases and are **not code-signed**. See
+`SHA256SUMS` file. Future releases replace AppImage with a native Arch Linux
+package; `v0.1.0` is unchanged. Installers are **not code-signed**. See
 [docs/releasing.md](docs/releasing.md) for installation, checksum
 verification, the expected Windows and macOS warnings, and how releases are
 published.
 
 ## Prerequisites
 
-Before building Arcadestr, ensure you have the following installed:
+- **Rust 1.89 or newer** — Install a current stable toolchain via
+  [rustup](https://rustup.rs/).
+- **WASM target:** `rustup target add wasm32-unknown-unknown`.
+- **Trunk:** `cargo install trunk --locked` (also used for the desktop frontend).
+- **Tauri CLI v2:** `cargo install tauri-cli --version "^2" --locked`.
+- **Native desktop dependencies:** follow the
+  [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS.
+  Linux needs WebKitGTK 4.1 and system development libraries.
 
-- **Rust** (stable, 2021 edition) — Install via [rustup](https://rustup.rs/)
-- **Trunk** — For web builds: `cargo install trunk`
-- **Tauri CLI v2** — For desktop builds: `cargo install tauri-cli --version "^2"`
-- **`wasm32-unknown-unknown` target** — `rustup target add wasm32-unknown-unknown`
-- **A NOSTR signer** — For web: Alby browser extension (NIP-07). For desktop: Nsec.app, Amber, or any NIP-46 compatible signer app.
-- **A Lightning wallet** — With LNURL-pay support for receiving payments (sellers only).
+Browsing does not require a signer. For account features, use a compatible
+signer or a local key. Desktop wallet integration uses a NWC connection;
+publishers receiving zap payments need an LNURL-pay-enabled Lightning address.
 
-## Building and Running
+## Quick Start
 
-### Desktop
+Run these commands from the repository root:
 
-```bash
-# Development (hot reload)
-cargo tauri dev
+```sh
+# Desktop development (starts the frontend and native app)
+(cd desktop && cargo tauri dev)
 
-# Production build
-cargo tauri build
+# Desktop release bundle (rebuilds and stamps the frontend)
+(cd desktop && cargo tauri build)
+
+# Standalone browser development at http://localhost:5173
+(cd web && trunk serve --features web)
 ```
 
-The desktop app opens a native window with the Arcadestr interface.
+The desktop binary needs matching frontend assets; `cargo build` alone does not
+rebuild them. Prefer the Tauri commands above. A release build does not
+automatically enable payment dispatch.
 
-### Web
+### Checks and Tests
 
-```bash
-cd web
-trunk serve              # Development server at http://localhost:8080
-trunk build --release    # Production build to web/dist/
+```sh
+cargo test -p arcadestr-core --features native --no-fail-fast
+cargo test -p arcadestr-app
+cargo test -p arcadestr-desktop
+cargo check -p arcadestr-web --target wasm32-unknown-unknown --features web
+cargo fmt --all -- --check
+git diff --check
 ```
 
-The web target requires a NIP-07 browser extension for authentication.
-
-### Core Tests
-
-```bash
-cargo test -p arcadestr-core
-```
+See [COMMANDS.md](COMMANDS.md) for focused checks, frontend build commands, and
+debugging guidance.
 
 Arcadestr builds and tests on its own. The [adp-server](https://github.com/kyhou/adp-server)
 reference implementation is needed only for the explicitly invoked
@@ -94,66 +164,47 @@ cross-implementation suites (`scripts/interop-test`). These run in
 independent Cargo workspaces against a pinned server revision; see
 [tests/interop/README.md](tests/interop/README.md).
 
-## Authentication
+## Workspace
 
-Arcadestr supports two authentication flows depending on your target:
+| Crate | Responsibility |
+|---|---|
+| `core` | Domain and protocol logic, validation, Nostr, ADP, payments, and storage |
+| `app` | Shared Leptos UI and desktop/browser bridges |
+| `desktop` | Tauri shell, native services, publishing, installation, and process launch |
+| `web` | WASM entry point for the desktop WebView and standalone browser |
+| `xtask` | Frontend builds and asset fingerprints used to reject stale release assets |
 
-### Web (NIP-07)
+## Security and Current Boundaries
 
-1. Install the Alby or nos2x browser extension
-2. Open Arcadestr in your browser
-3. Click "Connect" — the extension will prompt for approval
-4. Approve the connection in the extension popup
+- **Keys:** remote signing keeps your identity key in the signer. Local-key
+  accounts instead entrust it to Arcadestr's encrypted storage. Desktop local
+  accounts use a protected app-data master-key file, not the OS keyring.
+- **Availability:** relay publication does not guarantee permanent storage.
+  Downloads depend on available distribution servers unless you retain an
+  offline copy or already have the game installed.
+- **Games are executable software:** package verification checks integrity and
+  signed metadata, not whether a publisher's game is safe to run.
+- **Pre-releases:** installers are unsigned, there are no automatic updates, and
+  browser capabilities remain limited as shown above.
 
-### Desktop (NIP-46)
+Read [desktop security boundaries](docs/SECURITY_BOUNDARIES.md) before using real
+keys, and [the payment release policy](docs/PRODUCTION_PAYMENTS.md) before
+building a payment-enabled artifact.
 
-1. Open a NIP-46 compatible signer app (Nsec.app, Amber, etc.)
-2. In Arcadestr desktop, click "Connect with NIP-46"
-3. Copy the `nostrconnect://` URI from your signer app
-4. Paste it into Arcadestr and click Connect
-5. Approve the connection in your signer app
+## Documentation
 
-## Publishing a Game
-
-1. Log in using either NIP-07 (web) or NIP-46 (desktop)
-2. Click "Publish" in the sidebar
-3. Fill in the listing details:
-   - **Listing ID** — A unique slug (e.g., `my-game-v1`)
-   - **Title** — Display name for your game
-   - **Description** — What your game is about
-   - **Price** — In satoshis (0 for free)
-   - **Download URL** — Direct HTTPS link to your game files
-   - **Tags** — Comma-separated categories
-   - **Lightning Address** — Your lud16 address for receiving payments (required for paid games)
-4. Click "Publish Listing" — the listing is broadcast to NOSTR relays as a kind-30078 event
-
-## Buying a Game
-
-1. Browse listings on the main page
-2. Click a listing to open the detail view
-3. For paid games, click "Buy for N sats"
-4. Arcadestr generates a Lightning invoice via the seller's LNURL-pay address
-5. Copy the invoice or click "Open in Wallet"
-6. Pay with any Lightning wallet
-7. The seller's wallet publishes a NIP-57 zap receipt confirming payment
-8. Download the game using the download link
-
-Free games can be downloaded immediately without payment.
-
-## Known Limitations
-
-- **NIP-46 compatibility** — Tested with Nsec.app and Amber. Other signer apps may have compatibility issues.
-
-- **Event IDs** — For fetched listings, the event ID falls back to the listing slug (d-tag) when the actual event ID is not available. This will be fixed in a future update to properly track event IDs.
-
-- **Clipboard API** — Requires HTTPS in browser environments. Local development may not support clipboard operations.
-
-- **Payment verification** — Arcadestr generates Lightning invoices but does not verify on-chain payment status. Payment confirmation relies on the seller's wallet publishing zap receipts.
-
-- **Web target limitations** — NIP-46 is not supported in the web target. Use NIP-07 browser extensions for web authentication.
-
-- **Search and filtering** — Not yet implemented. The browse view shows the 20 most recent listings without search or category filtering.
+- [Development commands](COMMANDS.md) — build, test, and debug.
+- [Codebase guide](CODEBASE.md) — architecture and implementation map.
+- [Documentation index](docs/README.md) — current references versus historical plans.
+- [Releases](docs/releasing.md) — installation, checksums, and publishing.
+- [ADP-01](ADP-01.md), [NIP-102](NIP-102.md), and [NIP-103](NIP-103.md) — protocol drafts.
+- [Client conformance tracking](docs/protocol-implementation-gaps.md).
+- [Interop tests](tests/interop/README.md) and [regression scripts](scripts/README.md).
 
 ## License
 
-MIT
+Licensed under either the [MIT License](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option
+(`MIT OR Apache-2.0`).
+
+Third-party dependencies and assets retain their own licenses.
