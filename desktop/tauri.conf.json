@@ -10,7 +10,7 @@
       "wait": false
     },
     "beforeBuildCommand": {
-      "script": "cargo run -p arcadestr-xtask -- frontend-build --release",
+      "script": "cargo run --locked -p arcadestr-xtask -- frontend-build --release",
       "cwd": ".."
     },
     "devUrl": "http://localhost:5173/?tauri-dev=1",
