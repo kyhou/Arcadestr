@@ -12,8 +12,9 @@ use crate::ui_v2::views::store_page_publish::{
     discard_publisher_store_page_drafts, publisher_store_page_dirty_coordinates,
 };
 use crate::ui_v2::views::{
-    AchievementsView, BrowseGamesView, BrowseRequest, GameDetailView, LibraryView, ProfileV2View,
-    PublishV2View, PublishViewState, PurchasesView, SettingsView, SocialView, StoreFrontView,
+    AchievementsView, BrowseGamesView, BrowseRequest, GameDetailView, LibraryView, ModsView,
+    ProfileV2View, PublishV2View, PublishViewState, PurchasesView, SettingsView, SocialView,
+    StoreFrontView,
 };
 use crate::{invoke_get_allow_insecure_public_ws, invoke_get_connected_relays, AuthContext};
 
@@ -82,6 +83,7 @@ enum UiV2View {
     Detail(GameListing, DetailOrigin),
     Library,
     Social,
+    Mods,
     Achievements,
     Purchases,
     Publish(PublishViewState),
@@ -97,6 +99,7 @@ impl UiV2View {
             Self::Detail(listing, _) => listing.title.clone(),
             Self::Library => "Library".to_string(),
             Self::Social => "Community".to_string(),
+            Self::Mods => "Mods".to_string(),
             Self::Achievements => "Achievements".to_string(),
             Self::Purchases => "Purchases and access".to_string(),
             Self::Publish(_) => "Publisher console".to_string(),
@@ -258,6 +261,7 @@ mod tests {
             "navigate_browse",
             "navigate_library",
             "navigate_social",
+            "navigate_mods",
             "navigate_publish",
             "navigate_profile",
             "navigate_achievements",
@@ -348,6 +352,7 @@ mod tests {
             "navigate_browse",
             "navigate_library",
             "navigate_social",
+            "navigate_mods",
             "navigate_publish",
             "navigate_profile",
             "navigate_achievements",
@@ -405,6 +410,7 @@ mod tests {
     fn navigation_titles_identify_the_destination() {
         assert_eq!(UiV2View::Store.page_title(), "Store");
         assert_eq!(UiV2View::Social.page_title(), "Community");
+        assert_eq!(UiV2View::Mods.page_title(), "Mods");
         assert_eq!(UiV2View::Settings.page_title(), "Settings");
         let game = listing();
         assert_eq!(
@@ -599,17 +605,21 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     let display_name = Signal::derive(move || {
         let non_empty = |value: Option<String>| value.filter(|text| !text.trim().is_empty());
         let profile = auth.profile.get();
-        non_empty(profile.as_ref().and_then(|profile| profile.display_name.clone()))
-            .or_else(|| non_empty(profile.as_ref().and_then(|profile| profile.name.clone())))
-            .or_else(|| {
-                auth.active_account.get().and_then(|account| {
-                    non_empty(account.display_name)
-                        .or_else(|| non_empty(account.name))
-                        .or_else(|| non_empty(account.username))
-                })
+        non_empty(
+            profile
+                .as_ref()
+                .and_then(|profile| profile.display_name.clone()),
+        )
+        .or_else(|| non_empty(profile.as_ref().and_then(|profile| profile.name.clone())))
+        .or_else(|| {
+            auth.active_account.get().and_then(|account| {
+                non_empty(account.display_name)
+                    .or_else(|| non_empty(account.name))
+                    .or_else(|| non_empty(account.username))
             })
-            .or_else(|| auth.npub.get().map(|npub| npub_fallback_label(&npub)))
-            .unwrap_or_else(|| "No active account".to_string())
+        })
+        .or_else(|| auth.npub.get().map(|npub| npub_fallback_label(&npub)))
+        .unwrap_or_else(|| "No active account".to_string())
     });
     let avatar_url = Signal::derive(move || {
         auth.profile
@@ -725,6 +735,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     });
     let navigate_library = Callback::new(move |_| navigate_guarded.run(UiV2View::Library));
     let navigate_social = Callback::new(move |_| navigate_guarded.run(UiV2View::Social));
+    let navigate_mods = Callback::new(move |_| navigate_guarded.run(UiV2View::Mods));
     let navigate_publish = Callback::new(move |_| {
         navigate_guarded.run(UiV2View::Publish(PublishViewState::Games));
     });
@@ -770,6 +781,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
         )
     });
     let social_active = Signal::derive(move || current_view.get() == UiV2View::Social);
+    let mods_active = Signal::derive(move || current_view.get() == UiV2View::Mods);
     let publish_active = Signal::derive(move || matches!(current_view.get(), UiV2View::Publish(_)));
 
     view! {
@@ -787,12 +799,14 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                 discover_active=discover_active
                 library_active=library_active
                 community_active=social_active
+                mods_active=mods_active
                 publish_active=publish_active
                 on_open_store=navigate_store
                 on_open_browse=navigate_browse
                 on_search=search_browse
                 on_open_library=navigate_library
                 on_open_community=navigate_social
+                on_open_mods=navigate_mods
                 on_open_publish=navigate_publish
                 on_open_profile=navigate_profile
                 on_open_achievements=navigate_achievements
@@ -821,6 +835,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
                         }
                         .into_any(),
                         UiV2View::Social => view! { <SocialView /> }.into_any(),
+                        UiV2View::Mods => view! { <ModsView /> }.into_any(),
                         UiV2View::Achievements => view! { <AchievementsView /> }.into_any(),
                         UiV2View::Purchases => view! { <PurchasesView on_browse_store=navigate_store /> }.into_any(),
                         UiV2View::Publish(state) => {

@@ -32,12 +32,14 @@ pub fn TopBar(
     discover_active: Signal<bool>,
     library_active: Signal<bool>,
     community_active: Signal<bool>,
+    mods_active: Signal<bool>,
     publish_active: Signal<bool>,
     on_open_store: Callback<()>,
     on_open_browse: Callback<()>,
     on_search: Callback<String>,
     on_open_library: Callback<()>,
     on_open_community: Callback<()>,
+    on_open_mods: Callback<()>,
     on_open_publish: Callback<()>,
     on_open_profile: Callback<()>,
     on_open_achievements: Callback<()>,
@@ -96,6 +98,15 @@ pub fn TopBar(
                         on:click=move |_| on_open_community.run(())
                     >
                         "Community"
+                    </button>
+                    <button
+                        type="button"
+                        class:arc-nav-active=move || mods_active.get()
+                        style="min-height:44px"
+                        aria-current=move || mods_active.get().then_some("page")
+                        on:click=move |_| on_open_mods.run(())
+                    >
+                        "Mods"
                     </button>
                     <button
                         type="button"

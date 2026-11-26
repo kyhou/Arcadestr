@@ -5096,6 +5096,7 @@ dialog.v2-confirm-backdrop::backdrop {
 }
 
 .arc-community-page,
+.arc-mods-page,
 .arc-profile-page,
 .arc-profile-main,
 .arc-profile-side,
@@ -5425,7 +5426,8 @@ dialog.v2-confirm-backdrop::backdrop {
   }
 }
 
-.arc-community-page {
+.arc-community-page,
+.arc-mods-page {
   gap: 18px;
 }
 
