@@ -15,7 +15,7 @@ prefix="Arcadestr-$version-$platform"
 
 case "$platform" in
   linux-x86_64)
-    expected=("appimage:AppImage:$prefix.AppImage" "deb:deb:$prefix.deb" "rpm:rpm:$prefix.rpm")
+    expected=("deb:deb:$prefix.deb" "rpm:rpm:$prefix.rpm")
     ;;
   windows-x86_64)
     expected=("msi:msi:$prefix.msi" "nsis:exe:$prefix-setup.exe")

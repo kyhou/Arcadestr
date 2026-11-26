@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Arcadestr
+Comment=Decentralized indie game marketplace on Nostr
+Exec=arcadestr
+Icon=arcadestr
+Terminal=false
+Categories=Game;

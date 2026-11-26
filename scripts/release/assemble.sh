@@ -13,7 +13,7 @@ dir="$4"
 notes="$5"
 
 expected=(
-  "Arcadestr-$version-linux-x86_64.AppImage"
+  "arcadestr-$version-1-x86_64.pkg.tar.zst"
   "Arcadestr-$version-linux-x86_64.deb"
   "Arcadestr-$version-linux-x86_64.rpm"
   "Arcadestr-$version-macos-arm64.dmg"

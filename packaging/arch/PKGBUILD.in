@@ -1,0 +1,51 @@
+# Maintainer: Arcadestr Team
+# Upstream release recipe; build-arch.sh substitutes the exact version and
+# SHA-256 of a local git archive of the selected release commit.
+pkgname=arcadestr
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Decentralized indie game marketplace on Nostr'
+arch=('x86_64')
+url='https://github.com/kyhou/Arcadestr'
+# Matches Cargo.toml; upstream license declarations are not changed here.
+license=('MIT OR Apache-2.0')
+depends=('glibc' 'libgcc' 'webkit2gtk-4.1' 'gtk3' 'glib2' 'libsoup3'
+         'libssl.so' 'libcrypto.so' 'dbus' 'cairo' 'gdk-pixbuf2' 'hicolor-icon-theme')
+makedepends=('cargo' 'rust-wasm' 'trunk' 'clang' 'pkgconf'
+             'libayatana-appindicator' 'xdotool')
+options=('!lto' '!debug')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('@SHA256@')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  # Trunk queries metadata for the whole workspace, including other targets.
+  cargo fetch --locked
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export CARGO_TARGET_DIR="$srcdir/$pkgname-$pkgver/target"
+  export CARGO_NET_OFFLINE=true
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$srcdir=/usr/src/debug/$pkgname"
+  # Trunk invokes Cargo too; offline mode preserves the fetched lock graph.
+  # Keep the normal release stamp and desktop/build.rs freshness verification.
+  (
+    # makepkg's x86-64 C hardening flags cannot target WebAssembly.
+    # Keep them for the native build below, not the frontend's C dependencies.
+    unset CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
+    cargo run --frozen -p arcadestr-xtask -- frontend-build --release
+  )
+  cargo build --frozen --release -p arcadestr-desktop
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/arcadestr-desktop "$pkgdir/usr/bin/arcadestr"
+  install -Dm644 packaging/arch/arcadestr.desktop \
+    "$pkgdir/usr/share/applications/arcadestr.desktop"
+  install -Dm644 desktop/icons/icon.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/arcadestr.png"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}

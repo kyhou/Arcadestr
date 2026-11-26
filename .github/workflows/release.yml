@@ -75,7 +75,7 @@ jobs:
           - platform: linux-x86_64
             runner: ubuntu-24.04
             arch: x86_64
-            bundles: appimage,deb,rpm
+            bundles: deb,rpm
           - platform: windows-x86_64
             runner: windows-2025
             arch: x86_64
@@ -163,7 +163,6 @@ jobs:
           # Ad-hoc signature only (no identity, no credentials): Apple Silicon
           # refuses to run a bundle without any signature.
           APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
-          APPIMAGE_EXTRACT_AND_RUN: "1"
         with:
           projectPath: desktop
           tauriScript: cargo tauri
@@ -194,9 +193,34 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  arch:
+    name: Build archlinux-x86_64
+    needs: resolve
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Build with makepkg in Arch Linux
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: bash scripts/release/build-arch.sh "$SHA" "$VERSION" dist
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: arcadestr-archlinux-x86_64
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 14
+
   assemble:
     name: Assemble release
-    needs: [resolve, build]
+    needs: [resolve, build, arch]
     runs-on: ubuntu-24.04
     env:
       TAG: ${{ needs.resolve.outputs.tag }}

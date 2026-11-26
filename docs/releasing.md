@@ -10,9 +10,12 @@ It is independent of the ADP protocol version (`0.3.0`).
 
 ### Downloads
 
+The next release replaces AppImage with the Arch package below. The existing
+`v0.1.0` release is unchanged and does not contain an Arch package.
+
 | Platform | File | Notes |
 |---|---|---|
-| Linux x86-64 | `Arcadestr-X.Y.Z-linux-x86_64.AppImage` | Portable; any glibc 2.39+ system (Ubuntu 24.04, Fedora 40, Debian 13, or newer) |
+| Arch Linux x86-64 | `arcadestr-X.Y.Z-1-x86_64.pkg.tar.zst` | Native Arch package built with `makepkg`; uses system WebKitGTK and graphics libraries |
 | Linux x86-64 | `Arcadestr-X.Y.Z-linux-x86_64.deb` | Debian/Ubuntu (`libc6 >= 2.39`) |
 | Linux x86-64 | `Arcadestr-X.Y.Z-linux-x86_64.rpm` | Fedora/openSUSE with glibc 2.39+ |
 | Windows x86-64 | `Arcadestr-X.Y.Z-windows-x86_64-setup.exe` | Installer (NSIS) |
@@ -20,8 +23,8 @@ It is independent of the ADP protocol version (`0.3.0`).
 | macOS Intel | `Arcadestr-X.Y.Z-macos-x86_64.dmg` | |
 | macOS Apple Silicon | `Arcadestr-X.Y.Z-macos-arm64.dmg` | |
 
-The Linux packages need WebKitGTK 4.1, which the `.deb` and `.rpm` declare as
-dependencies; the AppImage bundles it. Windows needs the WebView2 runtime,
+The Linux packages need WebKitGTK 4.1, declared as a package dependency.
+Windows needs the WebView2 runtime,
 which ships with Windows 10 and 11; the installers download it if it is
 missing. Linux ARM64 and Windows ARM64 builds are not produced.
 
@@ -63,9 +66,30 @@ not prove who built it.
   xattr -dr com.apple.quarantine /Applications/Arcadestr.app
   ```
 
-- **Linux:** the `.deb` and `.rpm` packages are not GPG-signed. Make the
-  AppImage executable (`chmod +x`) before running it. The AppImage needs FUSE 2
-  (`libfuse2`); without it, run it with `--appimage-extract-and-run`.
+- **Linux:** the Arch, `.deb` and `.rpm` packages are not GPG-signed.
+
+### Arch Linux and Manjaro
+
+On an up-to-date Arch Linux system, install the downloaded package with:
+
+```bash
+sudo pacman -U ./arcadestr-X.Y.Z-1-x86_64.pkg.tar.zst
+arcadestr
+```
+
+Manjaro may lag behind Arch's library versions. Do not force dependency
+installation or perform a partial upgrade if the package requires newer
+libraries. This native package does not bundle WebKitGTK, Wayland or EGL.
+Rendering on Manjaro Wayland still requires a runtime check on that system.
+The validation build linked OpenSSL 4 (`libssl.so.4`/`libcrypto.so.4`).
+Manjaro installations with OpenSSL 3 cannot run that binary; rebuild on the
+target distribution or wait for matching libraries rather than forcing it.
+The recipe's shared-library dependencies let `makepkg` record the actual
+OpenSSL SONAME requirements in the package.
+
+AppImage is no longer built: the published `v0.1.0` AppImage fails to render
+on a reported Manjaro Wayland setup while the native release binary works.
+Existing release assets and checksums are unchanged.
 
 There are no automatic updates. Install a newer release over the old one;
 your accounts and library data are kept.
@@ -102,6 +126,38 @@ version.
    - checks the binary's architecture, the release frontend stamp, and that
      the debug-only MCP bridge capability is absent;
    - renames the bundles to the names above.
+   A separate Arch job runs `scripts/release/build-arch.sh` in a pinned
+   `archlinux:base-devel` container. It exports only the selected Git commit,
+   generates `PKGBUILD` from `packaging/arch/PKGBUILD.in` with its source
+   SHA-256 (never `SKIP`), updates the container with `pacman -Syu`, and runs
+   `makepkg` as an unprivileged user. `prepare()` fetches locked Cargo
+   dependencies; `build()` uses the normal release frontend stamp and frozen
+   Cargo builds. The package installs only `/usr/bin/arcadestr`, a desktop
+   entry, icon and both license texts; system WebKitGTK and graphics libraries
+   are not bundled.
+   `namcap`, `desktop-file-validate`, architecture and stamp checks run before
+   uploading. `pkgrel` starts at 1; packaging-only rebuilds of a version must
+   increment it in the recipe and expected asset list.
+
+   The recipe follows the [Arch package guidelines](https://wiki.archlinux.org/title/Arch_package_guidelines)
+   and [Rust guidelines](https://wiki.archlinux.org/title/Rust_package_guidelines).
+   Its SPDX license field matches Cargo's `MIT OR Apache-2.0` declaration.
+   `LICENSE-MIT` and `LICENSE-APACHE` are installed under
+   `/usr/share/licenses/arcadestr/`; the Tauri installers carry the same texts
+   as bundled `licenses/` resources. Third-party licenses are unchanged.
+   The Arch job refuses to upload on any `namcap` packaging error.
+   This is not an AUR submission.
+
+   To build the same package locally after committing the source and recipe:
+
+   ```bash
+   bash scripts/release/build-arch.sh HEAD X.Y.Z dist
+   ```
+
+   Docker is required. The script archives the specified commit, not the
+   working tree, so uncommitted changes are never shipped. Arch's repository
+   toolchain (`cargo`, `rust-wasm`, `trunk`) is used inside this job; it is
+   independent of the fixed toolchain used by the other release jobs.
 3. **assemble** requires every platform, checks the exact set of seven
    installers, writes `SHA256SUMS`, and generates notes from the commits
    since the previous tag.

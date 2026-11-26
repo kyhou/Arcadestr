@@ -149,6 +149,8 @@ This means:
 arcadestr/
 ├── Cargo.toml              # Workspace manifest - defines all 5 crates and Rust 1.89 MSRV
 ├── Cargo.lock              # Dependency lock file
+├── LICENSE-MIT             # MIT license text (choice under MIT OR Apache-2.0)
+├── LICENSE-APACHE          # Apache-2.0 license text (alternative choice)
 ├── .gitignore              # Generated output, local databases, caches, and environment exclusions
 ├── README.md               # Project overview and quickstart
 ├── CLAUDE.md               # Development guidelines for Claude Code
@@ -174,6 +176,7 @@ arcadestr/
 ├── .github/workflows/adp-interop.yml # Cross-implementation suites against the pinned adp-server revision
 ├── .github/workflows/release.yml # Tag-triggered installers (Linux/Windows/macOS) published as a GitHub pre-release
 ├── scripts/release/        # Release tag resolution, bundle collection, SHA256SUMS/notes, idempotent publishing
+├── packaging/arch/         # Checksummed-source PKGBUILD template and native desktop entry
 ├── docs/releasing.md       # Installing, verifying and publishing releases
 ├── scripts/clear_arcadestr_data.sh # Comprehensive local DB/files/cache/keyring reset
 ├── scripts/interop-test    # Explicit runner for the adp-server interop suites (verifies the pin)
@@ -2240,18 +2243,30 @@ out at the pinned SHA. `tests/interop/README.md` documents how to move the pin.
 
 1. **resolve:** finds the exact tagged commit and checks the versions.
 2. **build:** native jobs build `tauri-apps/tauri-action` bundles:
-   - `ubuntu-24.04`: AppImage, DEB, RPM;
+   - `ubuntu-24.04`: DEB, RPM (AppImage discontinued after a Manjaro EGL failure);
    - `windows-2025`: MSI, NSIS;
    - `macos-15-intel` and `macos-15`: DMG.
 
    They use the `--locked` `beforeBuildCommand` above and the existing
    `build.rs` freshness check. Each job checks the binary's architecture and
    that the debug MCP bridge capability is absent.
-3. **assemble:** checks the exact seven versioned assets and writes
+   A separate Arch job uses `scripts/release/build-arch.sh` and
+   `packaging/arch/PKGBUILD.in` to build the selected committed source via
+   non-root `makepkg` in an Arch container, with an explicit source SHA-256,
+   locked/frozen Cargo dependencies and the normal release frontend stamp.
+   It installs the binary, desktop entry, icon and both license texts under `/usr`, uses system
+   WebKitGTK/Wayland/EGL, and runs `namcap` and package checks.
+3. **assemble:** checks the exact seven versioned assets (including the Arch
+   `arcadestr-X.Y.Z-1-x86_64.pkg.tar.zst`, not AppImage) and writes
    `SHA256SUMS` and the notes.
 4. **publish:** the only job with `contents: write`. It creates or completes
    one draft, then publishes it as a pre-release, and never alters a
    published release.
+
+The Arch package installs `LICENSE-MIT` and `LICENSE-APACHE` under
+`/usr/share/licenses/arcadestr/`; Tauri bundles them as `licenses/` resources.
+This matches Cargo's `MIT OR Apache-2.0` declaration and the README.
+Third-party dependency and asset licenses are unchanged.
 
 Installers are unsigned (macOS is ad-hoc signed). A manual run with
 `dry_run` builds any ref without publishing. See `docs/releasing.md`.

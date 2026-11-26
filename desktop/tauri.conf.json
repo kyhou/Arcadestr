@@ -48,6 +48,10 @@
   },
   "bundle": {
     "active": true,
+    "resources": {
+      "../LICENSE-MIT": "licenses/LICENSE-MIT",
+      "../LICENSE-APACHE": "licenses/LICENSE-APACHE"
+    },
     "targets": "all",
     "icon": [
       "icons/icon.png",
