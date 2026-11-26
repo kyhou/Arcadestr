@@ -37,6 +37,16 @@ Arcadestr implements several NIPs to provide a complete decentralized marketplac
 
 - **NIP-78** — Parameterized replaceable events for game listings. Uses kind 30078 with a `d` tag for the listing ID, enabling updates and preventing duplicates.
 
+## Downloads
+
+Prebuilt desktop installers for Linux (AppImage, DEB, RPM), Windows (setup
+EXE, MSI) and macOS (Intel and Apple Silicon DMG) are published on
+[GitHub Releases](https://github.com/kyhou/Arcadestr/releases) with a
+`SHA256SUMS` file. They are pre-releases and are **not code-signed**. See
+[docs/releasing.md](docs/releasing.md) for installation, checksum
+verification, the expected Windows and macOS warnings, and how releases are
+published.
+
 ## Prerequisites
 
 Before building Arcadestr, ensure you have the following installed:

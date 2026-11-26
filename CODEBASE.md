@@ -172,6 +172,9 @@ arcadestr/
 │   └── src/main.rs         # `frontend-build [--release]`: Trunk build + atomic stamp
 ├── .github/workflows/msrv.yml # Rust 1.89 native, Windows, and WASM checks; Arcadestr-only checkout
 ├── .github/workflows/adp-interop.yml # Cross-implementation suites against the pinned adp-server revision
+├── .github/workflows/release.yml # Tag-triggered installers (Linux/Windows/macOS) published as a GitHub pre-release
+├── scripts/release/        # Release tag resolution, bundle collection, SHA256SUMS/notes, idempotent publishing
+├── docs/releasing.md       # Installing, verifying and publishing releases
 ├── scripts/clear_arcadestr_data.sh # Comprehensive local DB/files/cache/keyring reset
 ├── scripts/interop-test    # Explicit runner for the adp-server interop suites (verifies the pin)
 ├── tests/fixtures/
@@ -2231,6 +2234,28 @@ scripts/interop-test black-box  # or: crossflow | regtest-harness; --fetch clone
 `.github/workflows/adp-interop.yml` runs the same suites with adp-server checked
 out at the pinned SHA. `tests/interop/README.md` documents how to move the pin.
 
+**Releases**: pushing a `vX.Y.Z` tag on `main` runs
+`.github/workflows/release.yml`. The tag must match the versions in
+`Cargo.toml` and `desktop/tauri.conf.json`. The workflow has four stages:
+
+1. **resolve:** finds the exact tagged commit and checks the versions.
+2. **build:** native jobs build `tauri-apps/tauri-action` bundles:
+   - `ubuntu-24.04`: AppImage, DEB, RPM;
+   - `windows-2025`: MSI, NSIS;
+   - `macos-15-intel` and `macos-15`: DMG.
+
+   They use the `--locked` `beforeBuildCommand` above and the existing
+   `build.rs` freshness check. Each job checks the binary's architecture and
+   that the debug MCP bridge capability is absent.
+3. **assemble:** checks the exact seven versioned assets and writes
+   `SHA256SUMS` and the notes.
+4. **publish:** the only job with `contents: write`. It creates or completes
+   one draft, then publishes it as a pre-release, and never alters a
+   published release.
+
+Installers are unsigned (macOS is ad-hoc signed). A manual run with
+`dry_run` builds any ref without publishing. See `docs/releasing.md`.
+
 **Linting & Formatting**:
 ```bash
 # Format code
@@ -2274,7 +2299,7 @@ tauri = "2"
       "wait": false
     },
     "beforeBuildCommand": {
-      "script": "cargo run -p arcadestr-xtask -- frontend-build --release",
+      "script": "cargo run --locked -p arcadestr-xtask -- frontend-build --release",
       "cwd": ".."
     },
     "devUrl": "http://localhost:5173/?tauri-dev=1",
