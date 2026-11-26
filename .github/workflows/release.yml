@@ -1,0 +1,245 @@
+name: Release
+
+# Builds the desktop installers for a vX.Y.Z tag and publishes them as one
+# GitHub pre-release with SHA256SUMS. See docs/releasing.md.
+#
+#   resolve  -> tag, exact commit and version checks (read-only)
+#   build    -> one native job per platform; uploads workflow artifacts
+#   assemble -> requires every platform; exact asset set, SHA256SUMS, notes
+#   publish  -> the only job with contents: write; idempotent (safe to re-run)
+#
+# A failed or cancelled build stops assemble and publish, so a partial
+# release is never published. Installers are not code-signed.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to build and publish (with dry run, any branch, tag or commit)
+        required: true
+        type: string
+      dry_run:
+        description: Build and assemble only; never publish
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.98.0"
+  TAURI_CLI_VERSION: "2.10.1"
+  TRUNK_VERSION: "0.21.14"
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve tag, commit and version
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          INPUT_REF: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: bash scripts/release/resolve.sh
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            arch: x86_64
+            bundles: appimage,deb,rpm
+          - platform: windows-x86_64
+            runner: windows-2025
+            arch: x86_64
+            bundles: msi,nsis
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            arch: x86_64
+            bundles: dmg
+          - platform: macos-arm64
+            runner: macos-15
+            arch: arm64
+            bundles: dmg
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential curl file libayatana-appindicator3-dev librsvg2-dev \
+            libssl-dev libwebkit2gtk-4.1-dev libxdo-dev wget
+
+      # WiX's MSI validation (light.exe) needs the VBScript feature on demand.
+      - name: Ensure VBScript is available for MSI packaging
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $capability = Get-WindowsCapability -Online -Name 'VBSCRIPT*'
+          if ($capability -and $capability.State -ne 'Installed') {
+            Add-WindowsCapability -Online -Name $capability.Name | Out-Null
+          }
+          Get-WindowsCapability -Online -Name 'VBSCRIPT*' | Format-Table Name, State
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with the WASM target
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-${{ matrix.platform }}
+
+      - name: Install Trunk and the Tauri CLI
+        run: |
+          if [[ "$(trunk --version 2>/dev/null)" != "trunk $TRUNK_VERSION" ]]; then
+            cargo install --locked trunk --version "$TRUNK_VERSION"
+          fi
+          if [[ "$(cargo tauri --version 2>/dev/null)" != "tauri-cli $TAURI_CLI_VERSION" ]]; then
+            cargo install --locked tauri-cli --version "$TAURI_CLI_VERSION"
+          fi
+          trunk --version
+          cargo tauri --version
+
+      # beforeBuildCommand runs `arcadestr-xtask frontend-build --release`;
+      # desktop/build.rs then refuses a release build whose frontend stamp is
+      # stale. `-- --locked` reaches the desktop `cargo build`.
+      - name: Build installers
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          # Ad-hoc signature only (no identity, no credentials): Apple Silicon
+          # refuses to run a bundle without any signature.
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        with:
+          projectPath: desktop
+          tauriScript: cargo tauri
+          args: --bundles ${{ matrix.bundles }} -- --locked
+
+      - name: Verify release binary
+        run: |
+          binary=target/release/arcadestr-desktop
+          python=python3
+          if [[ "$RUNNER_OS" == Windows ]]; then binary+=.exe; python=python; fi
+          "$python" scripts/release/check-arch.py "$binary" "$ARCH"
+          grep -q '^profile=release$' web/.arcadestr-frontend-build.txt
+          # The debug-only MCP bridge capability is compiled only into debug
+          # builds; its identifier must not be in the release binary.
+          if grep -a -q 'debug-mcp-bridge' "$binary"; then
+            echo "::error::release binary contains the debug MCP bridge capability"
+            exit 1
+          fi
+
+      - name: Collect versioned installers
+        run: bash scripts/release/collect-bundles.sh "$PLATFORM" "$VERSION" dist
+
+      - name: Upload installers
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: arcadestr-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: Assemble release
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Check out the release commit with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download every platform's installers
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: arcadestr-*
+          merge-multiple: true
+          path: release/assets
+
+      - name: Verify assets, write SHA256SUMS and notes
+        run: bash scripts/release/assemble.sh "$VERSION" "$TAG" "$SHA" release/assets release/notes.md
+
+      - name: Upload the assembled release
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub release
+    needs: [resolve, assemble]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Download the assembled release
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release
+
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: bash scripts/release/publish.sh "$TAG" "Arcadestr $TAG" release/assets release/notes.md
