@@ -144,6 +144,9 @@ The desktop binary needs matching frontend assets; `cargo build` alone does not
 rebuild them. Prefer the Tauri commands above. A release build does not
 automatically enable payment dispatch.
 
+On Linux/Wayland, run `bash scripts/install-linux-dev-icon.sh` once to show the
+Arcadestr icon for the development build.
+
 ### Checks and Tests
 
 ```sh

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleaseAssets(unittest.TestCase):
+    def test_wayland_dev_icon_installs_matching_launcher_and_png(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            data = work / "xdg data"
+            checkout = work / "test checkout"
+            script = checkout / "scripts/install-linux-dev-icon.sh"
+            icon = checkout / "desktop/icons/icon.png"
+            for path in (script, icon):
+                path.parent.mkdir(parents=True)
+                shutil.copyfile(ROOT / path.relative_to(checkout), path)
+            subprocess.run(
+                ["bash", str(script)], check=True, capture_output=True,
+                env={**os.environ, "XDG_DATA_HOME": str(data)},
+            )
+            launcher = (data / "applications/arcadestr-desktop.desktop").read_text()
+            self.assertIn(f'Exec="{checkout}/target/debug/arcadestr-desktop"\n', launcher)
+            self.assertIn("Icon=arcadestr-desktop\n", launcher)
+            installed_icon = data / "icons/hicolor/256x256/apps/arcadestr-desktop.png"
+            self.assertEqual(installed_icon.read_bytes(), icon.read_bytes())
+
     def test_license_declarations_and_tauri_resources_agree(self):
         import tomllib
 
@@ -23,7 +44,7 @@ class ReleaseAssets(unittest.TestCase):
             self.assertEqual(resources[f"../{name}"], f"licenses/{name}")
             self.assertTrue((ROOT / name).is_file())
 
-    def test_arch_package_function_installs_both_license_texts(self):
+    def test_arch_package_installs_licenses_and_wayland_launcher(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             source = work / "arcadestr-1.2.3"
@@ -51,6 +72,11 @@ class ReleaseAssets(unittest.TestCase):
             for name in ["LICENSE-MIT", "LICENSE-APACHE"]:
                 installed = package / "usr/share/licenses/arcadestr" / name
                 self.assertEqual(installed.read_bytes(), (ROOT / name).read_bytes())
+            product = json.loads((ROOT / "desktop/tauri.conf.json").read_text())["productName"]
+            launcher = package / "usr/share/applications" / f"{product}.desktop"
+            self.assertIn("Exec=arcadestr\n", launcher.read_text())
+            self.assertIn("Icon=arcadestr\n", launcher.read_text())
+            self.assertTrue((package / "usr/share/icons/hicolor/256x256/apps/arcadestr.png").is_file())
 
     def test_linux_collection_requires_deb_and_rpm_not_appimage(self):
         with tempfile.TemporaryDirectory() as directory:

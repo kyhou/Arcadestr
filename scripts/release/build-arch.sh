@@ -50,7 +50,7 @@ docker run --rm \
     # in the archive: no bundled graphics libraries, keys or user data.
     find verify -type f -printf "%P\n" | LC_ALL=C sort >actual-files
     printf "%s\n" .BUILDINFO .MTREE .PKGINFO \
-      usr/bin/arcadestr usr/share/applications/arcadestr.desktop \
+      usr/bin/arcadestr usr/share/applications/Arcadestr.desktop \
       usr/share/licenses/arcadestr/LICENSE-MIT \
       usr/share/licenses/arcadestr/LICENSE-APACHE \
       usr/share/icons/hicolor/256x256/apps/arcadestr.png |

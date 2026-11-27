@@ -214,6 +214,7 @@ dependencies = [
  "cap-std",
  "dirs 5.0.1",
  "futures-util",
+ "glib",
  "imagesize",
  "infer 0.22.0",
  "libc",

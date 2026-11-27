@@ -43,7 +43,7 @@ package() {
   cd "$pkgname-$pkgver"
   install -Dm755 target/release/arcadestr-desktop "$pkgdir/usr/bin/arcadestr"
   install -Dm644 packaging/arch/arcadestr.desktop \
-    "$pkgdir/usr/share/applications/arcadestr.desktop"
+    "$pkgdir/usr/share/applications/Arcadestr.desktop"
   install -Dm644 desktop/icons/icon.png \
     "$pkgdir/usr/share/icons/hicolor/256x256/apps/arcadestr.png"
   install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"

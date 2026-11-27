@@ -8238,6 +8238,15 @@ fn main() {
     let blossom_state =
         blossom_commands::BlossomManagedState::new(blossom_upload, Arc::new(blossom_settings));
 
+    let context = tauri::generate_context!();
+    #[cfg(target_os = "linux")]
+    if !cfg!(debug_assertions) || !tauri::is_dev() {
+        // GTK 3 uses the GLib program name as its Wayland app ID. Match
+        // Tauri's <productName>.desktop filename, not the installed binary name.
+        if let Some(name) = context.config().product_name.as_deref() {
+            glib::set_prgname(Some(name));
+        }
+    }
     let mut builder = tauri::Builder::default();
 
     // Debug-only UI automation bridge. It can execute script in the webview and
@@ -8821,7 +8830,7 @@ fn main() {
             #[cfg(debug_assertions)]
             test_extended_network_discovery,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building Arcadestr")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {

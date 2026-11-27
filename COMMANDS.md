@@ -20,6 +20,11 @@ for development and `cargo tauri build` for distribution; building the Rust
 binary alone does not rebuild the frontend. Tauri configuration is under
 `desktop/`, so invoke its CLI there. Stop your development process with `Ctrl+C`.
 
+On Linux/Wayland, run `bash scripts/install-linux-dev-icon.sh` once to register
+the dev window's icon for your user, then restart the dev app. Rerun the script if
+the source icon changes or you move the checkout. Installed packages provide
+their own launcher and do not need this step.
+
 ## Checks and Tests
 
 | Task | Command |
