@@ -36,7 +36,8 @@ build() {
     unset CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
     cargo run --frozen -p arcadestr-xtask -- frontend-build --release
   )
-  cargo build --frozen --release -p arcadestr-desktop
+  # Direct Cargo builds need the feature that `tauri build` enables for us.
+  cargo build --frozen --release -p arcadestr-desktop --features custom-protocol
 }
 
 package() {

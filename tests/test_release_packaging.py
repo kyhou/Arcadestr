@@ -44,6 +44,26 @@ class ReleaseAssets(unittest.TestCase):
             self.assertEqual(resources[f"../{name}"], f"licenses/{name}")
             self.assertTrue((ROOT / name).is_file())
 
+    def test_arch_recipe_builds_desktop_with_embedded_frontend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "arcadestr-1.2.3").mkdir()
+            recipe = (ROOT / "packaging/arch/PKGBUILD.in").read_text()
+            (work / "PKGBUILD").write_text(recipe.replace("@VERSION@", "1.2.3"))
+            result = subprocess.run(
+                ["bash", "-ec", """
+                    cargo() { printf '%s\\n' "$*"; }
+                    source ./PKGBUILD
+                    srcdir="$PWD"
+                    build
+                """],
+                cwd=work, check=True, capture_output=True, text=True,
+            )
+            self.assertIn(
+                "build --frozen --release -p arcadestr-desktop --features custom-protocol",
+                result.stdout.splitlines(),
+            )
+
     def test_arch_package_installs_licenses_and_wayland_launcher(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
