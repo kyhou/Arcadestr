@@ -31,12 +31,16 @@ const STORE_PAGE_PROPAGATION_THRESHOLD: usize = 2;
 pub struct StorePageEnrichmentRequest {
     pub generation: u64,
     pub listings: Vec<StorePageListingRef>,
+    #[serde(default)]
+    pub cache_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct StorePageDetailRequest {
     pub generation: u64,
     pub listing: StorePageListingRef,
+    #[serde(default)]
+    pub cache_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,7 +220,7 @@ pub async fn enrich_store_pages(
     };
     let repository = StorePageRepository::new(state.database.pool().clone());
     StorePageBatchService::new(&relay_manager, &repository)
-        .enrich(request.generation, &request.listings)
+        .enrich(request.generation, &request.listings, request.cache_only)
         .await
         .map_err(|error| error.to_string())
 }
@@ -232,7 +236,7 @@ pub async fn enrich_store_page_detail(
     };
     let repository = StorePageRepository::new(state.database.pool().clone());
     StorePageBatchService::new(&relay_manager, &repository)
-        .enrich_detail(request.generation, &request.listing)
+        .enrich_detail(request.generation, &request.listing, request.cache_only)
         .await
         .map_err(|error| error.to_string())
 }

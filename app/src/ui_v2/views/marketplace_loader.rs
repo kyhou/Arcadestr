@@ -139,7 +139,21 @@ pub fn use_listing_store_page_presentations(
                 .collect(),
         };
         spawn_local(async move {
-            let result = invoke_enrich_store_pages(request).await;
+            let cached = invoke_enrich_store_pages(request.clone(), true).await;
+            if generation.try_get_untracked() != Some(request_generation) {
+                return;
+            }
+            if let Ok(response) = cached {
+                if response.generation == request_generation {
+                    apply_store_page_updates(
+                        &presentations,
+                        &known_events.get_untracked(),
+                        response.cached,
+                    );
+                }
+            }
+
+            let result = invoke_enrich_store_pages(request, false).await;
             let Some(current_generation) = generation.try_get_untracked() else {
                 return;
             };
@@ -183,7 +197,8 @@ fn apply_store_page_updates(
     expected_events: &HashMap<String, Option<String>>,
     updates: Vec<crate::models::StorePageEnrichmentResult>,
 ) {
-    presentations.update(|current| {
+    presentations.maybe_update(|current| {
+        let mut changed = false;
         for update in updates {
             if expected_events
                 .get(&update.listing_coordinate)
@@ -194,17 +209,21 @@ fn apply_store_page_updates(
                 continue;
             }
             match update.state {
-                StorePageEnrichmentState::Enriched(presentation) => {
+                StorePageEnrichmentState::Enriched(presentation)
+                    if current.get(&update.listing_coordinate) != Some(&presentation) =>
+                {
                     current.insert(update.listing_coordinate, presentation);
+                    changed = true;
                 }
-                StorePageEnrichmentState::Unavailable => {}
+                StorePageEnrichmentState::Enriched(_) | StorePageEnrichmentState::Unavailable => {}
                 StorePageEnrichmentState::NotAssociated
                 | StorePageEnrichmentState::NotFound
                 | StorePageEnrichmentState::Invalid => {
-                    current.remove(&update.listing_coordinate);
+                    changed |= current.remove(&update.listing_coordinate).is_some();
                 }
             }
         }
+        changed
     });
 }
 

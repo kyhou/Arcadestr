@@ -1078,14 +1078,41 @@ pub fn GameDetailView(
             return;
         };
         spawn_local(async move {
-            let response = invoke_enrich_store_page_detail(
-                requested_generation,
-                StorePageListingRef {
-                    listing_coordinate: coordinate.clone(),
-                    listing_event_id: event_id.clone(),
-                },
-            )
-            .await;
+            let show_presentation = |presentation| {
+                detail_presentation.maybe_update(|current| {
+                    if *current == presentation {
+                        return false;
+                    }
+                    *current = presentation;
+                    true
+                });
+            };
+            let listing = StorePageListingRef {
+                listing_coordinate: coordinate.clone(),
+                listing_event_id: event_id.clone(),
+            };
+            let cached =
+                invoke_enrich_store_page_detail(requested_generation, listing.clone(), true).await;
+            if detail_generation.try_get_untracked() != Some(requested_generation) {
+                return;
+            }
+            if let Ok(response) = cached {
+                if let Some(cached) = response.cached {
+                    if detail_response_is_current(
+                        requested_generation,
+                        requested_generation,
+                        response.generation,
+                        &coordinate,
+                        &event_id,
+                        &cached,
+                    ) {
+                        show_presentation(Some(cached));
+                    }
+                }
+            }
+
+            let response =
+                invoke_enrich_store_page_detail(requested_generation, listing, false).await;
             let Some(current_generation) = detail_generation.try_get_untracked() else {
                 return;
             };
@@ -1103,39 +1130,35 @@ pub fn GameDetailView(
             }
             listing_event_current.set(response.listing_event_current);
             listing_validation_error.set(!response.listing_event_current);
-            if let Some(cached) = response.cached {
-                if detail_response_is_current(
+            listing_validation_loading.set(false);
+            if !response.listing_event_current {
+                show_presentation(None);
+                return;
+            }
+            let matches_listing = |presentation: &GameDetailPresentation| {
+                detail_response_is_current(
                     current_generation,
                     requested_generation,
                     response.generation,
                     &coordinate,
                     &event_id,
-                    &cached,
-                ) {
-                    detail_presentation.set(Some(cached));
-                }
-            }
+                    presentation,
+                )
+            };
             match response.refreshed {
-                StorePageDetailState::Enriched(presentation)
-                    if detail_response_is_current(
-                        current_generation,
-                        requested_generation,
-                        response.generation,
-                        &coordinate,
-                        &event_id,
-                        &presentation,
-                    ) =>
-                {
-                    detail_presentation.set(Some(presentation));
+                StorePageDetailState::Enriched(presentation) if matches_listing(&presentation) => {
+                    show_presentation(Some(presentation));
                 }
-                StorePageDetailState::Unavailable => {}
-                StorePageDetailState::Enriched(_) => {}
+                StorePageDetailState::Unavailable | StorePageDetailState::Enriched(_) => {
+                    if let Some(cached) = response.cached.filter(matches_listing) {
+                        show_presentation(Some(cached));
+                    }
+                }
                 StorePageDetailState::NotAssociated
                 | StorePageDetailState::NotFound
                 | StorePageDetailState::Invalid
-                | StorePageDetailState::Unsupported => detail_presentation.set(None),
+                | StorePageDetailState::Unsupported => show_presentation(None),
             }
-            listing_validation_loading.set(false);
         });
     });
     on_cleanup(move || detail_generation.update(|value| *value = value.wrapping_add(1)));

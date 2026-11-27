@@ -1080,7 +1080,7 @@ fn PublishedGamesView(
         };
         let auth_for_request = auth_for_store_pages.clone();
         spawn_local(async move {
-            let result = invoke_enrich_store_pages(request).await;
+            let result = invoke_enrich_store_pages(request, false).await;
             if !accepts_account_response(
                 auth_for_request.npub.get_untracked().as_deref(),
                 &publisher_npub,
@@ -1476,7 +1476,7 @@ fn GameManagementView(
         };
         let auth_for_request = auth_for_store_page.clone();
         spawn_local(async move {
-            let result = invoke_enrich_store_pages(request).await;
+            let result = invoke_enrich_store_pages(request, false).await;
             if !accepts_account_response(
                 auth_for_request.npub.get_untracked().as_deref(),
                 &account,

@@ -562,10 +562,12 @@ impl<'a, R: StorePageRelaySource> StorePageBatchService<'a, R> {
         Self { relays, repository }
     }
 
+    /// A cache-only pass renders matching signed revisions without contacting relays.
     pub async fn enrich(
         &self,
         generation: u64,
         requested: &[StorePageListingRef],
+        cache_only: bool,
     ) -> Result<StorePageBatchEnrichment, StorePageDiscoveryError> {
         if requested.len() > MAX_STORE_PAGE_ENRICHMENT_BATCH {
             return Err(StorePageDiscoveryError::BatchTooLarge(
@@ -592,26 +594,30 @@ impl<'a, R: StorePageRelaySource> StorePageBatchService<'a, R> {
                 refreshed: Vec::new(),
             });
         }
-        let authors = requested
-            .values()
-            .map(|(author, _, _)| *author)
-            .collect::<HashSet<_>>();
-        let identifiers = requested
-            .values()
-            .map(|(_, identifier, _)| identifier.clone())
-            .collect::<HashSet<_>>();
-        let listing_query = self
-            .relays
-            .query(
-                Filter::new()
-                    .kind(Kind::Custom(crate::adp_protocol::NIP99_LISTING_KIND))
-                    .authors(authors)
-                    .custom_tags(SingleLetterTag::lowercase(Alphabet::D), identifiers),
-            )
-            .await;
-        let (mut listing_events, listing_coverage_complete) = match listing_query {
-            Ok(query) => (query.events, query.coverage_complete),
-            Err(_) => (Vec::new(), false),
+        let (mut listing_events, listing_coverage_complete) = if cache_only {
+            (Vec::new(), false)
+        } else {
+            let authors = requested
+                .values()
+                .map(|(author, _, _)| *author)
+                .collect::<HashSet<_>>();
+            let identifiers = requested
+                .values()
+                .map(|(_, identifier, _)| identifier.clone())
+                .collect::<HashSet<_>>();
+            match self
+                .relays
+                .query(
+                    Filter::new()
+                        .kind(Kind::Custom(crate::adp_protocol::NIP99_LISTING_KIND))
+                        .authors(authors)
+                        .custom_tags(SingleLetterTag::lowercase(Alphabet::D), identifiers),
+                )
+                .await
+            {
+                Ok(query) => (query.events, query.coverage_complete),
+                Err(_) => (Vec::new(), false),
+            }
         };
         for (coordinate, (_, _, expected_event_id)) in &requested {
             if let Some(cached_listing) = self.repository.load_listing_event(coordinate).await? {
@@ -645,7 +651,9 @@ impl<'a, R: StorePageRelaySource> StorePageBatchService<'a, R> {
                 refreshed.insert(coordinate.clone(), StorePageEnrichmentState::Unavailable);
                 continue;
             }
-            let _ = self.repository.upsert_listing_event(listing).await?;
+            if !cache_only {
+                let _ = self.repository.upsert_listing_event(listing).await?;
+            }
             let Ok(report) = parse_store_page_pointers(listing) else {
                 refreshed.insert(coordinate.clone(), StorePageEnrichmentState::Invalid);
                 continue;
@@ -665,9 +673,19 @@ impl<'a, R: StorePageRelaySource> StorePageBatchService<'a, R> {
                         &requested,
                         StorePageEnrichmentState::Enriched(presentation),
                     ));
-                    cached_pages.insert(coordinate.clone(), entry.parsed);
+                    if !cache_only {
+                        cached_pages.insert(coordinate.clone(), entry.parsed);
+                    }
                 }
             }
+        }
+
+        if cache_only {
+            return Ok(StorePageBatchEnrichment {
+                generation,
+                cached,
+                refreshed: Vec::new(),
+            });
         }
 
         let mut grouped: BTreeMap<String, (PublicKey, HashSet<String>)> = BTreeMap::new();
@@ -795,6 +813,7 @@ impl<'a, R: StorePageRelaySource> StorePageBatchService<'a, R> {
         &self,
         generation: u64,
         requested: &StorePageListingRef,
+        cache_only: bool,
     ) -> Result<StorePageDetailEnrichment, StorePageDiscoveryError> {
         let Some((coordinate, (author, identifier))) =
             parse_listing_coordinate_ref(&requested.listing_coordinate)
@@ -806,19 +825,23 @@ impl<'a, R: StorePageRelaySource> StorePageBatchService<'a, R> {
                 StorePageDetailState::Invalid,
             ));
         };
-        let listing_query = self
-            .relays
-            .query(
-                Filter::new()
-                    .kind(Kind::Custom(crate::adp_protocol::NIP99_LISTING_KIND))
-                    .author(author)
-                    .custom_tags(
-                        SingleLetterTag::lowercase(Alphabet::D),
-                        [identifier.clone()],
-                    ),
-            )
-            .await;
-        let mut listing_events = listing_query.map(|query| query.events).unwrap_or_default();
+        let mut listing_events = if cache_only {
+            Vec::new()
+        } else {
+            self.relays
+                .query(
+                    Filter::new()
+                        .kind(Kind::Custom(crate::adp_protocol::NIP99_LISTING_KIND))
+                        .author(author)
+                        .custom_tags(
+                            SingleLetterTag::lowercase(Alphabet::D),
+                            [identifier.clone()],
+                        ),
+                )
+                .await
+                .map(|query| query.events)
+                .unwrap_or_default()
+        };
         if let Some(cached_listing) = self.repository.load_listing_event(&coordinate).await? {
             if cached_listing.id.to_hex() == requested.listing_event_id {
                 listing_events.push(cached_listing);
@@ -845,11 +868,13 @@ impl<'a, R: StorePageRelaySource> StorePageBatchService<'a, R> {
                 StorePageDetailState::Unavailable,
             ));
         }
-        let _ = self.repository.upsert_listing_event(listing).await?;
+        if !cache_only {
+            let _ = self.repository.upsert_listing_event(listing).await?;
+        }
         let Ok(report) = parse_store_page_pointers(listing) else {
             return Ok(detail_result(
                 generation,
-                true,
+                !cache_only,
                 None,
                 StorePageDetailState::Invalid,
             ));
@@ -857,7 +882,7 @@ impl<'a, R: StorePageRelaySource> StorePageBatchService<'a, R> {
         let Some(pointer) = report.active else {
             return Ok(detail_result(
                 generation,
-                true,
+                !cache_only,
                 None,
                 StorePageDetailState::NotAssociated,
             ));
@@ -871,6 +896,15 @@ impl<'a, R: StorePageRelaySource> StorePageBatchService<'a, R> {
                 cached = Some(detail_presentation(&association, listing));
                 cached_parsed = Some(entry.parsed);
             }
+        }
+        if cache_only {
+            // Cache-only presentation must not count as a current-listing check.
+            return Ok(detail_result(
+                generation,
+                false,
+                cached,
+                StorePageDetailState::Unavailable,
+            ));
         }
         if let Some(relay_hint) = &pointer.relay_hint {
             self.relays.add_advisory_relay(relay_hint).await;
@@ -1794,6 +1828,7 @@ mod tests {
                         listing_event_id: windows_event_id,
                     },
                 ],
+                false,
             )
             .await
             .expect("batch enrichment");
@@ -1861,6 +1896,7 @@ mod tests {
                     listing_coordinate: coordinate,
                     listing_event_id: older.id.to_hex(),
                 },
+                false,
             )
             .await
             .expect("detail enrichment");
@@ -1941,6 +1977,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reopening_store_and_detail_reads_cached_artwork_without_querying_relays() {
+        use crate::store_page::StorePageMediaItem;
+
+        let (_directory, repository) = repository().await;
+        let keys = Keys::generate();
+        let listing = signed_listing(&keys, "game", Some("page"));
+        let coordinate = listing_coordinate(&listing).expect("coordinate");
+        let cover = "https://cdn.example.org/cover.jpg";
+        let screenshot = "https://cdn.example.org/screenshot.jpg";
+        let content = StorePageContentV1 {
+            media: [("hero", cover), ("screenshot", screenshot)]
+                .into_iter()
+                .map(|(role, url)| StorePageMediaItem {
+                    id: role.into(),
+                    media_type: "image".into(),
+                    role: role.into(),
+                    url: url.into(),
+                    sha256: None,
+                    mime_type: None,
+                    size: None,
+                    thumbnail_url: None,
+                    alt: None,
+                    caption: None,
+                    width: None,
+                    height: None,
+                })
+                .collect(),
+            ..StorePageContentV1::default()
+        };
+        let page = build_store_page_event_builder(&StorePageBuildParams {
+            publisher: keys.public_key(),
+            presentation_id: "page".into(),
+            listing_coordinates: vec![coordinate.clone()],
+            content,
+            compact_tags: StorePageCompactTags::default(),
+        })
+        .expect("page builder")
+        .sign_with_keys(&keys)
+        .expect("page");
+        let request = StorePageListingRef {
+            listing_coordinate: coordinate,
+            listing_event_id: listing.id.to_hex(),
+        };
+        let relays = FakeRelays::new(vec![query(vec![listing]), query(vec![page]), query(vec![])]);
+        let service = StorePageBatchService::new(&relays, &repository);
+        let first = service
+            .enrich_detail(1, &request, false)
+            .await
+            .expect("first open");
+        assert!(matches!(first.refreshed, StorePageDetailState::Enriched(_)));
+        let queries = *relays.query_count.lock().expect("query count lock");
+
+        let store = service
+            .enrich(2, std::slice::from_ref(&request), true)
+            .await
+            .expect("return to store");
+        assert!(matches!(
+            &store.cached[0].state,
+            StorePageEnrichmentState::Enriched(card) if card.hero_url.as_deref() == Some(cover)
+        ));
+        let reopened = service
+            .enrich_detail(3, &request, true)
+            .await
+            .expect("reopen detail");
+        assert!(reopened
+            .cached
+            .expect("cached detail")
+            .media
+            .iter()
+            .any(|media| { media.role == "screenshot" && media.url == screenshot }));
+        assert!(!reopened.listing_event_current);
+
+        let mismatched = StorePageListingRef {
+            listing_event_id: "0".repeat(64),
+            ..request
+        };
+        assert!(service
+            .enrich_detail(4, &mismatched, true)
+            .await
+            .expect("stale detail")
+            .cached
+            .is_none());
+        assert!(service
+            .enrich(4, &[mismatched], true)
+            .await
+            .expect("stale card")
+            .cached
+            .is_empty());
+        assert_eq!(
+            *relays.query_count.lock().expect("query count lock"),
+            queries
+        );
+    }
+
+    #[tokio::test]
     async fn game_detail_unavailable_refresh_preserves_cached_presentation() {
         let (_directory, repository) = repository().await;
         let keys = Keys::generate();
@@ -1967,6 +2098,7 @@ mod tests {
                     listing_coordinate: coordinate,
                     listing_event_id: listing.id.to_hex(),
                 },
+                false,
             )
             .await
             .expect("detail enrichment");

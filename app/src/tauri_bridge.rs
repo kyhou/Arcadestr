@@ -110,10 +110,15 @@ pub async fn invoke_approve_purchase_plan(
 #[cfg(not(feature = "web"))]
 pub async fn invoke_enrich_store_pages(
     request: StorePageEnrichmentRequest,
+    cache_only: bool,
 ) -> Result<StorePageBatchEnrichment, String> {
     crate::tauri_invoke::invoke(
         "enrich_store_pages",
-        serde_json::json!({ "request": request }),
+        serde_json::json!({ "request": {
+            "generation": request.generation,
+            "listings": request.listings,
+            "cache_only": cache_only,
+        } }),
     )
     .await
 }
@@ -225,10 +230,13 @@ struct RawDetailEnrichment {
 pub async fn invoke_enrich_store_page_detail(
     generation: u64,
     listing: StorePageListingRef,
+    cache_only: bool,
 ) -> Result<StorePageDetailEnrichment, String> {
     let raw: RawDetailEnrichment = crate::tauri_invoke::invoke(
         "enrich_store_page_detail",
-        serde_json::json!({ "request": { "generation": generation, "listing": listing } }),
+        serde_json::json!({ "request": {
+            "generation": generation, "listing": listing, "cache_only": cache_only
+        } }),
     )
     .await?;
     Ok(map_detail_enrichment(raw))
@@ -238,6 +246,7 @@ pub async fn invoke_enrich_store_page_detail(
 pub async fn invoke_enrich_store_page_detail(
     _generation: u64,
     _listing: StorePageListingRef,
+    _cache_only: bool,
 ) -> Result<StorePageDetailEnrichment, String> {
     Err("Store Page detail enrichment is unavailable in standalone web builds.".to_string())
 }
@@ -584,6 +593,7 @@ pub async fn invoke_retry_store_page_pointer_sync(
 #[cfg(feature = "web")]
 pub async fn invoke_enrich_store_pages(
     _request: StorePageEnrichmentRequest,
+    _cache_only: bool,
 ) -> Result<StorePageBatchEnrichment, String> {
     Err("Store Page relay enrichment is unavailable in standalone web builds.".to_string())
 }
