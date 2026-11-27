@@ -73,8 +73,19 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                         }
                         // Update listings signal to trigger re-render
                         listings.update(|v| {
-                            // Check for duplicates in the vector too
-                            if !v.iter().any(|l| l.id == listing.id) {
+                            if let Some(current) = v.iter_mut().find(|current| {
+                                current.id == listing.id
+                                    && current.publisher_npub == listing.publisher_npub
+                            }) {
+                                if arcadestr_core::is_replaceable_event_newer(
+                                    listing.created_at,
+                                    listing.event_id.as_deref(),
+                                    current.created_at,
+                                    current.event_id.as_deref(),
+                                ) {
+                                    *current = listing;
+                                }
+                            } else {
                                 v.push(listing);
                             }
                         });
@@ -142,6 +153,16 @@ pub fn BrowseView(on_select: Callback<GameListing>) -> impl IntoView {
                 }
             }
         });
+    });
+
+    let listings = Signal::derive(move || {
+        listings.with(|listings| {
+            listings
+                .iter()
+                .filter(|listing| listing.is_adp_storefront_listing())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
     });
 
     view! {

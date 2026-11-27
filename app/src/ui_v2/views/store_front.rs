@@ -28,7 +28,7 @@ pub fn StoreFrontView(
     on_browse: Callback<BrowseRequest>,
 ) -> impl IntoView {
     let marketplace = use_marketplace_listings_with_limit(STORE_FRONT_LISTING_LIMIT);
-    let listings = marketplace.listings;
+    let listings = marketplace.storefront_listings();
     let campaign_state = use_listing_campaign_states(listings);
     let store_pages = use_listing_store_page_presentations(listings);
     let active_slide = RwSignal::new(0_usize);

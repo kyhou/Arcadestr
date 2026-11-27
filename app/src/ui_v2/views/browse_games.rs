@@ -238,7 +238,7 @@ fn no_results_copy(has_query: bool, has_filters: bool) -> (&'static str, &'stati
     } else {
         (
             "No marketplace listings",
-            "No valid game listings were returned by the connected relays.",
+            "No games with ADP distribution metadata were found on the connected relays.",
         )
     }
 }
@@ -246,7 +246,7 @@ fn no_results_copy(has_query: bool, has_filters: bool) -> (&'static str, &'stati
 #[component]
 pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest) -> impl IntoView {
     let marketplace = use_marketplace_listings();
-    let listings = marketplace.listings;
+    let listings = marketplace.storefront_listings();
     let campaign_state = use_listing_campaign_states(listings);
     let store_pages = use_listing_store_page_presentations(listings);
     let query = RwSignal::new(request.query.unwrap_or_default());
@@ -318,7 +318,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
         let decision = decide_platform_auto_fetch(
             platform_auto_fetch.get(),
             filtered_listings.get().len(),
-            listings.get().len(),
+            marketplace.listings.with(Vec::len),
             active_platform_filter.get().as_deref(),
             marketplace.has_more.get(),
             MAX_PLATFORM_AUTO_FETCHES,
@@ -327,7 +327,7 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
             PlatformAutoFetchDecision::Wait => {}
             PlatformAutoFetchDecision::Stop => platform_auto_fetch.set(None),
             PlatformAutoFetchDecision::Fetch => {
-                let loaded_count = listings.get_untracked().len();
+                let loaded_count = marketplace.listings.with_untracked(Vec::len);
                 let displayed_count = filtered_listings.get_untracked().len();
                 let attempts = platform_auto_fetch
                     .get_untracked()
@@ -616,10 +616,11 @@ pub fn BrowseGamesView(on_select: Callback<GameListing>, request: BrowseRequest)
                                 class="v2-btn-secondary"
                                 on:click=move |_| {
                                     let displayed_count = filtered_listings.get_untracked().len();
-                                    let loaded_count = listings.get_untracked().len();
+                                    let loaded_count = marketplace.listings.with_untracked(Vec::len);
                                     let next_visible = next_visible_count(visible_count.get_untracked(), displayed_count, BROWSE_VISIBLE_INCREMENT);
                                     visible_count.set(next_visible);
-                                    let required_limit = required_listing_limit(next_visible);
+                                    let hidden_count = loaded_count.saturating_sub(listings.with_untracked(Vec::len));
+                                    let required_limit = required_listing_limit(next_visible).saturating_add(hidden_count);
                                     let fetch_limit = platform_load_more_fetch_limit(
                                         active_platform_filter.get_untracked().as_deref(),
                                         marketplace.has_more.get_untracked(),

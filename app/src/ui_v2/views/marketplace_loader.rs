@@ -33,6 +33,14 @@ use crate::{invoke_fetch_marketplace_stream, AuthContext};
 
 const DEFAULT_MARKETPLACE_LISTING_LIMIT: usize = 50;
 
+fn storefront_listings(listings: &[GameListing]) -> Vec<GameListing> {
+    listings
+        .iter()
+        .filter(|listing| listing.is_adp_storefront_listing())
+        .cloned()
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 pub struct MarketplaceListingsState {
     pub listings: RwSignal<Vec<GameListing>>,
@@ -44,6 +52,14 @@ pub struct MarketplaceListingsState {
     pub has_more: RwSignal<bool>,
     pub refreshing: RwSignal<bool>,
     pub using_cached_data: RwSignal<bool>,
+}
+
+impl MarketplaceListingsState {
+    pub fn storefront_listings(self) -> Signal<Vec<GameListing>> {
+        // Keep all revisions in the loader for replacement ordering and pagination;
+        // apply storefront policy to the current projection, regardless of its source.
+        Signal::derive(move || self.listings.with(|listings| storefront_listings(listings)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,7 +89,7 @@ pub fn canonical_listing_coordinate(listing: &GameListing) -> Option<String> {
 }
 
 pub fn use_listing_store_page_presentations(
-    listings: RwSignal<Vec<GameListing>>,
+    listings: Signal<Vec<GameListing>>,
 ) -> ListingStorePagePresentations {
     let presentations = RwSignal::new(HashMap::<String, StorePageCardPresentation>::new());
     let loading = RwSignal::new(false);
@@ -196,7 +212,7 @@ pub fn listing_state_key(listing: &GameListing) -> String {
     format!("{}:{}", listing.publisher_npub, listing.id)
 }
 
-pub fn use_listing_campaign_states(listings: RwSignal<Vec<GameListing>>) -> ListingCampaignStates {
+pub fn use_listing_campaign_states(listings: Signal<Vec<GameListing>>) -> ListingCampaignStates {
     let states = RwSignal::new(HashMap::<String, CampaignAvailability>::new());
     let loading = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
@@ -739,10 +755,16 @@ fn has_more_after_page(before_count: usize, after_count: usize) -> bool {
 }
 
 fn debug_mock_listings() -> Vec<GameListing> {
+    let distribution_specs = || {
+        vec![
+            ("file_hash".to_string(), "ab".repeat(32)),
+            ("server".to_string(), "https://example.com".to_string()),
+        ]
+    };
     vec![
         GameListing {
             id: "debug-neon-velocity".to_string(),
-            source: ListingSource::Nip15Product,
+            source: ListingSource::Nip99Listing,
             title: "Neon Velocity".to_string(),
             description: "Drift through a neon skyline in a high-speed action experience built for multiplayer tournaments.".to_string(),
             images: vec!["https://lh3.googleusercontent.com/aida-public/AB6AXuAkSqV1ZOY7qDKBQQ-nU-WKmOwR16envOE_TMPHQep0afObsmDW51MoGnuCDehLWvRSiX2M-G1ipCeBVnLuSnk_GtSaKNiiKAL3NGBqfTVvkZErj92gogHgjo8Dm9s9qZAoKzMpmCEwTLAaasaklmpG0EvebxYhk_pgx9zFciCa6eEvQAequV2_VwSfxkp8qFHQKZDgSfcZX7ItUvMkkVo9gJMVU1kvmoEqtnEdxEgw_XCFEvda_kG_L7oqZh2ranJukSzpwKvU8ow".to_string()],
@@ -752,7 +774,7 @@ fn debug_mock_listings() -> Vec<GameListing> {
             price_sats: 21000,
             quantity: None,
             tags: vec!["action".to_string(), "multiplayer".to_string()],
-            specs: vec![("genre".to_string(), "Action".to_string())],
+            specs: distribution_specs(),
             publisher_npub: "npub1debugstorefront000000000000000000000000000000000000000000".to_string(),
             stall_id: "debug-stall-1".to_string(),
             stall_name: Some("Neon Arcade".to_string()),
@@ -769,7 +791,7 @@ fn debug_mock_listings() -> Vec<GameListing> {
         },
         GameListing {
             id: "debug-bit-runners".to_string(),
-            source: ListingSource::Nip15Product,
+            source: ListingSource::Nip99Listing,
             title: "Bit-Runners".to_string(),
             description: "Cyberpunk platformer with chain-linked item economy and community-run speedrun ladders.".to_string(),
             images: vec!["https://lh3.googleusercontent.com/aida-public/AB6AXuBppEh6duJunDcRrAlDyCHwjcLgKSLNrLn7urlFTA1JDEkbmtnYBzd_8RTWxEH0yhfLUX6wQa3QLRpQt89K69EpDGFa4DG6BcbpzyvRD9MKUR4kFURF1OHnGUsMf8pBgOnoVi2rpRC8MhhdLRTwAZGOCXgv4HUTOLToqmpkDBz1btGwBcD05i3nH5GAd2JOlqCOUwMiPrEuVPBCjSKOLd6HZ8owiUNaSNfVauMEYH3RM5Gx5tWR72rlRSNaHzmv2votTLxYPeMXM5k".to_string()],
@@ -779,7 +801,7 @@ fn debug_mock_listings() -> Vec<GameListing> {
             price_sats: 0,
             quantity: None,
             tags: vec!["platformer".to_string(), "cyberpunk".to_string()],
-            specs: vec![("genre".to_string(), "Platformer".to_string())],
+            specs: distribution_specs(),
             publisher_npub: "npub1debugstorefront000000000000000000000000000000000000000000".to_string(),
             stall_id: "debug-stall-1".to_string(),
             stall_name: Some("Neon Arcade".to_string()),
@@ -796,7 +818,7 @@ fn debug_mock_listings() -> Vec<GameListing> {
         },
         GameListing {
             id: "debug-dune-settlers".to_string(),
-            source: ListingSource::Nip15Product,
+            source: ListingSource::Nip99Listing,
             title: "Dune Settlers".to_string(),
             description: "Build a resilient off-world economy in a tactical strategy game tuned for async league play.".to_string(),
             images: vec!["https://lh3.googleusercontent.com/aida-public/AB6AXuBalkh2NCA6UZ04qa-pFXIL4N2iVby1eMnZRzDd9a2oAa9WYnFWl8OIykQNH3c4AcYN_aUwFcdGEXpllBbQf7Hz_j2HDQGKQaQXRZAmXB0nrdVNADrOeO4o5chwWjZYJKlC9Zp48Rwgt9m66yqG-k_rZ-Aot35r46iWmWCWdpye8690JqLNYoO0KmKmmTtAS2g8EsoY7eG58kSRXTaRsTqPVGPu7q43eYjpHizKEqucFvwzRT8C14m3Gji3_-ym2ZZqXrJI8pdohOA".to_string()],
@@ -806,7 +828,7 @@ fn debug_mock_listings() -> Vec<GameListing> {
             price_sats: 39000,
             quantity: None,
             tags: vec!["strategy".to_string(), "scifi".to_string()],
-            specs: vec![("genre".to_string(), "Strategy".to_string())],
+            specs: distribution_specs(),
             publisher_npub: "npub1debugstorefront000000000000000000000000000000000000000000".to_string(),
             stall_id: "debug-stall-1".to_string(),
             stall_name: Some("Neon Arcade".to_string()),
@@ -857,6 +879,26 @@ mod tests {
             #[cfg(debug_assertions)]
             nip99_raw_event_json: None,
         }
+    }
+
+    #[test]
+    fn storefront_hides_generic_classifieds_and_respects_replacement_order() {
+        let mut generic = listing_with_sats(15_000);
+        generic.id = "browser-game-templates-arcade-preschool".into();
+        generic.source = ListingSource::Nip99Listing;
+        generic.tags = vec!["game".into(), "template".into()];
+        let mut compatible = debug_mock_listings().remove(0);
+        // Distribution alone is enough; no launch metadata or local platform match is needed.
+        compatible.platforms = vec!["windows-x86_64".into()];
+        let mut listings = vec![generic, compatible.clone()];
+        assert_eq!(storefront_listings(&listings), vec![compatible.clone()]);
+
+        let mut replacement = compatible.clone();
+        replacement.created_at += 1;
+        replacement.specs.clear();
+        upsert_latest_listing(&mut listings, replacement);
+        upsert_latest_listing(&mut listings, compatible);
+        assert!(storefront_listings(&listings).is_empty());
     }
 
     #[test]

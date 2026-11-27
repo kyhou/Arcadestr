@@ -399,6 +399,11 @@ pub struct GameListing {
 }
 
 impl GameListing {
+    pub fn is_adp_storefront_listing(&self) -> bool {
+        self.source == ListingSource::Nip99Listing
+            && arcadestr_core::marketplace_discovery::has_adp_distribution_metadata(&self.specs)
+    }
+
     pub fn has_declared_price(&self) -> bool {
         self.price_sats > 0
             || (self.price.is_finite() && self.price > 0.0 && !self.currency.trim().is_empty())
