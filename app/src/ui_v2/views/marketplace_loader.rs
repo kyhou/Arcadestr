@@ -123,10 +123,14 @@ pub fn use_listing_store_page_presentations(
                 .collect(),
         };
         spawn_local(async move {
-            let response = match invoke_enrich_store_pages(request).await {
+            let result = invoke_enrich_store_pages(request).await;
+            let Some(current_generation) = generation.try_get_untracked() else {
+                return;
+            };
+            let response = match result {
                 Ok(response) => response,
                 Err(_) => {
-                    if generation.get_untracked() == request_generation {
+                    if current_generation == request_generation {
                         unavailable.set(true);
                         loading.set(false);
                     }
@@ -134,7 +138,7 @@ pub fn use_listing_store_page_presentations(
                 }
             };
             if !store_page_generation_matches(
-                generation.get_untracked(),
+                current_generation,
                 request_generation,
                 response.generation,
             ) {
@@ -253,19 +257,17 @@ pub fn use_listing_campaign_states(listings: RwSignal<Vec<GameListing>>) -> List
                         })
                         .collect(),
                 };
-                let summaries = match invoke_discover_campaign_summaries(summary_request).await {
+                let result = invoke_discover_campaign_summaries(summary_request).await;
+                if generation.try_get_untracked() != Some(request_generation) {
+                    return;
+                }
+                let summaries = match result {
                     Ok(summaries) => summaries,
                     Err(message) => {
-                        if generation.get_untracked() != request_generation {
-                            return;
-                        }
                         error.set(Some(message));
                         Vec::new()
                     }
                 };
-                if generation.get_untracked() != request_generation {
-                    return;
-                }
                 let summaries = summaries
                     .into_iter()
                     .map(|summary| {
@@ -296,7 +298,11 @@ pub fn use_listing_campaign_states(listings: RwSignal<Vec<GameListing>>) -> List
                                 })
                                 .collect(),
                         };
-                        match invoke_discover_campaigns(request).await {
+                        let result = invoke_discover_campaigns(request).await;
+                        if generation.try_get_untracked() != Some(request_generation) {
+                            return;
+                        }
+                        match result {
                             Ok(discovered) => {
                                 availability = if discovered
                                     .iter()
@@ -321,9 +327,6 @@ pub fn use_listing_campaign_states(listings: RwSignal<Vec<GameListing>>) -> List
                             }
                             Err(message) => error.set(Some(message)),
                         }
-                        if generation.get_untracked() != request_generation {
-                            return;
-                        }
                     }
                     states.update(|current| match availability {
                         Some(availability) => {
@@ -335,7 +338,7 @@ pub fn use_listing_campaign_states(listings: RwSignal<Vec<GameListing>>) -> List
                     });
                 }
             }
-            if generation.get_untracked() == request_generation {
+            if generation.try_get_untracked() == Some(request_generation) {
                 loading.set(false);
             }
         });
@@ -392,6 +395,10 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
 
         let store = marketplace_store.clone();
         spawn_local(async move {
+            // Stream callbacks and queued tasks can outlive the route.
+            if request_generation.try_get_untracked() != Some(generation) {
+                return;
+            }
             let loaded_count = listings.get_untracked().len();
             let page_limit = next_fetch_limit(loaded_count, target_limit).unwrap_or(target_limit);
             let until_secs = if loaded_count > 0 {
@@ -469,7 +476,7 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                     let store_for_listing = store_for_listing.clone();
 
                     move |listing: GameListing| {
-                        if request_generation.get_untracked() != generation {
+                        if request_generation.try_get_untracked() != Some(generation) {
                             return;
                         }
                         let is_first_coordinate = mark_received_coordinate(
@@ -504,7 +511,7 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                                 // into one signal update while the UI remains responsive.
                                 TimeoutFuture::new(50).await;
 
-                                if request_generation.get_untracked() != generation {
+                                if request_generation.try_get_untracked() != Some(generation) {
                                     buffer.borrow_mut().clear();
                                     flush_queued.set(false);
                                     return;
@@ -547,7 +554,7 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                     let store_for_complete = store.clone();
 
                     move || {
-                        if request_generation.get_untracked() != generation {
+                        if request_generation.try_get_untracked() != Some(generation) {
                             return;
                         }
                         // Flush any remaining buffered items before finalising
@@ -596,7 +603,7 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                         product_cleanup();
                         completion_cleanup();
 
-                        if request_generation.get_untracked() != generation {
+                        if request_generation.try_get_untracked() != Some(generation) {
                             return;
                         }
 
@@ -619,7 +626,7 @@ pub fn use_marketplace_listings_with_limit(limit: usize) -> MarketplaceListingsS
                         }
                     }
                     Err(e) => {
-                        if request_generation.get_untracked() != generation {
+                        if request_generation.try_get_untracked() != Some(generation) {
                             return;
                         }
                         // A failed relay can finish before the debounce fires.

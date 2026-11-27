@@ -4,34 +4,35 @@
 use arcadestr_core::payment_boundary::{DispatchActivation, PaymentActivationStatus};
 use leptos::prelude::*;
 
-#[derive(Clone, Copy)]
-pub struct PaymentActivation(pub RwSignal<Option<PaymentActivationStatus>>);
+#[derive(Clone, Copy, Default)]
+pub struct PaymentActivation(Option<RwSignal<Option<PaymentActivationStatus>>>);
 
 impl PaymentActivation {
+    fn with_status<T>(self, f: impl FnOnce(Option<&PaymentActivationStatus>) -> T) -> T {
+        let status = self.0.and_then(|state| state.try_read());
+        f(status.as_deref().and_then(Option::as_ref))
+    }
+
     pub fn buyer_enabled(self) -> bool {
-        self.0.with(|s| buyer_enabled(s.as_ref()))
+        self.with_status(buyer_enabled)
     }
     pub fn buyer_label(self) -> &'static str {
-        self.0
-            .with(|s| activation_label(s.as_ref().map(|s| s.buyer_purchase)))
+        self.with_status(|s| activation_label(s.map(|s| s.buyer_purchase)))
     }
     pub fn refund_label(self) -> &'static str {
-        self.0
-            .with(|s| activation_label(s.as_ref().map(|s| s.recipient_refund)))
+        self.with_status(|s| activation_label(s.map(|s| s.recipient_refund)))
     }
     pub fn reported_fees_allowed(self) -> bool {
-        self.0
-            .with(|s| s.as_ref().is_some_and(|s| s.reported_fees_allowed))
+        self.with_status(|s| s.is_some_and(|s| s.reported_fees_allowed))
     }
     pub fn refund_enabled(self) -> bool {
-        self.0.with(|s| refund_enabled(s.as_ref()))
+        self.with_status(refund_enabled)
     }
     pub fn refund_lock_reason(self) -> Option<String> {
-        self.0.with(|s| refund_lock_reason(s.as_ref()))
+        self.with_status(refund_lock_reason)
     }
     pub fn test_build_label(self) -> Option<String> {
-        self.0
-            .with(|s| s.as_ref().and_then(|s| s.test_build_label.clone()))
+        self.with_status(|s| s.and_then(|s| s.test_build_label.clone()))
     }
 }
 
@@ -56,14 +57,12 @@ pub fn refund_lock_reason(status: Option<&PaymentActivationStatus>) -> Option<St
     }
 }
 
-/// Shared activation state; created and loaded once on first use.
-pub fn use_payment_activation() -> PaymentActivation {
-    if let Some(existing) = use_context::<PaymentActivation>() {
-        return existing;
-    }
-    let state = PaymentActivation(RwSignal::new(None));
-    provide_context(state);
-    #[cfg(not(feature = "web"))]
+/// Install at a stable owner above the route renderer. A route owner's context
+/// can survive a rerender even after its arena signals have been disposed.
+pub(crate) fn provide_payment_activation() {
+    let state = RwSignal::new(None);
+    provide_context(PaymentActivation(Some(state)));
+    #[cfg(all(target_arch = "wasm32", not(feature = "web")))]
     wasm_bindgen_futures::spawn_local(async move {
         if let Ok(status) = crate::tauri_invoke::invoke::<PaymentActivationStatus>(
             "get_payment_activation",
@@ -71,14 +70,16 @@ pub fn use_payment_activation() -> PaymentActivation {
         )
         .await
         {
-            state.0.set(Some(status));
+            // The shell may have unmounted while the IPC request was pending.
+            let _ = state.try_set(Some(status));
         }
     });
     #[cfg(feature = "web")]
-    state
-        .0
-        .set(Some(arcadestr_core::payment_boundary::activation_status()));
-    state
+    state.set(Some(arcadestr_core::payment_boundary::activation_status()));
+}
+
+pub fn use_payment_activation() -> PaymentActivation {
+    use_context().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -116,5 +117,31 @@ mod tests {
         );
         let none = status(DispatchActivation::Disabled, DispatchActivation::Disabled);
         assert!(!buyer_enabled(Some(&none)));
+    }
+
+    #[test]
+    fn activation_survives_route_owner_cleanup_and_fails_closed_after_shell_cleanup() {
+        let shell = Owner::new();
+        shell.with(provide_payment_activation);
+        let route = shell.child();
+
+        let first = route.with(use_payment_activation);
+        let signal = first.0.expect("route inherits shell activation");
+        let mut active = status(
+            DispatchActivation::RegtestOnly,
+            DispatchActivation::Disabled,
+        );
+        active.test_build_label = Some("Test build".into());
+        signal.set(Some(active));
+        assert!(first.buyer_enabled());
+
+        let reopened = route.with_cleanup(use_payment_activation);
+        assert_eq!(reopened.test_build_label().as_deref(), Some("Test build"));
+        assert!(reopened.buyer_enabled());
+        assert!(!reopened.refund_enabled());
+
+        shell.cleanup();
+        assert!(!reopened.buyer_enabled());
+        assert!(reopened.test_build_label().is_none());
     }
 }

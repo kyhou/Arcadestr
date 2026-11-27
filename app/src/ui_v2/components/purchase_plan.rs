@@ -410,6 +410,7 @@ pub fn PurchasePlanPreview() -> impl IntoView {
     let wallet = crate::ui_v2::nwc_wallet::NwcWalletContext::new();
     wallet.loaded.set(true);
     provide_context(wallet);
+    crate::ui_v2::payment_activation::provide_payment_activation();
     let parent_review = RwSignal::new(None::<PurchasePlanReview>);
     let recovered = RwSignal::new(0_u64);
     view! {

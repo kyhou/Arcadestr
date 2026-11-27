@@ -778,7 +778,7 @@ pub fn LibraryView(
         let auth_for_response = saved_auth.clone();
         spawn_local(async move {
             let result = invoke_get_library_games().await;
-            if refresh_generation.get_untracked() != requested_generation
+            if refresh_generation.try_get_untracked() != Some(requested_generation)
                 || receipt_sync
                     .map(|c| c.revision.get_untracked())
                     .unwrap_or(0)
@@ -818,7 +818,7 @@ pub fn LibraryView(
             // Recovery is intentionally lazy on Library access. Its command
             // result is authoritative; rows are fetched only after it returns.
             let recovery_result = invoke_retry_installation_recovery().await;
-            if refresh_generation.get_untracked() != requested_generation {
+            if refresh_generation.try_get_untracked() != Some(requested_generation) {
                 return;
             }
             if let Err(error) = recovery_result {
@@ -835,7 +835,7 @@ pub fn LibraryView(
             }
             recovery_completed.set(Some(requested_generation));
             let result = invoke_get_installed_games().await;
-            if refresh_generation.get_untracked() != requested_generation {
+            if refresh_generation.try_get_untracked() != Some(requested_generation) {
                 return;
             }
             let completes_reinstall = completes_retained_reinstall_refresh(
@@ -867,7 +867,7 @@ pub fn LibraryView(
         lifecycle_error.set(None);
         spawn_local(async move {
             let result = invoke_list_installation_lifecycle_issues().await;
-            if refresh_generation.get_untracked() != requested_generation
+            if refresh_generation.try_get_untracked() != Some(requested_generation)
                 || recovery_completed.get_untracked() != Some(requested_generation)
             {
                 return;
@@ -890,7 +890,7 @@ pub fn LibraryView(
         retained_error.set(None);
         spawn_local(async move {
             let result = invoke_list_retained_packages().await;
-            if refresh_generation.get_untracked() != requested_generation {
+            if refresh_generation.try_get_untracked() != Some(requested_generation) {
                 return;
             }
             match result {
@@ -1007,7 +1007,7 @@ pub fn LibraryView(
                 let result =
                     invoke_get_listing_ownership(buyer_npub.clone(), publisher_npub, listing_id)
                         .await;
-                if ownership_generation.get_untracked() != generation
+                if ownership_generation.try_get_untracked() != Some(generation)
                     || auth.npub.get_untracked().as_deref() != Some(buyer_npub.as_str())
                 {
                     return;

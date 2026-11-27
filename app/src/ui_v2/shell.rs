@@ -447,6 +447,7 @@ pub fn UiV2Root(relay_count: RwSignal<usize>) -> impl IntoView {
     provide_context(wallet);
     let refund_address = crate::ui_v2::refund_address::RefundAddressContext::new();
     provide_context(refund_address);
+    super::payment_activation::provide_payment_activation();
     let receipts = super::receipt_sync::provide_receipt_sync(auth.clone());
     if !cfg!(feature = "web") {
         let wallet_auth = auth.clone();

@@ -1086,14 +1086,17 @@ pub fn GameDetailView(
                 },
             )
             .await;
+            let Some(current_generation) = detail_generation.try_get_untracked() else {
+                return;
+            };
             let Ok(response) = response else {
-                if detail_generation.get_untracked() == requested_generation {
+                if current_generation == requested_generation {
                     listing_validation_loading.set(false);
                     listing_validation_error.set(true);
                 }
                 return;
             };
-            if detail_generation.get_untracked() != requested_generation
+            if current_generation != requested_generation
                 || response.generation != requested_generation
             {
                 return;
@@ -1102,7 +1105,7 @@ pub fn GameDetailView(
             listing_validation_error.set(!response.listing_event_current);
             if let Some(cached) = response.cached {
                 if detail_response_is_current(
-                    detail_generation.get_untracked(),
+                    current_generation,
                     requested_generation,
                     response.generation,
                     &coordinate,
@@ -1115,7 +1118,7 @@ pub fn GameDetailView(
             match response.refreshed {
                 StorePageDetailState::Enriched(presentation)
                     if detail_response_is_current(
-                        detail_generation.get_untracked(),
+                        current_generation,
                         requested_generation,
                         response.generation,
                         &coordinate,
@@ -1143,7 +1146,7 @@ pub fn GameDetailView(
         platform_error.set(false);
         spawn_local(async move {
             let result = invoke_get_platform_info().await;
-            if platform_refresh.get_untracked() != requested_refresh {
+            if platform_refresh.try_get_untracked() != Some(requested_refresh) {
                 return;
             }
             match result {
@@ -1177,9 +1180,10 @@ pub fn GameDetailView(
             let result =
                 invoke_get_listing_ownership(requested_account.clone(), publisher_npub, listing_id)
                     .await;
-            if auth_for_response.npub.get_untracked().as_deref() != Some(requested_account.as_str())
+            if ownership_refresh.try_get_untracked() != Some(refresh_epoch)
+                || auth_for_response.npub.get_untracked().as_deref()
+                    != Some(requested_account.as_str())
                 || !auth_for_response.is_current_auth_flow(auth_epoch)
-                || ownership_refresh.get_untracked() != refresh_epoch
             {
                 return;
             }
@@ -1210,7 +1214,9 @@ pub fn GameDetailView(
         let auth_for_response = library_auth.clone();
         spawn_local(async move {
             let result = invoke_is_game_in_library(coordinate).await;
-            if auth_for_response.npub.get_untracked().as_deref() != Some(requested_account.as_str())
+            if library_loading.is_disposed()
+                || auth_for_response.npub.get_untracked().as_deref()
+                    != Some(requested_account.as_str())
             {
                 return;
             }
@@ -1230,7 +1236,7 @@ pub fn GameDetailView(
             install_state_error.set(false);
             spawn_local(async move {
                 let result = invoke_get_installed_games().await;
-                if install_state_refresh.get_untracked() != requested_refresh {
+                if install_state_refresh.try_get_untracked() != Some(requested_refresh) {
                     return;
                 }
                 match result {
@@ -1265,7 +1271,7 @@ pub fn GameDetailView(
             retained_state_error.set(false);
             spawn_local(async move {
                 let result = invoke_list_retained_packages().await;
-                if install_state_refresh.get_untracked() != requested_refresh {
+                if install_state_refresh.try_get_untracked() != Some(requested_refresh) {
                     return;
                 }
                 match result {
@@ -2603,6 +2609,7 @@ pub fn ClaimSessionPreview() -> impl IntoView {
     auth.npub.set(Some(alice.clone()));
     provide_context(auth.clone());
     provide_context(crate::ui_v2::nwc_wallet::NwcWalletContext::new());
+    crate::ui_v2::payment_activation::provide_payment_activation();
     let listing = GameListing {
         id: "claim-session".into(),
         source: ListingSource::Nip99Listing,
