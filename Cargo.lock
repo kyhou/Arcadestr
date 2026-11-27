@@ -119,7 +119,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "arcadestr-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "arcadestr-core",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "arcadestr-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "arcadestr-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arcadestr-app",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "arcadestr-web"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arcadestr-app",
  "console_error_panic_hook",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "arcadestr-xtask"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "sha2",
 ]
