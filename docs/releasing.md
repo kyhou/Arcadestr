@@ -162,10 +162,23 @@ version.
    installers, writes `SHA256SUMS`, and generates notes from the commits
    since the previous tag.
 4. **publish** is the only job with write permission. It creates one draft
-   release with every asset, then publishes it as a pre-release.
+   release with every asset, then publishes it as the stable Latest release.
+   Once GitHub reports that tag from `/releases/latest`, the job dispatches
+   `app-released` to `kyhou/Arcadestr-Site`, which rebuilds its download links.
 
 A failed or cancelled platform build stops the run before anything is
 published, so a partial release never appears.
+
+### Site deployment setup
+
+In the Arcadestr app repository, add the Actions secret `SITE_DISPATCH_TOKEN`.
+Use a fine-grained GitHub token restricted to `kyhou/Arcadestr-Site` with
+**Contents: Read and write** (required by `repository_dispatch`). The app's
+default `GITHUB_TOKEN` cannot dispatch to another repository.
+
+If dispatch fails, the app release remains published. Fix the secret and
+re-run the failed publish job. A rerun only dispatches if its tag is still
+Latest. The site's Actions page tracks deployment separately.
 
 ### Retrying
 

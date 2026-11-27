@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publishes the assembled assets in <dir> as the GitHub pre-release for <tag>.
+# Publishes the assembled assets in <dir> as the latest stable release.
 # Safe to re-run; it never creates a second release or overwrites a published
 # one:
 #   - no release yet:     create a draft with every asset, then publish it;
@@ -25,9 +25,9 @@ mapfile -t assets < <(find "$dir" -mindepth 1 -maxdepth 1 -type f | sort)
 names="$(for asset in "${assets[@]}"; do basename "$asset"; done | sort)"
 
 if ! state="$(gh release view "$tag" --json isDraft,assets 2>/dev/null)"; then
-  gh release create "$tag" "${assets[@]}" --verify-tag --draft --prerelease \
+  gh release create "$tag" "${assets[@]}" --verify-tag --draft \
     --title "$title" --notes-file "$notes"
-  gh release edit "$tag" --draft=false
+  gh release edit "$tag" --prerelease=false --draft=false --latest
   echo "Published $tag with ${#assets[@]} assets"
   exit 0
 fi
@@ -49,5 +49,5 @@ gh release upload "$tag" "${assets[@]}" --clobber
 comm -13 <(echo "$names") <(echo "$existing") | while read -r stray; do
   [[ -n "$stray" ]] && gh release delete-asset "$tag" "$stray" --yes
 done
-gh release edit "$tag" --title "$title" --notes-file "$notes" --prerelease --draft=false
+gh release edit "$tag" --title "$title" --notes-file "$notes" --prerelease=false --draft=false --latest
 echo "Published $tag with ${#assets[@]} assets"

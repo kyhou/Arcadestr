@@ -1,7 +1,7 @@
 name: Release
 
 # Builds the desktop installers for a vX.Y.Z tag and publishes them as one
-# GitHub pre-release with SHA256SUMS. See docs/releasing.md.
+# stable GitHub release with SHA256SUMS. See docs/releasing.md.
 #
 #   resolve  -> tag, exact commit and version checks (read-only)
 #   build    -> one native job per platform; uploads workflow artifacts
@@ -277,9 +277,34 @@ jobs:
           name: release
           path: release
 
-      - name: Publish pre-release
+      - name: Publish stable release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.resolve.outputs.tag }}
         run: bash scripts/release/publish.sh "$TAG" "Arcadestr $TAG" release/assets release/notes.md
+
+      - name: Check whether this release is Latest
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          latest="$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)"
+          if [[ "$latest" == "$TAG" ]]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger Arcadestr site deploy
+        if: steps.latest.outputs.deploy == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::Set SITE_DISPATCH_TOKEN to deploy the site after publication."
+            exit 1
+          fi
+          gh api repos/kyhou/Arcadestr-Site/dispatches \
+            -f event_type=app-released -f "client_payload[tag]=$TAG"
