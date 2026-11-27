@@ -1,13 +1,14 @@
-//! Stock relay roles matching the local Amethyst checkout.
+//! Stock relay roles based on the local Amethyst checkout, plus Arcadestr's relay.
 //! General defaults: commons/.../defaults/{AmethystDefaults,Constants}.kt.
 //! QR login defaults: commonsUI/.../account/ui/login/LoginViewModel.kt.
 //! Keep signer rendezvous relays separate from feed/profile discovery.
 
-/// Amethyst's DefaultNIP65RelaySet, used when an account has no known relay list.
+/// Amethyst's DefaultNIP65RelaySet plus Arcadestr's relay, used when an account has no known relay list.
 pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://nostr.mom",
     "wss://nos.lol",
     "wss://nostr.bitcoiner.social",
+    "wss://relay.arcadestr.com",
 ];
 
 /// Amethyst's Constants.bootstrapInbox.
@@ -42,6 +43,11 @@ pub const DEFAULT_NIP46_RELAYS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_relays_include_arcadestr() {
+        assert!(DEFAULT_RELAYS.contains(&"wss://relay.arcadestr.com"));
+    }
 
     #[test]
     fn stock_relay_roles_are_valid_unique_secure_websocket_urls() {
