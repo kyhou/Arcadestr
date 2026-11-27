@@ -1,10 +1,11 @@
-"""Exercise the real Trunk dev server without Rust builds or application data.
+"""Exercise Trunk's frontend asset pipeline without Rust builds or application data.
 
 Run: python3 -B -m unittest discover -s tests -p test_dev_frontend.py -v
 """
 
 import json
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -19,6 +20,42 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(shutil.which("trunk"), "Trunk is required for dev-server smoke tests")
 class DevFrontendTests(unittest.TestCase):
+    def test_release_css_hides_topbar_search_label(self):
+        temporary_root = "/tmp/opencode" if Path("/tmp/opencode").is_dir() else None
+        with tempfile.TemporaryDirectory(prefix="arcadestr-release-css-", dir=temporary_root) as directory:
+            directory = Path(directory)
+            web = directory / "web"
+            for name in [
+                "web/Trunk.toml",
+                "web/style/tailwind.css",
+                "web/tailwind.config.js",
+                "web/assets/fonts/material-symbols-outlined.woff2",
+                "app/src/ui_v2/components/topbar.rs",
+            ]:
+                destination = directory / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / name, destination)
+
+            # Keep the real CSS and font pipelines, but omit the Rust build.
+            html = (ROOT / "web/index.html").read_text()
+            (web / "index.html").write_text(
+                "\n".join(line for line in html.splitlines() if 'rel="rust"' not in line)
+            )
+            result = subprocess.run(
+                ["trunk", "build", "--release", "--skip-version-check", "--no-color"],
+                cwd=web, capture_output=True, text=True, timeout=90,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            styles = list((web / "dist").glob("tailwind-*.css"))
+            self.assertEqual(len(styles), 1)
+            css = styles[0].read_text()
+            self.assertIsNotNone(
+                re.search(r"\.sr-only\s*\{[^}]*position:\s*absolute", css),
+                "Release CSS did not generate the sr-only utility used by the search label",
+            )
+            self.assertIn("@font-face", css)
+            self.assertTrue((web / "dist/fonts/material-symbols-outlined.woff2").is_file())
+
     def test_boot_document_and_wasm_are_not_cached(self):
         temporary_root = "/tmp/opencode" if Path("/tmp/opencode").is_dir() else None
         with tempfile.TemporaryDirectory(prefix="arcadestr-dev-http-", dir=temporary_root) as directory:

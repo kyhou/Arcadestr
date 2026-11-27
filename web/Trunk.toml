@@ -15,6 +15,11 @@ dist = "dist"
 # The public URL of the application
 public_url = "/"
 
+[tools]
+# The stylesheet and Rust content globs use Tailwind 3's JS configuration.
+# Newer Trunk versions default to Tailwind 4, which ignores it.
+tailwindcss = "3.3.5"
+
 [watch]
 # The UI lives in ../app and its protocol types in ../core; without these,
 # `cargo tauri dev` rebuilds the desktop binary but never the frontend.
